@@ -17,7 +17,7 @@
 //!
 //! ```rust
 //! use serde_json::json;
-//! use zeroclaw::tools::schema::SchemaCleanr;
+//! use rantaiclaw::tools::schema::SchemaCleanr;
 //!
 //! let dirty_schema = json!({
 //!     "type": "object",

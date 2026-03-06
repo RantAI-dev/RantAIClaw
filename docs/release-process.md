@@ -1,4 +1,4 @@
-# ZeroClaw Release Process
+# RantaiClaw Release Process
 
 This runbook defines the maintainers' standard release flow.
 

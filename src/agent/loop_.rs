@@ -887,7 +887,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
     // tool call. Tool calls MUST be explicitly wrapped in either:
     // 1. OpenAI-style JSON with a "tool_calls" array
-    // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
+    // 2. RantaiClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
     // 3. Markdown code blocks with tool_call/toolcall/tool-call language
     // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
     // This ensures only the LLM's intentional tool calls are executed.
@@ -1523,7 +1523,7 @@ pub async fn run(
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
@@ -1650,7 +1650,7 @@ pub async fn run(
         ));
         tool_descs.push((
             "arduino_upload",
-            "Upload agent-generated Arduino sketch. Use when: user asks for 'make a heart', 'blink pattern', or custom LED behavior on Arduino. You write the full .ino code; ZeroClaw compiles and uploads it. Pin 13 = built-in LED on Uno.",
+            "Upload agent-generated Arduino sketch. Use when: user asks for 'make a heart', 'blink pattern', or custom LED behavior on Arduino. You write the full .ino code; RantaiClaw compiles and uploads it. Pin 13 = built-in LED on Uno.",
         ));
         tool_descs.push((
             "hardware_memory_map",
@@ -1749,7 +1749,7 @@ pub async fn run(
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
-        println!("🦀 ZeroClaw Interactive Mode");
+        println!("🦀 RantaiClaw Interactive Mode");
         println!("Type /help for commands.\n");
         let cli = crate::channels::CliChannel::new();
 
@@ -1964,7 +1964,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
@@ -2018,7 +2018,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ));
         tool_descs.push((
             "arduino_upload",
-            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
+            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; RantaiClaw uploads it.",
         ));
         tool_descs.push((
             "hardware_memory_map",

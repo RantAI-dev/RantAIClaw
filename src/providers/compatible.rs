@@ -968,7 +968,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
+                "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
                 self.name
             )
         })?;
@@ -1097,7 +1097,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
+                "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
                 self.name
             )
         })?;
@@ -1203,7 +1203,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
+                "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
                 self.name
             )
         })?;
@@ -1299,7 +1299,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
+                "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
                 self.name
             )
         })?;
@@ -1577,7 +1577,7 @@ mod tests {
             messages: vec![
                 Message {
                     role: "system".to_string(),
-                    content: "You are ZeroClaw".to_string(),
+                    content: "You are RantaiClaw".to_string(),
                 },
                 Message {
                     role: "user".to_string(),

@@ -25,7 +25,7 @@ build_smoke_image() {
       --load
       --target dev
       --cache-to "type=local,dest=$SMOKE_CACHE_DIR,mode=max"
-      -t zeroclaw-local-smoke:latest
+      -t rantaiclaw-local-smoke:latest
       .
     )
     if [ -f "$SMOKE_CACHE_DIR/index.json" ]; then
@@ -33,13 +33,13 @@ build_smoke_image() {
     fi
     docker buildx build "${build_args[@]}"
   else
-    DOCKER_BUILDKIT=1 docker build --target dev -t zeroclaw-local-smoke:latest .
+    DOCKER_BUILDKIT=1 docker build --target dev -t rantaiclaw-local-smoke:latest .
   fi
 }
 
 print_help() {
   cat <<'EOF'
-ZeroClaw Local CI in Docker
+RantaiClaw Local CI in Docker
 
 Usage: ./dev/ci.sh <command>
 
@@ -109,7 +109,7 @@ case "$1" in
 
   docker-smoke)
     build_smoke_image
-    docker run --rm zeroclaw-local-smoke:latest --version
+    docker run --rm rantaiclaw-local-smoke:latest --version
     ;;
 
   all)
@@ -119,7 +119,7 @@ case "$1" in
     run_in_ci "cargo deny check licenses sources"
     run_in_ci "cargo audit"
     build_smoke_image
-    docker run --rm zeroclaw-local-smoke:latest --version
+    docker run --rm rantaiclaw-local-smoke:latest --version
     ;;
 
   clean)

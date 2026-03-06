@@ -1,6 +1,6 @@
-# zeroclaw-tools
+# rantaiclaw-tools
 
-Gói Python đồng hành cho [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) — gọi công cụ dựa trên LangGraph cho thực thi agent LLM nhất quán.
+Gói Python đồng hành cho [RantaiClaw](https://github.com/rantaiclaw-labs/rantaiclaw) — gọi công cụ dựa trên LangGraph cho thực thi agent LLM nhất quán.
 
 ## Tại sao cần gói này?
 
@@ -14,13 +14,13 @@ Một số nhà cung cấp LLM (đặc biệt là GLM-5/Zhipu và các model tư
 ## Cài đặt
 
 ```bash
-pip install zeroclaw-tools
+pip install rantaiclaw-tools
 ```
 
 Kèm tích hợp Discord:
 
 ```bash
-pip install zeroclaw-tools[discord]
+pip install rantaiclaw-tools[discord]
 ```
 
 ## Bắt đầu nhanh
@@ -29,7 +29,7 @@ pip install zeroclaw-tools[discord]
 
 ```python
 import asyncio
-from zeroclaw_tools import create_agent, shell, file_read, file_write
+from rantaiclaw_tools import create_agent, shell, file_read, file_write
 from langchain_core.messages import HumanMessage
 
 async def main():
@@ -59,17 +59,17 @@ export API_KEY="your-api-key"
 export API_BASE="https://api.z.ai/api/coding/paas/v4"
 
 # Chạy CLI
-zeroclaw-tools "List files in the current directory"
+rantaiclaw-tools "List files in the current directory"
 
 # Chế độ tương tác (không cần tin nhắn)
-zeroclaw-tools -i
+rantaiclaw-tools -i
 ```
 
 ### Bot Discord
 
 ```python
 import os
-from zeroclaw_tools.integrations import DiscordBot
+from rantaiclaw_tools.integrations import DiscordBot
 
 bot = DiscordBot(
     token=os.environ["DISCORD_TOKEN"],
@@ -95,7 +95,7 @@ bot.run()
 ## Tạo công cụ tùy chỉnh
 
 ```python
-from zeroclaw_tools import tool
+from rantaiclaw_tools import tool
 
 @tool
 def my_custom_tool(query: str) -> str:
@@ -124,7 +124,7 @@ Hoạt động với mọi provider tương thích OpenAI:
 ┌─────────────────────────────────────────────┐
 │              Ứng dụng của bạn               │
 ├─────────────────────────────────────────────┤
-│           zeroclaw-tools Agent              │
+│           rantaiclaw-tools Agent              │
 │  ┌─────────────────────────────────────┐   │
 │  │         LangGraph StateGraph         │   │
 │  │    ┌───────────┐    ┌──────────┐    │   │
@@ -137,9 +137,9 @@ Hoạt động với mọi provider tương thích OpenAI:
 └─────────────────────────────────────────────┘
 ```
 
-## So sánh với Rust ZeroClaw
+## So sánh với Rust RantaiClaw
 
-| Tính năng | Rust ZeroClaw | zeroclaw-tools |
+| Tính năng | Rust RantaiClaw | rantaiclaw-tools |
 |---------|---------------|----------------|
 | **Kích thước binary** | ~3.4 MB | Gói Python |
 | **Bộ nhớ** | <5 MB | ~50 MB |
@@ -147,7 +147,7 @@ Hoạt động với mọi provider tương thích OpenAI:
 | **Độ nhất quán công cụ** | Phụ thuộc model | LangGraph đảm bảo |
 | **Khả năng mở rộng** | Rust traits | Python decorators |
 
-Dùng **Rust ZeroClaw** cho triển khai biên (edge) trong sản phẩm. Dùng **zeroclaw-tools** khi cần đảm bảo tính nhất quán gọi công cụ hoặc tích hợp hệ sinh thái Python.
+Dùng **Rust RantaiClaw** cho triển khai biên (edge) trong sản phẩm. Dùng **rantaiclaw-tools** khi cần đảm bảo tính nhất quán gọi công cụ hoặc tích hợp hệ sinh thái Python.
 
 ## Giấy phép
 

@@ -78,7 +78,7 @@ FDCAN1: TX on D3/PB0, RX on D4/PA12. Requires external CAN transceiver.
 
 Dual ISPs: 13MP+13MP or 25MP@30fps. 4-lane MIPI-CSI-2. V4L2 at /dev/video*.
 
-## ZeroClaw Tools
+## RantaiClaw Tools
 
 - `uno_q_gpio_read`: Read digital pin (0-21)
 - `uno_q_gpio_write`: Set digital pin high/low (0-21)

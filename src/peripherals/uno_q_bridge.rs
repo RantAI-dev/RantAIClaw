@@ -719,7 +719,7 @@ impl Tool for UnoQCameraCaptureTool {
             .get("device")
             .and_then(|v| v.as_str())
             .unwrap_or("/dev/video0");
-        let output_path = "/tmp/zeroclaw_capture.jpg";
+        let output_path = "/tmp/rantaiclaw_capture.jpg";
 
         let fmt = format!("width={},height={},pixelformat=MJPG", width, height);
         let output = tokio::process::Command::new("v4l2-ctl")

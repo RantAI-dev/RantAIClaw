@@ -15,14 +15,14 @@ error() {
 
 usage() {
   cat <<'USAGE'
-ZeroClaw installer bootstrap engine
+RantaiClaw installer bootstrap engine
 
 Usage:
-  ./zeroclaw_install.sh [options]
+  ./rantaiclaw_install.sh [options]
   ./bootstrap.sh [options]         # compatibility entrypoint
 
 Modes:
-  Default mode installs/builds ZeroClaw only (requires existing Rust toolchain).
+  Default mode installs/builds RantaiClaw only (requires existing Rust toolchain).
   Guided mode asks setup questions and configures options interactively.
   Optional bootstrap mode can also install system dependencies and Rust.
 
@@ -46,30 +46,30 @@ Options:
   -h, --help                 Show help
 
 Examples:
-  ./zeroclaw_install.sh
-  ./zeroclaw_install.sh --guided
-  ./zeroclaw_install.sh --install-system-deps --install-rust
-  ./zeroclaw_install.sh --prefer-prebuilt
-  ./zeroclaw_install.sh --prebuilt-only
-  ./zeroclaw_install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
-  ./zeroclaw_install.sh --interactive-onboard
+  ./rantaiclaw_install.sh
+  ./rantaiclaw_install.sh --guided
+  ./rantaiclaw_install.sh --install-system-deps --install-rust
+  ./rantaiclaw_install.sh --prefer-prebuilt
+  ./rantaiclaw_install.sh --prebuilt-only
+  ./rantaiclaw_install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+  ./rantaiclaw_install.sh --interactive-onboard
 
   # Compatibility entrypoint:
   ./bootstrap.sh --docker
 
   # Remote one-liner
-  curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/rantaiclaw-labs/rantaiclaw/main/scripts/bootstrap.sh | bash
 
 Environment:
-  ZEROCLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
-  ZEROCLAW_DOCKER_DATA_DIR   Host path for Docker config/workspace persistence
-  ZEROCLAW_DOCKER_IMAGE      Docker image tag to build/run (default: zeroclaw-bootstrap:local)
-  ZEROCLAW_API_KEY           Used when --api-key is not provided
-  ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
-  ZEROCLAW_MODEL             Used when --model is not provided
-  ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
-  ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
-  ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS
+  RANTAICLAW_CONTAINER_CLI     Container CLI command (default: docker; auto-fallback: podman)
+  RANTAICLAW_DOCKER_DATA_DIR   Host path for Docker config/workspace persistence
+  RANTAICLAW_DOCKER_IMAGE      Docker image tag to build/run (default: rantaiclaw-bootstrap:local)
+  RANTAICLAW_API_KEY           Used when --api-key is not provided
+  RANTAICLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
+  RANTAICLAW_MODEL             Used when --model is not provided
+  RANTAICLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
+  RANTAICLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
+  RANTAICLAW_DISABLE_ALPINE_AUTO_DEPS
                             Set to 1 to disable Alpine auto-install of missing prerequisites
 USAGE
 }
@@ -137,8 +137,8 @@ should_attempt_prebuilt_for_resources() {
   local workspace="${1:-.}"
   local min_ram_mb min_disk_mb total_ram_mb free_disk_mb low_resource
 
-  min_ram_mb="${ZEROCLAW_BOOTSTRAP_MIN_RAM_MB:-2048}"
-  min_disk_mb="${ZEROCLAW_BOOTSTRAP_MIN_DISK_MB:-6144}"
+  min_ram_mb="${RANTAICLAW_BOOTSTRAP_MIN_RAM_MB:-2048}"
+  min_disk_mb="${RANTAICLAW_BOOTSTRAP_MIN_DISK_MB:-6144}"
   total_ram_mb="$(get_total_memory_mb || true)"
   free_disk_mb="$(get_available_disk_mb "$workspace" || true)"
   low_resource=false
@@ -186,9 +186,9 @@ install_prebuilt_binary() {
     return 1
   fi
 
-  archive_url="https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-${target}.tar.gz"
-  temp_dir="$(mktemp -d -t zeroclaw-prebuilt-XXXXXX)"
-  archive_path="$temp_dir/zeroclaw-${target}.tar.gz"
+  archive_url="https://github.com/rantaiclaw-labs/rantaiclaw/releases/latest/download/rantaiclaw-${target}.tar.gz"
+  temp_dir="$(mktemp -d -t rantaiclaw-prebuilt-XXXXXX)"
+  archive_path="$temp_dir/rantaiclaw-${target}.tar.gz"
 
   info "Attempting pre-built binary install for target: $target"
   if ! curl -fsSL "$archive_url" -o "$archive_path"; then
@@ -203,22 +203,22 @@ install_prebuilt_binary() {
     return 1
   fi
 
-  extracted_bin="$temp_dir/zeroclaw"
+  extracted_bin="$temp_dir/rantaiclaw"
   if [[ ! -x "$extracted_bin" ]]; then
-    extracted_bin="$(find "$temp_dir" -maxdepth 2 -type f -name zeroclaw -perm -u+x | head -n 1 || true)"
+    extracted_bin="$(find "$temp_dir" -maxdepth 2 -type f -name rantaiclaw -perm -u+x | head -n 1 || true)"
   fi
   if [[ -z "$extracted_bin" || ! -x "$extracted_bin" ]]; then
-    warn "Archive did not contain an executable zeroclaw binary."
+    warn "Archive did not contain an executable rantaiclaw binary."
     rm -rf "$temp_dir"
     return 1
   fi
 
   install_dir="$HOME/.cargo/bin"
   mkdir -p "$install_dir"
-  install -m 0755 "$extracted_bin" "$install_dir/zeroclaw"
+  install -m 0755 "$extracted_bin" "$install_dir/rantaiclaw"
   rm -rf "$temp_dir"
 
-  info "Installed pre-built binary to $install_dir/zeroclaw"
+  info "Installed pre-built binary to $install_dir/rantaiclaw"
   if [[ ":$PATH:" != *":$install_dir:"* ]]; then
     warn "$install_dir is not in PATH for this shell."
     warn "Run: export PATH=\"$install_dir:\$PATH\""
@@ -263,7 +263,7 @@ run_pacman() {
 
   local pacman_cfg_tmp=""
   local pacman_rc=0
-  pacman_cfg_tmp="$(mktemp /tmp/zeroclaw-pacman.XXXXXX.conf)"
+  pacman_cfg_tmp="$(mktemp /tmp/rantaiclaw-pacman.XXXXXX.conf)"
   cp /etc/pacman.conf "$pacman_cfg_tmp"
   if ! grep -Eq '^[[:space:]]*DisableSandboxSyscalls([[:space:]]|$)' "$pacman_cfg_tmp"; then
     printf '\nDisableSandboxSyscalls\n' >> "$pacman_cfg_tmp"
@@ -439,7 +439,7 @@ run_guided_installer() {
   local api_key_input=""
 
   echo
-  echo "ZeroClaw guided installer"
+  echo "RantaiClaw guided installer"
   echo "Answer a few questions, then the installer will run automatically."
   echo
 
@@ -467,7 +467,7 @@ run_guided_installer() {
     SKIP_BUILD=true
   fi
 
-  if prompt_yes_no "Install zeroclaw into cargo bin now?" "yes"; then
+  if prompt_yes_no "Install rantaiclaw into cargo bin now?" "yes"; then
     SKIP_INSTALL=false
   else
     SKIP_INSTALL=true
@@ -547,7 +547,7 @@ run_guided_installer() {
 
 resolve_container_cli() {
   local requested_cli
-  requested_cli="${ZEROCLAW_CONTAINER_CLI:-docker}"
+  requested_cli="${RANTAICLAW_CONTAINER_CLI:-docker}"
 
   if have_cmd "$requested_cli"; then
     CONTAINER_CLI="$requested_cli"
@@ -562,9 +562,9 @@ resolve_container_cli() {
 
   error "Container CLI '$requested_cli' is not installed."
   if [[ "$requested_cli" != "docker" ]]; then
-    error "Set ZEROCLAW_CONTAINER_CLI to an installed Docker-compatible CLI (e.g., docker or podman)."
+    error "Set RANTAICLAW_CONTAINER_CLI to an installed Docker-compatible CLI (e.g., docker or podman)."
   else
-    error "Install Docker, install podman, or set ZEROCLAW_CONTAINER_CLI to an available Docker-compatible CLI."
+    error "Install Docker, install podman, or set RANTAICLAW_CONTAINER_CLI to an available Docker-compatible CLI."
   fi
   exit 1
 }
@@ -583,17 +583,17 @@ run_docker_bootstrap() {
   local docker_image docker_data_dir default_data_dir fallback_image
   local config_mount workspace_mount
   local -a container_run_user_args container_run_namespace_args
-  docker_image="${ZEROCLAW_DOCKER_IMAGE:-zeroclaw-bootstrap:local}"
-  fallback_image="ghcr.io/zeroclaw-labs/zeroclaw:latest"
+  docker_image="${RANTAICLAW_DOCKER_IMAGE:-rantaiclaw-bootstrap:local}"
+  fallback_image="ghcr.io/rantaiclaw-labs/rantaiclaw:latest"
   if [[ "$TEMP_CLONE" == true ]]; then
-    default_data_dir="$HOME/.zeroclaw-docker"
+    default_data_dir="$HOME/.rantaiclaw-docker"
   else
-    default_data_dir="$WORK_DIR/.zeroclaw-docker"
+    default_data_dir="$WORK_DIR/.rantaiclaw-docker"
   fi
-  docker_data_dir="${ZEROCLAW_DOCKER_DATA_DIR:-$default_data_dir}"
+  docker_data_dir="${RANTAICLAW_DOCKER_DATA_DIR:-$default_data_dir}"
   DOCKER_DATA_DIR="$docker_data_dir"
 
-  mkdir -p "$docker_data_dir/.zeroclaw" "$docker_data_dir/workspace"
+  mkdir -p "$docker_data_dir/.rantaiclaw" "$docker_data_dir/workspace"
 
   if [[ "$SKIP_INSTALL" == true ]]; then
     warn "--skip-install has no effect with --docker."
@@ -606,7 +606,7 @@ run_docker_bootstrap() {
     info "Skipping Docker image build"
     if ! "$CONTAINER_CLI" image inspect "$docker_image" >/dev/null 2>&1; then
       warn "Local Docker image ($docker_image) was not found."
-      info "Pulling official ZeroClaw image ($fallback_image)"
+      info "Pulling official RantaiClaw image ($fallback_image)"
       if ! "$CONTAINER_CLI" pull "$fallback_image"; then
         error "Failed to pull fallback Docker image: $fallback_image"
         error "Run without --skip-build to build locally, or verify access to GHCR."
@@ -619,8 +619,8 @@ run_docker_bootstrap() {
     fi
   fi
 
-  config_mount="$docker_data_dir/.zeroclaw:/zeroclaw-data/.zeroclaw"
-  workspace_mount="$docker_data_dir/workspace:/zeroclaw-data/workspace"
+  config_mount="$docker_data_dir/.rantaiclaw:/rantaiclaw-data/.rantaiclaw"
+  workspace_mount="$docker_data_dir/workspace:/rantaiclaw-data/workspace"
   if [[ "$CONTAINER_CLI" == "podman" ]]; then
     config_mount+=":Z"
     workspace_mount+=":Z"
@@ -645,9 +645,9 @@ run_docker_bootstrap() {
 Use either:
   --api-key "sk-..."
 or:
-  ZEROCLAW_API_KEY="sk-..." ./zeroclaw_install.sh --docker
+  RANTAICLAW_API_KEY="sk-..." ./rantaiclaw_install.sh --docker
 or run interactive:
-  ./zeroclaw_install.sh --docker --interactive-onboard
+  ./rantaiclaw_install.sh --docker --interactive-onboard
 MSG
       exit 1
     fi
@@ -665,8 +665,8 @@ MSG
   "$CONTAINER_CLI" run --rm -it \
     "${container_run_namespace_args[@]}" \
     "${container_run_user_args[@]}" \
-    -e HOME=/zeroclaw-data \
-    -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+    -e HOME=/rantaiclaw-data \
+    -e RANTAICLAW_WORKSPACE=/rantaiclaw-data/workspace \
     -v "$config_mount" \
     -v "$workspace_mount" \
     "$docker_image" \
@@ -676,7 +676,7 @@ MSG
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd || pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd || pwd)"
-REPO_URL="https://github.com/zeroclaw-labs/zeroclaw.git"
+REPO_URL="https://github.com/rantaiclaw-labs/rantaiclaw.git"
 ORIGINAL_ARG_COUNT=$#
 GUIDED_MODE="auto"
 
@@ -691,10 +691,10 @@ INTERACTIVE_ONBOARD=false
 SKIP_BUILD=false
 SKIP_INSTALL=false
 PREBUILT_INSTALLED=false
-CONTAINER_CLI="${ZEROCLAW_CONTAINER_CLI:-docker}"
-API_KEY="${ZEROCLAW_API_KEY:-}"
-PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
-MODEL="${ZEROCLAW_MODEL:-}"
+CONTAINER_CLI="${RANTAICLAW_CONTAINER_CLI:-docker}"
+API_KEY="${RANTAICLAW_API_KEY:-}"
+PROVIDER="${RANTAICLAW_PROVIDER:-openrouter}"
+MODEL="${RANTAICLAW_MODEL:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -814,11 +814,11 @@ if [[ "$DOCKER_MODE" == true ]]; then
       warn "--install-rust is ignored with --docker."
   fi
 else
-  if [[ "$OS_NAME" == "Linux" && -z "${ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS:-}" ]] && have_cmd apk; then
+  if [[ "$OS_NAME" == "Linux" && -z "${RANTAICLAW_DISABLE_ALPINE_AUTO_DEPS:-}" ]] && have_cmd apk; then
     find_missing_alpine_prereqs
     if [[ ${#ALPINE_MISSING_PKGS[@]} -gt 0 && "$INSTALL_SYSTEM_DEPS" == false ]]; then
       info "Detected Alpine with missing prerequisites: ${ALPINE_MISSING_PKGS[*]}"
-      info "Auto-enabling system dependency installation (set ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS=1 to disable)."
+      info "Auto-enabling system dependency installation (set RANTAICLAW_DISABLE_ALPINE_AUTO_DEPS=1 to disable)."
       INSTALL_SYSTEM_DEPS=true
     fi
   fi
@@ -859,7 +859,7 @@ if [[ ! -f "$WORK_DIR/Cargo.toml" ]]; then
       exit 1
     fi
 
-    TEMP_DIR="$(mktemp -d -t zeroclaw-bootstrap-XXXXXX)"
+    TEMP_DIR="$(mktemp -d -t rantaiclaw-bootstrap-XXXXXX)"
     info "No local repository detected; cloning latest main branch"
     git clone --depth 1 "$REPO_URL" "$TEMP_DIR"
     WORK_DIR="$TEMP_DIR"
@@ -867,7 +867,7 @@ if [[ ! -f "$WORK_DIR/Cargo.toml" ]]; then
   fi
 fi
 
-info "ZeroClaw bootstrap"
+info "RantaiClaw bootstrap"
 echo "    workspace: $WORK_DIR"
 
 cd "$WORK_DIR"
@@ -894,14 +894,14 @@ if [[ "$DOCKER_MODE" == true ]]; then
 
 ✅ Docker bootstrap complete.
 
-Your containerized ZeroClaw data is persisted under:
+Your containerized RantaiClaw data is persisted under:
 DONE
   echo "  $DOCKER_DATA_DIR"
   cat <<'DONE'
 
 Next steps:
-  ./zeroclaw_install.sh --docker --interactive-onboard
-  ./zeroclaw_install.sh --docker --api-key "sk-..." --provider openrouter
+  ./rantaiclaw_install.sh --docker --interactive-onboard
+  ./rantaiclaw_install.sh --docker --api-key "sk-..." --provider openrouter
 DONE
   exit 0
 fi
@@ -934,7 +934,7 @@ if [[ "$PREBUILT_INSTALLED" == false && ( "$SKIP_BUILD" == false || "$SKIP_INSTA
   cat <<'MSG' >&2
 Install Rust first: https://rustup.rs/
 or re-run with:
-  ./zeroclaw_install.sh --install-rust
+  ./rantaiclaw_install.sh --install-rust
 MSG
   exit 1
 fi
@@ -947,31 +947,31 @@ else
 fi
 
 if [[ "$SKIP_INSTALL" == false ]]; then
-  info "Installing zeroclaw to cargo bin"
+  info "Installing rantaiclaw to cargo bin"
   cargo install --path "$WORK_DIR" --force --locked
 else
   info "Skipping install"
 fi
 
-ZEROCLAW_BIN=""
-if have_cmd zeroclaw; then
-  ZEROCLAW_BIN="zeroclaw"
-elif [[ -x "$HOME/.cargo/bin/zeroclaw" ]]; then
-  ZEROCLAW_BIN="$HOME/.cargo/bin/zeroclaw"
-elif [[ -x "$WORK_DIR/target/release/zeroclaw" ]]; then
-  ZEROCLAW_BIN="$WORK_DIR/target/release/zeroclaw"
+RANTAICLAW_BIN=""
+if have_cmd rantaiclaw; then
+  RANTAICLAW_BIN="rantaiclaw"
+elif [[ -x "$HOME/.cargo/bin/rantaiclaw" ]]; then
+  RANTAICLAW_BIN="$HOME/.cargo/bin/rantaiclaw"
+elif [[ -x "$WORK_DIR/target/release/rantaiclaw" ]]; then
+  RANTAICLAW_BIN="$WORK_DIR/target/release/rantaiclaw"
 fi
 
 if [[ "$RUN_ONBOARD" == true ]]; then
-  if [[ -z "$ZEROCLAW_BIN" ]]; then
-    error "onboarding requested but zeroclaw binary is not available."
-    error "Run without --skip-install, or ensure zeroclaw is in PATH."
+  if [[ -z "$RANTAICLAW_BIN" ]]; then
+    error "onboarding requested but rantaiclaw binary is not available."
+    error "Run without --skip-install, or ensure rantaiclaw is in PATH."
     exit 1
   fi
 
   if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
     info "Running interactive onboarding"
-    "$ZEROCLAW_BIN" onboard --interactive
+    "$RANTAICLAW_BIN" onboard --interactive
   else
     if [[ -z "$API_KEY" ]]; then
       cat <<'MSG'
@@ -979,9 +979,9 @@ if [[ "$RUN_ONBOARD" == true ]]; then
 Use either:
   --api-key "sk-..."
 or:
-  ZEROCLAW_API_KEY="sk-..." ./zeroclaw_install.sh --onboard
+  RANTAICLAW_API_KEY="sk-..." ./rantaiclaw_install.sh --onboard
 or run interactive:
-  ./zeroclaw_install.sh --interactive-onboard
+  ./rantaiclaw_install.sh --interactive-onboard
 MSG
       exit 1
     fi
@@ -990,7 +990,7 @@ MSG
     else
       info "Running quick onboarding (provider: $PROVIDER)"
     fi
-    ONBOARD_CMD=("$ZEROCLAW_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
+    ONBOARD_CMD=("$RANTAICLAW_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
     if [[ -n "$MODEL" ]]; then
       ONBOARD_CMD+=(--model "$MODEL")
     fi
@@ -1003,7 +1003,7 @@ cat <<'DONE'
 ✅ Bootstrap complete.
 
 Next steps:
-  zeroclaw status
-  zeroclaw agent -m "Hello, ZeroClaw!"
-  zeroclaw gateway
+  rantaiclaw status
+  rantaiclaw agent -m "Hello, RantaiClaw!"
+  rantaiclaw gateway
 DONE

@@ -1,4 +1,4 @@
-# Khắc phục sự cố ZeroClaw
+# Khắc phục sự cố RantaiClaw
 
 Các lỗi thường gặp khi cài đặt và chạy, kèm cách khắc phục.
 
@@ -78,7 +78,7 @@ cargo build --release --locked --no-default-features --features hardware
 
 Triệu chứng:
 
-- `cargo check` / `cargo build` dừng lâu ở `Checking zeroclaw`
+- `cargo check` / `cargo build` dừng lâu ở `Checking rantaiclaw`
 - Lặp lại thông báo `Blocking waiting for file lock on package cache` hoặc `build directory`
 
 Nguyên nhân:
@@ -119,17 +119,17 @@ pgrep -af "cargo (check|build|test)|cargo check|cargo build|cargo test"
 
 Dừng các cargo job không liên quan trước khi build.
 
-### Không tìm thấy lệnh `zeroclaw` sau cài đặt
+### Không tìm thấy lệnh `rantaiclaw` sau cài đặt
 
 Triệu chứng:
 
-- Cài đặt thành công nhưng shell không tìm thấy `zeroclaw`
+- Cài đặt thành công nhưng shell không tìm thấy `rantaiclaw`
 
 Khắc phục:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-which zeroclaw
+which rantaiclaw
 ```
 
 Thêm vào shell profile nếu cần giữ lâu dài.
@@ -141,11 +141,11 @@ Thêm vào shell profile nếu cần giữ lâu dài.
 Kiểm tra:
 
 ```bash
-zeroclaw status
-zeroclaw doctor
+rantaiclaw status
+rantaiclaw doctor
 ```
 
-Xác minh `~/.zeroclaw/config.toml`:
+Xác minh `~/.rantaiclaw/config.toml`:
 
 - `[gateway].host` (mặc định `127.0.0.1`)
 - `[gateway].port` (mặc định `3000`)
@@ -160,7 +160,7 @@ Kiểm tra:
 3. Chạy lại chẩn đoán:
 
 ```bash
-zeroclaw doctor
+rantaiclaw doctor
 ```
 
 ## Sự cố kênh
@@ -174,14 +174,14 @@ Nguyên nhân:
 Khắc phục:
 
 - Chỉ giữ một runtime đang chạy cho token đó
-- Dừng các tiến trình `zeroclaw daemon` / `zeroclaw channel start` thừa
+- Dừng các tiến trình `rantaiclaw daemon` / `rantaiclaw channel start` thừa
 
 ### Kênh không khỏe trong `channel doctor`
 
 Kiểm tra:
 
 ```bash
-zeroclaw channel doctor
+rantaiclaw channel doctor
 ```
 
 Sau đó xác minh thông tin xác thực và trường allowlist cho từng kênh trong config.
@@ -193,20 +193,20 @@ Sau đó xác minh thông tin xác thực và trường allowlist cho từng kê
 Kiểm tra:
 
 ```bash
-zeroclaw service status
+rantaiclaw service status
 ```
 
 Khôi phục:
 
 ```bash
-zeroclaw service stop
-zeroclaw service start
+rantaiclaw service stop
+rantaiclaw service start
 ```
 
 Xem log trên Linux:
 
 ```bash
-journalctl --user -u zeroclaw.service -f
+journalctl --user -u rantaiclaw.service -f
 ```
 
 ## Tương thích cài đặt cũ
@@ -214,8 +214,8 @@ journalctl --user -u zeroclaw.service -f
 Cả hai cách vẫn hoạt động:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/bootstrap.sh | bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rantaiclaw-labs/rantaiclaw/main/scripts/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rantaiclaw-labs/rantaiclaw/main/scripts/install.sh | bash
 ```
 
 `install.sh` là điểm vào tương thích, chuyển tiếp/dự phòng về hành vi bootstrap.
@@ -225,10 +225,10 @@ curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/scripts
 Thu thập và đính kèm các thông tin sau khi tạo issue:
 
 ```bash
-zeroclaw --version
-zeroclaw status
-zeroclaw doctor
-zeroclaw channel doctor
+rantaiclaw --version
+rantaiclaw status
+rantaiclaw doctor
+rantaiclaw channel doctor
 ```
 
 Kèm thêm: hệ điều hành, cách cài đặt, và đoạn config đã ẩn bí mật.

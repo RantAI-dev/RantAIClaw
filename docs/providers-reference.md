@@ -1,4 +1,4 @@
-# ZeroClaw Providers Reference
+# RantaiClaw Providers Reference
 
 This document maps provider IDs, aliases, and credential environment variables.
 
@@ -7,7 +7,7 @@ Last verified: **February 20, 2026**.
 ## How to List Providers
 
 ```bash
-zeroclaw providers
+rantaiclaw providers
 ```
 
 ## Credential Resolution Order
@@ -16,7 +16,7 @@ Runtime resolution order is:
 
 1. Explicit credential from config/CLI
 2. Provider-specific env var(s)
-3. Generic fallback env vars: `ZEROCLAW_API_KEY` then `API_KEY`
+3. Generic fallback env vars: `RANTAICLAW_API_KEY` then `API_KEY`
 
 For resilient fallback chains (`reliability.fallback_providers`), each fallback
 provider resolves credentials independently. The primary provider's explicit
@@ -69,14 +69,14 @@ credential is not reused for fallback providers.
 
 - Provider ID: `ollama`
 - Vision input is supported through user message image markers: ``[IMAGE:<source>]``.
-- After multimodal normalization, ZeroClaw sends image payloads through Ollama's native `messages[].images` field.
-- If a non-vision provider is selected, ZeroClaw returns a structured capability error instead of silently ignoring images.
+- After multimodal normalization, RantaiClaw sends image payloads through Ollama's native `messages[].images` field.
+- If a non-vision provider is selected, RantaiClaw returns a structured capability error instead of silently ignoring images.
 
 ### Ollama Cloud Routing Notes
 
 - Use `:cloud` model suffix only with a remote Ollama endpoint.
 - Remote endpoint should be set in `api_url` (example: `https://ollama.com`).
-- ZeroClaw normalizes a trailing `/api` in `api_url` automatically.
+- RantaiClaw normalizes a trailing `/api` in `api_url` automatically.
 - If `default_model` ends with `:cloud` while `api_url` is local or unset, config validation fails early with an actionable error.
 - Local Ollama model discovery intentionally excludes `:cloud` entries to avoid selecting cloud-only models in local mode.
 
@@ -85,7 +85,7 @@ credential is not reused for fallback providers.
 - Provider ID: `llamacpp` (alias: `llama.cpp`)
 - Default endpoint: `http://localhost:8080/v1`
 - API key is optional by default; set `LLAMACPP_API_KEY` only when `llama-server` is started with `--api-key`.
-- Model discovery: `zeroclaw models refresh --provider llamacpp`
+- Model discovery: `rantaiclaw models refresh --provider llamacpp`
 
 ### Bedrock Notes
 
@@ -125,7 +125,7 @@ Behavior:
 - Canonical provider ID: `nvidia`
 - Aliases: `nvidia-nim`, `build.nvidia.com`
 - Base API URL: `https://integrate.api.nvidia.com/v1`
-- Model discovery: `zeroclaw models refresh --provider nvidia`
+- Model discovery: `rantaiclaw models refresh --provider nvidia`
 
 Recommended starter model IDs (verified against NVIDIA API catalog on February 18, 2026):
 
@@ -264,8 +264,8 @@ Recommended workflow:
 1. Keep call sites stable (`hint:reasoning`, `hint:semantic`).
 2. Change only the target model under `[[model_routes]]` or `[[embedding_routes]]`.
 3. Run:
-   - `zeroclaw doctor`
-   - `zeroclaw status`
+   - `rantaiclaw doctor`
+   - `rantaiclaw status`
 4. Smoke test one representative flow (chat + memory retrieval) before rollout.
 
 This minimizes breakage because integrations and prompts do not need to change when model IDs are upgraded.

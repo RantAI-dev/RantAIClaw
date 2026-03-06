@@ -1,6 +1,6 @@
-# Network Deployment — ZeroClaw on Raspberry Pi and Local Network
+# Network Deployment — RantaiClaw on Raspberry Pi and Local Network
 
-This document covers deploying ZeroClaw on a Raspberry Pi or other host on your local network, with Telegram and optional webhook channels.
+This document covers deploying RantaiClaw on a Raspberry Pi or other host on your local network, with Telegram and optional webhook channels.
 
 ---
 
@@ -8,18 +8,18 @@ This document covers deploying ZeroClaw on a Raspberry Pi or other host on your 
 
 | Mode | Inbound port needed? | Use case |
 |------|----------------------|----------|
-| **Telegram polling** | No | ZeroClaw polls Telegram API; works from anywhere |
-| **Matrix sync (including E2EE)** | No | ZeroClaw syncs via Matrix client API; no inbound webhook required |
+| **Telegram polling** | No | RantaiClaw polls Telegram API; works from anywhere |
+| **Matrix sync (including E2EE)** | No | RantaiClaw syncs via Matrix client API; no inbound webhook required |
 | **Discord/Slack** | No | Same — outbound only |
 | **Gateway webhook** | Yes | POST /webhook, /whatsapp, /linq, /nextcloud-talk need a public URL |
 | **Gateway pairing** | Yes | If you pair clients via the gateway |
 | **Alpine/OpenRC service** | No | System-wide background service on Alpine Linux |
 
-**Key:** Telegram, Discord, and Slack use **long-polling** — ZeroClaw makes outbound requests. No port forwarding or public IP required.
+**Key:** Telegram, Discord, and Slack use **long-polling** — RantaiClaw makes outbound requests. No port forwarding or public IP required.
 
 ---
 
-## 2. ZeroClaw on Raspberry Pi
+## 2. RantaiClaw on Raspberry Pi
 
 ### 2.1 Prerequisites
 
@@ -38,7 +38,7 @@ cargo build --release --features hardware
 
 ### 2.3 Config
 
-Edit `~/.zeroclaw/config.toml`:
+Edit `~/.rantaiclaw/config.toml`:
 
 ```toml
 [peripherals]
@@ -68,11 +68,11 @@ allow_public_bind = false
 ### 2.4 Run Daemon (Local Only)
 
 ```bash
-zeroclaw daemon --host 127.0.0.1 --port 3000
+rantaiclaw daemon --host 127.0.0.1 --port 3000
 ```
 
 - Gateway binds to `127.0.0.1` — not reachable from other machines
-- Telegram channel works: ZeroClaw polls Telegram API (outbound)
+- Telegram channel works: RantaiClaw polls Telegram API (outbound)
 - No firewall or port forwarding needed
 
 ---
@@ -91,7 +91,7 @@ allow_public_bind = true
 ```
 
 ```bash
-zeroclaw daemon --host 0.0.0.0 --port 3000
+rantaiclaw daemon --host 0.0.0.0 --port 3000
 ```
 
 **Security:** `allow_public_bind = true` exposes the gateway to your local network. Only use on trusted LANs.
@@ -102,7 +102,7 @@ If you need a **public URL** (e.g. WhatsApp webhook, external clients):
 
 1. Run gateway on localhost:
    ```bash
-   zeroclaw daemon --host 127.0.0.1 --port 3000
+   rantaiclaw daemon --host 127.0.0.1 --port 3000
    ```
 
 2. Start a tunnel:
@@ -110,9 +110,9 @@ If you need a **public URL** (e.g. WhatsApp webhook, external clients):
    [tunnel]
    provider = "tailscale"   # or "ngrok", "cloudflare"
    ```
-   Or use `zeroclaw tunnel` (see tunnel docs).
+   Or use `rantaiclaw tunnel` (see tunnel docs).
 
-3. ZeroClaw will refuse `0.0.0.0` unless `allow_public_bind = true` or a tunnel is active.
+3. RantaiClaw will refuse `0.0.0.0` unless `allow_public_bind = true` or a tunnel is active.
 
 ---
 
@@ -120,7 +120,7 @@ If you need a **public URL** (e.g. WhatsApp webhook, external clients):
 
 Telegram uses **long-polling** by default:
 
-- ZeroClaw calls `https://api.telegram.org/bot{token}/getUpdates`
+- RantaiClaw calls `https://api.telegram.org/bot{token}/getUpdates`
 - No inbound port or public IP needed
 - Works behind NAT, on RPi, in a home lab
 
@@ -132,12 +132,12 @@ bot_token = "YOUR_BOT_TOKEN"
 allowed_users = []            # deny-by-default, bind identities explicitly
 ```
 
-Run `zeroclaw daemon` — Telegram channel starts automatically.
+Run `rantaiclaw daemon` — Telegram channel starts automatically.
 
 To approve one Telegram account at runtime:
 
 ```bash
-zeroclaw channel bind-telegram <IDENTITY>
+rantaiclaw channel bind-telegram <IDENTITY>
 ```
 
 `<IDENTITY>` can be a numeric Telegram user ID or a username (without `@`).
@@ -146,7 +146,7 @@ zeroclaw channel bind-telegram <IDENTITY>
 
 Telegram Bot API `getUpdates` supports only one active poller per bot token.
 
-- Keep one runtime instance for the same token (recommended: `zeroclaw daemon` service).
+- Keep one runtime instance for the same token (recommended: `rantaiclaw daemon` service).
 - Do not run `cargo run -- channel start` or another bot process at the same time.
 
 If you hit this error:
@@ -193,7 +193,7 @@ Configure Cloudflare Tunnel to forward to `127.0.0.1:3000`, then set your webhoo
 
 - [ ] Build with `--features hardware` (and `peripheral-rpi` if using native GPIO)
 - [ ] Configure `[peripherals]` and `[channels_config.telegram]`
-- [ ] Run `zeroclaw daemon --host 127.0.0.1 --port 3000` (Telegram works without 0.0.0.0)
+- [ ] Run `rantaiclaw daemon --host 127.0.0.1 --port 3000` (Telegram works without 0.0.0.0)
 - [ ] For LAN access: `--host 0.0.0.0` + `allow_public_bind = true` in config
 - [ ] For webhooks: use Tailscale, ngrok, or Cloudflare tunnel
 
@@ -201,56 +201,56 @@ Configure Cloudflare Tunnel to forward to `127.0.0.1:3000`, then set your webhoo
 
 ## 7. OpenRC (Alpine Linux Service)
 
-ZeroClaw supports OpenRC for Alpine Linux and other distributions using the OpenRC init system. OpenRC services run **system-wide** and require root/sudo.
+RantaiClaw supports OpenRC for Alpine Linux and other distributions using the OpenRC init system. OpenRC services run **system-wide** and require root/sudo.
 
 ### 7.1 Prerequisites
 
 - Alpine Linux (or another OpenRC-based distro)
 - Root or sudo access
-- A dedicated `zeroclaw` system user (created during install)
+- A dedicated `rantaiclaw` system user (created during install)
 
 ### 7.2 Install Service
 
 ```bash
 # Install service (OpenRC is auto-detected on Alpine)
-sudo zeroclaw service install
+sudo rantaiclaw service install
 ```
 
 This creates:
-- Init script: `/etc/init.d/zeroclaw`
-- Config directory: `/etc/zeroclaw/`
-- Log directory: `/var/log/zeroclaw/`
+- Init script: `/etc/init.d/rantaiclaw`
+- Config directory: `/etc/rantaiclaw/`
+- Log directory: `/var/log/rantaiclaw/`
 
 ### 7.3 Configuration
 
 Manual config copy is usually not required.
 
-`sudo zeroclaw service install` automatically prepares `/etc/zeroclaw`, migrates existing runtime state from your user setup when available, and sets ownership/permissions for the `zeroclaw` service user.
+`sudo rantaiclaw service install` automatically prepares `/etc/rantaiclaw`, migrates existing runtime state from your user setup when available, and sets ownership/permissions for the `rantaiclaw` service user.
 
-If no prior runtime state is available to migrate, create `/etc/zeroclaw/config.toml` before starting the service.
+If no prior runtime state is available to migrate, create `/etc/rantaiclaw/config.toml` before starting the service.
 
 ### 7.4 Enable and Start
 
 ```bash
 # Add to default runlevel
-sudo rc-update add zeroclaw default
+sudo rc-update add rantaiclaw default
 
 # Start the service
-sudo rc-service zeroclaw start
+sudo rc-service rantaiclaw start
 
 # Check status
-sudo rc-service zeroclaw status
+sudo rc-service rantaiclaw status
 ```
 
 ### 7.5 Manage Service
 
 | Command | Description |
 |---------|-------------|
-| `sudo rc-service zeroclaw start` | Start the daemon |
-| `sudo rc-service zeroclaw stop` | Stop the daemon |
-| `sudo rc-service zeroclaw status` | Check service status |
-| `sudo rc-service zeroclaw restart` | Restart the daemon |
-| `sudo zeroclaw service status` | ZeroClaw status wrapper (uses `/etc/zeroclaw` config) |
+| `sudo rc-service rantaiclaw start` | Start the daemon |
+| `sudo rc-service rantaiclaw stop` | Stop the daemon |
+| `sudo rc-service rantaiclaw status` | Check service status |
+| `sudo rc-service rantaiclaw restart` | Restart the daemon |
+| `sudo rantaiclaw service status` | RantaiClaw status wrapper (uses `/etc/rantaiclaw` config) |
 
 ### 7.6 Logs
 
@@ -258,41 +258,41 @@ OpenRC routes logs to:
 
 | Log | Path |
 |-----|------|
-| Access/stdout | `/var/log/zeroclaw/access.log` |
-| Errors/stderr | `/var/log/zeroclaw/error.log` |
+| Access/stdout | `/var/log/rantaiclaw/access.log` |
+| Errors/stderr | `/var/log/rantaiclaw/error.log` |
 
 View logs:
 
 ```bash
-sudo tail -f /var/log/zeroclaw/error.log
+sudo tail -f /var/log/rantaiclaw/error.log
 ```
 
 ### 7.7 Uninstall
 
 ```bash
 # Stop and remove from runlevel
-sudo rc-service zeroclaw stop
-sudo rc-update del zeroclaw default
+sudo rc-service rantaiclaw stop
+sudo rc-update del rantaiclaw default
 
 # Remove init script
-sudo zeroclaw service uninstall
+sudo rantaiclaw service uninstall
 ```
 
 ### 7.8 Notes
 
 - OpenRC is **system-wide only** (no user-level services)
 - Requires `sudo` or root for all service operations
-- The service runs as the `zeroclaw:zeroclaw` user (least privilege)
-- Config must be at `/etc/zeroclaw/config.toml` (explicit path in init script)
-- If the `zeroclaw` user does not exist, install will fail with instructions to create it
+- The service runs as the `rantaiclaw:rantaiclaw` user (least privilege)
+- Config must be at `/etc/rantaiclaw/config.toml` (explicit path in init script)
+- If the `rantaiclaw` user does not exist, install will fail with instructions to create it
 
 ### 7.9 Checklist: Alpine/OpenRC Deployment
 
-- [ ] Install: `sudo zeroclaw service install`
-- [ ] Enable: `sudo rc-update add zeroclaw default`
-- [ ] Start: `sudo rc-service zeroclaw start`
-- [ ] Verify: `sudo rc-service zeroclaw status`
-- [ ] Check logs: `/var/log/zeroclaw/error.log`
+- [ ] Install: `sudo rantaiclaw service install`
+- [ ] Enable: `sudo rc-update add rantaiclaw default`
+- [ ] Start: `sudo rc-service rantaiclaw start`
+- [ ] Verify: `sudo rc-service rantaiclaw status`
+- [ ] Check logs: `/var/log/rantaiclaw/error.log`
 
 ---
 

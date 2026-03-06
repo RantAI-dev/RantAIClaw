@@ -3,21 +3,21 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "zeroclaw-tools"
+name = "rantaiclaw-tools"
 version = "0.1.0"
-description = "Python companion package for ZeroClaw - LangGraph-based tool calling for consistent LLM agent execution"
+description = "Python companion package for RantaiClaw - LangGraph-based tool calling for consistent LLM agent execution"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "ZeroClaw Community" }
+    { name = "RantaiClaw Community" }
 ]
 keywords = [
     "ai",
     "llm",
     "agent",
     "langgraph",
-    "zeroclaw",
+    "rantaiclaw",
     "tool-calling",
 ]
 classifiers = [
@@ -38,7 +38,7 @@ dependencies = [
 ]
 
 [project.scripts]
-zeroclaw-tools = "zeroclaw_tools.__main__:main"
+rantaiclaw-tools = "rantaiclaw_tools.__main__:main"
 
 [project.optional-dependencies]
 discord = ["discord.py>=2.3.0"]
@@ -50,13 +50,13 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/zeroclaw-labs/zeroclaw"
-Documentation = "https://github.com/zeroclaw-labs/zeroclaw/tree/main/python"
-Repository = "https://github.com/zeroclaw-labs/zeroclaw"
-Issues = "https://github.com/zeroclaw-labs/zeroclaw/issues"
+Homepage = "https://github.com/rantaiclaw-labs/rantaiclaw"
+Documentation = "https://github.com/rantaiclaw-labs/rantaiclaw/tree/main/python"
+Repository = "https://github.com/rantaiclaw-labs/rantaiclaw"
+Issues = "https://github.com/rantaiclaw-labs/rantaiclaw/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["zeroclaw_tools"]
+packages = ["rantaiclaw_tools"]
 
 [tool.ruff]
 line-length = 100

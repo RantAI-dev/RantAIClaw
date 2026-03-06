@@ -1,4 +1,4 @@
-# Audit Logging for ZeroClaw
+# Audit Logging for RantaiClaw
 
 > ⚠️ **Status: Proposal / Roadmap**
 >
@@ -6,7 +6,7 @@
 > For current runtime behavior, see [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
 
 ## Problem
-ZeroClaw logs actions but lacks tamper-evident audit trails for:
+RantaiClaw logs actions but lacks tamper-evident audit trails for:
 - Who executed what command
 - When and from which channel
 - What resources were accessed
@@ -115,13 +115,13 @@ impl AuditLogger {
 ```toml
 [security.audit]
 enabled = true
-log_path = "~/.config/zeroclaw/audit.log"
+log_path = "~/.config/rantaiclaw/audit.log"
 max_size_mb = 100
 rotate = "daily"  # daily | weekly | size
 
 # Tamper evidence
 sign_events = true
-signing_key_path = "~/.config/zeroclaw/audit.key"
+signing_key_path = "~/.config/rantaiclaw/audit.key"
 
 # What to log
 log_commands = true
@@ -136,19 +136,19 @@ log_policy_violations = true
 
 ```bash
 # Show all commands executed by @alice
-zeroclaw audit --user @alice
+rantaiclaw audit --user @alice
 
 # Show all high-risk commands
-zeroclaw audit --risk high
+rantaiclaw audit --risk high
 
 # Show violations from last 24 hours
-zeroclaw audit --since 24h --violations-only
+rantaiclaw audit --since 24h --violations-only
 
 # Export to JSON for analysis
-zeroclaw audit --format json --output audit.json
+rantaiclaw audit --format json --output audit.json
 
 # Verify log integrity
-zeroclaw audit --verify-signatures
+rantaiclaw audit --verify-signatures
 ```
 
 ---

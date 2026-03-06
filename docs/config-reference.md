@@ -1,4 +1,4 @@
-# ZeroClaw Config Reference (Operator-Oriented)
+# RantaiClaw Config Reference (Operator-Oriented)
 
 This is a high-signal reference for common config sections and defaults.
 
@@ -6,17 +6,17 @@ Last verified: **February 19, 2026**.
 
 Config path resolution at startup:
 
-1. `ZEROCLAW_WORKSPACE` override (if set)
-2. persisted `~/.zeroclaw/active_workspace.toml` marker (if present)
-3. default `~/.zeroclaw/config.toml`
+1. `RANTAICLAW_WORKSPACE` override (if set)
+2. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present)
+3. default `~/.rantaiclaw/config.toml`
 
-ZeroClaw logs the resolved config on startup at `INFO` level:
+RantaiClaw logs the resolved config on startup at `INFO` level:
 
 - `Config loaded` with fields: `path`, `workspace`, `source`, `initialized`
 
 Schema export command:
 
-- `zeroclaw config schema` (prints JSON Schema draft 2020-12 to stdout)
+- `rantaiclaw config schema` (prints JSON Schema draft 2020-12 to stdout)
 
 ## Core Keys
 
@@ -32,7 +32,7 @@ Schema export command:
 |---|---|---|
 | `backend` | `none` | Observability backend: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, or `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | OTLP HTTP endpoint used when backend is `otel` |
-| `otel_service_name` | `zeroclaw` | Service name emitted to OTLP collector |
+| `otel_service_name` | `rantaiclaw` | Service name emitted to OTLP collector |
 
 Notes:
 
@@ -45,21 +45,21 @@ Example:
 [observability]
 backend = "otel"
 otel_endpoint = "http://localhost:4318"
-otel_service_name = "zeroclaw"
+otel_service_name = "rantaiclaw"
 ```
 
 ## Environment Provider Overrides
 
 Provider selection can also be controlled by environment variables. Precedence is:
 
-1. `ZEROCLAW_PROVIDER` (explicit override, always wins when non-empty)
+1. `RANTAICLAW_PROVIDER` (explicit override, always wins when non-empty)
 2. `PROVIDER` (legacy fallback, only applied when config provider is unset or still `openrouter`)
 3. `default_provider` in `config.toml`
 
 Operational note for container users:
 
 - If your `config.toml` sets an explicit custom provider like `custom:https://.../v1`, a default `PROVIDER=openrouter` from Docker/container env will no longer replace it.
-- Use `ZEROCLAW_PROVIDER` when you intentionally want runtime env to override a non-default configured provider.
+- Use `RANTAICLAW_PROVIDER` when you intentionally want runtime env to override a non-default configured provider.
 
 ## `[agent]`
 
@@ -138,12 +138,12 @@ Notes:
 
 Notes:
 
-- Security-first default: ZeroClaw does **not** clone or sync `open-skills` unless `open_skills_enabled = true`.
+- Security-first default: RantaiClaw does **not** clone or sync `open-skills` unless `open_skills_enabled = true`.
 - Environment overrides:
-  - `ZEROCLAW_OPEN_SKILLS_ENABLED` accepts `1/0`, `true/false`, `yes/no`, `on/off`.
-  - `ZEROCLAW_OPEN_SKILLS_DIR` overrides the repository path when non-empty.
-  - `ZEROCLAW_SKILLS_PROMPT_MODE` accepts `full` or `compact`.
-- Precedence for enable flag: `ZEROCLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
+  - `RANTAICLAW_OPEN_SKILLS_ENABLED` accepts `1/0`, `true/false`, `yes/no`, `on/off`.
+  - `RANTAICLAW_OPEN_SKILLS_DIR` overrides the repository path when non-empty.
+  - `RANTAICLAW_SKILLS_PROMPT_MODE` accepts `full` or `compact`.
+- Precedence for enable flag: `RANTAICLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
 
 ## `[composio]`
@@ -158,7 +158,7 @@ Notes:
 
 - Backward compatibility: legacy `enable = true` is accepted as an alias for `enabled = true`.
 - If `enabled = false` or `api_key` is missing, the `composio` tool is not registered.
-- ZeroClaw requests Composio v3 tools with `toolkit_versions=latest` and executes tools with `version="latest"` to avoid stale default tool revisions.
+- RantaiClaw requests Composio v3 tools with `toolkit_versions=latest` and executes tools with `version="latest"` to avoid stale default tool revisions.
 - Typical flow: call `connect`, complete browser OAuth, then run `execute` for the desired tool action.
 - If Composio returns a missing connected-account reference error, call `list_accounts` (optionally with `app`) and pass the returned `connected_account_id` to `execute`.
 
@@ -342,7 +342,7 @@ Upgrade strategy:
 
 1. Keep hints stable (`hint:reasoning`, `hint:semantic`).
 2. Update only `model = "...new-version..."` in the route entries.
-3. Validate with `zeroclaw doctor` before restart/rollout.
+3. Validate with `rantaiclaw doctor` before restart/rollout.
 
 ## `[query_classification]`
 
@@ -407,7 +407,7 @@ Notes:
 - When a timeout occurs, users receive: `⚠️ Request timed out while waiting for the model. Please try again.`
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
-- While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
+- While `rantaiclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
 
@@ -453,7 +453,7 @@ Native Nextcloud Talk bot integration (webhook receive + OCS send API).
 Notes:
 
 - Webhook endpoint is `POST /nextcloud-talk`.
-- `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
+- `RANTAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
 - See [nextcloud-talk-setup.md](nextcloud-talk-setup.md) for setup and troubleshooting.
 
 ## `[hardware]`
@@ -526,10 +526,10 @@ Notes:
 After editing config:
 
 ```bash
-zeroclaw status
-zeroclaw doctor
-zeroclaw channel doctor
-zeroclaw service restart
+rantaiclaw status
+rantaiclaw doctor
+rantaiclaw channel doctor
+rantaiclaw service restart
 ```
 
 ## Related Docs

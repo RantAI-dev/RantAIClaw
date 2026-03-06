@@ -1,6 +1,6 @@
 # Custom Provider Configuration
 
-ZeroClaw supports custom API endpoints for both OpenAI-compatible and Anthropic-compatible providers.
+RantaiClaw supports custom API endpoints for both OpenAI-compatible and Anthropic-compatible providers.
 
 ## Provider Types
 
@@ -28,7 +28,7 @@ default_model = "your-model-name"
 
 ### Config File
 
-Edit `~/.zeroclaw/config.toml`:
+Edit `~/.rantaiclaw/config.toml`:
 
 ```toml
 api_key = "your-api-key"
@@ -42,13 +42,13 @@ For `custom:` and `anthropic-custom:` providers, use the generic key env vars:
 
 ```bash
 export API_KEY="your-api-key"
-# or: export ZEROCLAW_API_KEY="your-api-key"
-zeroclaw agent
+# or: export RANTAICLAW_API_KEY="your-api-key"
+rantaiclaw agent
 ```
 
 ## llama.cpp Server (Recommended Local Setup)
 
-ZeroClaw includes a first-class local provider for `llama-server`:
+RantaiClaw includes a first-class local provider for `llama-server`:
 
 - Provider ID: `llamacpp` (alias: `llama.cpp`)
 - Default endpoint: `http://localhost:8080/v1`
@@ -60,7 +60,7 @@ Start a local server (example):
 llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
 ```
 
-Then configure ZeroClaw:
+Then configure RantaiClaw:
 
 ```toml
 default_provider = "llamacpp"
@@ -72,11 +72,11 @@ default_temperature = 0.7
 Quick validation:
 
 ```bash
-zeroclaw models refresh --provider llamacpp
-zeroclaw agent -m "hello"
+rantaiclaw models refresh --provider llamacpp
+rantaiclaw agent -m "hello"
 ```
 
-You do not need to export `ZEROCLAW_API_KEY=dummy` for this flow.
+You do not need to export `RANTAICLAW_API_KEY=dummy` for this flow.
 
 ## Testing Configuration
 
@@ -84,10 +84,10 @@ Verify your custom endpoint:
 
 ```bash
 # Interactive mode
-zeroclaw agent
+rantaiclaw agent
 
 # Single message test
-zeroclaw agent -m "test message"
+rantaiclaw agent -m "test message"
 ```
 
 ## Troubleshooting

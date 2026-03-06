@@ -1,4 +1,4 @@
-# Quy trình Release ZeroClaw
+# Quy trình Release RantaiClaw
 
 Runbook này định nghĩa quy trình release tiêu chuẩn của maintainer.
 

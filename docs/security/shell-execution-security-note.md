@@ -154,7 +154,7 @@ autonomy = "supervised"
 max_actions_per_hour = 50
 
 # Répertoire de travail isolé — éviter de pointer vers /
-workspace_dir = "/var/zeroclaw/workspace"
+workspace_dir = "/var/rantaiclaw/workspace"
 ```
 
 Sur Linux, Landlock est activé automatiquement si le noyau est ≥ 5.13. Vérifier

@@ -136,42 +136,42 @@ jobs:
                 include:
                     - os: ubuntu-latest
                       target: x86_64-unknown-linux-gnu
-                      artifact: zeroclaw
+                      artifact: rantaiclaw
                       archive_ext: tar.gz
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
                     - os: ubuntu-latest
                       target: aarch64-unknown-linux-gnu
-                      artifact: zeroclaw
+                      artifact: rantaiclaw
                       archive_ext: tar.gz
                       cross_compiler: gcc-aarch64-linux-gnu
                       linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
                       linker: aarch64-linux-gnu-gcc
                     - os: ubuntu-latest
                       target: armv7-unknown-linux-gnueabihf
-                      artifact: zeroclaw
+                      artifact: rantaiclaw
                       archive_ext: tar.gz
                       cross_compiler: gcc-arm-linux-gnueabihf
                       linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
                       linker: arm-linux-gnueabihf-gcc
                     - os: macos-15-intel
                       target: x86_64-apple-darwin
-                      artifact: zeroclaw
+                      artifact: rantaiclaw
                       archive_ext: tar.gz
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
                     - os: macos-14
                       target: aarch64-apple-darwin
-                      artifact: zeroclaw
+                      artifact: rantaiclaw
                       archive_ext: tar.gz
                       cross_compiler: ""
                       linker_env: ""
                       linker: ""
                     - os: windows-latest
                       target: x86_64-pc-windows-msvc
-                      artifact: zeroclaw.exe
+                      artifact: rantaiclaw.exe
                       archive_ext: zip
                       cross_compiler: ""
                       linker_env: ""
@@ -214,19 +214,19 @@ jobs:
               if: runner.os != 'Windows'
               run: |
                   cd target/${{ matrix.target }}/release-fast
-                  tar czf ../../../zeroclaw-${{ matrix.target }}.${{ matrix.archive_ext }} ${{ matrix.artifact }}
+                  tar czf ../../../rantaiclaw-${{ matrix.target }}.${{ matrix.archive_ext }} ${{ matrix.artifact }}
 
             - name: Package (Windows)
               if: runner.os == 'Windows'
               run: |
                   cd target/${{ matrix.target }}/release-fast
-                  7z a ../../../zeroclaw-${{ matrix.target }}.${{ matrix.archive_ext }} ${{ matrix.artifact }}
+                  7z a ../../../rantaiclaw-${{ matrix.target }}.${{ matrix.archive_ext }} ${{ matrix.artifact }}
 
             - name: Upload artifact
               uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
               with:
-                  name: zeroclaw-${{ matrix.target }}
-                  path: zeroclaw-${{ matrix.target }}.${{ matrix.archive_ext }}
+                  name: rantaiclaw-${{ matrix.target }}
+                  path: rantaiclaw-${{ matrix.target }}.${{ matrix.archive_ext }}
                   retention-days: 7
 
     verify-artifacts:
@@ -244,12 +244,12 @@ jobs:
               run: |
                   set -euo pipefail
                   expected=(
-                    "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
-                    "zeroclaw-aarch64-unknown-linux-gnu.tar.gz"
-                    "zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz"
-                    "zeroclaw-x86_64-apple-darwin.tar.gz"
-                    "zeroclaw-aarch64-apple-darwin.tar.gz"
-                    "zeroclaw-x86_64-pc-windows-msvc.zip"
+                    "rantaiclaw-x86_64-unknown-linux-gnu.tar.gz"
+                    "rantaiclaw-aarch64-unknown-linux-gnu.tar.gz"
+                    "rantaiclaw-armv7-unknown-linux-gnueabihf.tar.gz"
+                    "rantaiclaw-x86_64-apple-darwin.tar.gz"
+                    "rantaiclaw-aarch64-apple-darwin.tar.gz"
+                    "rantaiclaw-x86_64-pc-windows-msvc.zip"
                   )
 
                   missing=0
@@ -288,11 +288,11 @@ jobs:
 
             - name: Generate SBOM (CycloneDX)
               run: |
-                  syft dir:. --source-name zeroclaw -o cyclonedx-json=artifacts/zeroclaw.cdx.json -o spdx-json=artifacts/zeroclaw.spdx.json
+                  syft dir:. --source-name rantaiclaw -o cyclonedx-json=artifacts/rantaiclaw.cdx.json -o spdx-json=artifacts/rantaiclaw.spdx.json
                   {
                     echo "### SBOM Generated"
-                    echo "- CycloneDX: zeroclaw.cdx.json"
-                    echo "- SPDX: zeroclaw.spdx.json"
+                    echo "- CycloneDX: rantaiclaw.cdx.json"
+                    echo "- SPDX: rantaiclaw.spdx.json"
                   } >> "$GITHUB_STEP_SUMMARY"
 
             - name: Generate SHA256 checksums

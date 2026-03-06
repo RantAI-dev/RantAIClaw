@@ -44,6 +44,7 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod skill_tool;
 pub mod traits;
 pub mod web_search_tool;
 
@@ -80,6 +81,7 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use skill_tool::skill_tools_from_skills;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
@@ -298,7 +300,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             crate::providers::ProviderRuntimeOptions {
                 auth_profile_override: None,
-                zeroclaw_dir: root_config
+                rantaiclaw_dir: root_config
                     .config_path
                     .parent()
                     .map(std::path::PathBuf::from),

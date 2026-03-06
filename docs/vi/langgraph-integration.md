@@ -1,10 +1,10 @@
 # Hướng dẫn Tích hợp LangGraph
 
-Hướng dẫn này giải thích cách sử dụng gói Python `zeroclaw-tools` để gọi tool nhất quán với bất kỳ LLM provider nào tương thích OpenAI.
+Hướng dẫn này giải thích cách sử dụng gói Python `rantaiclaw-tools` để gọi tool nhất quán với bất kỳ LLM provider nào tương thích OpenAI.
 
 ## Bối cảnh
 
-Một số LLM provider, đặc biệt là các model Trung Quốc như GLM-5 (Zhipu AI), có hành vi gọi tool không nhất quán khi dùng phương thức text-based tool invocation. Core Rust của ZeroClaw sử dụng structured tool calling theo định dạng OpenAI API, nhưng một số model phản hồi tốt hơn với cách tiếp cận khác.
+Một số LLM provider, đặc biệt là các model Trung Quốc như GLM-5 (Zhipu AI), có hành vi gọi tool không nhất quán khi dùng phương thức text-based tool invocation. Core Rust của RantaiClaw sử dụng structured tool calling theo định dạng OpenAI API, nhưng một số model phản hồi tốt hơn với cách tiếp cận khác.
 
 LangGraph cung cấp một stateful graph execution engine đảm bảo hành vi gọi tool nhất quán bất kể khả năng native của model nền tảng.
 
@@ -14,7 +14,7 @@ LangGraph cung cấp một stateful graph execution engine đảm bảo hành vi
 ┌─────────────────────────────────────────────────────────────┐
 │                      Your Application                        │
 ├─────────────────────────────────────────────────────────────┤
-│                   zeroclaw-tools Agent                       │
+│                   rantaiclaw-tools Agent                       │
 │                                                              │
 │   ┌─────────────────────────────────────────────────────┐   │
 │   │              LangGraph StateGraph                    │   │
@@ -44,14 +44,14 @@ LangGraph cung cấp một stateful graph execution engine đảm bảo hành vi
 ### Cài đặt
 
 ```bash
-pip install zeroclaw-tools
+pip install rantaiclaw-tools
 ```
 
 ### Sử dụng cơ bản
 
 ```python
 import asyncio
-from zeroclaw_tools import create_agent, shell, file_read, file_write
+from rantaiclaw_tools import create_agent, shell, file_read, file_write
 from langchain_core.messages import HumanMessage
 
 async def main():
@@ -95,7 +95,7 @@ asyncio.run(main())
 Tạo tool riêng của bạn bằng decorator `@tool`:
 
 ```python
-from zeroclaw_tools import tool, create_agent
+from rantaiclaw_tools import tool, create_agent
 
 @tool
 def get_weather(city: str) -> str:
@@ -161,7 +161,7 @@ agent = create_agent(
 
 ```python
 import os
-from zeroclaw_tools.integrations import DiscordBot
+from rantaiclaw_tools.integrations import DiscordBot
 
 bot = DiscordBot(
     token=os.environ["DISCORD_TOKEN"],
@@ -182,15 +182,15 @@ export API_KEY="your-key"
 export BRAVE_API_KEY="your-brave-key"  # Optional, for web search
 
 # Single message
-zeroclaw-tools "What is the current date?"
+rantaiclaw-tools "What is the current date?"
 
 # Interactive mode
-zeroclaw-tools -i
+rantaiclaw-tools -i
 ```
 
-## So sánh với Rust ZeroClaw
+## So sánh với Rust RantaiClaw
 
-| Khía cạnh | Rust ZeroClaw | zeroclaw-tools |
+| Khía cạnh | Rust RantaiClaw | rantaiclaw-tools |
 |--------|---------------|-----------------|
 | **Hiệu năng** | Cực nhanh (~10ms khởi động) | Khởi động Python (~500ms) |
 | **Bộ nhớ** | <5 MB | ~50 MB |
@@ -199,12 +199,12 @@ zeroclaw-tools -i
 | **Khả năng mở rộng** | Rust traits | Python decorators |
 | **Hệ sinh thái** | Rust crates | PyPI packages |
 
-**Khi nào dùng Rust ZeroClaw:**
+**Khi nào dùng Rust RantaiClaw:**
 - Triển khai edge cho môi trường production
 - Môi trường hạn chế tài nguyên (Raspberry Pi, v.v.)
 - Yêu cầu hiệu năng tối đa
 
-**Khi nào dùng zeroclaw-tools:**
+**Khi nào dùng rantaiclaw-tools:**
 - Các model có tool calling native không nhất quán
 - Phát triển trung tâm vào Python
 - Prototyping nhanh

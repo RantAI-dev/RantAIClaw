@@ -251,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_existing_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("test.txt"), "hello world")
@@ -270,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_nonexistent_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_missing");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_missing");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
@@ -284,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_blocks_path_traversal() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_traversal");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_traversal");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
@@ -309,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_blocks_when_rate_limited() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_rate_limited");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_rate_limited");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("test.txt"), "hello world")
@@ -335,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_allows_readonly_mode() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_readonly");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_readonly");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("test.txt"), "readonly ok")
@@ -360,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_empty_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_empty");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_empty");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("empty.txt"), "").await.unwrap();
@@ -375,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_nested_path() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_nested");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_nested");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(dir.join("sub/dir"))
             .await
@@ -400,7 +400,7 @@ mod tests {
     async fn file_read_blocks_symlink_escape() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join("zeroclaw_test_file_read_symlink_escape");
+        let root = std::env::temp_dir().join("rantaiclaw_test_file_read_symlink_escape");
         let workspace = root.join("workspace");
         let outside = root.join("outside");
 
@@ -429,7 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_nonexistent_consumes_rate_limit_budget() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_probe");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
@@ -463,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_with_offset_and_limit() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_offset");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_offset");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("lines.txt"), "aaa\nbbb\nccc\nddd\neee")
@@ -517,7 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_offset_beyond_end() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_offset_end");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_offset_end");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("short.txt"), "one\ntwo")
@@ -539,7 +539,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_rejects_oversized_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_large");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_file_read_large");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 

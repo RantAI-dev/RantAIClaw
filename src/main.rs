@@ -53,7 +53,7 @@ mod approval;
 mod auth;
 mod channels;
 mod rag {
-    pub use zeroclaw::rag::*;
+    pub use rantaiclaw::rag::*;
 }
 mod config;
 mod cron;
@@ -84,11 +84,11 @@ mod util;
 use config::Config;
 
 // Re-export so binary's hardware/peripherals modules can use crate::HardwareCommands etc.
-pub use zeroclaw::{HardwareCommands, PeripheralCommands};
+pub use rantaiclaw::{HardwareCommands, PeripheralCommands};
 
-/// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
+/// `RantaiClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
-#[command(name = "zeroclaw")]
+#[command(name = "rantaiclaw")]
 #[command(author = "theonlyhennygod")]
 #[command(version = "0.1.0")]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
@@ -169,10 +169,10 @@ Launches an interactive chat session with the configured AI provider. \
 Use --message for single-shot queries without entering interactive mode.
 
 Examples:
-  zeroclaw agent                              # interactive session
-  zeroclaw agent -m \"Summarize today's logs\"  # single message
-  zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
-  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
+  rantaiclaw agent                              # interactive session
+  rantaiclaw agent -m \"Summarize today's logs\"  # single message
+  rantaiclaw agent -p anthropic --model claude-sonnet-4-20250514
+  rantaiclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
     Agent {
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
@@ -204,10 +204,10 @@ and WebSocket connections. Bind address defaults to the values in \
 your config file (gateway.host / gateway.port).
 
 Examples:
-  zeroclaw gateway                  # use config defaults
-  zeroclaw gateway -p 8080          # listen on port 8080
-  zeroclaw gateway --host 0.0.0.0   # bind to all interfaces
-  zeroclaw gateway -p 0             # random available port")]
+  rantaiclaw gateway                  # use config defaults
+  rantaiclaw gateway -p 8080          # listen on port 8080
+  rantaiclaw gateway --host 0.0.0.0   # bind to all interfaces
+  rantaiclaw gateway -p 0             # random available port")]
     Gateway {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -222,18 +222,18 @@ Examples:
     #[command(long_about = "\
 Start the long-running autonomous daemon.
 
-Launches the full ZeroClaw runtime: gateway server, all configured \
+Launches the full RantaiClaw runtime: gateway server, all configured \
 channels (Telegram, Discord, Slack, etc.), heartbeat monitor, and \
-the cron scheduler. This is the recommended way to run ZeroClaw in \
+the cron scheduler. This is the recommended way to run RantaiClaw in \
 production or as an always-on assistant.
 
-Use 'zeroclaw service install' to register the daemon as an OS \
+Use 'rantaiclaw service install' to register the daemon as an OS \
 service (systemd/launchd) for auto-start on boot.
 
 Examples:
-  zeroclaw daemon                   # use config defaults
-  zeroclaw daemon -p 9090           # gateway on port 9090
-  zeroclaw daemon --host 127.0.0.1  # localhost only")]
+  rantaiclaw daemon                   # use config defaults
+  rantaiclaw daemon -p 9090           # gateway on port 9090
+  rantaiclaw daemon --host 127.0.0.1  # localhost only")]
     Daemon {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -275,14 +275,14 @@ Cron expressions use the standard 5-field format: \
 override with --tz and an IANA timezone name.
 
 Examples:
-  zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  zeroclaw cron add '*/30 * * * *' 'Check system health'
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes'
-  zeroclaw cron pause <task-id>
-  zeroclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
+  rantaiclaw cron list
+  rantaiclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
+  rantaiclaw cron add '*/30 * * * *' 'Check system health'
+  rantaiclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
+  rantaiclaw cron add-every 60000 'Ping heartbeat'
+  rantaiclaw cron once 30m 'Run backup in 30 minutes'
+  rantaiclaw cron pause <task-id>
+  rantaiclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
     Cron {
         #[command(subcommand)]
         cron_command: CronCommands,
@@ -301,16 +301,16 @@ Examples:
     #[command(long_about = "\
 Manage communication channels.
 
-Add, remove, list, and health-check channels that connect ZeroClaw \
+Add, remove, list, and health-check channels that connect RantaiClaw \
 to messaging platforms. Supported channel types: telegram, discord, \
 slack, whatsapp, matrix, imessage, email.
 
 Examples:
-  zeroclaw channel list
-  zeroclaw channel doctor
-  zeroclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
-  zeroclaw channel remove my-bot
-  zeroclaw channel bind-telegram zeroclaw_user")]
+  rantaiclaw channel list
+  rantaiclaw channel doctor
+  rantaiclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
+  rantaiclaw channel remove my-bot
+  rantaiclaw channel bind-telegram rantaiclaw_user")]
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
@@ -349,12 +349,12 @@ Enumerate connected USB devices, identify known development boards \
 probe-rs / ST-Link.
 
 Examples:
-  zeroclaw hardware discover
-  zeroclaw hardware introspect /dev/ttyACM0
-  zeroclaw hardware info --chip STM32F401RETx")]
+  rantaiclaw hardware discover
+  rantaiclaw hardware introspect /dev/ttyACM0
+  rantaiclaw hardware info --chip STM32F401RETx")]
     Hardware {
         #[command(subcommand)]
-        hardware_command: zeroclaw::HardwareCommands,
+        hardware_command: rantaiclaw::HardwareCommands,
     },
 
     /// Manage hardware peripherals (STM32, RPi GPIO, etc.)
@@ -366,14 +366,14 @@ to the agent (GPIO, sensors, actuators). Supported boards: \
 nucleo-f401re, rpi-gpio, esp32, arduino-uno.
 
 Examples:
-  zeroclaw peripheral list
-  zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
-  zeroclaw peripheral add rpi-gpio native
-  zeroclaw peripheral flash --port /dev/cu.usbmodem12345
-  zeroclaw peripheral flash-nucleo")]
+  rantaiclaw peripheral list
+  rantaiclaw peripheral add nucleo-f401re /dev/ttyACM0
+  rantaiclaw peripheral add rpi-gpio native
+  rantaiclaw peripheral flash --port /dev/cu.usbmodem12345
+  rantaiclaw peripheral flash-nucleo")]
     Peripheral {
         #[command(subcommand)]
-        peripheral_command: zeroclaw::PeripheralCommands,
+        peripheral_command: rantaiclaw::PeripheralCommands,
     },
 
     /// Manage agent memory (list, get, stats, clear)
@@ -385,11 +385,11 @@ Supports filtering by category and session, pagination, and \
 batch clearing with confirmation.
 
 Examples:
-  zeroclaw memory stats
-  zeroclaw memory list
-  zeroclaw memory list --category core --limit 10
-  zeroclaw memory get <key>
-  zeroclaw memory clear --category conversation --yes")]
+  rantaiclaw memory stats
+  rantaiclaw memory list
+  rantaiclaw memory list --category core --limit 10
+  rantaiclaw memory get <key>
+  rantaiclaw memory clear --category conversation --yes")]
     Memory {
         #[command(subcommand)]
         memory_command: MemoryCommands,
@@ -397,15 +397,15 @@ Examples:
 
     /// Manage configuration
     #[command(long_about = "\
-Manage ZeroClaw configuration.
+Manage RantaiClaw configuration.
 
 Inspect and export configuration settings. Use 'schema' to dump \
 the full JSON Schema for the config file, which documents every \
 available key, type, and default value.
 
 Examples:
-  zeroclaw config schema              # print JSON Schema to stdout
-  zeroclaw config schema > schema.json")]
+  rantaiclaw config schema              # print JSON Schema to stdout
+  rantaiclaw config schema > schema.json")]
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
@@ -413,14 +413,14 @@ Examples:
 
     /// Generate shell completion script to stdout
     #[command(long_about = "\
-Generate shell completion scripts for `zeroclaw`.
+Generate shell completion scripts for `rantaiclaw`.
 
 The script is printed to stdout so it can be sourced directly:
 
 Examples:
-  source <(zeroclaw completions bash)
-  zeroclaw completions zsh > ~/.zfunc/_zeroclaw
-  zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish")]
+  source <(rantaiclaw completions bash)
+  rantaiclaw completions zsh > ~/.zfunc/_rantaiclaw
+  rantaiclaw completions fish > ~/.config/fish/completions/rantaiclaw.fish")]
     Completions {
         /// Target shell
         #[arg(value_enum)]
@@ -519,7 +519,7 @@ enum AuthCommands {
 
 #[derive(Subcommand, Debug)]
 enum MigrateCommands {
-    /// Import memory from an `OpenClaw` workspace into this `ZeroClaw` workspace
+    /// Import memory from an `OpenClaw` workspace into this `RantaiClaw` workspace
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
         #[arg(long)]
@@ -726,7 +726,7 @@ async fn main() -> Result<()> {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
         }
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir);
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir);
     }
 
     // Completions must remain stdout-only and should not load config or initialize logging.
@@ -794,7 +794,7 @@ async fn main() -> Result<()> {
             .await
         }?;
         // Auto-start channels if user said yes during wizard
-        if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
+        if std::env::var("RANTAICLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
             channels::start_channels(config).await?;
         }
         return Ok(());
@@ -821,9 +821,9 @@ async fn main() -> Result<()> {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
-                info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+                info!("🚀 Starting RantaiClaw Gateway on {host} (random port)");
             } else {
-                info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+                info!("🚀 Starting RantaiClaw Gateway on {host}:{port}");
             }
             gateway::run_gateway(&host, port, config).await
         }
@@ -832,15 +832,15 @@ async fn main() -> Result<()> {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
-                info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
+                info!("🧠 Starting RantaiClaw Daemon on {host} (random port)");
             } else {
-                info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
+                info!("🧠 Starting RantaiClaw Daemon on {host}:{port}");
             }
             daemon::run(config, host, port).await
         }
 
         Commands::Status => {
-            println!("🦀 ZeroClaw Status");
+            println!("🦀 RantaiClaw Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
             println!("Workspace:   {}", config.workspace_dir.display());
@@ -1281,7 +1281,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 Err(e) => {
                     println!("Callback capture failed: {e}");
                     println!(
-                            "Run `zeroclaw auth paste-redirect --provider openai-codex --profile {profile}`"
+                            "Run `rantaiclaw auth paste-redirect --provider openai-codex --profile {profile}`"
                         );
                     return Ok(());
                 }
@@ -1313,7 +1313,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             let pending = load_pending_openai_login(config)?.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "No pending OpenAI login found. Run `zeroclaw auth login --provider openai-codex` first."
+                    "No pending OpenAI login found. Run `rantaiclaw auth login --provider openai-codex` first."
                 )
             })?;
 
@@ -1424,7 +1424,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 }
                 None => {
                     bail!(
-                        "No OpenAI Codex auth profile found. Run `zeroclaw auth login --provider openai-codex`."
+                        "No OpenAI Codex auth profile found. Run `rantaiclaw auth login --provider openai-codex`."
                     )
                 }
             }
@@ -1532,7 +1532,7 @@ mod tests {
     #[test]
     fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
         let cli = Cli::try_parse_from([
-            "zeroclaw",
+            "rantaiclaw",
             "onboard",
             "--provider",
             "openrouter",
@@ -1567,7 +1567,7 @@ mod tests {
     #[test]
     fn completions_cli_parses_supported_shells() {
         for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
-            let cli = Cli::try_parse_from(["zeroclaw", "completions", shell])
+            let cli = Cli::try_parse_from(["rantaiclaw", "completions", shell])
                 .expect("completions invocation should parse");
             match cli.command {
                 Commands::Completions { .. } => {}
@@ -1583,14 +1583,14 @@ mod tests {
             .expect("completion generation should succeed");
         let script = String::from_utf8(output).expect("completion output should be valid utf-8");
         assert!(
-            script.contains("zeroclaw"),
+            script.contains("rantaiclaw"),
             "completion script should reference binary name"
         );
     }
 
     #[test]
     fn onboard_cli_accepts_force_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--force"])
+        let cli = Cli::try_parse_from(["rantaiclaw", "onboard", "--force"])
             .expect("onboard --force should parse");
 
         match cli.command {

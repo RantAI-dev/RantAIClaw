@@ -1,4 +1,4 @@
-# ZeroClaw Sandboxing Strategies
+# RantaiClaw Sandboxing Strategies
 
 > ⚠️ **Status: Proposal / Roadmap**
 >
@@ -6,7 +6,7 @@
 > For current runtime behavior, see [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), and [troubleshooting.md](troubleshooting.md).
 
 ## Problem
-ZeroClaw currently has application-layer security (allowlists, path blocking, command injection protection) but lacks OS-level containment. If an attacker is on the allowlist, they can run any allowed command with zeroclaw's user permissions.
+RantaiClaw currently has application-layer security (allowlists, path blocking, command injection protection) but lacks OS-level containment. If an attacker is on the allowlist, they can run any allowed command with rantaiclaw's user permissions.
 
 ## Proposed Solutions
 
@@ -164,7 +164,7 @@ extra_args = ["--seccomp", "--caps.drop=all"]
 # Landlock-specific
 [security.sandbox.landlock]
 readonly_paths = ["/usr", "/bin", "/lib"]
-readwrite_paths = ["$HOME/workspace", "/tmp/zeroclaw"]
+readwrite_paths = ["$HOME/workspace", "/tmp/rantaiclaw"]
 ```
 
 ## Testing Strategy

@@ -1,13 +1,13 @@
-# Contributing to ZeroClaw
+# Contributing to RantaiClaw
 
-Thanks for your interest in contributing to ZeroClaw! This guide will help you get started.
+Thanks for your interest in contributing to RantaiClaw! This guide will help you get started.
 
 ## Development Setup
 
 ```bash
 # Clone the repo
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/rantaiclaw-labs/rantaiclaw.git
+cd rantaiclaw
 
 # Enable the pre-push hook (runs fmt, clippy, tests before every push)
 git config core.hooksPath .githooks
@@ -44,25 +44,25 @@ The repo includes a pre-push hook in `.githooks/` that enforces `./scripts/ci/ru
 For an opt-in strict lint pass during pre-push, set:
 
 ```bash
-ZEROCLAW_STRICT_LINT=1 git push
+RANTAICLAW_STRICT_LINT=1 git push
 ```
 
 For an opt-in strict lint delta pass during pre-push (changed Rust lines only), set:
 
 ```bash
-ZEROCLAW_STRICT_DELTA_LINT=1 git push
+RANTAICLAW_STRICT_DELTA_LINT=1 git push
 ```
 
 For an opt-in docs quality pass during pre-push (changed-line markdown gate), set:
 
 ```bash
-ZEROCLAW_DOCS_LINT=1 git push
+RANTAICLAW_DOCS_LINT=1 git push
 ```
 
 For an opt-in docs links pass during pre-push (added-links gate), set:
 
 ```bash
-ZEROCLAW_DOCS_LINKS=1 git push
+RANTAICLAW_DOCS_LINKS=1 git push
 ```
 
 For full CI parity in Docker, run:
@@ -81,7 +81,7 @@ git push --no-verify
 
 ## Local Secret Management (Required)
 
-ZeroClaw supports layered secret management for local development and CI hygiene.
+RantaiClaw supports layered secret management for local development and CI hygiene.
 
 ### Secret Storage Options
 
@@ -90,11 +90,11 @@ ZeroClaw supports layered secret management for local development and CI hygiene
     - `.env` files are Git-ignored and should stay local
     - Best for temporary/local API keys
 
-2. **Config file** (`~/.zeroclaw/config.toml`)
+2. **Config file** (`~/.rantaiclaw/config.toml`)
     - Persistent setup for long-term use
     - When `secrets.encrypt = true` (default), secret values are encrypted before save
-    - Secret key is stored at `~/.zeroclaw/.secret_key` with restricted permissions
-    - Use `zeroclaw onboard` for guided setup
+    - Secret key is stored at `~/.rantaiclaw/.secret_key` with restricted permissions
+    - Use `rantaiclaw onboard` for guided setup
 
 ### Runtime Resolution Rules
 
@@ -102,12 +102,12 @@ API key resolution follows this order:
 
 1. Explicit key passed from config/CLI
 2. Provider-specific env vars (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, ...)
-3. Generic env vars (`ZEROCLAW_API_KEY`, `API_KEY`)
+3. Generic env vars (`RANTAICLAW_API_KEY`, `API_KEY`)
 
 Provider/model config overrides:
 
-- `ZEROCLAW_PROVIDER` / `PROVIDER`
-- `ZEROCLAW_MODEL`
+- `RANTAICLAW_PROVIDER` / `PROVIDER`
+- `RANTAICLAW_MODEL`
 
 See `.env.example` for practical examples and currently supported provider key env vars.
 
@@ -154,7 +154,7 @@ If gitleaks is not installed, the pre-commit hook prints a warning and continues
 - API keys, tokens, passwords, or credentials (plain or encrypted)
 - OAuth tokens or session identifiers
 - Webhook signing secrets
-- `~/.zeroclaw/.secret_key` or similar key files
+- `~/.rantaiclaw/.secret_key` or similar key files
 - Personal identifiers or real user data in tests/fixtures
 
 ### If a Secret Is Committed Accidentally
@@ -214,7 +214,7 @@ Before requesting review, ensure all of the following are true:
 - Security impact and rollback path are explicitly described.
 - No personal/sensitive data is introduced in code/docs/tests/fixtures/logs/examples/commit messages.
 - Tests/fixtures/examples use neutral project-scoped wording (no identity-specific or first-person phrasing).
-- If identity-like wording is required, use ZeroClaw-centric labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
+- If identity-like wording is required, use RantaiClaw-centric labels only (for example: `RantaiClawAgent`, `RantaiClawOperator`, `rantaiclaw_user`).
 - If docs were changed, update `docs/README.md` navigation and reciprocal links with related docs.
 - If a new operational doc was added, start from `docs/doc-template.md` and keep risk/rollback/troubleshooting sections where applicable.
 - Linked issue (or rationale for no issue) is included.
@@ -241,7 +241,7 @@ When PR traffic is high (especially with AI-assisted contributions), these rules
 - **Security-first review**: changes in `src/security/`, runtime, gateway, and CI need stricter validation.
 - **Risk-first triage**: use labels (`risk: high`, `risk: medium`, `risk: low`) to route review depth.
 - **Privacy-first hygiene**: redact/anonymize sensitive payloads and keep tests/examples neutral and project-scoped.
-- **Identity normalization**: when identity traits are unavoidable, use ZeroClaw/project-native roles instead of personal or real-world identities.
+- **Identity normalization**: when identity traits are unavoidable, use RantaiClaw/project-native roles instead of personal or real-world identities.
 - **Supersede hygiene**: if your PR replaces an older open PR, add `Supersedes #...` and request maintainers close the outdated one.
 
 Full maintainer workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md).
@@ -266,7 +266,7 @@ Agent implementation playbook lives in [`AGENTS.md`](AGENTS.md).
 
 ## Architecture: Trait-Based Pluggability
 
-ZeroClaw's architecture is built on **traits** — every subsystem is swappable. This means contributing a new integration is as simple as implementing a trait and registering it in the factory function.
+RantaiClaw's architecture is built on **traits** — every subsystem is swappable. This means contributing a new integration is as simple as implementing a trait and registering it in the factory function.
 
 ```
 src/
@@ -288,7 +288,7 @@ Use these defaults unless an existing subsystem pattern clearly overrides them.
 - **Trait implementers**: keep predictable suffixes (`*Provider`, `*Channel`, `*Tool`, `*Memory`, `*Observer`, `*RuntimeAdapter`).
 - **Factory keys**: keep lowercase and stable (`openai`, `discord`, `shell`); avoid adding aliases without migration need.
 - **Tests**: use behavior-oriented names (`subject_expected_behavior`) and neutral project-scoped fixtures.
-- **Identity-like labels**: if unavoidable, use ZeroClaw-native identifiers only (`ZeroClawAgent`, `zeroclaw_user`, `zeroclaw_node`).
+- **Identity-like labels**: if unavoidable, use RantaiClaw-native identifiers only (`RantaiClawAgent`, `rantaiclaw_user`, `rantaiclaw_node`).
 
 ## Architecture Boundary Rules (Required)
 
@@ -314,7 +314,7 @@ Use these quick examples to align implementation choices before opening a PR.
 - **Good test name**: `allowlist_denies_unknown_user`, `provider_returns_error_on_invalid_model`
 
 - **Bad identity-like label**: `john_user`, `alice_bot`
-- **Good identity-like label**: `ZeroClawAgent`, `zeroclaw_user`, `zeroclaw_node`
+- **Good identity-like label**: `RantaiClawAgent`, `rantaiclaw_user`, `rantaiclaw_node`
 
 ### Architecture boundary examples
 
@@ -474,7 +474,7 @@ impl Tool for YourTool {
 - [ ] Follows code naming conventions and architecture boundary rules in this guide
 - [ ] No personal/sensitive data in code/docs/tests/fixtures/logs/examples/commit messages
 - [ ] Test names/messages/fixtures/examples are neutral and project-focused
-- [ ] Any required identity-like wording uses ZeroClaw/project-native labels only
+- [ ] Any required identity-like wording uses RantaiClaw/project-native labels only
 
 ## Commit Convention
 

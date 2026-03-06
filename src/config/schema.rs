@@ -49,9 +49,9 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 // ── Top-level config ──────────────────────────────────────────────
 
-/// Top-level ZeroClaw configuration, loaded from `config.toml`.
+/// Top-level RantaiClaw configuration, loaded from `config.toml`.
 ///
-/// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
+/// Resolution order: `RANTAICLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.rantaiclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
     /// Workspace directory - computed from home, not serialized
@@ -60,7 +60,7 @@ pub struct Config {
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
-    /// API key for the selected provider. Overridden by `ZEROCLAW_API_KEY` or `API_KEY` env vars.
+    /// API key for the selected provider. Overridden by `RANTAICLAW_API_KEY` or `API_KEY` env vars.
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
@@ -985,9 +985,9 @@ impl Default for WebSearchConfig {
 pub enum ProxyScope {
     /// Use system environment proxy variables only.
     Environment,
-    /// Apply proxy to all ZeroClaw-managed HTTP traffic (default).
+    /// Apply proxy to all RantaiClaw-managed HTTP traffic (default).
     #[default]
-    Zeroclaw,
+    Rantaiclaw,
     /// Apply proxy only to explicitly listed service selectors.
     Services,
 }
@@ -1026,7 +1026,7 @@ impl Default for ProxyConfig {
             https_proxy: None,
             all_proxy: None,
             no_proxy: Vec::new(),
-            scope: ProxyScope::Zeroclaw,
+            scope: ProxyScope::Rantaiclaw,
             services: Vec::new(),
         }
     }
@@ -1099,7 +1099,7 @@ impl ProxyConfig {
 
         match self.scope {
             ProxyScope::Environment => false,
-            ProxyScope::Zeroclaw => true,
+            ProxyScope::Rantaiclaw => true,
             ProxyScope::Services => {
                 let service_key = service_key.trim().to_ascii_lowercase();
                 if service_key.is_empty() {
@@ -1428,7 +1428,7 @@ pub fn build_runtime_proxy_client_with_timeouts(
 fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "environment" | "env" => Some(ProxyScope::Environment),
-        "zeroclaw" | "internal" | "core" => Some(ProxyScope::Zeroclaw),
+        "rantaiclaw" | "internal" | "core" => Some(ProxyScope::Rantaiclaw),
         "services" | "service" => Some(ProxyScope::Services),
         _ => None,
     }
@@ -1673,7 +1673,7 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub otel_endpoint: Option<String>,
 
-    /// Service name reported to the OTel collector. Defaults to "zeroclaw".
+    /// Service name reported to the OTel collector. Defaults to "rantaiclaw".
     #[serde(default)]
     pub otel_service_name: Option<String>,
 }
@@ -2459,7 +2459,7 @@ pub struct WhatsAppConfig {
     #[serde(default)]
     pub verify_token: Option<String>,
     /// App secret from Meta Business Suite (for webhook signature verification)
-    /// Can also be set via `ZEROCLAW_WHATSAPP_APP_SECRET` environment variable
+    /// Can also be set via `RANTAICLAW_WHATSAPP_APP_SECRET` environment variable
     /// Only used in Cloud API mode
     #[serde(default)]
     pub app_secret: Option<String>,
@@ -2504,7 +2504,7 @@ pub struct NextcloudTalkConfig {
     pub app_token: String,
     /// Shared secret for webhook signature verification.
     ///
-    /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
+    /// Can also be set via `RANTAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
     #[serde(default)]
     pub webhook_secret: Option<String>,
     /// Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all).
@@ -2576,7 +2576,7 @@ fn default_irc_port() -> u16 {
     6697
 }
 
-/// How ZeroClaw receives events from Feishu / Lark.
+/// How RantaiClaw receives events from Feishu / Lark.
 ///
 /// - `websocket` (default) — persistent WSS long-connection; no public URL required.
 /// - `webhook`             — HTTP callback server; requires a public HTTPS endpoint.
@@ -2734,7 +2734,7 @@ pub struct AuditConfig {
     #[serde(default = "default_audit_enabled")]
     pub enabled: bool,
 
-    /// Path to audit log file (relative to zeroclaw dir)
+    /// Path to audit log file (relative to rantaiclaw dir)
     #[serde(default = "default_audit_log_path")]
     pub log_path: String,
 
@@ -2800,11 +2800,11 @@ impl Default for Config {
     fn default() -> Self {
         let home =
             UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
-        let zeroclaw_dir = home.join(".zeroclaw");
+        let rantaiclaw_dir = home.join(".rantaiclaw");
 
         Self {
-            workspace_dir: zeroclaw_dir.join("workspace"),
-            config_path: zeroclaw_dir.join("config.toml"),
+            workspace_dir: rantaiclaw_dir.join("workspace"),
+            config_path: rantaiclaw_dir.join("config.toml"),
             api_key: None,
             api_url: None,
             default_provider: Some("openrouter".to_string()),
@@ -2859,7 +2859,7 @@ fn default_config_dir() -> Result<PathBuf> {
     let home = UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
-    Ok(home.join(".zeroclaw"))
+    Ok(home.join(".rantaiclaw"))
 }
 
 fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
@@ -2979,7 +2979,7 @@ fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) 
 
     let legacy_config_dir = workspace_dir
         .parent()
-        .map(|parent| parent.join(".zeroclaw"));
+        .map(|parent| parent.join(".rantaiclaw"));
     if let Some(legacy_dir) = legacy_config_dir {
         if legacy_dir.join("config.toml").exists() {
             return (legacy_dir, workspace_config_dir);
@@ -3010,8 +3010,8 @@ enum ConfigResolutionSource {
 impl ConfigResolutionSource {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::EnvConfigDir => "ZEROCLAW_CONFIG_DIR",
-            Self::EnvWorkspace => "ZEROCLAW_WORKSPACE",
+            Self::EnvConfigDir => "RANTAICLAW_CONFIG_DIR",
+            Self::EnvWorkspace => "RANTAICLAW_WORKSPACE",
             Self::ActiveWorkspaceMarker => "active_workspace.toml",
             Self::DefaultConfigDir => "default",
         }
@@ -3019,45 +3019,45 @@ impl ConfigResolutionSource {
 }
 
 async fn resolve_runtime_config_dirs(
-    default_zeroclaw_dir: &Path,
+    default_rantaiclaw_dir: &Path,
     default_workspace_dir: &Path,
 ) -> Result<(PathBuf, PathBuf, ConfigResolutionSource)> {
-    if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+    if let Ok(custom_config_dir) = std::env::var("RANTAICLAW_CONFIG_DIR") {
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
-            let zeroclaw_dir = PathBuf::from(custom_config_dir);
+            let rantaiclaw_dir = PathBuf::from(custom_config_dir);
             return Ok((
-                zeroclaw_dir.clone(),
-                zeroclaw_dir.join("workspace"),
+                rantaiclaw_dir.clone(),
+                rantaiclaw_dir.join("workspace"),
                 ConfigResolutionSource::EnvConfigDir,
             ));
         }
     }
 
-    if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+    if let Ok(custom_workspace) = std::env::var("RANTAICLAW_WORKSPACE") {
         if !custom_workspace.is_empty() {
-            let (zeroclaw_dir, workspace_dir) =
+            let (rantaiclaw_dir, workspace_dir) =
                 resolve_config_dir_for_workspace(&PathBuf::from(custom_workspace));
             return Ok((
-                zeroclaw_dir,
+                rantaiclaw_dir,
                 workspace_dir,
                 ConfigResolutionSource::EnvWorkspace,
             ));
         }
     }
 
-    if let Some((zeroclaw_dir, workspace_dir)) =
-        load_persisted_workspace_dirs(default_zeroclaw_dir).await?
+    if let Some((rantaiclaw_dir, workspace_dir)) =
+        load_persisted_workspace_dirs(default_rantaiclaw_dir).await?
     {
         return Ok((
-            zeroclaw_dir,
+            rantaiclaw_dir,
             workspace_dir,
             ConfigResolutionSource::ActiveWorkspaceMarker,
         ));
     }
 
     Ok((
-        default_zeroclaw_dir.to_path_buf(),
+        default_rantaiclaw_dir.to_path_buf(),
         default_workspace_dir.to_path_buf(),
         ConfigResolutionSource::DefaultConfigDir,
     ))
@@ -3100,7 +3100,7 @@ fn encrypt_optional_secret(
 fn config_dir_creation_error(path: &Path) -> String {
     format!(
         "Failed to create config directory: {}. If running as an OpenRC service, \
-         ensure this path is writable by user 'zeroclaw'.",
+         ensure this path is writable by user 'rantaiclaw'.",
         path.display()
     )
 }
@@ -3124,7 +3124,7 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
         return true;
     }
 
-    ["OLLAMA_API_KEY", "ZEROCLAW_API_KEY", "API_KEY"]
+    ["OLLAMA_API_KEY", "RANTAICLAW_API_KEY", "API_KEY"]
         .iter()
         .any(|name| {
             std::env::var(name)
@@ -3135,16 +3135,16 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
 
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
-        let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+        let (default_rantaiclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
-        let (zeroclaw_dir, workspace_dir, resolution_source) =
-            resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
+        let (rantaiclaw_dir, workspace_dir, resolution_source) =
+            resolve_runtime_config_dirs(&default_rantaiclaw_dir, &default_workspace_dir).await?;
 
-        let config_path = zeroclaw_dir.join("config.toml");
+        let config_path = rantaiclaw_dir.join("config.toml");
 
-        fs::create_dir_all(&zeroclaw_dir)
+        fs::create_dir_all(&rantaiclaw_dir)
             .await
-            .with_context(|| config_dir_creation_error(&zeroclaw_dir))?;
+            .with_context(|| config_dir_creation_error(&rantaiclaw_dir))?;
         fs::create_dir_all(&workspace_dir)
             .await
             .context("Failed to create workspace directory")?;
@@ -3175,7 +3175,7 @@ impl Config {
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
-            let store = crate::security::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
+            let store = crate::security::SecretStore::new(&rantaiclaw_dir, config.secrets.encrypt);
             decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
             decrypt_optional_secret(
                 &store,
@@ -3320,8 +3320,8 @@ impl Config {
 
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
-        // API Key: ZEROCLAW_API_KEY or API_KEY (generic)
-        if let Ok(key) = std::env::var("ZEROCLAW_API_KEY").or_else(|_| std::env::var("API_KEY")) {
+        // API Key: RANTAICLAW_API_KEY or API_KEY (generic)
+        if let Ok(key) = std::env::var("RANTAICLAW_API_KEY").or_else(|_| std::env::var("API_KEY")) {
             if !key.is_empty() {
                 self.api_key = Some(key);
             }
@@ -3345,11 +3345,11 @@ impl Config {
         }
 
         // Provider override precedence:
-        // 1) ZEROCLAW_PROVIDER always wins when set.
+        // 1) RANTAICLAW_PROVIDER always wins when set.
         // 2) Legacy PROVIDER is only honored when config still uses the
         //    default provider (openrouter) or provider is unset. This prevents
         //    container defaults from overriding explicit custom providers.
-        if let Ok(provider) = std::env::var("ZEROCLAW_PROVIDER") {
+        if let Ok(provider) = std::env::var("RANTAICLAW_PROVIDER") {
             if !provider.is_empty() {
                 self.default_provider = Some(provider);
             }
@@ -3363,15 +3363,15 @@ impl Config {
             }
         }
 
-        // Model: ZEROCLAW_MODEL or MODEL
-        if let Ok(model) = std::env::var("ZEROCLAW_MODEL").or_else(|_| std::env::var("MODEL")) {
+        // Model: RANTAICLAW_MODEL or MODEL
+        if let Ok(model) = std::env::var("RANTAICLAW_MODEL").or_else(|_| std::env::var("MODEL")) {
             if !model.is_empty() {
                 self.default_model = Some(model);
             }
         }
 
-        // Workspace directory: ZEROCLAW_WORKSPACE
-        if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+        // Workspace directory: RANTAICLAW_WORKSPACE
+        if let Ok(workspace) = std::env::var("RANTAICLAW_WORKSPACE") {
             if !workspace.is_empty() {
                 let (_, workspace_dir) =
                     resolve_config_dir_for_workspace(&PathBuf::from(workspace));
@@ -3379,64 +3379,64 @@ impl Config {
             }
         }
 
-        // Open-skills opt-in flag: ZEROCLAW_OPEN_SKILLS_ENABLED
-        if let Ok(flag) = std::env::var("ZEROCLAW_OPEN_SKILLS_ENABLED") {
+        // Open-skills opt-in flag: RANTAICLAW_OPEN_SKILLS_ENABLED
+        if let Ok(flag) = std::env::var("RANTAICLAW_OPEN_SKILLS_ENABLED") {
             if !flag.trim().is_empty() {
                 match flag.trim().to_ascii_lowercase().as_str() {
                     "1" | "true" | "yes" | "on" => self.skills.open_skills_enabled = true,
                     "0" | "false" | "no" | "off" => self.skills.open_skills_enabled = false,
                     _ => tracing::warn!(
-                        "Ignoring invalid ZEROCLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
+                        "Ignoring invalid RANTAICLAW_OPEN_SKILLS_ENABLED (valid: 1|0|true|false|yes|no|on|off)"
                     ),
                 }
             }
         }
 
-        // Open-skills directory override: ZEROCLAW_OPEN_SKILLS_DIR
-        if let Ok(path) = std::env::var("ZEROCLAW_OPEN_SKILLS_DIR") {
+        // Open-skills directory override: RANTAICLAW_OPEN_SKILLS_DIR
+        if let Ok(path) = std::env::var("RANTAICLAW_OPEN_SKILLS_DIR") {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.skills.open_skills_dir = Some(trimmed.to_string());
             }
         }
 
-        // Skills prompt mode override: ZEROCLAW_SKILLS_PROMPT_MODE
-        if let Ok(mode) = std::env::var("ZEROCLAW_SKILLS_PROMPT_MODE") {
+        // Skills prompt mode override: RANTAICLAW_SKILLS_PROMPT_MODE
+        if let Ok(mode) = std::env::var("RANTAICLAW_SKILLS_PROMPT_MODE") {
             if !mode.trim().is_empty() {
                 if let Some(parsed) = parse_skills_prompt_injection_mode(&mode) {
                     self.skills.prompt_injection_mode = parsed;
                 } else {
                     tracing::warn!(
-                        "Ignoring invalid ZEROCLAW_SKILLS_PROMPT_MODE (valid: full|compact)"
+                        "Ignoring invalid RANTAICLAW_SKILLS_PROMPT_MODE (valid: full|compact)"
                     );
                 }
             }
         }
 
-        // Gateway port: ZEROCLAW_GATEWAY_PORT or PORT
+        // Gateway port: RANTAICLAW_GATEWAY_PORT or PORT
         if let Ok(port_str) =
-            std::env::var("ZEROCLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
+            std::env::var("RANTAICLAW_GATEWAY_PORT").or_else(|_| std::env::var("PORT"))
         {
             if let Ok(port) = port_str.parse::<u16>() {
                 self.gateway.port = port;
             }
         }
 
-        // Gateway host: ZEROCLAW_GATEWAY_HOST or HOST
-        if let Ok(host) = std::env::var("ZEROCLAW_GATEWAY_HOST").or_else(|_| std::env::var("HOST"))
+        // Gateway host: RANTAICLAW_GATEWAY_HOST or HOST
+        if let Ok(host) = std::env::var("RANTAICLAW_GATEWAY_HOST").or_else(|_| std::env::var("HOST"))
         {
             if !host.is_empty() {
                 self.gateway.host = host;
             }
         }
 
-        // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND
-        if let Ok(val) = std::env::var("ZEROCLAW_ALLOW_PUBLIC_BIND") {
+        // Allow public bind: RANTAICLAW_ALLOW_PUBLIC_BIND
+        if let Ok(val) = std::env::var("RANTAICLAW_ALLOW_PUBLIC_BIND") {
             self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
         }
 
-        // Temperature: ZEROCLAW_TEMPERATURE
-        if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
+        // Temperature: RANTAICLAW_TEMPERATURE
+        if let Ok(temp_str) = std::env::var("RANTAICLAW_TEMPERATURE") {
             if let Ok(temp) = temp_str.parse::<f64>() {
                 if (0.0..=2.0).contains(&temp) {
                     self.default_temperature = temp;
@@ -3444,8 +3444,8 @@ impl Config {
             }
         }
 
-        // Reasoning override: ZEROCLAW_REASONING_ENABLED or REASONING_ENABLED
-        if let Ok(flag) = std::env::var("ZEROCLAW_REASONING_ENABLED")
+        // Reasoning override: RANTAICLAW_REASONING_ENABLED or REASONING_ENABLED
+        if let Ok(flag) = std::env::var("RANTAICLAW_REASONING_ENABLED")
             .or_else(|_| std::env::var("REASONING_ENABLED"))
         {
             let normalized = flag.trim().to_ascii_lowercase();
@@ -3456,15 +3456,15 @@ impl Config {
             }
         }
 
-        // Web search enabled: ZEROCLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
-        if let Ok(enabled) = std::env::var("ZEROCLAW_WEB_SEARCH_ENABLED")
+        // Web search enabled: RANTAICLAW_WEB_SEARCH_ENABLED or WEB_SEARCH_ENABLED
+        if let Ok(enabled) = std::env::var("RANTAICLAW_WEB_SEARCH_ENABLED")
             .or_else(|_| std::env::var("WEB_SEARCH_ENABLED"))
         {
             self.web_search.enabled = enabled == "1" || enabled.eq_ignore_ascii_case("true");
         }
 
-        // Web search provider: ZEROCLAW_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
-        if let Ok(provider) = std::env::var("ZEROCLAW_WEB_SEARCH_PROVIDER")
+        // Web search provider: RANTAICLAW_WEB_SEARCH_PROVIDER or WEB_SEARCH_PROVIDER
+        if let Ok(provider) = std::env::var("RANTAICLAW_WEB_SEARCH_PROVIDER")
             .or_else(|_| std::env::var("WEB_SEARCH_PROVIDER"))
         {
             let provider = provider.trim();
@@ -3473,9 +3473,9 @@ impl Config {
             }
         }
 
-        // Brave API key: ZEROCLAW_BRAVE_API_KEY or BRAVE_API_KEY
+        // Brave API key: RANTAICLAW_BRAVE_API_KEY or BRAVE_API_KEY
         if let Ok(api_key) =
-            std::env::var("ZEROCLAW_BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY"))
+            std::env::var("RANTAICLAW_BRAVE_API_KEY").or_else(|_| std::env::var("BRAVE_API_KEY"))
         {
             let api_key = api_key.trim();
             if !api_key.is_empty() {
@@ -3483,8 +3483,8 @@ impl Config {
             }
         }
 
-        // Web search max results: ZEROCLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
-        if let Ok(max_results) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_RESULTS")
+        // Web search max results: RANTAICLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
+        if let Ok(max_results) = std::env::var("RANTAICLAW_WEB_SEARCH_MAX_RESULTS")
             .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
         {
             if let Ok(max_results) = max_results.parse::<usize>() {
@@ -3494,8 +3494,8 @@ impl Config {
             }
         }
 
-        // Web search timeout: ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS or WEB_SEARCH_TIMEOUT_SECS
-        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS")
+        // Web search timeout: RANTAICLAW_WEB_SEARCH_TIMEOUT_SECS or WEB_SEARCH_TIMEOUT_SECS
+        if let Ok(timeout_secs) = std::env::var("RANTAICLAW_WEB_SEARCH_TIMEOUT_SECS")
             .or_else(|_| std::env::var("WEB_SEARCH_TIMEOUT_SECS"))
         {
             if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
@@ -3505,32 +3505,32 @@ impl Config {
             }
         }
 
-        // Storage provider key (optional backend override): ZEROCLAW_STORAGE_PROVIDER
-        if let Ok(provider) = std::env::var("ZEROCLAW_STORAGE_PROVIDER") {
+        // Storage provider key (optional backend override): RANTAICLAW_STORAGE_PROVIDER
+        if let Ok(provider) = std::env::var("RANTAICLAW_STORAGE_PROVIDER") {
             let provider = provider.trim();
             if !provider.is_empty() {
                 self.storage.provider.config.provider = provider.to_string();
             }
         }
 
-        // Storage connection URL (for remote backends): ZEROCLAW_STORAGE_DB_URL
-        if let Ok(db_url) = std::env::var("ZEROCLAW_STORAGE_DB_URL") {
+        // Storage connection URL (for remote backends): RANTAICLAW_STORAGE_DB_URL
+        if let Ok(db_url) = std::env::var("RANTAICLAW_STORAGE_DB_URL") {
             let db_url = db_url.trim();
             if !db_url.is_empty() {
                 self.storage.provider.config.db_url = Some(db_url.to_string());
             }
         }
 
-        // Storage connect timeout: ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS
-        if let Ok(timeout_secs) = std::env::var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS") {
+        // Storage connect timeout: RANTAICLAW_STORAGE_CONNECT_TIMEOUT_SECS
+        if let Ok(timeout_secs) = std::env::var("RANTAICLAW_STORAGE_CONNECT_TIMEOUT_SECS") {
             if let Ok(timeout_secs) = timeout_secs.parse::<u64>() {
                 if timeout_secs > 0 {
                     self.storage.provider.config.connect_timeout_secs = Some(timeout_secs);
                 }
             }
         }
-        // Proxy enabled flag: ZEROCLAW_PROXY_ENABLED
-        let explicit_proxy_enabled = std::env::var("ZEROCLAW_PROXY_ENABLED")
+        // Proxy enabled flag: RANTAICLAW_PROXY_ENABLED
+        let explicit_proxy_enabled = std::env::var("RANTAICLAW_PROXY_ENABLED")
             .ok()
             .as_deref()
             .and_then(parse_proxy_enabled);
@@ -3538,28 +3538,28 @@ impl Config {
             self.proxy.enabled = enabled;
         }
 
-        // Proxy URLs: ZEROCLAW_* wins, then generic *PROXY vars.
+        // Proxy URLs: RANTAICLAW_* wins, then generic *PROXY vars.
         let mut proxy_url_overridden = false;
         if let Ok(proxy_url) =
-            std::env::var("ZEROCLAW_HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
+            std::env::var("RANTAICLAW_HTTP_PROXY").or_else(|_| std::env::var("HTTP_PROXY"))
         {
             self.proxy.http_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
         if let Ok(proxy_url) =
-            std::env::var("ZEROCLAW_HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
+            std::env::var("RANTAICLAW_HTTPS_PROXY").or_else(|_| std::env::var("HTTPS_PROXY"))
         {
             self.proxy.https_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
         if let Ok(proxy_url) =
-            std::env::var("ZEROCLAW_ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY"))
+            std::env::var("RANTAICLAW_ALL_PROXY").or_else(|_| std::env::var("ALL_PROXY"))
         {
             self.proxy.all_proxy = normalize_proxy_url_option(Some(&proxy_url));
             proxy_url_overridden = true;
         }
         if let Ok(no_proxy) =
-            std::env::var("ZEROCLAW_NO_PROXY").or_else(|_| std::env::var("NO_PROXY"))
+            std::env::var("RANTAICLAW_NO_PROXY").or_else(|_| std::env::var("NO_PROXY"))
         {
             self.proxy.no_proxy = normalize_no_proxy_list(vec![no_proxy]);
         }
@@ -3572,18 +3572,18 @@ impl Config {
         }
 
         // Proxy scope and service selectors.
-        if let Ok(scope_raw) = std::env::var("ZEROCLAW_PROXY_SCOPE") {
+        if let Ok(scope_raw) = std::env::var("RANTAICLAW_PROXY_SCOPE") {
             if let Some(scope) = parse_proxy_scope(&scope_raw) {
                 self.proxy.scope = scope;
             } else {
                 tracing::warn!(
                     scope = %scope_raw,
-                    "Ignoring invalid ZEROCLAW_PROXY_SCOPE (valid: environment|zeroclaw|services)"
+                    "Ignoring invalid RANTAICLAW_PROXY_SCOPE (valid: environment|rantaiclaw|services)"
                 );
             }
         }
 
-        if let Ok(services_raw) = std::env::var("ZEROCLAW_PROXY_SERVICES") {
+        if let Ok(services_raw) = std::env::var("RANTAICLAW_PROXY_SERVICES") {
             self.proxy.services = normalize_service_list(vec![services_raw]);
         }
 
@@ -3602,11 +3602,11 @@ impl Config {
     pub async fn save(&self) -> Result<()> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
-        let zeroclaw_dir = self
+        let rantaiclaw_dir = self
             .config_path
             .parent()
             .context("Config path must have a parent directory")?;
-        let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
+        let store = crate::security::SecretStore::new(rantaiclaw_dir, self.secrets.encrypt);
 
         encrypt_optional_secret(&store, &mut config_to_save.api_key, "config.api_key")?;
         encrypt_optional_secret(
@@ -3763,10 +3763,10 @@ mod tests {
 
     #[test]
     async fn config_dir_creation_error_mentions_openrc_and_path() {
-        let msg = config_dir_creation_error(Path::new("/etc/zeroclaw"));
-        assert!(msg.contains("/etc/zeroclaw"));
+        let msg = config_dir_creation_error(Path::new("/etc/rantaiclaw"));
+        assert!(msg.contains("/etc/rantaiclaw"));
         assert!(msg.contains("OpenRC"));
-        assert!(msg.contains("zeroclaw"));
+        assert!(msg.contains("rantaiclaw"));
     }
 
     #[test]
@@ -4040,7 +4040,7 @@ default_temperature = 0.7
 
 [storage.provider.config]
 provider = "postgres"
-dbURL = "postgres://postgres:postgres@localhost:5432/zeroclaw"
+dbURL = "postgres://postgres:postgres@localhost:5432/rantaiclaw"
 schema = "public"
 table = "memories"
 connect_timeout_secs = 12
@@ -4050,7 +4050,7 @@ connect_timeout_secs = 12
         assert_eq!(parsed.storage.provider.config.provider, "postgres");
         assert_eq!(
             parsed.storage.provider.config.db_url.as_deref(),
-            Some("postgres://postgres:postgres@localhost:5432/zeroclaw")
+            Some("postgres://postgres:postgres@localhost:5432/rantaiclaw")
         );
         assert_eq!(parsed.storage.provider.config.schema, "public");
         assert_eq!(parsed.storage.provider.config.table, "memories");
@@ -4105,7 +4105,7 @@ tool_dispatcher = "xml"
     #[tokio::test]
     async fn sync_directory_handles_existing_directory() {
         let dir = std::env::temp_dir().join(format!(
-            "zeroclaw_test_sync_directory_{}",
+            "rantaiclaw_test_sync_directory_{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).await.unwrap();
@@ -4117,7 +4117,7 @@ tool_dispatcher = "xml"
 
     #[tokio::test]
     async fn config_save_and_load_tmpdir() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_config");
+        let dir = std::env::temp_dir().join("rantaiclaw_test_config");
         let _ = fs::remove_dir_all(&dir).await;
         fs::create_dir_all(&dir).await.unwrap();
 
@@ -4182,7 +4182,7 @@ tool_dispatcher = "xml"
     #[tokio::test]
     async fn config_save_encrypts_nested_credentials() {
         let dir = std::env::temp_dir().join(format!(
-            "zeroclaw_test_nested_credentials_{}",
+            "rantaiclaw_test_nested_credentials_{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).await.unwrap();
@@ -4268,7 +4268,7 @@ tool_dispatcher = "xml"
     #[tokio::test]
     async fn config_save_atomic_cleanup() {
         let dir =
-            std::env::temp_dir().join(format!("zeroclaw_test_config_{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("rantaiclaw_test_config_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).await.unwrap();
 
         let config_path = dir.join("config.toml");
@@ -4671,7 +4671,7 @@ channel_id = "C123"
             phone_number_id: Some("123".into()),
             verify_token: Some("ver".into()),
             app_secret: None,
-            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            session_path: Some("~/.rantaiclaw/state/whatsapp-web/session.db".into()),
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
@@ -4687,7 +4687,7 @@ channel_id = "C123"
             phone_number_id: None,
             verify_token: None,
             app_secret: None,
-            session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+            session_path: Some("~/.rantaiclaw/state/whatsapp-web/session.db".into()),
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec![],
@@ -5048,13 +5048,13 @@ default_temperature = 0.7
 
     fn clear_proxy_env_test_vars() {
         for key in [
-            "ZEROCLAW_PROXY_ENABLED",
-            "ZEROCLAW_HTTP_PROXY",
-            "ZEROCLAW_HTTPS_PROXY",
-            "ZEROCLAW_ALL_PROXY",
-            "ZEROCLAW_NO_PROXY",
-            "ZEROCLAW_PROXY_SCOPE",
-            "ZEROCLAW_PROXY_SERVICES",
+            "RANTAICLAW_PROXY_ENABLED",
+            "RANTAICLAW_HTTP_PROXY",
+            "RANTAICLAW_HTTPS_PROXY",
+            "RANTAICLAW_ALL_PROXY",
+            "RANTAICLAW_NO_PROXY",
+            "RANTAICLAW_PROXY_SCOPE",
+            "RANTAICLAW_PROXY_SERVICES",
             "HTTP_PROXY",
             "HTTPS_PROXY",
             "ALL_PROXY",
@@ -5074,11 +5074,11 @@ default_temperature = 0.7
         let mut config = Config::default();
         assert!(config.api_key.is_none());
 
-        std::env::set_var("ZEROCLAW_API_KEY", "sk-test-env-key");
+        std::env::set_var("RANTAICLAW_API_KEY", "sk-test-env-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("sk-test-env-key"));
 
-        std::env::remove_var("ZEROCLAW_API_KEY");
+        std::env::remove_var("RANTAICLAW_API_KEY");
     }
 
     #[test]
@@ -5086,7 +5086,7 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_API_KEY");
+        std::env::remove_var("RANTAICLAW_API_KEY");
         std::env::set_var("API_KEY", "sk-fallback-key");
         config.apply_env_overrides();
         assert_eq!(config.api_key.as_deref(), Some("sk-fallback-key"));
@@ -5099,11 +5099,11 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_PROVIDER", "anthropic");
+        std::env::set_var("RANTAICLAW_PROVIDER", "anthropic");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
+        std::env::remove_var("RANTAICLAW_PROVIDER");
     }
 
     #[test]
@@ -5117,9 +5117,9 @@ default_temperature = 0.7
             SkillsPromptInjectionMode::Full
         );
 
-        std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
-        std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
-        std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "compact");
+        std::env::set_var("RANTAICLAW_OPEN_SKILLS_ENABLED", "true");
+        std::env::set_var("RANTAICLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        std::env::set_var("RANTAICLAW_SKILLS_PROMPT_MODE", "compact");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
@@ -5132,9 +5132,9 @@ default_temperature = 0.7
             SkillsPromptInjectionMode::Compact
         );
 
-        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
-        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR");
-        std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
+        std::env::remove_var("RANTAICLAW_OPEN_SKILLS_ENABLED");
+        std::env::remove_var("RANTAICLAW_OPEN_SKILLS_DIR");
+        std::env::remove_var("RANTAICLAW_SKILLS_PROMPT_MODE");
     }
 
     #[test]
@@ -5144,8 +5144,8 @@ default_temperature = 0.7
         config.skills.open_skills_enabled = true;
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
 
-        std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
-        std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "invalid");
+        std::env::set_var("RANTAICLAW_OPEN_SKILLS_ENABLED", "maybe");
+        std::env::set_var("RANTAICLAW_SKILLS_PROMPT_MODE", "invalid");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
@@ -5153,8 +5153,8 @@ default_temperature = 0.7
             config.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Compact
         );
-        std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
-        std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
+        std::env::remove_var("RANTAICLAW_OPEN_SKILLS_ENABLED");
+        std::env::remove_var("RANTAICLAW_SKILLS_PROMPT_MODE");
     }
 
     #[test]
@@ -5162,7 +5162,7 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
+        std::env::remove_var("RANTAICLAW_PROVIDER");
         std::env::set_var("PROVIDER", "openai");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
@@ -5178,7 +5178,7 @@ default_temperature = 0.7
             ..Config::default()
         };
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
+        std::env::remove_var("RANTAICLAW_PROVIDER");
         std::env::set_var("PROVIDER", "openrouter");
         config.apply_env_overrides();
         assert_eq!(
@@ -5197,12 +5197,12 @@ default_temperature = 0.7
             ..Config::default()
         };
 
-        std::env::set_var("ZEROCLAW_PROVIDER", "openrouter");
+        std::env::set_var("RANTAICLAW_PROVIDER", "openrouter");
         std::env::set_var("PROVIDER", "anthropic");
         config.apply_env_overrides();
         assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
+        std::env::remove_var("RANTAICLAW_PROVIDER");
         std::env::remove_var("PROVIDER");
     }
 
@@ -5241,11 +5241,11 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_MODEL", "gpt-4o");
+        std::env::set_var("RANTAICLAW_MODEL", "gpt-4o");
         config.apply_env_overrides();
         assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
 
-        std::env::remove_var("ZEROCLAW_MODEL");
+        std::env::remove_var("RANTAICLAW_MODEL");
     }
 
     #[test]
@@ -5288,7 +5288,7 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_MODEL");
+        std::env::remove_var("RANTAICLAW_MODEL");
         std::env::set_var("MODEL", "anthropic/claude-3.5-sonnet");
         config.apply_env_overrides();
         assert_eq!(
@@ -5304,11 +5304,11 @@ default_temperature = 0.7
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace");
+        std::env::set_var("RANTAICLAW_WORKSPACE", "/custom/workspace");
         config.apply_env_overrides();
         assert_eq!(config.workspace_dir, PathBuf::from("/custom/workspace"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
     }
 
     #[test]
@@ -5318,7 +5318,7 @@ default_temperature = 0.7
         let default_workspace_dir = default_config_dir.join("workspace");
         let workspace_dir = default_config_dir.join("profile-a");
 
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        std::env::set_var("RANTAICLAW_WORKSPACE", &workspace_dir);
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -5328,7 +5328,7 @@ default_temperature = 0.7
         assert_eq!(config_dir, workspace_dir);
         assert_eq!(resolved_workspace_dir, workspace_dir.join("workspace"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -5349,8 +5349,8 @@ default_temperature = 0.7
             .await
             .unwrap();
 
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", &explicit_config_dir);
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", &explicit_config_dir);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
 
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
@@ -5364,7 +5364,7 @@ default_temperature = 0.7
             explicit_config_dir.join("workspace")
         );
 
-        std::env::remove_var("ZEROCLAW_CONFIG_DIR");
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
@@ -5376,7 +5376,7 @@ default_temperature = 0.7
         let marker_config_dir = default_config_dir.join("profiles").join("alpha");
         let state_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
         fs::create_dir_all(&default_config_dir).await.unwrap();
         let state = ActiveWorkspaceState {
             config_dir: marker_config_dir.to_string_lossy().into_owned(),
@@ -5403,7 +5403,7 @@ default_temperature = 0.7
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let default_workspace_dir = default_config_dir.join("workspace");
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
@@ -5420,12 +5420,12 @@ default_temperature = 0.7
     async fn load_or_init_workspace_override_uses_workspace_root_for_config() {
         let _env_guard = env_override_lock().await;
         let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("profile-a");
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        std::env::set_var("RANTAICLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -5433,7 +5433,7 @@ default_temperature = 0.7
         assert_eq!(config.config_path, workspace_dir.join("config.toml"));
         assert!(workspace_dir.join("config.toml").exists());
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
@@ -5446,13 +5446,13 @@ default_temperature = 0.7
     async fn load_or_init_workspace_suffix_uses_legacy_config_layout() {
         let _env_guard = env_override_lock().await;
         let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("workspace");
-        let legacy_config_path = temp_home.join(".zeroclaw").join("config.toml");
+        let legacy_config_path = temp_home.join(".rantaiclaw").join("config.toml");
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        std::env::set_var("RANTAICLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -5460,7 +5460,7 @@ default_temperature = 0.7
         assert_eq!(config.config_path, legacy_config_path);
         assert!(config.config_path.exists());
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
@@ -5473,9 +5473,9 @@ default_temperature = 0.7
     async fn load_or_init_workspace_override_keeps_existing_legacy_config() {
         let _env_guard = env_override_lock().await;
         let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
         let workspace_dir = temp_home.join("custom-workspace");
-        let legacy_config_dir = temp_home.join(".zeroclaw");
+        let legacy_config_dir = temp_home.join(".rantaiclaw");
         let legacy_config_path = legacy_config_dir.join("config.toml");
 
         fs::create_dir_all(&legacy_config_dir).await.unwrap();
@@ -5490,7 +5490,7 @@ default_model = "legacy-model"
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
-        std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir);
+        std::env::set_var("RANTAICLAW_WORKSPACE", &workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
@@ -5498,7 +5498,7 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(config.default_model.as_deref(), Some("legacy-model"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
@@ -5511,7 +5511,7 @@ default_model = "legacy-model"
     async fn load_or_init_uses_persisted_active_workspace_marker() {
         let _env_guard = env_override_lock().await;
         let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
         let custom_config_dir = temp_home.join("profiles").join("agent-alpha");
 
         fs::create_dir_all(&custom_config_dir).await.unwrap();
@@ -5524,7 +5524,7 @@ default_model = "legacy-model"
 
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
 
         persist_active_workspace_config_dir(&custom_config_dir)
             .await
@@ -5548,7 +5548,7 @@ default_model = "legacy-model"
     async fn load_or_init_env_workspace_override_takes_priority_over_marker() {
         let _env_guard = env_override_lock().await;
         let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
         let marker_config_dir = temp_home.join("profiles").join("persisted-profile");
         let env_workspace_dir = temp_home.join("env-workspace");
 
@@ -5565,14 +5565,14 @@ default_model = "legacy-model"
         persist_active_workspace_config_dir(&marker_config_dir)
             .await
             .unwrap();
-        std::env::set_var("ZEROCLAW_WORKSPACE", &env_workspace_dir);
+        std::env::set_var("RANTAICLAW_WORKSPACE", &env_workspace_dir);
 
         let config = Config::load_or_init().await.unwrap();
 
         assert_eq!(config.workspace_dir, env_workspace_dir.join("workspace"));
         assert_eq!(config.config_path, env_workspace_dir.join("config.toml"));
 
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
         } else {
@@ -5585,8 +5585,8 @@ default_model = "legacy-model"
     async fn persist_active_workspace_marker_is_cleared_for_default_config_dir() {
         let _env_guard = env_override_lock().await;
         let temp_home =
-            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
-        let default_config_dir = temp_home.join(".zeroclaw");
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let default_config_dir = temp_home.join(".rantaiclaw");
         let custom_config_dir = temp_home.join("profiles").join("custom-profile");
         let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
@@ -5617,11 +5617,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         let original_provider = config.default_provider.clone();
 
-        std::env::set_var("ZEROCLAW_PROVIDER", "");
+        std::env::set_var("RANTAICLAW_PROVIDER", "");
         config.apply_env_overrides();
         assert_eq!(config.default_provider, original_provider);
 
-        std::env::remove_var("ZEROCLAW_PROVIDER");
+        std::env::remove_var("RANTAICLAW_PROVIDER");
     }
 
     #[test]
@@ -5630,11 +5630,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.gateway.port, 3000);
 
-        std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080");
+        std::env::set_var("RANTAICLAW_GATEWAY_PORT", "8080");
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, 8080);
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
+        std::env::remove_var("RANTAICLAW_GATEWAY_PORT");
     }
 
     #[test]
@@ -5642,7 +5642,7 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
+        std::env::remove_var("RANTAICLAW_GATEWAY_PORT");
         std::env::set_var("PORT", "9000");
         config.apply_env_overrides();
         assert_eq!(config.gateway.port, 9000);
@@ -5656,11 +5656,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.gateway.host, "127.0.0.1");
 
-        std::env::set_var("ZEROCLAW_GATEWAY_HOST", "0.0.0.0");
+        std::env::set_var("RANTAICLAW_GATEWAY_HOST", "0.0.0.0");
         config.apply_env_overrides();
         assert_eq!(config.gateway.host, "0.0.0.0");
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
+        std::env::remove_var("RANTAICLAW_GATEWAY_HOST");
     }
 
     #[test]
@@ -5668,7 +5668,7 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
+        std::env::remove_var("RANTAICLAW_GATEWAY_HOST");
         std::env::set_var("HOST", "0.0.0.0");
         config.apply_env_overrides();
         assert_eq!(config.gateway.host, "0.0.0.0");
@@ -5681,31 +5681,31 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_TEMPERATURE", "0.5");
+        std::env::set_var("RANTAICLAW_TEMPERATURE", "0.5");
         config.apply_env_overrides();
         assert!((config.default_temperature - 0.5).abs() < f64::EPSILON);
 
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        std::env::remove_var("RANTAICLAW_TEMPERATURE");
     }
 
     #[test]
     async fn env_override_temperature_out_of_range_ignored() {
         let _env_guard = env_override_lock().await;
         // Clean up any leftover env vars from other tests
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        std::env::remove_var("RANTAICLAW_TEMPERATURE");
 
         let mut config = Config::default();
         let original_temp = config.default_temperature;
 
         // Temperature > 2.0 should be ignored
-        std::env::set_var("ZEROCLAW_TEMPERATURE", "3.0");
+        std::env::set_var("RANTAICLAW_TEMPERATURE", "3.0");
         config.apply_env_overrides();
         assert!(
             (config.default_temperature - original_temp).abs() < f64::EPSILON,
             "Temperature 3.0 should be ignored (out of range)"
         );
 
-        std::env::remove_var("ZEROCLAW_TEMPERATURE");
+        std::env::remove_var("RANTAICLAW_TEMPERATURE");
     }
 
     #[test]
@@ -5714,15 +5714,15 @@ default_model = "legacy-model"
         let mut config = Config::default();
         assert_eq!(config.runtime.reasoning_enabled, None);
 
-        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "false");
+        std::env::set_var("RANTAICLAW_REASONING_ENABLED", "false");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
-        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "true");
+        std::env::set_var("RANTAICLAW_REASONING_ENABLED", "true");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(true));
 
-        std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+        std::env::remove_var("RANTAICLAW_REASONING_ENABLED");
     }
 
     #[test]
@@ -5731,11 +5731,11 @@ default_model = "legacy-model"
         let mut config = Config::default();
         config.runtime.reasoning_enabled = Some(false);
 
-        std::env::set_var("ZEROCLAW_REASONING_ENABLED", "maybe");
+        std::env::set_var("RANTAICLAW_REASONING_ENABLED", "maybe");
         config.apply_env_overrides();
         assert_eq!(config.runtime.reasoning_enabled, Some(false));
 
-        std::env::remove_var("ZEROCLAW_REASONING_ENABLED");
+        std::env::remove_var("RANTAICLAW_REASONING_ENABLED");
     }
 
     #[test]
@@ -5804,9 +5804,9 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_STORAGE_PROVIDER", "postgres");
-        std::env::set_var("ZEROCLAW_STORAGE_DB_URL", "postgres://example/db");
-        std::env::set_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
+        std::env::set_var("RANTAICLAW_STORAGE_PROVIDER", "postgres");
+        std::env::set_var("RANTAICLAW_STORAGE_DB_URL", "postgres://example/db");
+        std::env::set_var("RANTAICLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
 
         config.apply_env_overrides();
 
@@ -5820,9 +5820,9 @@ default_model = "legacy-model"
             Some(15)
         );
 
-        std::env::remove_var("ZEROCLAW_STORAGE_PROVIDER");
-        std::env::remove_var("ZEROCLAW_STORAGE_DB_URL");
-        std::env::remove_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS");
+        std::env::remove_var("RANTAICLAW_STORAGE_PROVIDER");
+        std::env::remove_var("RANTAICLAW_STORAGE_DB_URL");
+        std::env::remove_var("RANTAICLAW_STORAGE_CONNECT_TIMEOUT_SECS");
     }
 
     #[test]
@@ -5847,13 +5847,13 @@ default_model = "legacy-model"
         clear_proxy_env_test_vars();
 
         let mut config = Config::default();
-        std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true");
-        std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
+        std::env::set_var("RANTAICLAW_PROXY_ENABLED", "true");
+        std::env::set_var("RANTAICLAW_HTTP_PROXY", "http://127.0.0.1:7890");
         std::env::set_var(
-            "ZEROCLAW_PROXY_SERVICES",
+            "RANTAICLAW_PROXY_SERVICES",
             "provider.openai, tool.http_request",
         );
-        std::env::set_var("ZEROCLAW_PROXY_SCOPE", "services");
+        std::env::set_var("RANTAICLAW_PROXY_SCOPE", "services");
 
         config.apply_env_overrides();
 
@@ -5876,11 +5876,11 @@ default_model = "legacy-model"
         clear_proxy_env_test_vars();
 
         let mut config = Config::default();
-        std::env::set_var("ZEROCLAW_PROXY_ENABLED", "true");
-        std::env::set_var("ZEROCLAW_PROXY_SCOPE", "environment");
-        std::env::set_var("ZEROCLAW_HTTP_PROXY", "http://127.0.0.1:7890");
-        std::env::set_var("ZEROCLAW_HTTPS_PROXY", "http://127.0.0.1:7891");
-        std::env::set_var("ZEROCLAW_NO_PROXY", "localhost,127.0.0.1");
+        std::env::set_var("RANTAICLAW_PROXY_ENABLED", "true");
+        std::env::set_var("RANTAICLAW_PROXY_SCOPE", "environment");
+        std::env::set_var("RANTAICLAW_HTTP_PROXY", "http://127.0.0.1:7890");
+        std::env::set_var("RANTAICLAW_HTTPS_PROXY", "http://127.0.0.1:7891");
+        std::env::set_var("RANTAICLAW_NO_PROXY", "localhost,127.0.0.1");
 
         config.apply_env_overrides();
 

@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -14,7 +15,9 @@ use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
+use crate::skills;
 use crate::tools;
+use crate::tools::traits::Tool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -36,8 +39,10 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Request timeout — balances slow-loris protection with tool execution time.
+/// Tool-enabled webhooks may need multiple LLM round-trips, so 120s is the safe
+/// ceiling. Callers that need shorter deadlines should set their own HTTP timeout.
+pub const REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -264,6 +269,39 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     }
 }
 
+/// A webhook trigger route loaded from `~/.rantaiclaw/webhook-routes.json`.
+/// Maps an incoming HTTP path to a skill invocation.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WebhookRoute {
+    pub path: String,
+    pub skill: String,
+    pub message: String,
+}
+
+/// Load webhook routes from the JSON file written by the agent-runner.
+fn load_webhook_routes(config_dir: &std::path::Path) -> Vec<WebhookRoute> {
+    let routes_path = config_dir.join("webhook-routes.json");
+    match std::fs::read_to_string(&routes_path) {
+        Ok(content) => match serde_json::from_str::<Vec<WebhookRoute>>(&content) {
+            Ok(routes) => {
+                if !routes.is_empty() {
+                    tracing::info!(
+                        "[Gateway] Loaded {} webhook trigger route(s) from {}",
+                        routes.len(),
+                        routes_path.display()
+                    );
+                }
+                routes
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse webhook-routes.json: {e}");
+                Vec::new()
+            }
+        },
+        Err(_) => Vec::new(), // File doesn't exist — no webhook triggers configured
+    }
+}
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -273,6 +311,8 @@ pub struct AppState {
     pub temperature: f64,
     pub mem: Arc<dyn Memory>,
     pub auto_save: bool,
+    /// Full tool registry for agentic webhook execution.
+    pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
@@ -290,6 +330,8 @@ pub struct AppState {
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    /// Webhook trigger routes loaded from agent-runner config
+    pub webhook_routes: Arc<Vec<WebhookRoute>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -318,7 +360,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.reliability,
         &providers::ProviderRuntimeOptions {
             auth_profile_override: None,
-            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+            rantaiclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
         },
@@ -350,7 +392,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let mut base_tools = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -363,7 +405,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+
+    // Load skill tools from workspace and register them as real callable tools.
+    // Skills define [[tools]] blocks in SKILL.toml that become shell/http tools.
+    let startup_skills = skills::load_skills_with_config(&config.workspace_dir, &config);
+    let skill_tools = tools::skill_tools_from_skills(&startup_skills);
+    if !skill_tools.is_empty() {
+        tracing::info!(
+            "[Gateway] Registered {} skill tools from {} skills",
+            skill_tools.len(),
+            startup_skills.iter().filter(|s| !s.tools.is_empty()).count()
+        );
+        base_tools.extend(skill_tools);
+    }
+    let tools_registry = Arc::new(base_tools);
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -391,7 +447,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // WhatsApp app secret for webhook signature verification
     // Priority: environment variable > config file
-    let whatsapp_app_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_WHATSAPP_APP_SECRET")
+    let whatsapp_app_secret: Option<Arc<str>> = std::env::var("RANTAICLAW_WHATSAPP_APP_SECRET")
         .ok()
         .and_then(|secret| {
             let secret = secret.trim();
@@ -419,7 +475,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Linq signing secret for webhook signature verification
     // Priority: environment variable > config file
-    let linq_signing_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINQ_SIGNING_SECRET")
+    let linq_signing_secret: Option<Arc<str>> = std::env::var("RANTAICLAW_LINQ_SIGNING_SECRET")
         .ok()
         .and_then(|secret| {
             let secret = secret.trim();
@@ -449,7 +505,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Nextcloud Talk webhook secret for signature verification
     // Priority: environment variable > config file
     let nextcloud_talk_webhook_secret: Option<Arc<str>> =
-        std::env::var("ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
+        std::env::var("RANTAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET")
             .ok()
             .and_then(|secret| {
                 let secret = secret.trim();
@@ -511,7 +567,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     }
 
-    println!("🦀 ZeroClaw Gateway listening on http://{display_addr}");
+    println!("🦀 RantaiClaw Gateway listening on http://{display_addr}");
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
@@ -549,6 +605,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let observer: Arc<dyn crate::observability::Observer> =
         Arc::from(crate::observability::create_observer(&config.observability));
 
+    // Load webhook trigger routes from agent-runner config
+    let config_dir = config.config_path.parent().map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from(
+            directories::BaseDirs::new()
+                .map(|d| d.home_dir().join(".rantaiclaw"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/root/.rantaiclaw"))
+        ));
+    let webhook_routes = Arc::new(load_webhook_routes(&config_dir));
+
     let state = AppState {
         config: config_state,
         provider,
@@ -556,6 +621,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         temperature,
         mem,
         auto_save: config.memory.auto_save,
+        tools_registry,
         webhook_secret_hash,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
@@ -568,6 +634,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         observer,
+        webhook_routes,
     };
 
     // Build router with middleware
@@ -580,6 +647,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        .route("/triggers/{*path}", post(handle_trigger_webhook))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -713,11 +781,119 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
+/// Maximum tool-call iterations per webhook request. Keeps runaway loops bounded
+/// while allowing multi-step agentic tasks (memory recall → shell → file write → summarize).
+const GATEWAY_MAX_TOOL_ITERATIONS: usize = 15;
+
+/// Structured tool call info returned alongside the response text.
+#[derive(serde::Serialize)]
+struct WebhookToolCall {
+    #[serde(rename = "toolCallId")]
+    tool_call_id: String,
+    #[serde(rename = "toolName")]
+    tool_name: String,
+    input: serde_json::Value,
+    output: String,
+}
+
+/// Result of a gateway chat that includes both text and tool execution metadata.
+struct GatewayChatResult {
+    response: String,
+    tool_calls: Vec<WebhookToolCall>,
+}
+
+/// Extract structured tool call info from the conversation history that
+/// `run_tool_call_loop` built up during execution.
+///
+/// The history contains interleaved assistant messages (with `<tool_call>` XML)
+/// and tool-result messages. We parse the XML from assistant messages and pair
+/// them with subsequent results.
+fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCall> {
+    let call_re = regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#)
+        .expect("valid regex");
+    let result_re =
+        regex::Regex::new(r#"<tool_result name="([^"]+)">\s*([\s\S]*?)\s*</tool_result>"#)
+            .expect("valid regex");
+
+    let mut tool_calls = Vec::new();
+    let mut call_index = 0u32;
+
+    // Collect results from user "[Tool results]" messages
+    let mut result_map: HashMap<String, Vec<String>> = HashMap::new();
+    for msg in history {
+        if (msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            || msg.role == "tool"
+        {
+            for cap in result_re.captures_iter(&msg.content) {
+                result_map
+                    .entry(cap[1].to_string())
+                    .or_default()
+                    .push(cap[2].to_string());
+            }
+            // Native tool messages have JSON content with tool_call_id
+            if msg.role == "tool" {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                    if let (Some(id), Some(content)) = (
+                        parsed.get("tool_call_id").and_then(|v| v.as_str()),
+                        parsed.get("content").and_then(|v| v.as_str()),
+                    ) {
+                        result_map
+                            .entry(id.to_string())
+                            .or_default()
+                            .push(content.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Track per-tool-name result index for sequential matching
+    let mut result_indices: HashMap<String, usize> = HashMap::new();
+
+    for msg in history {
+        if msg.role != "assistant" {
+            continue;
+        }
+        for cap in call_re.captures_iter(&msg.content) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cap[1]) {
+                let tool_name = parsed
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let arguments = parsed
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+                // Find matching result
+                let idx = result_indices.entry(tool_name.clone()).or_insert(0);
+                let output = result_map
+                    .get(&tool_name)
+                    .and_then(|results| results.get(*idx))
+                    .cloned()
+                    .unwrap_or_else(|| "completed".to_string());
+                *idx += 1;
+
+                tool_calls.push(WebhookToolCall {
+                    tool_call_id: format!("tc_{call_index}"),
+                    tool_name,
+                    input: arguments,
+                    output,
+                });
+                call_index += 1;
+            }
+        }
+    }
+
+    tool_calls
+}
+
 async fn run_gateway_chat_with_multimodal(
     state: &AppState,
     provider_label: &str,
     message: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<GatewayChatResult> {
     let user_messages = vec![ChatMessage::user(message)];
     let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
     if image_marker_count > 0 && !state.provider.supports_vision() {
@@ -731,32 +907,67 @@ async fn run_gateway_chat_with_multimodal(
         .into());
     }
 
-    // Keep webhook/gateway prompts aligned with channel behavior by injecting
-    // workspace-aware system context before model invocation.
-    let system_prompt = {
+    // Load skills from workspace (same as CLI agent does).
+    let loaded_skills = {
+        let config_guard = state.config.lock();
+        skills::load_skills_with_config(&config_guard.workspace_dir, &config_guard)
+    };
+
+    // Convert tool registry to (name, description) pairs for system prompt.
+    let tool_descs: Vec<(&str, &str)> = state
+        .tools_registry
+        .iter()
+        .map(|t| (t.name(), t.description()))
+        .collect();
+
+    // Build system prompt with full tool + skill awareness.
+    let mut system_prompt = {
         let config_guard = state.config.lock();
         crate::channels::build_system_prompt(
             &config_guard.workspace_dir,
             &state.model,
-            &[], // tools - empty for simple chat
-            &[], // skills
+            &tool_descs,
+            &loaded_skills,
             Some(&config_guard.identity),
             None, // bootstrap_max_chars - use default
         )
     };
 
-    let mut messages = Vec::with_capacity(1 + user_messages.len());
-    messages.push(ChatMessage::system(system_prompt));
-    messages.extend(user_messages);
+    // Append tool use protocol and tool descriptions so the LLM knows how to call them.
+    system_prompt.push_str(&build_tool_instructions(&state.tools_registry));
+
+    let mut history = Vec::with_capacity(2);
+    history.push(ChatMessage::system(system_prompt));
+    history.extend(user_messages);
 
     let multimodal_config = state.config.lock().multimodal.clone();
-    let prepared =
-        crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
 
-    state
-        .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
-        .await
+    // Run the full agentic loop: LLM → tool calls → execute → feed results → repeat.
+    let response = run_tool_call_loop(
+        state.provider.as_ref(),
+        &mut history,
+        &state.tools_registry,
+        state.observer.as_ref(),
+        provider_label,
+        &state.model,
+        state.temperature,
+        true, // silent — no terminal output in gateway mode
+        None, // no approval manager — gateway runs autonomously
+        "webhook",
+        &multimodal_config,
+        GATEWAY_MAX_TOOL_ITERATIONS,
+        None, // no cancellation token
+        None, // no streaming delta channel
+    )
+    .await?;
+
+    // Extract tool call metadata from the conversation history for the UI.
+    let tool_calls = extract_tool_calls_from_history(&history);
+
+    Ok(GatewayChatResult {
+        response,
+        tool_calls,
+    })
 }
 
 /// Webhook request body
@@ -881,7 +1092,7 @@ async fn handle_webhook(
         });
 
     match run_gateway_chat_with_multimodal(&state, &provider_label, message).await {
-        Ok(response) => {
+        Ok(result) => {
             let duration = started_at.elapsed();
             state
                 .observer
@@ -905,7 +1116,14 @@ async fn handle_webhook(
                     cost_usd: None,
                 });
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let mut body = serde_json::json!({
+                "response": result.response,
+                "model": state.model,
+            });
+            if !result.tool_calls.is_empty() {
+                body["tool_calls"] = serde_json::to_value(&result.tool_calls)
+                    .unwrap_or(serde_json::Value::Array(vec![]));
+            }
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -1087,10 +1305,10 @@ async fn handle_whatsapp_message(
         }
 
         match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
-            Ok(response) => {
+            Ok(result) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(result.response, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
@@ -1201,10 +1419,10 @@ async fn handle_linq_webhook(
 
         // Call the LLM
         match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
-            Ok(response) => {
+            Ok(result) => {
                 // Send reply via Linq
                 if let Err(e) = linq
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(result.response, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send Linq reply: {e}");
@@ -1312,9 +1530,9 @@ async fn handle_nextcloud_talk_webhook(
         }
 
         match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
-            Ok(response) => {
+            Ok(result) => {
                 if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(result.response, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send Nextcloud Talk reply: {e}");
@@ -1333,6 +1551,112 @@ async fn handle_nextcloud_talk_webhook(
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// Webhook trigger request body (optional — payload is forwarded to the skill)
+#[derive(serde::Deserialize, Default)]
+pub struct TriggerBody {
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+}
+
+/// POST /triggers/*path — invoke a skill via its registered webhook trigger.
+/// Matches the incoming path against `webhook_routes` loaded from
+/// `~/.rantaiclaw/webhook-routes.json` and runs the matched skill's message
+/// through the full agentic loop.
+async fn handle_trigger_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Path(trigger_path): axum::extract::Path<String>,
+    body: Result<Json<TriggerBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    // Rate-limit using the same webhook limiter
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        let err = serde_json::json!({
+            "error": "Too many trigger requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    // Bearer token auth (same as webhook)
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair"
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+    }
+
+    // Match path against loaded webhook routes
+    let normalized_path = trigger_path.trim_start_matches('/');
+    let matched_route = state
+        .webhook_routes
+        .iter()
+        .find(|r| r.path.trim_start_matches('/') == normalized_path);
+
+    let Some(route) = matched_route else {
+        let err = serde_json::json!({
+            "error": format!("No trigger route registered for path: {normalized_path}"),
+            "available_routes": state.webhook_routes.iter().map(|r| &r.path).collect::<Vec<_>>(),
+        });
+        return (StatusCode::NOT_FOUND, Json(err));
+    };
+
+    // Build the message: route message + optional payload
+    let payload_str = body
+        .ok()
+        .and_then(|Json(b)| b.payload)
+        .map(|p| format!("\n\nPayload: {}", serde_json::to_string(&p).unwrap_or_default()))
+        .unwrap_or_default();
+
+    let message = format!(
+        "[Webhook Trigger: {}] {}{payload_str}",
+        route.skill, route.message
+    );
+
+    tracing::info!(
+        "Trigger webhook: path={normalized_path}, skill={}, message_len={}",
+        route.skill,
+        message.len()
+    );
+
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    match run_gateway_chat_with_multimodal(&state, &provider_label, &message).await {
+        Ok(result) => {
+            let mut body = serde_json::json!({
+                "response": result.response,
+                "skill": route.skill,
+                "trigger_path": normalized_path,
+            });
+            if !result.tool_calls.is_empty() {
+                body["tool_calls"] = serde_json::to_value(&result.tool_calls)
+                    .unwrap_or(serde_json::Value::Array(vec![]));
+            }
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+            tracing::error!("Trigger webhook error: {sanitized}");
+            let err = serde_json::json!({"error": "Trigger execution failed"});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1413,6 +1737,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1458,6 +1783,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer,
+            webhook_routes: Arc::new(Vec::new()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1465,7 +1791,7 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("zeroclaw_heartbeat_ticks_total 1"));
+        assert!(text.contains("rantaiclaw_heartbeat_ticks_total 1"));
     }
 
     #[test]
@@ -1820,6 +2146,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -1880,6 +2207,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
         };
 
         let headers = HeaderMap::new();
@@ -1952,6 +2280,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
         };
 
         let response = handle_webhook(
@@ -1996,6 +2325,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2045,6 +2375,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2099,6 +2430,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2149,6 +2481,7 @@ mod tests {
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();

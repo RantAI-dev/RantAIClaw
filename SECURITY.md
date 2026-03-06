@@ -13,7 +13,7 @@
 Instead, please report them responsibly:
 
 1. **Email**: Send details to the maintainers via GitHub private vulnerability reporting
-2. **GitHub**: Use [GitHub Security Advisories](https://github.com/theonlyhennygod/zeroclaw/security/advisories/new)
+2. **GitHub**: Use [GitHub Security Advisories](https://github.com/theonlyhennygod/rantaiclaw/security/advisories/new)
 
 ### What to Include
 
@@ -30,7 +30,7 @@ Instead, please report them responsibly:
 
 ## Security Architecture
 
-ZeroClaw implements defense-in-depth security:
+RantaiClaw implements defense-in-depth security:
 
 ### Autonomy Levels
 - **ReadOnly** — Agent can only read, no shell or write access
@@ -64,7 +64,7 @@ cargo test -- tools::file_write
 
 ## Container Security
 
-ZeroClaw Docker images follow CIS Docker Benchmark best practices:
+RantaiClaw Docker images follow CIS Docker Benchmark best practices:
 
 | Control | Implementation |
 |---------|----------------|
@@ -77,12 +77,12 @@ ZeroClaw Docker images follow CIS Docker Benchmark best practices:
 
 ```bash
 # Build and verify non-root user
-docker build -t zeroclaw .
-docker inspect --format='{{.Config.User}}' zeroclaw
+docker build -t rantaiclaw .
+docker inspect --format='{{.Config.User}}' rantaiclaw
 # Expected: 65534:65534
 
 # Run with read-only filesystem (production hardening)
-docker run --read-only -v /path/to/workspace:/workspace zeroclaw gateway
+docker run --read-only -v /path/to/workspace:/workspace rantaiclaw gateway
 ```
 
 ### CI Enforcement

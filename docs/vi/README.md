@@ -1,4 +1,4 @@
-# Tài liệu ZeroClaw (Tiếng Việt)
+# Tài liệu RantaiClaw (Tiếng Việt)
 
 Đây là trang chủ tiếng Việt của hệ thống tài liệu.
 

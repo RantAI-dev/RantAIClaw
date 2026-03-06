@@ -1,6 +1,6 @@
-# ZeroClaw Commands Reference
+# RantaiClaw Commands Reference
 
-This reference is derived from the current CLI surface (`zeroclaw --help`).
+This reference is derived from the current CLI surface (`rantaiclaw --help`).
 
 Last verified: **February 20, 2026**.
 
@@ -31,51 +31,51 @@ Last verified: **February 20, 2026**.
 
 ### `onboard`
 
-- `zeroclaw onboard`
-- `zeroclaw onboard --interactive`
-- `zeroclaw onboard --channels-only`
-- `zeroclaw onboard --force`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
+- `rantaiclaw onboard`
+- `rantaiclaw onboard --interactive`
+- `rantaiclaw onboard --channels-only`
+- `rantaiclaw onboard --force`
+- `rantaiclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
+- `rantaiclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
+- `rantaiclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
 
 `onboard` safety behavior:
 
 - If `config.toml` already exists, `onboard` asks for explicit confirmation before overwrite.
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
-- Use `zeroclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
+- Use `rantaiclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
 
 ### `agent`
 
-- `zeroclaw agent`
-- `zeroclaw agent -m "Hello"`
-- `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
-- `zeroclaw agent --peripheral <board:path>`
+- `rantaiclaw agent`
+- `rantaiclaw agent -m "Hello"`
+- `rantaiclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
+- `rantaiclaw agent --peripheral <board:path>`
 
 ### `gateway` / `daemon`
 
-- `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
-- `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
+- `rantaiclaw gateway [--host <HOST>] [--port <PORT>]`
+- `rantaiclaw daemon [--host <HOST>] [--port <PORT>]`
 
 ### `service`
 
-- `zeroclaw service install`
-- `zeroclaw service start`
-- `zeroclaw service stop`
-- `zeroclaw service restart`
-- `zeroclaw service status`
-- `zeroclaw service uninstall`
+- `rantaiclaw service install`
+- `rantaiclaw service start`
+- `rantaiclaw service stop`
+- `rantaiclaw service restart`
+- `rantaiclaw service status`
+- `rantaiclaw service uninstall`
 
 ### `cron`
 
-- `zeroclaw cron list`
-- `zeroclaw cron add <expr> [--tz <IANA_TZ>] <command>`
-- `zeroclaw cron add-at <rfc3339_timestamp> <command>`
-- `zeroclaw cron add-every <every_ms> <command>`
-- `zeroclaw cron once <delay> <command>`
-- `zeroclaw cron remove <id>`
-- `zeroclaw cron pause <id>`
-- `zeroclaw cron resume <id>`
+- `rantaiclaw cron list`
+- `rantaiclaw cron add <expr> [--tz <IANA_TZ>] <command>`
+- `rantaiclaw cron add-at <rfc3339_timestamp> <command>`
+- `rantaiclaw cron add-every <every_ms> <command>`
+- `rantaiclaw cron once <delay> <command>`
+- `rantaiclaw cron remove <id>`
+- `rantaiclaw cron pause <id>`
+- `rantaiclaw cron resume <id>`
 
 Notes:
 
@@ -84,20 +84,20 @@ Notes:
 
 ### `models`
 
-- `zeroclaw models refresh`
-- `zeroclaw models refresh --provider <ID>`
-- `zeroclaw models refresh --force`
+- `rantaiclaw models refresh`
+- `rantaiclaw models refresh --provider <ID>`
+- `rantaiclaw models refresh --force`
 
 `models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
 
 ### `channel`
 
-- `zeroclaw channel list`
-- `zeroclaw channel start`
-- `zeroclaw channel doctor`
-- `zeroclaw channel bind-telegram <IDENTITY>`
-- `zeroclaw channel add <type> <json>`
-- `zeroclaw channel remove <name>`
+- `rantaiclaw channel list`
+- `rantaiclaw channel start`
+- `rantaiclaw channel doctor`
+- `rantaiclaw channel bind-telegram <IDENTITY>`
+- `rantaiclaw channel add <type> <json>`
+- `rantaiclaw channel remove <name>`
 
 Runtime in-chat commands (Telegram/Discord while channel server is running):
 
@@ -117,13 +117,13 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 
 ### `integrations`
 
-- `zeroclaw integrations info <name>`
+- `rantaiclaw integrations info <name>`
 
 ### `skills`
 
-- `zeroclaw skills list`
-- `zeroclaw skills install <source>`
-- `zeroclaw skills remove <name>`
+- `rantaiclaw skills list`
+- `rantaiclaw skills install <source>`
+- `rantaiclaw skills remove <name>`
 
 `<source>` accepts git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`) or a local filesystem path.
 
@@ -131,43 +131,43 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 
 ### `migrate`
 
-- `zeroclaw migrate openclaw [--source <path>] [--dry-run]`
+- `rantaiclaw migrate openclaw [--source <path>] [--dry-run]`
 
 ### `config`
 
-- `zeroclaw config schema`
+- `rantaiclaw config schema`
 
 `config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
 
 ### `completions`
 
-- `zeroclaw completions bash`
-- `zeroclaw completions fish`
-- `zeroclaw completions zsh`
-- `zeroclaw completions powershell`
-- `zeroclaw completions elvish`
+- `rantaiclaw completions bash`
+- `rantaiclaw completions fish`
+- `rantaiclaw completions zsh`
+- `rantaiclaw completions powershell`
+- `rantaiclaw completions elvish`
 
 `completions` is stdout-only by design so scripts can be sourced directly without log/warning contamination.
 
 ### `hardware`
 
-- `zeroclaw hardware discover`
-- `zeroclaw hardware introspect <path>`
-- `zeroclaw hardware info [--chip <chip_name>]`
+- `rantaiclaw hardware discover`
+- `rantaiclaw hardware introspect <path>`
+- `rantaiclaw hardware info [--chip <chip_name>]`
 
 ### `peripheral`
 
-- `zeroclaw peripheral list`
-- `zeroclaw peripheral add <board> <path>`
-- `zeroclaw peripheral flash [--port <serial_port>]`
-- `zeroclaw peripheral setup-uno-q [--host <ip_or_host>]`
-- `zeroclaw peripheral flash-nucleo`
+- `rantaiclaw peripheral list`
+- `rantaiclaw peripheral add <board> <path>`
+- `rantaiclaw peripheral flash [--port <serial_port>]`
+- `rantaiclaw peripheral setup-uno-q [--host <ip_or_host>]`
+- `rantaiclaw peripheral flash-nucleo`
 
 ## Validation Tip
 
 To verify docs against your current binary quickly:
 
 ```bash
-zeroclaw --help
-zeroclaw <command> --help
+rantaiclaw --help
+rantaiclaw <command> --help
 ```

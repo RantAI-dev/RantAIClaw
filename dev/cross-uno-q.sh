@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compile ZeroClaw for Arduino UNO Q (aarch64 Debian Linux).
+# Cross-compile RantaiClaw for Arduino UNO Q (aarch64 Debian Linux).
 #
 # Prerequisites:
 #   brew install filosottile/musl-cross/musl-cross  # macOS
@@ -22,7 +22,7 @@ if [[ "${1:-}" == "--debug" ]]; then
     PROFILE="dev"
 fi
 
-echo "==> Cross-compiling ZeroClaw for $TARGET ($PROFILE)"
+echo "==> Cross-compiling RantaiClaw for $TARGET ($PROFILE)"
 
 # Check if cross is available (preferred)
 if command -v cross &>/dev/null; then
@@ -64,17 +64,17 @@ else
     fi
 fi
 
-BINARY="$PROJECT_DIR/target/$TARGET/$( [[ $PROFILE == release ]] && echo release || echo debug )/zeroclaw"
+BINARY="$PROJECT_DIR/target/$TARGET/$( [[ $PROFILE == release ]] && echo release || echo debug )/rantaiclaw"
 
 if [[ -f "$BINARY" ]]; then
     SIZE=$(du -h "$BINARY" | cut -f1)
     echo "==> Build complete: $BINARY ($SIZE)"
     echo ""
     echo "Deploy to Uno Q:"
-    echo "  zeroclaw peripheral deploy-uno-q --host <uno-q-ip>"
+    echo "  rantaiclaw peripheral deploy-uno-q --host <uno-q-ip>"
     echo ""
     echo "Or manually:"
-    echo "  scp $BINARY arduino@<uno-q-ip>:~/zeroclaw/"
+    echo "  scp $BINARY arduino@<uno-q-ip>:~/rantaiclaw/"
 else
     echo "Error: binary not found at $BINARY"
     exit 1
