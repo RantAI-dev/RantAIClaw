@@ -338,10 +338,13 @@ pub struct AppState {
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Webhook trigger routes loaded from agent-runner config
     pub webhook_routes: Arc<Vec<WebhookRoute>>,
+<<<<<<< HEAD
     /// Live channel registry for config API
     pub channel_registry: Arc<tokio::sync::RwLock<crate::channels::ChannelRegistry>>,
     /// Live MCP server registry for config API
     pub mcp_registry: Arc<tokio::sync::RwLock<crate::mcp::McpRegistry>>,
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -426,10 +429,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tracing::info!(
             "[Gateway] Registered {} skill tools from {} skills",
             skill_tools.len(),
+<<<<<<< HEAD
             startup_skills
                 .iter()
                 .filter(|s| !s.tools.is_empty())
                 .count()
+=======
+            startup_skills.iter().filter(|s| !s.tools.is_empty()).count()
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         );
         base_tools.extend(skill_tools);
     }
@@ -620,6 +627,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Arc::from(crate::observability::create_observer(&config.observability));
 
     // Load webhook trigger routes from agent-runner config
+<<<<<<< HEAD
     let config_dir = config
         .config_path
         .parent()
@@ -640,6 +648,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         crate::mcp::McpRegistry::new(),
     ));
 
+=======
+    let config_dir = config.config_path.parent().map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from(
+            directories::BaseDirs::new()
+                .map(|d| d.home_dir().join(".rantaiclaw"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/root/.rantaiclaw"))
+        ));
+    let webhook_routes = Arc::new(load_webhook_routes(&config_dir));
+
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
     let state = AppState {
         config: config_state,
         config_tx,
@@ -662,8 +680,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk_webhook_secret,
         observer,
         webhook_routes,
+<<<<<<< HEAD
         channel_registry: channel_registry.clone(),
         mcp_registry: mcp_registry.clone(),
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
     };
 
     // ── Seed live registries from config ────────────────────────────────
@@ -703,6 +724,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/triggers/{*path}", post(handle_trigger_webhook))
+<<<<<<< HEAD
         .route(
             "/tasks",
             get(task_handlers::handle_list_tasks).post(task_handlers::handle_create_task),
@@ -735,6 +757,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/config/model", axum::routing::patch(config_api::patch_model))
         .route("/config/tools", axum::routing::patch(config_api::patch_tools))
         .route("/config/agent", axum::routing::patch(config_api::patch_agent))
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -897,8 +921,13 @@ struct GatewayChatResult {
 /// and tool-result messages. We parse the XML from assistant messages and pair
 /// them with subsequent results.
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCall> {
+<<<<<<< HEAD
     let call_re =
         regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#).expect("valid regex");
+=======
+    let call_re = regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#)
+        .expect("valid regex");
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
     let result_re =
         regex::Regex::new(r#"<tool_result name="([^"]+)">\s*([\s\S]*?)\s*</tool_result>"#)
             .expect("valid regex");
@@ -909,7 +938,13 @@ fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCa
     // Collect results from user "[Tool results]" messages
     let mut result_map: HashMap<String, Vec<String>> = HashMap::new();
     for msg in history {
+<<<<<<< HEAD
         if (msg.role == "user" && msg.content.starts_with("[Tool results]")) || msg.role == "tool" {
+=======
+        if (msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            || msg.role == "tool"
+        {
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
             for cap in result_re.captures_iter(&msg.content) {
                 result_map
                     .entry(cap[1].to_string())
@@ -995,7 +1030,11 @@ async fn run_gateway_chat_with_multimodal(
 
     // Load skills from workspace (same as CLI agent does).
     let loaded_skills = {
+<<<<<<< HEAD
         let config_guard = state.config.read().await;
+=======
+        let config_guard = state.config.lock();
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         skills::load_skills_with_config(&config_guard.workspace_dir, &config_guard)
     };
 
@@ -1008,7 +1047,11 @@ async fn run_gateway_chat_with_multimodal(
 
     // Build system prompt with full tool + skill awareness.
     let mut system_prompt = {
+<<<<<<< HEAD
         let config_guard = state.config.read().await;
+=======
+        let config_guard = state.config.lock();
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         crate::channels::build_system_prompt(
             &config_guard.workspace_dir,
             &state.model,
@@ -1021,6 +1064,7 @@ async fn run_gateway_chat_with_multimodal(
 
     // Append tool use protocol and tool descriptions so the LLM knows how to call them.
     system_prompt.push_str(&build_tool_instructions(&state.tools_registry));
+<<<<<<< HEAD
 
     let mut history = Vec::with_capacity(2);
     history.push(ChatMessage::system(system_prompt));
@@ -1037,6 +1081,15 @@ async fn run_gateway_chat_with_multimodal(
         ApprovalManager::from_config(&config_guard.autonomy)
     };
 
+=======
+
+    let mut history = Vec::with_capacity(2);
+    history.push(ChatMessage::system(system_prompt));
+    history.extend(user_messages);
+
+    let multimodal_config = state.config.lock().multimodal.clone();
+
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
     // Run the full agentic loop: LLM → tool calls → execute → feed results → repeat.
     let response = run_tool_call_loop(
         state.provider.as_ref(),
@@ -1047,7 +1100,11 @@ async fn run_gateway_chat_with_multimodal(
         &state.model,
         state.temperature,
         true, // silent — no terminal output in gateway mode
+<<<<<<< HEAD
         Some(&approval_manager),
+=======
+        None, // no approval manager — gateway runs autonomously
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         "webhook",
         &multimodal_config,
         GATEWAY_MAX_TOOL_ITERATIONS,
@@ -1715,12 +1772,16 @@ async fn handle_trigger_webhook(
     let payload_str = body
         .ok()
         .and_then(|Json(b)| b.payload)
+<<<<<<< HEAD
         .map(|p| {
             format!(
                 "\n\nPayload: {}",
                 serde_json::to_string(&p).unwrap_or_default()
             )
         })
+=======
+        .map(|p| format!("\n\nPayload: {}", serde_json::to_string(&p).unwrap_or_default()))
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         .unwrap_or_default();
 
     let message = format!(
@@ -1736,8 +1797,12 @@ async fn handle_trigger_webhook(
 
     let provider_label = state
         .config
+<<<<<<< HEAD
         .read()
         .await
+=======
+        .lock()
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1846,7 +1911,10 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+<<<<<<< HEAD
             tools_registry: Arc::new(Vec::new()),
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1896,7 +1964,10 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer,
             webhook_routes: Arc::new(Vec::new()),
+<<<<<<< HEAD
             tools_registry: Arc::new(Vec::new()),
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2263,7 +2334,10 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+<<<<<<< HEAD
             tools_registry: Arc::new(Vec::new()),
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let mut headers = HeaderMap::new();
@@ -2328,7 +2402,10 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+<<<<<<< HEAD
             tools_registry: Arc::new(Vec::new()),
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let headers = HeaderMap::new();
@@ -2405,7 +2482,10 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+<<<<<<< HEAD
             tools_registry: Arc::new(Vec::new()),
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let response = handle_webhook(
@@ -2454,7 +2534,10 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+<<<<<<< HEAD
             tools_registry: Arc::new(Vec::new()),
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let mut headers = HeaderMap::new();
@@ -2508,7 +2591,10 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+<<<<<<< HEAD
             tools_registry: Arc::new(Vec::new()),
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let mut headers = HeaderMap::new();
@@ -2567,7 +2653,10 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+<<<<<<< HEAD
             tools_registry: Arc::new(Vec::new()),
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2622,7 +2711,10 @@ mod tests {
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+<<<<<<< HEAD
             tools_registry: Arc::new(Vec::new()),
+=======
+>>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let mut headers = HeaderMap::new();
