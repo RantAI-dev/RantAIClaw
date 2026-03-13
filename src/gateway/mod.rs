@@ -417,7 +417,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tracing::info!(
             "[Gateway] Registered {} skill tools from {} skills",
             skill_tools.len(),
-            startup_skills.iter().filter(|s| !s.tools.is_empty()).count()
+            startup_skills
+                .iter()
+                .filter(|s| !s.tools.is_empty())
+                .count()
         );
         base_tools.extend(skill_tools);
     }
@@ -608,12 +611,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Arc::from(crate::observability::create_observer(&config.observability));
 
     // Load webhook trigger routes from agent-runner config
-    let config_dir = config.config_path.parent().map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from(
-            directories::BaseDirs::new()
-                .map(|d| d.home_dir().join(".rantaiclaw"))
-                .unwrap_or_else(|| std::path::PathBuf::from("/root/.rantaiclaw"))
-        ));
+    let config_dir = config
+        .config_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(
+                directories::BaseDirs::new()
+                    .map(|d| d.home_dir().join(".rantaiclaw"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/root/.rantaiclaw")),
+            )
+        });
     let webhook_routes = Arc::new(load_webhook_routes(&config_dir));
 
     let state = AppState {
@@ -650,10 +658,24 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/triggers/{*path}", post(handle_trigger_webhook))
-        .route("/tasks", get(task_handlers::handle_list_tasks).post(task_handlers::handle_create_task))
-        .route("/tasks/{id}", get(task_handlers::handle_get_task).put(task_handlers::handle_update_task).delete(task_handlers::handle_delete_task))
-        .route("/tasks/{id}/review", post(task_handlers::handle_review_task))
-        .route("/tasks/{id}/comments", get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment))
+        .route(
+            "/tasks",
+            get(task_handlers::handle_list_tasks).post(task_handlers::handle_create_task),
+        )
+        .route(
+            "/tasks/{id}",
+            get(task_handlers::handle_get_task)
+                .put(task_handlers::handle_update_task)
+                .delete(task_handlers::handle_delete_task),
+        )
+        .route(
+            "/tasks/{id}/review",
+            post(task_handlers::handle_review_task),
+        )
+        .route(
+            "/tasks/{id}/comments",
+            get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment),
+        )
         .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
@@ -816,8 +838,8 @@ struct GatewayChatResult {
 /// and tool-result messages. We parse the XML from assistant messages and pair
 /// them with subsequent results.
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCall> {
-    let call_re = regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#)
-        .expect("valid regex");
+    let call_re =
+        regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#).expect("valid regex");
     let result_re =
         regex::Regex::new(r#"<tool_result name="([^"]+)">\s*([\s\S]*?)\s*</tool_result>"#)
             .expect("valid regex");
@@ -828,9 +850,7 @@ fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCa
     // Collect results from user "[Tool results]" messages
     let mut result_map: HashMap<String, Vec<String>> = HashMap::new();
     for msg in history {
-        if (msg.role == "user" && msg.content.starts_with("[Tool results]"))
-            || msg.role == "tool"
-        {
+        if (msg.role == "user" && msg.content.starts_with("[Tool results]")) || msg.role == "tool" {
             for cap in result_re.captures_iter(&msg.content) {
                 result_map
                     .entry(cap[1].to_string())
@@ -1623,7 +1643,12 @@ async fn handle_trigger_webhook(
     let payload_str = body
         .ok()
         .and_then(|Json(b)| b.payload)
-        .map(|p| format!("\n\nPayload: {}", serde_json::to_string(&p).unwrap_or_default()))
+        .map(|p| {
+            format!(
+                "\n\nPayload: {}",
+                serde_json::to_string(&p).unwrap_or_default()
+            )
+        })
         .unwrap_or_default();
 
     let message = format!(
@@ -1745,6 +1770,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1791,6 +1817,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer,
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2154,6 +2181,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2215,6 +2243,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let headers = HeaderMap::new();
@@ -2288,6 +2317,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let response = handle_webhook(
@@ -2333,6 +2363,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2383,6 +2414,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2438,6 +2470,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2489,6 +2522,7 @@ mod tests {
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
