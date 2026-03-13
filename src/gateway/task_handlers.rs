@@ -18,13 +18,33 @@ use crate::tasks::{
 };
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::Json,
 };
 use serde::Deserialize;
 
 /// Response type alias for all task handlers.
 type TaskResponse = (StatusCode, Json<serde_json::Value>);
+
+fn require_auth(state: &AppState, headers: &HeaderMap) -> Option<TaskResponse> {
+    if !state.pairing.require_pairing() {
+        return None;
+    }
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth.strip_prefix("Bearer ").unwrap_or("");
+    if !state.pairing.is_authenticated(token) {
+        return Some((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            })),
+        ));
+    }
+    None
+}
 
 fn err_disabled() -> TaskResponse {
     (
@@ -97,8 +117,12 @@ impl TaskListQuery {
 
 pub async fn handle_list_tasks(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<TaskListQuery>,
 ) -> TaskResponse {
+    if let Some(err) = require_auth(&state, &headers) {
+        return err;
+    }
     let config = state.config.lock();
     if !config.tasks.enabled {
         return err_disabled();
@@ -117,8 +141,12 @@ pub async fn handle_list_tasks(
 
 pub async fn handle_create_task(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateTask>,
 ) -> TaskResponse {
+    if let Some(err) = require_auth(&state, &headers) {
+        return err;
+    }
     let config = state.config.lock();
     if !config.tasks.enabled {
         return err_disabled();
@@ -136,8 +164,12 @@ pub async fn handle_create_task(
 
 pub async fn handle_get_task(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> TaskResponse {
+    if let Some(err) = require_auth(&state, &headers) {
+        return err;
+    }
     let config = state.config.lock();
     if !config.tasks.enabled {
         return err_disabled();
@@ -151,9 +183,13 @@ pub async fn handle_get_task(
 
 pub async fn handle_update_task(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(patch): Json<TaskPatch>,
 ) -> TaskResponse {
+    if let Some(err) = require_auth(&state, &headers) {
+        return err;
+    }
     let config = state.config.lock();
     if !config.tasks.enabled {
         return err_disabled();
@@ -181,8 +217,12 @@ pub async fn handle_update_task(
 
 pub async fn handle_delete_task(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> TaskResponse {
+    if let Some(err) = require_auth(&state, &headers) {
+        return err;
+    }
     let config = state.config.lock();
     if !config.tasks.enabled {
         return err_disabled();
@@ -196,9 +236,13 @@ pub async fn handle_delete_task(
 
 pub async fn handle_review_task(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(review): Json<ReviewRequest>,
 ) -> TaskResponse {
+    if let Some(err) = require_auth(&state, &headers) {
+        return err;
+    }
     let config = state.config.lock();
     if !config.tasks.enabled {
         return err_disabled();
@@ -209,7 +253,18 @@ pub async fn handle_review_task(
         Err(e) => return err_not_found(&e.to_string()),
     };
 
-    let (new_status, review_status) = match state::apply_review(task.status, &review.action) {
+    // Prevent self-review: if the reviewer is also the acting employee
+    if let Some(ref actor_emp_id) = review.actor_employee_id {
+        if !state::can_self_review(
+            task.assignee_id.as_deref(),
+            task.reviewer_id.as_deref(),
+            actor_emp_id,
+        ) {
+            return err_bad_request("Cannot review your own task when assigned as reviewer");
+        }
+    }
+
+    let (new_status, review_status) = match state::apply_review(task.status, review.action) {
         Ok(result) => result,
         Err(e) => return err_bad_request(&e.to_string()),
     };
@@ -225,7 +280,7 @@ pub async fn handle_review_task(
         Ok(updated) => {
             // Record review event (best-effort)
             let actor_type = review.actor_type.unwrap_or(ActorType::Human);
-            let action_str = format!("{:?}", review.action);
+            let action_str = review.action.as_str();
             let status_str = new_status.as_str();
             let _ = tasks::record_event(
                 &config,
@@ -256,8 +311,12 @@ pub struct AddCommentBody {
 
 pub async fn handle_list_comments(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> TaskResponse {
+    if let Some(err) = require_auth(&state, &headers) {
+        return err;
+    }
     let config = state.config.lock();
     if !config.tasks.enabled {
         return err_disabled();
@@ -271,9 +330,13 @@ pub async fn handle_list_comments(
 
 pub async fn handle_add_comment(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<AddCommentBody>,
 ) -> TaskResponse {
+    if let Some(err) = require_auth(&state, &headers) {
+        return err;
+    }
     let config = state.config.lock();
     if !config.tasks.enabled {
         return err_disabled();
@@ -304,8 +367,12 @@ pub async fn handle_add_comment(
 
 pub async fn handle_list_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> TaskResponse {
+    if let Some(err) = require_auth(&state, &headers) {
+        return err;
+    }
     let config = state.config.lock();
     if !config.tasks.enabled {
         return err_disabled();

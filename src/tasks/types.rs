@@ -299,12 +299,22 @@ pub struct TaskPatch {
 
 // ── Review action ────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReviewAction {
     Approve,
     Changes,
     Reject,
+}
+
+impl ReviewAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Changes => "changes",
+            Self::Reject => "reject",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

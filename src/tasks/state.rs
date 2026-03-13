@@ -39,7 +39,7 @@ pub fn validate_transition(from: TaskStatus, to: TaskStatus) -> Result<()> {
 /// Returns (new_status, review_status).
 pub fn apply_review(
     current_status: TaskStatus,
-    action: &ReviewAction,
+    action: ReviewAction,
 ) -> Result<(TaskStatus, ReviewStatus)> {
     if current_status != TaskStatus::InReview {
         bail!(
@@ -106,30 +106,30 @@ mod tests {
 
     #[test]
     fn review_approve_moves_to_done() {
-        let (status, review) = apply_review(TaskStatus::InReview, &ReviewAction::Approve).unwrap();
+        let (status, review) = apply_review(TaskStatus::InReview, ReviewAction::Approve).unwrap();
         assert_eq!(status, TaskStatus::Done);
         assert_eq!(review, ReviewStatus::Approved);
     }
 
     #[test]
     fn review_changes_moves_to_in_progress() {
-        let (status, review) = apply_review(TaskStatus::InReview, &ReviewAction::Changes).unwrap();
+        let (status, review) = apply_review(TaskStatus::InReview, ReviewAction::Changes).unwrap();
         assert_eq!(status, TaskStatus::InProgress);
         assert_eq!(review, ReviewStatus::ChangesRequested);
     }
 
     #[test]
     fn review_reject_moves_to_cancelled() {
-        let (status, review) = apply_review(TaskStatus::InReview, &ReviewAction::Reject).unwrap();
+        let (status, review) = apply_review(TaskStatus::InReview, ReviewAction::Reject).unwrap();
         assert_eq!(status, TaskStatus::Cancelled);
         assert_eq!(review, ReviewStatus::Rejected);
     }
 
     #[test]
     fn review_requires_in_review_status() {
-        assert!(apply_review(TaskStatus::Todo, &ReviewAction::Approve).is_err());
-        assert!(apply_review(TaskStatus::InProgress, &ReviewAction::Approve).is_err());
-        assert!(apply_review(TaskStatus::Done, &ReviewAction::Approve).is_err());
+        assert!(apply_review(TaskStatus::Todo, ReviewAction::Approve).is_err());
+        assert!(apply_review(TaskStatus::InProgress, ReviewAction::Approve).is_err());
+        assert!(apply_review(TaskStatus::Done, ReviewAction::Approve).is_err());
     }
 
     #[test]

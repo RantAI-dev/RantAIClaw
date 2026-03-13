@@ -498,6 +498,14 @@ fn parse_rfc3339(s: &str) -> rusqlite::Result<chrono::DateTime<Utc>> {
         })
 }
 
+fn enum_parse_error(msg: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg)),
+    )
+}
+
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let status_str: String = row.get(4)?;
     let priority_str: String = row.get(5)?;
@@ -513,13 +521,15 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         organization_id: row.get(1)?,
         title: row.get(2)?,
         description: row.get(3)?,
-        status: TaskStatus::try_from(status_str.as_str()).unwrap_or_default(),
-        priority: TaskPriority::try_from(priority_str.as_str()).unwrap_or_default(),
+        status: TaskStatus::try_from(status_str.as_str()).map_err(enum_parse_error)?,
+        priority: TaskPriority::try_from(priority_str.as_str()).map_err(enum_parse_error)?,
         assignee_id: row.get(6)?,
         group_id: row.get(7)?,
         reviewer_id: row.get(8)?,
         human_review: row.get(9)?,
-        review_status: review_status_str.and_then(|s| ReviewStatus::try_from(s.as_str()).ok()),
+        review_status: review_status_str
+            .map(|s| ReviewStatus::try_from(s.as_str()).map_err(enum_parse_error))
+            .transpose()?,
         review_comment: row.get(11)?,
         parent_task_id: row.get(12)?,
         created_by_employee_id: row.get(13)?,
@@ -541,7 +551,7 @@ fn row_to_comment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskComment> {
         id: row.get(0)?,
         task_id: row.get(1)?,
         content: row.get(2)?,
-        author_type: ActorType::try_from(author_type_str.as_str()).unwrap_or(ActorType::Human),
+        author_type: ActorType::try_from(author_type_str.as_str()).map_err(enum_parse_error)?,
         author_employee_id: row.get(4)?,
         author_user_id: row.get(5)?,
         created_at: parse_rfc3339(&created_at_str)?,
@@ -556,9 +566,8 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEvent> {
     Ok(TaskEvent {
         id: row.get(0)?,
         task_id: row.get(1)?,
-        event_type: TaskEventType::try_from(event_type_str.as_str())
-            .unwrap_or(TaskEventType::Created),
-        actor_type: ActorType::try_from(actor_type_str.as_str()).unwrap_or(ActorType::Human),
+        event_type: TaskEventType::try_from(event_type_str.as_str()).map_err(enum_parse_error)?,
+        actor_type: ActorType::try_from(actor_type_str.as_str()).map_err(enum_parse_error)?,
         actor_employee_id: row.get(4)?,
         actor_user_id: row.get(5)?,
         data: serde_json::from_str(&data_str).unwrap_or(serde_json::json!({})),
