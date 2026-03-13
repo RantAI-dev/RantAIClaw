@@ -1,36 +1,20 @@
 // src/tasks/store.rs
 use crate::config::Config;
-use crate::tasks::types::{
-    ActorType, CreateTask, ReviewStatus, Task, TaskComment, TaskDetail, TaskEvent, TaskEventType,
-    TaskFilter, TaskPatch, TaskPriority, TaskStatus,
-};
+use crate::tasks::types::*;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection};
-use std::fmt::Write;
 use uuid::Uuid;
-
-/// Track whether tables have been initialized for each DB path.
-static TABLES_INIT: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
-> = std::sync::OnceLock::new();
 
 /// Open (or create) the tasks SQLite database.
 /// Uses WAL mode for concurrent read performance.
-/// Tables are initialized once per unique DB path per process lifetime.
 fn open_db(config: &Config) -> Result<Connection> {
     let db_path = config.workspace_dir.join("tasks.db");
     std::fs::create_dir_all(&config.workspace_dir)?;
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open tasks DB at {}", db_path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-
-    let init_set =
-        TABLES_INIT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let mut set = init_set.lock().unwrap();
-    if set.insert(db_path) {
-        init_tables(&conn)?;
-    }
+    init_tables(&conn)?;
     Ok(conn)
 }
 
@@ -210,41 +194,39 @@ pub fn list_tasks(config: &Config, filter: &TaskFilter) -> Result<Vec<Task>> {
 
         if let Some(ref status) = filter.status {
             param_values.push(Box::new(status.as_str().to_string()));
-            let _ = write!(sql, " AND status = ?{}", param_values.len());
+            sql.push_str(&format!(" AND status = ?{}", param_values.len()));
         }
         if let Some(ref assignee) = filter.assignee_id {
             param_values.push(Box::new(assignee.clone()));
-            let _ = write!(sql, " AND assignee_id = ?{}", param_values.len());
+            sql.push_str(&format!(" AND assignee_id = ?{}", param_values.len()));
         }
         if let Some(ref group) = filter.group_id {
             param_values.push(Box::new(group.clone()));
-            let _ = write!(sql, " AND group_id = ?{}", param_values.len());
+            sql.push_str(&format!(" AND group_id = ?{}", param_values.len()));
         }
         if let Some(ref priority) = filter.priority {
             param_values.push(Box::new(priority.as_str().to_string()));
-            let _ = write!(sql, " AND priority = ?{}", param_values.len());
+            sql.push_str(&format!(" AND priority = ?{}", param_values.len()));
         }
         if let Some(ref parent) = filter.parent_task_id {
             param_values.push(Box::new(parent.clone()));
-            let _ = write!(sql, " AND parent_task_id = ?{}", param_values.len());
+            sql.push_str(&format!(" AND parent_task_id = ?{}", param_values.len()));
         }
         if filter.top_level_only == Some(true) {
             sql.push_str(" AND parent_task_id IS NULL");
         }
         if let Some(ref org) = filter.organization_id {
             param_values.push(Box::new(org.clone()));
-            let _ = write!(sql, " AND organization_id = ?{}", param_values.len());
+            sql.push_str(&format!(" AND organization_id = ?{}", param_values.len()));
         }
 
         sql.push_str(" ORDER BY order_in_status ASC, created_at DESC");
 
         if let Some(limit) = filter.limit {
-            param_values.push(Box::new(i64::from(limit)));
-            let _ = write!(sql, " LIMIT ?{}", param_values.len());
+            sql.push_str(&format!(" LIMIT {limit}"));
         }
         if let Some(offset) = filter.offset {
-            param_values.push(Box::new(i64::from(offset)));
-            let _ = write!(sql, " OFFSET ?{}", param_values.len());
+            sql.push_str(&format!(" OFFSET {offset}"));
         }
 
         let params_ref: Vec<&dyn rusqlite::types::ToSql> =
@@ -483,60 +465,22 @@ pub fn list_events(config: &Config, task_id: &str) -> Result<Vec<TaskEvent>> {
 // ── Task detail (composite) ──────────────────────────────────
 
 pub fn get_task_detail(config: &Config, id: &str) -> Result<TaskDetail> {
-    with_connection(config, |conn| {
-        // Task
-        let task = conn
-            .prepare(
-                "SELECT id, organization_id, title, description, status, priority,
-                        assignee_id, group_id, reviewer_id, human_review,
-                        review_status, review_comment, parent_task_id,
-                        created_by_employee_id, created_by_user_id,
-                        due_date, completed_at, order_in_status, order_in_parent,
-                        metadata, created_at, updated_at
-                 FROM tasks WHERE id = ?1",
-            )?
-            .query_row(params![id], row_to_task)
-            .with_context(|| format!("Task not found: {id}"))?;
+    let task = get_task(config, id)?;
+    let subtasks = list_tasks(
+        config,
+        &TaskFilter {
+            parent_task_id: Some(id.to_string()),
+            ..TaskFilter::default()
+        },
+    )?;
+    let comments = list_comments(config, id)?;
+    let events = list_events(config, id)?;
 
-        // Subtasks
-        let subtasks = conn
-            .prepare(
-                "SELECT id, organization_id, title, description, status, priority,
-                        assignee_id, group_id, reviewer_id, human_review,
-                        review_status, review_comment, parent_task_id,
-                        created_by_employee_id, created_by_user_id,
-                        due_date, completed_at, order_in_status, order_in_parent,
-                        metadata, created_at, updated_at
-                 FROM tasks WHERE parent_task_id = ?1
-                 ORDER BY order_in_status ASC, created_at DESC",
-            )?
-            .query_map(params![id], row_to_task)?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Comments
-        let comments = conn
-            .prepare(
-                "SELECT id, task_id, content, author_type, author_employee_id, author_user_id, created_at
-                 FROM task_comments WHERE task_id = ?1 ORDER BY created_at ASC",
-            )?
-            .query_map(params![id], row_to_comment)?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Events
-        let events = conn
-            .prepare(
-                "SELECT id, task_id, event_type, actor_type, actor_employee_id, actor_user_id, data, created_at
-                 FROM task_events WHERE task_id = ?1 ORDER BY created_at ASC",
-            )?
-            .query_map(params![id], row_to_event)?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(TaskDetail {
-            task,
-            subtasks,
-            comments,
-            events,
-        })
+    Ok(TaskDetail {
+        task,
+        subtasks,
+        comments,
+        events,
     })
 }
 
@@ -545,17 +489,11 @@ pub fn get_task_detail(config: &Config, id: &str) -> Result<TaskDetail> {
 fn parse_rfc3339(s: &str) -> rusqlite::Result<chrono::DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-        })
-}
-
-fn enum_parse_error(msg: String) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        0,
-        rusqlite::types::Type::Text,
-        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg)),
-    )
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(e),
+        ))
 }
 
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -573,15 +511,14 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         organization_id: row.get(1)?,
         title: row.get(2)?,
         description: row.get(3)?,
-        status: TaskStatus::try_from(status_str.as_str()).map_err(enum_parse_error)?,
-        priority: TaskPriority::try_from(priority_str.as_str()).map_err(enum_parse_error)?,
+        status: TaskStatus::try_from(status_str.as_str()).unwrap_or_default(),
+        priority: TaskPriority::try_from(priority_str.as_str()).unwrap_or_default(),
         assignee_id: row.get(6)?,
         group_id: row.get(7)?,
         reviewer_id: row.get(8)?,
         human_review: row.get(9)?,
         review_status: review_status_str
-            .map(|s| ReviewStatus::try_from(s.as_str()).map_err(enum_parse_error))
-            .transpose()?,
+            .and_then(|s| ReviewStatus::try_from(s.as_str()).ok()),
         review_comment: row.get(11)?,
         parent_task_id: row.get(12)?,
         created_by_employee_id: row.get(13)?,
@@ -603,7 +540,7 @@ fn row_to_comment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskComment> {
         id: row.get(0)?,
         task_id: row.get(1)?,
         content: row.get(2)?,
-        author_type: ActorType::try_from(author_type_str.as_str()).map_err(enum_parse_error)?,
+        author_type: ActorType::try_from(author_type_str.as_str()).unwrap_or(ActorType::Human),
         author_employee_id: row.get(4)?,
         author_user_id: row.get(5)?,
         created_at: parse_rfc3339(&created_at_str)?,
@@ -618,8 +555,9 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEvent> {
     Ok(TaskEvent {
         id: row.get(0)?,
         task_id: row.get(1)?,
-        event_type: TaskEventType::try_from(event_type_str.as_str()).map_err(enum_parse_error)?,
-        actor_type: ActorType::try_from(actor_type_str.as_str()).map_err(enum_parse_error)?,
+        event_type: TaskEventType::try_from(event_type_str.as_str())
+            .unwrap_or(TaskEventType::Created),
+        actor_type: ActorType::try_from(actor_type_str.as_str()).unwrap_or(ActorType::Human),
         actor_employee_id: row.get(4)?,
         actor_user_id: row.get(5)?,
         data: serde_json::from_str(&data_str).unwrap_or(serde_json::json!({})),
