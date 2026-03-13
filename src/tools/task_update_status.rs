@@ -123,18 +123,6 @@ impl Tool for TaskUpdateStatusTool {
             });
         }
 
-        // Block IN_REVIEW -> DONE via status update — must go through review_task tool
-        if existing.status == TaskStatus::InReview && new_status == TaskStatus::Done {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(
-                    "Cannot move a task from IN_REVIEW to DONE directly. Use the review_task tool to approve, request changes, or reject it."
-                        .into(),
-                ),
-            });
-        }
-
         let patch = TaskPatch {
             status: Some(new_status),
             review_status: if new_status == TaskStatus::InReview {

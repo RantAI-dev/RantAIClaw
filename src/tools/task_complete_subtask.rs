@@ -100,29 +100,7 @@ impl Tool for TaskCompleteSubtaskTool {
             TaskStatus::Done
         };
 
-        // Auto-advance from TODO through IN_PROGRESS if needed
-        let current_status = subtask.status;
-        if current_status == TaskStatus::Todo {
-            // TODO -> IN_PROGRESS is always valid; advance first
-            if let Err(e) = state::validate_transition(TaskStatus::Todo, TaskStatus::InProgress) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(e.to_string()),
-                });
-            }
-            let advance_patch = TaskPatch {
-                status: Some(TaskStatus::InProgress),
-                ..TaskPatch::default()
-            };
-            if let Err(e) = tasks::update_task(&self.config, subtask_id, &advance_patch) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(e.to_string()),
-                });
-            }
-        } else if let Err(e) = state::validate_transition(current_status, new_status) {
+        if let Err(e) = state::validate_transition(subtask.status, new_status) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
