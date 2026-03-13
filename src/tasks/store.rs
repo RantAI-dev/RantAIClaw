@@ -1,9 +1,13 @@
 // src/tasks/store.rs
 use crate::config::Config;
-use crate::tasks::types::*;
+use crate::tasks::types::{
+    ActorType, CreateTask, ReviewStatus, Task, TaskComment, TaskDetail, TaskEvent, TaskEventType,
+    TaskFilter, TaskPatch, TaskPriority, TaskStatus,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection};
+use std::fmt::Write;
 use uuid::Uuid;
 
 /// Open (or create) the tasks SQLite database.
@@ -194,39 +198,39 @@ pub fn list_tasks(config: &Config, filter: &TaskFilter) -> Result<Vec<Task>> {
 
         if let Some(ref status) = filter.status {
             param_values.push(Box::new(status.as_str().to_string()));
-            sql.push_str(&format!(" AND status = ?{}", param_values.len()));
+            let _ = write!(sql, " AND status = ?{}", param_values.len());
         }
         if let Some(ref assignee) = filter.assignee_id {
             param_values.push(Box::new(assignee.clone()));
-            sql.push_str(&format!(" AND assignee_id = ?{}", param_values.len()));
+            let _ = write!(sql, " AND assignee_id = ?{}", param_values.len());
         }
         if let Some(ref group) = filter.group_id {
             param_values.push(Box::new(group.clone()));
-            sql.push_str(&format!(" AND group_id = ?{}", param_values.len()));
+            let _ = write!(sql, " AND group_id = ?{}", param_values.len());
         }
         if let Some(ref priority) = filter.priority {
             param_values.push(Box::new(priority.as_str().to_string()));
-            sql.push_str(&format!(" AND priority = ?{}", param_values.len()));
+            let _ = write!(sql, " AND priority = ?{}", param_values.len());
         }
         if let Some(ref parent) = filter.parent_task_id {
             param_values.push(Box::new(parent.clone()));
-            sql.push_str(&format!(" AND parent_task_id = ?{}", param_values.len()));
+            let _ = write!(sql, " AND parent_task_id = ?{}", param_values.len());
         }
         if filter.top_level_only == Some(true) {
             sql.push_str(" AND parent_task_id IS NULL");
         }
         if let Some(ref org) = filter.organization_id {
             param_values.push(Box::new(org.clone()));
-            sql.push_str(&format!(" AND organization_id = ?{}", param_values.len()));
+            let _ = write!(sql, " AND organization_id = ?{}", param_values.len());
         }
 
         sql.push_str(" ORDER BY order_in_status ASC, created_at DESC");
 
         if let Some(limit) = filter.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
+            let _ = write!(sql, " LIMIT {limit}");
         }
         if let Some(offset) = filter.offset {
-            sql.push_str(&format!(" OFFSET {offset}"));
+            let _ = write!(sql, " OFFSET {offset}");
         }
 
         let params_ref: Vec<&dyn rusqlite::types::ToSql> =
@@ -489,11 +493,9 @@ pub fn get_task_detail(config: &Config, id: &str) -> Result<TaskDetail> {
 fn parse_rfc3339(s: &str) -> rusqlite::Result<chrono::DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(e),
-        ))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })
 }
 
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -517,8 +519,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         group_id: row.get(7)?,
         reviewer_id: row.get(8)?,
         human_review: row.get(9)?,
-        review_status: review_status_str
-            .and_then(|s| ReviewStatus::try_from(s.as_str()).ok()),
+        review_status: review_status_str.and_then(|s| ReviewStatus::try_from(s.as_str()).ok()),
         review_comment: row.get(11)?,
         parent_task_id: row.get(12)?,
         created_by_employee_id: row.get(13)?,

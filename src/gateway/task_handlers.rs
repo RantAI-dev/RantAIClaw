@@ -13,7 +13,9 @@
 //!   GET    /tasks/{id}/events   — list events
 
 use super::AppState;
-use crate::tasks::{self, state, ActorType, CreateTask, ReviewRequest, TaskEventType, TaskFilter, TaskPatch};
+use crate::tasks::{
+    self, state, ActorType, CreateTask, ReviewRequest, TaskEventType, TaskFilter, TaskPatch,
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -207,11 +209,10 @@ pub async fn handle_review_task(
         Err(e) => return err_not_found(&e.to_string()),
     };
 
-    let (new_status, review_status) =
-        match state::apply_review(task.status, &review.action) {
-            Ok(result) => result,
-            Err(e) => return err_bad_request(&e.to_string()),
-        };
+    let (new_status, review_status) = match state::apply_review(task.status, &review.action) {
+        Ok(result) => result,
+        Err(e) => return err_bad_request(&e.to_string()),
+    };
 
     let patch = TaskPatch {
         status: Some(new_status),

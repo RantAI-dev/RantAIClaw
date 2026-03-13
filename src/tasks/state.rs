@@ -14,12 +14,8 @@ pub fn validate_transition(from: TaskStatus, to: TaskStatus) -> Result<()> {
     let valid = matches!(
         (from, to),
         (TaskStatus::Todo, TaskStatus::InProgress)
-            | (TaskStatus::InProgress, TaskStatus::InReview)
-            | (TaskStatus::InProgress, TaskStatus::Done)
-            | (TaskStatus::InProgress, TaskStatus::Cancelled)
-            | (TaskStatus::InReview, TaskStatus::InProgress)
-            | (TaskStatus::InReview, TaskStatus::Done)
-            | (TaskStatus::InReview, TaskStatus::Cancelled)
+            | (TaskStatus::InProgress, TaskStatus::InReview | TaskStatus::Done | TaskStatus::Cancelled)
+            | (TaskStatus::InReview, TaskStatus::InProgress | TaskStatus::Done | TaskStatus::Cancelled)
             | (TaskStatus::Cancelled, TaskStatus::Todo)
     );
 
@@ -104,24 +100,21 @@ mod tests {
 
     #[test]
     fn review_approve_moves_to_done() {
-        let (status, review) =
-            apply_review(TaskStatus::InReview, &ReviewAction::Approve).unwrap();
+        let (status, review) = apply_review(TaskStatus::InReview, &ReviewAction::Approve).unwrap();
         assert_eq!(status, TaskStatus::Done);
         assert_eq!(review, ReviewStatus::Approved);
     }
 
     #[test]
     fn review_changes_moves_to_in_progress() {
-        let (status, review) =
-            apply_review(TaskStatus::InReview, &ReviewAction::Changes).unwrap();
+        let (status, review) = apply_review(TaskStatus::InReview, &ReviewAction::Changes).unwrap();
         assert_eq!(status, TaskStatus::InProgress);
         assert_eq!(review, ReviewStatus::ChangesRequested);
     }
 
     #[test]
     fn review_reject_moves_to_cancelled() {
-        let (status, review) =
-            apply_review(TaskStatus::InReview, &ReviewAction::Reject).unwrap();
+        let (status, review) = apply_review(TaskStatus::InReview, &ReviewAction::Reject).unwrap();
         assert_eq!(status, TaskStatus::Cancelled);
         assert_eq!(review, ReviewStatus::Rejected);
     }
@@ -135,20 +128,12 @@ mod tests {
 
     #[test]
     fn self_review_denied_when_assigned_as_reviewer() {
-        assert!(!can_self_review(
-            Some("emp-1"),
-            Some("emp-1"),
-            "emp-1"
-        ));
+        assert!(!can_self_review(Some("emp-1"), Some("emp-1"), "emp-1"));
     }
 
     #[test]
     fn self_review_allowed_when_different_reviewer() {
-        assert!(can_self_review(
-            Some("emp-1"),
-            Some("emp-2"),
-            "emp-1"
-        ));
+        assert!(can_self_review(Some("emp-1"), Some("emp-2"), "emp-1"));
     }
 
     #[test]

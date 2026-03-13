@@ -16,7 +16,7 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Todo => "TODO",
             Self::InProgress => "IN_PROGRESS",
@@ -57,7 +57,7 @@ pub enum TaskPriority {
 }
 
 impl TaskPriority {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Low => "LOW",
             Self::Medium => "MEDIUM",
@@ -94,7 +94,7 @@ pub enum ReviewStatus {
 }
 
 impl ReviewStatus {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "PENDING",
             Self::Approved => "APPROVED",
@@ -131,7 +131,7 @@ pub enum ActorType {
 }
 
 impl ActorType {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Human => "HUMAN",
             Self::Employee => "EMPLOYEE",
@@ -169,7 +169,7 @@ pub enum TaskEventType {
 }
 
 impl TaskEventType {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Created => "CREATED",
             Self::StatusChanged => "STATUS_CHANGED",
@@ -279,6 +279,7 @@ pub struct CreateTask {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(clippy::option_option)] // Intentional: None = no change, Some(None) = set null, Some(Some(v)) = set value
 pub struct TaskPatch {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -390,10 +391,7 @@ mod tests {
 
     #[test]
     fn actor_type_roundtrip() {
-        assert_eq!(
-            ActorType::try_from("HUMAN").unwrap(),
-            ActorType::Human
-        );
+        assert_eq!(ActorType::try_from("HUMAN").unwrap(), ActorType::Human);
         assert_eq!(
             ActorType::try_from("EMPLOYEE").unwrap(),
             ActorType::Employee
