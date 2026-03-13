@@ -14,14 +14,12 @@ pub fn validate_transition(from: TaskStatus, to: TaskStatus) -> Result<()> {
     let valid = matches!(
         (from, to),
         (TaskStatus::Todo, TaskStatus::InProgress)
-            | (
-                TaskStatus::InProgress,
-                TaskStatus::InReview | TaskStatus::Done | TaskStatus::Cancelled
-            )
-            | (
-                TaskStatus::InReview,
-                TaskStatus::InProgress | TaskStatus::Done | TaskStatus::Cancelled
-            )
+            | (TaskStatus::InProgress, TaskStatus::InReview)
+            | (TaskStatus::InProgress, TaskStatus::Done)
+            | (TaskStatus::InProgress, TaskStatus::Cancelled)
+            | (TaskStatus::InReview, TaskStatus::InProgress)
+            | (TaskStatus::InReview, TaskStatus::Done)
+            | (TaskStatus::InReview, TaskStatus::Cancelled)
             | (TaskStatus::Cancelled, TaskStatus::Todo)
     );
 
@@ -39,7 +37,7 @@ pub fn validate_transition(from: TaskStatus, to: TaskStatus) -> Result<()> {
 /// Returns (new_status, review_status).
 pub fn apply_review(
     current_status: TaskStatus,
-    action: ReviewAction,
+    action: &ReviewAction,
 ) -> Result<(TaskStatus, ReviewStatus)> {
     if current_status != TaskStatus::InReview {
         bail!(
@@ -55,9 +53,13 @@ pub fn apply_review(
     }
 }
 
-/// Check if an employee can submit a review on a task.
-/// Denies if the acting employee is the designated reviewer (prevents self-review).
-pub fn can_self_review(reviewer_id: Option<&str>, acting_employee_id: &str) -> bool {
+/// Check if an employee can submit their own task for review.
+/// An employee cannot review their own work (unless no reviewer is set).
+pub fn can_self_review(
+    _assignee_id: Option<&str>,
+    reviewer_id: Option<&str>,
+    acting_employee_id: &str,
+) -> bool {
     // If reviewer is the same as the actor, deny self-review
     if let Some(rev) = reviewer_id {
         if rev == acting_employee_id {
@@ -102,44 +104,55 @@ mod tests {
 
     #[test]
     fn review_approve_moves_to_done() {
-        let (status, review) = apply_review(TaskStatus::InReview, ReviewAction::Approve).unwrap();
+        let (status, review) =
+            apply_review(TaskStatus::InReview, &ReviewAction::Approve).unwrap();
         assert_eq!(status, TaskStatus::Done);
         assert_eq!(review, ReviewStatus::Approved);
     }
 
     #[test]
     fn review_changes_moves_to_in_progress() {
-        let (status, review) = apply_review(TaskStatus::InReview, ReviewAction::Changes).unwrap();
+        let (status, review) =
+            apply_review(TaskStatus::InReview, &ReviewAction::Changes).unwrap();
         assert_eq!(status, TaskStatus::InProgress);
         assert_eq!(review, ReviewStatus::ChangesRequested);
     }
 
     #[test]
     fn review_reject_moves_to_cancelled() {
-        let (status, review) = apply_review(TaskStatus::InReview, ReviewAction::Reject).unwrap();
+        let (status, review) =
+            apply_review(TaskStatus::InReview, &ReviewAction::Reject).unwrap();
         assert_eq!(status, TaskStatus::Cancelled);
         assert_eq!(review, ReviewStatus::Rejected);
     }
 
     #[test]
     fn review_requires_in_review_status() {
-        assert!(apply_review(TaskStatus::Todo, ReviewAction::Approve).is_err());
-        assert!(apply_review(TaskStatus::InProgress, ReviewAction::Approve).is_err());
-        assert!(apply_review(TaskStatus::Done, ReviewAction::Approve).is_err());
+        assert!(apply_review(TaskStatus::Todo, &ReviewAction::Approve).is_err());
+        assert!(apply_review(TaskStatus::InProgress, &ReviewAction::Approve).is_err());
+        assert!(apply_review(TaskStatus::Done, &ReviewAction::Approve).is_err());
     }
 
     #[test]
     fn self_review_denied_when_assigned_as_reviewer() {
-        assert!(!can_self_review(Some("emp-1"), "emp-1"));
+        assert!(!can_self_review(
+            Some("emp-1"),
+            Some("emp-1"),
+            "emp-1"
+        ));
     }
 
     #[test]
     fn self_review_allowed_when_different_reviewer() {
-        assert!(can_self_review(Some("emp-2"), "emp-1"));
+        assert!(can_self_review(
+            Some("emp-1"),
+            Some("emp-2"),
+            "emp-1"
+        ));
     }
 
     #[test]
     fn self_complete_allowed_when_no_reviewer() {
-        assert!(can_self_review(None, "emp-1"));
+        assert!(can_self_review(Some("emp-1"), None, "emp-1"));
     }
 }
