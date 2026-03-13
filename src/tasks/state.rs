@@ -55,13 +55,9 @@ pub fn apply_review(
     }
 }
 
-/// Check if an employee can submit their own task for review.
-/// An employee cannot review their own work (unless no reviewer is set).
-pub fn can_self_review(
-    _assignee_id: Option<&str>,
-    reviewer_id: Option<&str>,
-    acting_employee_id: &str,
-) -> bool {
+/// Check if an employee can submit a review on a task.
+/// Denies if the acting employee is the designated reviewer (prevents self-review).
+pub fn can_self_review(reviewer_id: Option<&str>, acting_employee_id: &str) -> bool {
     // If reviewer is the same as the actor, deny self-review
     if let Some(rev) = reviewer_id {
         if rev == acting_employee_id {
@@ -134,16 +130,16 @@ mod tests {
 
     #[test]
     fn self_review_denied_when_assigned_as_reviewer() {
-        assert!(!can_self_review(Some("emp-1"), Some("emp-1"), "emp-1"));
+        assert!(!can_self_review(Some("emp-1"), "emp-1"));
     }
 
     #[test]
     fn self_review_allowed_when_different_reviewer() {
-        assert!(can_self_review(Some("emp-1"), Some("emp-2"), "emp-1"));
+        assert!(can_self_review(Some("emp-2"), "emp-1"));
     }
 
     #[test]
     fn self_complete_allowed_when_no_reviewer() {
-        assert!(can_self_review(Some("emp-1"), None, "emp-1"));
+        assert!(can_self_review(None, "emp-1"));
     }
 }

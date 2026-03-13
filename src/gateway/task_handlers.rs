@@ -255,11 +255,7 @@ pub async fn handle_review_task(
 
     // Prevent self-review: if the reviewer is also the acting employee
     if let Some(ref actor_emp_id) = review.actor_employee_id {
-        if !state::can_self_review(
-            task.assignee_id.as_deref(),
-            task.reviewer_id.as_deref(),
-            actor_emp_id,
-        ) {
+        if !state::can_self_review(task.reviewer_id.as_deref(), actor_emp_id) {
             return err_bad_request("Cannot review your own task when assigned as reviewer");
         }
     }
