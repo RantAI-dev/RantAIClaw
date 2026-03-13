@@ -14,8 +14,14 @@ pub fn validate_transition(from: TaskStatus, to: TaskStatus) -> Result<()> {
     let valid = matches!(
         (from, to),
         (TaskStatus::Todo, TaskStatus::InProgress)
-            | (TaskStatus::InProgress, TaskStatus::InReview | TaskStatus::Done | TaskStatus::Cancelled)
-            | (TaskStatus::InReview, TaskStatus::InProgress | TaskStatus::Done | TaskStatus::Cancelled)
+            | (
+                TaskStatus::InProgress,
+                TaskStatus::InReview | TaskStatus::Done | TaskStatus::Cancelled
+            )
+            | (
+                TaskStatus::InReview,
+                TaskStatus::InProgress | TaskStatus::Done | TaskStatus::Cancelled
+            )
             | (TaskStatus::Cancelled, TaskStatus::Todo)
     );
 

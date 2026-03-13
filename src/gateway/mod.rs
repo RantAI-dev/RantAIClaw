@@ -616,11 +616,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| {
-            std::path::PathBuf::from(
-                directories::BaseDirs::new()
-                    .map(|d| d.home_dir().join(".rantaiclaw"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("/root/.rantaiclaw")),
-            )
+            directories::BaseDirs::new()
+                .map(|d| d.home_dir().join(".rantaiclaw"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/root/.rantaiclaw"))
         });
     let webhook_routes = Arc::new(load_webhook_routes(&config_dir));
 
