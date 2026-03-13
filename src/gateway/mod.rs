@@ -7,6 +7,8 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod task_handlers;
+
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
@@ -648,6 +650,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/triggers/{*path}", post(handle_trigger_webhook))
+        .route("/tasks", get(task_handlers::handle_list_tasks).post(task_handlers::handle_create_task))
+        .route("/tasks/{id}", get(task_handlers::handle_get_task).put(task_handlers::handle_update_task).delete(task_handlers::handle_delete_task))
+        .route("/tasks/{id}/review", post(task_handlers::handle_review_task))
+        .route("/tasks/{id}/comments", get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment))
+        .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
