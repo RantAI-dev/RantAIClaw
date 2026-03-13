@@ -7,11 +7,9 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-pub mod config_api;
 pub mod task_handlers;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
-use crate::approval::ApprovalManager;
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -309,9 +307,7 @@ fn load_webhook_routes(config_dir: &std::path::Path) -> Vec<WebhookRoute> {
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<tokio::sync::RwLock<Config>>,
-    /// Watch channel sender for broadcasting config changes to registries.
-    pub config_tx: tokio::sync::watch::Sender<Config>,
+    pub config: Arc<Mutex<Config>>,
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub temperature: f64,
@@ -338,13 +334,6 @@ pub struct AppState {
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Webhook trigger routes loaded from agent-runner config
     pub webhook_routes: Arc<Vec<WebhookRoute>>,
-<<<<<<< HEAD
-    /// Live channel registry for config API
-    pub channel_registry: Arc<tokio::sync::RwLock<crate::channels::ChannelRegistry>>,
-    /// Live MCP server registry for config API
-    pub mcp_registry: Arc<tokio::sync::RwLock<crate::mcp::McpRegistry>>,
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -359,8 +348,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         );
     }
-    let (config_tx, _config_rx) = tokio::sync::watch::channel(config.clone());
-    let config_state = Arc::new(tokio::sync::RwLock::new(config.clone()));
+    let config_state = Arc::new(Mutex::new(config.clone()));
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -429,14 +417,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tracing::info!(
             "[Gateway] Registered {} skill tools from {} skills",
             skill_tools.len(),
-<<<<<<< HEAD
-            startup_skills
-                .iter()
-                .filter(|s| !s.tools.is_empty())
-                .count()
-=======
             startup_skills.iter().filter(|s| !s.tools.is_empty()).count()
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         );
         base_tools.extend(skill_tools);
     }
@@ -627,28 +608,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Arc::from(crate::observability::create_observer(&config.observability));
 
     // Load webhook trigger routes from agent-runner config
-<<<<<<< HEAD
-    let config_dir = config
-        .config_path
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| {
-            directories::BaseDirs::new()
-                .map(|d| d.home_dir().join(".rantaiclaw"))
-                .unwrap_or_else(|| std::path::PathBuf::from("/root/.rantaiclaw"))
-        });
-    let webhook_routes = Arc::new(load_webhook_routes(&config_dir));
-
-    // Initialize live registries for Config API
-    let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(256);
-    let channel_registry = Arc::new(tokio::sync::RwLock::new(
-        crate::channels::ChannelRegistry::new(msg_tx),
-    ));
-    let mcp_registry = Arc::new(tokio::sync::RwLock::new(
-        crate::mcp::McpRegistry::new(),
-    ));
-
-=======
     let config_dir = config.config_path.parent().map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from(
             directories::BaseDirs::new()
@@ -657,10 +616,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         ));
     let webhook_routes = Arc::new(load_webhook_routes(&config_dir));
 
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
     let state = AppState {
         config: config_state,
-        config_tx,
         provider,
         model,
         temperature,
@@ -680,38 +637,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk_webhook_secret,
         observer,
         webhook_routes,
-<<<<<<< HEAD
-        channel_registry: channel_registry.clone(),
-        mcp_registry: mcp_registry.clone(),
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
     };
-
-    // ── Seed live registries from config ────────────────────────────────
-
-    // Register configured channels into the ChannelRegistry so the Config API
-    // can report and manage them at runtime.
-    {
-        let mut ch_reg = channel_registry.write().await;
-        crate::channels::register_configured_channels(&mut ch_reg, &config.channels_config).await;
-    }
-
-    // Start configured MCP servers and register them in the McpRegistry.
-    {
-        let mut mcp_reg = mcp_registry.write().await;
-        for (id, mcp_config) in &config.mcp_servers {
-            if let Err(e) = mcp_reg.add_server(id.clone(), mcp_config.clone()).await {
-                tracing::error!("Failed to start MCP server '{}': {}", id, e);
-            }
-        }
-    }
-
-    // Spawn MCP process supervisor for crash detection and restart.
-    let mcp_supervisor_cancel = tokio_util::sync::CancellationToken::new();
-    let _mcp_supervisor_handle = crate::mcp::supervisor::spawn_supervisor(
-        mcp_registry.clone(),
-        mcp_supervisor_cancel.clone(),
-    );
 
     // Build router with middleware
     let app = Router::new()
@@ -724,41 +650,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/triggers/{*path}", post(handle_trigger_webhook))
-<<<<<<< HEAD
-        .route(
-            "/tasks",
-            get(task_handlers::handle_list_tasks).post(task_handlers::handle_create_task),
-        )
-        .route(
-            "/tasks/{id}",
-            get(task_handlers::handle_get_task)
-                .put(task_handlers::handle_update_task)
-                .delete(task_handlers::handle_delete_task),
-        )
-        .route(
-            "/tasks/{id}/review",
-            post(task_handlers::handle_review_task),
-        )
-        .route(
-            "/tasks/{id}/comments",
-            get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment),
-        )
+        .route("/tasks", get(task_handlers::handle_list_tasks).post(task_handlers::handle_create_task))
+        .route("/tasks/{id}", get(task_handlers::handle_get_task).put(task_handlers::handle_update_task).delete(task_handlers::handle_delete_task))
+        .route("/tasks/{id}/review", post(task_handlers::handle_review_task))
+        .route("/tasks/{id}/comments", get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment))
         .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
-        // Config API routes
-        .route("/config", get(config_api::get_config))
-        .route(
-            "/config/channels",
-            get(config_api::get_channels_status).patch(config_api::patch_channels),
-        )
-        .route(
-            "/config/mcp-servers",
-            get(config_api::get_mcp_status).patch(config_api::patch_mcp_servers),
-        )
-        .route("/config/model", axum::routing::patch(config_api::patch_model))
-        .route("/config/tools", axum::routing::patch(config_api::patch_tools))
-        .route("/config/agent", axum::routing::patch(config_api::patch_agent))
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -876,12 +772,11 @@ async fn handle_pair(
     }
 }
 
-async fn persist_pairing_tokens(
-    config: Arc<tokio::sync::RwLock<Config>>,
-    pairing: &PairingGuard,
-) -> Result<()> {
+async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
     let paired_tokens = pairing.tokens();
-    let mut updated_cfg = config.read().await.clone();
+    // This is needed because parking_lot's guard is not Send so we clone the inner
+    // this should be removed once async mutexes are used everywhere
+    let mut updated_cfg = { config.lock().clone() };
     updated_cfg.gateway.paired_tokens = paired_tokens;
     updated_cfg
         .save()
@@ -889,7 +784,7 @@ async fn persist_pairing_tokens(
         .context("Failed to persist paired tokens to config.toml")?;
 
     // Keep shared runtime config in sync with persisted tokens.
-    *config.write().await = updated_cfg;
+    *config.lock() = updated_cfg;
     Ok(())
 }
 
@@ -921,13 +816,8 @@ struct GatewayChatResult {
 /// and tool-result messages. We parse the XML from assistant messages and pair
 /// them with subsequent results.
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCall> {
-<<<<<<< HEAD
-    let call_re =
-        regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#).expect("valid regex");
-=======
     let call_re = regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#)
         .expect("valid regex");
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
     let result_re =
         regex::Regex::new(r#"<tool_result name="([^"]+)">\s*([\s\S]*?)\s*</tool_result>"#)
             .expect("valid regex");
@@ -938,13 +828,9 @@ fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCa
     // Collect results from user "[Tool results]" messages
     let mut result_map: HashMap<String, Vec<String>> = HashMap::new();
     for msg in history {
-<<<<<<< HEAD
-        if (msg.role == "user" && msg.content.starts_with("[Tool results]")) || msg.role == "tool" {
-=======
         if (msg.role == "user" && msg.content.starts_with("[Tool results]"))
             || msg.role == "tool"
         {
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
             for cap in result_re.captures_iter(&msg.content) {
                 result_map
                     .entry(cap[1].to_string())
@@ -1030,11 +916,7 @@ async fn run_gateway_chat_with_multimodal(
 
     // Load skills from workspace (same as CLI agent does).
     let loaded_skills = {
-<<<<<<< HEAD
-        let config_guard = state.config.read().await;
-=======
         let config_guard = state.config.lock();
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         skills::load_skills_with_config(&config_guard.workspace_dir, &config_guard)
     };
 
@@ -1047,11 +929,7 @@ async fn run_gateway_chat_with_multimodal(
 
     // Build system prompt with full tool + skill awareness.
     let mut system_prompt = {
-<<<<<<< HEAD
-        let config_guard = state.config.read().await;
-=======
         let config_guard = state.config.lock();
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         crate::channels::build_system_prompt(
             &config_guard.workspace_dir,
             &state.model,
@@ -1064,24 +942,6 @@ async fn run_gateway_chat_with_multimodal(
 
     // Append tool use protocol and tool descriptions so the LLM knows how to call them.
     system_prompt.push_str(&build_tool_instructions(&state.tools_registry));
-<<<<<<< HEAD
-
-    let mut history = Vec::with_capacity(2);
-    history.push(ChatMessage::system(system_prompt));
-    history.extend(user_messages);
-
-    let multimodal_config = state.config.read().await.multimodal.clone();
-
-    // Create approval manager from config so autonomy levels are enforced.
-    // In gateway mode, tools that need approval are auto-denied (no interactive
-    // prompt available). The agent sees "Denied by user." and can explain to
-    // the user that the action requires a higher autonomy level.
-    let approval_manager = {
-        let config_guard = state.config.read().await;
-        ApprovalManager::from_config(&config_guard.autonomy)
-    };
-
-=======
 
     let mut history = Vec::with_capacity(2);
     history.push(ChatMessage::system(system_prompt));
@@ -1089,7 +949,6 @@ async fn run_gateway_chat_with_multimodal(
 
     let multimodal_config = state.config.lock().multimodal.clone();
 
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
     // Run the full agentic loop: LLM → tool calls → execute → feed results → repeat.
     let response = run_tool_call_loop(
         state.provider.as_ref(),
@@ -1100,11 +959,7 @@ async fn run_gateway_chat_with_multimodal(
         &state.model,
         state.temperature,
         true, // silent — no terminal output in gateway mode
-<<<<<<< HEAD
-        Some(&approval_manager),
-=======
         None, // no approval manager — gateway runs autonomously
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         "webhook",
         &multimodal_config,
         GATEWAY_MAX_TOOL_ITERATIONS,
@@ -1222,8 +1077,7 @@ async fn handle_webhook(
 
     let provider_label = state
         .config
-        .read()
-        .await
+        .lock()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1437,8 +1291,7 @@ async fn handle_whatsapp_message(
     // Process each message
     let provider_label = state
         .config
-        .read()
-        .await
+        .lock()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1551,8 +1404,7 @@ async fn handle_linq_webhook(
     // Process each message
     let provider_label = state
         .config
-        .read()
-        .await
+        .lock()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1664,8 +1516,7 @@ async fn handle_nextcloud_talk_webhook(
 
     let provider_label = state
         .config
-        .read()
-        .await
+        .lock()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1772,16 +1623,7 @@ async fn handle_trigger_webhook(
     let payload_str = body
         .ok()
         .and_then(|Json(b)| b.payload)
-<<<<<<< HEAD
-        .map(|p| {
-            format!(
-                "\n\nPayload: {}",
-                serde_json::to_string(&p).unwrap_or_default()
-            )
-        })
-=======
         .map(|p| format!("\n\nPayload: {}", serde_json::to_string(&p).unwrap_or_default()))
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         .unwrap_or_default();
 
     let message = format!(
@@ -1797,12 +1639,7 @@ async fn handle_trigger_webhook(
 
     let provider_label = state
         .config
-<<<<<<< HEAD
-        .read()
-        .await
-=======
         .lock()
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1889,10 +1726,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
-            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
-            config_tx: tokio::sync::watch::channel(Config::default()).0,
-            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
-            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
+            config: Arc::new(Mutex::new(Config::default())),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -1911,10 +1745,6 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-<<<<<<< HEAD
-            tools_registry: Arc::new(Vec::new()),
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1942,10 +1772,7 @@ mod tests {
 
         let observer: Arc<dyn crate::observability::Observer> = prom;
         let state = AppState {
-            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
-            config_tx: tokio::sync::watch::channel(Config::default()).0,
-            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
-            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
+            config: Arc::new(Mutex::new(Config::default())),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -1964,10 +1791,6 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer,
             webhook_routes: Arc::new(Vec::new()),
-<<<<<<< HEAD
-            tools_registry: Arc::new(Vec::new()),
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2129,7 +1952,7 @@ mod tests {
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
-        let shared_config = Arc::new(tokio::sync::RwLock::new(config));
+        let shared_config = Arc::new(Mutex::new(config));
         persist_pairing_tokens(shared_config.clone(), &guard)
             .await
             .unwrap();
@@ -2141,7 +1964,7 @@ mod tests {
         assert_eq!(persisted.len(), 64);
         assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
 
-        let in_memory = shared_config.read().await;
+        let in_memory = shared_config.lock();
         assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
         assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
     }
@@ -2312,10 +2135,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
-            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
-            config_tx: tokio::sync::watch::channel(Config::default()).0,
-            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
-            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2334,10 +2154,6 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-<<<<<<< HEAD
-            tools_registry: Arc::new(Vec::new()),
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let mut headers = HeaderMap::new();
@@ -2380,10 +2196,7 @@ mod tests {
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
         let state = AppState {
-            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
-            config_tx: tokio::sync::watch::channel(Config::default()).0,
-            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
-            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2402,10 +2215,6 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-<<<<<<< HEAD
-            tools_registry: Arc::new(Vec::new()),
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let headers = HeaderMap::new();
@@ -2460,10 +2269,7 @@ mod tests {
         let secret = generate_test_secret();
 
         let state = AppState {
-            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
-            config_tx: tokio::sync::watch::channel(Config::default()).0,
-            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
-            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2482,10 +2288,6 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-<<<<<<< HEAD
-            tools_registry: Arc::new(Vec::new()),
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let response = handle_webhook(
@@ -2512,10 +2314,7 @@ mod tests {
         let wrong_secret = generate_test_secret();
 
         let state = AppState {
-            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
-            config_tx: tokio::sync::watch::channel(Config::default()).0,
-            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
-            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2534,10 +2333,6 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-<<<<<<< HEAD
-            tools_registry: Arc::new(Vec::new()),
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let mut headers = HeaderMap::new();
@@ -2569,10 +2364,7 @@ mod tests {
         let secret = generate_test_secret();
 
         let state = AppState {
-            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
-            config_tx: tokio::sync::watch::channel(Config::default()).0,
-            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
-            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2591,10 +2383,6 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-<<<<<<< HEAD
-            tools_registry: Arc::new(Vec::new()),
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let mut headers = HeaderMap::new();
@@ -2631,10 +2419,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
-            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
-            config_tx: tokio::sync::watch::channel(Config::default()).0,
-            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
-            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2653,10 +2438,6 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-<<<<<<< HEAD
-            tools_registry: Arc::new(Vec::new()),
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2689,10 +2470,7 @@ mod tests {
         let invalid_signature = "deadbeef";
 
         let state = AppState {
-            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
-            config_tx: tokio::sync::watch::channel(Config::default()).0,
-            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
-            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
+            config: Arc::new(Mutex::new(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2711,10 +2489,6 @@ mod tests {
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
-<<<<<<< HEAD
-            tools_registry: Arc::new(Vec::new()),
-=======
->>>>>>> ff64c1a (chore: rename project from zeroclaw to rantaiclaw)
         };
 
         let mut headers = HeaderMap::new();
