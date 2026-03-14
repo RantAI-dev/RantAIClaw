@@ -52,6 +52,7 @@ pub mod task_create_subtask;
 pub mod task_get;
 pub mod task_list;
 pub mod task_read_comments;
+pub mod task_review;
 pub mod task_update_status;
 pub mod traits;
 pub mod web_search_tool;
@@ -100,6 +101,7 @@ pub use task_create_subtask::TaskCreateSubtaskTool;
 pub use task_get::TaskGetTool;
 pub use task_list::TaskListTool;
 pub use task_read_comments::TaskReadCommentsTool;
+pub use task_review::TaskReviewTool;
 pub use task_update_status::TaskUpdateStatusTool;
 pub use web_search_tool::WebSearchTool;
 
@@ -325,6 +327,11 @@ pub fn all_tools_with_runtime(
             agent_id.clone(),
         )));
         tool_arcs.push(Arc::new(TaskCompleteSubtaskTool::new(
+            config.clone(),
+            security.clone(),
+            agent_id.clone(),
+        )));
+        tool_arcs.push(Arc::new(TaskReviewTool::new(
             config.clone(),
             security.clone(),
             agent_id.clone(),
