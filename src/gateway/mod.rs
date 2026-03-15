@@ -10,6 +10,7 @@
 pub mod task_handlers;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::approval::ApprovalManager;
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -967,6 +968,15 @@ async fn run_gateway_chat_with_multimodal(
 
     let multimodal_config = state.config.lock().multimodal.clone();
 
+    // Create approval manager from config so autonomy levels are enforced.
+    // In gateway mode, tools that need approval are auto-denied (no interactive
+    // prompt available). The agent sees "Denied by user." and can explain to
+    // the user that the action requires a higher autonomy level.
+    let approval_manager = {
+        let config_guard = state.config.lock();
+        ApprovalManager::from_config(&config_guard.autonomy)
+    };
+
     // Run the full agentic loop: LLM → tool calls → execute → feed results → repeat.
     let response = run_tool_call_loop(
         state.provider.as_ref(),
@@ -977,7 +987,7 @@ async fn run_gateway_chat_with_multimodal(
         &state.model,
         state.temperature,
         true, // silent — no terminal output in gateway mode
-        None, // no approval manager — gateway runs autonomously
+        Some(&approval_manager),
         "webhook",
         &multimodal_config,
         GATEWAY_MAX_TOOL_ITERATIONS,
