@@ -7,7 +7,10 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod task_handlers;
+
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::approval::ApprovalManager;
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -305,7 +308,9 @@ fn load_webhook_routes(config_dir: &std::path::Path) -> Vec<WebhookRoute> {
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Mutex<Config>>,
+    pub config: Arc<tokio::sync::RwLock<Config>>,
+    /// Watch channel sender for broadcasting config changes to registries.
+    pub config_tx: tokio::sync::watch::Sender<Config>,
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub temperature: f64,
@@ -346,7 +351,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         );
     }
-    let config_state = Arc::new(Mutex::new(config.clone()));
+    let (config_tx, _config_rx) = tokio::sync::watch::channel(config.clone());
+    let config_state = Arc::new(tokio::sync::RwLock::new(config.clone()));
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -415,7 +421,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tracing::info!(
             "[Gateway] Registered {} skill tools from {} skills",
             skill_tools.len(),
-            startup_skills.iter().filter(|s| !s.tools.is_empty()).count()
+            startup_skills
+                .iter()
+                .filter(|s| !s.tools.is_empty())
+                .count()
         );
         base_tools.extend(skill_tools);
     }
@@ -606,16 +615,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Arc::from(crate::observability::create_observer(&config.observability));
 
     // Load webhook trigger routes from agent-runner config
-    let config_dir = config.config_path.parent().map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from(
+    let config_dir = config
+        .config_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| {
             directories::BaseDirs::new()
                 .map(|d| d.home_dir().join(".rantaiclaw"))
                 .unwrap_or_else(|| std::path::PathBuf::from("/root/.rantaiclaw"))
-        ));
+        });
     let webhook_routes = Arc::new(load_webhook_routes(&config_dir));
 
     let state = AppState {
         config: config_state,
+        config_tx,
         provider,
         model,
         temperature,
@@ -648,6 +661,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/linq", post(handle_linq_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/triggers/{*path}", post(handle_trigger_webhook))
+        .route(
+            "/tasks",
+            get(task_handlers::handle_list_tasks).post(task_handlers::handle_create_task),
+        )
+        .route(
+            "/tasks/{id}",
+            get(task_handlers::handle_get_task)
+                .put(task_handlers::handle_update_task)
+                .delete(task_handlers::handle_delete_task),
+        )
+        .route(
+            "/tasks/{id}/review",
+            post(task_handlers::handle_review_task),
+        )
+        .route(
+            "/tasks/{id}/comments",
+            get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment),
+        )
+        .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -765,11 +797,12 @@ async fn handle_pair(
     }
 }
 
-async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
+async fn persist_pairing_tokens(
+    config: Arc<tokio::sync::RwLock<Config>>,
+    pairing: &PairingGuard,
+) -> Result<()> {
     let paired_tokens = pairing.tokens();
-    // This is needed because parking_lot's guard is not Send so we clone the inner
-    // this should be removed once async mutexes are used everywhere
-    let mut updated_cfg = { config.lock().clone() };
+    let mut updated_cfg = config.read().await.clone();
     updated_cfg.gateway.paired_tokens = paired_tokens;
     updated_cfg
         .save()
@@ -777,7 +810,7 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
         .context("Failed to persist paired tokens to config.toml")?;
 
     // Keep shared runtime config in sync with persisted tokens.
-    *config.lock() = updated_cfg;
+    *config.write().await = updated_cfg;
     Ok(())
 }
 
@@ -809,8 +842,8 @@ struct GatewayChatResult {
 /// and tool-result messages. We parse the XML from assistant messages and pair
 /// them with subsequent results.
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCall> {
-    let call_re = regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#)
-        .expect("valid regex");
+    let call_re =
+        regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#).expect("valid regex");
     let result_re =
         regex::Regex::new(r#"<tool_result name="([^"]+)">\s*([\s\S]*?)\s*</tool_result>"#)
             .expect("valid regex");
@@ -821,9 +854,7 @@ fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCa
     // Collect results from user "[Tool results]" messages
     let mut result_map: HashMap<String, Vec<String>> = HashMap::new();
     for msg in history {
-        if (msg.role == "user" && msg.content.starts_with("[Tool results]"))
-            || msg.role == "tool"
-        {
+        if (msg.role == "user" && msg.content.starts_with("[Tool results]")) || msg.role == "tool" {
             for cap in result_re.captures_iter(&msg.content) {
                 result_map
                     .entry(cap[1].to_string())
@@ -909,7 +940,7 @@ async fn run_gateway_chat_with_multimodal(
 
     // Load skills from workspace (same as CLI agent does).
     let loaded_skills = {
-        let config_guard = state.config.lock();
+        let config_guard = state.config.read().await;
         skills::load_skills_with_config(&config_guard.workspace_dir, &config_guard)
     };
 
@@ -922,7 +953,7 @@ async fn run_gateway_chat_with_multimodal(
 
     // Build system prompt with full tool + skill awareness.
     let mut system_prompt = {
-        let config_guard = state.config.lock();
+        let config_guard = state.config.read().await;
         crate::channels::build_system_prompt(
             &config_guard.workspace_dir,
             &state.model,
@@ -940,7 +971,16 @@ async fn run_gateway_chat_with_multimodal(
     history.push(ChatMessage::system(system_prompt));
     history.extend(user_messages);
 
-    let multimodal_config = state.config.lock().multimodal.clone();
+    let multimodal_config = state.config.read().await.multimodal.clone();
+
+    // Create approval manager from config so autonomy levels are enforced.
+    // In gateway mode, tools that need approval are auto-denied (no interactive
+    // prompt available). The agent sees "Denied by user." and can explain to
+    // the user that the action requires a higher autonomy level.
+    let approval_manager = {
+        let config_guard = state.config.read().await;
+        ApprovalManager::from_config(&config_guard.autonomy)
+    };
 
     // Run the full agentic loop: LLM → tool calls → execute → feed results → repeat.
     let response = run_tool_call_loop(
@@ -952,7 +992,7 @@ async fn run_gateway_chat_with_multimodal(
         &state.model,
         state.temperature,
         true, // silent — no terminal output in gateway mode
-        None, // no approval manager — gateway runs autonomously
+        Some(&approval_manager),
         "webhook",
         &multimodal_config,
         GATEWAY_MAX_TOOL_ITERATIONS,
@@ -1070,7 +1110,8 @@ async fn handle_webhook(
 
     let provider_label = state
         .config
-        .lock()
+        .read()
+        .await
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1284,7 +1325,8 @@ async fn handle_whatsapp_message(
     // Process each message
     let provider_label = state
         .config
-        .lock()
+        .read()
+        .await
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1397,7 +1439,8 @@ async fn handle_linq_webhook(
     // Process each message
     let provider_label = state
         .config
-        .lock()
+        .read()
+        .await
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1509,7 +1552,8 @@ async fn handle_nextcloud_talk_webhook(
 
     let provider_label = state
         .config
-        .lock()
+        .read()
+        .await
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1616,7 +1660,12 @@ async fn handle_trigger_webhook(
     let payload_str = body
         .ok()
         .and_then(|Json(b)| b.payload)
-        .map(|p| format!("\n\nPayload: {}", serde_json::to_string(&p).unwrap_or_default()))
+        .map(|p| {
+            format!(
+                "\n\nPayload: {}",
+                serde_json::to_string(&p).unwrap_or_default()
+            )
+        })
         .unwrap_or_default();
 
     let message = format!(
@@ -1632,7 +1681,8 @@ async fn handle_trigger_webhook(
 
     let provider_label = state
         .config
-        .lock()
+        .read()
+        .await
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -1738,6 +1788,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1784,6 +1835,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer,
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1945,7 +1997,7 @@ mod tests {
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
-        let shared_config = Arc::new(Mutex::new(config));
+        let shared_config = Arc::new(tokio::sync::RwLock::new(config));
         persist_pairing_tokens(shared_config.clone(), &guard)
             .await
             .unwrap();
@@ -1957,7 +2009,7 @@ mod tests {
         assert_eq!(persisted.len(), 64);
         assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
 
-        let in_memory = shared_config.lock();
+        let in_memory = shared_config.read().await;
         assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
         assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
     }
@@ -2147,6 +2199,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2208,6 +2261,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let headers = HeaderMap::new();
@@ -2281,6 +2335,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let response = handle_webhook(
@@ -2326,6 +2381,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2376,6 +2432,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2431,6 +2488,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2482,6 +2540,7 @@ mod tests {
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            tools_registry: Arc::new(Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
