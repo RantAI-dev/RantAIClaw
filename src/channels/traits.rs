@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
@@ -66,7 +67,7 @@ pub trait Channel: Send + Sync {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
     /// Start listening for incoming messages (long-running)
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, cancel: CancellationToken) -> anyhow::Result<()>;
 
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
@@ -139,6 +140,7 @@ mod tests {
         async fn listen(
             &self,
             tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            _cancel: CancellationToken,
         ) -> anyhow::Result<()> {
             tx.send(ChannelMessage {
                 id: "1".into(),
@@ -211,7 +213,7 @@ mod tests {
         let channel = DummyChannel;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-        channel.listen(tx).await.unwrap();
+        channel.listen(tx, CancellationToken::new()).await.unwrap();
 
         let received = rx.recv().await.expect("message should be sent");
         assert_eq!(received.sender, "tester");

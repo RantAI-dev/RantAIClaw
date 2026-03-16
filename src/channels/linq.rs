@@ -293,7 +293,7 @@ impl Channel for LinqChannel {
         anyhow::bail!("Linq API error: {status}");
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
         // Linq uses webhooks (push-based), not polling.
         // Messages are received via the gateway's /linq endpoint.
         tracing::info!(

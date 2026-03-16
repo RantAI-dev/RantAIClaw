@@ -225,7 +225,7 @@ impl Channel for QQChannel {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
         tracing::info!("QQ: authenticating...");
         let token = self.get_token().await?;
 

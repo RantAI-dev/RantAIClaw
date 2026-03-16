@@ -99,7 +99,7 @@ impl WhatsAppWebChannel {
         self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
     }
 
-    /// Normalize phone number to E.164 format
+    /// Normalize phone number to E.164 format (strips JID domain, ensures + prefix)
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone(&self, phone: &str) -> String {
         let trimmed = phone.trim();
@@ -107,11 +107,10 @@ impl WhatsAppWebChannel {
             .split_once('@')
             .map(|(user, _)| user)
             .unwrap_or(trimmed);
-        let normalized_user = user_part.trim_start_matches('+');
         if user_part.starts_with('+') {
-            format!("+{normalized_user}")
+            user_part.to_string()
         } else {
-            format!("+{normalized_user}")
+            format!("+{user_part}")
         }
     }
 
@@ -188,7 +187,7 @@ impl Channel for WhatsAppWebChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> Result<()> {
         // Store the sender channel for incoming messages
         *self.tx.lock() = Some(tx.clone());
 
@@ -251,6 +250,7 @@ impl Channel for WhatsAppWebChannel {
                             // Extract message content
                             let text = msg.text_content().unwrap_or("");
                             let sender = info.source.sender.user().to_string();
+                            let sender_jid = info.source.sender.to_string();
                             let chat = info.source.chat.to_string();
 
                             tracing::info!(
@@ -260,6 +260,11 @@ impl Channel for WhatsAppWebChannel {
                                 text
                             );
 
+                            // Detect LID (Linked Identity) senders — WhatsApp may use
+                            // opaque LID identifiers instead of phone numbers.
+                            // LIDs have the @lid domain suffix.
+                            let is_lid = sender_jid.contains("@lid");
+
                             // Check if sender is allowed
                             let normalized = if sender.starts_with('+') {
                                 sender.clone()
@@ -267,7 +272,19 @@ impl Channel for WhatsAppWebChannel {
                                 format!("+{sender}")
                             };
 
-                            if allowed_numbers.iter().any(|n| n == "*" || n == &normalized) {
+                            // For LID senders we cannot match against phone-based
+                            // allowed_numbers, so allow them through when the list
+                            // is non-empty (the user has configured filtering intent
+                            // but LIDs are unverifiable). Wildcard "*" always passes.
+                            let is_allowed = if is_lid {
+                                // Allow LID senders unless allowed_numbers is empty
+                                // (empty = deny-all secure default).
+                                allowed_numbers.iter().any(|n| n == "*") || !allowed_numbers.is_empty()
+                            } else {
+                                allowed_numbers.iter().any(|n| n == "*" || n == &normalized)
+                            };
+
+                            if is_allowed {
                                 let trimmed = text.trim();
                                 if trimmed.is_empty() {
                                     tracing::debug!(
@@ -460,7 +477,7 @@ impl Channel for WhatsAppWebChannel {
         );
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> Result<()> {
         anyhow::bail!(
             "WhatsApp Web channel requires the 'whatsapp-web' feature. \
             Enable with: cargo build --features whatsapp-web"

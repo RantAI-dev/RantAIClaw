@@ -146,7 +146,7 @@ impl Channel for DingTalkChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
         tracing::info!("DingTalk: registering gateway connection...");
 
         let gw = self.register_connection().await?;

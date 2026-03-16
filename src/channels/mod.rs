@@ -1224,7 +1224,7 @@ fn spawn_supervised_listener_with_health_interval(
             let mut health = tokio::time::interval(health_interval);
             health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let result = {
-                let listen_future = ch.listen(tx.clone());
+                let listen_future = ch.listen(tx.clone(), tokio_util::sync::CancellationToken::new());
                 tokio::pin!(listen_future);
 
                 loop {
@@ -3224,6 +3224,7 @@ mod tests {
         async fn listen(
             &self,
             _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+            _cancel: tokio_util::sync::CancellationToken,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -3254,6 +3255,7 @@ mod tests {
         async fn listen(
             &self,
             _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+            _cancel: tokio_util::sync::CancellationToken,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -5557,6 +5559,7 @@ This is an example JSON object for profile settings."#;
         async fn listen(
             &self,
             _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+            _cancel: tokio_util::sync::CancellationToken,
         ) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("listen boom")
@@ -5576,6 +5579,7 @@ This is an example JSON object for profile settings."#;
         async fn listen(
             &self,
             tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+            _cancel: tokio_util::sync::CancellationToken,
         ) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tx.closed().await;
