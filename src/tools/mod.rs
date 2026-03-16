@@ -45,6 +45,15 @@ pub mod schema;
 pub mod screenshot;
 pub mod shell;
 pub mod skill_tool;
+pub mod task_comment;
+pub mod task_complete_subtask;
+pub mod task_create;
+pub mod task_create_subtask;
+pub mod task_get;
+pub mod task_list;
+pub mod task_read_comments;
+pub mod task_review;
+pub mod task_update_status;
 pub mod traits;
 pub mod web_search_tool;
 
@@ -85,6 +94,15 @@ pub use skill_tool::skill_tools_from_skills;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use task_comment::TaskCommentTool;
+pub use task_complete_subtask::TaskCompleteSubtaskTool;
+pub use task_create::TaskCreateTool;
+pub use task_create_subtask::TaskCreateSubtaskTool;
+pub use task_get::TaskGetTool;
+pub use task_list::TaskListTool;
+pub use task_read_comments::TaskReadCommentsTool;
+pub use task_review::TaskReviewTool;
+pub use task_update_status::TaskUpdateStatusTool;
 pub use web_search_tool::WebSearchTool;
 
 use crate::config::{Config, DelegateAgentConfig};
@@ -281,6 +299,49 @@ pub fn all_tools_with_runtime(
                 security.clone(),
             )));
         }
+    }
+
+    // Task management tools (available when tasks enabled)
+    if root_config.tasks.enabled {
+        let agent_id = std::env::var("RANTAICLAW_AGENT_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        tool_arcs.push(Arc::new(TaskListTool::new(
+            config.clone(),
+            agent_id.clone(),
+        )));
+        tool_arcs.push(Arc::new(TaskGetTool::new(config.clone())));
+        tool_arcs.push(Arc::new(TaskCreateTool::new(
+            config.clone(),
+            security.clone(),
+            agent_id.clone(),
+        )));
+        tool_arcs.push(Arc::new(TaskUpdateStatusTool::new(
+            config.clone(),
+            security.clone(),
+            agent_id.clone(),
+        )));
+        tool_arcs.push(Arc::new(TaskCreateSubtaskTool::new(
+            config.clone(),
+            security.clone(),
+            agent_id.clone(),
+        )));
+        tool_arcs.push(Arc::new(TaskCompleteSubtaskTool::new(
+            config.clone(),
+            security.clone(),
+            agent_id.clone(),
+        )));
+        tool_arcs.push(Arc::new(TaskReviewTool::new(
+            config.clone(),
+            security.clone(),
+            agent_id.clone(),
+        )));
+        tool_arcs.push(Arc::new(TaskCommentTool::new(
+            config.clone(),
+            security.clone(),
+            agent_id.clone(),
+        )));
+        tool_arcs.push(Arc::new(TaskReadCommentsTool::new(config.clone())));
     }
 
     // Add delegation tool when agents are configured

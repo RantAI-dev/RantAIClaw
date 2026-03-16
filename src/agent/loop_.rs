@@ -1135,7 +1135,16 @@ async fn execute_tools_sequential(
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
 
                 if decision == ApprovalResponse::No {
-                    individual_results.push("Denied by user.".to_string());
+                    let msg = if channel_name == "cli" {
+                        "Denied by user.".to_string()
+                    } else {
+                        format!(
+                            "Tool '{}' denied: requires approval at current autonomy level. \
+                             Ask your supervisor to promote your autonomy level to use this tool.",
+                            call.name
+                        )
+                    };
+                    individual_results.push(msg);
                     continue;
                 }
             }

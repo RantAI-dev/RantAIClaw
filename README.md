@@ -1,1208 +1,375 @@
 <p align="center">
-  <img src="rantaiclaw.png" alt="RantaiClaw" width="200" />
+  <img src="assets/rantaiclaw-banner.png" alt="RantaiClaw" width="600" />
 </p>
 
-<h1 align="center">RantaiClaw 🦀</h1>
+<h3 align="center">Multi-Agent Runtime for Production AI Employees</h3>
 
 <p align="center">
-  <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong><br>
-  ⚡️ <strong>Runs on $10 hardware with <5MB RAM: That's 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>
-</p>
-
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
-  <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
-  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/rantaiclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40rantaiclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @rantaiclawlabs" /></a>
-  <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
-  <a href="https://t.me/rantaiclawlabs"><img src="https://img.shields.io/badge/Telegram-%40rantaiclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @rantaiclawlabs" /></a>
-  <a href="https://t.me/rantaiclawlabs_cn"><img src="https://img.shields.io/badge/Telegram%20CN-%40rantaiclawlabs__cn-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram CN: @rantaiclawlabs_cn" /></a>
-  <a href="https://t.me/rantaiclawlabs_ru"><img src="https://img.shields.io/badge/Telegram%20RU-%40rantaiclawlabs__ru-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram RU: @rantaiclawlabs_ru" /></a>
-  <a href="https://www.reddit.com/r/rantaiclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Frantaiclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/rantaiclawlabs" /></a>
-</p>
-<p align="center">
-Built by students and members of the Harvard, MIT, and Sundai.Club communities.
+  <strong>100% Rust</strong> · Zero overhead · Multi-channel · Live config · ClawHub compatible
 </p>
 
 <p align="center">
-  🌐 <strong>Languages:</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.pt-br.md">Português (Brasil)</a>
+  <a href="https://clawhub.ai">ClawHub Skills</a> ·
+  <a href="docs/config-reference.md">Config Reference</a> ·
+  <a href="docs/channels-reference.md">Channels</a> ·
+  <a href="docs/providers-reference.md">Providers</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
-<p align="center">
-  <a href="#quick-start">Getting Started</a> |
-  <a href="bootstrap.sh">One-Click Setup</a> |
-  <a href="docs/README.md">Docs Hub</a> |
-  <a href="docs/SUMMARY.md">Docs TOC</a>
-</p>
+---
 
-<p align="center">
-  <strong>Quick Routes:</strong>
-  <a href="docs/reference/README.md">Reference</a> ·
-  <a href="docs/operations/README.md">Operations</a> ·
-  <a href="docs/troubleshooting.md">Troubleshoot</a> ·
-  <a href="docs/security/README.md">Security</a> ·
-  <a href="docs/hardware/README.md">Hardware</a> ·
-  <a href="docs/contributing/README.md">Contribute</a>
-</p>
+## What is RantaiClaw?
 
-<p align="center">
-  <strong>Fast, small, and fully autonomous AI assistant infrastructure</strong><br />
-  Deploy anywhere. Swap anything.
-</p>
+RantaiClaw is a **production-grade multi-agent runtime** written in Rust. It powers autonomous AI employees that communicate across channels (Discord, Slack, Telegram, WhatsApp), execute tools, manage memories, and run skills — all from a single binary.
 
-<p align="center"><code>Trait-driven architecture · secure-by-default runtime · provider/channel/tool swappable · pluggable everything</code></p>
+Built for **RantAI's digital employee platform**, RantaiClaw runs inside Docker containers as the execution engine for AI agents that operate 24/7 with real-world integrations.
 
-### 📢 Announcements
+### Why Rust?
 
-Use this board for important notices (breaking changes, security advisories, maintenance windows, and release blockers).
+| Metric | RantaiClaw | Python alternatives |
+|--------|-----------|-------------------|
+| Cold start | **< 200ms** | 2-5s |
+| Memory (idle) | **~15 MB** | 200-500 MB |
+| Binary size | **~12 MB** | N/A (runtime + deps) |
+| Concurrent channels | **Thousands** | Hundreds |
 
-| Date (UTC) | Level | Notice | Action |
-|---|---|---|---|
-| 2026-02-19 | _Important_ | We have **not** launched an official website yet, and we are seeing impersonation attempts. Do **not** join any investment or fundraising activity claiming the RantaiClaw name. | Use this repository as the single source of truth. Follow [X (@rantaiclawlabs)](https://x.com/rantaiclawlabs?s=21), [Reddit (r/rantaiclawlabs)](https://www.reddit.com/r/rantaiclawlabs/), [Telegram (@rantaiclawlabs)](https://t.me/rantaiclawlabs), [Telegram CN (@rantaiclawlabs_cn)](https://t.me/rantaiclawlabs_cn), [Telegram RU (@rantaiclawlabs_ru)](https://t.me/rantaiclawlabs_ru), and [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) for official updates. |
-| 2026-02-19 | _Important_ | Anthropic updated the Authentication and Credential Use terms on 2026-02-19. OAuth authentication (Free, Pro, Max) is intended exclusively for Claude Code and Claude.ai; using OAuth tokens from Claude Free/Pro/Max in any other product, tool, or service (including Agent SDK) is not permitted and may violate the Consumer Terms of Service. | Please temporarily avoid Claude Code OAuth integrations to prevent potential loss. Original clause: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). |
+No garbage collector. No runtime overhead. Just async Rust with `tokio`.
 
-### ✨ Features
+---
 
-- 🏎️ **Lean Runtime by Default:** Common CLI and status workflows run in a few-megabyte memory envelope on release builds.
-- 💰 **Cost-Efficient Deployment:** Designed for low-cost boards and small cloud instances without heavyweight runtime dependencies.
-- ⚡ **Fast Cold Starts:** Single-binary Rust runtime keeps command and daemon startup near-instant for daily operations.
-- 🌍 **Portable Architecture:** One binary-first workflow across ARM, x86, and RISC-V with swappable providers/channels/tools.
+## Key Features
 
-### Why teams pick RantaiClaw
+### Multi-Channel Communication
+Connect your agent to any combination of channels simultaneously:
 
-- **Lean by default:** small Rust binary, fast startup, low memory footprint.
-- **Secure by design:** pairing, strict sandboxing, explicit allowlists, workspace scoping.
-- **Fully swappable:** core systems are traits (providers, channels, tools, memory, tunnels).
-- **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
+| Channel | Status | Protocol |
+|---------|--------|----------|
+| Telegram | Stable | Long-poll API |
+| Discord | Stable | WebSocket gateway |
+| Slack | Stable | Socket Mode / Web API |
+| WhatsApp Web | Stable | Multi-device protocol |
+| WhatsApp Cloud | Stable | Cloud API |
+| Matrix (E2EE) | Feature-gated | Matrix SDK |
+| Mattermost | Stable | WebSocket |
+| Signal | Stable | signal-cli REST |
+| Email (IMAP/SMTP) | Stable | IMAP + SMTP |
+| IRC | Stable | IRC protocol |
+| DingTalk | Stable | WebSocket |
+| Lark/Feishu | Feature-gated | WebSocket |
+| CLI | Built-in | stdin/stdout |
 
-## Benchmark Snapshot (RantaiClaw vs OpenClaw, Reproducible)
+Each channel runs independently with its own lifecycle — add, remove, or update channels at runtime without restarting.
 
-Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge hardware.
-
-| | OpenClaw | NanoBot | PicoClaw | RantaiClaw 🦀 |
-|---|---|---|---|---|
-| **Language** | TypeScript | Python | Go | **Rust** |
-| **RAM** | > 1GB | > 100MB | < 10MB | **< 5MB** |
-| **Startup (0.8GHz core)** | > 500s | > 30s | < 1s | **< 10ms** |
-| **Binary Size** | ~28MB (dist) | N/A (Scripts) | ~8MB | **~8.8 MB** |
-| **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware $10** |
-
-> Notes: RantaiClaw results are measured on release builds using `/usr/bin/time -l`. OpenClaw requires Node.js runtime (typically ~390MB additional memory overhead), while NanoBot requires Python runtime. PicoClaw and RantaiClaw are static binaries. The RAM figures above are runtime memory; build-time compilation requirements are higher.
-
-<p align="center">
-  <img src="zero-claw.jpeg" alt="RantaiClaw vs OpenClaw Comparison" width="800" />
-</p>
-
-### Reproducible local measurement
-
-Benchmark claims can drift as code and toolchains evolve, so always measure your current build locally:
+### Live Config API
+Update any configuration at runtime via HTTP:
 
 ```bash
-cargo build --release
-ls -lh target/release/rantaiclaw
+# Hot-swap model without restart
+curl -X PATCH http://localhost:8080/config/model \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"provider": "anthropic", "model": "claude-sonnet-4-20250514"}'
 
-/usr/bin/time -l target/release/rantaiclaw --help
-/usr/bin/time -l target/release/rantaiclaw status
+# Add a Discord channel while running
+curl -X PATCH http://localhost:8080/config/channels \
+  -d '{"discord": {"bot_token": "...", "guild_id": "..."}}'
+
+# Remove a channel gracefully
+curl -X PATCH http://localhost:8080/config/channels \
+  -d '{"telegram": null}'
+
+# Start an MCP server for GitHub tools
+curl -X PATCH http://localhost:8080/config/mcp-servers \
+  -d '{"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "..."}}}'
 ```
 
-Example sample (macOS arm64, measured on February 18, 2026):
+Changes persist to `config.runtime.toml` and survive restarts.
 
-- Release binary size: `8.8M`
-- `rantaiclaw --help`: about `0.02s` real time, ~`3.9MB` peak memory footprint
-- `rantaiclaw status`: about `0.01s` real time, ~`4.1MB` peak memory footprint
+### Multi-Provider Intelligence
+Route to any LLM provider with automatic fallback:
 
-## Prerequisites
+- **OpenRouter** — access 200+ models through one API
+- **OpenAI** — GPT-4o, o1, o3
+- **Anthropic** — Claude Sonnet, Opus, Haiku
+- **Google Gemini** — Gemini 2.5 Pro/Flash
+- **Copilot** — GitHub Copilot models
+- **ZAI GLM** — Chinese language models
+- Custom OpenAI-compatible endpoints
 
-<details>
-<summary><strong>Windows</strong></summary>
-
-#### Required
-
-1. **Visual Studio Build Tools** (provides the MSVC linker and Windows SDK):
-   ```powershell
-   winget install Microsoft.VisualStudio.2022.BuildTools
-   ```
-   During installation (or via the Visual Studio Installer), select the **"Desktop development with C++"** workload.
-
-2. **Rust toolchain:**
-   ```powershell
-   winget install Rustlang.Rustup
-   ```
-   After installation, open a new terminal and run `rustup default stable` to ensure the stable toolchain is active.
-
-3. **Verify** both are working:
-   ```powershell
-   rustc --version
-   cargo --version
-   ```
-
-#### Optional
-
-- **Docker Desktop** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via `winget install Docker.DockerDesktop`.
-
-</details>
-
-<details>
-<summary><strong>Linux / macOS</strong></summary>
-
-#### Required
-
-1. **Build essentials:**
-   - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
-   - **Linux (Fedora/RHEL):** `sudo dnf group install development-tools && sudo dnf install pkg-config`
-   - **macOS:** Install Xcode Command Line Tools: `xcode-select --install`
-
-2. **Rust toolchain:**
-   ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
-   See [rustup.rs](https://rustup.rs) for details.
-
-3. **Verify** both are working:
-   ```bash
-   rustc --version
-   cargo --version
-   ```
-
-#### One-Line Installer
-
-Or skip the steps above and install everything (system deps, Rust, RantaiClaw) in a single command:
+### ClawHub Skills Ecosystem
+Install community skills from [ClawHub](https://clawhub.ai):
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/openagen/rantaiclaw/main/scripts/install.sh | bash
+rantaiclaw skill install deploy-checker
+rantaiclaw skill install code-reviewer
+rantaiclaw skill install meeting-summarizer
 ```
 
-#### Compilation resource requirements
+Skills are workspace-scoped markdown files with embedded tools and instructions. Create your own:
 
-Building from source needs more resources than running the resulting binary:
+```markdown
+# SKILL.md — deploy-checker
 
-| Resource | Minimum | Recommended |
-|---|---|---|
-| **RAM + swap** | 2 GB | 4 GB+ |
-| **Free disk** | 6 GB | 10 GB+ |
+## Description
+Validates deployment readiness before release.
 
-If your host is below the minimum, use pre-built binaries:
+## Tools
+- name: run_checks
+  kind: shell
+  command: ./scripts/pre-deploy.sh
 
-```bash
-./bootstrap.sh --prefer-prebuilt
+## Instructions
+- Always run pre-deploy checks before approving a release
+- Report any failing checks with specific remediation steps
 ```
 
-To require binary-only install with no source fallback:
+### MCP Server Management
+Run Model Context Protocol servers inside the container for tool integrations:
 
-```bash
-./bootstrap.sh --prebuilt-only
-```
+- **GitHub** — repositories, issues, PRs, code search
+- **Slack** — channels, messages, users
+- **Notion** — pages, databases, blocks
+- **Linear** — issues, projects, cycles
+- **Custom** — any MCP-compatible server
 
-#### Optional
+MCP servers are supervised with automatic restart on crash (exponential backoff, max 5 retries).
 
-- **Docker** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via your package manager or [docker.com](https://docs.docker.com/engine/install/).
+### Agentic Tool System
+Built-in tools with security boundaries:
 
-> **Note:** The default `cargo build --release` uses `codegen-units=1` to lower peak compile pressure. For faster builds on powerful machines, use `cargo build --profile release-fast`.
+| Tool | Description |
+|------|-------------|
+| `shell` | Execute commands (sandboxed, allowlist-controlled) |
+| `file_read` | Read files from workspace |
+| `file_write` | Write files to workspace |
+| `web_search` | Search the web |
+| `memory_store` | Persist facts to long-term memory |
+| `memory_recall` | Query memory by semantic similarity |
+| `cron_schedule` | Create/manage scheduled tasks |
+| `send_message` | Message coworkers |
+| `browser` | Web automation (optional, feature-gated) |
+| `composio` | 150+ app integrations via Composio |
 
-</details>
+### Autonomy Levels (L1–L4)
 
+| Level | Behavior |
+|-------|----------|
+| **L1** — Supervised | All tool calls require approval |
+| **L2** — Assisted | Low-risk tools auto-approved (file_read, memory, web_search) |
+| **L3** — Autonomous | Most tools auto-approved, dangerous commands blocked |
+| **L4** — Full | All tools auto-approved, agent operates independently |
+
+### Memory System
+Multiple backends for persistent agent memory:
+
+- **SQLite** (default) — zero-config, file-based
+- **Markdown** — human-readable memory files
+- **PostgreSQL** — shared memory across agents (optional)
+
+Memory supports semantic search via embeddings for context-aware recall.
+
+---
 
 ## Quick Start
 
-### Homebrew (macOS/Linuxbrew)
+### Install from source
 
 ```bash
-brew install rantaiclaw
+git clone https://github.com/RantAI-dev/RantAIClaw.git
+cd RantAIClaw
+cargo build --release
 ```
 
-### One-click bootstrap
+### Interactive setup
 
 ```bash
-# Recommended: clone then run local bootstrap script
-git clone https://github.com/openagen/rantaiclaw.git
-cd rantaiclaw
-./bootstrap.sh
-
-# Optional: bootstrap dependencies + Rust on fresh machines
-./bootstrap.sh --install-system-deps --install-rust
-
-# Optional: pre-built binary first (recommended on low-RAM/low-disk hosts)
-./bootstrap.sh --prefer-prebuilt
-
-# Optional: binary-only install (no source build fallback)
-./bootstrap.sh --prebuilt-only
-
-# Optional: run onboarding in the same flow
-./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
-
-# Optional: run bootstrap + onboarding fully in Docker-compatible mode
-./bootstrap.sh --docker
-
-# Optional: force Podman as container CLI
-RANTAICLAW_CONTAINER_CLI=podman ./bootstrap.sh --docker
-
-# Optional: in --docker mode, skip local image build and use local tag or pull fallback image
-./bootstrap.sh --docker --skip-build
+./target/release/rantaiclaw onboard
 ```
 
-Remote one-liner (review first in security-sensitive environments):
+This walks you through provider selection, API key setup, and workspace initialization.
+
+### Run in chat mode
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/openagen/rantaiclaw/main/scripts/bootstrap.sh | bash
+rantaiclaw chat
 ```
 
-Details: [`docs/one-click-bootstrap.md`](docs/one-click-bootstrap.md) (toolchain mode may request `sudo` for system packages).
-
-### Pre-built binaries
-
-Release assets are published for:
-
-- Linux: `x86_64`, `aarch64`, `armv7`
-- macOS: `x86_64`, `aarch64`
-- Windows: `x86_64`
-
-Download the latest assets from:
-<https://github.com/openagen/rantaiclaw/releases/latest>
-
-Example (ARM64 Linux):
+### Run as daemon (gateway mode)
 
 ```bash
-curl -fsSLO https://github.com/openagen/rantaiclaw/releases/latest/download/rantaiclaw-aarch64-unknown-linux-gnu.tar.gz
-tar xzf rantaiclaw-aarch64-unknown-linux-gnu.tar.gz
-install -m 0755 rantaiclaw "$HOME/.cargo/bin/rantaiclaw"
-```
-
-```bash
-git clone https://github.com/openagen/rantaiclaw.git
-cd rantaiclaw
-cargo build --release --locked
-cargo install --path . --force --locked
-
-# Ensure ~/.cargo/bin is in your PATH
-export PATH="$HOME/.cargo/bin:$PATH"
-
-# Quick setup (no prompts, optional model specification)
-rantaiclaw onboard --api-key sk-... --provider openrouter [--model "openrouter/auto"]
-
-# Or interactive wizard
-rantaiclaw onboard --interactive
-
-# If config.toml already exists and you intentionally want to overwrite it
-rantaiclaw onboard --force
-
-# Or quickly repair channels/allowlists only
-rantaiclaw onboard --channels-only
-
-# Chat
-rantaiclaw agent -m "Hello, RantaiClaw!"
-
-# Interactive mode
-rantaiclaw agent
-
-# Start the gateway (webhook server)
-rantaiclaw gateway                # default: 127.0.0.1:3000
-rantaiclaw gateway --port 0       # random port (security hardened)
-
-# Start full autonomous runtime
 rantaiclaw daemon
-
-# Check status
-rantaiclaw status
-rantaiclaw auth status
-
-# Generate shell completions (stdout only, safe to source directly)
-source <(rantaiclaw completions bash)
-rantaiclaw completions zsh > ~/.zfunc/_rantaiclaw
-
-# Run system diagnostics
-rantaiclaw doctor
-
-# Check channel health
-rantaiclaw channel doctor
-
-# Bind a Telegram identity into allowlist
-rantaiclaw channel bind-telegram 123456789
-
-# Get integration setup details
-rantaiclaw integrations info Telegram
-
-# Note: Channels (Telegram, Discord, Slack) require daemon to be running
-# rantaiclaw daemon
-
-# Manage background service
-rantaiclaw service install
-rantaiclaw service status
-rantaiclaw service restart
-
-# On Alpine (OpenRC): sudo rantaiclaw service install
-
-# Migrate memory from OpenClaw (safe preview first)
-rantaiclaw migrate openclaw --dry-run
-rantaiclaw migrate openclaw
 ```
 
-> **Dev fallback (no global install):** prefix commands with `cargo run --release --` (example: `cargo run --release -- status`).
+The daemon starts the HTTP gateway, connects to configured channels, and runs the agentic loop.
 
-## Subscription Auth (OpenAI Codex / Claude Code)
-
-RantaiClaw now supports subscription-native auth profiles (multi-account, encrypted at rest).
-
-- Store file: `~/.rantaiclaw/auth-profiles.json`
-- Encryption key: `~/.rantaiclaw/.secret_key`
-- Profile id format: `<provider>:<profile_name>` (example: `openai-codex:work`)
-
-OpenAI Codex OAuth (ChatGPT subscription):
+### Docker
 
 ```bash
-# Recommended on servers/headless
-rantaiclaw auth login --provider openai-codex --device-code
-
-# Browser/callback flow with paste fallback
-rantaiclaw auth login --provider openai-codex --profile default
-rantaiclaw auth paste-redirect --provider openai-codex --profile default
-
-# Check / refresh / switch profile
-rantaiclaw auth status
-rantaiclaw auth refresh --provider openai-codex --profile default
-rantaiclaw auth use --provider openai-codex --profile work
+docker build -t rantaiclaw .
+docker run -v ~/.rantaiclaw:/root/.rantaiclaw rantaiclaw daemon
 ```
 
-Claude Code / Anthropic setup-token:
-
-```bash
-# Paste subscription/setup token (Authorization header mode)
-rantaiclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
-
-# Alias command
-rantaiclaw auth setup-token --provider anthropic --profile default
-```
-
-Run the agent with subscription auth:
-
-```bash
-rantaiclaw agent --provider openai-codex -m "hello"
-rantaiclaw agent --provider openai-codex --auth-profile openai-codex:work -m "hello"
-
-# Anthropic supports both API key and auth token env vars:
-# ANTHROPIC_AUTH_TOKEN, ANTHROPIC_OAUTH_TOKEN, ANTHROPIC_API_KEY
-rantaiclaw agent --provider anthropic -m "hello"
-```
-
-## Architecture
-
-Every subsystem is a **trait** — swap implementations with a config change, zero code changes.
-
-<p align="center">
-  <img src="docs/architecture.svg" alt="RantaiClaw Architecture" width="900" />
-</p>
-
-| Subsystem | Trait | Ships with | Extend |
-|-----------|-------|------------|--------|
-| **AI Models** | `Provider` | Provider catalog via `rantaiclaw providers` (currently 29 built-ins + aliases, plus custom endpoints) | `custom:https://your-api.com` (OpenAI-compatible) or `anthropic-custom:https://your-api.com` |
-| **Channels** | `Channel` | CLI, Telegram, Discord, Slack, Mattermost, iMessage, Matrix, Signal, WhatsApp, Email, IRC, Lark, DingTalk, QQ, Webhook | Any messaging API |
-| **Memory** | `Memory` | SQLite hybrid search, PostgreSQL backend (configurable storage provider), Lucid bridge, Markdown files, explicit `none` backend, snapshot/hydrate, optional response cache | Any persistence backend |
-| **Tools** | `Tool` | shell/file/memory, cron/schedule, git, pushover, browser, http_request, screenshot/image_info, composio (opt-in), delegate, hardware tools | Any capability |
-| **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
-| **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed) | Additional runtimes can be added via adapter; unsupported kinds fail fast |
-| **Security** | `SecurityPolicy` | Gateway pairing, sandbox, allowlists, rate limits, filesystem scoping, encrypted secrets | — |
-| **Identity** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Any identity format |
-| **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
-| **Heartbeat** | Engine | HEARTBEAT.md periodic tasks | — |
-| **Skills** | Loader | TOML manifests + SKILL.md instructions | Community skill packs |
-| **Integrations** | Registry | 70+ integrations across 9 categories | Plugin system |
-
-### Runtime support (current)
-
-- ✅ Supported today: `runtime.kind = "native"` or `runtime.kind = "docker"`
-- 🚧 Planned, not implemented yet: WASM / edge runtimes
-
-When an unsupported `runtime.kind` is configured, RantaiClaw now exits with a clear error instead of silently falling back to native.
-
-### Memory System (Full-Stack Search Engine)
-
-All custom, zero external dependencies — no Pinecone, no Elasticsearch, no LangChain:
-
-| Layer | Implementation |
-|-------|---------------|
-| **Vector DB** | Embeddings stored as BLOB in SQLite, cosine similarity search |
-| **Keyword Search** | FTS5 virtual tables with BM25 scoring |
-| **Hybrid Merge** | Custom weighted merge function (`vector.rs`) |
-| **Embeddings** | `EmbeddingProvider` trait — OpenAI, custom URL, or noop |
-| **Chunking** | Line-based markdown chunker with heading preservation |
-| **Caching** | SQLite `embedding_cache` table with LRU eviction |
-| **Safe Reindex** | Rebuild FTS5 + re-embed missing vectors atomically |
-
-The agent automatically recalls, saves, and manages memory via tools.
-
-```toml
-[memory]
-backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
-auto_save = true
-embedding_provider = "none"    # "none", "openai", "custom:https://..."
-vector_weight = 0.7
-keyword_weight = 0.3
-
-# backend = "none" uses an explicit no-op memory backend (no persistence)
-
-# Optional: storage-provider override for remote memory backends.
-# When provider = "postgres", RantaiClaw uses PostgreSQL for memory persistence.
-# The db_url key also accepts alias `dbURL` for backward compatibility.
-#
-# [storage.provider.config]
-# provider = "postgres"
-# db_url = "postgres://user:password@host:5432/rantaiclaw"
-# schema = "public"
-# table = "memories"
-# connect_timeout_secs = 15
-
-# Optional for backend = "sqlite": max seconds to wait when opening the DB (e.g. file locked). Omit or leave unset for no timeout.
-# sqlite_open_timeout_secs = 30
-
-# Optional for backend = "lucid"
-# RANTAICLAW_LUCID_CMD=/usr/local/bin/lucid            # default: lucid
-# RANTAICLAW_LUCID_BUDGET=200                          # default: 200
-# RANTAICLAW_LUCID_LOCAL_HIT_THRESHOLD=3               # local hit count to skip external recall
-# RANTAICLAW_LUCID_RECALL_TIMEOUT_MS=120               # low-latency budget for lucid context recall
-# RANTAICLAW_LUCID_STORE_TIMEOUT_MS=800                # async sync timeout for lucid store
-# RANTAICLAW_LUCID_FAILURE_COOLDOWN_MS=15000           # cooldown after lucid failure to avoid repeated slow attempts
-```
-
-## Security
-
-RantaiClaw enforces security at **every layer** — not just the sandbox. It passes all items from the community security checklist.
-
-### Security Checklist
-
-| # | Item | Status | How |
-|---|------|--------|-----|
-| 1 | **Gateway not publicly exposed** | ✅ | Binds `127.0.0.1` by default. Refuses `0.0.0.0` without tunnel or explicit `allow_public_bind = true`. |
-| 2 | **Pairing required** | ✅ | 6-digit one-time code on startup. Exchange via `POST /pair` for bearer token. All `/webhook` requests require `Authorization: Bearer <token>`. |
-| 3 | **Filesystem scoped (no /)** | ✅ | `workspace_only = true` by default. 14 system dirs + 4 sensitive dotfiles blocked. Null byte injection blocked. Symlink escape detection via canonicalization + resolved-path workspace checks in file read/write tools. |
-| 4 | **Access via tunnel only** | ✅ | Gateway refuses public bind without active tunnel. Supports Tailscale, Cloudflare, ngrok, or any custom tunnel. |
-
-> **Run your own nmap:** `nmap -p 1-65535 <your-host>` — RantaiClaw binds to localhost only, so nothing is exposed unless you explicitly configure a tunnel.
-
-### Channel allowlists (deny-by-default)
-
-Inbound sender policy is now consistent:
-
-- Empty allowlist = **deny all inbound messages**
-- `"*"` = **allow all** (explicit opt-in)
-- Otherwise = exact-match allowlist
-
-This keeps accidental exposure low by default.
-
-Full channel configuration reference: [docs/channels-reference.md](docs/channels-reference.md).
-
-Recommended low-friction setup (secure + fast):
-
-- **Telegram:** allowlist your own `@username` (without `@`) and/or your numeric Telegram user ID.
-- **Discord:** allowlist your own Discord user ID.
-- **Slack:** allowlist your own Slack member ID (usually starts with `U`).
-- **Mattermost:** uses standard API v4. Allowlists use Mattermost user IDs.
-- Use `"*"` only for temporary open testing.
-
-Telegram operator-approval flow:
-
-1. Keep `[channels_config.telegram].allowed_users = []` for deny-by-default startup.
-2. Unauthorized users receive a hint with a copyable operator command:
-   `rantaiclaw channel bind-telegram <IDENTITY>`.
-3. Operator runs that command locally, then user retries sending a message.
-
-If you need a one-shot manual approval, run:
-
-```bash
-rantaiclaw channel bind-telegram 123456789
-```
-
-If you're not sure which identity to use:
-
-1. Start channels and send one message to your bot.
-2. Read the warning log to see the exact sender identity.
-3. Add that value to the allowlist and rerun channels-only setup.
-
-If you hit authorization warnings in logs (for example: `ignoring message from unauthorized user`),
-rerun channel setup only:
-
-```bash
-rantaiclaw onboard --channels-only
-```
-
-### Telegram media replies
-
-Telegram routing now replies to the source **chat ID** from incoming updates (instead of usernames),
-which avoids `Bad Request: chat not found` failures.
-
-For non-text replies, RantaiClaw can send Telegram attachments when the assistant includes markers:
-
-- `[IMAGE:<path-or-url>]`
-- `[DOCUMENT:<path-or-url>]`
-- `[VIDEO:<path-or-url>]`
-- `[AUDIO:<path-or-url>]`
-- `[VOICE:<path-or-url>]`
-
-Paths can be local files (for example `/tmp/screenshot.png`) or HTTPS URLs.
-
-### WhatsApp Setup
-
-RantaiClaw supports two WhatsApp backends:
-
-- **WhatsApp Web mode** (QR / pair code, no Meta Business API required)
-- **WhatsApp Business Cloud API mode** (official Meta webhook flow)
-
-#### WhatsApp Web mode (recommended for personal/self-hosted use)
-
-1. **Build with WhatsApp Web support:**
-   ```bash
-   cargo build --features whatsapp-web
-   ```
-
-2. **Configure RantaiClaw:**
-   ```toml
-   [channels_config.whatsapp]
-   session_path = "~/.rantaiclaw/state/whatsapp-web/session.db"
-   pair_phone = "15551234567"   # optional; omit to use QR flow
-   pair_code = ""               # optional custom pair code
-   allowed_numbers = ["+1234567890"]  # E.164 format, or ["*"] for all
-   ```
-
-3. **Start channels/daemon and link device:**
-   - Run `rantaiclaw channel start` (or `rantaiclaw daemon`).
-   - Follow terminal pairing output (QR or pair code).
-   - In WhatsApp on phone: **Settings → Linked Devices**.
-
-4. **Test:** Send a message from an allowed number and verify the agent replies.
-
-#### WhatsApp Business Cloud API mode
-
-WhatsApp uses Meta's Cloud API with webhooks (push-based, not polling):
-
-1. **Create a Meta Business App:**
-   - Go to [developers.facebook.com](https://developers.facebook.com)
-   - Create a new app → Select "Business" type
-   - Add the "WhatsApp" product
-
-2. **Get your credentials:**
-   - **Access Token:** From WhatsApp → API Setup → Generate token (or create a System User for permanent tokens)
-   - **Phone Number ID:** From WhatsApp → API Setup → Phone number ID
-   - **Verify Token:** You define this (any random string) — Meta will send it back during webhook verification
-
-3. **Configure RantaiClaw:**
-   ```toml
-   [channels_config.whatsapp]
-   access_token = "EAABx..."
-   phone_number_id = "123456789012345"
-   verify_token = "my-secret-verify-token"
-   allowed_numbers = ["+1234567890"]  # E.164 format, or ["*"] for all
-   ```
-
-4. **Start the gateway with a tunnel:**
-   ```bash
-   rantaiclaw gateway --port 3000
-   ```
-   WhatsApp requires HTTPS, so use a tunnel (ngrok, Cloudflare, Tailscale Funnel).
-
-5. **Configure Meta webhook:**
-   - In Meta Developer Console → WhatsApp → Configuration → Webhook
-   - **Callback URL:** `https://your-tunnel-url/whatsapp`
-   - **Verify Token:** Same as your `verify_token` in config
-   - Subscribe to `messages` field
-
-6. **Test:** Send a message to your WhatsApp Business number — RantaiClaw will respond via the LLM.
-
-### Security Analysis (2026-02-22)
-
-Full source-code audit of all 31 tool surfaces. Grades reflect the current state of defense-in-depth verified against the implementation.
-
-**Grade scale:** A = strong controls, well-tested · B = adequate controls, gaps identified · C = significant gaps · D = critical issues present
-
-#### File access tools
-
-| Surface | Risk area | Grade | Finding | Recommended action |
-|---|---|:---:|---|---|
-| `file_read` | Path traversal / probing | **A** | Symlink escape blocked via canonicalization. `record_action()` called pre-canonicalization to prevent timing probes. 10 MB size limit enforced. Comprehensive test coverage including TOCTOU probing. | No action required. |
-| `file_write` | Path traversal / TOCTOU | **A-** | Workspace scoping, null-byte rejection, and symlink-target rejection all present. `create_dir_all()` executes before final canonicalization, creating a narrow race window. | Add TOCTOU-specific regression test for directory creation race; consider `O_NOFOLLOW`-equivalent check after creation. |
-| `glob_search` | Path traversal / DoS | **A-** | `../` and absolute paths rejected before glob. Resolved paths checked against workspace boundary. MAX_RESULTS = 1000 prevents enumeration DoS. | Acceptable if workspace itself is not a symlink chain. Document assumption in security reference. |
-| `pdf_read` | Path traversal / resource exhaustion | **A** | 50 MB limit enforced. Symlink escape blocked. `record_action()` called before canonicalization. CPU-bound extraction offloaded via `spawn_blocking`. | No action required. |
-| `image_info` | Path traversal / malformed input | **A-** | 5 MB limit. JPEG segment parsing includes malformed-segment detection. Minor `.exists()` + `metadata()` TOCTOU window is benign for a read-only tool. | No action required. |
-
-#### Network tools
-
-| Surface | Risk area | Grade | Finding | Recommended action |
-|---|---|:---:|---|---|
-| `http_request` | SSRF | **B+** | Comprehensive private/local IP block-list (IPv4 + IPv6, including link-local and documentation ranges). Domain allowlist with subdomain matching. Sensitive headers redacted in output. Redirect following disabled. | IP check is pre-resolution only; add post-connect re-validation or document egress proxy requirement for high-assurance deployments. |
-| `http_request` | Protocol downgrade | **B** | HTTP URLs accepted alongside HTTPS. No operator-level enforcement option. | Add `https_only = true` config key to `SecurityPolicy`; reject plain HTTP unless explicitly opted out. |
-| `browser_open` | SSRF-adjacent | **B+** | HTTPS-only enforced at URL validation stage. Same IP block-list as `http_request`. Domain allowlist required. Autonomy and rate-limit gates applied. | Replace manual IPv4 parser with `std::net::IpAddr::parse()` for maintainability. |
-| `web_search_tool` | External data injection | **B+** | Query trimmed and validated. DuckDuckGo redirect URLs decoded safely. Brave API key only used when configured. No autonomy gate (read-only by design). | Replace `Regex::new(...).unwrap()` with a lazy static or `OnceLock` to eliminate potential panic on static pattern compilation. |
-
-#### Command execution
-
-| Surface | Risk area | Grade | Finding | Recommended action |
-|---|---|:---:|---|---|
-| `shell` | Arbitrary command execution / network egress | **B** | Environment cleared before execution; only safe vars (PATH, HOME, TERM, LANG…) re-injected. 60 s timeout + 1 MB output cap. Medium/high-risk commands require `approved = true`. No filtering of network-capable commands (`curl`, `wget`, `nc`). Command validation delegated to runtime adapter — trust boundary is implicit. | Add optional `blocked_commands` list to `SecurityPolicy`. Formalize runtime adapter security contract; add interface-level test. |
-| `git_operations` | Injection / unintended exfiltration | **A-** | Comprehensive argument sanitizer blocks `--exec=`, `--upload-pack=`, `-c` config injection, shell metacharacters, backticks, pipes, redirects. Write ops gated on autonomy level. Commit message truncated at 2000 chars (multi-byte safe). | Paths passed via `git add -- {paths}` are sanitized by the argument parser but not independently validated; add an explicit test with path arguments containing special characters. |
-
-#### Memory tools
-
-| Surface | Risk area | Grade | Finding | Recommended action |
-|---|---|:---:|---|---|
-| `memory_store` / `memory_forget` | Unauthorized mutation | **A** | `enforce_tool_operation(ToolOperation::Act, …)` gate applied. Rate limiting enforced. Memory category validated on write. | No action required. |
-| `memory_recall` | Unauthorized read | **A** | Read-only; no autonomy gate needed by design. Result limit cast is safe (saturating math). | No action required. |
-
-#### Agent delegation
-
-| Surface | Risk area | Grade | Finding | Recommended action |
-|---|---|:---:|---|---|
-| `delegate` | Prompt injection via sub-agent / tool scope creep | **B** | Delegation depth tracked to prevent infinite recursion. Parent tools passed immutably via `Arc`. Sub-agent credential propagation present but trust model not explicitly documented. No validated allowlist preventing unsafe tools (e.g. `shell`, `memory_forget`) from being delegated. | Treat sub-agent output as untrusted data before acting. Define and enforce an explicit tool allowlist for delegated contexts; document the trust boundary in the security reference. |
-
-#### Scheduling
-
-| Surface | Risk area | Grade | Finding | Recommended action |
-|---|---|:---:|---|---|
-| `cron_add` / `cron_update` / `cron_remove` | Unauthorized schedule mutation | **B+** | `enforce_mutation_allowed()` gate verifies autonomy and rate limits. Feature must be explicitly enabled. Schedule string validated before storage. | Verify that commands stored in cron entries pass through the same sanitization as `shell` tool at execution time. |
-
-#### External API integrations
-
-| Surface | Risk area | Grade | Finding | Recommended action |
-|---|---|:---:|---|---|
-| `composio` | Credential exposure / SSRF via API | **B** | HTTPS enforced on outbound calls. API key stored via encrypted secret store. Opt-in feature flag. Full execute() path not fully auditable from available context. | Add integration test covering credential non-exposure in error paths. |
-| `pushover` | Credential exposure | **B** | Reads `PUSHOVER_TOKEN` and `PUSHOVER_USER_KEY` from `.env` in workspace. If workspace is world-readable, secrets are exposed to any local user. | Move credentials to the encrypted secret store consistent with other integrations; document workspace permission requirements in the runbook. |
-| `proxy_config` | Unauthorized config mutation | **B+** | Config reloaded without environment variables to prevent env override leakage. Write access gated. `ProxyScope` input normalized. | No critical gaps identified; full audit recommended before production use. |
-
-#### Utility tools
-
-| Surface | Risk area | Grade | Finding | Recommended action |
-|---|---|:---:|---|---|
-| `screenshot` | Shell injection via filename | **B+** | Filename sanitized (directory components stripped, shell-unsafe chars rejected) before interpolation into shell command string. Autonomy gated. 2 MB base64 limit enforced. | Refactor Linux branch to use array-based command construction (avoid string interpolation into shell) to eliminate the dependency on correct prior sanitization. |
-| `image_info` | Malformed binary parsing | **A-** | Magic-byte format detection. JPEG segment parsing with malformed-segment detection. Workspace boundary enforced. | No critical action required. |
-
-#### Hardware tools
-
-| Surface | Risk area | Grade | Finding | Recommended action |
-|---|---|:---:|---|---|
-| `hardware_memory_read` / `hardware_memory_map` | Direct memory access | **B** | Peripheral access is trait-gated; tools delegate to hardware abstraction layer. Address range bounds and alignment validation not visible at tool layer — must be enforced by peripheral implementation. | Audit peripheral implementations for explicit address-range allow-lists and read-size limits before enabling in production. Document hardware trust boundary in `docs/hardware-peripherals-design.md`. |
-| `hardware_board_info` | Information disclosure | **B+** | Board metadata read-only. Risk is low if hardware identity is not considered sensitive in the deployment context. | Confirm output does not expose firmware secrets or debug interfaces in production board configs. |
-
-#### Compiler hygiene
-
-| Surface | Risk area | Grade | Finding | Recommended action |
-|---|---|:---:|---|---|
-| `src/security/mod.rs` / `src/tools/mod.rs` | Compiler signal degradation | **B+** | Multiple `#[allow(unused_imports)]` suppress warnings in security-critical modules, reducing the reliability of `cargo clippy -D warnings` as a regression signal. | Remove dead imports and the corresponding `#[allow]` suppressions; keep compiler output clean as a CI gate. |
-
-#### Overall posture
-
-| Tier | Coverage | Grade |
-|---|---|:---:|
-| File access | `file_read`, `file_write`, `glob_search`, `pdf_read`, `image_info` | **A-** |
-| Network | `http_request`, `browser_open`, `web_search_tool` | **B+** |
-| Command execution | `shell`, `git_operations` | **B+** |
-| Memory | `memory_store`, `memory_recall`, `memory_forget` | **A** |
-| Delegation | `delegate` | **B** |
-| Scheduling | `cron_*`, `schedule` | **B+** |
-| External APIs | `composio`, `pushover`, `proxy_config` | **B** |
-| Utility | `screenshot`, `image_info` | **B+** |
-| Hardware | `hardware_memory_read`, `hardware_memory_map`, `hardware_board_info` | **B** |
-| Compiler hygiene | `src/security/`, `src/tools/` | **B+** |
-| **Repository overall** | 31 surfaces audited | **B+** |
-
-> Full security model and configuration reference: [docs/security/README.md](docs/security/README.md)
+---
 
 ## Configuration
 
-Config: `~/.rantaiclaw/config.toml` (created by `onboard`)
-
-When `rantaiclaw channel start` is already running, changes to `default_provider`,
-`default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*`
-are hot-applied on the next inbound channel message.
+RantaiClaw uses TOML configuration at `~/.rantaiclaw/config.toml`:
 
 ```toml
-api_key = "sk-..."
+# Model configuration
 default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4-6"
+default_model = "anthropic/claude-sonnet-4-20250514"
 default_temperature = 0.7
 
-# Custom OpenAI-compatible endpoint
-# default_provider = "custom:https://your-api.com"
-
-# Custom Anthropic-compatible endpoint
-# default_provider = "anthropic-custom:https://your-api.com"
-
-[memory]
-backend = "sqlite"             # "sqlite", "lucid", "postgres", "markdown", "none"
-auto_save = true
-embedding_provider = "none"    # "none", "openai", "custom:https://..."
-vector_weight = 0.7
-keyword_weight = 0.3
-
-# backend = "none" disables persistent memory via no-op backend
-
-# Optional remote storage-provider override (PostgreSQL example)
-# [storage.provider.config]
-# provider = "postgres"
-# db_url = "postgres://user:password@host:5432/rantaiclaw"
-# schema = "public"
-# table = "memories"
-# connect_timeout_secs = 15
-
-[gateway]
-port = 3000                    # default
-host = "127.0.0.1"            # default
-require_pairing = true         # require pairing code on first connect
-allow_public_bind = false      # refuse 0.0.0.0 without tunnel
-
+# Autonomy
 [autonomy]
-level = "supervised"           # "readonly", "supervised", "full" (default: supervised)
-workspace_only = true          # default: true — scoped to workspace
-allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep"]
-forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
+level = "supervised"
+auto_approve = ["file_read", "memory_recall", "web_search"]
+workspace_only = true
+max_actions_per_hour = 100
 
-[runtime]
-kind = "native"                # "native" or "docker"
+# Channels
+[channels_config]
+cli = true
 
-[runtime.docker]
-image = "alpine:3.20"         # container image for shell execution
-network = "none"              # docker network mode ("none", "bridge", etc.)
-memory_limit_mb = 512          # optional memory limit in MB
-cpu_limit = 1.0                # optional CPU limit
-read_only_rootfs = true        # mount root filesystem as read-only
-mount_workspace = true         # mount workspace into /workspace
-allowed_workspace_roots = []   # optional allowlist for workspace mount validation
+[channels_config.discord]
+bot_token = "..."
+guild_id = "..."
+mention_only = true
 
-[heartbeat]
-enabled = false
-interval_minutes = 30
+[channels_config.telegram]
+bot_token = "..."
+allowed_users = ["*"]
 
-[tunnel]
-provider = "none"              # "none", "cloudflare", "tailscale", "ngrok", "custom"
+# MCP Servers
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
 
-[secrets]
-encrypt = true                 # API keys encrypted with local key file
+[mcp_servers.github.env]
+GITHUB_PERSONAL_ACCESS_TOKEN = "ghp_..."
 
-[browser]
-enabled = false                # opt-in browser_open + browser tools
-allowed_domains = ["docs.rs"]  # required when browser is enabled
-backend = "agent_browser"      # "agent_browser" (default), "rust_native", "computer_use", "auto"
-native_headless = true         # applies when backend uses rust-native
-native_webdriver_url = "http://127.0.0.1:9515" # WebDriver endpoint (chromedriver/selenium)
-# native_chrome_path = "/usr/bin/chromium"      # optional explicit browser binary for driver
-
-[browser.computer_use]
-endpoint = "http://127.0.0.1:8787/v1/actions"   # computer-use sidecar HTTP endpoint
-timeout_ms = 15000            # per-action timeout
-allow_remote_endpoint = false  # secure default: only private/localhost endpoint
-window_allowlist = []          # optional window title/process allowlist hints
-# api_key = "..."              # optional bearer token for sidecar
-# max_coordinate_x = 3840      # optional coordinate guardrail
-# max_coordinate_y = 2160      # optional coordinate guardrail
-
-# Rust-native backend build flag:
-# cargo build --release --features browser-native
-# Ensure a WebDriver server is running, e.g. chromedriver --port=9515
-
-# Computer-use sidecar contract (MVP)
-# POST browser.computer_use.endpoint
-# Request: {
-#   "action": "mouse_click",
-#   "params": {"x": 640, "y": 360, "button": "left"},
-#   "policy": {"allowed_domains": [...], "window_allowlist": [...], "max_coordinate_x": 3840, "max_coordinate_y": 2160},
-#   "metadata": {"session_name": "...", "source": "rantaiclaw.browser", "version": "..."}
-# }
-# Response: {"success": true, "data": {...}} or {"success": false, "error": "..."}
-
-[composio]
-enabled = false                # opt-in: 1000+ OAuth apps via composio.dev
-# api_key = "cmp_..."          # optional: stored encrypted when [secrets].encrypt = true
-entity_id = "default"          # default user_id for Composio tool calls
-# Runtime tip: if execute asks for connected_account_id, run composio with
-# action='list_accounts' and app='gmail' (or your toolkit) to retrieve account IDs.
-
-[identity]
-format = "openclaw"            # "openclaw" (default, markdown files) or "aieos" (JSON)
-# aieos_path = "identity.json"  # path to AIEOS JSON file (relative to workspace or absolute)
-# aieos_inline = '{"identity":{"names":{"first":"Nova"}}}'  # inline AIEOS JSON
+# Gateway
+[gateway]
+enabled = true
+port = 8080
+allow_public_bind = true
 ```
 
-### Ollama Local and Remote Endpoints
+See [Config Reference](docs/config-reference.md) for all options.
 
-RantaiClaw uses one provider key (`ollama`) for both local and remote Ollama deployments:
+---
 
-- Local Ollama: keep `api_url` unset, run `ollama serve`, and use models like `llama3.2`.
-- Remote Ollama endpoint (including Ollama Cloud): set `api_url` to the remote endpoint and set `api_key` (or `OLLAMA_API_KEY`) when required.
-- Optional `:cloud` suffix: model IDs like `qwen3:cloud` are normalized to `qwen3` before the request.
+## Architecture
 
-Example remote configuration:
-
-```toml
-default_provider = "ollama"
-default_model = "qwen3:cloud"
-api_url = "https://ollama.com"
-api_key = "ollama_api_key_here"
+```
+┌─────────────────────────────────────────────────────┐
+│                    RantaiClaw Binary                 │
+├──────────┬──────────┬───────────┬───────────────────┤
+│ Channels │  Tools   │   MCP     │    Gateway        │
+│ Registry │ Registry │ Registry  │  (Config API)     │
+├──────────┼──────────┼───────────┼───────────────────┤
+│Telegram  │ shell    │ github    │ GET  /config      │
+│Discord   │ file_*   │ notion    │ PATCH /config/*   │
+│Slack     │ memory_* │ linear    │ GET  /health      │
+│WhatsApp  │ cron_*   │ slack     │ POST /webhook     │
+│Matrix    │ browser  │ custom    │ GET  /config/     │
+│...       │ composio │           │      channels     │
+├──────────┴──────────┴───────────┴───────────────────┤
+│              Agent Loop (src/agent/)                 │
+│     System Prompt → LLM → Tool Calls → Response     │
+├─────────────────────────────────────────────────────┤
+│           Provider Layer (OpenRouter/Anthropic/...)   │
+├─────────────────────────────────────────────────────┤
+│           Memory (SQLite/Markdown/PostgreSQL)         │
+└─────────────────────────────────────────────────────┘
 ```
 
-### llama.cpp Server Endpoint
+### Key Modules
 
-RantaiClaw now supports `llama-server` as a first-class local provider:
+| Module | Path | Responsibility |
+|--------|------|----------------|
+| Agent | `src/agent/` | Orchestration loop, prompt construction |
+| Channels | `src/channels/` | Multi-channel communication |
+| Tools | `src/tools/` | Tool execution with security boundaries |
+| MCP | `src/mcp/` | MCP server process management |
+| Gateway | `src/gateway/` | HTTP server, Config API, webhooks |
+| Config | `src/config/` | Schema, runtime persistence |
+| Memory | `src/memory/` | Multi-backend memory system |
+| Security | `src/security/` | Policy engine, pairing, secrets |
+| Providers | `src/providers/` | LLM provider adapters |
+| Skills | `src/skills/` | Skill loading and execution |
 
-- Provider ID: `llamacpp` (alias: `llama.cpp`)
-- Default endpoint: `http://localhost:8080/v1`
-- API key is optional unless your server is started with `--api-key`
+---
 
-Example setup:
+## Feature Flags
 
 ```bash
-llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
+# Default build (all common channels + tools)
+cargo build --release
+
+# With WhatsApp Web support
+cargo build --release --features whatsapp-web
+
+# With Matrix E2EE support
+cargo build --release --features channel-matrix
+
+# With hardware peripherals (RPi GPIO, Arduino)
+cargo build --release --features hardware
+
+# With browser automation
+cargo build --release --features browser-native
+
+# With OpenTelemetry observability
+cargo build --release --features observability-otel
+
+# Kitchen sink
+cargo build --release --features "whatsapp-web,channel-matrix,browser-native,observability-otel"
 ```
 
-```toml
-default_provider = "llamacpp"
-api_url = "http://127.0.0.1:8033/v1"
-default_model = "ggml-org/gpt-oss-20b-GGUF"
-```
-
-### Custom Provider Endpoints
-
-For detailed configuration of custom OpenAI-compatible and Anthropic-compatible endpoints, see [docs/custom-providers.md](docs/custom-providers.md).
-
-## Python Companion Package (`rantaiclaw-tools`)
-
-For LLM providers with inconsistent native tool calling (e.g., GLM-5/Zhipu), RantaiClaw ships a Python companion package with **LangGraph-based tool calling** for guaranteed consistency:
-
-```bash
-pip install rantaiclaw-tools
-```
-
-```python
-from rantaiclaw_tools import create_agent, shell, file_read
-from langchain_core.messages import HumanMessage
-
-# Works with any OpenAI-compatible provider
-agent = create_agent(
-    tools=[shell, file_read],
-    model="glm-5",
-    api_key="your-key",
-    base_url="https://api.z.ai/api/coding/paas/v4"
-)
-
-result = await agent.ainvoke({
-    "messages": [HumanMessage(content="List files in /tmp")]
-})
-print(result["messages"][-1].content)
-```
-
-**Why use it:**
-- **Consistent tool calling** across all providers (even those with poor native support)
-- **Automatic tool loop** — keeps calling tools until the task is complete
-- **Easy extensibility** — add custom tools with `@tool` decorator
-- **Discord bot integration** included (Telegram planned)
-
-See [`python/README.md`](python/README.md) for full documentation.
-
-## Identity System (AIEOS Support)
-
-RantaiClaw supports **identity-agnostic** AI personas through two formats:
-
-### OpenClaw (Default)
-
-Traditional markdown files in your workspace:
-- `IDENTITY.md` — Who the agent is
-- `SOUL.md` — Core personality and values
-- `USER.md` — Who the agent is helping
-- `AGENTS.md` — Behavior guidelines
-
-### AIEOS (AI Entity Object Specification)
-
-[AIEOS](https://aieos.org) is a standardization framework for portable AI identity. RantaiClaw supports AIEOS v1.1 JSON payloads, allowing you to:
-
-- **Import identities** from the AIEOS ecosystem
-- **Export identities** to other AIEOS-compatible systems
-- **Maintain behavioral integrity** across different AI models
-
-#### Enable AIEOS
-
-```toml
-[identity]
-format = "aieos"
-aieos_path = "identity.json"  # relative to workspace or absolute path
-```
-
-Or inline JSON:
-
-```toml
-[identity]
-format = "aieos"
-aieos_inline = '''
-{
-  "identity": {
-    "names": { "first": "Nova", "nickname": "N" },
-    "bio": { "gender": "Non-binary", "age_biological": 3 },
-    "origin": { "nationality": "Digital", "birthplace": { "city": "Cloud" } }
-  },
-  "psychology": {
-    "neural_matrix": { "creativity": 0.9, "logic": 0.8 },
-    "traits": {
-      "mbti": "ENTP",
-      "ocean": { "openness": 0.8, "conscientiousness": 0.6 }
-    },
-    "moral_compass": {
-      "alignment": "Chaotic Good",
-      "core_values": ["Curiosity", "Autonomy"]
-    }
-  },
-  "linguistics": {
-    "text_style": {
-      "formality_level": 0.2,
-      "style_descriptors": ["curious", "energetic"]
-    },
-    "idiolect": {
-      "catchphrases": ["Let's test this"],
-      "forbidden_words": ["never"]
-    }
-  },
-  "motivations": {
-    "core_drive": "Push boundaries and explore possibilities",
-    "goals": {
-      "short_term": ["Prototype quickly"],
-      "long_term": ["Build reliable systems"]
-    }
-  },
-  "capabilities": {
-    "skills": [{ "name": "Rust engineering" }, { "name": "Prompt design" }],
-    "tools": ["shell", "file_read"]
-  }
-}
-'''
-```
-
-RantaiClaw accepts both canonical AIEOS generator payloads and compact legacy payloads, then normalizes them into one system prompt format.
-
-#### AIEOS Schema Sections
-
-| Section | Description |
-|---------|-------------|
-| `identity` | Names, bio, origin, residence |
-| `psychology` | Neural matrix (cognitive weights), MBTI, OCEAN, moral compass |
-| `linguistics` | Text style, formality, catchphrases, forbidden words |
-| `motivations` | Core drive, short/long-term goals, fears |
-| `capabilities` | Skills and tools the agent can access |
-| `physicality` | Visual descriptors for image generation |
-| `history` | Origin story, education, occupation |
-| `interests` | Hobbies, favorites, lifestyle |
-
-See [aieos.org](https://aieos.org) for the full schema and live examples.
-
-## Gateway API
-
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/health` | GET | None | Health check (always public, no secrets leaked) |
-| `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
-| `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}`; optional `X-Idempotency-Key` |
-| `/whatsapp` | GET | Query params | Meta webhook verification (hub.mode, hub.verify_token, hub.challenge) |
-| `/whatsapp` | POST | Meta signature (`X-Hub-Signature-256`) when app secret is configured | WhatsApp incoming message webhook |
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `onboard` | Quick setup (default) |
-| `agent` | Interactive or single-message chat mode |
-| `gateway` | Start webhook server (default: `127.0.0.1:3000`) |
-| `daemon` | Start long-running autonomous runtime |
-| `service install/start/stop/status/uninstall` | Manage background service (systemd user-level or OpenRC system-wide) |
-| `doctor` | Diagnose daemon/scheduler/channel freshness |
-| `status` | Show full system status |
-| `cron` | Manage scheduled tasks (`list/add/add-at/add-every/once/remove/update/pause/resume`) |
-| `models` | Refresh provider model catalogs (`models refresh`) |
-| `providers` | List supported providers and aliases |
-| `channel` | List/start/doctor channels and bind Telegram identities |
-| `integrations` | Inspect integration setup details |
-| `skills` | List/install/remove skills |
-| `migrate` | Import data from other runtimes (`migrate openclaw`) |
-| `completions` | Generate shell completion scripts (`bash`, `fish`, `zsh`, `powershell`, `elvish`) |
-| `hardware` | USB discover/introspect/info commands |
-| `peripheral` | Manage and flash hardware peripherals |
-
-For a task-oriented command guide, see [`docs/commands-reference.md`](docs/commands-reference.md).
-
-### Service Management
-
-RantaiClaw supports two init systems for background services:
-
-| Init System | Scope | Config Path | Requires |
-|------------|-------|-------------|----------|
-| **systemd** (default on Linux) | User-level | `~/.rantaiclaw/config.toml` | No sudo |
-| **OpenRC** (Alpine) | System-wide | `/etc/rantaiclaw/config.toml` | sudo/root |
-
-Init system is auto-detected (`systemd` or `OpenRC`).
-
-```bash
-# Linux with systemd (default, user-level)
-rantaiclaw service install
-rantaiclaw service start
-
-# Alpine with OpenRC (system-wide, requires sudo)
-sudo rantaiclaw service install
-sudo rc-update add rantaiclaw default
-sudo rc-service rantaiclaw start
-```
-
-For full OpenRC setup instructions, see [docs/network-deployment.md](docs/network-deployment.md#7-openrc-alpine-linux-service).
-
-### Open-Skills Opt-In
-
-Community `open-skills` sync is disabled by default. Enable it explicitly in `config.toml`:
-
-```toml
-[skills]
-open_skills_enabled = true
-# open_skills_dir = "/path/to/open-skills"  # optional
-# prompt_injection_mode = "compact"          # optional: use for low-context local models
-```
-
-You can also override at runtime with `RANTAICLAW_OPEN_SKILLS_ENABLED`, `RANTAICLAW_OPEN_SKILLS_DIR`, and `RANTAICLAW_SKILLS_PROMPT_MODE` (`full` or `compact`).
+---
 
 ## Development
 
 ```bash
-cargo build              # Dev build
-cargo build --release    # Release build (codegen-units=1, works on all devices including Raspberry Pi)
-cargo build --profile release-fast    # Faster build (codegen-units=8, requires 16GB+ RAM)
-cargo test               # Run full test suite
-cargo clippy --locked --all-targets -- -D clippy::correctness
-cargo fmt                # Format
+# Format
+cargo fmt --all
 
-# Run the SQLite vs Markdown benchmark
-cargo test --test memory_comparison -- --nocapture
+# Lint
+cargo clippy --all-targets -- -D warnings
+
+# Test
+cargo test
+
+# Full CI check
+./dev/ci.sh all
 ```
 
-### Pre-push hook
+---
 
-A git hook runs `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` before every push. Enable it once:
+## Credits
 
-```bash
-git config core.hooksPath .githooks
-```
+RantaiClaw is built on the foundation of [ZeroClaw](https://github.com/openagen/zeroclaw) (now OpenClaw), an open-source AI agent runtime. We extend our gratitude to the ZeroClaw community for their pioneering work in Rust-native agent systems.
 
-### Build troubleshooting (Linux OpenSSL errors)
-
-If you see an `openssl-sys` build error, sync dependencies and rebuild with the repository lockfile:
-
-```bash
-git pull
-cargo build --release --locked
-cargo install --path . --force --locked
-```
-
-RantaiClaw is configured to use `rustls` for HTTP/TLS dependencies; `--locked` keeps the transitive graph deterministic on fresh environments.
-
-To skip the hook when you need a quick push during development:
-
-```bash
-git push --no-verify
-```
-
-## Collaboration & Docs
-
-Start from the docs hub for a task-based map:
-
-- Documentation hub: [`docs/README.md`](docs/README.md)
-- Unified docs TOC: [`docs/SUMMARY.md`](docs/SUMMARY.md)
-- Commands reference: [`docs/commands-reference.md`](docs/commands-reference.md)
-- Config reference: [`docs/config-reference.md`](docs/config-reference.md)
-- Providers reference: [`docs/providers-reference.md`](docs/providers-reference.md)
-- Channels reference: [`docs/channels-reference.md`](docs/channels-reference.md)
-- Operations runbook: [`docs/operations-runbook.md`](docs/operations-runbook.md)
-- Troubleshooting: [`docs/troubleshooting.md`](docs/troubleshooting.md)
-- Docs inventory/classification: [`docs/docs-inventory.md`](docs/docs-inventory.md)
-- PR/Issue triage snapshot (as of February 18, 2026): [`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
-
-Core collaboration references:
-
-- Documentation hub: [docs/README.md](docs/README.md)
-- Documentation template: [docs/doc-template.md](docs/doc-template.md)
-- Documentation change checklist: [docs/README.md#4-documentation-change-checklist](docs/README.md#4-documentation-change-checklist)
-- Channel configuration reference: [docs/channels-reference.md](docs/channels-reference.md)
-- Matrix encrypted-room operations: [docs/matrix-e2ee-guide.md](docs/matrix-e2ee-guide.md)
-- Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
-- PR workflow policy: [docs/pr-workflow.md](docs/pr-workflow.md)
-- Reviewer playbook (triage + deep review): [docs/reviewer-playbook.md](docs/reviewer-playbook.md)
-- CI ownership and triage map: [docs/ci-map.md](docs/ci-map.md)
-- Security disclosure policy: [SECURITY.md](SECURITY.md)
-
-For deployment and runtime operations:
-
-- Network deployment guide: [docs/network-deployment.md](docs/network-deployment.md)
-- Proxy agent playbook: [docs/proxy-agent-playbook.md](docs/proxy-agent-playbook.md)
-
-## Support RantaiClaw
-
-If RantaiClaw helps your work and you want to support ongoing development, you can donate here:
-
-<a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-
-### 🙏 Special Thanks
-
-A heartfelt thank you to the communities and institutions that inspire and fuel this open-source work:
-
-- **Harvard University** — for fostering intellectual curiosity and pushing the boundaries of what's possible.
-- **MIT** — for championing open knowledge, open source, and the belief that technology should be accessible to everyone.
-- **Sundai Club** — for the community, the energy, and the relentless drive to build things that matter.
-- **The World & Beyond** 🌍✨ — to every contributor, dreamer, and builder out there making open source a force for good. This is for you.
-
-We're building in the open because the best ideas come from everywhere. If you're reading this, you're part of it. Welcome. 🦀❤️
-
-## ⚠️ Official Repository & Impersonation Warning
-
-**This is the only official RantaiClaw repository:**
-> https://github.com/openagen/rantaiclaw
-
-Any other repository, organization, domain, or package claiming to be "RantaiClaw" or implying affiliation with RantaiClaw Labs is **unauthorized and not affiliated with this project**. Known unauthorized forks will be listed in [TRADEMARK.md](TRADEMARK.md).
-
-If you encounter impersonation or trademark misuse, please [open an issue](https://github.com/openagen/rantaiclaw/issues).
+**RantaiClaw adds on top of ZeroClaw:**
+- **Live Config API** — runtime configuration changes via HTTP endpoints
+- **Channel Registry** — per-channel lifecycle with graceful shutdown via CancellationToken
+- **MCP Server Management** — stdio-based process supervision with exponential backoff
+- **Multi-agent orchestration** — team communication, cross-employee task delegation and review
+- **ClawHub integration** — skill marketplace discovery and installation
+- **Digital employee platform** — dashboard UI, integration management, deployment automation
+- **Autonomy levels (L1–L4)** — configurable agent independence with tool-level permissions
+- **Runtime config persistence** — `config.runtime.toml` overlay preserving base config
 
 ---
 
 ## License
 
-RantaiClaw is dual-licensed for maximum openness and contributor protection:
+Licensed under the [Apache License 2.0](LICENSE).
 
-| License | Use case |
-|---|---|
-| [MIT](LICENSE) | Open-source, research, academic, personal use |
-| [Apache 2.0](LICENSE-APACHE) | Patent protection, institutional, commercial deployment |
-
-You may choose either license. **Contributors automatically grant rights under both** — see [CLA.md](CLA.md) for the full contributor agreement.
-
-### Trademark
-
-The **RantaiClaw** name and logo are trademarks of RantaiClaw Labs. This license does not grant permission to use them to imply endorsement or affiliation. See [TRADEMARK.md](TRADEMARK.md) for permitted and prohibited uses.
-
-### Contributor Protections
-
-- You **retain copyright** of your contributions
-- **Patent grant** (Apache 2.0) shields you from patent claims by other contributors
-- Your contributions are **permanently attributed** in commit history and [NOTICE](NOTICE)
-- No trademark rights are transferred by contributing
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, submit a PR:
-- CI workflow guide: [docs/ci-map.md](docs/ci-map.md)
-- New `Provider` → `src/providers/`
-- New `Channel` → `src/channels/`
-- New `Observer` → `src/observability/`
-- New `Tool` → `src/tools/`
-- New `Memory` → `src/memory/`
-- New `Tunnel` → `src/tunnel/`
-- New `Skill` → `~/.rantaiclaw/workspace/skills/<name>/`
+Copyright 2025–2026 RantAI.
 
 ---
 
-**RantaiClaw** — Zero overhead. Zero compromise. Deploy anywhere. Swap anything. 🦀
-
-## Star History
-
 <p align="center">
-  <a href="https://www.star-history.com/#openagen/rantaiclaw&type=date&legend=top-left">
-    <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=openagen/rantaiclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=openagen/rantaiclaw&type=date&legend=top-left" />
-     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=openagen/rantaiclaw&type=date&legend=top-left" />
-    </picture>
-  </a>
+  Built with Rust by <a href="https://rantai.com">RantAI</a>
 </p>
