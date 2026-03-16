@@ -1824,7 +1824,10 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
+            config_tx: tokio::sync::watch::channel(Config::default()).0,
+            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
+            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -1871,7 +1874,10 @@ mod tests {
 
         let observer: Arc<dyn crate::observability::Observer> = prom;
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
+            config_tx: tokio::sync::watch::channel(Config::default()).0,
+            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
+            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -2235,7 +2241,10 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
+            config_tx: tokio::sync::watch::channel(Config::default()).0,
+            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
+            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2297,7 +2306,10 @@ mod tests {
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
+            config_tx: tokio::sync::watch::channel(Config::default()).0,
+            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
+            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2371,7 +2383,10 @@ mod tests {
         let secret = generate_test_secret();
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
+            config_tx: tokio::sync::watch::channel(Config::default()).0,
+            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
+            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2417,7 +2432,10 @@ mod tests {
         let wrong_secret = generate_test_secret();
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
+            config_tx: tokio::sync::watch::channel(Config::default()).0,
+            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
+            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2468,7 +2486,10 @@ mod tests {
         let secret = generate_test_secret();
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
+            config_tx: tokio::sync::watch::channel(Config::default()).0,
+            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
+            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2524,7 +2545,10 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
+            config_tx: tokio::sync::watch::channel(Config::default()).0,
+            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
+            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2576,7 +2600,10 @@ mod tests {
         let invalid_signature = "deadbeef";
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
+            config: Arc::new(tokio::sync::RwLock::new(Config::default())),
+            config_tx: tokio::sync::watch::channel(Config::default()).0,
+            channel_registry: Arc::new(tokio::sync::RwLock::new(crate::channels::ChannelRegistry::new(tokio::sync::mpsc::channel(1).0))),
+            mcp_registry: Arc::new(tokio::sync::RwLock::new(crate::mcp::McpRegistry::new())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
