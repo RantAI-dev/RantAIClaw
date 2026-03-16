@@ -662,9 +662,35 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk_webhook_secret,
         observer,
         webhook_routes,
-        channel_registry,
-        mcp_registry,
+        channel_registry: channel_registry.clone(),
+        mcp_registry: mcp_registry.clone(),
     };
+
+    // ── Seed live registries from config ────────────────────────────────
+
+    // Register configured channels into the ChannelRegistry so the Config API
+    // can report and manage them at runtime.
+    {
+        let mut ch_reg = channel_registry.write().await;
+        crate::channels::register_configured_channels(&mut ch_reg, &config.channels_config).await;
+    }
+
+    // Start configured MCP servers and register them in the McpRegistry.
+    {
+        let mut mcp_reg = mcp_registry.write().await;
+        for (id, mcp_config) in &config.mcp_servers {
+            if let Err(e) = mcp_reg.add_server(id.clone(), mcp_config.clone()).await {
+                tracing::error!("Failed to start MCP server '{}': {}", id, e);
+            }
+        }
+    }
+
+    // Spawn MCP process supervisor for crash detection and restart.
+    let mcp_supervisor_cancel = tokio_util::sync::CancellationToken::new();
+    let _mcp_supervisor_handle = crate::mcp::supervisor::spawn_supervisor(
+        mcp_registry.clone(),
+        mcp_supervisor_cancel.clone(),
+    );
 
     // Build router with middleware
     let app = Router::new()
