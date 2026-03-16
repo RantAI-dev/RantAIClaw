@@ -177,7 +177,7 @@ impl Channel for CapturingChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
         tx.send(ChannelMessage {
             id: "listen_1".into(),
             sender: "test_sender".into(),
@@ -210,7 +210,7 @@ async fn channel_listen_produces_correct_identity_fields() {
     let channel = CapturingChannel::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-    channel.listen(tx).await.unwrap();
+    channel.listen(tx, tokio_util::sync::CancellationToken::new()).await.unwrap();
     let received = rx.recv().await.expect("should receive message");
 
     assert_eq!(received.sender, "test_sender");
@@ -227,7 +227,7 @@ async fn channel_send_reply_uses_sender_from_listen() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
     // Simulate: listen() → receive message → send reply using sender
-    channel.listen(tx).await.unwrap();
+    channel.listen(tx, tokio_util::sync::CancellationToken::new()).await.unwrap();
     let incoming = rx.recv().await.expect("should receive message");
 
     // Reply should go to the reply_target, not sender
