@@ -364,7 +364,7 @@ RantaiClaw is built on the foundation of [ZeroClaw](https://github.com/zeroclaw-
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
 
 Copyright 2025–2026 RantAI.
 
