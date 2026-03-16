@@ -2522,6 +2522,156 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Populate a [`ChannelRegistry`] with the channels defined in `ChannelsConfig`.
+///
+/// This is used by the gateway to seed the registry at startup so the Config API
+/// can report which channels are active and manage their lifecycle. The existing
+/// `start_channels` daemon path is intentionally unchanged — it uses its own
+/// supervised spawn loop. Only the gateway's live-config path goes through the
+/// registry.
+pub async fn register_configured_channels(
+    registry: &mut ChannelRegistry,
+    channels_config: &crate::config::schema::ChannelsConfig,
+) {
+    /// Helper: register a single channel, logging on failure.
+    async fn try_register<F, Fut>(
+        registry: &mut ChannelRegistry,
+        id: &str,
+        config_json: serde_json::Value,
+        factory: F,
+    ) where
+        F: FnOnce(serde_json::Value) -> Fut,
+        Fut: std::future::Future<Output = Result<Box<dyn Channel + Send + Sync>>>,
+    {
+        if let Err(e) = registry.add_channel(id.to_string(), config_json, factory).await {
+            tracing::warn!("Failed to register channel '{}' in registry: {}", id, e);
+        }
+    }
+
+    if let Some(ref cfg) = channels_config.telegram {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "telegram", json, |v| async move {
+                let tg: crate::config::schema::TelegramConfig = serde_json::from_value(v)?;
+                let ch = TelegramChannel::new(tg.bot_token, tg.allowed_users, tg.mention_only)
+                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms);
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+    if let Some(ref cfg) = channels_config.discord {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "discord", json, |v| async move {
+                let dc: crate::config::schema::DiscordConfig = serde_json::from_value(v)?;
+                let ch = DiscordChannel::new(dc.bot_token, dc.guild_id, dc.allowed_users, dc.listen_to_bots, dc.mention_only);
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+    if let Some(ref cfg) = channels_config.slack {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "slack", json, |v| async move {
+                let sl: crate::config::schema::SlackConfig = serde_json::from_value(v)?;
+                let ch = SlackChannel::new(sl.bot_token, sl.channel_id, sl.allowed_users);
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+    if let Some(ref cfg) = channels_config.mattermost {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "mattermost", json, |v| async move {
+                let mm: crate::config::schema::MattermostConfig = serde_json::from_value(v)?;
+                let ch = MattermostChannel::new(
+                    mm.url, mm.bot_token, mm.channel_id, mm.allowed_users,
+                    mm.thread_replies.unwrap_or(true), mm.mention_only.unwrap_or(false),
+                );
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+    if let Some(ref cfg) = channels_config.signal {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "signal", json, |v| async move {
+                let sig: crate::config::schema::SignalConfig = serde_json::from_value(v)?;
+                let ch = SignalChannel::new(
+                    sig.http_url, sig.account, sig.group_id, sig.allowed_from,
+                    sig.ignore_attachments, sig.ignore_stories,
+                );
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+    if let Some(ref cfg) = channels_config.linq {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "linq", json, |v| async move {
+                let lq: crate::config::schema::LinqConfig = serde_json::from_value(v)?;
+                let ch = LinqChannel::new(lq.api_token, lq.from_phone, lq.allowed_senders);
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+    if let Some(ref cfg) = channels_config.nextcloud_talk {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "nextcloud_talk", json, |v| async move {
+                let nc: crate::config::schema::NextcloudTalkConfig = serde_json::from_value(v)?;
+                let ch = NextcloudTalkChannel::new(nc.base_url, nc.app_token, nc.allowed_users);
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+    if let Some(ref cfg) = channels_config.email {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "email", json, |v| async move {
+                let email_cfg: crate::channels::email_channel::EmailConfig = serde_json::from_value(v)?;
+                let ch = EmailChannel::new(email_cfg);
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+    if let Some(ref cfg) = channels_config.irc {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "irc", json, |v| async move {
+                let irc_cfg: crate::config::schema::IrcConfig = serde_json::from_value(v)?;
+                let ch = IrcChannel::new(irc::IrcChannelConfig {
+                    server: irc_cfg.server,
+                    port: irc_cfg.port,
+                    nickname: irc_cfg.nickname,
+                    username: irc_cfg.username,
+                    channels: irc_cfg.channels,
+                    allowed_users: irc_cfg.allowed_users,
+                    server_password: irc_cfg.server_password,
+                    nickserv_password: irc_cfg.nickserv_password,
+                    sasl_password: irc_cfg.sasl_password,
+                    verify_tls: irc_cfg.verify_tls.unwrap_or(true),
+                });
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+    if let Some(ref cfg) = channels_config.dingtalk {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "dingtalk", json, |v| async move {
+                let dt: crate::config::schema::DingTalkConfig = serde_json::from_value(v)?;
+                let ch = DingTalkChannel::new(dt.client_id, dt.client_secret, dt.allowed_users);
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+    if let Some(ref cfg) = channels_config.qq {
+        if let Ok(json) = serde_json::to_value(cfg) {
+            try_register(registry, "qq", json, |v| async move {
+                let qq_cfg: crate::config::schema::QQConfig = serde_json::from_value(v)?;
+                let ch = QQChannel::new(qq_cfg.app_id, qq_cfg.app_secret, qq_cfg.allowed_users);
+                Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
+            }).await;
+        }
+    }
+
+    let count = registry.list_channels().len();
+    if count > 0 {
+        tracing::info!("Registered {} channel(s) from config into ChannelRegistry", count);
+    }
+}
+
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
