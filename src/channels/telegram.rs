@@ -1786,7 +1786,7 @@ impl Channel for TelegramChannel {
         self.send_text_chunks(&content, chat_id, thread_id).await
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
 
         if self.mention_only {
@@ -1810,12 +1810,20 @@ impl Channel for TelegramChannel {
                 "allowed_updates": ["message"]
             });
 
-            let resp = match self.http_client().post(&url).json(&body).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Telegram poll error: {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
+            let resp = tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!("Telegram channel shutting down");
+                    return Ok(());
+                }
+                result = self.http_client().post(&url).json(&body).send() => {
+                    match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("Telegram poll error: {e}");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
+                    }
                 }
             };
 

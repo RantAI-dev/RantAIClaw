@@ -103,7 +103,7 @@ impl Channel for SlackChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
         let channel_id = self
             .channel_id
             .clone()
@@ -115,7 +115,13 @@ impl Channel for SlackChannel {
         tracing::info!("Slack channel listening on #{channel_id}...");
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!("Slack channel shutting down");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+            }
 
             let mut params = vec![("channel", channel_id.clone()), ("limit", "10".to_string())];
             if !last_ts.is_empty() {
