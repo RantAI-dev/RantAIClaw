@@ -1,38 +1,16 @@
-ZeroClaw
-Copyright 2025 ZeroClaw Labs
+RantaiClaw
+Copyright 2025-2026 RantAI
 
-This product includes software developed at ZeroClaw Labs (https://github.com/zeroclaw-labs).
-
-Official Repository
-===================
-
-The only official ZeroClaw repository is:
-https://github.com/zeroclaw-labs/zeroclaw
-
-Any other repository claiming to be ZeroClaw is unauthorized.
-See TRADEMARK.md for the full trademark policy.
+This product is built on the foundation of ZeroClaw
+(https://github.com/zeroclaw-labs/zeroclaw), originally developed
+by ZeroClaw Labs. We gratefully acknowledge their contributions
+to the Rust-native AI agent ecosystem.
 
 License
 =======
 
-This software is available under a dual-license model:
-
-  1. MIT License — see LICENSE
-  2. Apache License 2.0 — see LICENSE-APACHE
-
-You may use either license. Contributors grant rights under both.
-See CLA.md for the contributor license agreement.
-
-Contributors
-============
-
-This NOTICE file is maintained by repository automation.
-For the latest contributor list, see the repository contributors page:
-https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors
-
-All contributors retain copyright ownership of their contributions.
-Contributions are permanently attributed in the repository commit history.
-Patent rights are protected for all contributors under Apache License 2.0.
+This software is licensed under the GNU Affero General Public License v3.0
+(AGPL-3.0). See LICENSE for details.
 
 Third-Party Dependencies
 ========================
