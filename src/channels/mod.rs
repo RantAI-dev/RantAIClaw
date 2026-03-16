@@ -55,6 +55,8 @@ pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
+pub mod registry;
+pub use registry::{ChannelRegistry, ChannelStatus};
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
