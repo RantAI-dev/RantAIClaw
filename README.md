@@ -348,7 +348,7 @@ cargo test
 
 ## Credits
 
-RantaiClaw is built on the foundation of [ZeroClaw](https://github.com/openagen/zeroclaw) (now OpenClaw), an open-source AI agent runtime. We extend our gratitude to the ZeroClaw community for their pioneering work in Rust-native agent systems.
+RantaiClaw is built on the foundation of [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw), an open-source AI agent runtime. We extend our gratitude to the ZeroClaw community for their pioneering work in Rust-native agent systems.
 
 **RantaiClaw adds on top of ZeroClaw:**
 - **Live Config API** — runtime configuration changes via HTTP endpoints
