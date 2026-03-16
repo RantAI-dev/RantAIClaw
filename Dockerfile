@@ -1,0 +1,112 @@
+# syntax=docker/dockerfile:1.7
+
+# ── Stage 1: Build ────────────────────────────────────────────
+FROM rust:1.93-slim@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c84745537cd35d8b AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# 1. Copy manifests and toolchain pin to cache dependencies with the same compiler
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
+# Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
+RUN mkdir -p src benches crates/robot-kit/src \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "fn main() {}" > benches/agent_benchmarks.rs \
+    && echo "pub fn placeholder() {}" > crates/robot-kit/src/lib.rs
+RUN --mount=type=cache,id=rantaiclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=rantaiclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=rantaiclaw-target,target=/app/target,sharing=locked \
+    cargo build --release --locked
+RUN rm -rf src benches crates/robot-kit/src
+
+# 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
+COPY src/ src/
+COPY benches/ benches/
+COPY crates/ crates/
+COPY firmware/ firmware/
+RUN --mount=type=cache,id=rantaiclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=rantaiclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=rantaiclaw-target,target=/app/target,sharing=locked \
+    cargo build --release --locked && \
+    cp target/release/rantaiclaw /app/rantaiclaw && \
+    strip /app/rantaiclaw
+
+# Prepare runtime directory structure and default config inline (no extra stage)
+RUN mkdir -p /rantaiclaw-data/.rantaiclaw /rantaiclaw-data/workspace && \
+    cat > /rantaiclaw-data/.rantaiclaw/config.toml <<EOF && \
+    chown -R 65534:65534 /rantaiclaw-data
+workspace_dir = "/rantaiclaw-data/workspace"
+config_path = "/rantaiclaw-data/.rantaiclaw/config.toml"
+api_key = ""
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4-20250514"
+default_temperature = 0.7
+
+[gateway]
+port = 3000
+host = "[::]"
+allow_public_bind = true
+EOF
+
+# ── Stage 2: Development Runtime (Debian) ────────────────────
+FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS dev
+
+# Install essential runtime dependencies only (use docker-compose.override.yml for dev tools)
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /rantaiclaw-data /rantaiclaw-data
+COPY --from=builder /app/rantaiclaw /usr/local/bin/rantaiclaw
+
+# Overwrite minimal config with DEV template (Ollama defaults)
+COPY dev/config.template.toml /rantaiclaw-data/.rantaiclaw/config.toml
+RUN chown 65534:65534 /rantaiclaw-data/.rantaiclaw/config.toml
+
+# Environment setup
+# Use consistent workspace path
+ENV RANTAICLAW_WORKSPACE=/rantaiclaw-data/workspace
+ENV HOME=/rantaiclaw-data
+# Defaults for local dev (Ollama) - matches config.template.toml
+ENV PROVIDER="ollama"
+ENV RANTAICLAW_MODEL="llama3.2"
+ENV RANTAICLAW_GATEWAY_PORT=3000
+
+# Note: API_KEY is intentionally NOT set here to avoid confusion.
+# It is set in config.toml as the Ollama URL.
+
+WORKDIR /rantaiclaw-data
+USER 65534:65534
+EXPOSE 3000
+ENTRYPOINT ["rantaiclaw"]
+CMD ["gateway"]
+
+# ── Stage 3: Production Runtime (Distroless) ─────────────────
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
+
+COPY --from=builder /app/rantaiclaw /usr/local/bin/rantaiclaw
+COPY --from=builder /rantaiclaw-data /rantaiclaw-data
+
+# Environment setup
+ENV RANTAICLAW_WORKSPACE=/rantaiclaw-data/workspace
+ENV HOME=/rantaiclaw-data
+# Default provider (model is set in config.toml, not here,
+# so config file edits are not silently overridden)
+ENV PROVIDER="openrouter"
+ENV RANTAICLAW_GATEWAY_PORT=3000
+
+# API_KEY must be provided at runtime!
+
+WORKDIR /rantaiclaw-data
+USER 65534:65534
+EXPOSE 3000
+ENTRYPOINT ["rantaiclaw"]
+CMD ["gateway"]

@@ -1,0 +1,72 @@
+# Development Environment for RantaiClaw Agentic Testing
+#
+# Use this for:
+# - Running the agent in a sandboxed environment
+# - Testing dangerous commands safely
+# - Developing new skills/integrations
+#
+# Usage:
+#   cd dev && ./cli.sh up
+#   or from root: ./dev/cli.sh up
+name: rantaiclaw-dev
+services:
+  # ── The Agent (Development Image) ──
+  # Builds from source using the 'dev' stage of the root Dockerfile
+  rantaiclaw-dev:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: dev
+    container_name: rantaiclaw-dev
+    restart: unless-stopped
+    environment:
+      - RANTAICLAW_GATEWAY_PORT=3000
+      - SANDBOX_HOST=rantaiclaw-sandbox
+    secrets:
+      - source: rantaiclaw_env
+        target: rantaiclaw_env
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - |
+        if [ -f /run/secrets/rantaiclaw_env ]; then
+          set -a
+          . /run/secrets/rantaiclaw_env
+          set +a
+        fi
+        exec rantaiclaw gateway --port "${RANTAICLAW_GATEWAY_PORT:-3000}" --host "[::]"
+    volumes:
+      # Mount single config file (avoids shadowing other files in .rantaiclaw)
+      - ../target/.rantaiclaw/config.toml:/rantaiclaw-data/.rantaiclaw/config.toml
+      # Mount shared workspace
+      - ../playground:/rantaiclaw-data/workspace
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - dev-net
+
+  # ── The Sandbox (Ubuntu Environment) ──
+  # A fully loaded Ubuntu environment for the agent to play in.
+  sandbox:
+    build:
+      context: sandbox # Context relative to dev/
+      dockerfile: Dockerfile
+    container_name: rantaiclaw-sandbox
+    hostname: dev-box
+    command: ["tail", "-f", "/dev/null"]
+    working_dir: /home/developer/workspace
+    user: developer
+    environment:
+      - TERM=xterm-256color
+      - SHELL=/bin/bash
+    volumes:
+      - ../playground:/home/developer/workspace # Mount local playground
+    networks:
+      - dev-net
+
+networks:
+  dev-net:
+    driver: bridge
+
+secrets:
+  rantaiclaw_env:
+    file: ../.env
