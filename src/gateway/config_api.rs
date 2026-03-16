@@ -15,7 +15,12 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::channels::traits::Channel;
-use crate::config::schema::McpServerConfig;
+use crate::channels::{
+    DiscordChannel, MattermostChannel, SignalChannel, SlackChannel, TelegramChannel,
+};
+use crate::config::schema::{
+    DiscordConfig, MattermostConfig, McpServerConfig, SignalConfig, SlackConfig, TelegramConfig,
+};
 
 use super::AppState;
 
@@ -173,17 +178,11 @@ pub async fn patch_channels(
                 }
             }
             Some(config) => {
-                // Extract channel type from config for factory
-                let channel_type = config
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
+                let channel_id = id.clone();
                 let cfg = config.clone();
                 match registry
                     .update_channel(id.clone(), config, |c| {
-                        build_channel_from_config(channel_type.clone(), c)
+                        build_channel_from_config(channel_id.clone(), c)
                     })
                     .await
                 {
@@ -194,14 +193,10 @@ pub async fn patch_channels(
                     Err(e) => {
                         warn!("[ConfigAPI] Failed to update channel '{}': {}", id, e);
                         // Try add if update failed because channel didn't exist
-                        let ct = cfg
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
+                        let cid = id.clone();
                         match registry
                             .add_channel(id.clone(), cfg, |c| {
-                                build_channel_from_config(ct, c)
+                                build_channel_from_config(cid, c)
                             })
                             .await
                         {
@@ -223,12 +218,66 @@ pub async fn patch_channels(
     (StatusCode::OK, Json(ConfigResponse::partial(val, errors)))
 }
 
-/// Stub factory — will be fully implemented when ChannelRegistry is wired into daemon mode.
+/// Build a channel from its ID and JSON config.
+///
+/// Mirrors the factories in `register_configured_channels` so that live PATCH
+/// /config/channels creates the same channel objects as startup-time registration.
 async fn build_channel_from_config(
-    _channel_type: String,
-    _config: serde_json::Value,
+    channel_id: String,
+    config: serde_json::Value,
 ) -> anyhow::Result<Box<dyn Channel + Send + Sync>> {
-    Err(anyhow::anyhow!("Channel factory not yet connected"))
+    match channel_id.as_str() {
+        "telegram" => {
+            let tg: TelegramConfig = serde_json::from_value(config)?;
+            let ch = TelegramChannel::new(tg.bot_token, tg.allowed_users, tg.mention_only)
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms);
+            Ok(Box::new(ch))
+        }
+        "discord" => {
+            let dc: DiscordConfig = serde_json::from_value(config)?;
+            let ch = DiscordChannel::new(
+                dc.bot_token,
+                dc.guild_id,
+                dc.allowed_users,
+                dc.listen_to_bots,
+                dc.mention_only,
+            );
+            Ok(Box::new(ch))
+        }
+        "slack" => {
+            let sl: SlackConfig = serde_json::from_value(config)?;
+            let ch = SlackChannel::new(sl.bot_token, sl.channel_id, sl.allowed_users);
+            Ok(Box::new(ch))
+        }
+        "mattermost" => {
+            let mm: MattermostConfig = serde_json::from_value(config)?;
+            let ch = MattermostChannel::new(
+                mm.url,
+                mm.bot_token,
+                mm.channel_id,
+                mm.allowed_users,
+                mm.thread_replies.unwrap_or(true),
+                mm.mention_only.unwrap_or(false),
+            );
+            Ok(Box::new(ch))
+        }
+        "signal" => {
+            let sig: SignalConfig = serde_json::from_value(config)?;
+            let ch = SignalChannel::new(
+                sig.http_url,
+                sig.account,
+                sig.group_id,
+                sig.allowed_from,
+                sig.ignore_attachments,
+                sig.ignore_stories,
+            );
+            Ok(Box::new(ch))
+        }
+        other => Err(anyhow::anyhow!(
+            "Unknown channel type '{}'. Supported: telegram, discord, slack, mattermost, signal",
+            other
+        )),
+    }
 }
 
 // ── PATCH /config/mcp-servers ────────────────────────────────────
