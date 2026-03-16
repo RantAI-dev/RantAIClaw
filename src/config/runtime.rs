@@ -29,7 +29,7 @@ pub fn read_runtime_overrides(base_config_path: &Path) -> Result<TomlValue> {
     }
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let value: TomlValue = content.parse()
+    let value: TomlValue = toml::from_str(&content)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
     Ok(value)
 }
@@ -91,11 +91,68 @@ pub fn deep_merge(base: &mut TomlValue, override_val: &TomlValue) {
 pub fn load_with_runtime_overrides(base_config_path: &Path) -> Result<String> {
     let base_content = std::fs::read_to_string(base_config_path)
         .with_context(|| format!("Failed to read {}", base_config_path.display()))?;
-    let mut base: TomlValue = base_content.parse()
+    let mut base: TomlValue = toml::from_str(&base_content)
         .with_context(|| format!("Failed to parse {}", base_config_path.display()))?;
 
     let overrides = read_runtime_overrides(base_config_path)?;
     deep_merge(&mut base, &overrides);
 
     toml::to_string_pretty(&base).context("Failed to serialize merged config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_runtime_path() {
+        let base = Path::new("/root/.rantaiclaw/config.toml");
+        assert_eq!(runtime_path(base), PathBuf::from("/root/.rantaiclaw/config.runtime.toml"));
+    }
+
+    #[test]
+    fn test_deep_merge_tables() {
+        let mut base: TomlValue = toml::from_str("[a]\nx = 1\ny = 2").unwrap();
+        let over: TomlValue = toml::from_str("[a]\ny = 99\nz = 3").unwrap();
+        deep_merge(&mut base, &over);
+        let table = base.as_table().unwrap().get("a").unwrap().as_table().unwrap();
+        assert_eq!(table.get("x").unwrap().as_integer(), Some(1));
+        assert_eq!(table.get("y").unwrap().as_integer(), Some(99));
+        assert_eq!(table.get("z").unwrap().as_integer(), Some(3));
+    }
+
+    #[test]
+    fn test_read_missing_runtime_returns_empty() {
+        let result = read_runtime_overrides(Path::new("/nonexistent/config.toml")).unwrap();
+        assert!(result.as_table().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_write_and_read_runtime_section() {
+        let mut base = NamedTempFile::new().unwrap();
+        writeln!(base, "[gateway]\nport = 8080").unwrap();
+        let base_path = base.path();
+
+        let section_toml: TomlValue = toml::from_str("bot_token = \"abc\"").unwrap();
+        write_runtime_section(base_path, "channels_config", section_toml).unwrap();
+
+        let overrides = read_runtime_overrides(base_path).unwrap();
+        assert!(overrides.as_table().unwrap().contains_key("channels_config"));
+    }
+
+    #[test]
+    fn test_remove_runtime_section() {
+        let mut base = NamedTempFile::new().unwrap();
+        writeln!(base, "[gateway]\nport = 8080").unwrap();
+        let base_path = base.path();
+
+        let section_toml: TomlValue = toml::from_str("key = \"value\"").unwrap();
+        write_runtime_section(base_path, "test_section", section_toml).unwrap();
+        remove_runtime_section(base_path, "test_section").unwrap();
+
+        let overrides = read_runtime_overrides(base_path).unwrap();
+        assert!(!overrides.as_table().unwrap().contains_key("test_section"));
+    }
 }

@@ -4085,6 +4085,7 @@ default_temperature = 0.7
             agents: HashMap::new(),
             gateway_agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp_servers: HashMap::new(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4256,6 +4257,7 @@ tool_dispatcher = "xml"
             agents: HashMap::new(),
             gateway_agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp_servers: HashMap::new(),
         };
 
         config.save().await.unwrap();

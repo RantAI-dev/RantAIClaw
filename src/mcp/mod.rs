@@ -76,3 +76,51 @@ impl McpRegistry {
         self.servers.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn test_config(cmd: &str) -> McpServerConfig {
+        McpServerConfig {
+            command: cmd.to_string(),
+            args: vec!["--version".to_string()],
+            env: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_duplicate_server() {
+        let mut registry = McpRegistry::new();
+        // Use "echo" which exists on Linux and exits immediately
+        let _ = registry.add_server("test".to_string(), test_config("echo")).await;
+        let result = registry.add_server("test".to_string(), test_config("echo")).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_server() {
+        let mut registry = McpRegistry::new();
+        let result = registry.remove_server("nonexistent").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_server_count() {
+        let mut registry = McpRegistry::new();
+        assert_eq!(registry.count(), 0);
+        let _ = registry.add_server("s1".to_string(), test_config("echo")).await;
+        assert_eq!(registry.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_servers() {
+        let mut registry = McpRegistry::new();
+        let _ = registry.add_server("s1".to_string(), test_config("echo")).await;
+        let servers = registry.list_servers();
+        assert!(servers.contains_key("s1"));
+    }
+}
