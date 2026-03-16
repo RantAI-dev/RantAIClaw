@@ -119,6 +119,10 @@ pub struct Config {
     #[serde(default)]
     pub cron: CronConfig,
 
+    /// Task engine configuration (`[tasks]`).
+    #[serde(default)]
+    pub tasks: TasksConfig,
+
     /// Channel configurations: Telegram, Discord, Slack, etc. (`[channels_config]`).
     #[serde(default)]
     pub channels_config: ChannelsConfig,
@@ -183,9 +187,33 @@ pub struct Config {
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
 
+    /// Gateway agent configurations for multi-agent gateway routing.
+    /// Each entry defines a co-equal agent hosted by the gateway, routed via `X-Agent-Id` header.
+    #[serde(default)]
+    pub gateway_agents: HashMap<String, GatewayAgentConfig>,
+
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// MCP servers managed by the runtime (`[mcp_servers.<name>]`).
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerConfig>,
+}
+
+// ── MCP Servers ──────────────────────────────────────────────────
+
+/// MCP server configuration for stdio-based servers.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpServerConfig {
+    /// Command to spawn (e.g., "npx", "node")
+    pub command: String,
+    /// Arguments (e.g., ["-y", "@modelcontextprotocol/server-github"])
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables passed to the process
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -226,6 +254,41 @@ fn default_max_depth() -> u32 {
 
 fn default_max_tool_iterations() -> usize {
     10
+}
+
+// ── Gateway Agents ──────────────────────────────────────────────
+
+/// Configuration for a co-equal agent hosted by the gateway.
+/// Unlike `DelegateAgentConfig` (used for sub-agent delegation via the `delegate` tool),
+/// gateway agents are independent agents routed by the `X-Agent-Id` HTTP header.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayAgentConfig {
+    /// Workspace directory for this agent (skills, memory, persona files).
+    pub workspace_dir: PathBuf,
+    /// Provider name override (falls back to root `default_provider`).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model name override (falls back to root `default_model`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// System prompt override for this agent.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// API key override for this agent.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Temperature override (falls back to root `default_temperature`).
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Allowlist of tool names available to this agent (empty = all tools).
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Maximum tool-call iterations per request.
+    #[serde(default = "default_max_tool_iterations")]
+    pub max_tool_iterations: usize,
+    /// Mark this agent as the default (receives requests without `X-Agent-Id`).
+    #[serde(default)]
+    pub default: bool,
 }
 
 // ── Hardware Config (wizard-driven) ─────────────────────────────
@@ -696,6 +759,12 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Request timeout in seconds (default: 300).
+    /// Controls how long the gateway waits for the agentic loop to complete.
+    /// Increase for workloads with long-running tool calls (package installs, etc.)
+    #[serde(default = "default_gateway_request_timeout_secs")]
+    pub request_timeout_secs: u64,
 }
 
 fn default_gateway_port() -> u16 {
@@ -722,6 +791,10 @@ fn default_gateway_rate_limit_max_keys() -> usize {
     10_000
 }
 
+fn default_gateway_request_timeout_secs() -> u64 {
+    300
+}
+
 fn default_gateway_idempotency_max_keys() -> usize {
     10_000
 }
@@ -744,6 +817,7 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            request_timeout_secs: default_gateway_request_timeout_secs(),
         }
     }
 }
@@ -2138,6 +2212,22 @@ impl Default for CronConfig {
     }
 }
 
+// ── Tasks ──────────────────────────────────────────────────────
+
+/// Task engine configuration (`[tasks]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TasksConfig {
+    /// Enable the task engine. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for TasksConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 // ── Tunnel ──────────────────────────────────────────────────────
 
 /// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
@@ -2821,6 +2911,7 @@ impl Default for Config {
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
+            tasks: TasksConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -2837,8 +2928,10 @@ impl Default for Config {
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            gateway_agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
+            mcp_servers: HashMap::new(),
         }
     }
 }
@@ -3946,6 +4039,7 @@ default_temperature = 0.7
                 interval_minutes: 15,
             },
             cron: CronConfig::default(),
+            tasks: TasksConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
                 telegram: Some(TelegramConfig {
@@ -3989,6 +4083,7 @@ default_temperature = 0.7
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            gateway_agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         };
 
@@ -4141,6 +4236,7 @@ tool_dispatcher = "xml"
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
+            tasks: TasksConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -4158,6 +4254,7 @@ tool_dispatcher = "xml"
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            gateway_agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         };
 
@@ -4810,6 +4907,7 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            request_timeout_secs: 120,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
