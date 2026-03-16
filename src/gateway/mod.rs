@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod config_api;
 pub mod task_handlers;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
@@ -337,6 +338,10 @@ pub struct AppState {
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Webhook trigger routes loaded from agent-runner config
     pub webhook_routes: Arc<Vec<WebhookRoute>>,
+    /// Live channel registry for config API
+    pub channel_registry: Arc<tokio::sync::RwLock<crate::channels::ChannelRegistry>>,
+    /// Live MCP server registry for config API
+    pub mcp_registry: Arc<tokio::sync::RwLock<crate::mcp::McpRegistry>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -626,6 +631,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         });
     let webhook_routes = Arc::new(load_webhook_routes(&config_dir));
 
+    // Initialize live registries for Config API
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(256);
+    let channel_registry = Arc::new(tokio::sync::RwLock::new(
+        crate::channels::ChannelRegistry::new(msg_tx),
+    ));
+    let mcp_registry = Arc::new(tokio::sync::RwLock::new(
+        crate::mcp::McpRegistry::new(),
+    ));
+
     let state = AppState {
         config: config_state,
         config_tx,
@@ -648,6 +662,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk_webhook_secret,
         observer,
         webhook_routes,
+        channel_registry,
+        mcp_registry,
     };
 
     // Build router with middleware
@@ -680,6 +696,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment),
         )
         .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
+        // Config API routes
+        .route("/config", get(config_api::get_config))
+        .route(
+            "/config/channels",
+            get(config_api::get_channels_status).patch(config_api::patch_channels),
+        )
+        .route(
+            "/config/mcp-servers",
+            get(config_api::get_mcp_status).patch(config_api::patch_mcp_servers),
+        )
+        .route("/config/model", axum::routing::patch(config_api::patch_model))
+        .route("/config/tools", axum::routing::patch(config_api::patch_tools))
+        .route("/config/agent", axum::routing::patch(config_api::patch_agent))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
