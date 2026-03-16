@@ -187,7 +187,7 @@ impl Channel for WhatsAppWebChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> Result<()> {
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, cancel: tokio_util::sync::CancellationToken) -> Result<()> {
         // Store the sender channel for incoming messages
         *self.tx.lock() = Some(tx.clone());
 
@@ -363,11 +363,9 @@ impl Channel for WhatsAppWebChannel {
         // Store the bot handle for later shutdown
         *self.bot_handle.lock() = Some(bot_handle);
 
-        // Wait for shutdown signal
-        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-
+        // Wait for cancellation or shutdown signal
         select! {
-            _ = shutdown_rx.recv() => {
+            _ = cancel.cancelled() => {
                 tracing::info!("WhatsApp Web channel shutting down");
             }
             _ = tokio::signal::ctrl_c() => {

@@ -227,7 +227,7 @@ impl Channel for DiscordChannel {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
 
         // Get Gateway URL
@@ -301,6 +301,10 @@ impl Channel for DiscordChannel {
 
         loop {
             tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!("Discord channel shutting down");
+                    break;
+                }
                 _ = hb_rx.recv() => {
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
