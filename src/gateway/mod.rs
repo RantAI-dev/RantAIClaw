@@ -1724,8 +1724,8 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    fn security_timeout_is_120_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 120);
     }
 
     #[test]

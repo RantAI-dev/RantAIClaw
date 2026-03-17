@@ -919,10 +919,14 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_still_uses_allowlist() {
+    fn full_autonomy_allows_all_non_empty_commands() {
         let p = full_policy();
         assert!(p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("rm -rf /"));
+        // Full autonomy allows everything — the environment is expected
+        // to be sandboxed (e.g. isolated Docker container).
+        assert!(p.is_command_allowed("rm -rf /"));
+        assert!(!p.is_command_allowed(""));
+        assert!(!p.is_command_allowed("   "));
     }
 
     #[test]
