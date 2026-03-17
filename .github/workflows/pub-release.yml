@@ -44,7 +44,7 @@ env:
 jobs:
     prepare:
         name: Prepare Release Context
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: ubuntu-latest
         outputs:
             release_ref: ${{ steps.vars.outputs.release_ref }}
             release_tag: ${{ steps.vars.outputs.release_tag }}
@@ -187,7 +187,7 @@ jobs:
                   toolchain: 1.92.0
                   targets: ${{ matrix.target }}
 
-            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+            - uses: Swatinem/rust-cache@v2
 
             - name: Install cross-compilation toolchain (Linux)
               if: runner.os == 'Linux' && matrix.cross_compiler != ''
@@ -232,7 +232,7 @@ jobs:
     verify-artifacts:
         name: Verify Artifact Set
         needs: [prepare, build-release]
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: ubuntu-latest
         steps:
             - name: Download all artifacts
               uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -270,7 +270,7 @@ jobs:
         name: Publish Release
         if: needs.prepare.outputs.publish_release == 'true'
         needs: [prepare, verify-artifacts]
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: ubuntu-latest
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
