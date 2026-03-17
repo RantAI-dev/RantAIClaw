@@ -362,11 +362,51 @@ RantaiClaw is built on the foundation of [ZeroClaw](https://github.com/zeroclaw-
 
 ---
 
+## Community
+
+- **GitHub Discussions** — [RantAI-dev/RantAIClaw/discussions](https://github.com/RantAI-dev/RantAIClaw/discussions)
+- **Issues & Feature Requests** — [RantAI-dev/RantAIClaw/issues](https://github.com/RantAI-dev/RantAIClaw/issues)
+- **ClawHub Skills** — [clawhub.ai](https://clawhub.ai)
+
+---
+
+## Sponsor This Project
+
+RantaiClaw is built and maintained by the RantAI team. If this project is useful to you, consider sponsoring to support ongoing development:
+
+<p align="center">
+  <a href="https://github.com/sponsors/RantAI-dev">
+    <img src="https://img.shields.io/badge/Sponsor-RantAI-ea4aaa?style=for-the-badge&logo=github-sponsors&logoColor=white" alt="Sponsor RantAI" />
+  </a>
+</p>
+
+Your sponsorship helps fund:
+- New channel integrations and MCP server support
+- Performance optimization and security hardening
+- ClawHub skills ecosystem development
+- Documentation and community support
+
+---
+
 ## License
 
 Licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
 
 Copyright 2025–2026 RantAI.
+
+---
+
+## Star History
+
+<p align="center">
+  <a href="https://www.star-history.com/#RantAI-dev/RantAIClaw&type=Date">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=RantAI-dev/RantAIClaw&type=Date&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=RantAI-dev/RantAIClaw&type=Date" />
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=RantAI-dev/RantAIClaw&type=Date" />
+    </picture>
+  </a>
+</p>
 
 ---
 
