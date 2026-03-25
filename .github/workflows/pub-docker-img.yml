@@ -78,7 +78,7 @@ jobs:
 
     publish:
         name: Build and Push Docker Image
-        if: (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))) && github.repository == 'rantaiclaw-labs/rantaiclaw'
+        if: (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))) && (github.repository == 'RantAI-dev/RantaiClaw' || github.repository == 'rantaiclaw-labs/rantaiclaw')
         runs-on: ubuntu-latest
         timeout-minutes: 45
         permissions:
@@ -104,6 +104,7 @@ jobs:
               run: |
                   set -euo pipefail
                   IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+                  IMAGE="${IMAGE,,}"
                   SHA_TAG="${IMAGE}:sha-${GITHUB_SHA::12}"
 
                   if [[ "${GITHUB_REF}" == refs/tags/* ]]; then

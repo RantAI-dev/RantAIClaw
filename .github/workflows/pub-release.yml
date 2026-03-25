@@ -347,9 +347,18 @@ jobs:
                   max_attempts=18
                   sleep_seconds=20
 
+                  token_resp="$(curl -sS "https://ghcr.io/token?scope=repository:${repo}:pull")"
+                  token="$(echo "$token_resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+
+                  if [ -z "$token" ]; then
+                    echo "::error::Unable to fetch GHCR bearer token"
+                    echo "$token_resp"
+                    exit 1
+                  fi
+
                   for attempt in $(seq 1 "$max_attempts"); do
                     code="$(curl -sS -o /tmp/ghcr-release-manifest.json -w "%{http_code}" \
-                      -u "${GITHUB_ACTOR}:${{ secrets.GITHUB_TOKEN }}" \
+                      -H "Authorization: Bearer ${token}" \
                       -H "Accept: ${accept_header}" \
                       "${manifest_url}" || true)"
 
