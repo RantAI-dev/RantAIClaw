@@ -302,6 +302,23 @@ jobs:
                   echo "Generated checksums:"
                   cat SHA256SUMS
 
+            - name: Generate release manifest
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cat > artifacts/release-manifest.json <<JSON
+                  {
+                    "project": "rantaiclaw",
+                    "release_tag": "${{ needs.prepare.outputs.release_tag }}",
+                    "release_ref": "${{ needs.prepare.outputs.release_ref }}",
+                    "source_sha": "${GITHUB_SHA}",
+                    "run_id": "${GITHUB_RUN_ID}",
+                    "run_number": "${GITHUB_RUN_NUMBER}",
+                    "generated_at_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+                  }
+                  JSON
+                  cat artifacts/release-manifest.json
+
             - name: Install cosign
               uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
 
