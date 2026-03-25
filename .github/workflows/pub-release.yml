@@ -347,20 +347,23 @@ jobs:
                   max_attempts=18
                   sleep_seconds=20
 
-                  token_resp="$(curl -sS "https://ghcr.io/token?scope=repository:${repo}:pull")"
-                  token="$(echo "$token_resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
-
-                  if [ -z "$token" ]; then
-                    echo "::error::Unable to fetch GHCR bearer token"
-                    echo "$token_resp"
-                    exit 1
-                  fi
-
                   for attempt in $(seq 1 "$max_attempts"); do
-                    code="$(curl -sS -o /tmp/ghcr-release-manifest.json -w "%{http_code}" \
-                      -H "Authorization: Bearer ${token}" \
-                      -H "Accept: ${accept_header}" \
-                      "${manifest_url}" || true)"
+                    token_resp="$(curl -sS -u "${GITHUB_ACTOR}:${{ secrets.GITHUB_TOKEN }}" \
+                      "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" || true)"
+                    token="$(echo "$token_resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+
+                    if [ -n "$token" ]; then
+                      code="$(curl -sS -o /tmp/ghcr-release-manifest.json -w "%{http_code}" \
+                        -H "Authorization: Bearer ${token}" \
+                        -H "Accept: ${accept_header}" \
+                        "${manifest_url}" || true)"
+                    else
+                      # Fallback path in case token endpoint is temporarily unavailable.
+                      code="$(curl -sS -o /tmp/ghcr-release-manifest.json -w "%{http_code}" \
+                        -u "${GITHUB_ACTOR}:${{ secrets.GITHUB_TOKEN }}" \
+                        -H "Accept: ${accept_header}" \
+                        "${manifest_url}" || true)"
+                    fi
 
                     if [ "$code" = "200" ]; then
                       echo "GHCR release tag is available: ${repo}:${RELEASE_TAG}"
