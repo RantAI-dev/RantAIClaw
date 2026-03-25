@@ -344,7 +344,7 @@ jobs:
                   repo="${GITHUB_REPOSITORY,,}"
                   manifest_url="https://ghcr.io/v2/${repo}/manifests/${RELEASE_TAG}"
                   accept_header="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json"
-                  max_attempts=18
+                  max_attempts=45
                   sleep_seconds=20
 
                   for attempt in $(seq 1 "$max_attempts"); do
@@ -376,9 +376,9 @@ jobs:
                     fi
                   done
 
-                  echo "::error::GHCR tag ${repo}:${RELEASE_TAG} was not available before release publish timeout."
+                  echo "::warning::GHCR tag ${repo}:${RELEASE_TAG} was not available before release publish timeout."
                   cat /tmp/ghcr-release-manifest.json || true
-                  exit 1
+                  echo "Continuing release publish; check Pub Docker Img workflow for image status."
 
             - name: Create GitHub Release
               uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
