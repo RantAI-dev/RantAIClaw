@@ -352,25 +352,7 @@ jobs:
                     response="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "${api_url}")"
                     echo "$response" > /tmp/docker-workflow-runs.json
 
-                    status="$(TARGET_SHA="${target_sha}" python3 - <<'PY'
-import json
-import os
-with open('/tmp/docker-workflow-runs.json', 'r', encoding='utf-8') as f:
-    data = json.load(f)
-target_sha = os.environ.get("TARGET_SHA", "")
-target = None
-for run in data.get("workflow_runs", []):
-    if run.get("head_sha") == target_sha:
-        target = run
-        break
-if target is None:
-    print("NOT_FOUND")
-else:
-    st = target.get("status", "unknown")
-    concl = target.get("conclusion", "")
-    print(f"{st}:{concl}")
-PY
-)"
+                    status="$(TARGET_SHA="${target_sha}" python3 -c 'import json, os; data=json.load(open("/tmp/docker-workflow-runs.json","r",encoding="utf-8")); target=next((r for r in data.get("workflow_runs",[]) if r.get("head_sha")==os.environ.get("TARGET_SHA","")), None); print("NOT_FOUND" if target is None else f"{target.get(\"status\",\"unknown\")}:{target.get(\"conclusion\",\"\")}")')"
 
                     case "$status" in
                       completed:success)
