@@ -36,6 +36,7 @@ concurrency:
 permissions:
     contents: write
     packages: read
+    actions: read
     id-token: write # Required for cosign keyless signing via OIDC
 
 env:
@@ -335,50 +336,63 @@ jobs:
                       "$file"
                   done < <(find artifacts -type f ! -name '*.sig' ! -name '*.pem' ! -name '*.bundle' -print0)
 
-            - name: Verify GHCR release tag availability
+            - name: Verify Docker publish workflow succeeded
               shell: bash
               env:
                   RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
                   set -euo pipefail
-                  repo="${GITHUB_REPOSITORY,,}"
-                  manifest_url="https://ghcr.io/v2/${repo}/manifests/${RELEASE_TAG}"
-                  accept_header="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json"
-                  max_attempts=45
-                  sleep_seconds=20
+                  max_attempts=40
+                  sleep_seconds=15
+                  api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/pub-docker-img.yml/runs?event=push&per_page=50"
+                  target_sha="${GITHUB_SHA}"
 
                   for attempt in $(seq 1 "$max_attempts"); do
-                    token_resp="$(curl -sS -u "${GITHUB_ACTOR}:${{ secrets.GITHUB_TOKEN }}" \
-                      "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" || true)"
-                    token="$(echo "$token_resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+                    response="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "${api_url}")"
+                    echo "$response" > /tmp/docker-workflow-runs.json
 
-                    if [ -n "$token" ]; then
-                      code="$(curl -sS -o /tmp/ghcr-release-manifest.json -w "%{http_code}" \
-                        -H "Authorization: Bearer ${token}" \
-                        -H "Accept: ${accept_header}" \
-                        "${manifest_url}" || true)"
-                    else
-                      # Fallback path in case token endpoint is temporarily unavailable.
-                      code="$(curl -sS -o /tmp/ghcr-release-manifest.json -w "%{http_code}" \
-                        -u "${GITHUB_ACTOR}:${{ secrets.GITHUB_TOKEN }}" \
-                        -H "Accept: ${accept_header}" \
-                        "${manifest_url}" || true)"
-                    fi
+                    status="$(TARGET_SHA="${target_sha}" python3 - <<'PY'
+import json
+import os
+with open('/tmp/docker-workflow-runs.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+target_sha = os.environ.get("TARGET_SHA", "")
+target = None
+for run in data.get("workflow_runs", []):
+    if run.get("head_sha") == target_sha:
+        target = run
+        break
+if target is None:
+    print("NOT_FOUND")
+else:
+    st = target.get("status", "unknown")
+    concl = target.get("conclusion", "")
+    print(f"{st}:{concl}")
+PY
+)"
 
-                    if [ "$code" = "200" ]; then
-                      echo "GHCR release tag is available: ${repo}:${RELEASE_TAG}"
-                      exit 0
-                    fi
+                    case "$status" in
+                      completed:success)
+                        echo "Pub Docker Img succeeded for release tag ${RELEASE_TAG} (${target_sha})."
+                        exit 0
+                        ;;
+                      completed:*)
+                        echo "::error::Pub Docker Img did not succeed for ${RELEASE_TAG}. Status=${status}"
+                        cat /tmp/docker-workflow-runs.json || true
+                        exit 1
+                        ;;
+                    esac
 
                     if [ "$attempt" -lt "$max_attempts" ]; then
-                      echo "Waiting for GHCR tag ${repo}:${RELEASE_TAG} (attempt ${attempt}/${max_attempts}, HTTP ${code})..."
+                      echo "Waiting for Pub Docker Img on ${RELEASE_TAG} (attempt ${attempt}/${max_attempts}, state=${status})..."
                       sleep "$sleep_seconds"
                     fi
                   done
 
-                  echo "::warning::GHCR tag ${repo}:${RELEASE_TAG} was not available before release publish timeout."
-                  cat /tmp/ghcr-release-manifest.json || true
-                  echo "Continuing release publish; check Pub Docker Img workflow for image status."
+                  echo "::error::Timed out waiting for Pub Docker Img workflow completion for ${RELEASE_TAG}."
+                  cat /tmp/docker-workflow-runs.json || true
+                  exit 1
 
             - name: Create GitHub Release
               uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
