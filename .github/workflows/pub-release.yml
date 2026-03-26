@@ -273,7 +273,7 @@ jobs:
         if: needs.prepare.outputs.publish_release == 'true'
         needs: [prepare, verify-artifacts]
         runs-on: ubuntu-latest
-        timeout-minutes: 15
+        timeout-minutes: 90
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
               with:
@@ -343,7 +343,7 @@ jobs:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
                   set -euo pipefail
-                  max_attempts=40
+                  max_attempts=220
                   sleep_seconds=15
                   api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/pub-docker-img.yml/runs?event=push&per_page=50"
                   target_sha="${GITHUB_SHA}"
