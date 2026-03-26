@@ -35,12 +35,14 @@ concurrency:
 
 permissions:
     contents: write
-    packages: read
+    packages: write
     actions: read
     id-token: write # Required for cosign keyless signing via OIDC
 
 env:
     CARGO_TERM_COLOR: always
+    REGISTRY: ghcr.io
+    IMAGE_NAME: ${{ github.repository }}
 
 jobs:
     prepare:
@@ -336,47 +338,38 @@ jobs:
                       "$file"
                   done < <(find artifacts -type f ! -name '*.sig' ! -name '*.pem' ! -name '*.bundle' -print0)
 
-            - name: Verify Docker publish workflow succeeded
+            - name: Setup Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to Container Registry
+              uses: docker/login-action@v3
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Compute Docker release tags
+              id: docker_meta
               shell: bash
               env:
                   RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
                   set -euo pipefail
-                  max_attempts=220
-                  sleep_seconds=15
-                  api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/pub-docker-img.yml/runs?event=push&per_page=50"
-                  target_sha="${GITHUB_SHA}"
+                  image="${REGISTRY}/${IMAGE_NAME}"
+                  image="${image,,}"
+                  sha_tag="${image}:sha-${GITHUB_SHA::12}"
+                  tags="${image}:${RELEASE_TAG},${sha_tag}"
+                  echo "tags=${tags}" >> "$GITHUB_OUTPUT"
 
-                  for attempt in $(seq 1 "$max_attempts"); do
-                    response="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "${api_url}")"
-                    echo "$response" > /tmp/docker-workflow-runs.json
-
-                    status="$(TARGET_SHA="${target_sha}" python3 -c 'import json, os; data=json.load(open("/tmp/docker-workflow-runs.json","r",encoding="utf-8")); runs=[r for r in data.get("workflow_runs",[]) if r.get("head_sha")==os.environ.get("TARGET_SHA","")]; print("NOT_FOUND" if not runs else ("completed:success" if any(r.get("status")=="completed" and r.get("conclusion")=="success" for r in runs) else ("IN_PROGRESS" if any(r.get("status")!="completed" for r in runs) else "completed:{}".format(runs[0].get("conclusion") or ""))))')"
-
-                    case "$status" in
-                      completed:success)
-                        echo "Pub Docker Img succeeded for release tag ${RELEASE_TAG} (${target_sha})."
-                        exit 0
-                        ;;
-                      IN_PROGRESS|in_progress*|queued*)
-                        ;;
-                      completed:*)
-                        echo "::error::Pub Docker Img did not succeed for ${RELEASE_TAG}. Status=${status}"
-                        cat /tmp/docker-workflow-runs.json || true
-                        exit 1
-                        ;;
-                    esac
-
-                    if [ "$attempt" -lt "$max_attempts" ]; then
-                      echo "Waiting for Pub Docker Img on ${RELEASE_TAG} (attempt ${attempt}/${max_attempts}, state=${status})..."
-                      sleep "$sleep_seconds"
-                    fi
-                  done
-
-                  echo "::error::Timed out waiting for Pub Docker Img workflow completion for ${RELEASE_TAG}."
-                  cat /tmp/docker-workflow-runs.json || true
-                  exit 1
+            - name: Build and push release Docker image
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  push: true
+                  tags: ${{ steps.docker_meta.outputs.tags }}
+                  platforms: linux/amd64,linux/arm64
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
 
             - name: Create GitHub Release
               uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
