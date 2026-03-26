@@ -352,12 +352,14 @@ jobs:
                     response="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "${api_url}")"
                     echo "$response" > /tmp/docker-workflow-runs.json
 
-                    status="$(TARGET_SHA="${target_sha}" python3 -c 'import json, os; data=json.load(open("/tmp/docker-workflow-runs.json","r",encoding="utf-8")); target=next((r for r in data.get("workflow_runs",[]) if r.get("head_sha")==os.environ.get("TARGET_SHA","")), None); print("NOT_FOUND" if target is None else "{}:{}".format(target.get("status","unknown"), target.get("conclusion","")))')"
+                    status="$(TARGET_SHA="${target_sha}" python3 -c 'import json, os; data=json.load(open("/tmp/docker-workflow-runs.json","r",encoding="utf-8")); runs=[r for r in data.get("workflow_runs",[]) if r.get("head_sha")==os.environ.get("TARGET_SHA","")]; print("NOT_FOUND" if not runs else ("completed:success" if any(r.get("status")=="completed" and r.get("conclusion")=="success" for r in runs) else ("IN_PROGRESS" if any(r.get("status")!="completed" for r in runs) else "completed:{}".format(runs[0].get("conclusion") or ""))))')"
 
                     case "$status" in
                       completed:success)
                         echo "Pub Docker Img succeeded for release tag ${RELEASE_TAG} (${target_sha})."
                         exit 0
+                        ;;
+                      IN_PROGRESS|in_progress*|queued*)
                         ;;
                       completed:*)
                         echo "::error::Pub Docker Img did not succeed for ${RELEASE_TAG}. Status=${status}"

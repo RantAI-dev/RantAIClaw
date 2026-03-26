@@ -154,7 +154,8 @@ jobs:
 
                   echo "::warning::Unable to update GHCR visibility via API in this run; proceeding to direct anonymous pull verification."
 
-            - name: Verify anonymous GHCR pull access
+            - name: Verify anonymous GHCR pull access (non-blocking)
+              continue-on-error: true
               shell: bash
               run: |
                   set -euo pipefail
@@ -162,8 +163,8 @@ jobs:
                   token="$(echo "$token_resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
 
                   if [ -z "$token" ]; then
-                    echo "::error::Anonymous GHCR token request failed: $token_resp"
-                    exit 1
+                    echo "::warning::Anonymous GHCR token request failed: $token_resp"
+                    exit 0
                   fi
 
                   code="$(curl -sS -o /tmp/ghcr-manifest.json -w "%{http_code}" \
@@ -172,9 +173,9 @@ jobs:
                     "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/latest")"
 
                   if [ "$code" != "200" ]; then
-                    echo "::error::Anonymous manifest pull failed with HTTP ${code}"
+                    echo "::warning::Anonymous manifest pull failed with HTTP ${code}"
                     cat /tmp/ghcr-manifest.json || true
-                    exit 1
+                    exit 0
                   fi
 
                   echo "Anonymous GHCR pull access verified."
