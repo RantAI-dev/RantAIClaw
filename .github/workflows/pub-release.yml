@@ -324,7 +324,7 @@ jobs:
                   cat artifacts/release-manifest.json
 
             - name: Install cosign
-              uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+              uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
             - name: Sign artifacts with cosign (keyless)
               shell: bash
@@ -372,7 +372,7 @@ jobs:
                   cache-to: type=gha,mode=max
 
             - name: Create GitHub Release
-              uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+              uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
               with:
                   tag_name: ${{ needs.prepare.outputs.release_tag }}
                   target_commitish: ${{ github.sha }}
