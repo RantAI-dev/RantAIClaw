@@ -91,9 +91,6 @@ pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use skill_tool::skill_tools_from_skills;
-pub use traits::Tool;
-#[allow(unused_imports)]
-pub use traits::{ToolResult, ToolSpec};
 pub use task_comment::TaskCommentTool;
 pub use task_complete_subtask::TaskCompleteSubtaskTool;
 pub use task_create::TaskCreateTool;
@@ -103,6 +100,9 @@ pub use task_list::TaskListTool;
 pub use task_read_comments::TaskReadCommentsTool;
 pub use task_review::TaskReviewTool;
 pub use task_update_status::TaskUpdateStatusTool;
+pub use traits::Tool;
+#[allow(unused_imports)]
+pub use traits::{ToolResult, ToolSpec};
 pub use web_search_tool::WebSearchTool;
 
 use crate::config::{Config, DelegateAgentConfig};

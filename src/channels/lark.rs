@@ -884,7 +884,11 @@ impl Channel for LarkChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
+    async fn listen(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
         use crate::config::schema::LarkReceiveMode;
         match self.receive_mode {
             LarkReceiveMode::Websocket => self.listen_ws(tx).await,

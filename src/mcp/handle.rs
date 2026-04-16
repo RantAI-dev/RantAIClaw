@@ -1,11 +1,11 @@
 //! Individual MCP server process handle — manages lifecycle of a single stdio-based MCP server.
 
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Stdio;
-use anyhow::{Context, Result};
-use serde::{Serialize, Deserialize};
 use tokio::process::{Child, Command};
-use tracing::{info, error};
+use tracing::{error, info};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", content = "error")]
@@ -40,9 +40,16 @@ impl McpHandle {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("Failed to spawn MCP server: {} {}", command, args.join(" ")))?;
+            .with_context(|| {
+                format!("Failed to spawn MCP server: {} {}", command, args.join(" "))
+            })?;
 
-        info!("MCP server spawned: {} {} (pid: {:?})", command, args.join(" "), process.id());
+        info!(
+            "MCP server spawned: {} {} (pid: {:?})",
+            command,
+            args.join(" "),
+            process.id()
+        );
 
         Ok(Self {
             command,
@@ -68,12 +75,19 @@ impl McpHandle {
         self.process = process;
         self.status = McpStatus::Running;
         self.consecutive_failures = 0;
-        info!("MCP server respawned: {} (pid: {:?})", self.command, self.process.id());
+        info!(
+            "MCP server respawned: {} (pid: {:?})",
+            self.command,
+            self.process.id()
+        );
         Ok(())
     }
 
     pub async fn kill(&mut self) -> Result<()> {
-        self.process.kill().await.context("Failed to kill MCP server process")?;
+        self.process
+            .kill()
+            .await
+            .context("Failed to kill MCP server process")?;
         self.status = McpStatus::Stopped;
         Ok(())
     }
@@ -94,9 +108,13 @@ impl McpHandle {
         self.consecutive_failures += 1;
         if self.is_failed() {
             self.status = McpStatus::Error(format!(
-                "Exceeded {} consecutive failures", MAX_CONSECUTIVE_FAILURES
+                "Exceeded {} consecutive failures",
+                MAX_CONSECUTIVE_FAILURES
             ));
-            error!("MCP server {} failed {} times, giving up", self.command, self.consecutive_failures);
+            error!(
+                "MCP server {} failed {} times, giving up",
+                self.command, self.consecutive_failures
+            );
             false
         } else {
             true

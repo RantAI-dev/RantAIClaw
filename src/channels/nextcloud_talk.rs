@@ -212,7 +212,11 @@ impl Channel for NextcloudTalkChannel {
             .await
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
         tracing::info!(
             "Nextcloud Talk channel active (webhook mode). \
             Configure Nextcloud Talk bot webhook to POST to your gateway's /nextcloud-talk endpoint."

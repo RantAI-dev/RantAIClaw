@@ -114,7 +114,8 @@ fn write_embedded_bridge(dest: &std::path::Path) -> Result<()> {
     let sketch_ino = include_str!("../../firmware/rantaiclaw-uno-q-bridge/sketch/sketch.ino");
     let sketch_yaml = include_str!("../../firmware/rantaiclaw-uno-q-bridge/sketch/sketch.yaml");
     let main_py = include_str!("../../firmware/rantaiclaw-uno-q-bridge/python/main.py");
-    let requirements = include_str!("../../firmware/rantaiclaw-uno-q-bridge/python/requirements.txt");
+    let requirements =
+        include_str!("../../firmware/rantaiclaw-uno-q-bridge/python/requirements.txt");
 
     std::fs::write(dest.join("app.yaml"), app_yaml)?;
     std::fs::create_dir_all(dest.join("sketch"))?;
@@ -198,7 +199,10 @@ pub fn deploy_uno_q(host: &str) -> Result<()> {
     println!("RantaiClaw deployed to Uno Q!");
     println!("  Binary: ~/rantaiclaw/rantaiclaw");
     println!();
-    println!("Start with: ssh {} '~/rantaiclaw/rantaiclaw agent'", ssh_target);
+    println!(
+        "Start with: ssh {} '~/rantaiclaw/rantaiclaw agent'",
+        ssh_target
+    );
 
     Ok(())
 }

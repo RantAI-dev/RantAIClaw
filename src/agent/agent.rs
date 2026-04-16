@@ -544,7 +544,12 @@ impl Agent {
         let cli = crate::channels::CliChannel::new();
 
         let listen_handle = tokio::spawn(async move {
-            let _ = crate::channels::Channel::listen(&cli, tx, tokio_util::sync::CancellationToken::new()).await;
+            let _ = crate::channels::Channel::listen(
+                &cli,
+                tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
         });
 
         while let Some(msg) = rx.recv().await {

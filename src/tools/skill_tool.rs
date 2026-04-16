@@ -28,12 +28,24 @@ impl SkillToolAdapter {
     pub fn new(skill_name: &str, tool: SkillTool) -> Self {
         let safe_skill = skill_name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>();
         let safe_tool = tool
             .name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>();
         let prefixed_name = format!("skill_{safe_skill}_{safe_tool}");
         Self {
@@ -101,10 +113,7 @@ impl Tool for SkillToolAdapter {
             _ => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Unsupported skill tool kind: {}",
-                    self.tool.kind
-                )),
+                error: Some(format!("Unsupported skill tool kind: {}", self.tool.kind)),
             }),
         }
     }
@@ -132,19 +141,13 @@ impl SkillToolAdapter {
         }
 
         // Append LLM-provided extra args as a single argument (not shell-expanded)
-        let extra_args = args
-            .get("args")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let extra_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("");
         if !extra_args.is_empty() {
             cmd.arg(extra_args);
         }
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(SKILL_TOOL_TIMEOUT_SECS),
-            cmd.output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(SKILL_TOOL_TIMEOUT_SECS), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -196,10 +199,7 @@ impl SkillToolAdapter {
 
     async fn execute_http(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // Validate method is a known HTTP method to prevent injection
-        let method = args
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("GET");
+        let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
         let allowed_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
         let safe_method = if allowed_methods.contains(&method.to_uppercase().as_str()) {
             method.to_uppercase()
@@ -207,10 +207,7 @@ impl SkillToolAdapter {
             "GET".to_string()
         };
 
-        let body = args
-            .get("body")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
 
         let url = &self.tool.command;
 
@@ -224,11 +221,8 @@ impl SkillToolAdapter {
         }
         cmd.arg(url);
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(SKILL_TOOL_TIMEOUT_SECS),
-            cmd.output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(SKILL_TOOL_TIMEOUT_SECS), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {

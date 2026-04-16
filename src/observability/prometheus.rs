@@ -42,14 +42,19 @@ impl PrometheusObserver {
         .expect("valid metric");
 
         let channel_messages = IntCounterVec::new(
-            prometheus::Opts::new("rantaiclaw_channel_messages_total", "Total channel messages"),
+            prometheus::Opts::new(
+                "rantaiclaw_channel_messages_total",
+                "Total channel messages",
+            ),
             &["channel", "direction"],
         )
         .expect("valid metric");
 
-        let heartbeat_ticks =
-            prometheus::IntCounter::new("rantaiclaw_heartbeat_ticks_total", "Total heartbeat ticks")
-                .expect("valid metric");
+        let heartbeat_ticks = prometheus::IntCounter::new(
+            "rantaiclaw_heartbeat_ticks_total",
+            "Total heartbeat ticks",
+        )
+        .expect("valid metric");
 
         let errors = IntCounterVec::new(
             prometheus::Opts::new("rantaiclaw_errors_total", "Total errors by component"),

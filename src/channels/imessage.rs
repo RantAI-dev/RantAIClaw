@@ -130,7 +130,11 @@ end tell"#
         Ok(())
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
+    async fn listen(
+        &self,
+        tx: mpsc::Sender<ChannelMessage>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
         tracing::info!("iMessage channel listening (AppleScript bridge)...");
 
         // Query the Messages SQLite database for new messages

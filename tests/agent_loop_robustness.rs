@@ -9,8 +9,6 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::json;
-use std::sync::{Arc, Mutex};
 use rantaiclaw::agent::agent::Agent;
 use rantaiclaw::agent::dispatcher::NativeToolDispatcher;
 use rantaiclaw::config::MemoryConfig;
@@ -19,6 +17,8 @@ use rantaiclaw::memory::Memory;
 use rantaiclaw::observability::{NoopObserver, Observer};
 use rantaiclaw::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
 use rantaiclaw::tools::{Tool, ToolResult};
+use serde_json::json;
+use std::sync::{Arc, Mutex};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock infrastructure

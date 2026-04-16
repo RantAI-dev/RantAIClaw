@@ -1226,7 +1226,8 @@ fn spawn_supervised_listener_with_health_interval(
             let mut health = tokio::time::interval(health_interval);
             health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let result = {
-                let listen_future = ch.listen(tx.clone(), tokio_util::sync::CancellationToken::new());
+                let listen_future =
+                    ch.listen(tx.clone(), tokio_util::sync::CancellationToken::new());
                 tokio::pin!(listen_future);
 
                 loop {
@@ -2543,7 +2544,10 @@ pub async fn register_configured_channels(
         F: FnOnce(serde_json::Value) -> Fut,
         Fut: std::future::Future<Output = Result<Box<dyn Channel + Send + Sync>>>,
     {
-        if let Err(e) = registry.add_channel(id.to_string(), config_json, factory).await {
+        if let Err(e) = registry
+            .add_channel(id.to_string(), config_json, factory)
+            .await
+        {
             tracing::warn!("Failed to register channel '{}' in registry: {}", id, e);
         }
     }
@@ -2555,16 +2559,24 @@ pub async fn register_configured_channels(
                 let ch = TelegramChannel::new(tg.bot_token, tg.allowed_users, tg.mention_only)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms);
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
     if let Some(ref cfg) = channels_config.discord {
         if let Ok(json) = serde_json::to_value(cfg) {
             try_register(registry, "discord", json, |v| async move {
                 let dc: crate::config::schema::DiscordConfig = serde_json::from_value(v)?;
-                let ch = DiscordChannel::new(dc.bot_token, dc.guild_id, dc.allowed_users, dc.listen_to_bots, dc.mention_only);
+                let ch = DiscordChannel::new(
+                    dc.bot_token,
+                    dc.guild_id,
+                    dc.allowed_users,
+                    dc.listen_to_bots,
+                    dc.mention_only,
+                );
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
     if let Some(ref cfg) = channels_config.slack {
@@ -2573,7 +2585,8 @@ pub async fn register_configured_channels(
                 let sl: crate::config::schema::SlackConfig = serde_json::from_value(v)?;
                 let ch = SlackChannel::new(sl.bot_token, sl.channel_id, sl.allowed_users);
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
     if let Some(ref cfg) = channels_config.mattermost {
@@ -2581,11 +2594,16 @@ pub async fn register_configured_channels(
             try_register(registry, "mattermost", json, |v| async move {
                 let mm: crate::config::schema::MattermostConfig = serde_json::from_value(v)?;
                 let ch = MattermostChannel::new(
-                    mm.url, mm.bot_token, mm.channel_id, mm.allowed_users,
-                    mm.thread_replies.unwrap_or(true), mm.mention_only.unwrap_or(false),
+                    mm.url,
+                    mm.bot_token,
+                    mm.channel_id,
+                    mm.allowed_users,
+                    mm.thread_replies.unwrap_or(true),
+                    mm.mention_only.unwrap_or(false),
                 );
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
     if let Some(ref cfg) = channels_config.signal {
@@ -2593,11 +2611,16 @@ pub async fn register_configured_channels(
             try_register(registry, "signal", json, |v| async move {
                 let sig: crate::config::schema::SignalConfig = serde_json::from_value(v)?;
                 let ch = SignalChannel::new(
-                    sig.http_url, sig.account, sig.group_id, sig.allowed_from,
-                    sig.ignore_attachments, sig.ignore_stories,
+                    sig.http_url,
+                    sig.account,
+                    sig.group_id,
+                    sig.allowed_from,
+                    sig.ignore_attachments,
+                    sig.ignore_stories,
                 );
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
     if let Some(ref cfg) = channels_config.linq {
@@ -2606,7 +2629,8 @@ pub async fn register_configured_channels(
                 let lq: crate::config::schema::LinqConfig = serde_json::from_value(v)?;
                 let ch = LinqChannel::new(lq.api_token, lq.from_phone, lq.allowed_senders);
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
     if let Some(ref cfg) = channels_config.nextcloud_talk {
@@ -2615,16 +2639,19 @@ pub async fn register_configured_channels(
                 let nc: crate::config::schema::NextcloudTalkConfig = serde_json::from_value(v)?;
                 let ch = NextcloudTalkChannel::new(nc.base_url, nc.app_token, nc.allowed_users);
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
     if let Some(ref cfg) = channels_config.email {
         if let Ok(json) = serde_json::to_value(cfg) {
             try_register(registry, "email", json, |v| async move {
-                let email_cfg: crate::channels::email_channel::EmailConfig = serde_json::from_value(v)?;
+                let email_cfg: crate::channels::email_channel::EmailConfig =
+                    serde_json::from_value(v)?;
                 let ch = EmailChannel::new(email_cfg);
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
     if let Some(ref cfg) = channels_config.irc {
@@ -2644,7 +2671,8 @@ pub async fn register_configured_channels(
                     verify_tls: irc_cfg.verify_tls.unwrap_or(true),
                 });
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
     if let Some(ref cfg) = channels_config.dingtalk {
@@ -2653,7 +2681,8 @@ pub async fn register_configured_channels(
                 let dt: crate::config::schema::DingTalkConfig = serde_json::from_value(v)?;
                 let ch = DingTalkChannel::new(dt.client_id, dt.client_secret, dt.allowed_users);
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
     if let Some(ref cfg) = channels_config.qq {
@@ -2662,13 +2691,17 @@ pub async fn register_configured_channels(
                 let qq_cfg: crate::config::schema::QQConfig = serde_json::from_value(v)?;
                 let ch = QQChannel::new(qq_cfg.app_id, qq_cfg.app_secret, qq_cfg.allowed_users);
                 Ok(Box::new(ch) as Box<dyn Channel + Send + Sync>)
-            }).await;
+            })
+            .await;
         }
     }
 
     let count = registry.list_channels().len();
     if count > 0 {
-        tracing::info!("Registered {} channel(s) from config into ChannelRegistry", count);
+        tracing::info!(
+            "Registered {} channel(s) from config into ChannelRegistry",
+            count
+        );
     }
 }
 
@@ -3165,7 +3198,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Create minimal workspace files
         std::fs::write(tmp.path().join("SOUL.md"), "# Soul\nBe helpful.").unwrap();
-        std::fs::write(tmp.path().join("IDENTITY.md"), "# Identity\nName: RantaiClaw").unwrap();
+        std::fs::write(
+            tmp.path().join("IDENTITY.md"),
+            "# Identity\nName: RantaiClaw",
+        )
+        .unwrap();
         std::fs::write(tmp.path().join("USER.md"), "# User\nName: Test User").unwrap();
         std::fs::write(
             tmp.path().join("AGENTS.md"),

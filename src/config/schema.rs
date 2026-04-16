@@ -3516,7 +3516,8 @@ impl Config {
         }
 
         // Gateway host: RANTAICLAW_GATEWAY_HOST or HOST
-        if let Ok(host) = std::env::var("RANTAICLAW_GATEWAY_HOST").or_else(|_| std::env::var("HOST"))
+        if let Ok(host) =
+            std::env::var("RANTAICLAW_GATEWAY_HOST").or_else(|_| std::env::var("HOST"))
         {
             if !host.is_empty() {
                 self.gateway.host = host;

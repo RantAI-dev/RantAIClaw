@@ -527,7 +527,11 @@ impl Channel for EmailChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> Result<()> {
+    async fn listen(
+        &self,
+        tx: mpsc::Sender<ChannelMessage>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
         info!(
             "Starting email channel with IDLE support on {}",
             self.config.imap_folder

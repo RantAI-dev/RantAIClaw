@@ -183,8 +183,11 @@ fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
 fn stop_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let _ =
-                run_checked(Command::new("systemctl").args(["--user", "stop", "rantaiclaw.service"]));
+            let _ = run_checked(Command::new("systemctl").args([
+                "--user",
+                "stop",
+                "rantaiclaw.service",
+            ]));
         }
         InitSystem::Openrc => {
             let _ = run_checked(Command::new("rc-service").args(["rantaiclaw", "stop"]));
@@ -222,7 +225,11 @@ fn restart_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "restart", "rantaiclaw.service"]))?;
+            run_checked(Command::new("systemctl").args([
+                "--user",
+                "restart",
+                "rantaiclaw.service",
+            ]))?;
         }
         InitSystem::Openrc => {
             run_checked(Command::new("rc-service").args(["rantaiclaw", "restart"]))?;
@@ -469,7 +476,9 @@ fn is_root() -> bool {
 /// Returns Ok if user doesn't exist (OpenRC will handle creation or fail gracefully).
 /// Returns error if user exists but has unexpected properties.
 fn check_rantaiclaw_user() -> Result<()> {
-    let output = Command::new("getent").args(["passwd", "rantaiclaw"]).output();
+    let output = Command::new("getent")
+        .args(["passwd", "rantaiclaw"])
+        .output();
     let is_alpine = Path::new("/etc/alpine-release").exists();
 
     let (del_cmd, add_cmd) = if is_alpine {
@@ -478,7 +487,10 @@ fn check_rantaiclaw_user() -> Result<()> {
             "addgroup -S rantaiclaw && adduser -S -s /sbin/nologin -H -D -G rantaiclaw rantaiclaw",
         )
     } else {
-        ("userdel rantaiclaw", "useradd -r -s /sbin/nologin rantaiclaw")
+        (
+            "userdel rantaiclaw",
+            "useradd -r -s /sbin/nologin rantaiclaw",
+        )
     };
 
     match output {
@@ -525,7 +537,9 @@ fn check_rantaiclaw_user() -> Result<()> {
 }
 
 fn ensure_rantaiclaw_user() -> Result<()> {
-    let output = Command::new("getent").args(["passwd", "rantaiclaw"]).output();
+    let output = Command::new("getent")
+        .args(["passwd", "rantaiclaw"])
+        .output();
     if let Ok(output) = output {
         if output.status.success() {
             return check_rantaiclaw_user();
@@ -535,7 +549,9 @@ fn ensure_rantaiclaw_user() -> Result<()> {
     let is_alpine = Path::new("/etc/alpine-release").exists();
 
     if is_alpine {
-        let group_output = Command::new("getent").args(["group", "rantaiclaw"]).output();
+        let group_output = Command::new("getent")
+            .args(["group", "rantaiclaw"])
+            .output();
         let group_exists = group_output.map(|o| o.status.success()).unwrap_or(false);
 
         if !group_exists {

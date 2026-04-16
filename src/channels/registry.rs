@@ -1,12 +1,12 @@
 //! Per-channel lifecycle management with graceful shutdown support.
 
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
-use anyhow::{anyhow, Result};
-use serde::{Serialize, Deserialize};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::channels::traits::{Channel, ChannelMessage};
 
@@ -68,12 +68,15 @@ impl ChannelRegistry {
             }
         });
 
-        self.channels.insert(id.clone(), ChannelHandle {
-            config,
-            cancel,
-            task,
-            status: ChannelStatus::Running,
-        });
+        self.channels.insert(
+            id.clone(),
+            ChannelHandle {
+                config,
+                cancel,
+                task,
+                status: ChannelStatus::Running,
+            },
+        );
 
         info!("Channel '{}' started", id);
         Ok(())
@@ -81,7 +84,9 @@ impl ChannelRegistry {
 
     /// Gracefully stop and remove a channel.
     pub async fn remove_channel(&mut self, id: &str) -> Result<()> {
-        let handle = self.channels.remove(id)
+        let handle = self
+            .channels
+            .remove(id)
             .ok_or_else(|| anyhow!("Channel '{}' not found", id))?;
 
         handle.cancel.cancel();
@@ -91,7 +96,11 @@ impl ChannelRegistry {
             Ok(Ok(())) => info!("Channel '{}' stopped gracefully", id),
             Ok(Err(e)) => warn!("Channel '{}' task panicked: {}", id, e),
             Err(_) => {
-                warn!("Channel '{}' did not stop within {}s, aborting", id, SHUTDOWN_TIMEOUT.as_secs());
+                warn!(
+                    "Channel '{}' did not stop within {}s, aborting",
+                    id,
+                    SHUTDOWN_TIMEOUT.as_secs()
+                );
             }
         }
 
@@ -122,7 +131,8 @@ impl ChannelRegistry {
 
     /// List all channels and their statuses.
     pub fn list_channels(&self) -> HashMap<String, ChannelStatus> {
-        self.channels.iter()
+        self.channels
+            .iter()
             .map(|(id, handle)| (id.clone(), handle.status.clone()))
             .collect()
     }

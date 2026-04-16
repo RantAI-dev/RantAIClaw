@@ -67,7 +67,11 @@ pub trait Channel: Send + Sync {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
     /// Start listening for incoming messages (long-running)
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, cancel: CancellationToken) -> anyhow::Result<()>;
+    async fn listen(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()>;
 
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {

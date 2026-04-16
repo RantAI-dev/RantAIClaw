@@ -9,8 +9,6 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::json;
-use std::sync::{Arc, Mutex};
 use rantaiclaw::agent::agent::Agent;
 use rantaiclaw::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
 use rantaiclaw::agent::memory_loader::MemoryLoader;
@@ -19,10 +17,10 @@ use rantaiclaw::memory;
 use rantaiclaw::memory::Memory;
 use rantaiclaw::observability::{NoopObserver, Observer};
 use rantaiclaw::providers::traits::ChatMessage;
-use rantaiclaw::providers::{
-    ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
-};
+use rantaiclaw::providers::{ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall};
 use rantaiclaw::tools::{Tool, ToolResult};
+use serde_json::json;
+use std::sync::{Arc, Mutex};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock infrastructure
@@ -641,4 +639,3 @@ async fn e2e_empty_memory_context_passthrough() {
         "Empty context should not prepend anything to user message",
     );
 }
-

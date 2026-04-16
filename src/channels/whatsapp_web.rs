@@ -187,7 +187,11 @@ impl Channel for WhatsAppWebChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>, cancel: tokio_util::sync::CancellationToken) -> Result<()> {
+    async fn listen(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
         // Store the sender channel for incoming messages
         *self.tx.lock() = Some(tx.clone());
 
@@ -475,7 +479,11 @@ impl Channel for WhatsAppWebChannel {
         );
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>, _cancel: tokio_util::sync::CancellationToken) -> Result<()> {
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
         anyhow::bail!(
             "WhatsApp Web channel requires the 'whatsapp-web' feature. \
             Enable with: cargo build --features whatsapp-web"
