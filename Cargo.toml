@@ -119,6 +119,10 @@ rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
 
+# TUI framework
+ratatui = { version = "0.29", optional = true, default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", optional = true }
+
 # email
 lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"
@@ -171,7 +175,8 @@ landlock = { version = "0.4" }
 libc = "0.2"
 
 [features]
-default = []
+default = ["tui"]
+tui = ["dep:ratatui", "dep:crossterm"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
