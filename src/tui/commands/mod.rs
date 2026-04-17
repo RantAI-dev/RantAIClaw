@@ -1,8 +1,11 @@
 mod agent;
 mod config;
 mod core;
+mod cron;
+mod memory;
 mod model;
 mod session;
+mod skills;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -65,6 +68,14 @@ impl CommandRegistry {
         self.register(Box::new(config::ConfigCommand));
         self.register(Box::new(config::DoctorCommand));
         self.register(Box::new(config::PlatformsCommand));
+        self.register(Box::new(memory::MemoryCommand));
+        self.register(Box::new(memory::ForgetCommand));
+        self.register(Box::new(memory::CompressCommand));
+        self.register(Box::new(cron::CronCommand));
+        self.register(Box::new(skills::SkillsCommand));
+        self.register(Box::new(skills::SkillCommand));
+        self.register(Box::new(skills::PersonalityCommand));
+        self.register(Box::new(skills::InsightsCommand));
     }
 
     pub fn register(&mut self, handler: Box<dyn CommandHandler>) {
