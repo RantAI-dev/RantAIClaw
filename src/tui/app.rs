@@ -15,6 +15,7 @@ use ratatui::{
     Terminal,
 };
 
+use super::commands::{CommandRegistry, CommandResult as CmdResult};
 use super::context::TuiContext;
 use super::TuiConfig;
 use crate::sessions::SessionStore;
@@ -37,6 +38,7 @@ pub enum EventResult {
 pub struct TuiApp {
     pub state: AppState,
     pub context: TuiContext,
+    pub command_registry: CommandRegistry,
 }
 
 impl TuiApp {
@@ -51,6 +53,7 @@ impl TuiApp {
         Ok(Self {
             state: AppState::Chatting,
             context,
+            command_registry: CommandRegistry::new(),
         })
     }
 
@@ -125,22 +128,15 @@ impl TuiApp {
 
     /// Handle a slash command (text after the leading `/`).
     pub fn handle_command(&mut self, cmd: &str) -> Result<()> {
-        match cmd {
-            "quit" | "exit" => {
+        match self.command_registry.dispatch(cmd, &mut self.context)? {
+            CmdResult::Quit => {
                 self.state = AppState::Quitting;
             }
-            "new" | "clear" => {
-                self.context.clear_session()?;
+            CmdResult::Message(msg) => {
+                self.context.last_error = Some(msg);
             }
-            "help" => {
-                let help = concat!(
-                    "Commands: /quit /exit /new /clear /help\n",
-                    "Keys: Ctrl+Enter to send, Enter for newline, Ctrl+C/D to quit"
-                );
-                self.context.last_error.replace(help.to_string());
-            }
-            other => {
-                self.context.last_error = Some(format!("Unknown command: /{other}"));
+            CmdResult::Continue | CmdResult::ClearError => {
+                self.context.last_error = None;
             }
         }
         Ok(())
@@ -327,6 +323,7 @@ mod tests {
         TuiApp {
             state: AppState::Chatting,
             context: ctx,
+            command_registry: CommandRegistry::new(),
         }
     }
 
