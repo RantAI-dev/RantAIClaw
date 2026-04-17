@@ -19,21 +19,55 @@ impl CommandHandler for HelpCommand {
 
     fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
         if args.is_empty() {
-            let help_text = r#"Available commands:
-  /help [cmd]     Show help
-  /quit, /exit    Exit the application
-  /new, /clear    Start a new session
-  /model [name]   Change model
-  /sessions       List past sessions
-  /resume <id>    Resume a session
-  /search <query> Search message history
+            let help_text = r#"RantaiClaw TUI Commands:
+
+Core:
+  /help [cmd]        Show help
+  /quit, /exit       Exit the application
+  /new, /clear       Start a new session
+
+Model:
+  /model [name]      Change or show current model
+  /usage             Show token usage statistics
+
+Session:
+  /sessions          List past sessions
+  /resume <id>       Resume a session
+  /search <query>    Search message history
+  /title <name>      Set session title
+  /insights          Show session analytics
+
+Conversation:
+  /retry             Retry last response
+  /undo              Remove last exchange
+  /stop              Cancel streaming
+
+Memory:
+  /memory [action]   Manage persistent memory
+  /forget <key>      Remove a memory entry
+  /compress          Compress context
+
+Cron:
+  /cron [action]     Manage scheduled tasks
+
+Skills:
+  /skills            List available skills
+  /skill <name>      Run a skill
+  /personality       Set agent personality
+
+Config:
+  /status            Show system status
+  /config [k] [v]    View or set config
+  /debug             Toggle debug mode
+  /doctor            Run diagnostics
+  /platforms         Show connected platforms
 
 Press Ctrl+Enter to send a message.
 Press Ctrl+C to quit."#;
             Ok(CommandResult::Message(help_text.to_string()))
         } else {
             Ok(CommandResult::Message(format!(
-                "Help for /{}: Not yet implemented",
+                "Help for /{}: Use /help to see all commands.",
                 args
             )))
         }
