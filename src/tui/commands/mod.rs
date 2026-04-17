@@ -1,4 +1,5 @@
 mod core;
+mod session;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -47,6 +48,10 @@ impl CommandRegistry {
         self.register(Box::new(core::HelpCommand));
         self.register(Box::new(core::QuitCommand));
         self.register(Box::new(core::NewCommand));
+        self.register(Box::new(session::SessionsCommand));
+        self.register(Box::new(session::ResumeCommand));
+        self.register(Box::new(session::SearchCommand));
+        self.register(Box::new(session::TitleCommand));
     }
 
     pub fn register(&mut self, handler: Box<dyn CommandHandler>) {
