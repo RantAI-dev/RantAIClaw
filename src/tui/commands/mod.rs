@@ -1,4 +1,7 @@
+mod agent;
+mod config;
 mod core;
+mod model;
 mod session;
 
 use anyhow::Result;
@@ -52,6 +55,16 @@ impl CommandRegistry {
         self.register(Box::new(session::ResumeCommand));
         self.register(Box::new(session::SearchCommand));
         self.register(Box::new(session::TitleCommand));
+        self.register(Box::new(model::ModelCommand));
+        self.register(Box::new(model::UsageCommand));
+        self.register(Box::new(agent::RetryCommand));
+        self.register(Box::new(agent::UndoCommand));
+        self.register(Box::new(agent::StopCommand));
+        self.register(Box::new(config::StatusCommand));
+        self.register(Box::new(config::DebugCommand));
+        self.register(Box::new(config::ConfigCommand));
+        self.register(Box::new(config::DoctorCommand));
+        self.register(Box::new(config::PlatformsCommand));
     }
 
     pub fn register(&mut self, handler: Box<dyn CommandHandler>) {
