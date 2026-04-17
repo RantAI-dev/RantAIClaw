@@ -1026,7 +1026,11 @@ async fn main() -> Result<()> {
             migration::handle_command(migrate_command, &config).await
         }
 
-        Commands::Chat { resume, message, model } => {
+        Commands::Chat {
+            resume,
+            message,
+            model,
+        } => {
             #[cfg(feature = "tui")]
             {
                 use rantaiclaw::tui::{run_tui, TuiConfig};
