@@ -27,11 +27,9 @@ impl CommandHandler for MemoryCommand {
             "add" | "list" | "remove" => Ok(CommandResult::Message(
                 "Integration with memory backend pending".to_string(),
             )),
-            "" => Ok(CommandResult::Message(
-                "Usage: /memory [add|list|remove] [args]".to_string(),
-            )),
             _ => Ok(CommandResult::Message(
-                "Usage: /memory [add|list|remove] [args]".to_string(),
+                "Usage: /memory [add|list|remove] [args]\n\nManage persistent memory entries."
+                    .to_string(),
             )),
         }
     }

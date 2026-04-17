@@ -78,7 +78,10 @@ impl Autocomplete {
             return;
         }
 
-        let height = (self.suggestions.len() + 2).min(8) as u16;
+        let height: u16 = (self.suggestions.len() + 2)
+            .min(8)
+            .try_into()
+            .unwrap_or(8u16);
         let popup_area = Rect {
             x: area.x,
             y: area.y.saturating_sub(height),
@@ -93,11 +96,7 @@ impl Autocomplete {
             .collect();
 
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Suggestions"),
-            )
+            .block(Block::default().borders(Borders::ALL).title("Suggestions"))
             .highlight_style(
                 Style::default()
                     .fg(Color::Black)

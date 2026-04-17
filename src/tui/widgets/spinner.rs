@@ -36,11 +36,7 @@ impl Spinner {
     }
 
     pub fn render_with_text(&self, text: &str) -> Vec<Span<'static>> {
-        vec![
-            self.render(),
-            Span::raw(" "),
-            Span::raw(text.to_string()),
-        ]
+        vec![self.render(), Span::raw(" "), Span::raw(text.to_string())]
     }
 }
 

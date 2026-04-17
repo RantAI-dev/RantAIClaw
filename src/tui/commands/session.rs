@@ -25,7 +25,9 @@ impl CommandHandler for SessionsCommand {
         let sessions = ctx.session_store.list_sessions(limit)?;
 
         if sessions.is_empty() {
-            return Ok(CommandResult::Message("No past sessions found.".to_string()));
+            return Ok(CommandResult::Message(
+                "No past sessions found.".to_string(),
+            ));
         }
 
         let mut lines = vec!["Past sessions:".to_string()];
@@ -110,7 +112,8 @@ impl CommandHandler for ResumeCommand {
                 for s in &matches {
                     let short_id = &s.id[..s.id.len().min(8)];
                     let title = s.title.as_deref().unwrap_or("(untitled)");
-                    msg.push_str(&format!("  {} — {}\n", short_id, title));
+                    use std::fmt::Write as _;
+                    writeln!(msg, "  {} — {}", short_id, title).unwrap();
                 }
                 Ok(CommandResult::Message(msg.trim_end().to_string()))
             }
@@ -137,9 +140,7 @@ impl CommandHandler for SearchCommand {
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let query = args.trim();
         if query.is_empty() {
-            return Ok(CommandResult::Message(
-                "Usage: /search <query>".to_string(),
-            ));
+            return Ok(CommandResult::Message("Usage: /search <query>".to_string()));
         }
 
         let results = ctx.session_store.search(query, 10)?;
@@ -194,9 +195,7 @@ impl CommandHandler for TitleCommand {
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let title = args.trim();
         if title.is_empty() {
-            return Ok(CommandResult::Message(
-                "Usage: /title <name>".to_string(),
-            ));
+            return Ok(CommandResult::Message("Usage: /title <name>".to_string()));
         }
 
         ctx.session_store.set_title(&ctx.session_id, title)?;

@@ -117,7 +117,7 @@ impl CommandRegistry {
             .map(|name| format!("/{}", name))
             .collect();
 
-        for (alias, _) in &self.aliases {
+        for alias in self.aliases.keys() {
             if alias.starts_with(&partial) {
                 matches.push(format!("/{}", alias));
             }

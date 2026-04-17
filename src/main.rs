@@ -94,12 +94,13 @@ pub use rantaiclaw::{HardwareCommands, PeripheralCommands};
 #[command(author = "theonlyhennygod")]
 #[command(version = "0.1.0")]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
+#[command(subcommand_required = false)]
 struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -746,9 +747,26 @@ async fn main() -> Result<()> {
         std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir);
     }
 
+    // No subcommand: launch TUI (bare invocation).
+    // TODO: read default model from user config once config loading is cheap before TUI init.
+    // Currently, TuiConfig::default() uses the hardcoded fallback model; the Chat branch below
+    // reads the model from CLI flags and overrides it via tui_config.model.
+    if cli.command.is_none() {
+        #[cfg(feature = "tui")]
+        {
+            use rantaiclaw::tui::{run_tui, TuiConfig};
+            return run_tui(TuiConfig::default()).await;
+        }
+        #[cfg(not(feature = "tui"))]
+        {
+            eprintln!("TUI feature not enabled. Rebuild with --features tui");
+            return Ok(());
+        }
+    }
+
     // Completions must remain stdout-only and should not load config or initialize logging.
     // This avoids warnings/log lines corrupting sourced completion scripts.
-    if let Commands::Completions { shell } = &cli.command {
+    if let Some(Commands::Completions { shell }) = &cli.command {
         let mut stdout = std::io::stdout().lock();
         write_shell_completion(*shell, &mut stdout)?;
         return Ok(());
@@ -767,7 +785,7 @@ async fn main() -> Result<()> {
     // The onboard wizard uses reqwest::blocking internally, which creates its own
     // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
     // not allowed", we run the wizard on a blocking thread via spawn_blocking.
-    if let Commands::Onboard {
+    if let Some(Commands::Onboard {
         interactive,
         force,
         channels_only,
@@ -775,7 +793,7 @@ async fn main() -> Result<()> {
         provider,
         model,
         memory,
-    } = &cli.command
+    }) = &cli.command
     {
         let interactive = *interactive;
         let force = *force;
@@ -822,19 +840,21 @@ async fn main() -> Result<()> {
     config.apply_env_overrides();
 
     match cli.command {
-        Commands::Onboard { .. } | Commands::Completions { .. } => unreachable!(),
+        None | Some(Commands::Onboard { .. }) | Some(Commands::Completions { .. }) => {
+            unreachable!()
+        }
 
-        Commands::Agent {
+        Some(Commands::Agent {
             message,
             provider,
             model,
             temperature,
             peripheral,
-        } => agent::run(config, message, provider, model, temperature, peripheral)
+        }) => agent::run(config, message, provider, model, temperature, peripheral)
             .await
             .map(|_| ()),
 
-        Commands::Gateway { port, host } => {
+        Some(Commands::Gateway { port, host }) => {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -845,7 +865,7 @@ async fn main() -> Result<()> {
             gateway::run_gateway(&host, port, config).await
         }
 
-        Commands::Daemon { port, host } => {
+        Some(Commands::Daemon { port, host }) => {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -856,7 +876,7 @@ async fn main() -> Result<()> {
             daemon::run(config, host, port).await
         }
 
-        Commands::Status => {
+        Some(Commands::Status) => {
             println!("🦀 RantaiClaw Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
@@ -941,9 +961,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
+        Some(Commands::Cron { cron_command }) => cron::handle_command(cron_command, &config),
 
-        Commands::Models { model_command } => match model_command {
+        Some(Commands::Models { model_command }) => match model_command {
             ModelCommands::Refresh { provider, force } => {
                 let config_for_refresh = config.clone();
                 tokio::task::spawn_blocking(move || {
@@ -954,7 +974,7 @@ async fn main() -> Result<()> {
             }
         },
 
-        Commands::Providers => {
+        Some(Commands::Providers) => {
             let providers = providers::list_providers();
             let current = config
                 .default_provider
@@ -987,15 +1007,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Service {
+        Some(Commands::Service {
             service_command,
             service_init,
-        } => {
+        }) => {
             let init_system = service_init.parse()?;
             service::handle_command(&service_command, &config, init_system)
         }
 
-        Commands::Doctor { doctor_command } => match doctor_command {
+        Some(Commands::Doctor { doctor_command }) => match doctor_command {
             Some(DoctorCommands::Models {
                 provider,
                 use_cache,
@@ -1010,33 +1030,36 @@ async fn main() -> Result<()> {
             None => doctor::run(&config),
         },
 
-        Commands::Channel { channel_command } => match channel_command {
+        Some(Commands::Channel { channel_command }) => match channel_command {
             ChannelCommands::Start => channels::start_channels(config).await,
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
             other => channels::handle_command(other, &config).await,
         },
 
-        Commands::Integrations {
+        Some(Commands::Integrations {
             integration_command,
-        } => integrations::handle_command(integration_command, &config),
+        }) => integrations::handle_command(integration_command, &config),
 
-        Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
+        Some(Commands::Skills { skill_command }) => skills::handle_command(skill_command, &config),
 
-        Commands::Migrate { migrate_command } => {
+        Some(Commands::Migrate { migrate_command }) => {
             migration::handle_command(migrate_command, &config).await
         }
 
-        Commands::Chat {
+        Some(Commands::Chat {
             resume,
             message,
             model,
-        } => {
+        }) => {
             #[cfg(feature = "tui")]
             {
                 use rantaiclaw::tui::{run_tui, TuiConfig};
 
                 let mut tui_config = TuiConfig::default();
+                // Prefer explicit --model flag, then user's configured default_model.
                 if let Some(m) = model {
+                    tui_config.model = m;
+                } else if let Some(m) = config.default_model.clone() {
                     tui_config.model = m;
                 }
                 tui_config.resume_session = resume;
@@ -1056,21 +1079,21 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Memory { memory_command } => {
+        Some(Commands::Memory { memory_command }) => {
             memory::cli::handle_command(memory_command, &config).await
         }
 
-        Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
+        Some(Commands::Auth { auth_command }) => handle_auth_command(auth_command, &config).await,
 
-        Commands::Hardware { hardware_command } => {
+        Some(Commands::Hardware { hardware_command }) => {
             hardware::handle_command(hardware_command.clone(), &config)
         }
 
-        Commands::Peripheral { peripheral_command } => {
+        Some(Commands::Peripheral { peripheral_command }) => {
             peripherals::handle_command(peripheral_command.clone(), &config).await
         }
 
-        Commands::Config { config_command } => match config_command {
+        Some(Commands::Config { config_command }) => match config_command {
             ConfigCommands::Schema => {
                 let schema = schemars::schema_for!(config::Config);
                 println!(
@@ -1591,7 +1614,7 @@ mod tests {
         .expect("quick onboard invocation should parse");
 
         match cli.command {
-            Commands::Onboard {
+            Some(Commands::Onboard {
                 interactive,
                 force,
                 channels_only,
@@ -1599,7 +1622,7 @@ mod tests {
                 provider,
                 model,
                 ..
-            } => {
+            }) => {
                 assert!(!interactive);
                 assert!(!force);
                 assert!(!channels_only);
@@ -1617,7 +1640,7 @@ mod tests {
             let cli = Cli::try_parse_from(["rantaiclaw", "completions", shell])
                 .expect("completions invocation should parse");
             match cli.command {
-                Commands::Completions { .. } => {}
+                Some(Commands::Completions { .. }) => {}
                 other => panic!("expected completions command, got {other:?}"),
             }
         }
@@ -1641,7 +1664,7 @@ mod tests {
             .expect("onboard --force should parse");
 
         match cli.command {
-            Commands::Onboard { force, .. } => assert!(force),
+            Some(Commands::Onboard { force, .. }) => assert!(force),
             other => panic!("expected onboard command, got {other:?}"),
         }
     }
