@@ -378,6 +378,21 @@ Examples:
         peripheral_command: rantaiclaw::PeripheralCommands,
     },
 
+    /// Start interactive chat (default when no subcommand given)
+    Chat {
+        /// Resume a specific session by ID
+        #[arg(long)]
+        resume: Option<String>,
+
+        /// Single message mode (non-interactive)
+        #[arg(short, long)]
+        message: Option<String>,
+
+        /// Model to use (e.g., anthropic:claude-sonnet-4-20250514)
+        #[arg(long)]
+        model: Option<String>,
+    },
+
     /// Manage agent memory (list, get, stats, clear)
     #[command(long_about = "\
 Manage agent memory entries.
@@ -1009,6 +1024,32 @@ async fn main() -> Result<()> {
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
+        }
+
+        Commands::Chat { resume, message, model } => {
+            #[cfg(feature = "tui")]
+            {
+                use rantaiclaw::tui::{run_tui, TuiConfig};
+
+                let mut tui_config = TuiConfig::default();
+                if let Some(m) = model {
+                    tui_config.model = m;
+                }
+                tui_config.resume_session = resume;
+
+                if let Some(msg) = message {
+                    println!("Single message mode not yet implemented: {msg}");
+                    return Ok(());
+                }
+
+                run_tui(tui_config).await?;
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                let _ = (resume, message, model);
+                eprintln!("TUI feature not enabled. Rebuild with --features tui");
+            }
+            Ok(())
         }
 
         Commands::Memory { memory_command } => {

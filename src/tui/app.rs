@@ -4,15 +4,15 @@ use anyhow::{bail, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    Terminal,
 };
 
 use super::context::TuiContext;
@@ -66,11 +66,7 @@ impl TuiApp {
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<EventResult> {
         match key.code {
             // Ctrl+C or Ctrl+D → quit
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state = AppState::Quitting;
-                return Ok(EventResult::Quit);
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state = AppState::Quitting;
                 return Ok(EventResult::Quit);
             }
@@ -141,9 +137,7 @@ impl TuiApp {
                     "Commands: /quit /exit /new /clear /help\n",
                     "Keys: Ctrl+Enter to send, Enter for newline, Ctrl+C/D to quit"
                 );
-                self.context
-                    .last_error
-                    .replace(help.to_string());
+                self.context.last_error.replace(help.to_string());
             }
             other => {
                 self.context.last_error = Some(format!("Unknown command: /{other}"));
@@ -176,11 +170,7 @@ impl TuiApp {
     }
 
     /// Render the top header bar.
-    fn render_header(
-        &self,
-        frame: &mut ratatui::Frame,
-        area: Rect,
-    ) {
+    fn render_header(&self, frame: &mut ratatui::Frame, area: Rect) {
         let title = format!(
             " RantaiClaw TUI  session: {}",
             &self.context.session_id[..8.min(self.context.session_id.len())]
@@ -195,11 +185,7 @@ impl TuiApp {
     }
 
     /// Render the scrollable chat history.
-    fn render_chat(
-        &self,
-        frame: &mut ratatui::Frame,
-        area: Rect,
-    ) {
+    fn render_chat(&self, frame: &mut ratatui::Frame, area: Rect) {
         let items: Vec<ListItem> = self
             .context
             .messages
@@ -231,11 +217,7 @@ impl TuiApp {
     }
 
     /// Render the multi-line input area.
-    fn render_input(
-        &self,
-        frame: &mut ratatui::Frame,
-        area: Rect,
-    ) {
+    fn render_input(&self, frame: &mut ratatui::Frame, area: Rect) {
         let display = if self.context.input_buffer.is_empty() {
             Span::styled(
                 "Type a message… (Ctrl+Enter to send, /help for commands)",
@@ -257,11 +239,7 @@ impl TuiApp {
     }
 
     /// Render the bottom status bar.
-    fn render_status(
-        &self,
-        frame: &mut ratatui::Frame,
-        area: Rect,
-    ) {
+    fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
         let status_text = if let Some(ref err) = self.context.last_error {
             format!(" {err}")
         } else {
@@ -273,9 +251,8 @@ impl TuiApp {
             )
         };
 
-        let status = Paragraph::new(status_text).style(
-            Style::default().fg(Color::White).bg(Color::DarkGray),
-        );
+        let status = Paragraph::new(status_text)
+            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
         frame.render_widget(status, area);
     }
 }
@@ -320,10 +297,7 @@ pub async fn run_tui(config: TuiConfig) -> Result<()> {
 }
 
 /// Inner event loop separated from terminal lifecycle for easier testing.
-fn run_loop(
-    app: &mut TuiApp,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> Result<()> {
+fn run_loop(app: &mut TuiApp, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     loop {
         app.render(terminal)?;
 

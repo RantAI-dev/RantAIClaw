@@ -69,8 +69,8 @@ pub mod sessions;
 pub(crate) mod skills;
 pub(crate) mod tasks;
 pub mod tools;
-pub(crate) mod tunnel;
 pub mod tui;
+pub(crate) mod tunnel;
 pub(crate) mod util;
 
 pub use config::Config;

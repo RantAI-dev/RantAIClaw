@@ -82,9 +82,7 @@ impl TuiContext {
     /// End the current session and start a fresh one, clearing in-memory state.
     pub fn clear_session(&mut self) -> Result<()> {
         self.session_store.end_session(&self.session_id)?;
-        let session = self
-            .session_store
-            .new_session(&self.model.clone(), "tui")?;
+        let session = self.session_store.new_session(&self.model.clone(), "tui")?;
         self.session_id = session.id;
         self.messages.clear();
         self.input_buffer.clear();
@@ -127,8 +125,7 @@ mod tests {
             .append_message(&Message::user(&session.id, "persisted"))
             .unwrap();
 
-        let ctx =
-            TuiContext::new(store, "test-model", Some(&session.id)).expect("context resume");
+        let ctx = TuiContext::new(store, "test-model", Some(&session.id)).expect("context resume");
 
         assert_eq!(ctx.messages.len(), 1);
         assert_eq!(ctx.messages[0].content, "persisted");
