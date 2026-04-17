@@ -4,6 +4,8 @@ mod app;
 mod commands;
 #[cfg(feature = "tui")]
 mod context;
+#[cfg(feature = "tui")]
+mod widgets;
 
 #[cfg(feature = "tui")]
 pub use app::run_tui;
