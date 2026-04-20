@@ -29,3 +29,9 @@ venv/
 *.pem
 credentials.json
 .worktrees/
+
+# Local Claude Code harness state
+.claude/
+
+# Agent implementation plans (scratchpad — not product docs)
+docs/superpowers/plans/
