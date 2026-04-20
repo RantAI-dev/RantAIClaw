@@ -133,7 +133,7 @@ mod tests {
         assert_eq!(ctx.messages.len(), 2);
         match result {
             CommandResult::Message(msg) => {
-                assert!(msg.contains("2"));
+                assert!(msg.contains('2'));
             }
             _ => panic!("Expected Message result"),
         }

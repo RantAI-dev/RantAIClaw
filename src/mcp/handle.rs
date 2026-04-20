@@ -27,6 +27,7 @@ pub struct McpHandle {
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
 impl McpHandle {
+    #[allow(clippy::unused_async)]
     pub async fn spawn(
         command: String,
         args: Vec<String>,
@@ -61,6 +62,7 @@ impl McpHandle {
         })
     }
 
+    #[allow(clippy::unused_async)]
     pub async fn respawn(&mut self) -> Result<()> {
         let process = Command::new(&self.command)
             .args(&self.args)
