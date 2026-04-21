@@ -15,6 +15,7 @@ use ratatui::{
     Terminal,
 };
 
+use super::async_bridge::TurnRequest;
 use super::commands::{CommandRegistry, CommandResult as CmdResult};
 use super::context::TuiContext;
 use super::TuiConfig;
@@ -64,8 +65,9 @@ impl TuiApp {
         let store = SessionStore::open(&db_path)?;
 
         // TODO(task-15): wire these channel ends to a real `TuiAgentActor`
-        // spawned from `run_tui`. Until then the TUI submit path does not
-        // reach a real agent; the placeholder in `submit_input` is retained.
+        // spawned from `run_tui`. `submit_input` already dispatches
+        // `TurnRequest`s on `req_tx`; until the actor is spawned, those
+        // requests will sit unread in the channel.
         let (req_tx, _req_rx) = tokio::sync::mpsc::channel(4);
         let (_events_tx, events_rx) = tokio::sync::mpsc::channel(32);
 
@@ -85,15 +87,15 @@ impl TuiApp {
     }
 
     /// Process a single terminal event, returning whether to continue or quit.
-    pub fn handle_event(&mut self, event: Event) -> Result<EventResult> {
+    pub async fn handle_event(&mut self, event: Event) -> Result<EventResult> {
         if let Event::Key(key) = event {
-            return self.handle_key(key);
+            return self.handle_key(key).await;
         }
         Ok(EventResult::Continue)
     }
 
     /// Dispatch a key event.
-    pub fn handle_key(&mut self, key: KeyEvent) -> Result<EventResult> {
+    pub async fn handle_key(&mut self, key: KeyEvent) -> Result<EventResult> {
         match key.code {
             // Ctrl+C or Ctrl+D → quit
             KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -102,7 +104,7 @@ impl TuiApp {
             }
             // Ctrl+Enter → submit
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.submit_input()?;
+                self.submit_input().await?;
             }
             // Plain Enter → newline in buffer
             KeyCode::Enter => {
@@ -130,25 +132,54 @@ impl TuiApp {
     }
 
     /// Submit the current input buffer as a message (or command).
-    pub fn submit_input(&mut self) -> Result<()> {
-        let input = self.context.input_buffer.trim().to_string();
-        self.context.input_buffer.clear();
-
-        if input.is_empty() {
+    ///
+    /// For slash-prefixed input, dispatches to the command registry.
+    /// For message input in `Ready` state, records the user turn, sends a
+    /// `TurnRequest::Submit` to the `TuiAgentActor` via the bridge, and
+    /// transitions to `Streaming`. For message input in `Streaming` state,
+    /// the request is still dispatched (the actor will queue it) and
+    /// `queued_turns` is incremented so the status bar reflects backlog.
+    pub async fn submit_input(&mut self) -> Result<()> {
+        let raw = std::mem::take(&mut self.context.input_buffer);
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
             return Ok(());
         }
 
-        if let Some(cmd) = input.strip_prefix('/') {
-            self.handle_command(cmd.trim())?;
-        } else {
-            self.context.append_user_message(&input)?;
-            // NOTE: actual provider call will be wired in a later task.
-            // For now, emit a placeholder acknowledgement.
-            self.context
-                .append_assistant_message("[provider not yet wired]")?;
+        // Slash-commands bypass the bridge entirely.
+        if let Some(cmd) = trimmed.strip_prefix('/') {
+            let cmd = cmd.trim().to_string();
+            self.handle_command(&cmd)?;
+            self.context.scroll_offset = 0;
+            return Ok(());
         }
 
-        // Reset scroll to bottom after new content
+        let text = trimmed.to_string();
+        self.context.append_user_message(&text)?;
+
+        // Dispatch to the actor. If the bridge is closed (e.g. actor has
+        // exited), surface a visible error but do not propagate — the TUI
+        // should remain responsive so the user can /quit cleanly.
+        if let Err(e) = self.context.req_tx.send(TurnRequest::Submit(text)).await {
+            self.context.last_error = Some(format!("agent bridge closed: {e}"));
+            self.context.scroll_offset = 0;
+            return Ok(());
+        }
+
+        match self.state {
+            AppState::Ready => {
+                self.state = AppState::Streaming {
+                    partial: String::new(),
+                    tool_blocks: Vec::new(),
+                    cancelling: false,
+                };
+            }
+            AppState::Streaming { .. } => {
+                self.context.queued_turns += 1;
+            }
+            AppState::Quitting => {}
+        }
+
         self.context.scroll_offset = 0;
         Ok(())
     }
@@ -307,7 +338,7 @@ pub async fn run_tui(config: TuiConfig) -> Result<()> {
     let mut app = TuiApp::new(&config)?;
     let mut terminal = setup_terminal()?;
 
-    let result = run_loop(&mut app, &mut terminal);
+    let result = run_loop(&mut app, &mut terminal).await;
 
     // Always restore terminal, even on error
     let restore_result = restore_terminal(&mut terminal);
@@ -320,13 +351,16 @@ pub async fn run_tui(config: TuiConfig) -> Result<()> {
 }
 
 /// Inner event loop separated from terminal lifecycle for easier testing.
-fn run_loop(app: &mut TuiApp, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+async fn run_loop(
+    app: &mut TuiApp,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<()> {
     loop {
         app.render(terminal)?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
             let ev = event::read()?;
-            match app.handle_event(ev)? {
+            match app.handle_event(ev).await? {
                 EventResult::Quit => break,
                 EventResult::Continue => {}
             }
@@ -366,34 +400,107 @@ mod tests {
         assert!(app.context.messages.is_empty());
     }
 
-    #[test]
-    fn app_handles_quit_command() {
+    #[tokio::test]
+    async fn app_handles_quit_command() {
         let store = SessionStore::in_memory().expect("store");
         let mut app = make_app_from_store(store, "test-model");
 
         app.context.input_buffer = "/quit".to_string();
-        app.submit_input().unwrap();
+        app.submit_input().await.unwrap();
 
         assert!(matches!(app.state, AppState::Quitting));
     }
 
-    #[test]
-    fn app_handles_new_command() {
+    #[tokio::test]
+    async fn app_handles_new_command() {
         let store = SessionStore::in_memory().expect("store");
         let mut app = make_app_from_store(store, "test-model");
 
         let first_session_id = app.context.session_id.clone();
 
-        // Add a message then clear
+        // A non-command submit now dispatches via the bridge and transitions
+        // the app to Streaming (no real actor in this test — the request
+        // simply sits in the channel). The user message is still appended
+        // locally, which is what this test originally covered.
         app.context.input_buffer = "hello".to_string();
-        app.submit_input().unwrap();
+        app.submit_input().await.unwrap();
         assert!(!app.context.messages.is_empty());
 
         app.context.input_buffer = "/new".to_string();
-        app.submit_input().unwrap();
+        app.submit_input().await.unwrap();
 
         assert!(app.context.messages.is_empty());
         assert_ne!(app.context.session_id, first_session_id);
+    }
+}
+
+#[cfg(test)]
+mod submit_tests {
+    use super::*;
+    use crate::tui::async_bridge::TurnRequest;
+    use crate::tui::context::TuiContext;
+
+    fn make_app_with_context(ctx: TuiContext) -> TuiApp {
+        TuiApp {
+            state: AppState::Ready,
+            context: ctx,
+            command_registry: CommandRegistry::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_input_ready_state_sends_request_and_transitions_to_streaming() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Ready;
+        app.context.input_buffer = "hello".into();
+
+        app.submit_input().await.unwrap();
+
+        assert!(matches!(app.state, AppState::Streaming { .. }));
+        assert_eq!(app.context.input_buffer, "");
+        let req = req_rx.recv().await.expect("request should have been sent");
+        match req {
+            TurnRequest::Submit(text) => assert_eq!(text, "hello"),
+            TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_input_streaming_state_queues_and_increments_counter() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Streaming {
+            partial: String::new(),
+            tool_blocks: vec![],
+            cancelling: false,
+        };
+        app.context.input_buffer = "queued".into();
+
+        app.submit_input().await.unwrap();
+
+        assert!(matches!(app.state, AppState::Streaming { .. }));
+        assert_eq!(app.context.queued_turns, 1);
+        let req = req_rx.recv().await.expect("request should have been sent");
+        match req {
+            TurnRequest::Submit(text) => assert_eq!(text, "queued"),
+            TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_input_empty_buffer_is_noop() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Ready;
+        app.context.input_buffer = "   ".into(); // whitespace only
+
+        app.submit_input().await.unwrap();
+
         assert!(matches!(app.state, AppState::Ready));
+        assert!(
+            req_rx.try_recv().is_err(),
+            "no request should have been sent for whitespace-only buffer"
+        );
     }
 }
