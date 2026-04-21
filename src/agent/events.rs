@@ -7,6 +7,9 @@ use crate::cost::TokenUsage;
 
 pub type AgentEventSender = tokio::sync::mpsc::Sender<AgentEvent>;
 
+// Serde derives intentionally omitted: these events flow through in-process
+// mpsc channels only. Add Serialize/Deserialize if a future caller needs to
+// log or persist them.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// Streaming text fragment from the provider. Multiple emitted per turn.
@@ -50,7 +53,7 @@ pub(crate) fn truncate_preview(s: &str) -> String {
     if s.len() <= TOOL_OUTPUT_PREVIEW_MAX {
         s.to_string()
     } else {
-        let mut out = String::with_capacity(TOOL_OUTPUT_PREVIEW_MAX + 1);
+        let mut out = String::with_capacity(TOOL_OUTPUT_PREVIEW_MAX + '…'.len_utf8());
         // char-boundary-safe truncation
         let mut end = TOOL_OUTPUT_PREVIEW_MAX;
         while !s.is_char_boundary(end) && end > 0 {
@@ -82,12 +85,33 @@ mod tests {
 
     #[test]
     fn tool_output_preview_respects_char_boundaries() {
-        // Emoji takes 4 bytes in UTF-8 — ensure we don't slice mid-codepoint.
+        // Place a 4-byte emoji (🦀) so that byte 500 falls inside it —
+        // forces truncate_preview to walk `end` back from 500 to the
+        // nearest valid char boundary.
         let mut s = String::new();
-        for _ in 0..TOOL_OUTPUT_PREVIEW_MAX { s.push('a'); }
-        s.push('🦀'); // 4 bytes
+        for _ in 0..497 { s.push('a'); }
+        s.push('🦀'); // 4 bytes: spans byte indices 497..501, so byte 500 is mid-codepoint
+        for _ in 0..100 { s.push('b'); } // ensure s.len() > TOOL_OUTPUT_PREVIEW_MAX
+        assert!(s.len() > TOOL_OUTPUT_PREVIEW_MAX);
+
         let out = truncate_preview(&s);
-        assert!(out.is_char_boundary(out.len() - '…'.len_utf8()));
+
+        // The output must end with the ellipsis AND the byte just before '…' must be
+        // a valid char boundary (the walk-back worked).
+        assert!(out.ends_with('…'));
+        let pre_ellipsis_end = out.len() - '…'.len_utf8();
+        assert!(out.is_char_boundary(pre_ellipsis_end));
+
+        // More importantly: the 🦀 must NOT appear truncated. Either it's fully
+        // present (walk-back kept boundary before byte 497) or fully absent
+        // (walk-back stopped exactly at byte 497). Never partial.
+        // The walk from 500 → 499 → 498 → 497 lands at 497, which is the start
+        // of 🦀. So the emoji is EXCLUDED from the truncated output.
+        assert!(!out.contains('🦀'),
+            "walk-back should have stopped at byte 497, excluding the mid-cut emoji");
+        // And the body before the emoji should be fully present.
+        let body_before_emoji: String = std::iter::repeat('a').take(497).collect();
+        assert!(out.starts_with(&body_before_emoji));
     }
 
     #[test]
