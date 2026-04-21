@@ -15,11 +15,14 @@ use ratatui::{
     Terminal,
 };
 
-use super::async_bridge::TurnRequest;
+use tokio::sync::mpsc;
+
+use super::async_bridge::{TuiAgentActor, TurnRequest};
 use super::commands::{CommandRegistry, CommandResult as CmdResult};
 use super::context::{TokenUsage, TuiContext};
 use super::TuiConfig;
-use crate::agent::events::AgentEvent;
+use crate::agent::agent::Agent;
+use crate::agent::events::{AgentEvent, AgentEventSender};
 use crate::sessions::SessionStore;
 
 /// Per-tool-call accumulation state used while streaming.
@@ -60,17 +63,18 @@ pub struct TuiApp {
 
 impl TuiApp {
     /// Create a new `TuiApp`, starting or resuming a session based on config.
-    pub fn new(config: &TuiConfig) -> Result<Self> {
+    ///
+    /// `req_tx` and `events_rx` are the TUI-side ends of the bridge to the
+    /// `TuiAgentActor`. The actor owns the paired `req_rx`/`events_tx` and is
+    /// spawned by `run_tui` before the app is constructed.
+    pub fn new(
+        config: &TuiConfig,
+        req_tx: mpsc::Sender<TurnRequest>,
+        events_rx: mpsc::Receiver<AgentEvent>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)?;
         let db_path = config.data_dir.join("sessions.db");
         let store = SessionStore::open(&db_path)?;
-
-        // TODO(task-15): wire these channel ends to a real `TuiAgentActor`
-        // spawned from `run_tui`. `submit_input` already dispatches
-        // `TurnRequest`s on `req_tx`; until the actor is spawned, those
-        // requests will sit unread in the channel.
-        let (req_tx, _req_rx) = tokio::sync::mpsc::channel(4);
-        let (_events_tx, events_rx) = tokio::sync::mpsc::channel(32);
 
         let context = TuiContext::new(
             store,
@@ -472,21 +476,53 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
     Ok(())
 }
 
-/// Entry point for the TUI: guards TTY, runs the event loop.
-pub async fn run_tui(config: TuiConfig) -> Result<()> {
+/// Entry point for the TUI: guards TTY, builds the `Agent` + actor bridge,
+/// runs the event loop, then shuts the actor down cleanly.
+///
+/// The TUI talks to the `Agent` exclusively through an mpsc bridge:
+///   * `req_tx`/`req_rx` — TUI -> actor (`TurnRequest::Submit`/`Cancel`)
+///   * `events_tx`/`events_rx` — actor -> TUI (`AgentEvent` stream)
+///
+/// Config is loaded here (rather than passed in) to avoid the binary/library
+/// `Config` duplication that results from the bin+lib sharing `src/config/`.
+/// `Agent::from_config` lives in the library crate, so it must receive the
+/// library-side `Config`, which we obtain via the library's own loader.
+///
+/// On exit we drop the `TuiApp` (which releases `req_tx`), giving the actor
+/// `None` from `req_rx.recv()` so it can finish its current turn and return.
+/// A bounded timeout avoids hanging shutdown if the actor is stuck.
+pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("TUI requires an interactive terminal (stdin is not a TTY)");
     }
 
-    let mut app = TuiApp::new(&config)?;
+    let mut app_config = crate::config::Config::load_or_init().await?;
+    app_config.apply_env_overrides();
+
+    let agent = Agent::from_config(&app_config)?;
+
+    // Channel capacities are intentionally small on the request side (user
+    // input is human-paced) and larger on the event side (streaming chunks
+    // burst quickly per turn).
+    let (req_tx, req_rx) = mpsc::channel::<TurnRequest>(16);
+    let (events_tx, events_rx): (AgentEventSender, mpsc::Receiver<AgentEvent>) = mpsc::channel(128);
+
+    let actor = TuiAgentActor::new(agent, req_rx, events_tx);
+    let actor_handle = tokio::spawn(actor.run());
+
+    let mut app = TuiApp::new(&tui_config, req_tx, events_rx)?;
     let mut terminal = setup_terminal()?;
 
     let result = run_loop(&mut app, &mut terminal).await;
 
-    // Always restore terminal, even on error
+    // Always restore terminal, even on error.
     let restore_result = restore_terminal(&mut terminal);
 
-    // Surface the loop error first, then the restore error
+    // Drop the app so the actor's req_rx sees all senders gone and exits.
+    drop(app);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), actor_handle).await;
+
+    // Surface the loop error first, then the restore error.
     result?;
     restore_result?;
 
@@ -527,6 +563,9 @@ mod tests {
     use crate::tui::context::TuiContext;
 
     fn make_app_from_store(store: SessionStore, model: &str) -> TuiApp {
+        // Tests that hit this helper do not exercise the bridge; the request
+        // receiver and events sender are held locally so the TUI-side ends
+        // stay valid for the duration of the test.
         let (req_tx, _req_rx) = tokio::sync::mpsc::channel(4);
         let (_events_tx, events_rx) = tokio::sync::mpsc::channel(32);
         let ctx = TuiContext::new(store, model, None, req_tx, events_rx).expect("context");

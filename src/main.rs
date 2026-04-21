@@ -749,9 +749,8 @@ async fn main() -> Result<()> {
     }
 
     // No subcommand: launch TUI (bare invocation).
-    // TODO: read default model from user config once config loading is cheap before TUI init.
-    // Currently, TuiConfig::default() uses the hardcoded fallback model; the Chat branch below
-    // reads the model from CLI flags and overrides it via tui_config.model.
+    // `run_tui` loads its own `Config` internally — see `run_tui` docs for
+    // why (bin+lib Config type duplication).
     if cli.command.is_none() {
         #[cfg(feature = "tui")]
         {
