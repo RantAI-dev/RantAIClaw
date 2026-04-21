@@ -1067,7 +1067,16 @@ async fn execute_one_tool(
     let tool_future = tool.execute(call_arguments);
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
-            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+            () = token.cancelled() => {
+                if let Some(ref tx) = events {
+                    let _ = tx.send(AgentEvent::ToolCallEnd {
+                        id: call_id.clone(),
+                        ok: false,
+                        output_preview: "[cancelled]".into(),
+                    }).await;
+                }
+                return Err(ToolLoopCancelled.into());
+            }
             result = tool_future => result,
         }
     } else {
@@ -1148,9 +1157,8 @@ async fn execute_tools_parallel(
 ) -> Result<Vec<String>> {
     let futures: Vec<_> = tool_calls
         .iter()
-        .enumerate()
-        .map(|(idx, call)| {
-            let call_id = format!("call-{idx}");
+        .map(|call| {
+            let call_id = Uuid::new_v4().to_string();
             // Clone the sender so each future owns its copy (Sender is cheap to clone).
             let events_for_call = events.cloned();
             execute_one_tool(
@@ -1180,8 +1188,8 @@ async fn execute_tools_sequential(
 ) -> Result<Vec<String>> {
     let mut individual_results: Vec<String> = Vec::with_capacity(tool_calls.len());
 
-    for (idx, call) in tool_calls.iter().enumerate() {
-        let call_id = format!("call-{idx}");
+    for call in tool_calls.iter() {
+        let call_id = Uuid::new_v4().to_string();
 
         if let Some(mgr) = approval {
             if mgr.needs_approval(&call.name) {
@@ -1199,6 +1207,19 @@ async fn execute_tools_sequential(
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
 
                 if decision == ApprovalResponse::No {
+                    if let Some(ref tx) = events {
+                        let denial_id = Uuid::new_v4().to_string();
+                        let _ = tx.send(AgentEvent::ToolCallStart {
+                            id: denial_id.clone(),
+                            name: call.name.clone(),
+                            args: call.arguments.clone(),
+                        }).await;
+                        let _ = tx.send(AgentEvent::ToolCallEnd {
+                            id: denial_id,
+                            ok: false,
+                            output_preview: "[denied by user]".into(),
+                        }).await;
+                    }
                     let msg = if channel_name == "cli" {
                         "Denied by user.".to_string()
                     } else {
@@ -3905,15 +3926,19 @@ Let me check the result."#;
 
         let mut saw_start = false;
         let mut saw_end = false;
+        let mut start_id = String::new();
+        let mut end_id = String::new();
         while let Ok(ev) = events_rx.try_recv() {
             match ev {
-                crate::agent::events::AgentEvent::ToolCallStart { name, .. } => {
+                crate::agent::events::AgentEvent::ToolCallStart { id, name, .. } => {
                     assert_eq!(name, "echo");
                     saw_start = true;
+                    start_id = id;
                 }
-                crate::agent::events::AgentEvent::ToolCallEnd { ok, .. } => {
+                crate::agent::events::AgentEvent::ToolCallEnd { id, ok, .. } => {
                     assert!(ok, "echo tool should succeed");
                     saw_end = true;
+                    end_id = id;
                 }
                 _ => {}
             }
@@ -3922,5 +3947,89 @@ Let me check the result."#;
             saw_start && saw_end,
             "expected both ToolCallStart and ToolCallEnd events"
         );
+        assert!(
+            !start_id.is_empty() && start_id == end_id,
+            "Start and End must share id"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_cancellation_mid_tool_emits_paired_start_end() {
+        // A tool that sleeps 200ms — long enough for cancel to fire.
+        struct SlowTool;
+        #[async_trait]
+        impl Tool for SlowTool {
+            fn name(&self) -> &str {
+                "slow"
+            }
+            fn description(&self) -> &str {
+                "sleeps"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "done".into(),
+                    error: None,
+                })
+            }
+        }
+
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>{"name":"slow","arguments":{}}</tool_call>"#,
+        ]);
+        let mut history = vec![ChatMessage::user("call slow")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(SlowTool)];
+        let observer = NoopObserver;
+        let (events_tx, mut events_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::events::AgentEvent>(32);
+        let multimodal = crate::config::MultimodalConfig::default();
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let token_for_spawn = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token_for_spawn.cancel();
+        });
+
+        let res = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            &multimodal,
+            5,
+            Some(token),
+            None,
+            Some(events_tx),
+        )
+        .await;
+        assert!(res.is_err(), "expected cancellation error");
+
+        // Collect events; verify one Start with one matching End.
+        let mut starts: Vec<String> = Vec::new();
+        let mut ends: Vec<String> = Vec::new();
+        while let Ok(ev) = events_rx.try_recv() {
+            match ev {
+                crate::agent::events::AgentEvent::ToolCallStart { id, .. } => starts.push(id),
+                crate::agent::events::AgentEvent::ToolCallEnd { id, .. } => ends.push(id),
+                _ => {}
+            }
+        }
+        assert_eq!(starts.len(), 1);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(starts[0], ends[0], "End must correlate to Start by id");
     }
 }
