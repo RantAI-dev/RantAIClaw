@@ -125,14 +125,22 @@ impl Agent {
 
 No other callers (Telegram, Discord, Slack, gateway) change. `turn()` keeps the same signature and behavior.
 
-Internally, `turn_streaming` calls an extended `run_tool_call_loop` that accepts a new `events: Option<mpsc::Sender<AgentEvent>>` argument. The loop emits:
+Internally, `turn_streaming` calls an extended `run_tool_call_loop` that accepts a new `events: Option<mpsc::Sender<AgentEvent>>` argument **in addition to** the existing `on_delta: Option<mpsc::Sender<String>>` argument. Both remain; they serve different callers:
 
-- `Chunk` whenever the existing `on_delta` path would have sent text (just reshaped).
+- When `events` is `Some` (TUI path): the loop emits `Chunk` / `ToolCallStart` / `ToolCallEnd` / `Usage` on the `events` channel. The `on_delta` argument, if also provided, is ignored in this path to avoid duplicate chunks.
+- When `events` is `None` and `on_delta` is `Some` (existing channel path, e.g. Telegram draft updates): behavior is unchanged — text deltas flow through `on_delta`, no structured events.
+- When both are `None`: no streaming, matching current `Agent::turn()` behavior.
+
+The loop emits:
+
+- `Chunk` at each provider text delta (same emission point as `on_delta`, different type).
 - `ToolCallStart` immediately before executing a tool call (inside the parallel tool-call batch).
 - `ToolCallEnd` immediately after each call finishes, with a truncated preview.
 - `Usage` after the provider returns the final non-tool response.
 
 `Done` and `Error` are emitted by `turn_streaming` itself (not the loop), so the loop stays focused on LLM + tool mechanics.
+
+No existing channel caller changes: Telegram keeps its `on_delta`-based draft updater; the loop's new `events` parameter is `None` on the channel path.
 
 ---
 
