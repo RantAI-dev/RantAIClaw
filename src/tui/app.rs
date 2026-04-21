@@ -98,10 +98,29 @@ impl TuiApp {
     /// Dispatch a key event.
     pub async fn handle_key(&mut self, key: KeyEvent) -> Result<EventResult> {
         match key.code {
-            // Ctrl+C or Ctrl+D → quit
-            KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+D → always quit
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state = AppState::Quitting;
                 return Ok(EventResult::Quit);
+            }
+            // Ctrl+C → cancel streaming turn if active; otherwise quit
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match &mut self.state {
+                    AppState::Streaming { cancelling, .. } => {
+                        *cancelling = true;
+                        if let Err(e) = self.context.req_tx.send(TurnRequest::Cancel).await {
+                            // Bridge closed — fall through to quit.
+                            self.context.last_error = Some(format!("cancel failed: {e}"));
+                            self.state = AppState::Quitting;
+                            return Ok(EventResult::Quit);
+                        }
+                        return Ok(EventResult::Continue);
+                    }
+                    AppState::Ready | AppState::Quitting => {
+                        self.state = AppState::Quitting;
+                        return Ok(EventResult::Quit);
+                    }
+                }
             }
             // Ctrl+Enter → submit
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -630,6 +649,62 @@ mod submit_tests {
             req_rx.try_recv().is_err(),
             "no request should have been sent for whitespace-only buffer"
         );
+    }
+}
+
+#[cfg(test)]
+mod ctrl_c_tests {
+    use super::*;
+    use crate::tui::async_bridge::TurnRequest;
+    use crate::tui::context::TuiContext;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn make_app_with_context(ctx: TuiContext) -> TuiApp {
+        TuiApp {
+            state: AppState::Ready,
+            context: ctx,
+            command_registry: CommandRegistry::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_in_streaming_sends_cancel_and_sets_cancelling_flag() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Streaming {
+            partial: String::new(),
+            tool_blocks: vec![],
+            cancelling: false,
+        };
+
+        let result = app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert_eq!(result, EventResult::Continue);
+        let got = req_rx.recv().await.unwrap();
+        assert!(matches!(got, TurnRequest::Cancel));
+        if let AppState::Streaming { cancelling, .. } = &app.state {
+            assert!(*cancelling);
+        } else {
+            panic!("state should remain Streaming during cancel");
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_in_ready_state_transitions_to_quitting() {
+        let (ctx, mut _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Ready;
+
+        let result = app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert_eq!(result, EventResult::Quit);
+        assert!(matches!(app.state, AppState::Quitting));
     }
 }
 
