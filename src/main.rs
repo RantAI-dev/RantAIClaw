@@ -56,6 +56,7 @@ mod rag {
     pub use rantaiclaw::rag::*;
 }
 mod config;
+mod cost;
 mod cron;
 mod daemon;
 mod doctor;
