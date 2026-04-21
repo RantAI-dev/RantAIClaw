@@ -1198,7 +1198,6 @@ pub(crate) async fn run_tool_call_loop(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     events: Option<AgentEventSender>,
 ) -> Result<String> {
-    let _ = events; // noop — threaded through for future tasks
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -1332,9 +1331,11 @@ pub(crate) async fn run_tool_call_loop(
             // No tool calls — this is the final response.
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
-            if let Some(ref tx) = on_delta {
+            if events.is_some() || on_delta.is_some() {
                 // Split on whitespace boundaries, accumulating chunks of at least
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
+                // When `events` is Some, emit AgentEvent::Chunk and ignore `on_delta`
+                // to avoid duplicate delivery.
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
                     if cancellation_token
@@ -1344,14 +1345,31 @@ pub(crate) async fn run_tool_call_loop(
                         return Err(ToolLoopCancelled.into());
                     }
                     chunk.push_str(word);
-                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS
-                        && tx.send(std::mem::take(&mut chunk)).await.is_err()
-                    {
-                        break; // receiver dropped
+                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS {
+                        let piece = std::mem::take(&mut chunk);
+                        if let Some(ref tx) = events {
+                            if tx
+                                .send(crate::agent::events::AgentEvent::Chunk(piece))
+                                .await
+                                .is_err()
+                            {
+                                break; // receiver dropped
+                            }
+                        } else if let Some(ref tx) = on_delta {
+                            if tx.send(piece).await.is_err() {
+                                break; // receiver dropped
+                            }
+                        }
                     }
                 }
                 if !chunk.is_empty() {
-                    let _ = tx.send(chunk).await;
+                    if let Some(ref tx) = events {
+                        let _ = tx
+                            .send(crate::agent::events::AgentEvent::Chunk(chunk))
+                            .await;
+                    } else if let Some(ref tx) = on_delta {
+                        let _ = tx.send(chunk).await;
+                    }
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
@@ -3682,5 +3700,50 @@ Let me check the result."#;
             system_prompt.contains("## Your Task"),
             "Native prompt should contain task instructions"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_emits_chunk_events_when_events_some() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            "hello world this is a streamed response",
+        ]);
+        let mut history = vec![ChatMessage::user("hi")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let observer = NoopObserver;
+        let (events_tx, mut events_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::events::AgentEvent>(32);
+
+        let multimodal = crate::config::MultimodalConfig::default();
+        let _ = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            &multimodal,
+            5,
+            None,
+            None,            // on_delta: None
+            Some(events_tx), // events: Some
+        )
+        .await
+        .expect("loop succeeds");
+
+        // Drain the receiver; expect at least one Chunk event.
+        let mut chunks = Vec::new();
+        while let Ok(ev) = events_rx.try_recv() {
+            if let crate::agent::events::AgentEvent::Chunk(s) = ev {
+                chunks.push(s);
+            }
+        }
+        assert!(!chunks.is_empty(), "expected ≥1 Chunk event");
+        let combined: String = chunks.join("");
+        assert!(combined.contains("hello"));
+        assert!(combined.contains("streamed"));
     }
 }
