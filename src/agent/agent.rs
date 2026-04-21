@@ -1,9 +1,11 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use crate::agent::events::{truncate_preview, AgentEvent, AgentEventSender, TurnResult};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
+use crate::cost::TokenUsage;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
@@ -14,6 +16,8 @@ use anyhow::Result;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -215,6 +219,15 @@ impl AgentBuilder {
             available_hints: self.available_hints.unwrap_or_default(),
         })
     }
+}
+
+/// Placeholder `TokenUsage` for turns that do not yet track real usage.
+///
+/// `Agent::turn_streaming` must emit a `Usage` event before `Done`. Until the
+/// inline loop wires real token accounting from provider responses this helper
+/// produces a zero-valued record scoped to the effective model name.
+fn empty_usage(model: &str) -> TokenUsage {
+    TokenUsage::new(model.to_string(), 0, 0, 0.0, 0.0)
 }
 
 impl Agent {
@@ -435,6 +448,69 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        self.turn_streaming(user_message, None, None)
+            .await
+            .map(|r| r.text)
+    }
+
+    /// Execute a single agent turn with optional structured event streaming and
+    /// cancellation support.
+    ///
+    /// Event ordering invariants (when `events` is `Some`):
+    ///   * `Chunk` events (if any) precede `Usage`.
+    ///   * On success: `Usage` immediately precedes `Done { cancelled: false }`.
+    ///   * On error: `Error(msg)` precedes `Done { cancelled: false, final_text: "" }`.
+    ///   * On cancellation: `Done { cancelled: true }` fires with whatever
+    ///     partial text has been produced.
+    ///   * `Done` fires exactly once per call.
+    ///
+    /// History is preserved across early-exit paths — any tool results or
+    /// partial assistant text already appended remain intact.
+    pub async fn turn_streaming(
+        &mut self,
+        user_message: &str,
+        events: Option<AgentEventSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<TurnResult> {
+        let result = self
+            .turn_inner(user_message, events.as_ref(), cancel.as_ref())
+            .await;
+
+        // Emit terminal events exactly once, regardless of outcome.
+        match &result {
+            Ok(tr) => {
+                if let Some(tx) = events.as_ref() {
+                    let _ = tx.send(AgentEvent::Usage(tr.usage.clone())).await;
+                    let _ = tx
+                        .send(AgentEvent::Done {
+                            final_text: tr.text.clone(),
+                            cancelled: tr.cancelled,
+                        })
+                        .await;
+                }
+            }
+            Err(err) => {
+                if let Some(tx) = events.as_ref() {
+                    let _ = tx.send(AgentEvent::Error(err.to_string())).await;
+                    let _ = tx
+                        .send(AgentEvent::Done {
+                            final_text: String::new(),
+                            cancelled: false,
+                        })
+                        .await;
+                }
+            }
+        }
+
+        result
+    }
+
+    async fn turn_inner(
+        &mut self,
+        user_message: &str,
+        events: Option<&AgentEventSender>,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<TurnResult> {
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -468,25 +544,41 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         for _ in 0..self.config.max_tool_iterations {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(TurnResult {
+                    text: String::new(),
+                    usage: empty_usage(&effective_model),
+                    cancelled: true,
+                });
+            }
+
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let response = match self
-                .provider
-                .chat(
-                    ChatRequest {
-                        messages: &messages,
-                        tools: if self.tool_dispatcher.should_send_tool_specs() {
-                            Some(&self.tool_specs)
-                        } else {
-                            None
-                        },
+            let chat_future = self.provider.chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: if self.tool_dispatcher.should_send_tool_specs() {
+                        Some(&self.tool_specs)
+                    } else {
+                        None
                     },
-                    &effective_model,
-                    self.temperature,
-                )
-                .await
-            {
-                Ok(resp) => resp,
-                Err(err) => return Err(err),
+                },
+                &effective_model,
+                self.temperature,
+            );
+
+            let response = if let Some(token) = cancel {
+                tokio::select! {
+                    () = token.cancelled() => {
+                        return Ok(TurnResult {
+                            text: String::new(),
+                            usage: empty_usage(&effective_model),
+                            cancelled: true,
+                        });
+                    }
+                    result = chat_future => result?,
+                }
+            } else {
+                chat_future.await?
             };
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
@@ -497,13 +589,26 @@ impl Agent {
                     text
                 };
 
+                // Emit final text as a single chunk when an events channel is
+                // provided. The inline loop does not stream mid-response, so
+                // one chunk per turn is the honest representation.
+                if let Some(tx) = events {
+                    if !final_text.is_empty() {
+                        let _ = tx.send(AgentEvent::Chunk(final_text.clone())).await;
+                    }
+                }
+
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
                     )));
                 self.trim_history();
 
-                return Ok(final_text);
+                return Ok(TurnResult {
+                    text: final_text,
+                    usage: empty_usage(&effective_model),
+                    cancelled: false,
+                });
             }
 
             if !text.is_empty() {
@@ -511,8 +616,12 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         text.clone(),
                     )));
-                print!("{text}");
-                let _ = std::io::stdout().flush();
+                if events.is_none() {
+                    // Preserve CLI streaming behavior only when no structured
+                    // events consumer is attached.
+                    print!("{text}");
+                    let _ = std::io::stdout().flush();
+                }
             }
 
             self.history.push(ConversationMessage::AssistantToolCalls {
@@ -520,7 +629,18 @@ impl Agent {
                 tool_calls: response.tool_calls.clone(),
             });
 
-            let results = self.execute_tools(&calls).await;
+            let results = self.execute_tools_with_events(&calls, events, cancel).await;
+            let results = match results {
+                Ok(r) => r,
+                Err(cancelled) if cancelled => {
+                    return Ok(TurnResult {
+                        text: String::new(),
+                        usage: empty_usage(&effective_model),
+                        cancelled: true,
+                    });
+                }
+                Err(_) => unreachable!("execute_tools_with_events only fails on cancellation"),
+            };
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
@@ -530,6 +650,58 @@ impl Agent {
             "Agent exceeded maximum tool iterations ({})",
             self.config.max_tool_iterations
         )
+    }
+
+    /// Execute tool calls while emitting `ToolCallStart`/`ToolCallEnd` events
+    /// when a consumer is attached. Returns `Err(true)` if cancelled between
+    /// tool dispatches.
+    async fn execute_tools_with_events(
+        &self,
+        calls: &[ParsedToolCall],
+        events: Option<&AgentEventSender>,
+        cancel: Option<&CancellationToken>,
+    ) -> std::result::Result<Vec<ToolExecutionResult>, bool> {
+        // Fast path: no events consumer means we can reuse the existing
+        // batch execution (potentially parallel) without per-call bookkeeping.
+        if events.is_none() {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Err(true);
+            }
+            return Ok(self.execute_tools(calls).await);
+        }
+
+        // Events path: emit Start/End per call. Run sequentially so event
+        // ordering matches observer ordering; a consumer can still interleave
+        // UI updates in real time.
+        let tx = events.expect("events is Some on this branch");
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Err(true);
+            }
+
+            let id = Uuid::new_v4().to_string();
+            let _ = tx
+                .send(AgentEvent::ToolCallStart {
+                    id: id.clone(),
+                    name: call.name.clone(),
+                    args: call.arguments.clone(),
+                })
+                .await;
+
+            let result = self.execute_tool_call(call).await;
+
+            let _ = tx
+                .send(AgentEvent::ToolCallEnd {
+                    id,
+                    ok: result.success,
+                    output_preview: truncate_preview(&result.output),
+                })
+                .await;
+
+            results.push(result);
+        }
+        Ok(results)
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
@@ -764,5 +936,81 @@ mod tests {
             .history()
             .iter()
             .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
+    }
+
+    /// Build a minimal `Agent` whose mock provider returns a single text
+    /// response with the given body. Shared by the streaming/delegation tests.
+    fn build_test_agent(text: &str) -> Agent {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![crate::providers::ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: vec![],
+            }]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    #[tokio::test]
+    async fn turn_streaming_emits_done_with_final_text() {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        let mut agent = build_test_agent("hello");
+
+        let result = agent
+            .turn_streaming("hi", Some(events_tx), None)
+            .await
+            .unwrap();
+        assert_eq!(result.text, "hello");
+        assert!(!result.cancelled);
+
+        // Drop the sender implicitly by letting it go out of scope — it was
+        // moved into `turn_streaming` and released on return. Drain the rx
+        // with try_recv until empty.
+        let mut saw_done = false;
+        let mut saw_usage_before_done = false;
+        let mut saw_usage = false;
+        while let Ok(ev) = events_rx.try_recv() {
+            match ev {
+                AgentEvent::Usage(_) => saw_usage = true,
+                AgentEvent::Done {
+                    final_text,
+                    cancelled,
+                } => {
+                    assert_eq!(final_text, "hello");
+                    assert!(!cancelled);
+                    assert!(!saw_done, "Done must fire exactly once");
+                    saw_usage_before_done = saw_usage;
+                    saw_done = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_done, "expected Done event");
+        assert!(saw_usage_before_done, "Usage must precede Done on success");
+    }
+
+    #[tokio::test]
+    async fn turn_delegates_to_turn_streaming() {
+        let mut agent = build_test_agent("delegated");
+        let text = agent.turn("hi").await.unwrap();
+        assert_eq!(text, "delegated");
     }
 }
