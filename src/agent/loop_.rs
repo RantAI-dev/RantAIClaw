@@ -1462,6 +1462,10 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
+            if let Some(ref tx) = events {
+                let usage = crate::cost::TokenUsage::new(model, 0, 0, 0.0, 0.0);
+                let _ = tx.send(AgentEvent::Usage(usage)).await;
+            }
             return Ok(display_text);
         }
 
@@ -4031,5 +4035,33 @@ Let me check the result."#;
         assert_eq!(starts.len(), 1);
         assert_eq!(ends.len(), 1);
         assert_eq!(starts[0], ends[0], "End must correlate to Start by id");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Task 5: Usage event emission before loop returns
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_tool_call_loop_emits_usage_event_before_returning() {
+        let provider = ScriptedProvider::from_text_responses(vec!["done"]);
+        let mut history = vec![ChatMessage::user("hi")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let observer = crate::observability::NoopObserver;
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        let multimodal = crate::config::MultimodalConfig::default();
+
+        run_tool_call_loop(
+            &provider, &mut history, &tools_registry, &observer,
+            "mock-provider", "mock-model", 0.0, true, None, "test",
+            &multimodal, 5, None, None, Some(events_tx),
+        ).await.unwrap();
+
+        let mut usage_seen = false;
+        while let Ok(ev) = events_rx.try_recv() {
+            if let crate::agent::events::AgentEvent::Usage(_) = ev {
+                usage_seen = true;
+            }
+        }
+        assert!(usage_seen, "expected Usage event before loop returned");
     }
 }
