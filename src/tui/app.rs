@@ -48,7 +48,19 @@ impl TuiApp {
         let db_path = config.data_dir.join("sessions.db");
         let store = SessionStore::open(&db_path)?;
 
-        let context = TuiContext::new(store, &config.model, config.resume_session.as_deref())?;
+        // TODO(task-15): wire these channel ends to a real `TuiAgentActor`
+        // spawned from `run_tui`. Until then the TUI submit path does not
+        // reach a real agent; the placeholder in `submit_input` is retained.
+        let (req_tx, _req_rx) = tokio::sync::mpsc::channel(4);
+        let (_events_tx, events_rx) = tokio::sync::mpsc::channel(32);
+
+        let context = TuiContext::new(
+            store,
+            &config.model,
+            config.resume_session.as_deref(),
+            req_tx,
+            events_rx,
+        )?;
 
         Ok(Self {
             state: AppState::Chatting,
@@ -319,7 +331,9 @@ mod tests {
     use crate::tui::context::TuiContext;
 
     fn make_app_from_store(store: SessionStore, model: &str) -> TuiApp {
-        let ctx = TuiContext::new(store, model, None).expect("context");
+        let (req_tx, _req_rx) = tokio::sync::mpsc::channel(4);
+        let (_events_tx, events_rx) = tokio::sync::mpsc::channel(32);
+        let ctx = TuiContext::new(store, model, None, req_tx, events_rx).expect("context");
         TuiApp {
             state: AppState::Chatting,
             context: ctx,

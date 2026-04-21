@@ -1,6 +1,9 @@
 use anyhow::Result;
+use tokio::sync::mpsc;
 
+use crate::agent::events::AgentEvent;
 use crate::sessions::{Message, SessionStore};
+use crate::tui::async_bridge::TurnRequest;
 
 /// Accumulated token usage for the current TUI session.
 #[derive(Debug, Clone, Default)]
@@ -21,6 +24,13 @@ pub struct TuiContext {
     pub token_usage: TokenUsage,
     pub last_error: Option<String>,
     pub debug_mode: bool,
+    /// Outbound channel to the `TuiAgentActor` for submitting turn requests.
+    pub req_tx: mpsc::Sender<TurnRequest>,
+    /// Inbound channel from the `TuiAgentActor` for draining agent events.
+    pub events_rx: mpsc::Receiver<AgentEvent>,
+    /// Number of turn requests currently queued at the actor (submitted but
+    /// not yet completed). Incremented on submit, decremented on `Done`.
+    pub queued_turns: usize,
 }
 
 impl TuiContext {
@@ -32,6 +42,8 @@ impl TuiContext {
         session_store: SessionStore,
         model: &str,
         resume_session: Option<&str>,
+        req_tx: mpsc::Sender<TurnRequest>,
+        events_rx: mpsc::Receiver<AgentEvent>,
     ) -> Result<Self> {
         let (session_id, messages) = match resume_session {
             Some(id) => {
@@ -54,7 +66,27 @@ impl TuiContext {
             token_usage: TokenUsage::default(),
             last_error: None,
             debug_mode: false,
+            req_tx,
+            events_rx,
+            queued_turns: 0,
         })
+    }
+
+    /// Build a `TuiContext` suitable for unit tests, returning the peer ends
+    /// of the bridge channels so tests can assert on what the TUI sends and
+    /// feed simulated agent events back in.
+    #[cfg(test)]
+    pub fn test_context() -> (
+        TuiContext,
+        mpsc::Receiver<TurnRequest>,
+        mpsc::Sender<AgentEvent>,
+    ) {
+        let store = SessionStore::in_memory().expect("in-memory session store");
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let (events_tx, events_rx) = mpsc::channel(32);
+        let ctx = TuiContext::new(store, "mock-model", None, req_tx, events_rx)
+            .expect("test context creation");
+        (ctx, req_rx, events_tx)
     }
 
     /// Append a user message to the in-memory list and persist it.
@@ -99,7 +131,9 @@ mod tests {
 
     fn in_memory_context(model: &str) -> TuiContext {
         let store = SessionStore::in_memory().expect("in-memory store");
-        TuiContext::new(store, model, None).expect("context creation")
+        let (req_tx, _req_rx) = mpsc::channel(4);
+        let (_events_tx, events_rx) = mpsc::channel(32);
+        TuiContext::new(store, model, None, req_tx, events_rx).expect("context creation")
     }
 
     #[test]
@@ -125,10 +159,32 @@ mod tests {
             .append_message(&Message::user(&session.id, "persisted"))
             .unwrap();
 
-        let ctx = TuiContext::new(store, "test-model", Some(&session.id)).expect("context resume");
+        let (req_tx, _req_rx) = mpsc::channel(4);
+        let (_events_tx, events_rx) = mpsc::channel(32);
+        let ctx = TuiContext::new(store, "test-model", Some(&session.id), req_tx, events_rx)
+            .expect("context resume");
 
         assert_eq!(ctx.messages.len(), 1);
         assert_eq!(ctx.messages[0].content, "persisted");
         assert_eq!(ctx.session_id, session.id);
+    }
+
+    #[test]
+    fn test_context_helper_wires_peer_channel_ends() {
+        let (ctx, mut req_rx, events_tx) = TuiContext::test_context();
+        assert_eq!(ctx.queued_turns, 0);
+        assert_eq!(ctx.model, "mock-model");
+        // Peer ends are live: sending through the ctx reaches the test receiver,
+        // and sending via the test sender reaches the ctx's events receiver.
+        ctx.req_tx
+            .try_send(TurnRequest::Submit("ping".into()))
+            .expect("req channel open");
+        match req_rx.try_recv().expect("req received") {
+            TurnRequest::Submit(s) => assert_eq!(s, "ping"),
+            TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
+        }
+        events_tx
+            .try_send(AgentEvent::Chunk("ok".into()))
+            .expect("events channel open");
     }
 }
