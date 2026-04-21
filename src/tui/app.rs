@@ -17,8 +17,9 @@ use ratatui::{
 
 use super::async_bridge::TurnRequest;
 use super::commands::{CommandRegistry, CommandResult as CmdResult};
-use super::context::TuiContext;
+use super::context::{TokenUsage, TuiContext};
 use super::TuiConfig;
+use crate::agent::events::AgentEvent;
 use crate::sessions::SessionStore;
 
 /// Per-tool-call accumulation state used while streaming.
@@ -182,6 +183,129 @@ impl TuiApp {
 
         self.context.scroll_offset = 0;
         Ok(())
+    }
+
+    /// Drain any queued `AgentEvent`s from the bridge without blocking.
+    ///
+    /// Called once per frame by the render loop, before rendering, so that
+    /// state transitions (Chunk, ToolCall*, Usage, Done, Error) are reflected
+    /// in the next paint. Uses `try_recv` to remain non-blocking on an empty
+    /// channel; a closed channel is treated the same as empty here — the
+    /// actor lifecycle is separately managed by `run_tui`.
+    pub fn drain_events(&mut self) {
+        while let Ok(ev) = self.context.events_rx.try_recv() {
+            self.handle_agent_event(ev);
+        }
+    }
+
+    /// Apply a single `AgentEvent` to the app state.
+    fn handle_agent_event(&mut self, ev: AgentEvent) {
+        match ev {
+            AgentEvent::Chunk(s) => {
+                if let AppState::Streaming { partial, .. } = &mut self.state {
+                    partial.push_str(&s);
+                }
+            }
+            AgentEvent::ToolCallStart { id, name, args } => {
+                if let AppState::Streaming { tool_blocks, .. } = &mut self.state {
+                    tool_blocks.push(ToolBlockState {
+                        id,
+                        name,
+                        args,
+                        result: None,
+                    });
+                }
+            }
+            AgentEvent::ToolCallEnd {
+                id,
+                ok,
+                output_preview,
+            } => {
+                if let AppState::Streaming { tool_blocks, .. } = &mut self.state {
+                    if let Some(b) = tool_blocks.iter_mut().find(|b| b.id == id) {
+                        b.result = Some((ok, output_preview));
+                    }
+                }
+            }
+            AgentEvent::Usage(u) => {
+                // Map the agent's cost::TokenUsage onto the TUI's tally shape.
+                self.context.token_usage = TokenUsage {
+                    prompt_tokens: u.input_tokens,
+                    completion_tokens: u.output_tokens,
+                    total_tokens: u.total_tokens,
+                };
+            }
+            AgentEvent::Done {
+                final_text,
+                cancelled,
+            } => {
+                self.finalize_turn(final_text, cancelled);
+            }
+            AgentEvent::Error(msg) => {
+                self.finalize_error(msg);
+            }
+        }
+    }
+
+    /// Finalize a turn on `AgentEvent::Done`.
+    ///
+    /// On cancel, the inline `Agent::turn_streaming` loop emits an empty
+    /// `final_text` (it cannot easily salvage buffered partial text), so the
+    /// TUI must reconstruct the visible output from the local `partial`
+    /// accumulator built up from `Chunk` events. A `[cancelled]` marker is
+    /// appended in that case so the user sees the interruption clearly.
+    ///
+    /// If more turns are queued, transitions back to a fresh `Streaming`
+    /// state; otherwise returns to `Ready`.
+    fn finalize_turn(&mut self, final_text: String, cancelled: bool) {
+        let mut body = if cancelled && final_text.is_empty() {
+            if let AppState::Streaming { partial, .. } = &self.state {
+                partial.clone()
+            } else {
+                String::new()
+            }
+        } else {
+            final_text
+        };
+
+        if cancelled {
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            body.push_str("[cancelled]");
+        }
+
+        // Persist and display the assistant reply. A store failure should not
+        // crash the loop — surface it as a visible error and keep running.
+        if let Err(e) = self.context.append_assistant_message(&body) {
+            self.context.last_error = Some(format!("failed to persist reply: {e}"));
+        }
+
+        if self.context.queued_turns > 0 {
+            self.context.queued_turns -= 1;
+            self.state = AppState::Streaming {
+                partial: String::new(),
+                tool_blocks: Vec::new(),
+                cancelling: false,
+            };
+        } else {
+            self.state = AppState::Ready;
+        }
+    }
+
+    /// Finalize a turn on `AgentEvent::Error`. Surfaces the error as a
+    /// visible assistant message (so it shows up in chat history) AND sets
+    /// `last_error` so the status bar reflects it until cleared.
+    fn finalize_error(&mut self, msg: String) {
+        let body = format!("[error] {msg}");
+        if let Err(e) = self.context.append_assistant_message(&body) {
+            // If persistence fails, prefer reporting the persistence error —
+            // the original error is already in `last_error` below.
+            self.context.last_error = Some(format!("failed to persist error: {e}"));
+        } else {
+            self.context.last_error = Some(msg);
+        }
+        self.state = AppState::Ready;
     }
 
     /// Handle a slash command (text after the leading `/`).
@@ -356,6 +480,10 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     loop {
+        // Drain any buffered agent events before rendering so the frame
+        // reflects the latest streaming state.
+        app.drain_events();
+
         app.render(terminal)?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
@@ -502,5 +630,130 @@ mod submit_tests {
             req_rx.try_recv().is_err(),
             "no request should have been sent for whitespace-only buffer"
         );
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::agent::events::AgentEvent;
+    use crate::tui::context::TuiContext;
+
+    fn make_app_with_context(ctx: TuiContext) -> TuiApp {
+        TuiApp {
+            state: AppState::Ready,
+            context: ctx,
+            command_registry: CommandRegistry::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_events_chunk_appends_to_partial() {
+        let (ctx, _req_rx, events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Streaming {
+            partial: String::from("prev "),
+            tool_blocks: vec![],
+            cancelling: false,
+        };
+        events_tx
+            .send(AgentEvent::Chunk("more".into()))
+            .await
+            .unwrap();
+
+        app.drain_events();
+
+        if let AppState::Streaming { partial, .. } = &app.state {
+            assert_eq!(partial, "prev more");
+        } else {
+            panic!("expected Streaming");
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_events_done_finalizes_turn_to_ready() {
+        let (ctx, _req_rx, events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Streaming {
+            partial: String::from("answer"),
+            tool_blocks: vec![],
+            cancelling: false,
+        };
+        events_tx
+            .send(AgentEvent::Done {
+                final_text: "answer".into(),
+                cancelled: false,
+            })
+            .await
+            .unwrap();
+
+        app.drain_events();
+
+        assert!(matches!(app.state, AppState::Ready));
+        assert!(!app.context.messages.is_empty());
+        assert_eq!(app.context.messages.last().unwrap().content, "answer");
+    }
+
+    #[tokio::test]
+    async fn drain_events_done_cancelled_appends_marker_using_local_partial() {
+        let (ctx, _req_rx, events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Streaming {
+            partial: String::from("partial text from chunks"),
+            tool_blocks: vec![],
+            cancelling: true,
+        };
+        // Agent emits Done with empty final_text on cancel — TUI must use local partial.
+        events_tx
+            .send(AgentEvent::Done {
+                final_text: String::new(),
+                cancelled: true,
+            })
+            .await
+            .unwrap();
+
+        app.drain_events();
+
+        assert!(matches!(app.state, AppState::Ready));
+        let last = app.context.messages.last().unwrap();
+        assert!(last.content.contains("partial text"));
+        assert!(last.content.contains("[cancelled]"));
+    }
+
+    #[tokio::test]
+    async fn drain_events_tool_call_start_end_updates_blocks() {
+        let (ctx, _req_rx, events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Streaming {
+            partial: String::new(),
+            tool_blocks: vec![],
+            cancelling: false,
+        };
+        events_tx
+            .send(AgentEvent::ToolCallStart {
+                id: "call-1".into(),
+                name: "shell".into(),
+                args: serde_json::json!({"cmd":"ls"}),
+            })
+            .await
+            .unwrap();
+        events_tx
+            .send(AgentEvent::ToolCallEnd {
+                id: "call-1".into(),
+                ok: true,
+                output_preview: "files".into(),
+            })
+            .await
+            .unwrap();
+
+        app.drain_events();
+
+        if let AppState::Streaming { tool_blocks, .. } = &app.state {
+            assert_eq!(tool_blocks.len(), 1);
+            assert_eq!(tool_blocks[0].name, "shell");
+            assert_eq!(tool_blocks[0].result, Some((true, "files".into())));
+        } else {
+            panic!("expected Streaming");
+        }
     }
 }
