@@ -1194,7 +1194,7 @@ async fn execute_tools_sequential(
 ) -> Result<Vec<String>> {
     let mut individual_results: Vec<String> = Vec::with_capacity(tool_calls.len());
 
-    for call in tool_calls.iter() {
+    for call in tool_calls {
         let call_id = Uuid::new_v4().to_string();
 
         if let Some(mgr) = approval {
@@ -1213,7 +1213,7 @@ async fn execute_tools_sequential(
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
 
                 if decision == ApprovalResponse::No {
-                    if let Some(ref tx) = events {
+                    if let Some(tx) = events {
                         let denial_id = Uuid::new_v4().to_string();
                         let _ = tx
                             .send(AgentEvent::ToolCallStart {

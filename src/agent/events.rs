@@ -116,7 +116,7 @@ mod tests {
             "walk-back should have stopped at byte 497, excluding the mid-cut emoji"
         );
         // And the body before the emoji should be fully present.
-        let body_before_emoji: String = std::iter::repeat('a').take(497).collect();
+        let body_before_emoji: String = "a".repeat(497);
         assert!(out.starts_with(&body_before_emoji));
     }
 
