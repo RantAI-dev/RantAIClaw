@@ -48,12 +48,8 @@ fn build_agent(response: &'static str) -> Agent {
         ..rantaiclaw::config::MemoryConfig::default()
     };
     let mem: Arc<dyn Memory> = Arc::from(
-        rantaiclaw::memory::create_memory(
-            &memory_cfg,
-            std::path::Path::new("/tmp"),
-            None,
-        )
-        .expect("memory creation should succeed with valid config"),
+        rantaiclaw::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+            .expect("memory creation should succeed with valid config"),
     );
     let observer: Arc<dyn Observer> = Arc::from(NoopObserver {});
 
@@ -98,7 +94,10 @@ async fn end_to_end_turn_emits_chunks_and_done() {
     }
     assert!(!chunks.is_empty(), "expected at least one Chunk event");
     let combined: String = chunks.into_iter().collect();
-    assert!(combined.contains("hello"), "chunks should contain response text");
+    assert!(
+        combined.contains("hello"),
+        "chunks should contain response text"
+    );
     assert!(saw_done, "expected Done event");
 
     drop(req_tx);

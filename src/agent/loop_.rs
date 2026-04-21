@@ -1093,7 +1093,13 @@ async fn execute_one_tool(
             let (ok, output) = if r.success {
                 (true, scrub_credentials(&r.output))
             } else {
-                (false, format!("Error: {}", r.error.clone().unwrap_or_else(|| r.output.clone())))
+                (
+                    false,
+                    format!(
+                        "Error: {}",
+                        r.error.clone().unwrap_or_else(|| r.output.clone())
+                    ),
+                )
             };
             // Emit ToolCallEnd after execution.
             if let Some(ref tx) = events {
@@ -1209,16 +1215,20 @@ async fn execute_tools_sequential(
                 if decision == ApprovalResponse::No {
                     if let Some(ref tx) = events {
                         let denial_id = Uuid::new_v4().to_string();
-                        let _ = tx.send(AgentEvent::ToolCallStart {
-                            id: denial_id.clone(),
-                            name: call.name.clone(),
-                            args: call.arguments.clone(),
-                        }).await;
-                        let _ = tx.send(AgentEvent::ToolCallEnd {
-                            id: denial_id,
-                            ok: false,
-                            output_preview: "[denied by user]".into(),
-                        }).await;
+                        let _ = tx
+                            .send(AgentEvent::ToolCallStart {
+                                id: denial_id.clone(),
+                                name: call.name.clone(),
+                                args: call.arguments.clone(),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentEvent::ToolCallEnd {
+                                id: denial_id,
+                                ok: false,
+                                output_preview: "[denied by user]".into(),
+                            })
+                            .await;
                     }
                     let msg = if channel_name == "cli" {
                         "Denied by user.".to_string()
@@ -1434,11 +1444,7 @@ pub(crate) async fn run_tool_call_loop(
                     if chunk.len() >= STREAM_CHUNK_MIN_CHARS {
                         let piece = std::mem::take(&mut chunk);
                         if let Some(ref tx) = events {
-                            if tx
-                                .send(AgentEvent::Chunk(piece))
-                                .await
-                                .is_err()
-                            {
+                            if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
                                 break; // receiver dropped
                             }
                         } else if let Some(ref tx) = on_delta {
@@ -1453,9 +1459,7 @@ pub(crate) async fn run_tool_call_loop(
                 // attempt, so this flush is a no-op in that case.
                 if !chunk.is_empty() {
                     if let Some(ref tx) = events {
-                        let _ = tx
-                            .send(AgentEvent::Chunk(chunk))
-                            .await;
+                        let _ = tx.send(AgentEvent::Chunk(chunk)).await;
                     } else if let Some(ref tx) = on_delta {
                         let _ = tx.send(chunk).await;
                     }
@@ -3880,7 +3884,10 @@ Let me check the result."#;
             })
         }
 
-        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
             let text = args
                 .get("text")
                 .and_then(|v| v.as_str())
@@ -4051,10 +4058,24 @@ Let me check the result."#;
         let multimodal = crate::config::MultimodalConfig::default();
 
         run_tool_call_loop(
-            &provider, &mut history, &tools_registry, &observer,
-            "mock-provider", "mock-model", 0.0, true, None, "test",
-            &multimodal, 5, None, None, Some(events_tx),
-        ).await.unwrap();
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            &multimodal,
+            5,
+            None,
+            None,
+            Some(events_tx),
+        )
+        .await
+        .unwrap();
 
         let mut usage_seen = false;
         while let Ok(ev) = events_rx.try_recv() {

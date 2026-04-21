@@ -89,9 +89,13 @@ mod tests {
         // forces truncate_preview to walk `end` back from 500 to the
         // nearest valid char boundary.
         let mut s = String::new();
-        for _ in 0..497 { s.push('a'); }
+        for _ in 0..497 {
+            s.push('a');
+        }
         s.push('🦀'); // 4 bytes: spans byte indices 497..501, so byte 500 is mid-codepoint
-        for _ in 0..100 { s.push('b'); } // ensure s.len() > TOOL_OUTPUT_PREVIEW_MAX
+        for _ in 0..100 {
+            s.push('b');
+        } // ensure s.len() > TOOL_OUTPUT_PREVIEW_MAX
         assert!(s.len() > TOOL_OUTPUT_PREVIEW_MAX);
 
         let out = truncate_preview(&s);
@@ -107,8 +111,10 @@ mod tests {
         // (walk-back stopped exactly at byte 497). Never partial.
         // The walk from 500 → 499 → 498 → 497 lands at 497, which is the start
         // of 🦀. So the emoji is EXCLUDED from the truncated output.
-        assert!(!out.contains('🦀'),
-            "walk-back should have stopped at byte 497, excluding the mid-cut emoji");
+        assert!(
+            !out.contains('🦀'),
+            "walk-back should have stopped at byte 497, excluding the mid-cut emoji"
+        );
         // And the body before the emoji should be fully present.
         let body_before_emoji: String = std::iter::repeat('a').take(497).collect();
         assert!(out.starts_with(&body_before_emoji));
@@ -127,7 +133,10 @@ mod tests {
             ok: true,
             output_preview: "ok".into(),
         };
-        let _ = AgentEvent::Done { final_text: "done".into(), cancelled: false };
+        let _ = AgentEvent::Done {
+            final_text: "done".into(),
+            cancelled: false,
+        };
         let _ = AgentEvent::Error("boom".into());
     }
 }
