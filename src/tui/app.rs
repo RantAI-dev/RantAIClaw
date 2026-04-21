@@ -20,10 +20,25 @@ use super::context::TuiContext;
 use super::TuiConfig;
 use crate::sessions::SessionStore;
 
+/// Per-tool-call accumulation state used while streaming.
+#[derive(Debug, Clone)]
+pub struct ToolBlockState {
+    pub id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+    pub result: Option<(bool, String)>, // (ok, preview)
+}
+
 /// Current application state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub enum AppState {
-    Chatting,
+    #[default]
+    Ready,
+    Streaming {
+        partial: String,
+        tool_blocks: Vec<ToolBlockState>,
+        cancelling: bool,
+    },
     Quitting,
 }
 
@@ -63,7 +78,7 @@ impl TuiApp {
         )?;
 
         Ok(Self {
-            state: AppState::Chatting,
+            state: AppState::Ready,
             context,
             command_registry: CommandRegistry::new(),
         })
@@ -317,7 +332,7 @@ fn run_loop(app: &mut TuiApp, terminal: &mut Terminal<CrosstermBackend<Stdout>>)
             }
         }
 
-        if app.state == AppState::Quitting {
+        if matches!(app.state, AppState::Quitting) {
             break;
         }
     }
@@ -335,7 +350,7 @@ mod tests {
         let (_events_tx, events_rx) = tokio::sync::mpsc::channel(32);
         let ctx = TuiContext::new(store, model, None, req_tx, events_rx).expect("context");
         TuiApp {
-            state: AppState::Chatting,
+            state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
         }
@@ -347,7 +362,7 @@ mod tests {
         let app = make_app_from_store(store, "test-model");
 
         assert!(!app.context.session_id.is_empty());
-        assert_eq!(app.state, AppState::Chatting);
+        assert!(matches!(app.state, AppState::Ready));
         assert!(app.context.messages.is_empty());
     }
 
@@ -359,7 +374,7 @@ mod tests {
         app.context.input_buffer = "/quit".to_string();
         app.submit_input().unwrap();
 
-        assert_eq!(app.state, AppState::Quitting);
+        assert!(matches!(app.state, AppState::Quitting));
     }
 
     #[test]
@@ -379,6 +394,6 @@ mod tests {
 
         assert!(app.context.messages.is_empty());
         assert_ne!(app.context.session_id, first_session_id);
-        assert_eq!(app.state, AppState::Chatting);
+        assert!(matches!(app.state, AppState::Ready));
     }
 }
