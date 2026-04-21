@@ -993,6 +993,7 @@ async fn run_gateway_chat_with_multimodal(
         GATEWAY_MAX_TOOL_ITERATIONS,
         None, // no cancellation token
         None, // no streaming delta channel
+        None, // no event sender
     )
     .await?;
 

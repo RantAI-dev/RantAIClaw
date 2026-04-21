@@ -1,3 +1,4 @@
+use crate::agent::events::AgentEventSender;
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -1012,6 +1013,7 @@ pub(crate) async fn agent_turn(
         max_tool_iterations,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1194,7 +1196,9 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    events: Option<AgentEventSender>,
 ) -> Result<String> {
+    let _ = events; // noop — threaded through for future tasks
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -1752,6 +1756,7 @@ pub async fn run(
             config.agent.max_tool_iterations,
             None,
             None,
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -1869,6 +1874,7 @@ pub async fn run(
                 "cli",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                None,
                 None,
                 None,
             )
@@ -2341,6 +2347,7 @@ mod tests {
             3,
             None,
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -2385,6 +2392,7 @@ mod tests {
             3,
             None,
             None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -2421,6 +2429,7 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            None,
             None,
             None,
         )
@@ -2541,6 +2550,7 @@ mod tests {
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
+            None,
             None,
             None,
         )
