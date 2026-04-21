@@ -1,4 +1,4 @@
-use crate::agent::events::AgentEventSender;
+use crate::agent::events::{AgentEvent, AgentEventSender};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -1349,7 +1349,7 @@ pub(crate) async fn run_tool_call_loop(
                         let piece = std::mem::take(&mut chunk);
                         if let Some(ref tx) = events {
                             if tx
-                                .send(crate::agent::events::AgentEvent::Chunk(piece))
+                                .send(AgentEvent::Chunk(piece))
                                 .await
                                 .is_err()
                             {
@@ -1362,10 +1362,13 @@ pub(crate) async fn run_tool_call_loop(
                         }
                     }
                 }
+                // Flush any remainder. When the inner send broke because the receiver was
+                // dropped, `chunk` was already emptied by std::mem::take before the send
+                // attempt, so this flush is a no-op in that case.
                 if !chunk.is_empty() {
                     if let Some(ref tx) = events {
                         let _ = tx
-                            .send(crate::agent::events::AgentEvent::Chunk(chunk))
+                            .send(AgentEvent::Chunk(chunk))
                             .await;
                     } else if let Some(ref tx) = on_delta {
                         let _ = tx.send(chunk).await;
@@ -3704,9 +3707,13 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_emits_chunk_events_when_events_some() {
-        let provider = ScriptedProvider::from_text_responses(vec![
-            "hello world this is a streamed response",
-        ]);
+        // Long enough to cross STREAM_CHUNK_MIN_CHARS (80) several times, so the
+        // inner threshold-send path fires (not just the final flush).
+        let long_text = "hello world this is a streamed response with \
+            plenty of whitespace-separated words so that the chunker \
+            accumulates past the 80-char threshold multiple times and \
+            emits several distinct chunks before the final flush runs.";
+        let provider = ScriptedProvider::from_text_responses(vec![long_text]);
         let mut history = vec![ChatMessage::user("hi")];
         let tools_registry: Vec<Box<dyn Tool>> = vec![];
         let observer = NoopObserver;
@@ -3734,16 +3741,23 @@ Let me check the result."#;
         .await
         .expect("loop succeeds");
 
-        // Drain the receiver; expect at least one Chunk event.
         let mut chunks = Vec::new();
         while let Ok(ev) = events_rx.try_recv() {
             if let crate::agent::events::AgentEvent::Chunk(s) = ev {
                 chunks.push(s);
             }
         }
-        assert!(!chunks.is_empty(), "expected ≥1 Chunk event");
+        // At least 2 chunks proves the inner threshold-send path fired — if only
+        // the final flush ran, we'd see exactly 1 chunk.
+        assert!(
+            chunks.len() >= 2,
+            "expected ≥2 Chunk events (inner threshold-send + flush), got {}: {:?}",
+            chunks.len(),
+            chunks
+        );
         let combined: String = chunks.join("");
         assert!(combined.contains("hello"));
         assert!(combined.contains("streamed"));
+        assert!(combined.contains("threshold"));
     }
 }
