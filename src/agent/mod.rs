@@ -2,6 +2,7 @@
 pub mod agent;
 pub mod classifier;
 pub mod dispatcher;
+pub mod events;
 pub mod loop_;
 pub mod memory_loader;
 pub mod prompt;
@@ -11,5 +12,7 @@ mod tests;
 
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder};
+#[allow(unused_imports)]
+pub use events::{AgentEvent, AgentEventSender, TurnResult};
 #[allow(unused_imports)]
 pub use loop_::{process_message, run};
