@@ -1013,4 +1013,92 @@ mod tests {
         let text = agent.turn("hi").await.unwrap();
         assert_eq!(text, "delegated");
     }
+
+    #[tokio::test]
+    async fn turn_streaming_cancellation_yields_done_cancelled_true() {
+        use tokio::time::{sleep, Duration};
+
+        // SlowProvider hangs 200ms in chat() so cancellation has time to fire.
+        struct SlowProvider;
+
+        #[async_trait]
+        impl Provider for SlowProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: f64,
+            ) -> Result<String> {
+                Ok("slow".into())
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: f64,
+            ) -> Result<crate::providers::ChatResponse> {
+                sleep(Duration::from_millis(200)).await;
+                Ok(crate::providers::ChatResponse {
+                    text: Some("never delivered".into()),
+                    tool_calls: vec![],
+                })
+            }
+        }
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(SlowProvider))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+
+        // Fire cancel after 50ms (before provider delivers at 200ms).
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let result = agent
+            .turn_streaming("hi", Some(events_tx), Some(cancel))
+            .await;
+        let result = result.expect("turn_streaming returns Ok on cancel path");
+        assert!(result.cancelled, "expected cancelled=true");
+        assert!(
+            result.text.is_empty(),
+            "expected empty text on cancellation"
+        );
+
+        // Verify Done { cancelled: true } appeared in the event stream.
+        let mut saw_cancelled_done = false;
+        while let Ok(ev) = events_rx.try_recv() {
+            if let AgentEvent::Done {
+                cancelled: true, ..
+            } = ev
+            {
+                saw_cancelled_done = true;
+            }
+        }
+        assert!(
+            saw_cancelled_done,
+            "expected Done {{ cancelled: true }} event"
+        );
+    }
 }
