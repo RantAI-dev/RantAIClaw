@@ -170,10 +170,11 @@ impl TuiApp {
             return Ok(());
         }
 
-        // Slash-commands bypass the bridge entirely.
+        // Slash-commands bypass the bridge entirely (except `/retry`
+        // which dispatches via `handle_command` → `dispatch_resubmit`).
         if let Some(cmd) = trimmed.strip_prefix('/') {
             let cmd = cmd.trim().to_string();
-            self.handle_command(&cmd)?;
+            self.handle_command(&cmd).await?;
             self.context.scroll_offset = 0;
             return Ok(());
         }
@@ -332,7 +333,7 @@ impl TuiApp {
     }
 
     /// Handle a slash command (text after the leading `/`).
-    pub fn handle_command(&mut self, cmd: &str) -> Result<()> {
+    pub async fn handle_command(&mut self, cmd: &str) -> Result<()> {
         match self.command_registry.dispatch(cmd, &mut self.context)? {
             CmdResult::Quit => {
                 self.state = AppState::Quitting;
@@ -343,8 +344,38 @@ impl TuiApp {
             CmdResult::Continue | CmdResult::ClearError => {
                 self.context.last_error = None;
             }
+            CmdResult::Resubmit(text) => {
+                self.dispatch_resubmit(text).await;
+            }
         }
         Ok(())
+    }
+
+    /// Dispatch a `/retry`-style resubmit: re-runs an existing user message
+    /// without appending it to history. Refuses while a turn is already
+    /// streaming — the user should cancel first.
+    async fn dispatch_resubmit(&mut self, text: String) {
+        match self.state {
+            AppState::Streaming { .. } => {
+                self.context.last_error = Some(
+                    "Cannot retry while a response is streaming. Press Ctrl+C to cancel first."
+                        .to_string(),
+                );
+            }
+            AppState::Ready => {
+                if let Err(e) = self.context.req_tx.send(TurnRequest::Submit(text)).await {
+                    self.context.last_error = Some(format!("agent bridge closed: {e}"));
+                    return;
+                }
+                self.state = AppState::Streaming {
+                    partial: String::new(),
+                    tool_blocks: Vec::new(),
+                    cancelling: false,
+                };
+                self.context.last_error = None;
+            }
+            AppState::Quitting => {}
+        }
     }
 
     /// Render the full UI into the terminal frame.
@@ -869,5 +900,79 @@ mod drain_tests {
         } else {
             panic!("expected Streaming");
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::tui::async_bridge::TurnRequest;
+    use crate::tui::context::TuiContext;
+
+    fn make_app_with_context(ctx: TuiContext) -> TuiApp {
+        TuiApp {
+            state: AppState::Ready,
+            context: ctx,
+            command_registry: CommandRegistry::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_in_ready_resubmits_last_user_message_and_streams() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("previous prompt").unwrap();
+        app.context.append_assistant_message("old reply").unwrap();
+        app.state = AppState::Ready;
+
+        app.handle_command("retry").await.unwrap();
+
+        assert!(matches!(app.state, AppState::Streaming { .. }));
+        // The user message is retained; the old assistant reply is gone.
+        assert_eq!(app.context.messages.len(), 1);
+        assert_eq!(app.context.messages[0].content, "previous prompt");
+        let req = req_rx.recv().await.expect("resubmit should dispatch");
+        match req {
+            TurnRequest::Submit(text) => assert_eq!(text, "previous prompt"),
+            TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
+        }
+        assert!(app.context.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_in_streaming_refuses_and_sets_last_error() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.context.append_user_message("prompt").unwrap();
+        app.context.append_assistant_message("reply").unwrap();
+        app.state = AppState::Streaming {
+            partial: String::new(),
+            tool_blocks: vec![],
+            cancelling: false,
+        };
+
+        app.handle_command("retry").await.unwrap();
+
+        assert!(matches!(app.state, AppState::Streaming { .. }));
+        assert!(
+            req_rx.try_recv().is_err(),
+            "no request should be dispatched while streaming"
+        );
+        let err = app.context.last_error.as_deref().unwrap_or("");
+        assert!(err.contains("Cannot retry"));
+    }
+
+    #[tokio::test]
+    async fn retry_with_no_history_sets_message_and_stays_ready() {
+        let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Ready;
+
+        app.handle_command("retry").await.unwrap();
+
+        assert!(matches!(app.state, AppState::Ready));
+        assert!(req_rx.try_recv().is_err());
+        let err = app.context.last_error.as_deref().unwrap_or("");
+        assert!(err.contains("No previous response"));
     }
 }
