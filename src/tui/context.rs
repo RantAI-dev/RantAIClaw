@@ -99,7 +99,20 @@ impl TuiContext {
 
     /// Append an assistant message to the in-memory list and persist it.
     pub fn append_assistant_message(&mut self, content: &str) -> Result<()> {
-        let msg = Message::assistant(&self.session_id, content);
+        self.append_assistant_message_with_tools(content, None)
+    }
+
+    /// Append an assistant message with optional tool-call snapshot
+    /// (JSON-serialized PersistedToolCall list). Used by the bridge
+    /// finalize path so chat history can re-render tool blocks after
+    /// the streaming session ends.
+    pub fn append_assistant_message_with_tools(
+        &mut self,
+        content: &str,
+        tool_calls_json: Option<String>,
+    ) -> Result<()> {
+        let mut msg = Message::assistant(&self.session_id, content);
+        msg.tool_calls = tool_calls_json;
         self.session_store.append_message(&msg)?;
         self.messages.push(msg);
         Ok(())

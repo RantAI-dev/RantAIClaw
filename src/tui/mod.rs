@@ -7,6 +7,8 @@ mod commands;
 #[cfg(feature = "tui")]
 mod context;
 #[cfg(feature = "tui")]
+mod render;
+#[cfg(feature = "tui")]
 mod widgets;
 
 #[cfg(feature = "tui")]
