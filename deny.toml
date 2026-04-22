@@ -7,10 +7,21 @@
 unmaintained = "all"
 # yanked: deny | warn | allow
 yanked = "deny"
-# Ignore known unmaintained transitive deps we cannot easily replace
+# Ignore known unmaintained/unsound transitive deps we cannot easily replace.
+# Each entry cites (a) the crate, (b) the upstream chain blocking the upgrade,
+# and (c) why the risk is acceptable for our usage.
 ignore = [
-    # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete
+    # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete.
     "RUSTSEC-2025-0141",
+    # paste v1.0.15 via ratatui 0.29 — archived proc-macro, no runtime surface.
+    # Unblocks only on a ratatui 0.30 upgrade.
+    "RUSTSEC-2024-0436",
+    # derivative v2.2.0 via matrix-sdk-indexeddb 0.16 — wasm-only path; upstream
+    # matrix-sdk replaced it with derive_more in newer releases.
+    "RUSTSEC-2024-0388",
+    # lru v0.12.5 via ratatui 0.29 — IterMut unsound; ratatui's layout cache
+    # does not expose the affected API to our render path. Unblocks on ratatui 0.30.
+    "RUSTSEC-2026-0002",
 ]
 
 [licenses]
