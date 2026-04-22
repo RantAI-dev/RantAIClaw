@@ -305,7 +305,7 @@ impl Channel for DiscordChannel {
 
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => {
+                () = cancel.cancelled() => {
                     tracing::info!("Discord channel shutting down");
                     break;
                 }

@@ -840,7 +840,7 @@ async fn main() -> Result<()> {
     config.apply_env_overrides();
 
     match cli.command {
-        None | Some(Commands::Onboard { .. }) | Some(Commands::Completions { .. }) => {
+        None | Some(Commands::Onboard { .. } | Commands::Completions { .. }) => {
             unreachable!()
         }
 

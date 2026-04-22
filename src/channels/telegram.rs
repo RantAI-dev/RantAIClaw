@@ -1815,7 +1815,7 @@ impl Channel for TelegramChannel {
             });
 
             let resp = tokio::select! {
-                _ = cancel.cancelled() => {
+                () = cancel.cancelled() => {
                     tracing::info!("Telegram channel shutting down");
                     return Ok(());
                 }

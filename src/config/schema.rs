@@ -208,7 +208,7 @@ pub struct Config {
 pub struct McpServerConfig {
     /// Command to spawn (e.g., "npx", "node")
     pub command: String,
-    /// Arguments (e.g., ["-y", "@modelcontextprotocol/server-github"])
+    /// Arguments (e.g., `["-y", "@modelcontextprotocol/server-github"]`)
     #[serde(default)]
     pub args: Vec<String>,
     /// Environment variables passed to the process

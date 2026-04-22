@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::security::SecurityPolicy;
-use crate::tasks::{self, state, ActorType, ReviewAction, TaskEventType, TaskPatch, TaskStatus};
+use crate::tasks::{self, state, ActorType, ReviewAction, TaskEventType, TaskPatch};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;

@@ -120,11 +120,11 @@ impl Channel for SlackChannel {
 
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => {
+                () = cancel.cancelled() => {
                     tracing::info!("Slack channel shutting down");
                     return Ok(());
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                () = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
             }
 
             let mut params = vec![("channel", channel_id.clone()), ("limit", "10".to_string())];
