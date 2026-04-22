@@ -148,11 +148,10 @@ impl Default for CommandRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sessions::SessionStore;
 
     fn test_context() -> TuiContext {
-        let store = SessionStore::in_memory().expect("in-memory store");
-        TuiContext::new(store, "test-model", None).expect("context creation")
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        ctx
     }
 
     #[test]

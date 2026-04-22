@@ -1,6 +1,8 @@
 #[cfg(feature = "tui")]
 mod app;
 #[cfg(feature = "tui")]
+pub mod async_bridge;
+#[cfg(feature = "tui")]
 mod commands;
 #[cfg(feature = "tui")]
 mod context;
@@ -9,6 +11,9 @@ mod widgets;
 
 #[cfg(feature = "tui")]
 pub use app::run_tui;
+#[cfg(feature = "tui")]
+#[allow(unused_imports)]
+pub use async_bridge::{TuiAgentActor, TurnRequest};
 #[cfg(feature = "tui")]
 pub use commands::{CommandHandler, CommandRegistry, CommandResult};
 

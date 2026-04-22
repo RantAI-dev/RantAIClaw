@@ -93,11 +93,10 @@ impl CommandHandler for StopCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sessions::SessionStore;
 
     fn test_context() -> TuiContext {
-        let store = SessionStore::in_memory().unwrap();
-        TuiContext::new(store, "test-model", None).unwrap()
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        ctx
     }
 
     #[test]

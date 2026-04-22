@@ -1,3 +1,4 @@
+use crate::agent::events::{AgentEvent, AgentEventSender};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -1012,20 +1013,51 @@ pub(crate) async fn agent_turn(
         max_tool_iterations,
         None,
         None,
+        None,
     )
     .await
 }
 
 async fn execute_one_tool(
+    call_id: String,
     call_name: &str,
     call_arguments: serde_json::Value,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    events: Option<AgentEventSender>,
 ) -> Result<String> {
     let Some(tool) = find_tool(tools_registry, call_name) else {
+        // Emit start + immediate end (ok=false) so callers always see paired events.
+        if let Some(ref tx) = events {
+            let _ = tx
+                .send(AgentEvent::ToolCallStart {
+                    id: call_id.clone(),
+                    name: call_name.to_string(),
+                    args: serde_json::Value::Null,
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::ToolCallEnd {
+                    id: call_id,
+                    ok: false,
+                    output_preview: format!("Unknown tool: {call_name}"),
+                })
+                .await;
+        }
         return Ok(format!("Unknown tool: {call_name}"));
     };
+
+    // Emit ToolCallStart before execution.
+    if let Some(ref tx) = events {
+        let _ = tx
+            .send(AgentEvent::ToolCallStart {
+                id: call_id.clone(),
+                name: call_name.to_string(),
+                args: call_arguments.clone(),
+            })
+            .await;
+    }
 
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -1035,7 +1067,16 @@ async fn execute_one_tool(
     let tool_future = tool.execute(call_arguments);
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
-            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+            () = token.cancelled() => {
+                if let Some(ref tx) = events {
+                    let _ = tx.send(AgentEvent::ToolCallEnd {
+                        id: call_id.clone(),
+                        ok: false,
+                        output_preview: "[cancelled]".into(),
+                    }).await;
+                }
+                return Err(ToolLoopCancelled.into());
+            }
             result = tool_future => result,
         }
     } else {
@@ -1049,11 +1090,28 @@ async fn execute_one_tool(
                 duration: start.elapsed(),
                 success: r.success,
             });
-            if r.success {
-                Ok(scrub_credentials(&r.output))
+            let (ok, output) = if r.success {
+                (true, scrub_credentials(&r.output))
             } else {
-                Ok(format!("Error: {}", r.error.unwrap_or_else(|| r.output)))
+                (
+                    false,
+                    format!(
+                        "Error: {}",
+                        r.error.clone().unwrap_or_else(|| r.output.clone())
+                    ),
+                )
+            };
+            // Emit ToolCallEnd after execution.
+            if let Some(ref tx) = events {
+                let _ = tx
+                    .send(AgentEvent::ToolCallEnd {
+                        id: call_id,
+                        ok,
+                        output_preview: crate::agent::events::truncate_preview(&output),
+                    })
+                    .await;
             }
+            Ok(output)
         }
         Err(e) => {
             observer.record_event(&ObserverEvent::ToolCall {
@@ -1061,7 +1119,18 @@ async fn execute_one_tool(
                 duration: start.elapsed(),
                 success: false,
             });
-            Ok(format!("Error executing {call_name}: {e}"))
+            let output = format!("Error executing {call_name}: {e}");
+            // Emit ToolCallEnd (ok=false) on execution error.
+            if let Some(ref tx) = events {
+                let _ = tx
+                    .send(AgentEvent::ToolCallEnd {
+                        id: call_id,
+                        ok: false,
+                        output_preview: crate::agent::events::truncate_preview(&output),
+                    })
+                    .await;
+            }
+            Ok(output)
         }
     }
 }
@@ -1090,16 +1159,22 @@ async fn execute_tools_parallel(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    events: Option<&AgentEventSender>,
 ) -> Result<Vec<String>> {
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|call| {
+            let call_id = Uuid::new_v4().to_string();
+            // Clone the sender so each future owns its copy (Sender is cheap to clone).
+            let events_for_call = events.cloned();
             execute_one_tool(
+                call_id,
                 &call.name,
                 call.arguments.clone(),
                 tools_registry,
                 observer,
                 cancellation_token,
+                events_for_call,
             )
         })
         .collect();
@@ -1115,10 +1190,13 @@ async fn execute_tools_sequential(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     cancellation_token: Option<&CancellationToken>,
+    events: Option<&AgentEventSender>,
 ) -> Result<Vec<String>> {
     let mut individual_results: Vec<String> = Vec::with_capacity(tool_calls.len());
 
     for call in tool_calls {
+        let call_id = Uuid::new_v4().to_string();
+
         if let Some(mgr) = approval {
             if mgr.needs_approval(&call.name) {
                 let request = ApprovalRequest {
@@ -1135,6 +1213,23 @@ async fn execute_tools_sequential(
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
 
                 if decision == ApprovalResponse::No {
+                    if let Some(tx) = events {
+                        let denial_id = Uuid::new_v4().to_string();
+                        let _ = tx
+                            .send(AgentEvent::ToolCallStart {
+                                id: denial_id.clone(),
+                                name: call.name.clone(),
+                                args: call.arguments.clone(),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentEvent::ToolCallEnd {
+                                id: denial_id,
+                                ok: false,
+                                output_preview: "[denied by user]".into(),
+                            })
+                            .await;
+                    }
                     let msg = if channel_name == "cli" {
                         "Denied by user.".to_string()
                     } else {
@@ -1151,11 +1246,14 @@ async fn execute_tools_sequential(
         }
 
         let result = execute_one_tool(
+            call_id,
             &call.name,
             call.arguments.clone(),
             tools_registry,
             observer,
             cancellation_token,
+            // Clone the sender for each sequential call so it can be consumed.
+            events.cloned(),
         )
         .await?;
         individual_results.push(result);
@@ -1194,6 +1292,7 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    events: Option<AgentEventSender>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -1328,9 +1427,11 @@ pub(crate) async fn run_tool_call_loop(
             // No tool calls — this is the final response.
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
-            if let Some(ref tx) = on_delta {
+            if events.is_some() || on_delta.is_some() {
                 // Split on whitespace boundaries, accumulating chunks of at least
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
+                // When `events` is Some, emit AgentEvent::Chunk and ignore `on_delta`
+                // to avoid duplicate delivery.
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
                     if cancellation_token
@@ -1340,17 +1441,35 @@ pub(crate) async fn run_tool_call_loop(
                         return Err(ToolLoopCancelled.into());
                     }
                     chunk.push_str(word);
-                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS
-                        && tx.send(std::mem::take(&mut chunk)).await.is_err()
-                    {
-                        break; // receiver dropped
+                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS {
+                        let piece = std::mem::take(&mut chunk);
+                        if let Some(ref tx) = events {
+                            if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
+                                break; // receiver dropped
+                            }
+                        } else if let Some(ref tx) = on_delta {
+                            if tx.send(piece).await.is_err() {
+                                break; // receiver dropped
+                            }
+                        }
                     }
                 }
+                // Flush any remainder. When the inner send broke because the receiver was
+                // dropped, `chunk` was already emptied by std::mem::take before the send
+                // attempt, so this flush is a no-op in that case.
                 if !chunk.is_empty() {
-                    let _ = tx.send(chunk).await;
+                    if let Some(ref tx) = events {
+                        let _ = tx.send(AgentEvent::Chunk(chunk)).await;
+                    } else if let Some(ref tx) = on_delta {
+                        let _ = tx.send(chunk).await;
+                    }
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
+            if let Some(ref tx) = events {
+                let usage = crate::cost::TokenUsage::new(model, 0, 0, 0.0, 0.0);
+                let _ = tx.send(AgentEvent::Usage(usage)).await;
+            }
             return Ok(display_text);
         }
 
@@ -1373,6 +1492,7 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                events.as_ref(),
             )
             .await?
         } else {
@@ -1383,6 +1503,7 @@ pub(crate) async fn run_tool_call_loop(
                 approval,
                 channel_name,
                 cancellation_token.as_ref(),
+                events.as_ref(),
             )
             .await?
         };
@@ -1752,6 +1873,7 @@ pub async fn run(
             config.agent.max_tool_iterations,
             None,
             None,
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -1869,6 +1991,7 @@ pub async fn run(
                 "cli",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                None,
                 None,
                 None,
             )
@@ -2341,6 +2464,7 @@ mod tests {
             3,
             None,
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -2385,6 +2509,7 @@ mod tests {
             3,
             None,
             None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -2421,6 +2546,7 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            None,
             None,
             None,
         )
@@ -2541,6 +2667,7 @@ mod tests {
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
+            None,
             None,
             None,
         )
@@ -3672,5 +3799,290 @@ Let me check the result."#;
             system_prompt.contains("## Your Task"),
             "Native prompt should contain task instructions"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_emits_chunk_events_when_events_some() {
+        // Long enough to cross STREAM_CHUNK_MIN_CHARS (80) several times, so the
+        // inner threshold-send path fires (not just the final flush).
+        let long_text = "hello world this is a streamed response with \
+            plenty of whitespace-separated words so that the chunker \
+            accumulates past the 80-char threshold multiple times and \
+            emits several distinct chunks before the final flush runs.";
+        let provider = ScriptedProvider::from_text_responses(vec![long_text]);
+        let mut history = vec![ChatMessage::user("hi")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let observer = NoopObserver;
+        let (events_tx, mut events_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::events::AgentEvent>(32);
+
+        let multimodal = crate::config::MultimodalConfig::default();
+        let _ = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            &multimodal,
+            5,
+            None,
+            None,            // on_delta: None
+            Some(events_tx), // events: Some
+        )
+        .await
+        .expect("loop succeeds");
+
+        let mut chunks = Vec::new();
+        while let Ok(ev) = events_rx.try_recv() {
+            if let crate::agent::events::AgentEvent::Chunk(s) = ev {
+                chunks.push(s);
+            }
+        }
+        // At least 2 chunks proves the inner threshold-send path fired — if only
+        // the final flush ran, we'd see exactly 1 chunk.
+        assert!(
+            chunks.len() >= 2,
+            "expected ≥2 Chunk events (inner threshold-send + flush), got {}: {:?}",
+            chunks.len(),
+            chunks
+        );
+        let combined: String = chunks.join("");
+        assert!(combined.contains("hello"));
+        assert!(combined.contains("streamed"));
+        assert!(combined.contains("threshold"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Task 4: ToolCallStart / ToolCallEnd event emission
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Minimal inline tool that echoes the `text` argument. Used to keep this
+    /// test self-contained without pulling in a real shell or file-system tool.
+    struct EchoTool;
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn description(&self) -> &str {
+            "echoes the text input"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: text,
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_emits_tool_call_start_and_end_events() {
+        // First response triggers a tool call; second response is the final answer.
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>{"name":"echo","arguments":{"text":"hi"}}</tool_call>"#,
+            "final answer",
+        ]);
+        let mut history = vec![ChatMessage::user("call echo")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let observer = NoopObserver;
+        let (events_tx, mut events_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::events::AgentEvent>(32);
+
+        let multimodal = crate::config::MultimodalConfig::default();
+        let _ = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            &multimodal,
+            5,
+            None,
+            None,
+            Some(events_tx),
+        )
+        .await
+        .expect("loop succeeds");
+
+        let mut saw_start = false;
+        let mut saw_end = false;
+        let mut start_id = String::new();
+        let mut end_id = String::new();
+        while let Ok(ev) = events_rx.try_recv() {
+            match ev {
+                crate::agent::events::AgentEvent::ToolCallStart { id, name, .. } => {
+                    assert_eq!(name, "echo");
+                    saw_start = true;
+                    start_id = id;
+                }
+                crate::agent::events::AgentEvent::ToolCallEnd { id, ok, .. } => {
+                    assert!(ok, "echo tool should succeed");
+                    saw_end = true;
+                    end_id = id;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_start && saw_end,
+            "expected both ToolCallStart and ToolCallEnd events"
+        );
+        assert!(
+            !start_id.is_empty() && start_id == end_id,
+            "Start and End must share id"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_cancellation_mid_tool_emits_paired_start_end() {
+        // A tool that sleeps 200ms — long enough for cancel to fire.
+        struct SlowTool;
+        #[async_trait]
+        impl Tool for SlowTool {
+            fn name(&self) -> &str {
+                "slow"
+            }
+            fn description(&self) -> &str {
+                "sleeps"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "done".into(),
+                    error: None,
+                })
+            }
+        }
+
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>{"name":"slow","arguments":{}}</tool_call>"#,
+        ]);
+        let mut history = vec![ChatMessage::user("call slow")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(SlowTool)];
+        let observer = NoopObserver;
+        let (events_tx, mut events_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::events::AgentEvent>(32);
+        let multimodal = crate::config::MultimodalConfig::default();
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let token_for_spawn = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token_for_spawn.cancel();
+        });
+
+        let res = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            &multimodal,
+            5,
+            Some(token),
+            None,
+            Some(events_tx),
+        )
+        .await;
+        assert!(res.is_err(), "expected cancellation error");
+
+        // Collect events; verify one Start with one matching End.
+        let mut starts: Vec<String> = Vec::new();
+        let mut ends: Vec<String> = Vec::new();
+        while let Ok(ev) = events_rx.try_recv() {
+            match ev {
+                crate::agent::events::AgentEvent::ToolCallStart { id, .. } => starts.push(id),
+                crate::agent::events::AgentEvent::ToolCallEnd { id, .. } => ends.push(id),
+                _ => {}
+            }
+        }
+        assert_eq!(starts.len(), 1);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(starts[0], ends[0], "End must correlate to Start by id");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Task 5: Usage event emission before loop returns
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_tool_call_loop_emits_usage_event_before_returning() {
+        let provider = ScriptedProvider::from_text_responses(vec!["done"]);
+        let mut history = vec![ChatMessage::user("hi")];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![];
+        let observer = crate::observability::NoopObserver;
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        let multimodal = crate::config::MultimodalConfig::default();
+
+        run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            &multimodal,
+            5,
+            None,
+            None,
+            Some(events_tx),
+        )
+        .await
+        .unwrap();
+
+        let mut usage_seen = false;
+        while let Ok(ev) = events_rx.try_recv() {
+            if let crate::agent::events::AgentEvent::Usage(_) = ev {
+                usage_seen = true;
+            }
+        }
+        assert!(usage_seen, "expected Usage event before loop returned");
     }
 }
