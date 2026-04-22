@@ -18,7 +18,6 @@
 
 #[test]
 fn config_api_test_placeholder() {
-    // Placeholder to ensure the test file compiles
-    // Real integration tests require a gateway test harness
-    assert!(true);
+    // Placeholder to ensure the test file compiles.
+    // Real integration tests require a gateway test harness.
 }

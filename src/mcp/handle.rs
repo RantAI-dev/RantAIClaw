@@ -97,8 +97,7 @@ impl McpHandle {
     pub fn is_running(&mut self) -> bool {
         match self.process.try_wait() {
             Ok(None) => true,
-            Ok(Some(_)) => false,
-            Err(_) => false,
+            Ok(Some(_)) | Err(_) => false,
         }
     }
 

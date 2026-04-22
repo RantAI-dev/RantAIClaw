@@ -27,11 +27,11 @@ pub fn spawn_supervisor(
         info!("MCP supervisor started");
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => {
+                () = cancel.cancelled() => {
                     info!("MCP supervisor shutting down");
                     break;
                 }
-                _ = tokio::time::sleep(SUPERVISOR_POLL_INTERVAL) => {
+                () = tokio::time::sleep(SUPERVISOR_POLL_INTERVAL) => {
                     let server_ids = {
                         let reg = registry.read().await;
                         reg.server_ids()
