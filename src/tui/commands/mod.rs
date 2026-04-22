@@ -19,6 +19,10 @@ pub enum CommandResult {
     Message(String),
     Quit,
     ClearError,
+    /// Dispatch a new agent turn with the given user message.
+    /// The message is not appended to history again — the caller
+    /// expects it to already live there (e.g. `/retry`).
+    Resubmit(String),
 }
 
 /// Trait for command handlers

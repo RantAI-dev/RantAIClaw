@@ -3,7 +3,8 @@ use anyhow::Result;
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
 
-/// /retry command — remove the last assistant message to allow re-generation
+/// /retry command — drop the last assistant reply and re-dispatch
+/// the previous user message to the agent without making the user retype.
 pub struct RetryCommand;
 
 impl CommandHandler for RetryCommand {
@@ -12,23 +13,27 @@ impl CommandHandler for RetryCommand {
     }
 
     fn description(&self) -> &str {
-        "Remove the last assistant message for re-generation"
+        "Re-run the last user message"
     }
 
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
-        let pos = ctx.messages.iter().rposition(|m| m.role == "assistant");
+        let Some(assistant_idx) = ctx.messages.iter().rposition(|m| m.role == "assistant") else {
+            return Ok(CommandResult::Message(
+                "No previous response to retry.".to_string(),
+            ));
+        };
+        let Some(user_idx) = ctx.messages[..assistant_idx]
+            .iter()
+            .rposition(|m| m.role == "user")
+        else {
+            return Ok(CommandResult::Message(
+                "No previous user message to retry.".to_string(),
+            ));
+        };
 
-        match pos {
-            Some(idx) => {
-                ctx.messages.remove(idx);
-                Ok(CommandResult::Message(
-                    "Last assistant message removed. Resend your message to retry.".to_string(),
-                ))
-            }
-            None => Ok(CommandResult::Message(
-                "No assistant message to remove.".to_string(),
-            )),
-        }
+        let prompt = ctx.messages[user_idx].content.clone();
+        ctx.messages.remove(assistant_idx);
+        Ok(CommandResult::Resubmit(prompt))
     }
 }
 
@@ -100,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_removes_last_assistant_message() {
+    fn retry_drops_last_assistant_and_returns_resubmit_with_last_user_text() {
         let cmd = RetryCommand;
         let mut ctx = test_context();
 
@@ -110,9 +115,60 @@ mod tests {
 
         let result = cmd.execute("", &mut ctx).unwrap();
 
+        // The user message is retained; the assistant reply is dropped.
         assert_eq!(ctx.messages.len(), 1);
         assert_eq!(ctx.messages[0].role, "user");
+        assert_eq!(ctx.messages[0].content, "hello");
+        match result {
+            CommandResult::Resubmit(text) => assert_eq!(text, "hello"),
+            other => panic!("expected Resubmit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_with_no_assistant_reports_message() {
+        let cmd = RetryCommand;
+        let mut ctx = test_context();
+
+        ctx.append_user_message("hello").unwrap();
+
+        let result = cmd.execute("", &mut ctx).unwrap();
+        assert_eq!(ctx.messages.len(), 1);
+        match result {
+            CommandResult::Message(msg) => assert!(msg.contains("No previous response")),
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_with_no_messages_reports_message() {
+        let cmd = RetryCommand;
+        let mut ctx = test_context();
+
+        let result = cmd.execute("", &mut ctx).unwrap();
+        assert!(ctx.messages.is_empty());
         assert!(matches!(result, CommandResult::Message(_)));
+    }
+
+    #[test]
+    fn retry_uses_most_recent_user_when_multiple_turns() {
+        let cmd = RetryCommand;
+        let mut ctx = test_context();
+
+        ctx.append_user_message("first").unwrap();
+        ctx.append_assistant_message("ans1").unwrap();
+        ctx.append_user_message("second").unwrap();
+        ctx.append_assistant_message("ans2").unwrap();
+
+        let result = cmd.execute("", &mut ctx).unwrap();
+
+        // "ans2" is removed, "second" stays as the next prompt to resubmit.
+        assert_eq!(ctx.messages.len(), 3);
+        assert_eq!(ctx.messages[2].content, "second");
+        match result {
+            CommandResult::Resubmit(text) => assert_eq!(text, "second"),
+            other => panic!("expected Resubmit, got {other:?}"),
+        }
     }
 
     #[test]
