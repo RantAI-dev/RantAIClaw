@@ -299,9 +299,20 @@ impl TuiApp {
             body.push_str("[cancelled]");
         }
 
+        // Snapshot tool blocks from streaming state before we transition
+        // away — they're discarded otherwise.
+        let tool_calls_json = if let AppState::Streaming { tool_blocks, .. } = &self.state {
+            super::render::serialize_tool_calls(tool_blocks)
+        } else {
+            None
+        };
+
         // Persist and display the assistant reply. A store failure should not
         // crash the loop — surface it as a visible error and keep running.
-        if let Err(e) = self.context.append_assistant_message(&body) {
+        if let Err(e) = self
+            .context
+            .append_assistant_message_with_tools(&body, tool_calls_json)
+        {
             self.context.last_error = Some(format!("failed to persist reply: {e}"));
         }
 
@@ -418,26 +429,37 @@ impl TuiApp {
 
     /// Render the scrollable chat history.
     fn render_chat(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let items: Vec<ListItem> = self
-            .context
-            .messages
-            .iter()
-            .map(|msg| {
-                let (label, color) = match msg.role.as_str() {
-                    "user" => ("You", Color::Green),
-                    "assistant" => ("Assistant", Color::Blue),
-                    _ => ("System", Color::Yellow),
-                };
-                let line = Line::from(vec![
-                    Span::styled(
-                        format!("{label}: "),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(msg.content.clone()),
-                ]);
-                ListItem::new(line)
-            })
-            .collect();
+        let theme = super::render::RenderTheme::default();
+        let mut items: Vec<ListItem> = Vec::with_capacity(self.context.messages.len() + 1);
+
+        for msg in &self.context.messages {
+            let persisted = msg
+                .tool_calls
+                .as_deref()
+                .map(super::render::parse_persisted_tool_calls)
+                .unwrap_or_default();
+            let lines = super::render::render_message_lines(
+                &msg.role,
+                &msg.content,
+                &persisted,
+                &[],
+                &theme,
+            );
+            items.push(ListItem::new(lines));
+        }
+
+        // While a turn is streaming, render the in-progress assistant
+        // message + tool blocks so the user sees live progress.
+        if let AppState::Streaming {
+            partial,
+            tool_blocks,
+            ..
+        } = &self.state
+        {
+            let lines =
+                super::render::render_message_lines("assistant", partial, &[], tool_blocks, &theme);
+            items.push(ListItem::new(lines));
+        }
 
         let list = List::new(items).block(
             Block::default()
