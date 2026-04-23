@@ -4,8 +4,10 @@ use crate::providers::traits::{
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
@@ -400,6 +402,124 @@ impl Provider for OpenRouterProvider {
         true
     }
 
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    /// Real SSE streaming for OpenRouter.
+    ///
+    /// Forwards each text delta to `text_tx` as it arrives, accumulates the
+    /// full text + tool-call fragments, and returns the assembled response.
+    /// Tool-call arguments arrive as small string fragments keyed by `index`
+    /// — they are accumulated into a `BTreeMap<usize, AccumulatedToolCall>`
+    /// so the order matches what the LLM emitted.
+    async fn chat_stream(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        text_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenRouter API key not set. Run `rantaiclaw onboard` or set OPENROUTER_API_KEY env var."
+            )
+        })?;
+
+        let tools = Self::convert_tools(request.tools);
+        let native_request = NativeChatRequestStreaming {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature,
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+            stream: true,
+        };
+
+        let response = self
+            .http_client()
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {credential}"))
+            .header(
+                "HTTP-Referer",
+                "https://github.com/theonlyhennygod/rantaiclaw",
+            )
+            .header("X-Title", "RantaiClaw")
+            .header("Accept", "text/event-stream")
+            .json(&native_request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenRouter", response).await);
+        }
+
+        let mut text_buf = String::new();
+        let mut tool_acc: BTreeMap<usize, AccumulatedToolCall> = BTreeMap::new();
+        let mut sse_buffer = String::new();
+        let mut byte_stream = response.bytes_stream();
+
+        while let Some(chunk) = byte_stream.next().await {
+            let bytes = chunk?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|e| anyhow::anyhow!("OpenRouter streamed non-UTF8 bytes: {e}"))?;
+            sse_buffer.push_str(text);
+
+            // Process complete lines.
+            while let Some(pos) = sse_buffer.find('\n') {
+                let line: String = sse_buffer.drain(..=pos).collect();
+                if let Some(payload) = parse_sse_line(line.trim_end()) {
+                    match payload {
+                        SsePayload::Done => {
+                            sse_buffer.clear();
+                            break;
+                        }
+                        SsePayload::Delta(delta) => {
+                            if let Some(content) = delta.content {
+                                if !content.is_empty() {
+                                    text_buf.push_str(&content);
+                                    let _ = text_tx.send(content).await;
+                                }
+                            }
+                            for tc_delta in delta.tool_calls.unwrap_or_default() {
+                                let entry = tool_acc.entry(tc_delta.index).or_default();
+                                if let Some(id) = tc_delta.id {
+                                    entry.id = Some(id);
+                                }
+                                if let Some(func) = tc_delta.function {
+                                    if let Some(name) = func.name {
+                                        entry.name.push_str(&name);
+                                    }
+                                    if let Some(args) = func.arguments {
+                                        entry.arguments.push_str(&args);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let tool_calls = tool_acc
+            .into_values()
+            .map(|t| ProviderToolCall {
+                id: t.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                name: t.name,
+                arguments: t.arguments,
+            })
+            .collect();
+
+        Ok(ProviderChatResponse {
+            text: if text_buf.is_empty() {
+                None
+            } else {
+                Some(text_buf)
+            },
+            tool_calls,
+        })
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -483,6 +603,91 @@ impl Provider for OpenRouterProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
         Ok(Self::parse_native_response(message))
     }
+}
+
+// ── Streaming wire types & SSE parser ────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct NativeChatRequestStreaming {
+    model: String,
+    messages: Vec<NativeMessage>,
+    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<NativeToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+    stream: bool,
+}
+
+/// One delta from an OpenAI-format SSE stream.
+#[derive(Debug, Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolCallDelta {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChunkChoice {
+    delta: StreamDelta,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChunkResponse {
+    choices: Vec<StreamChunkChoice>,
+}
+
+/// Tool-call accumulator: a tool call comes in fragments tagged by `index`.
+/// We collect the bits as they arrive and assemble the final
+/// `ProviderToolCall` once the stream ends.
+#[derive(Debug, Default)]
+struct AccumulatedToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+/// Result of parsing a single SSE line.
+enum SsePayload {
+    Delta(StreamDelta),
+    Done,
+}
+
+/// Parse one trimmed SSE line. Returns `None` for blank lines / comments
+/// that don't carry a payload, `Some(SsePayload::Done)` for the `[DONE]`
+/// sentinel, and `Some(SsePayload::Delta(...))` for normal deltas.
+///
+/// Malformed JSON is treated as `None` so a single bad chunk does not
+/// abort an otherwise-valid stream.
+fn parse_sse_line(line: &str) -> Option<SsePayload> {
+    if line.is_empty() || line.starts_with(':') {
+        return None;
+    }
+    let data = line.strip_prefix("data:")?.trim();
+    if data == "[DONE]" {
+        return Some(SsePayload::Done);
+    }
+    let parsed: StreamChunkResponse = serde_json::from_str(data).ok()?;
+    let delta = parsed.choices.into_iter().next()?.delta;
+    Some(SsePayload::Delta(delta))
 }
 
 #[cfg(test)]
@@ -747,5 +952,85 @@ mod tests {
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_xyz"));
         assert_eq!(converted[0].content.as_deref(), Some("done"));
         assert!(converted[0].tool_calls.is_none());
+    }
+
+    // ── SSE streaming parser tests ─────────────────────────────────────
+
+    fn delta_or_panic(payload: SsePayload) -> StreamDelta {
+        match payload {
+            SsePayload::Delta(d) => d,
+            SsePayload::Done => panic!("expected delta, got DONE"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_line_with_content_returns_delta() {
+        let line = r#"data: {"choices":[{"delta":{"content":"hello"},"index":0}]}"#;
+        let payload = parse_sse_line(line).expect("parse should succeed");
+        let delta = delta_or_panic(payload);
+        assert_eq!(delta.content.as_deref(), Some("hello"));
+        assert!(delta.tool_calls.is_none());
+    }
+
+    #[test]
+    fn parse_sse_line_done_returns_done_sentinel() {
+        let payload = parse_sse_line("data: [DONE]").expect("parse should succeed");
+        assert!(matches!(payload, SsePayload::Done));
+    }
+
+    #[test]
+    fn parse_sse_line_blank_returns_none() {
+        assert!(parse_sse_line("").is_none());
+        assert!(parse_sse_line(": comment").is_none());
+    }
+
+    #[test]
+    fn parse_sse_line_non_data_prefix_returns_none() {
+        assert!(parse_sse_line("event: ping").is_none());
+    }
+
+    #[test]
+    fn parse_sse_line_malformed_json_returns_none_does_not_panic() {
+        assert!(parse_sse_line(r#"data: {not json"#).is_none());
+    }
+
+    #[test]
+    fn parse_sse_line_with_tool_call_fragment_extracts_index_and_function_name() {
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_42","function":{"name":"shell","arguments":""}}]},"index":0}]}"#;
+        let payload = parse_sse_line(line).expect("parse should succeed");
+        let delta = delta_or_panic(payload);
+        let tcs = delta.tool_calls.expect("tool_calls present");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].index, 0);
+        assert_eq!(tcs[0].id.as_deref(), Some("call_42"));
+        let func = tcs[0].function.as_ref().expect("function present");
+        assert_eq!(func.name.as_deref(), Some("shell"));
+    }
+
+    #[test]
+    fn parse_sse_line_with_tool_call_arg_fragment_only_has_arguments() {
+        // Subsequent tool-call deltas typically only carry an arguments slice.
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\""}}]},"index":0}]}"#;
+        let payload = parse_sse_line(line).expect("parse should succeed");
+        let delta = delta_or_panic(payload);
+        let tc = &delta.tool_calls.expect("tool_calls present")[0];
+        assert!(tc.id.is_none());
+        let func = tc.function.as_ref().expect("function present");
+        assert!(func.name.is_none());
+        assert_eq!(func.arguments.as_deref(), Some(r#"{"cmd""#));
+    }
+
+    #[test]
+    fn accumulated_tool_call_assembles_fragments_in_order() {
+        // Simulate three SSE deltas for one tool call: header + arg fragments.
+        let mut acc = AccumulatedToolCall::default();
+        acc.id = Some("call_42".to_string());
+        acc.name.push_str("shell");
+        acc.arguments.push_str(r#"{"cmd":""#);
+        acc.arguments.push_str("ls");
+        acc.arguments.push_str(r#""}"#);
+        assert_eq!(acc.id.as_deref(), Some("call_42"));
+        assert_eq!(acc.name, "shell");
+        assert_eq!(acc.arguments, r#"{"cmd":"ls"}"#);
     }
 }

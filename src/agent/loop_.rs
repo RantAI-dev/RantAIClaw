@@ -1343,22 +1343,69 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
-        let chat_future = provider.chat(
-            ChatRequest {
-                messages: &prepared_messages.messages,
-                tools: request_tools,
-            },
-            model,
-            temperature,
-        );
+        // True streaming path: when an events channel is attached and the
+        // provider opts into streaming, use `chat_stream` so text deltas
+        // arrive in real time. Tool calls + final text still get assembled
+        // into a `ChatResponse` so the rest of the loop is unchanged.
+        let streamed_inline = events.is_some() && provider.supports_streaming();
 
-        let chat_result = if let Some(token) = cancellation_token.as_ref() {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_future => result,
+        let chat_result = if streamed_inline {
+            let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
+            let events_for_forwarder = events.clone();
+            let cancel_for_forwarder = cancellation_token.clone();
+            let stream_future = provider.chat_stream(
+                ChatRequest {
+                    messages: &prepared_messages.messages,
+                    tools: request_tools,
+                },
+                model,
+                temperature,
+                text_tx,
+            );
+            let forwarder = async move {
+                while let Some(piece) = text_rx.recv().await {
+                    if cancel_for_forwarder
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        break;
+                    }
+                    if let Some(ref tx) = events_for_forwarder {
+                        if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            };
+            let combined = async {
+                let (r, ()) = tokio::join!(stream_future, forwarder);
+                r
+            };
+            if let Some(token) = cancellation_token.as_ref() {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = combined => result,
+                }
+            } else {
+                combined.await
             }
         } else {
-            chat_future.await
+            let chat_future = provider.chat(
+                ChatRequest {
+                    messages: &prepared_messages.messages,
+                    tools: request_tools,
+                },
+                model,
+                temperature,
+            );
+            if let Some(token) = cancellation_token.as_ref() {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = chat_future => result,
+                }
+            } else {
+                chat_future.await
+            }
         };
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
@@ -1425,9 +1472,12 @@ pub(crate) async fn run_tool_call_loop(
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
-            // If a streaming sender is provided, relay the text in small chunks
-            // so the channel can progressively update the draft message.
-            if events.is_some() || on_delta.is_some() {
+            // If a streaming sender is provided AND we did NOT already stream
+            // inline via `chat_stream`, relay the text in small chunks so the
+            // channel can progressively update the draft message. When
+            // `streamed_inline` is true, chunks were emitted during the
+            // provider call, so we skip the post-response chunking.
+            if (events.is_some() || on_delta.is_some()) && !streamed_inline {
                 // Split on whitespace boundaries, accumulating chunks of at least
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 // When `events` is Some, emit AgentEvent::Chunk and ignore `on_delta`
