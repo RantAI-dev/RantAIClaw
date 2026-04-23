@@ -396,6 +396,35 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// Streaming variant of [`chat`] that forwards text deltas to `text_tx`
+    /// as they arrive from the provider, while still accumulating the full
+    /// response (text + tool calls) for the caller.
+    ///
+    /// `text_tx` receives plain text fragments — the caller is responsible
+    /// for wrapping them into `AgentEvent::Chunk` (or whatever event shape
+    /// it needs). Keeping the trait dependency on a primitive `String`
+    /// channel preserves the provider/agent layering.
+    ///
+    /// Default implementation simply delegates to non-streaming
+    /// [`chat`] and emits the entire text as a single fragment, so
+    /// callers always get *some* signal even from providers that have
+    /// not yet implemented true SSE.
+    async fn chat_stream(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        text_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<ChatResponse> {
+        let response = self.chat(request, model, temperature).await?;
+        if let Some(text) = response.text.as_deref() {
+            if !text.is_empty() {
+                let _ = text_tx.send(text.to_string()).await;
+            }
+        }
+        Ok(response)
+    }
+
     /// Streaming chat with optional system prompt.
     /// Returns an async stream of text chunks.
     /// Default implementation falls back to non-streaming chat.
