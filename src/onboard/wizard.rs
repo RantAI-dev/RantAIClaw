@@ -10,6 +10,7 @@ use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
+use crate::onboard::ui;
 use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
     is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
@@ -100,19 +101,7 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
 // ── Main wizard entry point ──────────────────────────────────────
 
 pub async fn run_wizard(force: bool) -> Result<Config> {
-    println!("{}", style(BANNER).cyan().bold());
-
-    println!(
-        "  {}",
-        style("Welcome to RantaiClaw — the fastest, smallest AI assistant.")
-            .white()
-            .bold()
-    );
-    println!(
-        "  {}",
-        style("This wizard will configure your agent in under 60 seconds.").dim()
-    );
-    println!();
+    ui::print_welcome_banner();
 
     print_step(1, 9, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace()?;
@@ -233,6 +222,14 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         }
     }
 
+    if console::user_attended() {
+        ui::print_completion_banner(&[
+            "rantaiclaw chat       — start an interactive session",
+            "rantaiclaw agent      — run the autonomous agent loop",
+            "rantaiclaw status     — verify installation",
+        ]);
+    }
+
     Ok(config)
 }
 
@@ -283,6 +280,10 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
             // Signal to main.rs to call start_channels after wizard returns
             std::env::set_var("RANTAICLAW_AUTOSTART_CHANNELS", "1");
         }
+    }
+
+    if console::user_attended() {
+        ui::print_completion_banner(&["rantaiclaw status     — verify channels are configured"]);
     }
 
     Ok(config)
@@ -528,6 +529,13 @@ async fn run_quick_setup_with_home(
         println!("    3. Status:   rantaiclaw status");
     }
     println!();
+
+    if console::user_attended() {
+        ui::print_completion_banner(&[
+            "rantaiclaw chat       — start an interactive session",
+            "rantaiclaw status     — verify installation",
+        ]);
+    }
 
     Ok(config)
 }
@@ -1613,13 +1621,7 @@ pub fn run_models_refresh(
 // ── Step helpers ─────────────────────────────────────────────────
 
 fn print_step(current: u8, total: u8, title: &str) {
-    println!();
-    println!(
-        "  {} {}",
-        style(format!("[{current}/{total}]")).cyan().bold(),
-        style(title).white().bold()
-    );
-    println!("  {}", style("─".repeat(50)).dim());
+    ui::print_section_header(current, total, title);
 }
 
 fn print_bullet(text: &str) {
