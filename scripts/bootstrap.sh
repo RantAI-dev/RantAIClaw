@@ -1059,12 +1059,13 @@ MSG
   fi
 fi
 
-cat <<'DONE'
-
-✅ Bootstrap complete.
-
-Next steps:
-  rantaiclaw status
-  rantaiclaw agent -m "Hello, RantaiClaw!"
-  rantaiclaw gateway
-DONE
+# Show success banner only when real install work was performed.
+# Pure --skip-build --skip-install runs (no prebuilt either) get a plain notice.
+if [[ "$SKIP_BUILD" == "true" && "$SKIP_INSTALL" == "true" && "$PREBUILT_INSTALLED" == "false" ]]; then
+  success "Skipped install per flags (--skip-build --skip-install)"
+else
+  print_success_banner \
+    "rantaiclaw chat       — start an interactive session" \
+    "rantaiclaw agent      — run the autonomous agent loop" \
+    "rantaiclaw status     — verify installation"
+fi
