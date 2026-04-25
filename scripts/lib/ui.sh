@@ -117,3 +117,49 @@ step() {
   shift
   printf '\n%s%s[%s]%s %s\n' "$__UI_BOLD" "$__UI_CYAN" "$progress" "$__UI_RESET" "$*"
 }
+
+# Braille spinner. Backgrounded subshell + carriage-return overwrite.
+# Falls back to a plain info line when stdout is not a TTY (capture-safe).
+__UI_SPINNER_PID=""
+__UI_SPINNER_FRAMES='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+spinner_start() {
+  local msg="$*"
+  __UI_SPINNER_MSG="$msg"
+  if [[ "$__UI_COLOR" != "1" || ! -t 1 ]]; then
+    info "$msg…"
+    __UI_SPINNER_PID=""
+    return
+  fi
+  (
+    local i=0
+    local frame
+    while :; do
+      frame="${__UI_SPINNER_FRAMES:i:1}"
+      i=$(((i + 1) % ${#__UI_SPINNER_FRAMES}))
+      printf '\r%s%s%s %s' "$__UI_CYAN" "$frame" "$__UI_RESET" "$msg" >&2
+      sleep 0.1
+    done
+  ) &
+  __UI_SPINNER_PID=$!
+  disown "$__UI_SPINNER_PID" 2>/dev/null || true
+}
+
+__ui_spinner_kill() {
+  if [[ -n "$__UI_SPINNER_PID" ]]; then
+    kill "$__UI_SPINNER_PID" 2>/dev/null || true
+    wait "$__UI_SPINNER_PID" 2>/dev/null || true
+    printf '\r\033[K' >&2
+    __UI_SPINNER_PID=""
+  fi
+}
+
+spinner_stop() {
+  __ui_spinner_kill
+  success "$*"
+}
+
+spinner_stop_fail() {
+  __ui_spinner_kill
+  error "$*"
+}

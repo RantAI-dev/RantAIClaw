@@ -56,5 +56,20 @@ out=$(NO_COLOR=1 bash -c "source '$UI_LIB' && step '3/7' 'Installing system deps
 assert_contains '[3/7]' "$out" 'step shows N/T in brackets'
 assert_contains 'Installing system deps' "$out" 'step shows title'
 
+# Spinner: in non-TTY mode (under bash -c capture), should fall back to plain info-style line.
+out=$(NO_COLOR=1 bash -c "
+  source '$UI_LIB'
+  spinner_start 'Building'
+  spinner_stop 'Built rantaiclaw'
+")
+assert_contains 'Built rantaiclaw' "$out" 'spinner_stop produces success line'
+
+out=$(NO_COLOR=1 bash -c "
+  source '$UI_LIB'
+  spinner_start 'Building'
+  spinner_stop_fail 'Build failed'
+" 2>&1)
+assert_contains 'Build failed' "$out" 'spinner_stop_fail produces error line'
+
 printf '\n%d pass, %d fail\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
