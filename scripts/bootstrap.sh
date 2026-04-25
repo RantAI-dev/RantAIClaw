@@ -207,7 +207,11 @@ install_prebuilt_binary() {
   archive_path="$temp_dir/rantaiclaw-${target}.tar.gz"
 
   next_step "Attempting pre-built binary install for target: $target"
-  if ! curl -fsSL "$archive_url" -o "$archive_path"; then
+  spinner_start "Downloading prebuilt binary for $target"
+  if curl -fsSL "$archive_url" -o "$archive_path"; then
+    spinner_stop "Downloaded prebuilt binary"
+  else
+    spinner_stop_fail "Download failed"
     warn "Could not download release asset: $archive_url"
     rm -rf "$temp_dir"
     return 1
@@ -434,7 +438,14 @@ install_rust_toolchain() {
   fi
 
   next_step "Installing Rust via rustup"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  spinner_start "Installing Rust toolchain via rustup"
+  if curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; then
+    spinner_stop "Rust toolchain installed"
+  else
+    spinner_stop_fail "Rust toolchain installation failed"
+    error "rustup installer exited non-zero."
+    exit 1
+  fi
 
   if [[ -f "$HOME/.cargo/env" ]]; then
     # shellcheck disable=SC1090
@@ -984,14 +995,28 @@ fi
 
 if [[ "$SKIP_BUILD" == false ]]; then
   next_step "Building release binary"
-  cargo build --release --locked
+  spinner_start "Building rantaiclaw (cargo build --release)"
+  if cargo build --release --locked; then
+    spinner_stop "Build complete"
+  else
+    spinner_stop_fail "Build failed"
+    error "cargo build failed; see output above for details."
+    exit 1
+  fi
 else
   info "Skipping build"
 fi
 
 if [[ "$SKIP_INSTALL" == false ]]; then
   next_step "Installing rantaiclaw to cargo bin"
-  cargo install --path "$WORK_DIR" --force --locked
+  spinner_start "Installing rantaiclaw to cargo bin"
+  if cargo install --path "$WORK_DIR" --force --locked; then
+    spinner_stop "Installed rantaiclaw"
+  else
+    spinner_stop_fail "cargo install failed"
+    error "cargo install failed; see output above for details."
+    exit 1
+  fi
 else
   info "Skipping install"
 fi
