@@ -333,7 +333,7 @@ bool_to_word() {
   fi
 }
 
-prompt_yes_no() {
+ask_yes_no() {
   local question="$1"
   local default_answer="${2:-yes}"
   local prompt=""
@@ -475,11 +475,11 @@ run_guided_installer() {
   echo
 
   if [[ "$os_name" == "Linux" ]]; then
-    if prompt_yes_no "Install Linux build dependencies (toolchain/pkg-config/git/curl)?" "yes"; then
+    if ask_yes_no "Install Linux build dependencies (toolchain/pkg-config/git/curl)?" "yes"; then
       INSTALL_SYSTEM_DEPS=true
     fi
   else
-    if prompt_yes_no "Install system dependencies for $os_name?" "no"; then
+    if ask_yes_no "Install system dependencies for $os_name?" "no"; then
       INSTALL_SYSTEM_DEPS=true
     fi
   fi
@@ -487,26 +487,26 @@ run_guided_installer() {
   if have_cmd cargo && have_cmd rustc; then
     info "Detected Rust toolchain: $(rustc --version)"
   else
-    if prompt_yes_no "Rust toolchain not found. Install Rust via rustup now?" "yes"; then
+    if ask_yes_no "Rust toolchain not found. Install Rust via rustup now?" "yes"; then
       INSTALL_RUST=true
     fi
   fi
 
-  if prompt_yes_no "Run a separate prebuild before install?" "yes"; then
+  if ask_yes_no "Run a separate prebuild before install?" "yes"; then
     SKIP_BUILD=false
   else
     SKIP_BUILD=true
   fi
 
-  if prompt_yes_no "Install rantaiclaw into cargo bin now?" "yes"; then
+  if ask_yes_no "Install rantaiclaw into cargo bin now?" "yes"; then
     SKIP_INSTALL=false
   else
     SKIP_INSTALL=true
   fi
 
-  if prompt_yes_no "Run onboarding after install?" "no"; then
+  if ask_yes_no "Run onboarding after install?" "no"; then
     RUN_ONBOARD=true
-    if prompt_yes_no "Use interactive onboarding?" "yes"; then
+    if ask_yes_no "Use interactive onboarding?" "yes"; then
       INTERACTIVE_ONBOARD=true
     else
       INTERACTIVE_ONBOARD=false
@@ -559,7 +559,7 @@ run_guided_installer() {
   fi
 
   echo
-  if ! prompt_yes_no "Proceed with this install plan?" "yes"; then
+  if ! ask_yes_no "Proceed with this install plan?" "yes"; then
     info "Installation canceled by user."
     exit 0
   fi
