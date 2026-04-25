@@ -102,6 +102,37 @@ pub fn print_welcome_banner() {
     print!("{}", render_welcome_banner());
 }
 
+/// Render (without printing) the wizard completion banner with optional
+/// next-step bullets.
+pub fn render_completion_banner(next_steps: &[&str]) -> String {
+    let frame = green().bold();
+    let arrow = cyan().apply_to("→");
+    let mut out = String::new();
+    out.push('\n');
+    writeln!(out, "{}", frame.apply_to(format!("┌{BANNER_INNER}┐"))).unwrap();
+    writeln!(
+        out,
+        "{}",
+        frame.apply_to("│            ✓ Setup Complete!                            │")
+    )
+    .unwrap();
+    writeln!(out, "{}", frame.apply_to(format!("└{BANNER_INNER}┘"))).unwrap();
+    if !next_steps.is_empty() {
+        writeln!(out, "\n{} Next steps:", arrow).unwrap();
+        for line in next_steps {
+            writeln!(out, "  {} {}", cyan().apply_to("•"), line).unwrap();
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// Print the wizard completion banner. Called at the success path of
+/// `run_wizard`, `run_quick_setup_with_home`, and `run_channels_repair_wizard`.
+pub fn print_completion_banner(next_steps: &[&str]) {
+    print!("{}", render_completion_banner(next_steps));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +200,27 @@ mod tests {
         );
         assert!(stripped.contains("┌"));
         assert!(stripped.contains("└"));
+    }
+
+    #[test]
+    fn completion_banner_includes_all_next_steps() {
+        let rendered = render_completion_banner(&[
+            "rantaiclaw chat — start a session",
+            "rantaiclaw status — verify installation",
+        ]);
+        let stripped = strip_ansi_codes(&rendered);
+        assert!(stripped.contains("Setup Complete"), "got {stripped:?}");
+        assert!(stripped.contains("rantaiclaw chat"));
+        assert!(stripped.contains("rantaiclaw status"));
+        assert!(stripped.contains("Next steps"));
+    }
+
+    #[test]
+    fn completion_banner_handles_empty_next_steps() {
+        let rendered = render_completion_banner(&[]);
+        let stripped = strip_ansi_codes(&rendered);
+        assert!(stripped.contains("Setup Complete"));
+        // No "Next steps" header when list is empty.
+        assert!(!stripped.contains("Next steps"));
     }
 }
