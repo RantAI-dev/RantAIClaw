@@ -52,5 +52,9 @@ out=$(NO_COLOR=1 bash -c "source '$UI_LIB' && print_success_banner 'Run rantaicl
 assert_contains 'Installation Complete' "$out" 'success banner contains title'
 assert_contains 'Run rantaiclaw chat' "$out" 'success banner includes next step'
 
+out=$(NO_COLOR=1 bash -c "source '$UI_LIB' && step '3/7' 'Installing system deps'")
+assert_contains '[3/7]' "$out" 'step shows N/T in brackets'
+assert_contains 'Installing system deps' "$out" 'step shows title'
+
 printf '\n%d pass, %d fail\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

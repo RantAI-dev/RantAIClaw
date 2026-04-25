@@ -110,3 +110,10 @@ print_success_banner() {
   fi
   printf '\n'
 }
+
+# step "N/T" "title" — bold cyan [N/T] step label, plain title after.
+step() {
+  local progress="$1"
+  shift
+  printf '\n%s%s[%s]%s %s\n' "$__UI_BOLD" "$__UI_CYAN" "$progress" "$__UI_RESET" "$*"
+}
