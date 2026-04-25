@@ -125,7 +125,6 @@ __UI_SPINNER_FRAMES='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
 spinner_start() {
   local msg="$*"
-  __UI_SPINNER_MSG="$msg"
   if [[ "$__UI_COLOR" != "1" || ! -t 1 ]]; then
     info "$msg…"
     __UI_SPINNER_PID=""
