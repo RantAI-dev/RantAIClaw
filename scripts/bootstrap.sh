@@ -335,7 +335,7 @@ bool_to_word() {
 
 prompt_yes_no() {
   local question="$1"
-  local default_answer="$2"
+  local default_answer="${2:-yes}"
   local prompt=""
   local answer=""
 
@@ -346,9 +346,13 @@ prompt_yes_no() {
   fi
 
   while true; do
-    if ! read -r -p "$question $prompt " answer; then
-      error "guided installer input was interrupted."
-      exit 1
+    if [[ "$IS_INTERACTIVE" == "true" ]]; then
+      read -r -p "$question $prompt " answer || answer=""
+    elif [[ -r /dev/tty && -w /dev/tty ]]; then
+      printf '%s %s ' "$question" "$prompt" > /dev/tty
+      IFS= read -r answer < /dev/tty || answer=""
+    else
+      answer=""
     fi
     answer="${answer:-$default_answer}"
     case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
@@ -506,29 +510,18 @@ run_guided_installer() {
       INTERACTIVE_ONBOARD=true
     else
       INTERACTIVE_ONBOARD=false
-      if ! read -r -p "Provider [$PROVIDER]: " provider_input; then
-        error "guided installer input was interrupted."
-        exit 1
-      fi
+      provider_input="$(prompt_input "Provider" "$PROVIDER")"
       if [[ -n "$provider_input" ]]; then
         PROVIDER="$provider_input"
       fi
 
-      if ! read -r -p "Model [${MODEL:-leave empty}]: " model_input; then
-        error "guided installer input was interrupted."
-        exit 1
-      fi
+      model_input="$(prompt_input "Model" "${MODEL:-}")"
       if [[ -n "$model_input" ]]; then
         MODEL="$model_input"
       fi
 
       if [[ -z "$API_KEY" ]]; then
-        if ! read -r -s -p "API key (hidden, leave empty to switch to interactive onboarding): " api_key_input; then
-          echo
-          error "guided installer input was interrupted."
-          exit 1
-        fi
-        echo
+        api_key_input="$(prompt_input_secret "API key (hidden, leave empty to switch to interactive onboarding)")"
         if [[ -n "$api_key_input" ]]; then
           API_KEY="$api_key_input"
         else
