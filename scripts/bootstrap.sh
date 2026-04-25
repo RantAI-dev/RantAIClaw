@@ -1,17 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-info() {
-  echo "==> $*"
-}
+__BOOTSTRAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || pwd)"
 
-warn() {
-  echo "warning: $*" >&2
-}
+# Source UX helpers; fall back to minimal definitions if missing
+# (defensive — partial checkout, network-fetched single file, etc.).
+if [[ -r "$__BOOTSTRAP_DIR/lib/ui.sh" ]]; then
+  # shellcheck source=lib/ui.sh
+  source "$__BOOTSTRAP_DIR/lib/ui.sh"
+else
+  info()    { printf '==> %s\n' "$*"; }
+  success() { printf 'OK %s\n' "$*"; }
+  warn()    { printf 'warning: %s\n' "$*" >&2; }
+  error()   { printf 'error: %s\n' "$*" >&2; }
+  step()    { printf '\n[%s] %s\n' "$1" "${*:2}"; }
+  print_banner()         { printf '== RantaiClaw Installer ==\n'; }
+  print_success_banner() { printf '== Installation Complete ==\n'; for s in "$@"; do printf '  - %s\n' "$s"; done; }
+  spinner_start()       { info "$*…"; }
+  spinner_stop()        { success "$*"; }
+  spinner_stop_fail()   { error "$*"; }
+  IS_INTERACTIVE=true
+  [[ ! -t 0 ]] && IS_INTERACTIVE=false
+  prompt_yes_no() { local d="${2:-yes}"; case "$d" in [yY]*|1|true) return 0 ;; *) return 1 ;; esac; }
+  prompt_input() { printf '%s' "${2:-}"; }
+  prompt_input_secret() { printf ''; }
+fi
 
-error() {
-  echo "error: $*" >&2
-}
+# Defensive trap: kill spinner if bootstrap exits mid-step.
+trap '__ui_spinner_kill 2>/dev/null || true' EXIT
 
 usage() {
   cat <<'USAGE'
@@ -787,6 +803,9 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Opening banner — sets the visual identity for the install run.
+print_banner
 
 OS_NAME="$(uname -s)"
 if [[ "$GUIDED_MODE" == "auto" ]]; then
