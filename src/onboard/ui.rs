@@ -56,6 +56,29 @@ pub fn error(msg: &str) {
     println!("{} {}", red().apply_to("✗"), msg);
 }
 
+const BANNER_INNER: &str = "─────────────────────────────────────────────────────────";
+
+/// Render (without printing) a framed section header. Used in tests; production
+/// callers use `print_section_header`.
+pub fn render_section_header(current: u8, total: u8, title: &str) -> String {
+    let label = format!("Step {current}/{total}: {title}");
+    let inner_width = BANNER_INNER.chars().count();
+    let pad = inner_width.saturating_sub(label.chars().count() + 4);
+    let top = format!(
+        "{}{}",
+        cyan().apply_to(format!("┌─ {label} ")),
+        cyan().apply_to(format!("{}┐", "─".repeat(pad))),
+    );
+    let bottom = format!("{}", cyan().apply_to(format!("└{BANNER_INNER}┘")));
+    format!("{top}\n{bottom}\n")
+}
+
+/// Print a framed cyan section header announcing the current step.
+pub fn print_section_header(current: u8, total: u8, title: &str) {
+    println!();
+    print!("{}", render_section_header(current, total, title));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +110,25 @@ mod tests {
     fn error_glyph_strips_to_cross() {
         let rendered = format!("{}", red().apply_to("✗"));
         assert_eq!(strip_ansi_codes(&rendered), "✗");
+    }
+
+    #[test]
+    fn section_header_format_includes_step_and_title() {
+        let rendered = render_section_header(3, 7, "Provider Selection");
+        let stripped = strip_ansi_codes(&rendered);
+        assert!(
+            stripped.contains("Step 3/7: Provider Selection"),
+            "got {stripped:?}"
+        );
+        assert!(stripped.contains("┌"), "missing top frame: {stripped:?}");
+        assert!(
+            stripped.contains("┐"),
+            "missing top-right frame: {stripped:?}"
+        );
+        assert!(stripped.contains("└"), "missing bottom frame: {stripped:?}");
+        assert!(
+            stripped.contains("┘"),
+            "missing bottom-right frame: {stripped:?}"
+        );
     }
 }
