@@ -26,8 +26,6 @@ else
   prompt_input_secret() { printf ''; }
 fi
 
-# Defensive trap: kill spinner if bootstrap exits mid-step.
-trap '__ui_spinner_kill 2>/dev/null || true' EXIT
 
 usage() {
   cat <<'USAGE'
@@ -884,6 +882,7 @@ TEMP_CLONE=false
 TEMP_DIR=""
 
 cleanup() {
+  __ui_spinner_kill 2>/dev/null || true
   if [[ "$TEMP_CLONE" == true && -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
     rm -rf "$TEMP_DIR"
   fi
@@ -937,19 +936,10 @@ if [[ "$DOCKER_MODE" == true ]]; then
     fi
   fi
   run_docker_bootstrap
-  cat <<'DONE'
-
-✅ Docker bootstrap complete.
-
-Your containerized RantaiClaw data is persisted under:
-DONE
-  echo "  $DOCKER_DATA_DIR"
-  cat <<'DONE'
-
-Next steps:
-  ./rantaiclaw_install.sh --docker --interactive-onboard
-  ./rantaiclaw_install.sh --docker --api-key "sk-..." --provider openrouter
-DONE
+  print_success_banner \
+    "./rantaiclaw_install.sh --docker --interactive-onboard   — run guided onboarding" \
+    "./rantaiclaw_install.sh --docker --api-key \"sk-...\" --provider openrouter   — onboard non-interactively"
+  info "Containerized RantaiClaw data persisted under: $DOCKER_DATA_DIR"
   exit 0
 fi
 

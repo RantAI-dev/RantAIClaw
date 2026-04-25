@@ -50,12 +50,12 @@ pub fn success(msg: &str) {
 
 /// Print a yellow warn line with the `⚠` glyph.
 pub fn warn(msg: &str) {
-    println!("{} {}", yellow().apply_to("⚠"), msg);
+    eprintln!("{} {}", yellow().apply_to("⚠"), msg);
 }
 
 /// Print a red error line with the `✗` glyph.
 pub fn error(msg: &str) {
-    println!("{} {}", red().apply_to("✗"), msg);
+    eprintln!("{} {}", red().apply_to("✗"), msg);
 }
 
 const BANNER_INNER: &str = "─────────────────────────────────────────────────────────";
