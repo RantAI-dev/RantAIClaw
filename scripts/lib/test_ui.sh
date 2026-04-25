@@ -71,5 +71,25 @@ out=$(NO_COLOR=1 bash -c "
 " 2>&1)
 assert_contains 'Build failed' "$out" 'spinner_stop_fail produces error line'
 
+# prompt_yes_no — non-interactive (no /dev/tty available) returns default.
+out=$(NO_COLOR=1 bash -c "
+  source '$UI_LIB'
+  if prompt_yes_no 'Continue?' 'yes' </dev/null; then echo YES; else echo NO; fi
+" 2>/dev/null)
+assert_contains 'YES' "$out" 'prompt_yes_no returns yes-default under non-interactive stdin'
+
+out=$(NO_COLOR=1 bash -c "
+  source '$UI_LIB'
+  if prompt_yes_no 'Continue?' 'no' </dev/null; then echo YES; else echo NO; fi
+" 2>/dev/null)
+assert_contains 'NO' "$out" 'prompt_yes_no returns no-default under non-interactive stdin'
+
+# prompt_input — non-interactive returns default.
+out=$(NO_COLOR=1 bash -c "
+  source '$UI_LIB'
+  prompt_input 'Provider' 'openrouter' </dev/null
+" 2>/dev/null)
+assert_contains 'openrouter' "$out" 'prompt_input returns default under non-interactive stdin'
+
 printf '\n%d pass, %d fail\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

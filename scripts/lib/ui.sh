@@ -162,3 +162,89 @@ spinner_stop_fail() {
   __ui_spinner_kill
   error "$*"
 }
+
+# IS_INTERACTIVE detects whether stdin is a TTY at script start.
+# Sourced scripts re-detect; consumers may override after sourcing.
+if [[ -t 0 ]]; then
+  IS_INTERACTIVE=true
+else
+  IS_INTERACTIVE=false
+fi
+
+# prompt_yes_no "Question?" "yes|no" — returns 0 for yes, 1 for no.
+# Default is used when input is empty or unavailable.
+prompt_yes_no() {
+  local question="$1"
+  local default="${2:-yes}"
+  local prompt_suffix
+  case "$default" in
+    [yY]|[yY][eE][sS]|1|true|TRUE) prompt_suffix="[Y/n]" ;;
+    *) prompt_suffix="[y/N]" ;;
+  esac
+
+  local answer=""
+  if [[ "$IS_INTERACTIVE" == "true" ]]; then
+    read -r -p "$question $prompt_suffix " answer || answer=""
+  elif [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s %s ' "$question" "$prompt_suffix" > /dev/tty
+    IFS= read -r answer < /dev/tty || answer=""
+  else
+    answer=""
+  fi
+
+  # Trim surrounding whitespace.
+  answer="${answer#"${answer%%[![:space:]]*}"}"
+  answer="${answer%"${answer##*[![:space:]]}"}"
+
+  if [[ -z "$answer" ]]; then
+    case "$default" in
+      [yY]|[yY][eE][sS]|1|true|TRUE) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  case "$answer" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# prompt_input "Question" "default" — echoes the captured value (or default).
+prompt_input() {
+  local question="$1"
+  local default="${2:-}"
+  local suffix=""
+  [[ -n "$default" ]] && suffix=" [$default]"
+
+  local answer=""
+  if [[ "$IS_INTERACTIVE" == "true" ]]; then
+    read -r -p "$question$suffix: " answer || answer=""
+  elif [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s%s: ' "$question" "$suffix" > /dev/tty
+    IFS= read -r answer < /dev/tty || answer=""
+  else
+    answer=""
+  fi
+  answer="${answer#"${answer%%[![:space:]]*}"}"
+  answer="${answer%"${answer##*[![:space:]]}"}"
+  [[ -z "$answer" ]] && answer="$default"
+  printf '%s' "$answer"
+}
+
+# prompt_input_secret "Question" — echoes captured value, hidden during entry.
+prompt_input_secret() {
+  local question="$1"
+  local answer=""
+  if [[ "$IS_INTERACTIVE" == "true" ]]; then
+    read -r -s -p "$question: " answer || answer=""
+    printf '\n' >&2
+  elif [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf '%s: ' "$question" > /dev/tty
+    stty -echo < /dev/tty 2>/dev/null || true
+    IFS= read -r answer < /dev/tty || answer=""
+    stty echo < /dev/tty 2>/dev/null || true
+    printf '\n' > /dev/tty
+  else
+    answer=""
+  fi
+  printf '%s' "$answer"
+}
