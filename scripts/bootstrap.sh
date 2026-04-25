@@ -206,7 +206,7 @@ install_prebuilt_binary() {
   temp_dir="$(mktemp -d -t rantaiclaw-prebuilt-XXXXXX)"
   archive_path="$temp_dir/rantaiclaw-${target}.tar.gz"
 
-  info "Attempting pre-built binary install for target: $target"
+  next_step "Attempting pre-built binary install for target: $target"
   if ! curl -fsSL "$archive_url" -o "$archive_path"; then
     warn "Could not download release asset: $archive_url"
     rm -rf "$temp_dir"
@@ -362,7 +362,7 @@ prompt_yes_no() {
 }
 
 install_system_deps() {
-  info "Installing system dependencies"
+  next_step "Installing system dependencies"
 
   case "$(uname -s)" in
     Linux)
@@ -433,7 +433,7 @@ install_rust_toolchain() {
     exit 1
   fi
 
-  info "Installing Rust via rustup"
+  next_step "Installing Rust via rustup"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
   if [[ -f "$HOME/.cargo/env" ]]; then
@@ -804,6 +804,30 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Compute total visible steps from CLI flag combination so [N/T] labels
+# show a stable progress denominator across the whole install.
+compute_step_total() {
+  local total=2  # preflight + final install
+  [[ "${INSTALL_SYSTEM_DEPS:-false}" == "true" ]] && total=$((total + 1))
+  [[ "${INSTALL_RUST:-false}" == "true" ]] && total=$((total + 1))
+  if [[ "${PREBUILT_ONLY:-false}" == "true" ]]; then
+    total=$((total + 1))   # prebuilt fetch
+  elif [[ "${SKIP_BUILD:-false}" != "true" ]]; then
+    total=$((total + 2))   # source fetch + build
+  fi
+  [[ "${RUN_ONBOARD:-false}" == "true" ]] && total=$((total + 1))
+  __STEP_TOTAL="$total"
+  __STEP_CURRENT=0
+}
+
+# Increment step counter and print a step label.
+next_step() {
+  __STEP_CURRENT=$((__STEP_CURRENT + 1))
+  step "$__STEP_CURRENT/$__STEP_TOTAL" "$1"
+}
+
+compute_step_total
+
 # Opening banner — sets the visual identity for the install run.
 print_banner
 
@@ -886,7 +910,7 @@ if [[ ! -f "$WORK_DIR/Cargo.toml" ]]; then
   fi
 fi
 
-info "RantaiClaw bootstrap"
+next_step "RantaiClaw bootstrap"
 echo "    workspace: $WORK_DIR"
 
 cd "$WORK_DIR"
@@ -959,14 +983,14 @@ MSG
 fi
 
 if [[ "$SKIP_BUILD" == false ]]; then
-  info "Building release binary"
+  next_step "Building release binary"
   cargo build --release --locked
 else
   info "Skipping build"
 fi
 
 if [[ "$SKIP_INSTALL" == false ]]; then
-  info "Installing rantaiclaw to cargo bin"
+  next_step "Installing rantaiclaw to cargo bin"
   cargo install --path "$WORK_DIR" --force --locked
 else
   info "Skipping install"
@@ -989,7 +1013,7 @@ if [[ "$RUN_ONBOARD" == true ]]; then
   fi
 
   if [[ "$INTERACTIVE_ONBOARD" == true ]]; then
-    info "Running interactive onboarding"
+    next_step "Running interactive onboarding"
     "$RANTAICLAW_BIN" onboard --interactive
   else
     if [[ -z "$API_KEY" ]]; then
@@ -1005,9 +1029,9 @@ MSG
       exit 1
     fi
     if [[ -n "$MODEL" ]]; then
-      info "Running quick onboarding (provider: $PROVIDER, model: $MODEL)"
+      next_step "Running quick onboarding (provider: $PROVIDER, model: $MODEL)"
     else
-      info "Running quick onboarding (provider: $PROVIDER)"
+      next_step "Running quick onboarding (provider: $PROVIDER)"
     fi
     ONBOARD_CMD=("$RANTAICLAW_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
     if [[ -n "$MODEL" ]]; then
