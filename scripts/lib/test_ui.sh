@@ -36,7 +36,9 @@ out=$(NO_COLOR=1 bash -c "source '$UI_LIB' && error 'oops'" 2>&1)
 assert_contains '✗ oops' "$out" 'error emits cross + message under NO_COLOR'
 
 # Color-on path simulated by clearing NO_COLOR and forcing __UI_COLOR=1.
-out=$(unset NO_COLOR; bash -c "__UI_FORCE_COLOR=1 source '$UI_LIB' && info 'colored'")
+# Use `env` to set __UI_FORCE_COLOR for the bash -c invocation — avoids
+# reliance on special-builtin assignment semantics inside the subshell.
+out=$(env -u NO_COLOR __UI_FORCE_COLOR=1 bash -c "source '$UI_LIB' && info 'colored'")
 assert_contains $'\033[' "$out" 'info emits ANSI escape when forced color'
 assert_contains 'colored' "$out" 'info still includes message under color'
 
