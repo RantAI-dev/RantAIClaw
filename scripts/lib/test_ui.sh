@@ -42,5 +42,15 @@ out=$(env -u NO_COLOR __UI_FORCE_COLOR=1 bash -c "source '$UI_LIB' && info 'colo
 assert_contains $'\033[' "$out" 'info emits ANSI escape when forced color'
 assert_contains 'colored' "$out" 'info still includes message under color'
 
+# Banners.
+out=$(NO_COLOR=1 bash -c "source '$UI_LIB' && print_banner")
+assert_contains 'RantaiClaw Installer' "$out" 'print_banner contains title'
+assert_contains '┌' "$out" 'print_banner contains box-drawing top'
+assert_contains '└' "$out" 'print_banner contains box-drawing bottom'
+
+out=$(NO_COLOR=1 bash -c "source '$UI_LIB' && print_success_banner 'Run rantaiclaw chat'")
+assert_contains 'Installation Complete' "$out" 'success banner contains title'
+assert_contains 'Run rantaiclaw chat' "$out" 'success banner includes next step'
+
 printf '\n%d pass, %d fail\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

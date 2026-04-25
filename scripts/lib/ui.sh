@@ -77,3 +77,36 @@ warn() {
 error() {
   printf '%s✗%s %s\n' "$__UI_RED" "$__UI_RESET" "$*" >&2
 }
+
+# Box-drawing banner — fixed 59-column inner width matches Hermes' style.
+# Avoids dynamic `tput cols` so output is stable under non-TTY widths.
+__UI_BANNER_INNER='─────────────────────────────────────────────────────────'
+
+print_banner() {
+  printf '\n'
+  printf '%s%s┌%s┐%s\n' "$__UI_MAGENTA" "$__UI_BOLD" "$__UI_BANNER_INNER" "$__UI_RESET"
+  printf '%s%s│            ⚙ RantaiClaw Installer                       │%s\n' \
+    "$__UI_MAGENTA" "$__UI_BOLD" "$__UI_RESET"
+  printf '%s%s├%s┤%s\n' "$__UI_MAGENTA" "$__UI_BOLD" "$__UI_BANNER_INNER" "$__UI_RESET"
+  printf '%s%s│  Multi-Agent Runtime for Production AI Employees        │%s\n' \
+    "$__UI_MAGENTA" "$__UI_BOLD" "$__UI_RESET"
+  printf '%s%s└%s┘%s\n' "$__UI_MAGENTA" "$__UI_BOLD" "$__UI_BANNER_INNER" "$__UI_RESET"
+  printf '\n'
+}
+
+# print_success_banner [next_step ...]
+# Each argument becomes one bullet line under the banner.
+print_success_banner() {
+  printf '\n'
+  printf '%s%s┌%s┐%s\n' "$__UI_GREEN" "$__UI_BOLD" "$__UI_BANNER_INNER" "$__UI_RESET"
+  printf '%s%s│            ✓ Installation Complete!                     │%s\n' \
+    "$__UI_GREEN" "$__UI_BOLD" "$__UI_RESET"
+  printf '%s%s└%s┘%s\n' "$__UI_GREEN" "$__UI_BOLD" "$__UI_BANNER_INNER" "$__UI_RESET"
+  if [[ "$#" -gt 0 ]]; then
+    printf '\n%s→%s Next steps:\n' "$__UI_CYAN" "$__UI_RESET"
+    for line in "$@"; do
+      printf '  %s•%s %s\n' "$__UI_CYAN" "$__UI_RESET" "$line"
+    done
+  fi
+  printf '\n'
+}
