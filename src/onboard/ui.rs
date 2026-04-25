@@ -4,6 +4,8 @@
 //! between the bash bootstrap phase and the Rust wizard phase reads as one
 //! product. Pure presentation; no side effects.
 
+use std::fmt::Write as FmtWrite;
+
 use console::Style;
 
 /// Cyan style used for `info` glyphs and step counters.
@@ -79,6 +81,27 @@ pub fn print_section_header(current: u8, total: u8, title: &str) {
     print!("{}", render_section_header(current, total, title));
 }
 
+/// Render (without printing) the wizard welcome banner.
+pub fn render_welcome_banner() -> String {
+    let style = magenta().bold();
+    let mut out = String::new();
+    out.push('\n');
+    let _ = writeln!(out, "{}", style.apply_to(format!("┌{BANNER_INNER}┐")));
+    let _ = writeln!(
+        out,
+        "{}",
+        style.apply_to("│            ⚙ RantaiClaw Setup Wizard                    │")
+    );
+    let _ = writeln!(out, "{}", style.apply_to(format!("└{BANNER_INNER}┘")));
+    out.push_str("  Let's get you configured. Press Ctrl-C to abort at any time.\n\n");
+    out
+}
+
+/// Print the wizard welcome banner. Called once at the top of `run_wizard`.
+pub fn print_welcome_banner() {
+    print!("{}", render_welcome_banner());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +153,21 @@ mod tests {
             stripped.contains("┘"),
             "missing bottom-right frame: {stripped:?}"
         );
+    }
+
+    #[test]
+    fn welcome_banner_contains_brand() {
+        let rendered = render_welcome_banner();
+        let stripped = strip_ansi_codes(&rendered);
+        assert!(
+            stripped.contains("RantaiClaw Setup Wizard"),
+            "got {stripped:?}"
+        );
+        assert!(
+            stripped.contains("Ctrl-C"),
+            "should mention abort hint: {stripped:?}"
+        );
+        assert!(stripped.contains("┌"));
+        assert!(stripped.contains("└"));
     }
 }
