@@ -220,8 +220,8 @@ journalctl --user -u rantaiclaw.service -f
 Both still work:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rantaiclaw-labs/rantaiclaw/main/scripts/bootstrap.sh | bash
-curl -fsSL https://raw.githubusercontent.com/rantaiclaw-labs/rantaiclaw/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install.sh | bash
 ```
 
 `install.sh` is a compatibility entry and forwards/falls back to bootstrap behavior.

@@ -9,10 +9,19 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/RantAI-dev/RantAIClaw/releases/latest"><img src="https://img.shields.io/github/v/release/RantAI-dev/RantAIClaw?label=release&color=blue" alt="latest release" /></a>
+  <a href="https://github.com/RantAI-dev/RantAIClaw/blob/main/LICENSE"><img src="https://img.shields.io/github/license/RantAI-dev/RantAIClaw" alt="license" /></a>
+  <a href="https://github.com/RantAI-dev/RantAIClaw/actions/workflows/ci-run.yml"><img src="https://img.shields.io/github/actions/workflow/status/RantAI-dev/RantAIClaw/ci-run.yml?branch=main&label=CI" alt="CI status" /></a>
+  <a href="https://github.com/RantAI-dev/RantAIClaw/stargazers"><img src="https://img.shields.io/github/stars/RantAI-dev/RantAIClaw?style=social" alt="stars" /></a>
+</p>
+
+<p align="center">
+  <a href="docs/install.md"><strong>Install</strong></a> ·
   <a href="https://clawhub.ai">ClawHub Skills</a> ·
-  <a href="docs/config-reference.md">Config Reference</a> ·
+  <a href="docs/config-reference.md">Config</a> ·
   <a href="docs/channels-reference.md">Channels</a> ·
   <a href="docs/providers-reference.md">Providers</a> ·
+  <a href="docs/troubleshooting.md">Troubleshooting</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
@@ -169,43 +178,70 @@ Memory supports semantic search via embeddings for context-aware recall.
 
 ---
 
-## Quick Start
-
-### Install from source
+## Quick Install
 
 ```bash
-git clone https://github.com/RantAI-dev/RantAIClaw.git
-cd RantAIClaw
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
 ```
 
-### Interactive setup
+Works on Linux (x86_64, aarch64, armv7) and macOS (Intel, Apple Silicon). The installer auto-detects your platform, downloads the latest pre-built binary, verifies its SHA256 checksum, and installs it — no Rust toolchain, no compiler, no git clone.
+
+> **Windows:** native Windows is not yet supported by the installer. Run via [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install), or download the `x86_64-pc-windows-msvc.zip` manually from the [latest release](https://github.com/RantAI-dev/RantAIClaw/releases/latest).
+>
+> **PATH:** binary lands in `~/.cargo/bin` (or `~/.local/bin`). If `rantaiclaw --version` says "command not found", the installer prints the exact `export PATH=...` line for your shell.
+
+After installation:
 
 ```bash
-./target/release/rantaiclaw onboard
+rantaiclaw --version
+rantaiclaw onboard --interactive   # connect a provider, pick autonomy level
+rantaiclaw chat                    # start chatting!
 ```
 
-This walks you through provider selection, API key setup, and workspace initialization.
+---
 
-### Run in chat mode
+## Getting Started
 
 ```bash
-rantaiclaw chat
+rantaiclaw chat              # Interactive TUI chat session
+rantaiclaw onboard            # Provider, model, channels, workspace setup
+rantaiclaw daemon             # Run gateway: HTTP API + multi-channel listeners
+rantaiclaw skill install <id> # Install a community skill from ClawHub
+rantaiclaw status             # Verify install and show config health
+rantaiclaw config get|set     # Inspect/update runtime config
+rantaiclaw --help             # All commands
 ```
 
-### Run as daemon (gateway mode)
+📖 **[Full install reference →](docs/install.md)** · **[Troubleshooting →](docs/troubleshooting.md)** · **[Releases →](https://github.com/RantAI-dev/RantAIClaw/releases)**
+
+---
+
+## Other install options
+
+| Method | Command |
+|--------|---------|
+| **One-liner** (recommended) | `curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh \| bash` |
+| **Manual download** | [Pick a release archive](https://github.com/RantAI-dev/RantAIClaw/releases/latest), verify against `SHA256SUMS`, extract, move into `PATH`. |
+| **Build from source** | `git clone https://github.com/RantAI-dev/RantAIClaw.git && cd RantAIClaw && ./bootstrap.sh --from-source` |
+| **Cargo** | `cargo install --git https://github.com/RantAI-dev/RantAIClaw --locked` |
+| **Docker** | `docker pull ghcr.io/rantai-dev/rantaiclaw:latest` |
+| **Bootstrap-managed Docker** | `./bootstrap.sh --docker --interactive-onboard` |
+| **Homebrew** *(when published)* | `brew install rantaiclaw` |
+
+Step-by-step recipes for each (with checksum + cosign verification, feature flags, container persistence): see **[docs/install.md](docs/install.md)**.
+
+### Updating
 
 ```bash
-rantaiclaw daemon
+# Re-run the installer — always pulls the latest release
+curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
 ```
 
-The daemon starts the HTTP gateway, connects to configured channels, and runs the agentic loop.
-
-### Docker
+### Uninstalling
 
 ```bash
-docker build -t rantaiclaw .
-docker run -v ~/.rantaiclaw:/root/.rantaiclaw rantaiclaw daemon
+rm -f ~/.cargo/bin/rantaiclaw ~/.local/bin/rantaiclaw
+rm -rf ~/.rantaiclaw            # config + workspace (back up first if needed)
 ```
 
 ---

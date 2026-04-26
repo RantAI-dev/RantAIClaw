@@ -1,6 +1,6 @@
 # rantaiclaw-tools
 
-Python companion package for [RantaiClaw](https://github.com/rantaiclaw-labs/rantaiclaw) — LangGraph-based tool calling for consistent LLM agent execution.
+Python companion package for [RantaiClaw](https://github.com/RantAI-dev/RantAIClaw) — LangGraph-based tool calling for consistent LLM agent execution.
 
 ## Why This Package?
 

@@ -23,8 +23,8 @@ Options:
   -h, --help              Show this help
 
 Examples:
-  ./$SCRIPT_NAME --repo rantaiclaw-labs/rantaiclaw --limit 50
-  ./$SCRIPT_NAME --repo rantaiclaw-labs/rantaiclaw --kind prs --state open --apply
+  ./$SCRIPT_NAME --repo RantAI-dev/RantAIClaw --limit 50
+  ./$SCRIPT_NAME --repo RantAI-dev/RantAIClaw --kind prs --state open --apply
 USAGE
 }
 

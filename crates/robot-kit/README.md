@@ -88,7 +88,7 @@ pip install piper-tts
 
 ```bash
 # Clone and build
-git clone https://github.com/rantaiclaw-labs/rantaiclaw
+git clone https://github.com/RantAI-dev/RantAIClaw
 cd rantaiclaw
 cargo build -p rantaiclaw-robot-kit --release
 ```
