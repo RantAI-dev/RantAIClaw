@@ -44,9 +44,9 @@ jobs:
         run: |
           cat > NOTICE << 'EOF'
           RantaiClaw
-          Copyright 2025 RantaiClaw Labs
+          Copyright 2025 RantAI Dev
 
-          This product includes software developed at RantaiClaw Labs (https://github.com/rantaiclaw-labs).
+          This product includes software developed at RantAI Dev (https://github.com/RantAI-dev).
 
           Contributors
           ============

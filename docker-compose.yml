@@ -5,11 +5,11 @@
 #   2. Run: docker compose up -d
 #   3. Access gateway at http://localhost:3000
 #
-# For more info: https://github.com/rantaiclaw-labs/rantaiclaw
+# For more info: https://github.com/RantAI-dev/RantAIClaw
 
 services:
   rantaiclaw:
-    image: ghcr.io/rantaiclaw-labs/rantaiclaw:latest
+    image: ghcr.io/rantai-dev/rantaiclaw:latest
     # Or build locally:
     # build: .
     container_name: rantaiclaw

@@ -9,7 +9,7 @@ Options:
     --mode brief|full   Output mode (default: full)
                         brief: billable minutes/hours table only
                         full:  detailed breakdown with per-run list
-    --repo OWNER/NAME   Repository (default: rantaiclaw-labs/rantaiclaw)
+    --repo OWNER/NAME   Repository (default: RantAI-dev/RantAIClaw)
     -h, --help          Show this help message
 """
 
@@ -38,8 +38,8 @@ def parse_args():
     )
     parser.add_argument(
         "--repo",
-        default="rantaiclaw-labs/rantaiclaw",
-        help="Repository in OWNER/NAME format (default: rantaiclaw-labs/rantaiclaw)",
+        default="RantAI-dev/RantAIClaw",
+        help="Repository in OWNER/NAME format (default: RantAI-dev/RantAIClaw)",
     )
     return parser.parse_args()
 

@@ -50,10 +50,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/rantaiclaw-labs/rantaiclaw"
-Documentation = "https://github.com/rantaiclaw-labs/rantaiclaw/tree/main/python"
-Repository = "https://github.com/rantaiclaw-labs/rantaiclaw"
-Issues = "https://github.com/rantaiclaw-labs/rantaiclaw/issues"
+Homepage = "https://github.com/RantAI-dev/RantAIClaw"
+Documentation = "https://github.com/RantAI-dev/RantAIClaw/tree/main/python"
+Repository = "https://github.com/RantAI-dev/RantAIClaw"
+Issues = "https://github.com/RantAI-dev/RantAIClaw/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["rantaiclaw_tools"]

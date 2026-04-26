@@ -29,8 +29,8 @@ Selected allowlist patterns:
 Use these commands to export the current effective policy for audit/change control:
 
 ```bash
-gh api repos/rantaiclaw-labs/rantaiclaw/actions/permissions
-gh api repos/rantaiclaw-labs/rantaiclaw/actions/permissions/selected-actions
+gh api repos/RantAI-dev/RantAIClaw/actions/permissions
+gh api repos/RantAI-dev/RantAIClaw/actions/permissions/selected-actions
 ```
 
 Record each policy change with:
