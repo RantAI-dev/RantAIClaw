@@ -2,7 +2,7 @@
 
 This page defines the fastest supported path to install and initialize RantaiClaw.
 
-Last verified: **February 20, 2026**.
+Last verified: **April 26, 2026**.
 
 ## Option 0: Homebrew (macOS/Linuxbrew)
 
@@ -10,79 +10,92 @@ Last verified: **February 20, 2026**.
 brew install rantaiclaw
 ```
 
-## Option A (Recommended): Clone + local script
+## Option A (Recommended): Remote one-liner
+
+The default installer downloads the **latest pre-built binary** for your
+platform, verifies its SHA256 checksum, and installs it. No Rust toolchain,
+no compiler, no git clone.
 
 ```bash
-git clone https://github.com/rantaiclaw-labs/rantaiclaw.git
-cd rantaiclaw
+curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
+```
+
+Legacy compatibility entrypoint:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install.sh | bash
+```
+
+For high-security environments, prefer Option B so you can review the script
+before execution.
+
+## Option B: Clone + local script
+
+```bash
+git clone https://github.com/RantAI-dev/RantAIClaw.git
+cd RantAIClaw
 ./bootstrap.sh
 ```
 
-What it does by default:
+The default flow still downloads the pre-built binary. To build from source
+instead (contributor workflow, or unsupported platform):
 
-1. `cargo build --release --locked`
-2. `cargo install --path . --force --locked`
+```bash
+./bootstrap.sh --from-source
+```
 
-### Resource preflight and pre-built flow
+That runs `cargo build --release --locked` then `cargo install --path . --force --locked`.
 
-Source builds typically require at least:
+## Supported pre-built targets
+
+The installer auto-detects your platform and downloads the matching archive
+from [the latest GitHub release](https://github.com/RantAI-dev/RantAIClaw/releases/latest):
+
+| OS / arch | Target tuple |
+|---|---|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux aarch64 | `aarch64-unknown-linux-gnu` |
+| Linux armv7 | `armv7-unknown-linux-gnueabihf` |
+| macOS x86_64 | `x86_64-apple-darwin` |
+| macOS arm64 | `aarch64-apple-darwin` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` |
+
+Unsupported platform? Re-run with `--from-source`.
+
+## Source-build resource notes
+
+If you opt into `--from-source`, expect:
 
 - **2 GB RAM + swap**
 - **6 GB free disk**
 
-When resources are constrained, bootstrap now attempts a pre-built binary first.
+The installer prints a preflight warning when these thresholds aren't met,
+but does not auto-switch back to binary install — pass `--from-source`
+explicitly only when you mean it.
+
+## Installer flags
+
+For the full reference, run:
 
 ```bash
-./bootstrap.sh --prefer-prebuilt
+./bootstrap.sh --help
 ```
 
-To require binary-only installation and fail if no compatible release asset exists:
+Highlights:
 
-```bash
-./bootstrap.sh --prebuilt-only
-```
+- `--from-source` — build from source instead of downloading a binary (default is binary)
+- `--no-verify-checksum` — skip SHA256 verification (offline / mirror only)
+- `--guided` — interactive guided installer
+- `--docker` — build & run inside a container
+- `--onboard` / `--interactive-onboard` — connect a provider after install
+- `--api-key`, `--provider`, `--model` — non-interactive onboarding values
+- `--install-system-deps`, `--install-rust` — only relevant with `--from-source`
 
-To bypass pre-built flow and force source compilation:
+Backward-compatible (deprecated) aliases:
 
-```bash
-./bootstrap.sh --force-source-build
-```
-
-## Dual-mode bootstrap
-
-Default behavior is **app-only** (build/install RantaiClaw) and expects existing Rust toolchain.
-
-For fresh machines, enable environment bootstrap explicitly:
-
-```bash
-./bootstrap.sh --install-system-deps --install-rust
-```
-
-Notes:
-
-- `--install-system-deps` installs compiler/build prerequisites (may require `sudo`).
-- `--install-rust` installs Rust via `rustup` when missing.
-- `--prefer-prebuilt` tries release binary download first, then falls back to source build.
-- `--prebuilt-only` disables source fallback.
-- `--force-source-build` disables pre-built flow entirely.
-
-## Option B: Remote one-liner
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/rantaiclaw-labs/rantaiclaw/main/scripts/bootstrap.sh | bash
-```
-
-For high-security environments, prefer Option A so you can review the script before execution.
-
-Legacy compatibility:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/rantaiclaw-labs/rantaiclaw/main/scripts/install.sh | bash
-```
-
-This legacy endpoint prefers forwarding to `scripts/bootstrap.sh` and falls back to legacy source install if unavailable in that revision.
-
-If you run Option B outside a repository checkout, the bootstrap script automatically clones a temporary workspace, builds, installs, and then cleans it up.
+- `--prefer-prebuilt` — no-op (binary is the default now)
+- `--prebuilt-only` — fail if no compatible release asset is published
+- `--force-source-build` — alias for `--from-source`
 
 ## Optional onboarding modes
 
@@ -104,7 +117,7 @@ workspace/config mounts remain writable inside the container.
 
 If you add `--skip-build`, bootstrap skips local image build. It first tries the local
 Docker tag (`RANTAICLAW_DOCKER_IMAGE`, default: `rantaiclaw-bootstrap:local`); if missing,
-it pulls `ghcr.io/rantaiclaw-labs/rantaiclaw:latest` and tags it locally before running.
+it pulls `ghcr.io/rantai-dev/rantaiclaw:latest` and tags it locally before running.
 
 ### Quick onboarding (non-interactive)
 
@@ -124,19 +137,18 @@ RANTAICLAW_API_KEY="sk-..." RANTAICLAW_PROVIDER="openrouter" ./bootstrap.sh --on
 ./bootstrap.sh --interactive-onboard
 ```
 
-## Useful flags
+## Environment variables
 
-- `--install-system-deps`
-- `--install-rust`
-- `--skip-build` (in `--docker` mode: use local image if present, otherwise pull `ghcr.io/rantaiclaw-labs/rantaiclaw:latest`)
-- `--skip-install`
-- `--provider <id>`
-
-See all options:
-
-```bash
-./bootstrap.sh --help
-```
+| Variable | Purpose |
+|---|---|
+| `RANTAICLAW_RELEASE_BASE_URL` | Override release-archive base URL (mirror / staging) |
+| `RANTAICLAW_REPO_URL` | Override git URL for `--from-source` / `--docker` clones |
+| `RANTAICLAW_FALLBACK_IMAGE` | Override fallback Docker image |
+| `RANTAICLAW_INSTALL_DIR` | Override install directory (default: `~/.cargo/bin`, else `~/.local/bin`) |
+| `VERIFY_CHECKSUM` | Set to `false` to skip SHA256 check |
+| `RANTAICLAW_API_KEY` | Used when `--api-key` is not provided |
+| `RANTAICLAW_PROVIDER` | Used when `--provider` is not provided |
+| `RANTAICLAW_MODEL` | Used when `--model` is not provided |
 
 ## Related docs
 
@@ -144,3 +156,4 @@ See all options:
 - [commands-reference.md](commands-reference.md)
 - [providers-reference.md](providers-reference.md)
 - [channels-reference.md](channels-reference.md)
+- [troubleshooting.md](troubleshooting.md)
