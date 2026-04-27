@@ -91,7 +91,9 @@ Environment:
   RANTAICLAW_RELEASE_BASE_URL  Override release-archive base URL (mirror / staging)
   RANTAICLAW_REPO_URL          Override git URL for source/docker mode clones
   RANTAICLAW_FALLBACK_IMAGE    Override fallback Docker image
-  RANTAICLAW_INSTALL_DIR       Override install directory (default: ~/.cargo/bin or ~/.local/bin)
+  RANTAICLAW_INSTALL_DIR       Override install directory (default: pick a dir already in PATH)
+  RANTAICLAW_AUTO_MODIFY_PATH  Set to "1" to auto-amend shell rc with PATH export (no prompt)
+  RANTAICLAW_NO_MODIFY_PATH    Set to "1" to never modify the shell rc
   RANTAICLAW_API_KEY           Used when --api-key is not provided
   RANTAICLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   RANTAICLAW_MODEL             Used when --model is not provided
@@ -318,13 +320,32 @@ install_prebuilt_binary() {
   return 0
 }
 
-# Decide where the binary should land. Prefer ~/.cargo/bin when cargo exists
-# (matches `cargo install`); otherwise default to ~/.local/bin which is in
-# PATH on most modern distros (Ubuntu, Fedora, Arch via systemd's user dirs).
-# Override with RANTAICLAW_INSTALL_DIR.
+# Decide where the binary should land. Priority:
+#   1. RANTAICLAW_INSTALL_DIR (explicit override)
+#   2. ~/.cargo/bin if it's already in $PATH (cargo user — works immediately)
+#   3. ~/.local/bin if it's already in $PATH (XDG-style — works immediately)
+#   4. /usr/local/bin if writable without sudo (system-wide)
+#   5. ~/.cargo/bin if dir exists or cargo is available
+#   6. ~/.local/bin (final fallback; we'll auto-add it to PATH below)
+#
+# Picking a directory that's *already in PATH* is the difference between
+# "the install just works" and "rantaiclaw: command not found" right after
+# install — the most common beginner trip-up.
 resolve_install_dir() {
   if [[ -n "${RANTAICLAW_INSTALL_DIR:-}" ]]; then
     printf '%s' "$RANTAICLAW_INSTALL_DIR"
+    return
+  fi
+  if [[ ":$PATH:" == *":$HOME/.cargo/bin:"* ]]; then
+    printf '%s' "$HOME/.cargo/bin"
+    return
+  fi
+  if [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
+    printf '%s' "$HOME/.local/bin"
+    return
+  fi
+  if [[ -w /usr/local/bin && -d /usr/local/bin ]]; then
+    printf '%s' "/usr/local/bin"
     return
   fi
   if have_cmd cargo || [[ -d "$HOME/.cargo/bin" ]]; then
@@ -334,31 +355,73 @@ resolve_install_dir() {
   printf '%s' "$HOME/.local/bin"
 }
 
+# Pick the user's interactive shell rc. Falls back to ~/.bashrc.
+# Returns the unexpanded form (e.g. "~/.bashrc") for display, plus the
+# expanded path for filesystem operations, separated by a tab.
+detect_shell_rc() {
+  local shell_name display expanded
+  shell_name="$(basename "${SHELL:-/bin/bash}")"
+  case "$shell_name" in
+    zsh)  display='~/.zshrc';                    expanded="$HOME/.zshrc" ;;
+    fish) display='~/.config/fish/config.fish';  expanded="$HOME/.config/fish/config.fish" ;;
+    *)    display='~/.bashrc';                   expanded="$HOME/.bashrc" ;;
+  esac
+  printf '%s\t%s\t%s' "$shell_name" "$display" "$expanded"
+}
+
+# When the install dir isn't in PATH, offer to auto-amend the user's shell rc
+# (the rustup pattern). Falls back to a printed hint when prompts can't run.
+# Skip the prompt entirely with RANTAICLAW_NO_MODIFY_PATH=1; force-yes with
+# RANTAICLAW_AUTO_MODIFY_PATH=1.
 print_path_hint() {
   local dir="$1"
-  local shell_name shell_rc
   if [[ ":$PATH:" == *":$dir:"* ]]; then
     return 0
   fi
+
+  local rc_info shell_name display_rc rc_file export_line
+  rc_info="$(detect_shell_rc)"
+  IFS=$'\t' read -r shell_name display_rc rc_file <<<"$rc_info"
+  if [[ "$shell_name" == "fish" ]]; then
+    export_line="fish_add_path $dir"
+  else
+    export_line="export PATH=\"$dir:\$PATH\""
+  fi
+
   warn "$dir is not in your PATH for this shell."
-  shell_name="$(basename "${SHELL:-/bin/bash}")"
-  case "$shell_name" in
-    zsh)  shell_rc="~/.zshrc" ;;
-    fish) shell_rc="~/.config/fish/config.fish" ;;
-    *)    shell_rc="~/.bashrc" ;;
-  esac
-  echo "    Add this line to $shell_rc:"
-  if [[ "$shell_name" == "fish" ]]; then
-    echo "        fish_add_path $dir"
+
+  local should_modify=""
+  if [[ "${RANTAICLAW_NO_MODIFY_PATH:-0}" == "1" ]]; then
+    should_modify="no"
+  elif [[ "${RANTAICLAW_AUTO_MODIFY_PATH:-0}" == "1" ]]; then
+    should_modify="yes"
+  elif [[ -t 1 || -r /dev/tty ]]; then
+    if prompt_yes_no "Add $dir to PATH in $display_rc now?" "yes"; then
+      should_modify="yes"
+    else
+      should_modify="no"
+    fi
   else
-    echo "        export PATH=\"$dir:\$PATH\""
+    should_modify="no"
   fi
+
+  if [[ "$should_modify" == "yes" ]]; then
+    if mkdir -p "$(dirname "$rc_file")" 2>/dev/null && {
+        printf '\n# Added by RantaiClaw installer\n%s\n' "$export_line" >> "$rc_file"
+       }; then
+      success "Updated $display_rc."
+      info "To start using rantaiclaw now, run:"
+      echo "    source $display_rc   # or open a new terminal"
+      return 0
+    else
+      warn "Could not write to $display_rc — printing the hint instead."
+    fi
+  fi
+
+  echo "    Add this line to $display_rc:"
+  echo "        $export_line"
   echo "    Or run it now in this shell:"
-  if [[ "$shell_name" == "fish" ]]; then
-    echo "        fish_add_path $dir"
-  else
-    echo "        export PATH=\"$dir:\$PATH\""
-  fi
+  echo "        $export_line"
 }
 
 run_privileged() {
