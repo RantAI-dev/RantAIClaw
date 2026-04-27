@@ -73,6 +73,9 @@ mod multimodal;
 mod observability;
 mod onboard;
 mod peripherals;
+mod profile {
+    pub use rantaiclaw::profile::*;
+}
 mod providers;
 mod runtime;
 mod security;
