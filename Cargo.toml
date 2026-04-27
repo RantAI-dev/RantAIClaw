@@ -86,6 +86,9 @@ parking_lot = "0.12"
 # Async traits
 async-trait = "0.1"
 
+# File-system advisory locking (used by profile migration to serialize concurrent migrations)
+fs2 = "0.4"
+
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
 
