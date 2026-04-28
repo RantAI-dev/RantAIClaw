@@ -55,7 +55,7 @@ pub(crate) mod identity;
 pub(crate) mod integrations;
 pub mod mcp;
 pub mod memory;
-pub(crate) mod migration;
+pub mod migration;
 pub(crate) mod multimodal;
 pub mod observability;
 pub mod onboard;
@@ -162,7 +162,7 @@ pub(crate) enum SkillCommands {
 
 /// Migration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum MigrateCommands {
+pub enum MigrateCommands {
     /// Import memory from an `OpenClaw` workspace into this `RantaiClaw` workspace
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)

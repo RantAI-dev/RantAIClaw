@@ -386,9 +386,31 @@ Examples:
     },
 
     /// Migrate data from other agent runtimes
+    ///
+    /// Two modes:
+    ///   - `migrate --from <openclaw|zeroclaw|auto>`: profile-based import
+    ///     (creates a fresh RantaiClaw profile from the detected install).
+    ///   - `migrate openclaw [--source ...] [--dry-run]`: legacy memory-only
+    ///     subcommand, kept for backwards compatibility.
+    #[command(args_conflicts_with_subcommands = true)]
     Migrate {
         #[command(subcommand)]
-        migrate_command: MigrateCommands,
+        migrate_command: Option<MigrateCommands>,
+
+        /// External source to import from. Use `auto` to walk the standard
+        /// candidate paths in order: `~/.openclaw`, `~/.zeroclaw`,
+        /// `~/.config/openclaw`, `~/.config/zeroclaw`.
+        #[arg(long, value_enum)]
+        from: Option<MigrationSourceArg>,
+
+        /// Name of the new profile to create. Defaults to
+        /// `migrated-from-openclaw` (or `migrated-from-zeroclaw`).
+        #[arg(long)]
+        profile_name: Option<String>,
+
+        /// Overwrite the destination profile if it already exists.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Manage provider subscription authentication profiles
@@ -621,6 +643,28 @@ enum MigrateCommands {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// CLI-facing variant of `migration::MigrationSource`. Kept separate so the
+/// clap derive on the binary doesn't pollute the lib's public surface.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum MigrationSourceArg {
+    #[value(name = "openclaw")]
+    OpenClaw,
+    #[value(name = "zeroclaw")]
+    ZeroClaw,
+    #[value(name = "auto")]
+    Auto,
+}
+
+impl From<MigrationSourceArg> for rantaiclaw::migration::MigrationSource {
+    fn from(arg: MigrationSourceArg) -> Self {
+        match arg {
+            MigrationSourceArg::OpenClaw => Self::OpenClaw,
+            MigrationSourceArg::ZeroClaw => Self::ZeroClaw,
+            MigrationSourceArg::Auto => Self::Auto,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1232,8 +1276,23 @@ async fn main() -> Result<()> {
 
         Some(Commands::Skills { skill_command }) => skills::handle_command(skill_command, &config),
 
-        Some(Commands::Migrate { migrate_command }) => {
-            migration::handle_command(migrate_command, &config).await
+        Some(Commands::Migrate {
+            migrate_command,
+            from,
+            profile_name,
+            force,
+        }) => {
+            // New profile-based flow takes precedence when --from is given.
+            if let Some(from) = from {
+                handle_migrate_profile_flow(from.into(), profile_name, force)
+            } else if let Some(cmd) = migrate_command {
+                migration::handle_command(cmd, &config).await
+            } else {
+                anyhow::bail!(
+                    "`migrate` requires either `--from <openclaw|zeroclaw|auto>` or a subcommand. \
+                     Run `rantaiclaw migrate --help` for details."
+                )
+            }
         }
 
         Some(Commands::Chat {
@@ -1298,6 +1357,40 @@ async fn main() -> Result<()> {
         // arm exists solely to make the match exhaustive without touching
         // the other Commands arms.
         Some(Commands::Profile { .. }) => unreachable!("Profile dispatched earlier"),
+    }
+}
+
+/// Drive the `rantaiclaw migrate --from <source>` flow: detect, create new
+/// profile, print summary. Synchronous because all I/O is filesystem-bound.
+fn handle_migrate_profile_flow(
+    source: rantaiclaw::migration::MigrationSource,
+    profile_name: Option<String>,
+    force: bool,
+) -> Result<()> {
+    use rantaiclaw::migration::{migrate_from_external, MigrationSource};
+
+    let default_name = match source {
+        MigrationSource::ZeroClaw => "migrated-from-zeroclaw",
+        // Auto + OpenClaw both default to the same name; users can override.
+        _ => "migrated-from-openclaw",
+    };
+    let profile_name = profile_name.unwrap_or_else(|| default_name.to_string());
+
+    match migrate_from_external(source, &profile_name, force, None)? {
+        Some(summary) => {
+            summary.print_human();
+            Ok(())
+        }
+        None => {
+            // Auto-detect with no candidate found. Friendly hint, not a panic.
+            eprintln!("No OpenClaw / ZeroClaw install detected. Probed:");
+            for path in rantaiclaw::migration::openclaw::detection_paths() {
+                eprintln!("  - {}", path.display());
+            }
+            eprintln!("Pass `--from openclaw` or `--from zeroclaw` to force a specific source,");
+            eprintln!("or set $HOME so one of the candidate paths above is reachable.");
+            std::process::exit(1);
+        }
     }
 }
 
