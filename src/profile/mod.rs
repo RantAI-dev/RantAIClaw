@@ -17,6 +17,7 @@
 pub mod commands;
 pub mod migration;
 pub mod paths;
+pub mod sentinel;
 
 use std::fs;
 use std::path::PathBuf;
