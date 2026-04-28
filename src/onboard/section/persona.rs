@@ -14,7 +14,7 @@
 use anyhow::Result;
 
 use crate::config::Config;
-use crate::onboard::section::_stub::{SetupContext, SetupSection};
+use crate::onboard::section::{SetupContext, SetupSection};
 use crate::persona::{
     self, render_system_md, write_persona_toml, PersonaToml, PresetId,
 };

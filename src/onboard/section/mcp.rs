@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 
-use super::_stub::{SetupContext, SetupSection};
+use super::{SetupContext, SetupSection};
 use crate::config::Config;
 use crate::mcp::curated::{curated_count, AUTHED, NO_AUTH};
 use crate::mcp::setup;
@@ -107,7 +107,7 @@ mod tests {
             McpServerConfig {
                 command: "node".into(),
                 args: vec!["./server.js".into()],
-                env: Default::default(),
+                env: std::collections::HashMap::default(),
             },
         );
         let dummy_profile = Profile {
@@ -121,7 +121,7 @@ mod tests {
             McpServerConfig {
                 command: "npx".into(),
                 args: vec![],
-                env: Default::default(),
+                env: std::collections::HashMap::default(),
             },
         );
         assert!(section.is_already_configured(&dummy_profile, &config));

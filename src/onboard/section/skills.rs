@@ -12,7 +12,7 @@
 use anyhow::Result;
 
 use crate::config::Config;
-use crate::onboard::section::_stub::{SetupContext, SetupSection};
+use crate::onboard::section::{SetupContext, SetupSection};
 use crate::profile::Profile;
 use crate::skills::bundled::{self, STARTER_PACK};
 use crate::skills::clawhub;

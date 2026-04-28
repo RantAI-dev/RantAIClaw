@@ -1723,7 +1723,9 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
+pub(crate) fn setup_provider(
+    workspace_dir: &Path,
+) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
@@ -2813,7 +2815,7 @@ fn setup_memory() -> Result<MemoryConfig> {
 // ── Step 3: Channels ────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_channels() -> Result<ChannelsConfig> {
+pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to RantaiClaw from anywhere.");
     print_bullet("CLI is always available. Connect more channels now.");
     println!();
