@@ -1,3 +1,6 @@
+pub mod bundled;
+pub mod clawhub;
+
 use anyhow::Result;
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};

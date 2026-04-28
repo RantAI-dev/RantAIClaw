@@ -67,7 +67,7 @@ pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub mod sessions;
-pub(crate) mod skills;
+pub mod skills;
 pub(crate) mod tasks;
 pub mod tools;
 pub mod tui;
