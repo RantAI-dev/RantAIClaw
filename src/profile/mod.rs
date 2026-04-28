@@ -276,6 +276,15 @@ impl ProfileManager {
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, format!("{name}\n"))?;
         fs::rename(&tmp, &path)?;
+
+        // If a daemon is registered for this profile, ask the init system to
+        // restart it so it picks up the new active config. Errors here are
+        // downgraded to warnings — a stale daemon must never block the
+        // profile switch itself.
+        if let Err(e) = crate::daemon::handoff::restart_daemon_for_profile(name) {
+            eprintln!("Warning: daemon handoff for profile {name:?} failed: {e}");
+        }
+
         Ok(())
     }
 
