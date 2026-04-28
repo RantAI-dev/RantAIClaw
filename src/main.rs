@@ -270,8 +270,21 @@ Examples:
         service_command: ServiceCommands,
     },
 
-    /// Run diagnostics for daemon/scheduler/channel freshness
+    /// Run diagnostics for daemon/scheduler/channel freshness.
+    ///
+    /// With no subcommand, runs the full new-style health check
+    /// pipeline (config + live + system). Use `--brief` for a sub-second
+    /// offline-friendly summary or `--format json` for CI consumption.
     Doctor {
+        /// Output format: text (default), json, brief.
+        #[arg(long, default_value = "text", value_enum)]
+        format: DoctorFormat,
+        /// Skip the slow `live` checks (provider ping / channel auth / MCP startup).
+        #[arg(long)]
+        brief: bool,
+        /// Treat all live checks as `Info: skipped (offline)`.
+        #[arg(long)]
+        offline: bool,
         #[command(subcommand)]
         doctor_command: Option<DoctorCommands>,
     },
@@ -679,6 +692,17 @@ enum DoctorCommands {
     },
 }
 
+/// Output format for the new-style `rantaiclaw doctor` health check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DoctorFormat {
+    /// Color-coded human-readable output (default).
+    Text,
+    /// Structured JSON for CI consumption.
+    Json,
+    /// One-liner summary, e.g. `doctor: 6/8 ok, 1 warn, 1 fail`.
+    Brief,
+}
+
 #[derive(Subcommand, Debug)]
 enum ChannelCommands {
     /// List configured channels
@@ -1065,7 +1089,12 @@ async fn main() -> Result<()> {
             service::handle_command(&service_command, &config, init_system)
         }
 
-        Some(Commands::Doctor { doctor_command }) => match doctor_command {
+        Some(Commands::Doctor {
+            format,
+            brief,
+            offline,
+            doctor_command,
+        }) => match doctor_command {
             Some(DoctorCommands::Models {
                 provider,
                 use_cache,
@@ -1077,7 +1106,28 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("doctor models task failed: {e}"))?
             }
-            None => doctor::run(&config),
+            None => {
+                use rantaiclaw::doctor::report::{render, DoctorFormat as RenderFormat};
+                let lib_config = rantaiclaw::Config::load_or_init().await?;
+                let profile = profile::ProfileManager::active()
+                    .map_err(|e| anyhow::anyhow!("could not resolve active profile: {e}"))?;
+                let ctx = rantaiclaw::doctor::DoctorContext {
+                    profile,
+                    config: lib_config,
+                    offline,
+                };
+                let results = rantaiclaw::doctor::run_all(ctx, brief).await;
+                let render_format = match format {
+                    DoctorFormat::Text => RenderFormat::Text,
+                    DoctorFormat::Json => RenderFormat::Json,
+                    DoctorFormat::Brief => RenderFormat::Brief,
+                };
+                println!("{}", render(&results, render_format));
+                if rantaiclaw::doctor::report::has_failures(&results) {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
         },
 
         Some(Commands::Channel { channel_command }) => match channel_command {

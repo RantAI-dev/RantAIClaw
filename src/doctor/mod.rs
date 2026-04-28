@@ -12,7 +12,9 @@ pub mod checks;
 pub mod legacy;
 pub mod report;
 
-pub use legacy::{run, run_models};
+pub use legacy::run_models;
+#[allow(unused_imports)]
+pub use legacy::run;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
