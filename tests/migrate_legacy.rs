@@ -205,3 +205,76 @@ fn needs_migration_predicate() {
         assert!(!migration::needs_migration());
     });
 }
+
+/// Regression: `.secret_key` must move with `config.toml` so api_keys
+/// encrypted in the v0.4.x install can still be decrypted post-migration.
+///
+/// Found by KubeVirt smoke test on Ubuntu 22.04: legacy `onboard
+/// --api-key …` produced encrypted `config.toml` + `.secret_key` at the
+/// flat root. After migration only `config.toml` moved, leaving the
+/// loader to spawn a fresh `.secret_key` in the profile dir → next load
+/// failed with `Decryption failed — wrong key or tampered data`.
+#[test]
+fn migration_preserves_secret_key_so_encrypted_api_key_still_decrypts() {
+    use rantaiclaw::security::SecretStore;
+    with_home(|home| {
+        let root = home.join(".rantaiclaw");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.toml"),
+            "default_provider = \"openrouter\"\n",
+        )
+        .unwrap();
+
+        // Pre-encrypt a secret with a SecretStore rooted at the legacy
+        // path — this writes `.secret_key` next to the legacy config.
+        let pre_store = SecretStore::new(&root, true);
+        let ciphertext = pre_store.encrypt("sk-test-legacy-1234").unwrap();
+        assert!(SecretStore::is_encrypted(&ciphertext));
+        assert!(root.join(".secret_key").exists());
+
+        let did = migration::maybe_migrate_legacy_layout().unwrap();
+        assert!(did, "migration should fire on this fixture");
+
+        // Post-migration: the loader uses `config.toml.parent()` to build
+        // the SecretStore, which now points at the profile dir. That
+        // SecretStore must decrypt the same ciphertext — meaning the
+        // legacy `.secret_key` was carried into the profile dir.
+        let post_root = paths::profile_dir("default");
+        let post_store = SecretStore::new(&post_root, true);
+        let recovered = post_store
+            .decrypt(&ciphertext)
+            .expect("api_key must still decrypt after migration");
+        assert_eq!(recovered, "sk-test-legacy-1234");
+
+        // The legacy `.secret_key` should no longer sit at root — moved,
+        // not copied — to avoid confusion / future double-keys.
+        assert!(
+            !root.join(".secret_key").is_file(),
+            ".secret_key must be moved out of legacy root, not duplicated",
+        );
+    });
+}
+
+/// Defensive: a legacy `secrets/` directory (used by some out-of-band
+/// onboard variants for token caches) should follow the config into the
+/// profile dir.
+#[test]
+fn migration_carries_secrets_directory() {
+    with_home(|home| {
+        create_legacy_fixture(home);
+        let root = home.join(".rantaiclaw");
+        std::fs::create_dir_all(root.join("secrets")).unwrap();
+        std::fs::write(root.join("secrets/api_keys.toml"), "openrouter = \"x\"\n").unwrap();
+
+        let did = migration::maybe_migrate_legacy_layout().unwrap();
+        assert!(did);
+
+        let dest = paths::secrets_dir("default").join("api_keys.toml");
+        assert!(dest.exists(), "secrets/api_keys.toml should move into profile dir");
+        assert!(
+            !root.join("secrets").is_dir(),
+            "legacy secrets/ should be gone after migration",
+        );
+    });
+}

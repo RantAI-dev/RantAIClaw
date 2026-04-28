@@ -86,8 +86,15 @@ fn perform_migration() -> Result<()> {
 
     // Anything that lived at `~/.rantaiclaw/<name>` and now lives at
     // `~/.rantaiclaw/profiles/default/<name>`.
+    //
+    // `.secret_key` MUST move with `config.toml`. SecretStore derives its
+    // key path from `config_path.parent()`, so leaving the legacy key at
+    // root while the profile dir spawns a fresh one breaks api_key
+    // decryption on the next load.
     let movables = [
         "config.toml",
+        ".secret_key",
+        "secrets",
         "workspace",
         "memory",
         "sessions",
@@ -95,6 +102,7 @@ fn perform_migration() -> Result<()> {
         "persona",
         "policy",
         "audit.log",
+        ".onboard_progress",
     ];
     for name in &movables {
         let src = root.join(name);
