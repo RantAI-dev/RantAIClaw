@@ -1,0 +1,5 @@
+# v0.4.1-shaped synthetic config used by tests/compat_v041_to_v050.rs.
+# Intentionally minimal — exercises the migration path, not the full schema.
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4-20250514"
+default_temperature = 0.7

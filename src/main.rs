@@ -103,6 +103,12 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
 
+    /// Override the active profile for this invocation.
+    /// Sets `RANTAICLAW_PROFILE` before any config is loaded; precedence:
+    /// CLI flag > env var > active_profile file > "default".
+    #[arg(short = 'p', long = "profile", global = true, value_name = "NAME")]
+    profile: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -448,6 +454,26 @@ Examples:
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+
+    /// Manage RantaiClaw profiles (multi-profile storage layout, v0.5.0+)
+    #[command(long_about = "\
+Manage profiles. Each profile is a self-contained \
+~/.rantaiclaw/profiles/<name>/ directory with its own config, persona, \
+workspace, memory, skills, sessions, policy, secrets and runtime state.
+
+The default profile is auto-created on first run. Use `-p <name>` (or \
+the RANTAICLAW_PROFILE env var) to switch profiles for a single \
+invocation without changing the active marker.
+
+Examples:
+  rantaiclaw profile list
+  rantaiclaw profile create work --clone default
+  rantaiclaw profile use work
+  rantaiclaw -p work profile current")]
+    Profile {
+        #[command(subcommand)]
+        cmd: profile::commands::ProfileCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -751,6 +777,16 @@ async fn main() -> Result<()> {
         std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir);
     }
 
+    // Profile flag must be applied before any config-loading code path so
+    // that ProfileManager::resolve_active_name() observes it. Resolution
+    // precedence is documented on the Cli struct.
+    if let Some(profile_name) = &cli.profile {
+        if profile_name.trim().is_empty() {
+            bail!("--profile cannot be empty");
+        }
+        std::env::set_var("RANTAICLAW_PROFILE", profile_name);
+    }
+
     // No subcommand: launch TUI (bare invocation).
     // `run_tui` loads its own `Config` internally — see `run_tui` docs for
     // why (bin+lib Config type duplication).
@@ -773,6 +809,14 @@ async fn main() -> Result<()> {
         let mut stdout = std::io::stdout().lock();
         write_shell_completion(*shell, &mut stdout)?;
         return Ok(());
+    }
+
+    // Profile management runs without loading the AI agent's full Config —
+    // it only manipulates ~/.rantaiclaw/profiles/<name>/ directories. Run
+    // before Config::load_or_init so `profile create` on a fresh install
+    // does not hit a half-initialised config flow.
+    if let Some(Commands::Profile { cmd }) = cli.command {
+        return profile::commands::run(cmd);
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
@@ -1106,6 +1150,11 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+
+        // Already short-circuited above before Config::load_or_init; this
+        // arm exists solely to make the match exhaustive without touching
+        // the other Commands arms.
+        Some(Commands::Profile { .. }) => unreachable!("Profile dispatched earlier"),
     }
 }
 
