@@ -110,8 +110,9 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
 // §"Setup orchestrator + sections" + §"Re-entry semantics".
 
 use crate::onboard::section::{
-    channels::ChannelsSection, mcp::McpSection, persona::PersonaSection,
-    provider::ProviderSection, skills::SkillsSection, SetupContext, SetupSection,
+    approvals::ApprovalsSection, channels::ChannelsSection, mcp::McpSection,
+    persona::PersonaSection, provider::ProviderSection, skills::SkillsSection, SetupContext,
+    SetupSection,
 };
 use crate::profile::Profile;
 
@@ -123,8 +124,12 @@ pub fn canonical_section_order() -> Vec<&'static str> {
 }
 
 fn canonical_sections() -> Vec<Box<dyn SetupSection>> {
+    // Wave 4A inserts `approvals` between `provider` and `channels`. The
+    // approval-gate runtime gates every tool call, so the user must have
+    // a policy chosen before any channel triggers a tool execution.
     vec![
         Box::new(ProviderSection),
+        Box::new(ApprovalsSection),
         Box::new(ChannelsSection),
         Box::new(PersonaSection),
         Box::new(SkillsSection),

@@ -56,7 +56,14 @@ fn setup_runs_all_sections_in_canonical_order() {
     let order = wizard::canonical_section_order();
     assert_eq!(
         order,
-        vec!["provider", "channels", "persona", "skills", "mcp"],
+        vec![
+            "provider",
+            "approvals",
+            "channels",
+            "persona",
+            "skills",
+            "mcp"
+        ],
         "canonical section order changed — update spec + tests together",
     );
 }
@@ -156,7 +163,7 @@ fn setup_with_unknown_topic_errors_with_valid_topic_list() {
             "error should call out unknown topic: {msg}"
         );
         // The error must enumerate the valid topics so the user can recover.
-        for s in ["provider", "channels", "persona", "skills", "mcp"] {
+        for s in ["provider", "approvals", "channels", "persona", "skills", "mcp"] {
             assert!(
                 msg.contains(s),
                 "error should list valid topic {s}: {msg}",
@@ -201,8 +208,9 @@ fn onboard_alias_dispatches_to_setup_with_no_topic() {
         let report = wizard::run_setup(&profile, &mut config, None, false, true)
             .expect("legacy-equivalent dispatch should succeed");
         // No topic + non-interactive ⇒ every section visited at least once
-        // (some skipped, but never fewer than 5 outcomes total).
-        assert_eq!(report.visited.len() + report.skipped.len(), 5);
+        // (some skipped, but never fewer than 6 outcomes total — Wave 4A
+        // added `approvals` between provider and channels).
+        assert_eq!(report.visited.len() + report.skipped.len(), 6);
     });
 }
 

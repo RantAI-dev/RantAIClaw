@@ -1,9 +1,10 @@
 //! Setup-section root.
 //!
 //! Wave 3 lifts the `SetupSection` trait + `SetupContext` out of the Wave-2
-//! `_stub.rs` placeholder and into this canonical home, then exposes the
-//! five wired-up section impls (`provider`, `channels`, `persona`, `skills`,
-//! `mcp`) for the orchestrator (`crate::onboard::wizard::run_setup`) to walk.
+//! `_stub.rs` placeholder and into this canonical home; Wave 4A then adds
+//! the `approvals` section so the canonical order is now six section impls
+//! (`provider`, `approvals`, `channels`, `persona`, `skills`, `mcp`)
+//! for the orchestrator (`crate::onboard::wizard::run_setup`) to walk.
 //!
 //! The trait is intentionally synchronous: section bodies that need an
 //! async runtime (skills' ClawHub fetcher, mcp's curated picker) bridge
@@ -18,6 +19,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::profile::Profile;
 
+pub mod approvals;
 pub mod channels;
 pub mod mcp;
 pub mod persona;
