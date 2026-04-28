@@ -46,7 +46,7 @@ pub mod config;
 pub(crate) mod cost;
 pub(crate) mod cron;
 pub(crate) mod daemon;
-pub(crate) mod doctor;
+pub mod doctor;
 pub mod gateway;
 pub(crate) mod hardware;
 pub(crate) mod health;
