@@ -24,7 +24,7 @@ pub fn render_text(results: &[CheckResult], colors: bool) -> String {
 
     let mut out = String::new();
     let _ = writeln!(out, "RantaiClaw Doctor");
-    let _ = writeln!(out, "=================");
+    let _ = writeln!(out, "─────────────────");
 
     let mut current_cat = "";
     for r in results {

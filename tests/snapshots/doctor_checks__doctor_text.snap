@@ -3,7 +3,7 @@ source: tests/doctor_checks.rs
 expression: rendered
 ---
 RantaiClaw Doctor
-=================
+─────────────────
 
 [config]
   ✓ config.schema — config schema is valid
