@@ -208,18 +208,34 @@ pub fn translate_config(source_toml: &str) -> (String, usize) {
 
     let mut blocks_translated = count_top_level_blocks(source_toml);
 
-    if !source_toml.contains("[autonomy]") {
+    if !has_section_header(source_toml, "autonomy") {
         out.push_str(defaults_l2_smart_autonomy_toml());
         out.push('\n');
         blocks_translated += 1;
     }
-    if !source_toml.contains("[approvals]") {
+    if !has_section_header(source_toml, "approvals") {
         out.push_str(defaults_l2_smart_approvals_toml());
         out.push('\n');
         blocks_translated += 1;
     }
 
     (out, blocks_translated)
+}
+
+/// Whether `source_toml` contains a top-level `[name]` section header,
+/// ignoring matches that appear inside comment lines or string values.
+fn has_section_header(source_toml: &str, name: &str) -> bool {
+    let needle = format!("[{name}]");
+    for raw in source_toml.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if line == needle {
+            return true;
+        }
+    }
+    false
 }
 
 /// Count the number of distinct top-level config "blocks" in a TOML string —

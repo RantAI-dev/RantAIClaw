@@ -1,0 +1,20 @@
+# Fixture: OpenClaw v0.4 config — the last release before the rename.
+# Adds the [providers] table form (plural, parameterised per provider) on top
+# of v0.3 keys, and a richer [gateway] block with paired_tokens.
+
+default_provider = "openrouter"
+default_model = "anthropic/claude-3.5-sonnet"
+default_temperature = 0.6
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+timeout_secs = 30
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+
+[gateway]
+host = "0.0.0.0"
+port = 8765
+allow_public_bind = true
+paired_tokens = ["fake-token-A", "fake-token-B"]
