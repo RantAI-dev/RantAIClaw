@@ -17,6 +17,7 @@
 //! The L4 ("off") preset prints a stern stderr warning whenever it is
 //! selected — the spec is explicit that L4 is for trusted CI only.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
@@ -151,7 +152,6 @@ pub fn write_policy_files(profile: &Profile, preset: PolicyPreset, force: bool) 
 
     if matches!(preset, PolicyPreset::L4Off) {
         eprintln!(
-            "{}",
             "⚠️  approval policy preset L4 selected — gating is OFF.\n   \
              Every tool call will execute without prompts. Use this only in \
              trusted CI environments. To revert: `rantaiclaw setup approvals --force`."
@@ -225,7 +225,7 @@ fn write_patterns(
     let mut body = String::new();
     body.push_str(header);
     body.push('\n');
-    body.push_str(&format!("[{section}]\n"));
+    writeln!(body, "[{section}]").expect("write to String never fails");
     if patterns.is_empty() {
         body.push_str("patterns = []\n");
     } else {
@@ -233,7 +233,7 @@ fn write_patterns(
         for p in patterns {
             // escape any embedded `"` defensively even though presets don't use them
             let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
-            body.push_str(&format!("  \"{escaped}\",\n"));
+            writeln!(body, "  \"{escaped}\",").expect("write to String never fails");
         }
         body.push_str("]\n");
     }
