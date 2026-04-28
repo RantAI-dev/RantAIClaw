@@ -1,3 +1,4 @@
+pub mod section;
 pub mod wizard;
 
 pub(crate) mod ui;
