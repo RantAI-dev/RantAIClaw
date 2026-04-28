@@ -109,7 +109,7 @@ struct Cli {
     /// Override the active profile for this invocation.
     /// Sets `RANTAICLAW_PROFILE` before any config is loaded; precedence:
     /// CLI flag > env var > active_profile file > "default".
-    #[arg(short = 'p', long = "profile", global = true, value_name = "NAME")]
+    #[arg(long = "profile", global = true, value_name = "NAME")]
     profile: Option<String>,
 
     #[command(subcommand)]
