@@ -9,12 +9,9 @@ use crate::doctor::{CheckResult, DoctorCheck, DoctorContext, Severity};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Default)]
 pub struct ProviderPingCheck {
     endpoint_override: Option<String>,
-}
-
-impl Default for ProviderPingCheck {
-    fn default() -> Self { Self { endpoint_override: None } }
 }
 
 impl ProviderPingCheck {

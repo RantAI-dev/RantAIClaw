@@ -4,6 +4,11 @@
 //! Snapshot tests are pinned via [`insta`]. Update them with
 //! `cargo insta review` when output format changes intentionally.
 
+// Mutex held across .await is intentional — serializes mockito's global state
+// across tests. The field-reassign pattern in `ctx_with_provider` is clearer
+// than a struct literal given the optional api_key.
+#![allow(clippy::await_holding_lock, clippy::field_reassign_with_default)]
+
 use std::sync::Mutex;
 
 use rantaiclaw::config::Config;

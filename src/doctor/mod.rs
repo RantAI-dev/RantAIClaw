@@ -87,7 +87,7 @@ pub trait DoctorCheck: Send + Sync {
 async fn run_one(check: &dyn DoctorCheck, ctx: &DoctorContext) -> CheckResult {
     let started = std::time::Instant::now();
     let mut result = check.run(ctx).await;
-    let elapsed = started.elapsed().as_millis() as u64;
+    let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if result.duration_ms == 0 { result.duration_ms = elapsed; }
     if result.category == "config" && check.category() != "config" {
         result.category = check.category();

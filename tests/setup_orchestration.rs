@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 //! Wave 3 integration tests — orchestrator over the canonical setup-section list.
 //!
 //! Plan: `docs/superpowers/plans/2026-04-27-onboarding-depth-v2.md`,

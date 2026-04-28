@@ -1,3 +1,7 @@
+// MutexGuard held across .await — intentional, serializes HOME-env mutation
+// against parallel test workers.
+#![allow(clippy::await_holding_lock)]
+
 //! Integration tests for Wave 2D — bundled starter pack and ClawHub
 //! list_top caching. See `docs/superpowers/plans/2026-04-27-onboarding-depth-v2.md`,
 //! Task 2D.5.

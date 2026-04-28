@@ -37,13 +37,13 @@ pub fn inspect_channels(config: &crate::config::Config) -> ChannelSummary {
     let mut missing: Vec<&str> = Vec::new();
 
     if let Some(c) = cc.telegram.as_ref() {
-        if !c.bot_token.trim().is_empty() { configured.push("telegram") } else { missing.push("telegram") }
+        if c.bot_token.trim().is_empty() { missing.push("telegram") } else { configured.push("telegram") }
     }
     if let Some(c) = cc.discord.as_ref() {
-        if !c.bot_token.trim().is_empty() { configured.push("discord") } else { missing.push("discord") }
+        if c.bot_token.trim().is_empty() { missing.push("discord") } else { configured.push("discord") }
     }
     if let Some(c) = cc.slack.as_ref() {
-        if !c.bot_token.trim().is_empty() { configured.push("slack") } else { missing.push("slack") }
+        if c.bot_token.trim().is_empty() { missing.push("slack") } else { configured.push("slack") }
     }
 
     let n_total = configured.len() + missing.len();
