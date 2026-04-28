@@ -1,0 +1,47 @@
+---
+source: tests/doctor_checks.rs
+expression: rendered
+---
+{
+  "results": [
+    {
+      "category": "config",
+      "duration_ms": 0,
+      "hint": null,
+      "message": "config schema is valid",
+      "name": "config.schema",
+      "severity": "ok"
+    },
+    {
+      "category": "config",
+      "duration_ms": 0,
+      "hint": "run: rantaiclaw setup approvals",
+      "message": "allowlist is empty",
+      "name": "policy.allowlist",
+      "severity": "warn"
+    },
+    {
+      "category": "live",
+      "duration_ms": 0,
+      "hint": "re-enter API key with: rantaiclaw setup provider",
+      "message": "401 unauthorized",
+      "name": "provider.ping",
+      "severity": "fail"
+    },
+    {
+      "category": "system",
+      "duration_ms": 0,
+      "hint": null,
+      "message": "init system not detected (skipped)",
+      "name": "daemon.registration",
+      "severity": "info"
+    }
+  ],
+  "summary": {
+    "fail": 1,
+    "info": 1,
+    "ok": 1,
+    "total": 4,
+    "warn": 1
+  }
+}

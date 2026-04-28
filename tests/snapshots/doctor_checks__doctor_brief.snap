@@ -1,0 +1,5 @@
+---
+source: tests/doctor_checks.rs
+expression: rendered
+---
+doctor: 1/4 ok, 1 warn, 1 fail

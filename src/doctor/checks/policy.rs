@@ -21,7 +21,7 @@ pub fn diagnose_allowlist(file: &Path) -> AllowlistDiagnosis {
         Ok(s) => s,
         Err(e) => return AllowlistDiagnosis::Malformed(e.to_string()),
     };
-    let parsed: toml::Value = match raw.parse() {
+    let parsed: toml::Table = match raw.parse() {
         Ok(v) => v,
         Err(e) => return AllowlistDiagnosis::Malformed(e.to_string()),
     };

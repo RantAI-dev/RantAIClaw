@@ -1,0 +1,20 @@
+---
+source: tests/doctor_checks.rs
+expression: rendered
+---
+RantaiClaw Doctor
+=================
+
+[config]
+  ✓ config.schema — config schema is valid
+  ⚠ policy.allowlist — allowlist is empty
+      → run: rantaiclaw setup approvals
+
+[live]
+  ✗ provider.ping — 401 unauthorized
+      → re-enter API key with: rantaiclaw setup provider
+
+[system]
+  ℹ daemon.registration — init system not detected (skipped)
+
+Summary: 1 ok, 1 warn, 1 fail, 1 info
