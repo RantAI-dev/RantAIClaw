@@ -1,3 +1,5 @@
+pub mod openclaw;
+
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use anyhow::{bail, Context, Result};
@@ -6,6 +8,70 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Identifies which external runtime to import from when running
+/// `rantaiclaw migrate --from <source>`. Wired through the CLI as a clap
+/// `ValueEnum`. `Auto` walks `openclaw::detection_paths()` in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationSource {
+    OpenClaw,
+    ZeroClaw,
+    Auto,
+}
+
+/// Top-level entry point for the new profile-based migration flow.
+///
+/// Auto-detects (or accepts an explicit `source_root` override), creates a
+/// new RantaiClaw profile, and prints a one-line summary on success. Returns
+/// `Ok(None)` when `--from auto` is used and nothing was found — callers
+/// (the CLI) translate that into a friendly stderr message.
+pub fn migrate_from_external(
+    source: MigrationSource,
+    profile_name: &str,
+    force: bool,
+    source_root_override: Option<&Path>,
+) -> Result<Option<openclaw::MigrationSummary>> {
+    let detected_result = match source_root_override {
+        Some(root) => openclaw::detect_at(root).with_context(|| {
+            format!(
+                "no OpenClaw / ZeroClaw install detected at {}",
+                root.display()
+            )
+        }),
+        None => match source {
+            MigrationSource::OpenClaw => detect_with_filter(|v| {
+                matches!(v, openclaw::SourceVariant::OpenClaw)
+            })
+            .context("no OpenClaw install detected"),
+            MigrationSource::ZeroClaw => detect_with_filter(|v| {
+                matches!(v, openclaw::SourceVariant::ZeroClaw)
+            })
+            .context("no ZeroClaw install detected"),
+            MigrationSource::Auto => match openclaw::detect() {
+                Some(d) => Ok(d),
+                None => return Ok(None),
+            },
+        },
+    };
+
+    let detected = detected_result?;
+    let summary = openclaw::migrate_to_profile(&detected, profile_name, force)?;
+    Ok(Some(summary))
+}
+
+fn detect_with_filter<F>(predicate: F) -> Result<openclaw::DetectedSource>
+where
+    F: Fn(openclaw::SourceVariant) -> bool,
+{
+    for path in openclaw::detection_paths() {
+        if let Some(d) = openclaw::detect_at(&path) {
+            if predicate(d.variant) {
+                return Ok(d);
+            }
+        }
+    }
+    bail!("no matching install found in standard candidate paths")
+}
 
 #[derive(Debug, Clone)]
 struct SourceEntry {

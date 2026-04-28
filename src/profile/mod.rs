@@ -189,6 +189,76 @@ impl ProfileManager {
         Ok(dst)
     }
 
+    /// Create a new profile by importing from an external on-disk source
+    /// (e.g. `~/.openclaw/`). Mirrors `create` but the source is a raw
+    /// filesystem path, not another profile. See `crate::migration::openclaw`.
+    ///
+    /// `force=true` overwrites an existing profile of the same name (the
+    /// existing directory is removed first); without `force`, an
+    /// already-existing profile is an error — never silently merged.
+    ///
+    /// Memory and sessions are intentionally NOT copied (matches the
+    /// `clone_into` policy).
+    pub fn create_clone_from_path(
+        name: &str,
+        source_root: &std::path::Path,
+        force: bool,
+    ) -> Result<Profile> {
+        validate_profile_name(name)?;
+        if !source_root.is_dir() {
+            bail!("source root {} is not a directory", source_root.display());
+        }
+        let dst_dir = paths::profile_dir(name);
+        if dst_dir.exists() {
+            if !force {
+                bail!(
+                    "profile {name:?} already exists at {} — pass --force to overwrite",
+                    dst_dir.display()
+                );
+            }
+            fs::remove_dir_all(&dst_dir)
+                .with_context(|| format!("remove existing profile dir {}", dst_dir.display()))?;
+        }
+        let dst = Self::ensure(name)?;
+
+        // 1. Translate config.toml using the OpenClaw migration helper.
+        let src_config = source_root.join("config.toml");
+        if src_config.is_file() {
+            let body = fs::read_to_string(&src_config)
+                .with_context(|| format!("read {}", src_config.display()))?;
+            let (translated, _) = crate::migration::openclaw::translate_config(&body);
+            let dst_config = dst.config_toml();
+            if let Some(parent) = dst_config.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&dst_config, translated)
+                .with_context(|| format!("write {}", dst_config.display()))?;
+        }
+
+        // 2. Copy skills/ verbatim.
+        let src_skills = source_root.join("skills");
+        if src_skills.is_dir() {
+            copy_dir_all(&src_skills, &dst.skills_dir())?;
+        }
+
+        // 3. Copy secrets/ verbatim, retaining 0700 perms on the dest dir.
+        let src_secrets = source_root.join("secrets");
+        if src_secrets.is_dir() {
+            copy_dir_all(&src_secrets, &dst.secrets_dir())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(dst.secrets_dir()) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o700);
+                    let _ = fs::set_permissions(dst.secrets_dir(), perms);
+                }
+            }
+        }
+
+        Ok(dst)
+    }
+
     /// Set the active profile. Refuses unknown profile names so users get a
     /// clear error instead of a silent typo.
     pub fn use_profile(name: &str) -> Result<()> {
