@@ -60,6 +60,7 @@ pub(crate) mod multimodal;
 pub mod observability;
 pub(crate) mod onboard;
 pub mod peripherals;
+pub mod persona;
 pub mod profile;
 pub mod providers;
 pub mod rag;
