@@ -98,6 +98,183 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         || qq.is_some()
 }
 
+// ── Wave-3 orchestrator ──────────────────────────────────────────
+//
+// `run_setup` walks the canonical `SetupSection` list (or dispatches to a
+// single section) and persists the resulting `Config`. It is the public
+// entry point behind `Commands::Setup` — and behind the legacy
+// `Commands::Onboard` alias, which is preserved for backward compat
+// across v0.5.0.
+//
+// Spec: `docs/superpowers/specs/2026-04-27-onboarding-depth-v2-design.md`,
+// §"Setup orchestrator + sections" + §"Re-entry semantics".
+
+use crate::onboard::section::{
+    approvals::ApprovalsSection, channels::ChannelsSection, mcp::McpSection,
+    persona::PersonaSection, provider::ProviderSection, skills::SkillsSection, SetupContext,
+    SetupSection,
+};
+use crate::profile::Profile;
+
+/// Returns the canonical section order. Wave 3 wires five sections; later
+/// waves grow this list (workspace, tunnel, tools, hardware, memory,
+/// project_context, workspace_files, daemon, doctor_handoff).
+pub fn canonical_section_order() -> Vec<&'static str> {
+    canonical_sections().iter().map(|s| s.name()).collect()
+}
+
+fn canonical_sections() -> Vec<Box<dyn SetupSection>> {
+    // Wave 4A inserts `approvals` between `provider` and `channels`. The
+    // approval-gate runtime gates every tool call, so the user must have
+    // a policy chosen before any channel triggers a tool execution.
+    vec![
+        Box::new(ProviderSection),
+        Box::new(ApprovalsSection),
+        Box::new(ChannelsSection),
+        Box::new(PersonaSection),
+        Box::new(SkillsSection),
+        Box::new(McpSection),
+    ]
+}
+
+/// Per-section outcome returned by `run_setup`. Used by tests + the CLI
+/// `setup --topic` summary line.
+#[derive(Debug, Default, Clone)]
+pub struct SetupReport {
+    /// Sections whose `run` was invoked.
+    pub visited: Vec<String>,
+    /// Sections skipped because `is_already_configured` returned `true`
+    /// and `--force` was not set.
+    pub skipped: Vec<String>,
+}
+
+/// Walk the canonical section list (or a single topic) and persist any
+/// changes to the profile's `config.toml`. Pure-functional except for
+/// section side effects + the final `config.save().await`.
+///
+/// * `topic = None` → run every section in canonical order.
+/// * `topic = Some("foo")` → dispatch to the single section named `foo`;
+///   error with the valid topic list if no match.
+/// * `force = true` → bypass `is_already_configured` skip logic.
+/// * `non_interactive = true` → sections that prompt should bail with
+///   their `headless_hint()` rather than calling `dialoguer`.
+pub fn run_setup(
+    profile: &Profile,
+    config: &mut Config,
+    topic: Option<String>,
+    force: bool,
+    non_interactive: bool,
+) -> Result<SetupReport> {
+    let interactive = !non_interactive;
+    if interactive {
+        ui::print_welcome_banner();
+    }
+
+    let sections = canonical_sections();
+
+    // Topic dispatch — single-section path.
+    if let Some(name) = topic.as_deref() {
+        let valid: Vec<&'static str> = sections.iter().map(|s| s.name()).collect();
+        let section = sections
+            .iter()
+            .find(|s| s.name() == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown setup topic '{name}'. valid topics: {}",
+                    valid.join(", ")
+                )
+            })?;
+        let mut report = SetupReport::default();
+        run_one(
+            section.as_ref(),
+            profile,
+            config,
+            interactive,
+            force,
+            &mut report,
+            interactive,
+            1,
+            1,
+        )?;
+        if interactive {
+            print_setup_completion();
+        }
+        return Ok(report);
+    }
+
+    // Full sweep. Section count is small (5 in v0.5.0, ≤13 ever) so a
+    // saturating cast keeps clippy quiet without changing behaviour.
+    let total = u8::try_from(sections.len()).unwrap_or(u8::MAX);
+    let mut report = SetupReport::default();
+    for (idx, section) in sections.iter().enumerate() {
+        let step = u8::try_from(idx + 1).unwrap_or(u8::MAX);
+        run_one(
+            section.as_ref(),
+            profile,
+            config,
+            interactive,
+            force,
+            &mut report,
+            interactive,
+            step,
+            total,
+        )?;
+    }
+
+    if interactive {
+        print_setup_completion();
+    }
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_one(
+    section: &dyn SetupSection,
+    profile: &Profile,
+    config: &mut Config,
+    interactive: bool,
+    force: bool,
+    report: &mut SetupReport,
+    show_header: bool,
+    step: u8,
+    total: u8,
+) -> Result<()> {
+    let already = section.is_already_configured(profile, config);
+    if already && !force {
+        if show_header {
+            ui::info(&format!(
+                "Section [{}/{}] {} — already configured, skipping (use --force to re-run).",
+                step,
+                total,
+                section.name()
+            ));
+        }
+        report.skipped.push(section.name().to_string());
+        return Ok(());
+    }
+
+    if show_header {
+        ui::print_section_header(step, total, section.description());
+    }
+
+    let mut ctx = SetupContext {
+        profile,
+        config,
+        interactive,
+    };
+    section.run(&mut ctx)?;
+    report.visited.push(section.name().to_string());
+    Ok(())
+}
+
+fn print_setup_completion() {
+    ui::print_completion_banner(&[
+        "rantaiclaw doctor — verify the install",
+        "rantaiclaw chat   — start a session",
+        "rantaiclaw setup <topic> — re-run any section",
+    ]);
+}
+
 // ── Main wizard entry point ──────────────────────────────────────
 
 pub async fn run_wizard(force: bool) -> Result<Config> {
@@ -1723,7 +1900,9 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
+pub(crate) fn setup_provider(
+    workspace_dir: &Path,
+) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
@@ -2813,7 +2992,7 @@ fn setup_memory() -> Result<MemoryConfig> {
 // ── Step 3: Channels ────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_channels() -> Result<ChannelsConfig> {
+pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to RantaiClaw from anywhere.");
     print_bullet("CLI is always available. Connect more channels now.");
     println!();

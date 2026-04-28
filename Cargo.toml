@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rantaiclaw"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "Apache-2.0"
@@ -86,8 +86,16 @@ parking_lot = "0.12"
 # Async traits
 async-trait = "0.1"
 
+# File-system advisory locking (used by profile migration to serialize concurrent migrations)
+fs2 = "0.4"
+
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
+
+# Approval gate — glob matching for command allowlist + forbidden_paths
+globset = "0.4"
+# Approval gate — round-trip TOML for command_allowlist.toml preserving comments
+toml_edit = { version = "0.22", default-features = false }
 
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, optional = true }
@@ -108,6 +116,9 @@ glob = "0.3"
 
 # Binary discovery (init system detection)
 which = "7.0"
+
+# Open the user's default browser for OAuth flows (used by `mcp::oauth`)
+webbrowser = "1.0"
 
 # WebSocket client channels (Discord/Lark/DingTalk)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
@@ -227,6 +238,11 @@ panic = "abort"
 tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs"] }
+insta = { version = "1", features = ["json"] }
+mockito = "1"
+# Wave 5 — drives the `setup` CLI from integration tests with a temp $HOME.
+assert_cmd = "2"
+predicates = "3"
 
 [[bench]]
 name = "agent_benchmarks"

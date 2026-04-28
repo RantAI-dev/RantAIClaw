@@ -1,0 +1,48 @@
+# RantaiClaw approval policy — preset L1 (Manual / paranoid)
+#
+# Source bundle for the three policy files written into
+# `<profile>/policy/` by `crate::approval::policy_writer::write_policy_files`.
+# The keys here mirror the eventual on-disk layout one-for-one:
+#
+#   [autonomy]          → `<profile>/policy/autonomy.toml`
+#   [command_allowlist] → `<profile>/policy/command_allowlist.toml`
+#   [forbidden_paths]   → `<profile>/policy/forbidden_paths.toml`
+#
+# L1 is the most restrictive preset. Every tool call is gated by an
+# interactive prompt. The allowlist starts empty — accreted entries
+# accumulate as the user picks `[a]lways` over time. The forbidden-paths
+# list covers system + user-secret directories that no agent should ever
+# touch.
+
+[autonomy]
+preset = "L1"
+mode = "manual"
+description = "Manual — prompt for every tool call. Safest, slowest."
+
+[approvals]
+mode = "manual"
+timeout_secs = 60
+
+[command_allowlist]
+# Empty — every command requires an interactive prompt.
+patterns = []
+
+[forbidden_paths]
+# Maximum surface: system internals + user-secret dirs.
+patterns = [
+  "/etc/**",
+  "/sys/**",
+  "/proc/**",
+  "/boot/**",
+  "/root/**",
+  "/var/log/**",
+  "~/.ssh/**",
+  "~/.gnupg/**",
+  "~/.aws/**",
+  "~/.azure/**",
+  "~/.config/gcloud/**",
+  "~/.kube/**",
+  "~/.docker/**",
+  "~/.rantaiclaw/secrets/**",
+  "~/.rantaiclaw/profiles/*/secrets/**",
+]

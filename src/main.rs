@@ -73,6 +73,12 @@ mod multimodal;
 mod observability;
 mod onboard;
 mod peripherals;
+mod persona {
+    pub use rantaiclaw::persona::*;
+}
+mod profile {
+    pub use rantaiclaw::profile::*;
+}
 mod providers;
 mod runtime;
 mod security;
@@ -99,6 +105,12 @@ pub use rantaiclaw::{HardwareCommands, PeripheralCommands};
 struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
+
+    /// Override the active profile for this invocation.
+    /// Sets `RANTAICLAW_PROFILE` before any config is loaded; precedence:
+    /// CLI flag > env var > active_profile file > "default".
+    #[arg(long = "profile", global = true, value_name = "NAME")]
+    profile: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -163,6 +175,34 @@ enum Commands {
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
+    },
+
+    /// Run the canonical setup wizard, or re-run a single section.
+    ///
+    /// With no `<topic>`, walks every wired section (provider, channels,
+    /// persona, skills, mcp) skipping any that are already configured.
+    /// Pass `--force` to re-run already-configured sections.
+    /// Pass `--non-interactive` in CI / scripts — sections that prompt
+    /// will bail with their CLI hint instead of blocking on stdin.
+    #[command(long_about = "\
+Run the canonical setup wizard, or re-run a single section.
+
+Examples:
+  rantaiclaw setup                       # full wizard (skip already-configured)
+  rantaiclaw setup --force               # re-run every section
+  rantaiclaw setup persona               # only re-run the persona section
+  rantaiclaw setup mcp --non-interactive # show the headless hint and exit")]
+    Setup {
+        /// Single section to run; omit to walk the whole list.
+        topic: Option<String>,
+
+        /// Re-run sections even if they are already configured.
+        #[arg(long)]
+        force: bool,
+
+        /// Skip prompts; emit each section's headless hint and continue.
+        #[arg(long = "non-interactive")]
+        non_interactive: bool,
     },
 
     /// Start the AI agent loop
@@ -258,8 +298,21 @@ Examples:
         service_command: ServiceCommands,
     },
 
-    /// Run diagnostics for daemon/scheduler/channel freshness
+    /// Run diagnostics for daemon/scheduler/channel freshness.
+    ///
+    /// With no subcommand, runs the full new-style health check
+    /// pipeline (config + live + system). Use `--brief` for a sub-second
+    /// offline-friendly summary or `--format json` for CI consumption.
     Doctor {
+        /// Output format: text (default), json, brief.
+        #[arg(long, default_value = "text", value_enum)]
+        format: DoctorFormat,
+        /// Skip the slow `live` checks (provider ping / channel auth / MCP startup).
+        #[arg(long)]
+        brief: bool,
+        /// Treat all live checks as `Info: skipped (offline)`.
+        #[arg(long)]
+        offline: bool,
         #[command(subcommand)]
         doctor_command: Option<DoctorCommands>,
     },
@@ -333,9 +386,31 @@ Examples:
     },
 
     /// Migrate data from other agent runtimes
+    ///
+    /// Two modes:
+    ///   - `migrate --from <openclaw|zeroclaw|auto>`: profile-based import
+    ///     (creates a fresh RantaiClaw profile from the detected install).
+    ///   - `migrate openclaw [--source ...] [--dry-run]`: legacy memory-only
+    ///     subcommand, kept for backwards compatibility.
+    #[command(args_conflicts_with_subcommands = true)]
     Migrate {
         #[command(subcommand)]
-        migrate_command: MigrateCommands,
+        migrate_command: Option<MigrateCommands>,
+
+        /// External source to import from. Use `auto` to walk the standard
+        /// candidate paths in order: `~/.openclaw`, `~/.zeroclaw`,
+        /// `~/.config/openclaw`, `~/.config/zeroclaw`.
+        #[arg(long, value_enum)]
+        from: Option<MigrationSourceArg>,
+
+        /// Name of the new profile to create. Defaults to
+        /// `migrated-from-openclaw` (or `migrated-from-zeroclaw`).
+        #[arg(long)]
+        profile_name: Option<String>,
+
+        /// Overwrite the destination profile if it already exists.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Manage provider subscription authentication profiles
@@ -445,6 +520,26 @@ Examples:
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+
+    /// Manage RantaiClaw profiles (multi-profile storage layout, v0.5.0+)
+    #[command(long_about = "\
+Manage profiles. Each profile is a self-contained \
+~/.rantaiclaw/profiles/<name>/ directory with its own config, persona, \
+workspace, memory, skills, sessions, policy, secrets and runtime state.
+
+The default profile is auto-created on first run. Use `-p <name>` (or \
+the RANTAICLAW_PROFILE env var) to switch profiles for a single \
+invocation without changing the active marker.
+
+Examples:
+  rantaiclaw profile list
+  rantaiclaw profile create work --clone default
+  rantaiclaw profile use work
+  rantaiclaw -p work profile current")]
+    Profile {
+        #[command(subcommand)]
+        cmd: profile::commands::ProfileCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -550,6 +645,28 @@ enum MigrateCommands {
     },
 }
 
+/// CLI-facing variant of `migration::MigrationSource`. Kept separate so the
+/// clap derive on the binary doesn't pollute the lib's public surface.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum MigrationSourceArg {
+    #[value(name = "openclaw")]
+    OpenClaw,
+    #[value(name = "zeroclaw")]
+    ZeroClaw,
+    #[value(name = "auto")]
+    Auto,
+}
+
+impl From<MigrationSourceArg> for rantaiclaw::migration::MigrationSource {
+    fn from(arg: MigrationSourceArg) -> Self {
+        match arg {
+            MigrationSourceArg::OpenClaw => Self::OpenClaw,
+            MigrationSourceArg::ZeroClaw => Self::ZeroClaw,
+            MigrationSourceArg::Auto => Self::Auto,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum CronCommands {
     /// List all scheduled tasks
@@ -645,6 +762,17 @@ enum DoctorCommands {
         #[arg(long)]
         use_cache: bool,
     },
+}
+
+/// Output format for the new-style `rantaiclaw doctor` health check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DoctorFormat {
+    /// Color-coded human-readable output (default).
+    Text,
+    /// Structured JSON for CI consumption.
+    Json,
+    /// One-liner summary, e.g. `doctor: 6/8 ok, 1 warn, 1 fail`.
+    Brief,
 }
 
 #[derive(Subcommand, Debug)]
@@ -748,6 +876,16 @@ async fn main() -> Result<()> {
         std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir);
     }
 
+    // Profile flag must be applied before any config-loading code path so
+    // that ProfileManager::resolve_active_name() observes it. Resolution
+    // precedence is documented on the Cli struct.
+    if let Some(profile_name) = &cli.profile {
+        if profile_name.trim().is_empty() {
+            bail!("--profile cannot be empty");
+        }
+        std::env::set_var("RANTAICLAW_PROFILE", profile_name);
+    }
+
     // No subcommand: launch TUI (bare invocation).
     // `run_tui` loads its own `Config` internally — see `run_tui` docs for
     // why (bin+lib Config type duplication).
@@ -772,6 +910,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Profile management runs without loading the AI agent's full Config —
+    // it only manipulates ~/.rantaiclaw/profiles/<name>/ directories. Run
+    // before Config::load_or_init so `profile create` on a fresh install
+    // does not hit a half-initialised config flow.
+    if let Some(Commands::Profile { cmd }) = cli.command {
+        return profile::commands::run(cmd);
+    }
+
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(
@@ -780,6 +926,59 @@ async fn main() -> Result<()> {
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
+    // ── Wave-3 Setup orchestrator ───────────────────────────────────
+    //
+    // The canonical entry point. Walks the SetupSection list (or
+    // dispatches to a single section) and persists the resulting Config.
+    // Wraps `run_setup` in `spawn_blocking` because the underlying
+    // sections still call `reqwest::blocking` + `dialoguer::Input`, which
+    // panic if invoked inside the tokio runtime.
+    if let Some(Commands::Setup {
+        topic,
+        force,
+        non_interactive,
+    }) = &cli.command
+    {
+        let topic = topic.clone();
+        let force = *force;
+        let non_interactive = *non_interactive;
+
+        // Load (or initialise) config + resolve the active profile in
+        // async land so the section bodies (which use blocking IO +
+        // dialoguer) can run on a dedicated blocking thread.
+        let mut config = Config::load_or_init().await.unwrap_or_default();
+        let profile = profile::ProfileManager::active()?;
+
+        let mut owned_config = config.clone();
+        let profile_for_task = profile.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            let r = onboard::wizard::run_setup(
+                &profile_for_task,
+                &mut owned_config,
+                topic,
+                force,
+                non_interactive,
+            )?;
+            anyhow::Ok((owned_config, r))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("setup task failed: {e}"))?;
+
+        let (updated_config, report) = report?;
+        config = updated_config;
+        config.save().await?;
+
+        // Single-line summary for scripts / CI.
+        if !report.visited.is_empty() || !report.skipped.is_empty() {
+            eprintln!(
+                "setup: visited=[{}] skipped=[{}]",
+                report.visited.join(","),
+                report.skipped.join(","),
+            );
+        }
+        return Ok(());
+    }
 
     // Onboard runs quick setup by default, or the interactive wizard with --interactive.
     // The onboard wizard uses reqwest::blocking internally, which creates its own
@@ -795,6 +994,12 @@ async fn main() -> Result<()> {
         memory,
     }) = &cli.command
     {
+        // Wave-3 deprecation: the canonical command is now `rantaiclaw setup`.
+        // Emit a one-line hint to stderr and continue with the legacy
+        // behaviour for backward compat through v0.5.0; the alias is
+        // slated for removal in a future release once the docs and CI
+        // recipes have caught up.
+        eprintln!("note: `onboard` is now a legacy alias for `rantaiclaw setup`.");
         let interactive = *interactive;
         let force = *force;
         let channels_only = *channels_only;
@@ -840,9 +1045,12 @@ async fn main() -> Result<()> {
     config.apply_env_overrides();
 
     match cli.command {
-        None | Some(Commands::Onboard { .. } | Commands::Completions { .. }) => {
-            unreachable!()
-        }
+        None
+        | Some(
+            Commands::Onboard { .. }
+            | Commands::Setup { .. }
+            | Commands::Completions { .. },
+        ) => unreachable!(),
 
         Some(Commands::Agent {
             message,
@@ -1015,7 +1223,12 @@ async fn main() -> Result<()> {
             service::handle_command(&service_command, &config, init_system)
         }
 
-        Some(Commands::Doctor { doctor_command }) => match doctor_command {
+        Some(Commands::Doctor {
+            format,
+            brief,
+            offline,
+            doctor_command,
+        }) => match doctor_command {
             Some(DoctorCommands::Models {
                 provider,
                 use_cache,
@@ -1027,7 +1240,28 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("doctor models task failed: {e}"))?
             }
-            None => doctor::run(&config),
+            None => {
+                use rantaiclaw::doctor::report::{render, DoctorFormat as RenderFormat};
+                let lib_config = rantaiclaw::Config::load_or_init().await?;
+                let profile = profile::ProfileManager::active()
+                    .map_err(|e| anyhow::anyhow!("could not resolve active profile: {e}"))?;
+                let ctx = rantaiclaw::doctor::DoctorContext {
+                    profile,
+                    config: lib_config,
+                    offline,
+                };
+                let results = rantaiclaw::doctor::run_all(ctx, brief).await;
+                let render_format = match format {
+                    DoctorFormat::Text => RenderFormat::Text,
+                    DoctorFormat::Json => RenderFormat::Json,
+                    DoctorFormat::Brief => RenderFormat::Brief,
+                };
+                println!("{}", render(&results, render_format));
+                if rantaiclaw::doctor::report::has_failures(&results) {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
         },
 
         Some(Commands::Channel { channel_command }) => match channel_command {
@@ -1042,8 +1276,23 @@ async fn main() -> Result<()> {
 
         Some(Commands::Skills { skill_command }) => skills::handle_command(skill_command, &config),
 
-        Some(Commands::Migrate { migrate_command }) => {
-            migration::handle_command(migrate_command, &config).await
+        Some(Commands::Migrate {
+            migrate_command,
+            from,
+            profile_name,
+            force,
+        }) => {
+            // New profile-based flow takes precedence when --from is given.
+            if let Some(from) = from {
+                handle_migrate_profile_flow(from.into(), profile_name, force)
+            } else if let Some(cmd) = migrate_command {
+                migration::handle_command(cmd, &config).await
+            } else {
+                anyhow::bail!(
+                    "`migrate` requires either `--from <openclaw|zeroclaw|auto>` or a subcommand. \
+                     Run `rantaiclaw migrate --help` for details."
+                )
+            }
         }
 
         Some(Commands::Chat {
@@ -1103,6 +1352,45 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+
+        // Already short-circuited above before Config::load_or_init; this
+        // arm exists solely to make the match exhaustive without touching
+        // the other Commands arms.
+        Some(Commands::Profile { .. }) => unreachable!("Profile dispatched earlier"),
+    }
+}
+
+/// Drive the `rantaiclaw migrate --from <source>` flow: detect, create new
+/// profile, print summary. Synchronous because all I/O is filesystem-bound.
+fn handle_migrate_profile_flow(
+    source: rantaiclaw::migration::MigrationSource,
+    profile_name: Option<String>,
+    force: bool,
+) -> Result<()> {
+    use rantaiclaw::migration::{migrate_from_external, MigrationSource};
+
+    let default_name = match source {
+        MigrationSource::ZeroClaw => "migrated-from-zeroclaw",
+        // Auto + OpenClaw both default to the same name; users can override.
+        _ => "migrated-from-openclaw",
+    };
+    let profile_name = profile_name.unwrap_or_else(|| default_name.to_string());
+
+    match migrate_from_external(source, &profile_name, force, None)? {
+        Some(summary) => {
+            summary.print_human();
+            Ok(())
+        }
+        None => {
+            // Auto-detect with no candidate found. Friendly hint, not a panic.
+            eprintln!("No OpenClaw / ZeroClaw install detected. Probed:");
+            for path in rantaiclaw::migration::openclaw::detection_paths() {
+                eprintln!("  - {}", path.display());
+            }
+            eprintln!("Pass `--from openclaw` or `--from zeroclaw` to force a specific source,");
+            eprintln!("or set $HOME so one of the candidate paths above is reachable.");
+            std::process::exit(1);
+        }
     }
 }
 

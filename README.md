@@ -194,22 +194,29 @@ After installation:
 
 ```bash
 rantaiclaw --version
-rantaiclaw onboard --interactive   # connect a provider, pick autonomy level
+rantaiclaw setup                   # guided wizard — provider, approvals, channels, persona, skills, MCP
+rantaiclaw doctor                  # verify the install and surface any gaps
 rantaiclaw chat                    # start chatting!
 ```
+
+> The legacy `rantaiclaw onboard` command still works as an alias for
+> `rantaiclaw setup` through v0.5.0; new recipes should prefer `setup`.
 
 ---
 
 ## Getting Started
 
 ```bash
-rantaiclaw chat              # Interactive TUI chat session
-rantaiclaw onboard            # Provider, model, channels, workspace setup
-rantaiclaw daemon             # Run gateway: HTTP API + multi-channel listeners
-rantaiclaw skill install <id> # Install a community skill from ClawHub
-rantaiclaw status             # Verify install and show config health
-rantaiclaw config get|set     # Inspect/update runtime config
-rantaiclaw --help             # All commands
+rantaiclaw chat                # Interactive TUI chat session
+rantaiclaw setup               # Guided wizard (or `rantaiclaw setup <topic>` for a single section)
+rantaiclaw doctor              # Diagnostics: config, policy, daemon, system deps
+rantaiclaw daemon              # Run gateway: HTTP API + multi-channel listeners
+rantaiclaw skill install <id>  # Install a community skill from ClawHub
+rantaiclaw profile list        # Manage multi-profile configs (v0.5.0+)
+rantaiclaw migrate --from auto # Import config from a legacy OpenClaw / ZeroClaw install
+rantaiclaw status              # Verify install and show config health
+rantaiclaw config get|set      # Inspect/update runtime config
+rantaiclaw --help              # All commands
 ```
 
 📖 **[Full install reference →](docs/install.md)** · **[Troubleshooting →](docs/troubleshooting.md)** · **[Releases →](https://github.com/RantAI-dev/RantAIClaw/releases)**

@@ -2941,6 +2941,17 @@ fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
     Ok((config_dir.clone(), config_dir.join("workspace")))
 }
 
+/// Profile-aware default that the runtime resolver falls back to when no
+/// `RANTAICLAW_CONFIG_DIR`, `RANTAICLAW_WORKSPACE`, or `active_workspace.toml`
+/// override is present. The active_workspace marker still lives at the
+/// flat root so existing per-workspace overrides continue to work; only the
+/// final fallback now points at `~/.rantaiclaw/profiles/<active>/`.
+fn profile_default_config_and_workspace_dirs() -> Option<(PathBuf, PathBuf)> {
+    let profile = crate::profile::ProfileManager::active().ok()?;
+    let workspace = profile.workspace_dir();
+    Some((profile.root, workspace))
+}
+
 const ACTIVE_WORKSPACE_STATE_FILE: &str = "active_workspace.toml";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3149,6 +3160,18 @@ async fn resolve_runtime_config_dirs(
         ));
     }
 
+    // v0.5.0+: if no explicit override and no per-workspace marker,
+    // resolve to the active profile's directory. Falls back to the flat
+    // layout if profile resolution fails (defensive — should be unreachable
+    // because ProfileManager::active() auto-creates `default`).
+    if let Some((profile_root, profile_workspace)) = profile_default_config_and_workspace_dirs() {
+        return Ok((
+            profile_root,
+            profile_workspace,
+            ConfigResolutionSource::DefaultConfigDir,
+        ));
+    }
+
     Ok((
         default_rantaiclaw_dir.to_path_buf(),
         default_workspace_dir.to_path_buf(),
@@ -3228,6 +3251,15 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
 
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
+        // v0.5.0 introduces a profile-aware storage layout
+        // (~/.rantaiclaw/profiles/<name>/...). On first run after upgrading
+        // from v0.4.x, atomically move the flat layout into profiles/default/.
+        // No-op on fresh installs and on already-migrated systems.
+        // See `docs/superpowers/specs/2026-04-27-onboarding-depth-v2-design.md` §7.1.
+        if let Err(e) = crate::profile::migration::maybe_migrate_legacy_layout() {
+            tracing::warn!("legacy-layout migration failed: {e:#}; continuing with current layout");
+        }
+
         let (default_rantaiclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
         let (rantaiclaw_dir, workspace_dir, resolution_source) =
@@ -5501,7 +5533,16 @@ default_temperature = 0.7
     #[test]
     async fn resolve_runtime_config_dirs_falls_back_to_default_layout() {
         let _env_guard = env_override_lock().await;
-        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        // Pin HOME so the v0.5.0 profile-aware fallback resolves into a
+        // tempdir we control instead of the real ~/.rantaiclaw.
+        let temp_home =
+            std::env::temp_dir().join(format!("rantaiclaw_test_home_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_home).await.unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
+        std::env::remove_var("RANTAICLAW_PROFILE");
+
+        let default_config_dir = temp_home.join(".rantaiclaw");
         let default_workspace_dir = default_config_dir.join("workspace");
 
         std::env::remove_var("RANTAICLAW_WORKSPACE");
@@ -5510,11 +5551,24 @@ default_temperature = 0.7
                 .await
                 .unwrap();
 
+        // Source is still `DefaultConfigDir`, but the dirs now point at the
+        // active profile under `<HOME>/.rantaiclaw/profiles/default/`.
         assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
-        assert_eq!(config_dir, default_config_dir);
-        assert_eq!(resolved_workspace_dir, default_workspace_dir);
+        assert_eq!(
+            config_dir,
+            temp_home.join(".rantaiclaw/profiles/default")
+        );
+        assert_eq!(
+            resolved_workspace_dir,
+            temp_home.join(".rantaiclaw/profiles/default/workspace")
+        );
 
-        let _ = fs::remove_dir_all(default_config_dir).await;
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
     }
 
     #[test]

@@ -1,0 +1,10 @@
+---
+source: tests/setup_orchestration.rs
+assertion_line: 213
+expression: banner
+---
+
+┌─────────────────────────────────────────────────────────┐
+│            ⚙ RantaiClaw Setup Wizard                    │
+└─────────────────────────────────────────────────────────┘
+  Let's get you configured. Press Ctrl-C to abort at any time.

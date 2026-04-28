@@ -251,7 +251,10 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         let y = *b.get(i).unwrap_or(&0);
         byte_diff |= x ^ y;
     }
-    (len_diff == 0) & (byte_diff == 0)
+    // Bitwise & is deliberate — `&&` would short-circuit and leak timing info.
+    #[allow(clippy::needless_bitwise_bool)]
+    let eq = (len_diff == 0) & (byte_diff == 0);
+    eq
 }
 
 /// Check if a host string represents a non-localhost bind address.

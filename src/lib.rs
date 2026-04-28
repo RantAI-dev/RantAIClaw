@@ -39,14 +39,14 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 pub mod agent;
-pub(crate) mod approval;
+pub mod approval;
 pub(crate) mod auth;
 pub mod channels;
 pub mod config;
 pub(crate) mod cost;
 pub(crate) mod cron;
-pub(crate) mod daemon;
-pub(crate) mod doctor;
+pub mod daemon;
+pub mod doctor;
 pub mod gateway;
 pub(crate) mod hardware;
 pub(crate) mod health;
@@ -55,18 +55,20 @@ pub(crate) mod identity;
 pub(crate) mod integrations;
 pub mod mcp;
 pub mod memory;
-pub(crate) mod migration;
+pub mod migration;
 pub(crate) mod multimodal;
 pub mod observability;
-pub(crate) mod onboard;
+pub mod onboard;
 pub mod peripherals;
+pub mod persona;
+pub mod profile;
 pub mod providers;
 pub mod rag;
 pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub mod sessions;
-pub(crate) mod skills;
+pub mod skills;
 pub(crate) mod tasks;
 pub mod tools;
 pub mod tui;
@@ -160,7 +162,7 @@ pub(crate) enum SkillCommands {
 
 /// Migration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum MigrateCommands {
+pub enum MigrateCommands {
     /// Import memory from an `OpenClaw` workspace into this `RantaiClaw` workspace
     Openclaw {
         /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)

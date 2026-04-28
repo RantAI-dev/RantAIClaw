@@ -1,0 +1,91 @@
+# RantaiClaw approval policy — preset L2 (Smart / safe-by-default)
+#
+# See `policy_l1.toml` for the bundle layout. L2 is the recommended
+# default for general-assistant use. Read-only and trivially-safe
+# commands are pre-allowed; anything that could mutate state still
+# triggers an interactive prompt.
+
+[autonomy]
+preset = "L2"
+mode = "manual"
+description = "Smart — read-only and trivially-safe commands are pre-allowed; the rest prompt."
+
+[approvals]
+mode = "manual"
+timeout_secs = 60
+
+[command_allowlist]
+# Read-only seeds + safe inspections. Globs follow the
+# `<command> <args>` shape used by ApprovalGate::check.
+patterns = [
+  # File / directory inspection
+  "ls",
+  "ls *",
+  "cat *",
+  "head *",
+  "tail *",
+  "wc *",
+  "file *",
+  "stat *",
+  "tree",
+  "tree *",
+  "pwd",
+
+  # Search
+  "grep *",
+  "rg *",
+  "find *",
+  "locate *",
+
+  # Process / env (read-only)
+  "ps",
+  "ps *",
+  "env",
+  "whoami",
+  "id",
+  "uname *",
+  "date",
+
+  # Git read-only
+  "git status",
+  "git log",
+  "git log *",
+  "git diff",
+  "git diff *",
+  "git show *",
+  "git branch",
+  "git branch *",
+  "git remote *",
+
+  # Networking (read-only HEAD/GET)
+  "curl --head *",
+  "curl -I *",
+  "ping *",
+  "dig *",
+  "host *",
+
+  # Tool / memory built-ins
+  "file_read *",
+  "memory_*",
+  "web_search *",
+  "tool_search *",
+  "list_*",
+]
+
+[forbidden_paths]
+# Same defaults as L1: even on a permissive preset, secrets stay sealed.
+patterns = [
+  "/etc/**",
+  "/sys/**",
+  "/proc/**",
+  "/boot/**",
+  "~/.ssh/**",
+  "~/.gnupg/**",
+  "~/.aws/**",
+  "~/.azure/**",
+  "~/.config/gcloud/**",
+  "~/.kube/**",
+  "~/.docker/**",
+  "~/.rantaiclaw/secrets/**",
+  "~/.rantaiclaw/profiles/*/secrets/**",
+]

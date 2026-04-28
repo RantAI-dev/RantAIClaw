@@ -1,0 +1,15 @@
+# Fixture: realistic OpenClaw v0.3 config layout.
+# Ships before any [autonomy] / [approvals] sections existed.
+# Keys mirror what a real ~/.openclaw/config.toml looked like in v0.3.x.
+
+default_provider = "openrouter"
+default_model = "anthropic/claude-3.5-sonnet"
+default_temperature = 0.6
+
+[provider]
+openrouter_base_url = "https://openrouter.ai/api/v1"
+
+[gateway]
+host = "127.0.0.1"
+port = 8765
+allow_public_bind = false

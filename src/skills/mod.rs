@@ -1,3 +1,6 @@
+pub mod bundled;
+pub mod clawhub;
+
 use anyhow::Result;
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
@@ -647,7 +650,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 
 /// Handle the `skills` CLI command
 #[allow(clippy::too_many_lines)]
-pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
+pub(crate) fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
     let workspace_dir = &config.workspace_dir;
     match command {
         crate::SkillCommands::List => {

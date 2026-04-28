@@ -1,3 +1,5 @@
+pub mod handoff;
+
 use crate::config::Config;
 use anyhow::Result;
 use chrono::Utc;
@@ -16,6 +18,20 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .max(initial_backoff);
 
     crate::health::mark_component_ok("daemon");
+
+    // Write per-profile sentinel so `profile use` knows a daemon is bound.
+    // Best-effort — failure to write must not block the daemon.
+    let active_profile = std::env::var("RANTAICLAW_PROFILE").unwrap_or_else(|_| "default".into());
+    if let Err(e) = crate::profile::sentinel::write_sentinel(
+        &active_profile,
+        &crate::profile::sentinel::DaemonSentinel {
+            pid: std::process::id(),
+            unit: std::env::var("RANTAICLAW_UNIT").ok(),
+            started_at: Some(Utc::now().to_rfc3339()),
+        },
+    ) {
+        tracing::warn!("Failed to write daemon sentinel: {e}");
+    }
 
     if config.heartbeat.enabled {
         let _ =
@@ -100,6 +116,12 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     }
     for handle in handles {
         let _ = handle.await;
+    }
+
+    // Clear sentinel — best-effort; a stale sentinel from a crash will be
+    // ignored by handoff anyway since the unit will not be active.
+    if let Err(e) = crate::profile::sentinel::clear_sentinel(&active_profile) {
+        tracing::warn!("Failed to clear daemon sentinel: {e}");
     }
 
     Ok(())

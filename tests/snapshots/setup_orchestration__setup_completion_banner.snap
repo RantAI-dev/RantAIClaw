@@ -1,0 +1,13 @@
+---
+source: tests/setup_orchestration.rs
+assertion_line: 225
+expression: banner
+---
+
+┌─────────────────────────────────────────────────────────┐
+│            ✓ Setup Complete!                            │
+└─────────────────────────────────────────────────────────┘
+
+→ Next steps:
+  • rantaiclaw doctor — verify the install
+  • rantaiclaw chat   — start a session
