@@ -1,0 +1,82 @@
+# RantaiClaw approval policy — preset L3 (Strict / deny-by-default)
+#
+# See `policy_l1.toml` for the bundle layout. L3 is for unattended
+# / production agents. Mode is `strict`: anything not explicitly
+# allowed is denied (no interactive prompt fallback).
+
+[autonomy]
+preset = "L3"
+mode = "strict"
+description = "Strict — deny-by-default. Only explicitly allowlisted commands run; no prompts."
+
+[approvals]
+mode = "strict"
+timeout_secs = 0
+
+[command_allowlist]
+# Read-only seeds *plus* safe-write seeds: memory bookkeeping, skill
+# install, cron / session housekeeping. Anything beyond this set fails
+# closed under strict mode.
+patterns = [
+  # Read-only (same as L2)
+  "ls",
+  "ls *",
+  "cat *",
+  "head *",
+  "tail *",
+  "wc *",
+  "file *",
+  "stat *",
+  "pwd",
+  "grep *",
+  "rg *",
+  "find *",
+  "ps",
+  "ps *",
+  "env",
+  "whoami",
+  "id",
+  "uname *",
+  "date",
+  "git status",
+  "git log",
+  "git log *",
+  "git diff",
+  "git diff *",
+  "git show *",
+  "git branch",
+  "git branch *",
+  "git remote *",
+  "file_read *",
+  "memory_*",
+  "web_search *",
+  "tool_search *",
+  "list_*",
+
+  # Safe-write seeds — bookkeeping the agent must do to function.
+  "memory_write *",
+  "skill_install *",
+  "cron_*",
+  "session_*",
+]
+
+[forbidden_paths]
+# Strictest set: same as L1 + L2, with read-only system trees added.
+patterns = [
+  "/etc/**",
+  "/sys/**",
+  "/proc/**",
+  "/boot/**",
+  "/root/**",
+  "/var/log/**",
+  "/var/lib/**",
+  "~/.ssh/**",
+  "~/.gnupg/**",
+  "~/.aws/**",
+  "~/.azure/**",
+  "~/.config/gcloud/**",
+  "~/.kube/**",
+  "~/.docker/**",
+  "~/.rantaiclaw/secrets/**",
+  "~/.rantaiclaw/profiles/*/secrets/**",
+]
