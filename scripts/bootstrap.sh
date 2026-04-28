@@ -1267,7 +1267,8 @@ else
     "rantaiclaw status     — verify installation"
   )
   if [[ "$RUN_ONBOARD" == false ]]; then
-    next_steps+=("rantaiclaw onboard --interactive   — connect a provider (OpenRouter, Anthropic, etc.)")
+    next_steps+=("rantaiclaw setup     — guided wizard (provider, approvals, channels, persona, skills, MCP)")
+    next_steps+=("rantaiclaw doctor    — verify the install once configured")
   fi
   print_success_banner "${next_steps[@]}"
 fi

@@ -996,10 +996,10 @@ async fn main() -> Result<()> {
     {
         // Wave-3 deprecation: the canonical command is now `rantaiclaw setup`.
         // Emit a one-line hint to stderr and continue with the legacy
-        // behaviour for backward compat. Wave 5 removes this branch.
-        eprintln!(
-            "warning: `rantaiclaw onboard` is deprecated; prefer `rantaiclaw setup` (this command will be removed before v0.5.0 ships)."
-        );
+        // behaviour for backward compat through v0.5.0; the alias is
+        // slated for removal in a future release once the docs and CI
+        // recipes have caught up.
+        eprintln!("note: `onboard` is now a legacy alias for `rantaiclaw setup`.");
         let interactive = *interactive;
         let force = *force;
         let channels_only = *channels_only;
