@@ -9,5 +9,6 @@
 
 pub mod _stub;
 
+pub mod mcp;
 pub mod persona;
 pub mod skills;
