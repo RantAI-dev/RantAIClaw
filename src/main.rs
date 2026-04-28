@@ -177,6 +177,34 @@ enum Commands {
         memory: Option<String>,
     },
 
+    /// Run the canonical setup wizard, or re-run a single section.
+    ///
+    /// With no `<topic>`, walks every wired section (provider, channels,
+    /// persona, skills, mcp) skipping any that are already configured.
+    /// Pass `--force` to re-run already-configured sections.
+    /// Pass `--non-interactive` in CI / scripts — sections that prompt
+    /// will bail with their CLI hint instead of blocking on stdin.
+    #[command(long_about = "\
+Run the canonical setup wizard, or re-run a single section.
+
+Examples:
+  rantaiclaw setup                       # full wizard (skip already-configured)
+  rantaiclaw setup --force               # re-run every section
+  rantaiclaw setup persona               # only re-run the persona section
+  rantaiclaw setup mcp --non-interactive # show the headless hint and exit")]
+    Setup {
+        /// Single section to run; omit to walk the whole list.
+        topic: Option<String>,
+
+        /// Re-run sections even if they are already configured.
+        #[arg(long)]
+        force: bool,
+
+        /// Skip prompts; emit each section's headless hint and continue.
+        #[arg(long = "non-interactive")]
+        non_interactive: bool,
+    },
+
     /// Start the AI agent loop
     #[command(long_about = "\
 Start the AI agent loop.
@@ -855,6 +883,59 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
+    // ── Wave-3 Setup orchestrator ───────────────────────────────────
+    //
+    // The canonical entry point. Walks the SetupSection list (or
+    // dispatches to a single section) and persists the resulting Config.
+    // Wraps `run_setup` in `spawn_blocking` because the underlying
+    // sections still call `reqwest::blocking` + `dialoguer::Input`, which
+    // panic if invoked inside the tokio runtime.
+    if let Some(Commands::Setup {
+        topic,
+        force,
+        non_interactive,
+    }) = &cli.command
+    {
+        let topic = topic.clone();
+        let force = *force;
+        let non_interactive = *non_interactive;
+
+        // Load (or initialise) config + resolve the active profile in
+        // async land so the section bodies (which use blocking IO +
+        // dialoguer) can run on a dedicated blocking thread.
+        let mut config = Config::load_or_init().await.unwrap_or_default();
+        let profile = profile::ProfileManager::active()?;
+
+        let mut owned_config = config.clone();
+        let profile_for_task = profile.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            let r = onboard::wizard::run_setup(
+                &profile_for_task,
+                &mut owned_config,
+                topic,
+                force,
+                non_interactive,
+            )?;
+            anyhow::Ok((owned_config, r))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("setup task failed: {e}"))?;
+
+        let (updated_config, report) = report?;
+        config = updated_config;
+        config.save().await?;
+
+        // Single-line summary for scripts / CI.
+        if !report.visited.is_empty() || !report.skipped.is_empty() {
+            eprintln!(
+                "setup: visited=[{}] skipped=[{}]",
+                report.visited.join(","),
+                report.skipped.join(","),
+            );
+        }
+        return Ok(());
+    }
+
     // Onboard runs quick setup by default, or the interactive wizard with --interactive.
     // The onboard wizard uses reqwest::blocking internally, which creates its own
     // Tokio runtime. To avoid "Cannot drop a runtime in a context where blocking is
@@ -869,6 +950,12 @@ async fn main() -> Result<()> {
         memory,
     }) = &cli.command
     {
+        // Wave-3 deprecation: the canonical command is now `rantaiclaw setup`.
+        // Emit a one-line hint to stderr and continue with the legacy
+        // behaviour for backward compat. Wave 5 removes this branch.
+        eprintln!(
+            "warning: `rantaiclaw onboard` is deprecated; prefer `rantaiclaw setup` (this command will be removed before v0.5.0 ships)."
+        );
         let interactive = *interactive;
         let force = *force;
         let channels_only = *channels_only;
@@ -914,9 +1001,12 @@ async fn main() -> Result<()> {
     config.apply_env_overrides();
 
     match cli.command {
-        None | Some(Commands::Onboard { .. } | Commands::Completions { .. }) => {
-            unreachable!()
-        }
+        None
+        | Some(
+            Commands::Onboard { .. }
+            | Commands::Setup { .. }
+            | Commands::Completions { .. },
+        ) => unreachable!(),
 
         Some(Commands::Agent {
             message,
