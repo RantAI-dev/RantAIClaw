@@ -73,6 +73,9 @@ mod multimodal;
 mod observability;
 mod onboard;
 mod peripherals;
+mod persona {
+    pub use rantaiclaw::persona::*;
+}
 mod profile {
     pub use rantaiclaw::profile::*;
 }
