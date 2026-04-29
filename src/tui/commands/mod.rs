@@ -17,12 +17,35 @@ use super::context::TuiContext;
 pub enum CommandResult {
     Continue,
     Message(String),
+    /// Open a modal overlay (Claude-Code-style). The renderer pins it
+    /// above the chat until the user presses `Esc`. Use for content too
+    /// big or too structured for an inline `Message` — `/help`, full
+    /// `/skills` listings, `/sessions` directory, etc.
+    Overlay(OverlayContent),
     Quit,
     ClearError,
     /// Dispatch a new agent turn with the given user message.
     /// The message is not appended to history again — the caller
     /// expects it to already live there (e.g. `/retry`).
     Resubmit(String),
+}
+
+/// Pre-rendered content for the modal help overlay. Multiple "tabs" can
+/// share one overlay (a la Claude Code's `general / commands /
+/// custom-commands` strip); only the active tab is visible at a time.
+#[derive(Debug, Clone)]
+pub struct OverlayContent {
+    pub title: String,
+    pub tabs: Vec<OverlayTab>,
+    pub active_tab: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct OverlayTab {
+    pub label: String,
+    /// Body lines, plain text. The renderer applies brand styling at
+    /// draw time (sky for keywords, muted for descriptions, etc.).
+    pub body: Vec<String>,
 }
 
 /// Trait for command handlers

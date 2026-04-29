@@ -106,6 +106,23 @@ impl TuiContext {
         Ok(())
     }
 
+    /// Append a system-role message (used for inline command output like
+    /// `/usage`, `/sessions`, etc.). Persisted to the session store so
+    /// scrollback + resume still show the line.
+    pub fn append_system_message(&mut self, content: &str) -> Result<()> {
+        let msg = Message {
+            id: 0,
+            session_id: self.session_id.clone(),
+            role: "system".to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+        self.session_store.append_message(&msg)?;
+        self.messages.push(msg);
+        Ok(())
+    }
+
     /// Append an assistant message to the in-memory list and persist it.
     pub fn append_assistant_message(&mut self, content: &str) -> Result<()> {
         self.append_assistant_message_with_tools(content, None)

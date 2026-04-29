@@ -62,6 +62,9 @@ pub struct TuiApp {
     /// Slash-command dropdown — visible whenever the input buffer starts
     /// with `/`. Filtered by prefix on every keystroke.
     pub autocomplete: super::widgets::autocomplete::Autocomplete,
+    /// Active modal overlay (e.g. /help). `None` = no overlay shown.
+    /// Esc dismisses; left/right arrows cycle tabs.
+    pub overlay: Option<super::commands::OverlayContent>,
 }
 
 impl TuiApp {
@@ -92,6 +95,7 @@ impl TuiApp {
             context,
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
+            overlay: None,
         })
     }
 
@@ -174,6 +178,37 @@ impl TuiApp {
             // Escape — dismiss the dropdown without changing the buffer.
             KeyCode::Esc if self.autocomplete.is_visible() => {
                 self.autocomplete.hide();
+            }
+            // Escape — close the modal overlay (e.g. /help).
+            KeyCode::Esc if self.overlay.is_some() => {
+                self.overlay = None;
+            }
+            // Tab cycles tabs in the overlay.
+            KeyCode::Tab if self.overlay.is_some() => {
+                if let Some(o) = self.overlay.as_mut() {
+                    if !o.tabs.is_empty() {
+                        o.active_tab = (o.active_tab + 1) % o.tabs.len();
+                    }
+                }
+            }
+            // Left/Right also cycle tabs in the overlay.
+            KeyCode::Left if self.overlay.is_some() => {
+                if let Some(o) = self.overlay.as_mut() {
+                    if !o.tabs.is_empty() {
+                        o.active_tab = if o.active_tab == 0 {
+                            o.tabs.len() - 1
+                        } else {
+                            o.active_tab - 1
+                        };
+                    }
+                }
+            }
+            KeyCode::Right if self.overlay.is_some() => {
+                if let Some(o) = self.overlay.as_mut() {
+                    if !o.tabs.is_empty() {
+                        o.active_tab = (o.active_tab + 1) % o.tabs.len();
+                    }
+                }
             }
             // Backspace
             KeyCode::Backspace => {
@@ -400,7 +435,13 @@ impl TuiApp {
                 self.state = AppState::Quitting;
             }
             CmdResult::Message(msg) => {
-                self.context.last_error = Some(msg);
+                // Append as a system chat message so multi-line content
+                // renders properly. The status bar's `last_error` slot is
+                // reserved for errors only.
+                let _ = self.context.append_system_message(&msg);
+            }
+            CmdResult::Overlay(content) => {
+                self.overlay = Some(content);
             }
             CmdResult::Continue | CmdResult::ClearError => {
                 self.context.last_error = None;
@@ -447,6 +488,7 @@ impl TuiApp {
             state,
             context,
             autocomplete,
+            overlay,
             ..
         } = self;
 
@@ -467,6 +509,14 @@ impl TuiApp {
             render_chat_pane(state, context, frame, chunks[1]);
             render_input_pane(context, frame, chunks[2]);
             render_status_pane(context, frame, chunks[3]);
+
+            // Modal overlay — when open, occupies most of the chat area.
+            // Drawn before the dropdown so the dropdown wins focus visually
+            // if both are open (rare; the user closes one before toggling
+            // the other).
+            if let Some(content) = overlay.as_ref() {
+                render_overlay_pane(content, frame, chunks[1]);
+            }
 
             // Slash-command dropdown — anchored just above the input box,
             // grows upward into the chat area like a Hermes / Claude-Code
@@ -963,6 +1013,157 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+/// Render the modal `/help`-style overlay over the chat area. Layout
+/// mirrors Claude Code's:
+///   ┌ Rantaiclaw v0.5.0  [general]  commands ───────────┐
+///   │                                                   │
+///   │ <body of active tab>                              │
+///   │                                                   │
+///   │                                Esc to close       │
+///   └───────────────────────────────────────────────────┘
+fn render_overlay_pane(
+    content: &super::commands::OverlayContent,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+) {
+    use ratatui::widgets::{Clear, Paragraph};
+
+    if area.height < 5 || area.width < 30 {
+        // Terminal too small for the overlay; fall back to silently
+        // skipping the panel — the user can still see the chat behind it
+        // and dismiss with Esc.
+        return;
+    }
+
+    // Center the panel — leave a 2-col gutter on each side.
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2);
+    let panel_area = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: inner_w,
+        height: inner_h,
+    };
+
+    // Draw a clean opaque background so chat content underneath doesn't
+    // bleed through.
+    frame.render_widget(Clear, panel_area);
+
+    let sky = Color::Rgb(94, 184, 255);
+    let blue = Color::Rgb(59, 140, 255);
+    let muted = Color::Rgb(107, 114, 128);
+    let active_bg = Color::Rgb(94, 184, 255);
+    let frame_color = Color::Rgb(40, 70, 140);
+
+    // Title spans the full width. Active tab gets a sky-blue chip; inactive
+    // tabs are muted.
+    let mut title_spans: Vec<Span<'static>> = vec![
+        Span::raw(" "),
+        Span::styled(
+            content.title.clone(),
+            Style::default().fg(sky).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    for (i, tab) in content.tabs.iter().enumerate() {
+        if i == content.active_tab {
+            title_spans.push(Span::styled(
+                format!(" {} ", tab.label),
+                Style::default()
+                    .fg(Color::Rgb(4, 11, 46))
+                    .bg(active_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            title_spans.push(Span::styled(
+                format!(" {} ", tab.label),
+                Style::default().fg(muted),
+            ));
+        }
+        title_spans.push(Span::raw(" "));
+    }
+
+    let block = Block::default()
+        .title(Line::from(title_spans))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(frame_color));
+
+    let body_lines: Vec<Line> = content
+        .tabs
+        .get(content.active_tab)
+        .map(|t| {
+            let mut lines: Vec<Line> = Vec::with_capacity(t.body.len() + 2);
+            for raw in &t.body {
+                if raw.is_empty() {
+                    lines.push(Line::from(""));
+                    continue;
+                }
+                // Section header heuristic: line that doesn't start with
+                // whitespace and ends without colon (or is short) — bolden
+                // it as a category label.
+                let is_section = !raw.starts_with(' ')
+                    && !raw.contains("://")
+                    && raw.split_whitespace().count() <= 4;
+                if is_section {
+                    lines.push(Line::from(Span::styled(
+                        raw.clone(),
+                        Style::default().fg(blue).add_modifier(Modifier::BOLD),
+                    )));
+                } else {
+                    // Inside the body lines, bullet rows are coloured to make
+                    // command names + key bindings pop without overdoing it.
+                    lines.push(highlight_help_line(raw, sky, muted));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  Esc",
+                    Style::default().fg(sky).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to close · ", Style::default().fg(muted)),
+                Span::styled(
+                    "Tab / ← →",
+                    Style::default().fg(sky).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to switch tabs", Style::default().fg(muted)),
+            ]));
+            lines
+        })
+        .unwrap_or_default();
+
+    let body = Paragraph::new(body_lines).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(body, panel_area);
+}
+
+/// Color the leading token of a help-body line — command names (`/foo`)
+/// or shortcut keys (`Ctrl+C`) get the sky accent, the rest stays muted.
+fn highlight_help_line(raw: &str, sky: Color, muted: Color) -> Line<'static> {
+    // Line shape we expect: `  /command   description...` or
+    // `  Ctrl+X    description...` or just `  • text...`. We split on the
+    // first run of >=2 spaces.
+    let trimmed = raw.trim_start();
+    let leading = raw.len() - trimmed.len();
+    // Find the first "double-space" gap that separates the keyword from
+    // the description.
+    if let Some(gap) = trimmed.find("  ") {
+        let keyword = &trimmed[..gap];
+        let rest = trimmed[gap..].trim_start();
+        Line::from(vec![
+            Span::raw(" ".repeat(leading)),
+            Span::styled(
+                keyword.to_string(),
+                Style::default().fg(sky).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(rest.to_string(), Style::default().fg(muted)),
+        ])
+    } else {
+        Line::from(Span::styled(raw.to_string(), Style::default().fg(muted)))
+    }
+}
+
 /// Format a duration in seconds as a compact `1h2m` / `34m` / `12s` label.
 fn format_duration_short(secs: u64) -> String {
     if secs >= 3600 {
@@ -1090,6 +1291,7 @@ mod tests {
             context: ctx,
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
+            overlay: None,
         }
     }
 
@@ -1132,7 +1334,10 @@ mod tests {
         app.context.input_buffer = "/new".to_string();
         app.submit_input().await.unwrap();
 
-        assert!(app.context.messages.is_empty());
+        // /new clears the chat, then appends a system "Started new session"
+        // confirmation line — so messages == 1, not 0. The session id flips.
+        assert_eq!(app.context.messages.len(), 1);
+        assert_eq!(app.context.messages[0].role, "system");
         assert_ne!(app.context.session_id, first_session_id);
     }
 }
@@ -1149,6 +1354,7 @@ mod submit_tests {
             context: ctx,
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
+            overlay: None,
         }
     }
 
@@ -1222,6 +1428,7 @@ mod ctrl_c_tests {
             context: ctx,
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
+            overlay: None,
         }
     }
 
@@ -1278,6 +1485,7 @@ mod drain_tests {
             context: ctx,
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
+            overlay: None,
         }
     }
 
@@ -1404,6 +1612,7 @@ mod retry_tests {
             context: ctx,
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
+            overlay: None,
         }
     }
 
@@ -1462,7 +1671,15 @@ mod retry_tests {
 
         assert!(matches!(app.state, AppState::Ready));
         assert!(req_rx.try_recv().is_err());
-        let err = app.context.last_error.as_deref().unwrap_or("");
-        assert!(err.contains("No previous response"));
+        // CommandResult::Message now appends as a system chat message
+        // (instead of the single-line error slot) so multi-line content
+        // renders properly.
+        let last_msg = app.context.messages.last().expect("system message");
+        assert_eq!(last_msg.role, "system");
+        assert!(
+            last_msg.content.contains("No previous response"),
+            "got {:?}",
+            last_msg.content
+        );
     }
 }
