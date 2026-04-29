@@ -134,15 +134,15 @@ pub fn write_policy_files(profile: &Profile, preset: PolicyPreset, force: bool) 
         )
     })?;
 
-    write_autonomy(&dir, &bundle, preset, force)?;
-    write_patterns(
+    let wrote_autonomy = write_autonomy(&dir, &bundle, preset, force)?;
+    let wrote_allowlist = write_patterns(
         &dir.join("command_allowlist.toml"),
         "command_allowlist",
         &bundle.command_allowlist.patterns,
         ALLOWLIST_HEADER,
         force,
     )?;
-    write_patterns(
+    let wrote_forbidden = write_patterns(
         &dir.join("forbidden_paths.toml"),
         "forbidden_paths",
         &bundle.forbidden_paths.patterns,
@@ -162,7 +162,17 @@ pub fn write_policy_files(profile: &Profile, preset: PolicyPreset, force: bool) 
     // between the bundled preset and the writer (e.g. someone adds a new
     // required field to PolicyBundle but forgets to update the templates),
     // bundled preset syntax bugs, and writer-side encoding mistakes.
-    verify_written_policy(&dir).with_context(|| {
+    //
+    // Only verify the files this call actually wrote — when `force=false`
+    // and a file already exists on disk we leave the user's edits alone,
+    // and that file is no longer the writer's responsibility to validate.
+    verify_written_policy(
+        &dir,
+        wrote_autonomy,
+        wrote_allowlist,
+        wrote_forbidden,
+    )
+    .with_context(|| {
         format!(
             "approval preset {} wrote policy files but they failed parse-back \
              — preset bundles or writer drift",
@@ -175,31 +185,38 @@ pub fn write_policy_files(profile: &Profile, preset: PolicyPreset, force: bool) 
 
 /// Re-read each of `autonomy.toml`, `command_allowlist.toml`,
 /// `forbidden_paths.toml` and confirm they deserialize into the shapes
-/// the approval gate consumer code expects. Fails loud if any file is
-/// missing, malformed, or shaped wrong.
-fn verify_written_policy(dir: &Path) -> Result<()> {
-    let autonomy = dir.join("autonomy.toml");
-    let raw = fs::read_to_string(&autonomy)
-        .with_context(|| format!("read {}", autonomy.display()))?;
-    let parsed: toml::value::Table = toml::from_str(&raw)
-        .with_context(|| format!("parse {}", autonomy.display()))?;
-    if !parsed.contains_key("autonomy") {
-        anyhow::bail!(
-            "{} missing required [autonomy] block",
-            autonomy.display()
-        );
-    }
-    if !parsed.contains_key("approvals") {
-        anyhow::bail!(
-            "{} missing required [approvals] block",
-            autonomy.display()
-        );
+/// the approval gate consumer code expects. Files that this call did
+/// NOT freshly write (the `force=false` no-op path with pre-existing
+/// content) are skipped — the user's edits are not the writer's
+/// concern.
+fn verify_written_policy(
+    dir: &Path,
+    check_autonomy: bool,
+    check_allowlist: bool,
+    check_forbidden: bool,
+) -> Result<()> {
+    if check_autonomy {
+        let autonomy = dir.join("autonomy.toml");
+        let raw = fs::read_to_string(&autonomy)
+            .with_context(|| format!("read {}", autonomy.display()))?;
+        let parsed: toml::value::Table =
+            toml::from_str(&raw).with_context(|| format!("parse {}", autonomy.display()))?;
+        if !parsed.contains_key("autonomy") {
+            anyhow::bail!("{} missing required [autonomy] block", autonomy.display());
+        }
+        if !parsed.contains_key("approvals") {
+            anyhow::bail!("{} missing required [approvals] block", autonomy.display());
+        }
     }
 
-    for (name, key) in [
-        ("command_allowlist.toml", "command_allowlist"),
-        ("forbidden_paths.toml", "forbidden_paths"),
-    ] {
+    let pattern_files: &[(bool, &str, &str)] = &[
+        (check_allowlist, "command_allowlist.toml", "command_allowlist"),
+        (check_forbidden, "forbidden_paths.toml", "forbidden_paths"),
+    ];
+    for &(should_check, name, key) in pattern_files {
+        if !should_check {
+            continue;
+        }
         let path = dir.join(name);
         let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let parsed: toml::value::Table =
@@ -207,7 +224,6 @@ fn verify_written_policy(dir: &Path) -> Result<()> {
         let block = parsed.get(key).ok_or_else(|| {
             anyhow::anyhow!("{} missing required [{key}] block", path.display())
         })?;
-        // The block must contain a `patterns` array of strings.
         let table = block
             .as_table()
             .ok_or_else(|| anyhow::anyhow!("{} [{key}] is not a table", path.display()))?;
@@ -252,15 +268,17 @@ const FORBIDDEN_HEADER: &str = "\
 # these paths (spec §6.1).
 ";
 
+/// Returns `Ok(true)` if the file was freshly written, `Ok(false)` if the
+/// existing file was preserved (force=false + path exists).
 fn write_autonomy(
     dir: &Path,
     bundle: &PolicyBundle,
     preset: PolicyPreset,
     force: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let path = dir.join("autonomy.toml");
     if path.exists() && !force {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut doc = toml::value::Table::new();
@@ -277,18 +295,20 @@ fn write_autonomy(
     })?;
     let out = format!("{AUTONOMY_HEADER}\n{body}");
     fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    Ok(true)
 }
 
+/// Returns `Ok(true)` if the file was freshly written, `Ok(false)` if the
+/// existing file was preserved.
 fn write_patterns(
     path: &Path,
     section: &str,
     patterns: &[String],
     header: &str,
     force: bool,
-) -> Result<()> {
+) -> Result<bool> {
     if path.exists() && !force {
-        return Ok(());
+        return Ok(false);
     }
     // Hand-roll the TOML so the test fixtures (which assert on raw
     // string presence) get a stable, easily-grep-able shape.
@@ -308,7 +328,7 @@ fn write_patterns(
         body.push_str("]\n");
     }
     fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    Ok(true)
 }
 
 // ── Tests (unit) ────────────────────────────────────────────────
@@ -397,7 +417,7 @@ mod tests {
             )
             .expect("write forbidden_paths");
 
-            verify_written_policy(tmp.path()).unwrap_or_else(|e| {
+            verify_written_policy(tmp.path(), true, true, true).unwrap_or_else(|e| {
                 panic!("preset {} round-trip self-check failed: {e}", p.id())
             });
         }
@@ -422,7 +442,7 @@ mod tests {
             "[forbidden_paths]\npatterns = []\n",
         )
         .unwrap();
-        let err = verify_written_policy(tmp.path()).unwrap_err();
+        let err = verify_written_policy(tmp.path(), true, true, true).unwrap_err();
         assert!(
             err.to_string().contains("autonomy"),
             "expected autonomy-related error, got {err}"
@@ -449,7 +469,7 @@ mod tests {
             "[forbidden_paths]\npatterns = []\n",
         )
         .unwrap();
-        let err = verify_written_policy(tmp.path()).unwrap_err();
+        let err = verify_written_policy(tmp.path(), true, true, true).unwrap_err();
         assert!(
             err.to_string().contains("not a string"),
             "expected pattern type error, got {err}"
