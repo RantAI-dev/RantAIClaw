@@ -156,24 +156,60 @@ impl TuiApp {
                     }
                 }
             }
-            // Ctrl+Enter → submit
+            // Tab — completes the highlighted command from the dropdown.
+            // Always wins over the cycling-tabs handler when typing a
+            // slash command (the autocomplete is visible only then).
+            KeyCode::Tab if self.autocomplete.is_visible() => {
+                self.complete_selected_command();
+            }
+            // Ctrl+Enter → submit (Kitty-protocol terminals).
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.autocomplete.hide();
                 self.submit_input().await?;
             }
-            // Plain Enter — completes the highlighted command if the
-            // dropdown is visible; otherwise inserts a newline as before.
+            // Ctrl+J → newline (alt for terminals that don't pass Shift+Enter).
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.context.input_buffer.push('\n');
+            }
+            // Plain Enter:
+            //   * On a slash-command buffer (`/foo …` on a single line) →
+            //     submit, so users don't need Ctrl+Enter for `/help`.
+            //   * Otherwise → newline (multi-line prompts still work).
+            //   * If the autocomplete dropdown is open and the highlighted
+            //     command differs from what the user typed, complete first
+            //     and submit on the *next* Enter; if the highlight already
+            //     matches, submit immediately.
             KeyCode::Enter => {
-                if self.autocomplete.is_visible() {
+                let buf = self.context.input_buffer.trim_end_matches(' ');
+                let is_single_line_slash = buf.starts_with('/') && !buf.contains('\n');
+                if is_single_line_slash {
+                    if self.autocomplete.is_visible() {
+                        // If the user's typed text already matches the
+                        // highlighted suggestion, just submit — they
+                        // intended to fire it. Otherwise complete to the
+                        // selection and let them confirm or add args.
+                        let typed_cmd = buf.trim_end_matches(' ').to_string();
+                        let selected = self
+                            .autocomplete
+                            .selected()
+                            .map(|s| s.to_string());
+                        if selected.as_deref() == Some(typed_cmd.as_str()) {
+                            self.autocomplete.hide();
+                            self.submit_input().await?;
+                        } else {
+                            self.complete_selected_command();
+                        }
+                    } else {
+                        self.submit_input().await?;
+                    }
+                } else if self.autocomplete.is_visible() {
+                    // Defensive: dropdown shouldn't be visible here, but if
+                    // it is, treat Enter as completion to match user
+                    // muscle memory.
                     self.complete_selected_command();
                 } else {
                     self.context.input_buffer.push('\n');
                 }
-            }
-            // Tab — completes the highlighted command (Hermes / Claude-Code
-            // muscle memory).
-            KeyCode::Tab if self.autocomplete.is_visible() => {
-                self.complete_selected_command();
             }
             // Escape — dismiss the dropdown without changing the buffer.
             KeyCode::Esc if self.autocomplete.is_visible() => {
@@ -875,7 +911,7 @@ fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
     );
     let body = if ctx.input_buffer.is_empty() {
         Span::styled(
-            "Type a message…  (Ctrl+Enter send · /help for commands · Ctrl+C exit)",
+            "Type a message…  (Enter sends · /help for commands · Ctrl+J newline · Ctrl+C exit)",
             Style::default().fg(Color::Rgb(107, 114, 128)),
         )
     } else {
