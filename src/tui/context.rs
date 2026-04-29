@@ -22,6 +22,13 @@ pub struct TuiContext {
     pub input_buffer: String,
     pub scroll_offset: usize,
     pub token_usage: TokenUsage,
+    /// Total context window of the active model, in tokens. Used by the
+    /// status bar to display a `used/window  pct%` meter. `None` when the
+    /// provider didn't surface a window size.
+    pub context_window: Option<u64>,
+    /// When the TUI session started — used by the status bar to display a
+    /// compact `1h2m` / `34m` / `12s` age label.
+    pub started_at: std::time::Instant,
     pub last_error: Option<String>,
     pub debug_mode: bool,
     /// Outbound channel to the `TuiAgentActor` for submitting turn requests.
@@ -64,6 +71,8 @@ impl TuiContext {
             input_buffer: String::new(),
             scroll_offset: 0,
             token_usage: TokenUsage::default(),
+            context_window: None,
+            started_at: std::time::Instant::now(),
             last_error: None,
             debug_mode: false,
             req_tx,

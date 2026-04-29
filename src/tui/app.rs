@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
     Terminal,
 };
 
@@ -59,6 +59,9 @@ pub struct TuiApp {
     pub state: AppState,
     pub context: TuiContext,
     pub command_registry: CommandRegistry,
+    /// Slash-command dropdown — visible whenever the input buffer starts
+    /// with `/`. Filtered by prefix on every keystroke.
+    pub autocomplete: super::widgets::autocomplete::Autocomplete,
 }
 
 impl TuiApp {
@@ -88,7 +91,30 @@ impl TuiApp {
             state: AppState::Ready,
             context,
             command_registry: CommandRegistry::new(),
+            autocomplete: crate::tui::widgets::Autocomplete::new(),
         })
+    }
+
+    /// Re-evaluate the slash-command dropdown against the current input
+    /// buffer. Called after every keystroke that mutates `input_buffer`.
+    fn refresh_autocomplete(&mut self) {
+        let buf = &self.context.input_buffer;
+        if buf.starts_with('/') && !buf.contains(' ') && !buf.contains('\n') {
+            let suggestions = self
+                .command_registry
+                .autocomplete_with_descriptions(buf);
+            self.autocomplete.update(suggestions);
+        } else {
+            self.autocomplete.hide();
+        }
+    }
+
+    /// Replace the input buffer with the highlighted command name.
+    fn complete_selected_command(&mut self) {
+        if let Some(name) = self.autocomplete.selected() {
+            self.context.input_buffer = format!("{name} ");
+            self.autocomplete.hide();
+        }
     }
 
     /// Process a single terminal event, returning whether to continue or quit.
@@ -128,21 +154,45 @@ impl TuiApp {
             }
             // Ctrl+Enter → submit
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.autocomplete.hide();
                 self.submit_input().await?;
             }
-            // Plain Enter → newline in buffer
+            // Plain Enter — completes the highlighted command if the
+            // dropdown is visible; otherwise inserts a newline as before.
             KeyCode::Enter => {
-                self.context.input_buffer.push('\n');
+                if self.autocomplete.is_visible() {
+                    self.complete_selected_command();
+                } else {
+                    self.context.input_buffer.push('\n');
+                }
+            }
+            // Tab — completes the highlighted command (Hermes / Claude-Code
+            // muscle memory).
+            KeyCode::Tab if self.autocomplete.is_visible() => {
+                self.complete_selected_command();
+            }
+            // Escape — dismiss the dropdown without changing the buffer.
+            KeyCode::Esc if self.autocomplete.is_visible() => {
+                self.autocomplete.hide();
             }
             // Backspace
             KeyCode::Backspace => {
                 self.context.input_buffer.pop();
+                self.refresh_autocomplete();
             }
             // Regular character input
             KeyCode::Char(c) => {
                 self.context.input_buffer.push(c);
+                self.refresh_autocomplete();
             }
-            // Scroll up
+            // Up/Down navigate the dropdown when visible; otherwise scroll
+            // the chat history.
+            KeyCode::Up if self.autocomplete.is_visible() => {
+                self.autocomplete.previous();
+            }
+            KeyCode::Down if self.autocomplete.is_visible() => {
+                self.autocomplete.next();
+            }
             KeyCode::Up => {
                 self.context.scroll_offset = self.context.scroll_offset.saturating_add(1);
             }
@@ -389,8 +439,17 @@ impl TuiApp {
         }
     }
 
-    /// Render the full UI into the terminal frame.
-    pub fn render(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    /// Render the full UI into the terminal frame. Uses a disjoint-field
+    /// borrow so `&mut self.autocomplete` (needed for `ListState`) coexists
+    /// with `&self.context` / `&self.state` borrows for the other panes.
+    pub fn render(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        let TuiApp {
+            state,
+            context,
+            autocomplete,
+            ..
+        } = self;
+
         terminal.draw(|frame| {
             let area = frame.area();
 
@@ -404,33 +463,75 @@ impl TuiApp {
                 ])
                 .split(area);
 
-            self.render_header(frame, chunks[0]);
-            self.render_chat(frame, chunks[1]);
-            self.render_input(frame, chunks[2]);
-            self.render_status(frame, chunks[3]);
+            render_header_pane(context, frame, chunks[0]);
+            render_chat_pane(state, context, frame, chunks[1]);
+            render_input_pane(context, frame, chunks[2]);
+            render_status_pane(context, frame, chunks[3]);
+
+            // Slash-command dropdown — anchored just above the input box,
+            // grows upward into the chat area like a Hermes / Claude-Code
+            // popup.
+            if autocomplete.is_visible() {
+                let input_area = chunks[2];
+                let chat_area = chunks[1];
+                // 8 rows max + 2 frame chars; clamp to available chat space.
+                let max_rows = chat_area.height.saturating_sub(1).max(3) as usize;
+                let popup_height =
+                    ((max_rows + 2).min(10)) as u16;
+                let popup_y = input_area.y.saturating_sub(popup_height);
+                let popup_area = Rect {
+                    x: input_area.x,
+                    y: popup_y,
+                    width: input_area.width,
+                    height: popup_height,
+                };
+                autocomplete.render(frame, popup_area);
+            }
         })?;
         Ok(())
     }
 
-    /// Render the top header bar.
+    /// Original `render_header` shape, kept for backward callers.
+    #[allow(dead_code)]
     fn render_header(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let title = format!(
-            " RantaiClaw TUI  session: {}",
-            &self.context.session_id[..8.min(self.context.session_id.len())]
-        );
-        let header = Paragraph::new(title).style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        let session_short = &self.context.session_id
+            [..8.min(self.context.session_id.len())];
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(
+                "  Rantaiclaw  ",
+                Style::default()
+                    .fg(Color::Rgb(4, 11, 46))
+                    .bg(Color::Rgb(94, 184, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" v{}  ", env!("CARGO_PKG_VERSION")),
+                Style::default()
+                    .fg(Color::Rgb(94, 184, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("· session {} ", session_short),
+                Style::default().fg(Color::Rgb(107, 114, 128)),
+            ),
+        ]));
         frame.render_widget(header, area);
     }
 
-    /// Render the scrollable chat history.
+    /// Render the scrollable chat history. Shows a brand splash when the
+    /// session is empty (mirrors Hermes' opening screen).
     fn render_chat(&self, frame: &mut ratatui::Frame, area: Rect) {
         let theme = super::render::RenderTheme::default();
         let mut items: Vec<ListItem> = Vec::with_capacity(self.context.messages.len() + 1);
+
+        // Empty-state splash — figlet wordmark + welcome line.
+        if self.context.messages.is_empty()
+            && !matches!(self.state, AppState::Streaming { .. })
+        {
+            for line in render_splash_lines() {
+                items.push(ListItem::new(line));
+            }
+        }
 
         for msg in &self.context.messages {
             let persisted = msg
@@ -456,6 +557,27 @@ impl TuiApp {
             ..
         } = &self.state
         {
+            // Spinner glyph cycles based on a millisecond clock so the user
+            // sees motion during the inevitable LLM round-trip.
+            let frame_idx = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as usize / 100)
+                .unwrap_or(0))
+                % SPINNER_FRAMES.len();
+            let spinner = SPINNER_FRAMES[frame_idx];
+            let header = Line::from(vec![
+                Span::styled(
+                    format!("{spinner} "),
+                    Style::default()
+                        .fg(Color::Rgb(94, 184, 255))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "thinking…",
+                    Style::default().fg(Color::Rgb(107, 114, 128)),
+                ),
+            ]);
+            items.push(ListItem::new(header));
             let lines =
                 super::render::render_message_lines("assistant", partial, &[], tool_blocks, &theme);
             items.push(ListItem::new(lines));
@@ -463,51 +585,392 @@ impl TuiApp {
 
         let list = List::new(items).block(
             Block::default()
-                .title(" Chat ")
+                .title(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        "Chat",
+                        Style::default()
+                            .fg(Color::Rgb(94, 184, 255))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                ]))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Rgb(40, 70, 140))),
         );
         frame.render_widget(list, area);
     }
 
-    /// Render the multi-line input area.
+    /// Render the multi-line input area with the brand cyan accent.
     fn render_input(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let display = if self.context.input_buffer.is_empty() {
+        let prefix = Span::styled(
+            "▎ ",
+            Style::default()
+                .fg(Color::Rgb(94, 184, 255))
+                .add_modifier(Modifier::BOLD),
+        );
+        let body = if self.context.input_buffer.is_empty() {
             Span::styled(
-                "Type a message… (Ctrl+Enter to send, /help for commands)",
-                Style::default().fg(Color::DarkGray),
+                "Type a message…  (Ctrl+Enter send · /help for commands · Ctrl+C exit)",
+                Style::default().fg(Color::Rgb(107, 114, 128)),
             )
         } else {
             Span::raw(self.context.input_buffer.clone())
         };
 
-        let input = Paragraph::new(Line::from(display))
+        let input = Paragraph::new(Line::from(vec![prefix, body]))
             .block(
                 Block::default()
-                    .title(" Input ")
+                    .title(Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled(
+                            "$ you",
+                            Style::default()
+                                .fg(Color::Rgb(94, 184, 255))
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                    ]))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Rgb(94, 184, 255))),
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(input, area);
     }
 
-    /// Render the bottom status bar.
+    /// Render the Hermes-style bottom status bar with model · usage · session age.
     fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let status_text = if let Some(ref err) = self.context.last_error {
-            format!(" {err}")
+        let muted = Style::default().fg(Color::Rgb(107, 114, 128));
+        let sky = Style::default().fg(Color::Rgb(94, 184, 255));
+        let coral = Style::default()
+            .fg(Color::Rgb(255, 123, 123))
+            .add_modifier(Modifier::BOLD);
+
+        let line = if let Some(ref err) = self.context.last_error {
+            Line::from(vec![
+                Span::styled(" ✗ ", coral),
+                Span::styled(err.clone(), Style::default().fg(Color::Rgb(255, 123, 123))),
+            ])
         } else {
-            format!(
-                " model: {}  msgs: {}  tokens: {}",
-                self.context.model,
-                self.context.messages.len(),
-                self.context.token_usage.total_tokens,
-            )
+            // Compact context-window meter — pretty-prints big numbers.
+            let used = self.context.token_usage.total_tokens;
+            let used_label = format_tokens(used);
+            // Approximate context window from configured value if available.
+            let window = self.context.context_window.unwrap_or(0);
+            let window_label = if window > 0 {
+                format!("/{}", format_tokens(window))
+            } else {
+                String::new()
+            };
+            let pct = if window > 0 {
+                ((used as f64 / window as f64) * 100.0).round() as u32
+            } else {
+                0
+            };
+
+            // Session age in human time.
+            let age_secs = self.context.started_at.elapsed().as_secs();
+            let age_label = format_duration_short(age_secs);
+
+            Line::from(vec![
+                Span::styled(" $ ", sky),
+                Span::styled(
+                    self.context.model.clone(),
+                    Style::default()
+                        .fg(Color::Rgb(94, 184, 255))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  │  ", muted),
+                Span::styled(
+                    format!("{used_label}{window_label}"),
+                    Style::default().fg(Color::Rgb(126, 226, 179)),
+                ),
+                Span::styled(
+                    if window > 0 {
+                        format!("  {pct}%")
+                    } else {
+                        String::new()
+                    },
+                    muted,
+                ),
+                Span::styled("  │  ", muted),
+                Span::styled(format!("{} msgs", self.context.messages.len()), muted),
+                Span::styled("  │  ", muted),
+                Span::styled(age_label, muted),
+            ])
         };
 
-        let status = Paragraph::new(status_text)
-            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+        let status = Paragraph::new(line);
         frame.render_widget(status, area);
+    }
+}
+
+/// Spinner cycle used during streaming — Braille pattern matches the rest
+/// of the brand's Unicode-forward look.
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+// ---------------------------------------------------------------------------
+// Free-standing render helpers used by `TuiApp::render`. They take parameter
+// references so the closure can call them while `render` holds a disjoint
+// `&mut self.autocomplete` borrow.
+// ---------------------------------------------------------------------------
+
+fn render_header_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
+    let session_short = &ctx.session_id[..8.min(ctx.session_id.len())];
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "  Rantaiclaw  ",
+            Style::default()
+                .fg(Color::Rgb(4, 11, 46))
+                .bg(Color::Rgb(94, 184, 255))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" v{}  ", env!("CARGO_PKG_VERSION")),
+            Style::default()
+                .fg(Color::Rgb(94, 184, 255))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("· session {} ", session_short),
+            Style::default().fg(Color::Rgb(107, 114, 128)),
+        ),
+    ]));
+    frame.render_widget(header, area);
+}
+
+fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
+    let theme = super::render::RenderTheme::default();
+    let mut items: Vec<ListItem> = Vec::with_capacity(ctx.messages.len() + 1);
+
+    if ctx.messages.is_empty() && !matches!(state, AppState::Streaming { .. }) {
+        for line in render_splash_lines() {
+            items.push(ListItem::new(line));
+        }
+    }
+
+    for msg in &ctx.messages {
+        let persisted = msg
+            .tool_calls
+            .as_deref()
+            .map(super::render::parse_persisted_tool_calls)
+            .unwrap_or_default();
+        let lines = super::render::render_message_lines(
+            &msg.role,
+            &msg.content,
+            &persisted,
+            &[],
+            &theme,
+        );
+        items.push(ListItem::new(lines));
+    }
+
+    if let AppState::Streaming {
+        partial,
+        tool_blocks,
+        ..
+    } = state
+    {
+        let frame_idx = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as usize / 100)
+            .unwrap_or(0))
+            % SPINNER_FRAMES.len();
+        let spinner = SPINNER_FRAMES[frame_idx];
+        let header = Line::from(vec![
+            Span::styled(
+                format!("{spinner} "),
+                Style::default()
+                    .fg(Color::Rgb(94, 184, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "thinking…",
+                Style::default().fg(Color::Rgb(107, 114, 128)),
+            ),
+        ]);
+        items.push(ListItem::new(header));
+        let lines =
+            super::render::render_message_lines("assistant", partial, &[], tool_blocks, &theme);
+        items.push(ListItem::new(lines));
+    }
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "Chat",
+                    Style::default()
+                        .fg(Color::Rgb(94, 184, 255))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ]))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(40, 70, 140))),
+    );
+    frame.render_widget(list, area);
+}
+
+fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
+    let prefix = Span::styled(
+        "▎ ",
+        Style::default()
+            .fg(Color::Rgb(94, 184, 255))
+            .add_modifier(Modifier::BOLD),
+    );
+    let body = if ctx.input_buffer.is_empty() {
+        Span::styled(
+            "Type a message…  (Ctrl+Enter send · /help for commands · Ctrl+C exit)",
+            Style::default().fg(Color::Rgb(107, 114, 128)),
+        )
+    } else {
+        Span::raw(ctx.input_buffer.clone())
+    };
+
+    let input = Paragraph::new(Line::from(vec![prefix, body]))
+        .block(
+            Block::default()
+                .title(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        "$ you",
+                        Style::default()
+                            .fg(Color::Rgb(94, 184, 255))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                ]))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Rgb(94, 184, 255))),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(input, area);
+}
+
+fn render_status_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
+    let muted = Style::default().fg(Color::Rgb(107, 114, 128));
+    let sky = Style::default().fg(Color::Rgb(94, 184, 255));
+    let coral = Style::default()
+        .fg(Color::Rgb(255, 123, 123))
+        .add_modifier(Modifier::BOLD);
+
+    let line = if let Some(ref err) = ctx.last_error {
+        Line::from(vec![
+            Span::styled(" ✗ ", coral),
+            Span::styled(err.clone(), Style::default().fg(Color::Rgb(255, 123, 123))),
+        ])
+    } else {
+        let used = ctx.token_usage.total_tokens;
+        let used_label = format_tokens(used);
+        let window = ctx.context_window.unwrap_or(0);
+        let window_label = if window > 0 {
+            format!("/{}", format_tokens(window))
+        } else {
+            String::new()
+        };
+        let pct = if window > 0 {
+            ((used as f64 / window as f64) * 100.0).round() as u32
+        } else {
+            0
+        };
+        let age_secs = ctx.started_at.elapsed().as_secs();
+        let age_label = format_duration_short(age_secs);
+
+        Line::from(vec![
+            Span::styled(" $ ", sky),
+            Span::styled(
+                ctx.model.clone(),
+                Style::default()
+                    .fg(Color::Rgb(94, 184, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  │  ", muted),
+            Span::styled(
+                format!("{used_label}{window_label}"),
+                Style::default().fg(Color::Rgb(126, 226, 179)),
+            ),
+            Span::styled(
+                if window > 0 {
+                    format!("  {pct}%")
+                } else {
+                    String::new()
+                },
+                muted,
+            ),
+            Span::styled("  │  ", muted),
+            Span::styled(format!("{} msgs", ctx.messages.len()), muted),
+            Span::styled("  │  ", muted),
+            Span::styled(age_label, muted),
+        ])
+    };
+
+    let status = Paragraph::new(line);
+    frame.render_widget(status, area);
+}
+
+/// Render the splash banner + welcome lines as ratatui `Line`s for the
+/// empty-chat state. Pulls the same assets the CLI splash uses, colored
+/// by the brand gradient.
+fn render_splash_lines() -> Vec<Line<'static>> {
+    let banner = include_str!("../onboard/assets/banner_full.txt");
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let palette = [
+        Color::Rgb(94, 184, 255),  // sky
+        Color::Rgb(94, 184, 255),  // sky
+        Color::Rgb(59, 140, 255),  // blue
+        Color::Rgb(59, 140, 255),  // blue
+        Color::Rgb(40, 70, 140),   // navy bright
+        Color::Rgb(107, 114, 128), // muted
+    ];
+    for (i, line) in banner.lines().enumerate() {
+        let color = palette[i.min(palette.len() - 1)];
+        out.push(Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )));
+    }
+    out.push(Line::from(""));
+    out.push(Line::from(vec![
+        Span::styled(
+            "  Welcome to Rantaiclaw. ",
+            Style::default()
+                .fg(Color::Rgb(94, 184, 255))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Type a message or /help for commands.",
+            Style::default().fg(Color::Rgb(107, 114, 128)),
+        ),
+    ]));
+    out.push(Line::from(""));
+    out
+}
+
+/// Format token counts with K / M suffixes so the status bar stays compact.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Format a duration in seconds as a compact `1h2m` / `34m` / `12s` label.
+fn format_duration_short(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
     }
 }
 
@@ -626,6 +1089,7 @@ mod tests {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
+            autocomplete: crate::tui::widgets::Autocomplete::new(),
         }
     }
 
@@ -684,6 +1148,7 @@ mod submit_tests {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
+            autocomplete: crate::tui::widgets::Autocomplete::new(),
         }
     }
 
@@ -756,6 +1221,7 @@ mod ctrl_c_tests {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
+            autocomplete: crate::tui::widgets::Autocomplete::new(),
         }
     }
 
@@ -811,6 +1277,7 @@ mod drain_tests {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
+            autocomplete: crate::tui::widgets::Autocomplete::new(),
         }
     }
 
@@ -936,6 +1403,7 @@ mod retry_tests {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
+            autocomplete: crate::tui::widgets::Autocomplete::new(),
         }
     }
 

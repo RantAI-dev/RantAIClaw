@@ -132,6 +132,34 @@ impl CommandRegistry {
         matches
     }
 
+    /// Same prefix-match as `autocomplete` but returns `(name, description)`
+    /// tuples sorted by command name. Aliases are shown only when they
+    /// match without their canonical name also matching, and inherit the
+    /// canonical command's description.
+    pub fn autocomplete_with_descriptions(&self, partial: &str) -> Vec<(String, String)> {
+        let partial = partial.trim_start_matches('/').to_lowercase();
+        let mut out: Vec<(String, String)> = Vec::new();
+
+        for (name, handler) in &self.commands {
+            if name.starts_with(&partial) {
+                out.push((format!("/{name}"), handler.description().to_string()));
+            }
+        }
+        for (alias, canonical) in &self.aliases {
+            if alias.starts_with(&partial)
+                && !canonical.starts_with(&partial)
+            {
+                if let Some(handler) = self.commands.get(canonical) {
+                    out.push((format!("/{alias}"), handler.description().to_string()));
+                }
+            }
+        }
+
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        out
+    }
+
     pub fn get_help(&self) -> Vec<(&str, &str)> {
         let mut help: Vec<_> = self
             .commands

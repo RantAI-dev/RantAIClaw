@@ -1,13 +1,26 @@
+//! Slash-command autocomplete dropdown — Hermes / Claude-Code style.
+//!
+//! Pops up the moment the user types `/` in the input buffer and filters
+//! by prefix on every keystroke. Each row shows the command name in the
+//! brand sky-blue and the description in muted gray, two-column laid out
+//! so descriptions don't crowd the names.
+
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, Borders, Clear, List, ListItem, ListState},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState},
     Frame,
 };
 
+const NAME_COLOR: Color = Color::Rgb(94, 184, 255);
+const DESC_COLOR: Color = Color::Rgb(107, 114, 128);
+const BORDER_COLOR: Color = Color::Rgb(40, 70, 140);
+const HIGHLIGHT_BG: Color = Color::Rgb(20, 30, 70);
+const NAME_COL_W: usize = 28;
+
 pub struct Autocomplete {
-    suggestions: Vec<String>,
+    suggestions: Vec<(String, String)>,
     state: ListState,
     visible: bool,
 }
@@ -21,11 +34,24 @@ impl Autocomplete {
         }
     }
 
-    pub fn update(&mut self, suggestions: Vec<String>) {
+    /// Replace the suggestion list. Empty → hidden.
+    pub fn update(&mut self, suggestions: Vec<(String, String)>) {
         self.suggestions = suggestions;
         self.visible = !self.suggestions.is_empty();
         if self.visible {
-            self.state.select(Some(0));
+            // Preserve the current selection when possible (so typing more
+            // characters keeps the highlight stable as long as the prefix
+            // still matches); otherwise reset to the first row.
+            let prev_selected = self
+                .state
+                .selected()
+                .and_then(|i| self.suggestions.get(i).cloned());
+            let new_idx = prev_selected
+                .and_then(|(name, _)| {
+                    self.suggestions.iter().position(|(n, _)| n == &name)
+                })
+                .unwrap_or(0);
+            self.state.select(Some(new_idx));
         } else {
             self.state.select(None);
         }
@@ -41,8 +67,12 @@ impl Autocomplete {
         self.visible
     }
 
-    pub fn selected(&self) -> Option<&String> {
-        self.state.selected().and_then(|i| self.suggestions.get(i))
+    /// The currently highlighted command name, if visible.
+    pub fn selected(&self) -> Option<&str> {
+        self.state
+            .selected()
+            .and_then(|i| self.suggestions.get(i))
+            .map(|(name, _)| name.as_str())
     }
 
     pub fn next(&mut self) {
@@ -73,39 +103,84 @@ impl Autocomplete {
         self.state.select(Some(i));
     }
 
+    /// Render the dropdown. Caller passes the area immediately *below* the
+    /// input box; the widget consumes whatever vertical space it needs and
+    /// ignores the rest.
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        if !self.visible || self.suggestions.is_empty() {
+        if !self.visible || self.suggestions.is_empty() || area.height < 3 {
             return;
         }
 
-        let height: u16 = (self.suggestions.len() + 2)
-            .min(8)
-            .try_into()
-            .unwrap_or(8u16);
-        let popup_area = Rect {
+        // 6 rows + 2 frame chars by default; collapse smaller if fewer
+        // suggestions or less space.
+        let max_visible = ((area.height as usize).saturating_sub(2)).min(8).max(1);
+        let visible_count = self.suggestions.len().min(max_visible);
+        let height: u16 = (visible_count + 2).try_into().unwrap_or(8);
+
+        let popup = Rect {
             x: area.x,
-            y: area.y.saturating_sub(height),
-            width: area.width.min(40),
-            height,
+            y: area.y,
+            width: area.width,
+            height: height.min(area.height),
         };
+
+        let inner_w = popup.width.saturating_sub(2) as usize;
+        let desc_col_w = inner_w.saturating_sub(NAME_COL_W + 2);
 
         let items: Vec<ListItem> = self
             .suggestions
             .iter()
-            .map(|s| ListItem::new(Line::from(s.as_str())))
+            .map(|(name, desc)| {
+                let name_pad = if name.chars().count() < NAME_COL_W {
+                    NAME_COL_W - name.chars().count()
+                } else {
+                    1
+                };
+                let truncated_desc = truncate(desc, desc_col_w);
+                let line = Line::from(vec![
+                    Span::styled(
+                        name.clone(),
+                        Style::default()
+                            .fg(NAME_COLOR)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" ".repeat(name_pad)),
+                    Span::styled(truncated_desc, Style::default().fg(DESC_COLOR)),
+                ]);
+                ListItem::new(line)
+            })
             .collect();
 
+        let title = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "/commands",
+                Style::default().fg(NAME_COLOR).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {} matches", self.suggestions.len()),
+                Style::default().fg(DESC_COLOR),
+            ),
+            Span::raw(" "),
+        ]);
+
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Suggestions"))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(BORDER_COLOR)),
+            )
             .highlight_style(
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(HIGHLIGHT_BG)
+                    .fg(NAME_COLOR)
                     .add_modifier(Modifier::BOLD),
             );
 
-        frame.render_widget(Clear, popup_area);
-        frame.render_stateful_widget(list, popup_area, &mut self.state);
+        frame.render_widget(Clear, popup);
+        frame.render_stateful_widget(list, popup, &mut self.state);
     }
 }
 
@@ -113,6 +188,19 @@ impl Default for Autocomplete {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let cap = max.saturating_sub(1);
+    let truncated: String = s.chars().take(cap).collect();
+    format!("{truncated}…")
 }
 
 #[cfg(test)]
@@ -129,31 +217,61 @@ mod tests {
     #[test]
     fn autocomplete_shows_with_suggestions() {
         let mut ac = Autocomplete::new();
-        ac.update(vec!["/help".to_string(), "/quit".to_string()]);
+        ac.update(vec![
+            ("/help".into(), "Show this help".into()),
+            ("/quit".into(), "Exit".into()),
+        ]);
         assert!(ac.is_visible());
-        assert_eq!(ac.selected(), Some(&"/help".to_string()));
+        assert_eq!(ac.selected(), Some("/help"));
     }
 
     #[test]
     fn autocomplete_navigates_next_and_previous() {
         let mut ac = Autocomplete::new();
-        ac.update(vec!["/a".to_string(), "/b".to_string(), "/c".to_string()]);
+        ac.update(vec![
+            ("/a".into(), "a".into()),
+            ("/b".into(), "b".into()),
+            ("/c".into(), "c".into()),
+        ]);
         ac.next();
-        assert_eq!(ac.selected(), Some(&"/b".to_string()));
+        assert_eq!(ac.selected(), Some("/b"));
         ac.next();
-        assert_eq!(ac.selected(), Some(&"/c".to_string()));
+        assert_eq!(ac.selected(), Some("/c"));
         ac.next();
-        assert_eq!(ac.selected(), Some(&"/a".to_string()));
+        assert_eq!(ac.selected(), Some("/a"));
         ac.previous();
-        assert_eq!(ac.selected(), Some(&"/c".to_string()));
+        assert_eq!(ac.selected(), Some("/c"));
     }
 
     #[test]
     fn autocomplete_hides_when_empty() {
         let mut ac = Autocomplete::new();
-        ac.update(vec!["/help".to_string()]);
+        ac.update(vec![("/help".into(), "h".into())]);
         assert!(ac.is_visible());
         ac.update(vec![]);
         assert!(!ac.is_visible());
+    }
+
+    #[test]
+    fn autocomplete_preserves_selection_through_filter() {
+        let mut ac = Autocomplete::new();
+        ac.update(vec![
+            ("/help".into(), "h".into()),
+            ("/quit".into(), "q".into()),
+            ("/retry".into(), "r".into()),
+        ]);
+        ac.next();
+        ac.next();
+        assert_eq!(ac.selected(), Some("/retry"));
+        // User keeps typing: filter narrows but `/retry` is still in the list.
+        ac.update(vec![("/retry".into(), "r".into())]);
+        assert_eq!(ac.selected(), Some("/retry"));
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis_when_too_long() {
+        assert_eq!(truncate("hello world", 6), "hello…");
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("a", 0), "");
     }
 }
