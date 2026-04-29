@@ -435,14 +435,17 @@ impl TuiApp {
     /// Finalize a turn on `AgentEvent::Error`. Surfaces the error as a
     /// visible assistant message (so it shows up in chat history) AND sets
     /// `last_error` so the status bar reflects it until cleared.
+    ///
+    /// Recognizes a small list of common error shapes (API key not set,
+    /// rate-limited, model not available) and rewrites them into a
+    /// short, actionable line so the chat doesn't get a wall of stack
+    /// trace. Unknown errors fall through verbatim.
     fn finalize_error(&mut self, msg: String) {
-        let body = format!("[error] {msg}");
-        if let Err(e) = self.context.append_assistant_message(&body) {
-            // If persistence fails, prefer reporting the persistence error —
-            // the original error is already in `last_error` below.
+        let (chat_body, status_line) = format_agent_error(&msg);
+        if let Err(e) = self.context.append_assistant_message(&chat_body) {
             self.context.last_error = Some(format!("failed to persist error: {e}"));
         } else {
-            self.context.last_error = Some(msg);
+            self.context.last_error = Some(status_line);
         }
         self.state = AppState::Ready;
     }
@@ -779,6 +782,127 @@ impl TuiApp {
 /// Spinner cycle used during streaming — Braille pattern matches the rest
 /// of the brand's Unicode-forward look.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Recognise a handful of common agent error shapes and rewrite them as a
+/// short, actionable chat message + a one-liner for the status bar.
+/// Unknown errors fall through verbatim so we never lose information.
+///
+/// Returns `(chat_message_body, status_line)`.
+fn format_agent_error(raw: &str) -> (String, String) {
+    let lower = raw.to_lowercase();
+
+    if lower.contains("api key not set") || lower.contains("api_key not set") {
+        let body = "✗ Missing API key.\n\
+\n\
+Set one of the following before sending a message:\n\
+  • Export `OPENROUTER_API_KEY=…` (or the equivalent for your provider)\n\
+  • Run `rantaiclaw onboard` outside the TUI to save it to config\n\
+  • Type `/quit`, then `rantaiclaw setup provider` for the guided flow"
+            .to_string();
+        return (body, "missing API key — set OPENROUTER_API_KEY or run setup".into());
+    }
+
+    if lower.contains("429") || lower.contains("rate limit") || lower.contains("rate-limit") {
+        let body = "⚠ Rate-limited by the provider.\n\n\
+            Wait a few seconds and try again, or switch models with `/model`."
+            .to_string();
+        return (body, "provider rate limit hit".into());
+    }
+
+    if lower.contains("not a valid model id") || lower.contains("model not found") {
+        let body = format!(
+            "✗ Model unavailable.\n\n\
+            The configured model isn't accepted by your provider. \
+            Pick a different one with `/model <name>` or run \
+            `rantaiclaw setup provider --force`.\n\n\
+            Provider response: {}",
+            first_meaningful_line(raw)
+        );
+        return (body, "model unavailable — see chat for details".into());
+    }
+
+    // Default: trim the verbose "Attempts: provider= ... attempt 1/3" tail
+    // so the chat shows the human-readable cause first, then the rest as
+    // dim context.
+    let trimmed = compact_provider_error(raw);
+    let status = first_meaningful_line(&trimmed);
+    (format!("✗ {trimmed}"), status)
+}
+
+/// Pull the first non-trivial line out of a multi-line error blob.
+fn first_meaningful_line(s: &str) -> String {
+    s.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("Attempts:"))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Reduce a "All providers/models failed. Attempts: …" blob to the most
+/// useful line plus a one-liner attempts summary. Keeps the user oriented
+/// without dumping the whole retry transcript.
+fn compact_provider_error(s: &str) -> String {
+    if !s.contains("All providers/models failed") {
+        return s.to_string();
+    }
+    let attempts: Vec<&str> = s
+        .lines()
+        .filter(|l| l.contains("attempt"))
+        .collect();
+    let primary = attempts
+        .first()
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| s.to_string());
+    if attempts.len() > 1 {
+        format!("{primary} (+{} more attempts)", attempts.len() - 1)
+    } else {
+        primary
+    }
+}
+
+/// Route tracing output to a per-day log file under
+/// `~/.rantaiclaw/logs/tui-YYYY-MM-DD.log` so warnings from the agent
+/// path don't corrupt the TUI's alt-screen render. Best-effort: any
+/// failure (no HOME, can't create directory, etc.) silently falls back
+/// to whatever subscriber is already installed (which in TUI mode is
+/// usually nothing — i.e. tracing becomes a no-op).
+///
+/// Idempotent: if a global subscriber is already set, this is a no-op.
+/// That makes the function safe to call from multiple entry points.
+fn install_tui_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    // Resolve the log path. Use the rantaiclaw root so it lives next to
+    // the user's other state, not buried under XDG cache.
+    let log_dir = crate::profile::paths::rantaiclaw_root().join("logs");
+    if std::fs::create_dir_all(&log_dir).is_err() {
+        return;
+    }
+    let date = chrono::Utc::now().format("%Y-%m-%d");
+    let log_path = log_dir.join(format!("tui-{date}.log"));
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(filter)
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .finish();
+
+    // `set_global_default` returns Err if a subscriber is already set; we
+    // happily swallow that — main()'s subscriber would have been less
+    // appropriate for TUI mode anyway, but if it somehow ran first we
+    // just leave it and accept the visual artifacts.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
 
 // ---------------------------------------------------------------------------
 // Free-standing render helpers used by `TuiApp::render`. They take parameter
@@ -1232,6 +1356,14 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         bail!("TUI requires an interactive terminal (stdin is not a TTY)");
     }
 
+    // Install a file-writing tracing subscriber BEFORE we touch any code
+    // that might emit logs. Without this, tracing falls through to the
+    // default-stderr writer, and `tracing::warn!` calls from the agent's
+    // provider/retry path bleed straight into the TUI's alt-screen frame.
+    // Best-effort: failure to set it up just falls back to stderr (which
+    // is rare in practice and worth knowing about).
+    install_tui_tracing();
+
     let mut app_config = crate::config::Config::load_or_init().await?;
     app_config.apply_env_overrides();
 
@@ -1290,6 +1422,43 @@ async fn run_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod error_format_tests {
+    use super::format_agent_error;
+
+    #[test]
+    fn api_key_missing_gets_friendly_chat_body() {
+        let raw = "All providers/models failed. Attempts:\nprovider=openrouter model=anthropic/claude-sonnet-4.6 attempt 1/3: non_retryable; error=OpenRouter API key not set. Run `rantaiclaw onboard` or set OPENROUTER_API_KEY env var.";
+        let (chat, status) = format_agent_error(raw);
+        assert!(chat.contains("Missing API key"));
+        assert!(chat.contains("OPENROUTER_API_KEY"));
+        assert!(!chat.contains("attempt 1/3"));
+        assert!(status.contains("missing API key"));
+    }
+
+    #[test]
+    fn rate_limit_gets_short_message() {
+        let raw = "All providers/models failed. Attempts:\nprovider=openrouter model=x attempt 1/3: rate-limited; HTTP 429";
+        let (chat, status) = format_agent_error(raw);
+        assert!(chat.contains("Rate-limited"));
+        assert!(status.contains("rate limit"));
+    }
+
+    #[test]
+    fn unknown_error_compacts_attempts_tail() {
+        let raw = "All providers/models failed. Attempts:\nprovider=p1 model=m attempt 1/3: foo\nprovider=p2 model=m attempt 1/3: bar";
+        let (chat, _status) = format_agent_error(raw);
+        // Compacted to first attempt plus +N more rather than full transcript.
+        assert!(chat.contains("(+1 more attempts)"), "got {chat:?}");
+    }
+
+    #[test]
+    fn non_provider_error_passes_through_with_prefix() {
+        let (chat, _) = format_agent_error("something else broke");
+        assert!(chat.starts_with("✗ something else broke"));
+    }
 }
 
 #[cfg(test)]
