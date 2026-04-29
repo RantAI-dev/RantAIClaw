@@ -19,7 +19,7 @@
 | Approvals (L1-L4)         | n/a (file-write only)   | Writes preset TOML files; no runtime cross-check that the gate loads them.                                     |
 | Persona                   | n/a (template render)   | Pure file write; works.                                                                                        |
 | Skills (starter pack)     | ✓ idempotent install    | Copies bundled SKILL.md into `<profile>/skills/`. Skips if dir exists.                                         |
-| Skills (ClawHub browse)   | ✓ HTTP fetch + cache    | Real `GET /api/v1/skills?sort=stars`; 24h cache.                                                               |
+| Skills (ClawHub browse)   | **partially broken**    | Listing fetch + cache work; **install always writes a stub SKILL.md** because the code reads a `latestVersion.readme` field that the live API does not expose. See §7. |
 | Doctor (`channels` check) | **misleading**          | Reports `live` category but only checks that bot_token strings are non-empty. No WhatsApp coverage. See §6.    |
 | Doctor (`provider.ping`)  | ✓ optional              | Mockito-tested round-trip; opt-in via `--brief`/`--offline` flags.                                             |
 
@@ -115,6 +115,106 @@ The check is bucketed into the `live` category alongside `provider.ping` (which 
 * Lines 3719-3720 in `setup_channels` reference the legacy `developers.facebook.com` flow with hardcoded instructions; those are still correct but read as static help, not interactive validation.
 * The WhatsApp Web branch prints "1. Build with --features whatsapp-web" but never re-enters the binary build path. If the running binary doesn't have the feature, configuring WA Web is dead-on-arrival until the user rebuilds. Worth an upfront check.
 
+## 7 · ClawHub skill fetching — listing OK, install body broken
+
+**Files**: `src/skills/clawhub.rs`, `src/onboard/section/skills.rs`.
+
+### What works
+
+* `GET /skills?sort=stars` round-trip against `https://clawhub.ai/api/v1` — verified live (HTTP 200, 19.7 KB JSON, ~30 items in `items`, `nextCursor` present). Response shape parses correctly into `Vec<ClawHubSkill>` because `serde(default)` swallows unknown extras.
+* Cache envelope at `~/.rantaiclaw/cache/clawhub/top-skills.json` with 24h TTL. On network failure, `read_cache(Duration::MAX)` returns stale-but-better-than-nothing data — the wizard never blocks.
+* Multi-select picker in `setup skills` uses `display_name + (stars*) + summary` labels. Path-traversal guard (`if slug.contains('/') || slug.contains('\\') || slug.contains("..")`) is in place.
+* `install_one` is idempotent: returns early if `<profile>/skills/<slug>/` already exists.
+
+### What's broken
+
+#### 7.1 `tags` field shape mismatch — silent data loss
+
+Live API returns:
+
+```json
+"tags": { "latest": "3.0.18" }
+```
+
+Rust expects:
+
+```rust
+pub tags: Vec<String>
+```
+
+`serde(default)` swallows the type mismatch and the deserialized struct gets an empty `tags: vec![]`. Not a hard failure, but tags are unusable in the picker label and in any future filter UI. Fix: `tags: serde_json::Value` or model the actual shape (`{ latest: String }`).
+
+#### 7.2 `install_one` always writes a placeholder, never the real skill body
+
+`install_one` does:
+
+```rust
+let url = format!("{}/skills/{}", base_url(), slug);
+// ... GET ...
+let md = body
+    .get("latestVersion")
+    .and_then(|v| v.get("readme"))
+    .and_then(|v| v.as_str())
+    .map(String::from)
+    .unwrap_or_else(|| {
+        format!(
+            "# {slug}\n\nInstalled from ClawHub: <https://clawhub.ai/skills/{slug}>\n"
+        )
+    });
+std::fs::write(dir.join("SKILL.md"), md)
+```
+
+Live `GET /skills/:slug` returns:
+
+```json
+{
+  "latestVersion": { "version": "...", "createdAt": ..., "changelog": ..., "license": null },
+  "metadata": null,
+  "moderation": ...,
+  "owner": {...},
+  "skill": {...}
+}
+```
+
+There is **no `readme` field anywhere in `latestVersion`**, so `body.get("latestVersion").and_then(|v| v.get("readme"))` always returns `None` and the placeholder branch always fires. Every ClawHub install produces:
+
+```markdown
+# self-improving-agent
+
+Installed from ClawHub: <https://clawhub.ai/skills/self-improving-agent>
+```
+
+The agent then sees a stub skill that's just a hyperlink — none of the actual instructions, prompts, or invocation logic the user picked.
+
+#### 7.3 Real content lives at a separate file endpoint that the code doesn't call
+
+The version metadata endpoint `GET /skills/:slug/versions/:version` returns a `version.files` array with entries like:
+
+```json
+{ "path": "SKILL.md", "size": 20674, "sha256": "...", "contentType": "text/markdown" }
+{ "path": "README.md", "size": 378,   "sha256": "...", "contentType": "text/markdown" }
+{ "path": "assets/...", ... }
+```
+
+The actual file body is fetched via a separate request — based on probing, `GET /skills/:slug/versions/:version/files/SKILL.md` returns the bytes (subject to aggressive rate-limiting; got `429` after a couple of probes). The current code doesn't traverse this path, so the file contents never reach disk.
+
+### Fix sketch
+
+Replace `install_one` with a proper version-aware fetch:
+
+1. `GET /skills/:slug` → grab `latestVersion.version`.
+2. `GET /skills/:slug/versions/:version` → walk `version.files`. Reject any `path` that escapes (`..`, leading `/`, absolute drives).
+3. For each file: `GET /skills/:slug/versions/:version/files/<encoded-path>`, write to `<profile>/skills/<slug>/<path>` with `set_permissions` to 0644 (or 0755 for executables — surface via the file metadata if upstream marks them).
+4. Verify SHA256 against the manifest before writing; bail on mismatch.
+5. Honour 429 with a polite backoff (exponential, capped at e.g. 30s) instead of dying.
+6. Optional: persist `metadata.json` alongside SKILL.md with `{slug, version, sha256_manifest, installed_at}` so a future `rantaiclaw skills update` can detect version drift.
+
+### Recommended test additions
+
+* Mock-server test that returns a realistic 4-file `version.files` list and asserts `install_one` writes all four with correct paths.
+* Test that `..`-escaping paths are rejected.
+* Test that a SHA-mismatch response aborts the install and leaves the directory empty.
+
 ## Recommended action plan
 
 | Order | Effort | What                                                                                             | Why                                                              |
@@ -125,6 +225,8 @@ The check is bucketed into the `live` category alongside `provider.ping` (which 
 | 4     | S      | Move `channels.auth` to the `config` category, OR upgrade to real probes (preferred).            | Stops misleading users about what doctor verified.               |
 | 5     | XS     | Runtime warning when WhatsApp Web is selected without the `whatsapp-web` feature compiled in.    | Avoids silent dead-end after re-running the wizard.              |
 | 6     | XS     | Approval-preset round-trip self-check (load the file you just wrote).                            | Schema drift insurance; ~10 lines.                               |
+| 7     | M      | Rewrite `clawhub::install_one` to walk `versions/:v/files` instead of fishing for non-existent `latestVersion.readme`. | Today every ClawHub install is a stub placeholder, not the actual skill body. |
+| 8     | XS     | Fix `ClawHubSkill::tags` type to match upstream shape (`{ latest: String }` map, not `Vec<String>`). | Stops silent data loss on the listing fetch. |
 
 ## Files touched in this audit (read-only)
 
