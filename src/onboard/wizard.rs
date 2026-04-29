@@ -3643,6 +3643,39 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
 
                 if mode_idx == 0 {
                     println!("  {}", style("Mode: WhatsApp Web").dim());
+                    // Compile-time gate: warn loudly when the running binary
+                    // wasn't built with the wa-rs feature, otherwise the
+                    // user finishes onboarding and silently has nothing
+                    // working.
+                    #[cfg(not(feature = "whatsapp-web"))]
+                    {
+                        println!(
+                            "  {} {}",
+                            style("⚠").yellow().bold(),
+                            style(
+                                "This binary was built WITHOUT --features whatsapp-web."
+                            )
+                            .yellow()
+                        );
+                        println!(
+                            "    Re-build with `cargo build --release --features whatsapp-web`"
+                        );
+                        println!(
+                            "    or install via the script with WHATSAPP_WEB=1 set in env."
+                        );
+                        println!(
+                            "    {}",
+                            style("Continuing will save config but no WhatsApp daemon will run.").dim()
+                        );
+                        let proceed = dialoguer::Confirm::new()
+                            .with_prompt("  Continue saving config anyway?")
+                            .default(false)
+                            .interact()?;
+                        if !proceed {
+                            println!("  {} Skipped", style("→").dim());
+                            continue;
+                        }
+                    }
                     print_bullet("1. Build with --features whatsapp-web");
                     print_bullet(
                         "2. Start channel/daemon and scan QR in WhatsApp > Linked Devices",
