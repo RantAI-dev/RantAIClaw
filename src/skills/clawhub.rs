@@ -27,6 +27,13 @@ const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 
 /// Subset of the ClawHub skill listing item that the wizard cares about.
 /// Extra fields in the payload are ignored (serde default behaviour).
+///
+/// Note on `tags`: upstream returns a `{ "latest": "version-string" }`
+/// object, not a list of strings. We model it as a free-form
+/// [`serde_json::Value`] so deserialization succeeds — the picker only
+/// uses `display_name`, `summary`, and `stats.stars` for labelling, so
+/// the tags shape isn't load-bearing yet, but losing it silently would
+/// have masked future surprises.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClawHubSkill {
     pub slug: String,
@@ -37,7 +44,7 @@ pub struct ClawHubSkill {
     #[serde(default)]
     pub stats: ClawHubStats,
     #[serde(default)]
-    pub tags: Vec<String>,
+    pub tags: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,48 +156,208 @@ pub async fn install_many(profile: &Profile, slugs: &[String]) -> Result<Vec<Str
     Ok(installed)
 }
 
-/// Install a single ClawHub skill. The on-disk shape follows the existing
-/// skills convention: a directory named after the slug containing a
-/// `SKILL.md`. We fetch the skill manifest's markdown content if available;
-/// otherwise we write a placeholder pointing to the upstream URL so the
-/// agent can still discover the skill exists.
+/// File entry returned by `GET /skills/:slug/versions/:v` (`version.files[*]`).
+#[derive(Debug, Clone, Deserialize)]
+struct VersionFile {
+    path: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default, alias = "contentType")]
+    content_type: String,
+}
+
+/// Install a single ClawHub skill. The on-disk shape mirrors the existing
+/// bundled-skills convention: a directory named after the slug containing
+/// a `SKILL.md` plus any auxiliary files (assets/, README.md, etc.) that
+/// shipped with the version.
 ///
-/// This is intentionally conservative — Wave 3 may swap it out for a
-/// fancier tarball-unpack path. The wave-2 contract is: after this returns
-/// `Ok`, `<profile>/skills/<slug>/SKILL.md` exists.
+/// Three-step fetch:
+/// 1. `GET /skills/:slug` → resolve the latest version string.
+/// 2. `GET /skills/:slug/versions/:v` → list `version.files[*]` (path + size + sha256).
+/// 3. For each file: `GET /skills/:slug/versions/:v/files/<path>` → write to disk,
+///    verify SHA-256 against the manifest.
+///
+/// On any failure (network, hash mismatch, path traversal in the manifest)
+/// the partially-written directory is removed so the install is all-or-nothing.
 pub async fn install_one(profile: &Profile, slug: &str) -> Result<()> {
+    validate_slug(slug)?;
+    let dir = profile.skills_dir().join(slug);
+    if dir.exists() {
+        // Idempotent — leave existing user state alone. Callers wanting a
+        // clean re-install should `fs::remove_dir_all` first.
+        return Ok(());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build reqwest client")?;
+
+    let result = install_one_inner(&client, profile, slug, &dir).await;
+    if result.is_err() {
+        // Partial-install cleanup so the next attempt starts fresh and the
+        // idempotent skip-if-exists guard above doesn't lock the user into
+        // a broken state.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    result
+}
+
+async fn install_one_inner(
+    client: &reqwest::Client,
+    _profile: &Profile,
+    slug: &str,
+    dir: &std::path::Path,
+) -> Result<()> {
+    // Step 1 — resolve latest version.
+    let detail_url = format!("{}/skills/{}", base_url(), slug);
+    let detail_resp = fetch_with_retry(client, &detail_url).await?;
+    let detail: serde_json::Value = detail_resp
+        .json()
+        .await
+        .context("parse clawhub skill detail")?;
+    let version = detail
+        .get("latestVersion")
+        .and_then(|v| v.get("version"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("clawhub: no latestVersion.version for {slug}"))?
+        .to_string();
+
+    // Step 2 — fetch version manifest with file list.
+    let version_url = format!("{}/skills/{}/versions/{}", base_url(), slug, version);
+    let version_resp = fetch_with_retry(client, &version_url).await?;
+    let version_body: serde_json::Value = version_resp
+        .json()
+        .await
+        .context("parse clawhub version manifest")?;
+    let files: Vec<VersionFile> = version_body
+        .get("version")
+        .and_then(|v| v.get("files"))
+        .map(|f| serde_json::from_value(f.clone()))
+        .transpose()
+        .context("parse version.files")?
+        .unwrap_or_default();
+
+    if files.is_empty() {
+        anyhow::bail!("clawhub: version {version} of {slug} has no files");
+    }
+
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+
+    // Step 3 — fetch + verify each file. We ban any path that escapes the
+    // skill's own directory; ClawHub manifests should already be safe, but
+    // a malicious or buggy upstream cannot trick us into writing outside
+    // `<profile>/skills/<slug>/`.
+    for file in &files {
+        let safe_rel = sanitize_relative_path(&file.path)
+            .with_context(|| format!("reject manifest path {:?}", file.path))?;
+        let target = dir.join(&safe_rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+
+        let file_url = format!(
+            "{}/skills/{}/versions/{}/files/{}",
+            base_url(),
+            slug,
+            version,
+            urlencoding::encode(&file.path),
+        );
+        let resp = fetch_with_retry(client, &file_url).await?;
+        let bytes = resp
+            .bytes()
+            .await
+            .with_context(|| format!("download {}", file.path))?;
+
+        if !file.sha256.is_empty() {
+            verify_sha256(&bytes, &file.sha256)
+                .with_context(|| format!("hash check failed for {}", file.path))?;
+        }
+
+        std::fs::write(&target, &bytes)
+            .with_context(|| format!("write {}", target.display()))?;
+    }
+
+    // Defensive: ClawHub manifests are required to ship a SKILL.md per the
+    // bundled-skills format. If a version somehow lacks one, surface that.
+    if !dir.join("SKILL.md").exists() {
+        anyhow::bail!("clawhub: version {version} of {slug} has no SKILL.md");
+    }
+
+    Ok(())
+}
+
+/// Fetch with two retries on `429 Too Many Requests`, with capped exponential
+/// backoff. ClawHub aggressively rate-limits the file endpoints; transparent
+/// retry is the difference between "install succeeds" and "user gives up".
+async fn fetch_with_retry(client: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
+    let mut backoff_ms = 500u64;
+    for attempt in 1..=3 {
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        if status.as_u16() == 429 && attempt < 3 {
+            tracing::warn!(url, attempt, backoff_ms, "clawhub 429, backing off");
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms * 2).min(8_000);
+            continue;
+        }
+        anyhow::bail!("clawhub returned status {status} for {url}");
+    }
+    unreachable!("loop exits via return or bail above")
+}
+
+/// Reject any relative path that contains parent-dir traversal, leading
+/// slashes, root anchors, or absolute drives. Returns the same path on success
+/// so callers can `dir.join()` it directly.
+fn sanitize_relative_path(raw: &str) -> Result<std::path::PathBuf> {
+    let path = std::path::Path::new(raw);
+    if path.is_absolute() {
+        anyhow::bail!("absolute path");
+    }
+    for comp in path.components() {
+        match comp {
+            std::path::Component::Normal(_) => {}
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!("forbidden component {comp:?}"),
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Verify a body against its hex-encoded SHA-256. Comparison is case-insensitive.
+fn verify_sha256(body: &[u8], expected_hex: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(body);
+    let actual = hex::encode(hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected_hex) {
+        anyhow::bail!("sha256 mismatch: got {actual}, expected {expected_hex}");
+    }
+    Ok(())
+}
+
+/// Slug guard — keep this aligned with ClawHub's own `^[a-z0-9-]+$` rule plus
+/// the path-traversal carve-outs we've always had.
+fn validate_slug(slug: &str) -> Result<()> {
+    if slug.is_empty() {
+        anyhow::bail!("empty slug");
+    }
     if slug.contains('/') || slug.contains('\\') || slug.contains("..") {
         anyhow::bail!("invalid clawhub slug {slug:?}");
     }
-    let dir = profile.skills_dir().join(slug);
-    if dir.exists() {
-        // Idempotent — leave existing user state alone.
-        return Ok(());
+    if !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        anyhow::bail!("clawhub slug {slug:?} has illegal characters");
     }
-    let url = format!("{}/skills/{}", base_url(), slug);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("build reqwest client")?;
-    let response = client.get(&url).send().await.context("GET clawhub skill")?;
-    if !response.status().is_success() {
-        anyhow::bail!("clawhub returned status {} for {slug}", response.status());
-    }
-    let body: serde_json::Value = response.json().await.context("parse clawhub skill")?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
-    let md = body
-        .get("latestVersion")
-        .and_then(|v| v.get("readme"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| {
-            format!(
-                "# {slug}\n\nInstalled from ClawHub: <https://clawhub.ai/skills/{slug}>\n"
-            )
-        });
-    std::fs::write(dir.join("SKILL.md"), md)
-        .with_context(|| format!("write SKILL.md for {slug}"))?;
     Ok(())
 }
 
@@ -208,7 +375,7 @@ mod tests {
                 stars: 7,
                 downloads: 42,
             },
-            tags: vec!["tag-a".into()],
+            tags: serde_json::json!({"latest": "1.0.0"}),
         }];
         let env = CacheEnvelope {
             fetched_at: 12_345,
@@ -229,5 +396,89 @@ mod tests {
         let json2 = r#"{"slug":"b","display_name":"B"}"#;
         let s2: ClawHubSkill = serde_json::from_str(json2).unwrap();
         assert_eq!(s2.display_name, "B");
+    }
+
+    #[test]
+    fn deserializes_live_listing_shape() {
+        // Snapshot of an actual ClawHub /skills?sort=stars item taken via
+        // curl on 2026-04-29. Pinning the field shape here so future
+        // upstream drift fails loud instead of silently emptying tags
+        // again.
+        let json = r#"{
+            "slug": "self-improving-agent",
+            "displayName": "self-improving-agent",
+            "summary": "Captures learnings",
+            "tags": {"latest": "3.0.18"},
+            "stats": {
+                "comments": 53,
+                "downloads": 415412,
+                "installsAllTime": 6434,
+                "installsCurrent": 6108,
+                "stars": 3393,
+                "versions": 29
+            },
+            "createdAt": 1767632598365
+        }"#;
+        let s: ClawHubSkill = serde_json::from_str(json).expect("live shape parses");
+        assert_eq!(s.slug, "self-improving-agent");
+        assert_eq!(s.stats.stars, 3393);
+        assert_eq!(s.stats.downloads, 415412);
+        // tags is now a Value, not a Vec — the `latest` key is preserved
+        // instead of silently emptied.
+        assert_eq!(
+            s.tags.get("latest").and_then(|v| v.as_str()),
+            Some("3.0.18")
+        );
+    }
+
+    #[test]
+    fn validate_slug_rejects_traversal_and_path_separators() {
+        validate_slug("ok-slug").unwrap();
+        validate_slug("ok_slug_2").unwrap();
+        assert!(validate_slug("").is_err());
+        assert!(validate_slug("..").is_err());
+        assert!(validate_slug("a/b").is_err());
+        assert!(validate_slug("a\\b").is_err());
+        assert!(validate_slug("with space").is_err());
+        assert!(validate_slug("../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn sanitize_relative_path_accepts_nested_paths() {
+        let p = sanitize_relative_path("assets/SKILL-TEMPLATE.md").unwrap();
+        assert_eq!(p, std::path::PathBuf::from("assets/SKILL-TEMPLATE.md"));
+        let q = sanitize_relative_path("README.md").unwrap();
+        assert_eq!(q, std::path::PathBuf::from("README.md"));
+    }
+
+    #[test]
+    fn sanitize_relative_path_rejects_traversal() {
+        assert!(sanitize_relative_path("../escape").is_err());
+        assert!(sanitize_relative_path("/etc/passwd").is_err());
+        assert!(sanitize_relative_path("a/../b").is_err());
+    }
+
+    #[test]
+    fn verify_sha256_accepts_correct_hash() {
+        // SHA-256 of the empty string.
+        let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        verify_sha256(b"", empty_sha).unwrap();
+
+        // SHA-256 of "abc".
+        let abc_sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        verify_sha256(b"abc", abc_sha).unwrap();
+    }
+
+    #[test]
+    fn verify_sha256_rejects_mismatch() {
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_sha256(b"abc", wrong).unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"));
+    }
+
+    #[test]
+    fn verify_sha256_is_case_insensitive() {
+        let upper = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
+        verify_sha256(b"abc", upper).unwrap();
     }
 }
