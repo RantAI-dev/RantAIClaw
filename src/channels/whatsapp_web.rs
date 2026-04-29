@@ -327,16 +327,19 @@ impl Channel for WhatsAppWebChannel {
                             tracing::error!("WhatsApp Web stream error: {:?}", stream_error);
                         }
                         Event::PairingCode { code, .. } => {
-                            tracing::info!("WhatsApp Web pair code received: {}", code);
-                            tracing::info!(
-                                "Link your phone by entering this code in WhatsApp > Linked Devices"
-                            );
+                            crate::channels::qr_terminal::render_pair_code(&code);
                         }
                         Event::PairingQrCode { code, .. } => {
-                            tracing::info!(
-                                "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)"
+                            // The wa-rs `Event::PairingQrCode` payload IS the
+                            // raw QR text WhatsApp expects you to scan. Render
+                            // it as actual block characters so the user can
+                            // point a phone at the terminal — printing only
+                            // the base64 payload (the previous behaviour) is
+                            // useless even at INFO level.
+                            crate::channels::qr_terminal::render_qr_with_header(
+                                &code,
+                                "WhatsApp Web — scan with WhatsApp > Linked Devices > Link a Device",
                             );
-                            tracing::debug!("QR code: {}", code);
                         }
                         _ => {}
                     }

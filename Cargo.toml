@@ -167,6 +167,10 @@ probe-rs = { version = "0.31", optional = true }
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
 
+# Terminal QR rendering (used by `whatsapp-web` for pairing display, and any
+# future channels that need QR-driven linking). Pure Rust, no_std-friendly.
+qrcode = { version = "0.14", default-features = false }
+
 # WhatsApp Web client (wa-rs) — optional, enable with --features whatsapp-web
 # Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
 wa-rs = { version = "0.2", optional = true, default-features = false }

@@ -31,6 +31,7 @@ pub mod qq;
 pub mod signal;
 pub mod slack;
 pub mod telegram;
+pub mod qr_terminal;
 pub mod traits;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
