@@ -22,6 +22,13 @@ pub struct TuiContext {
     pub input_buffer: String,
     pub scroll_offset: usize,
     pub token_usage: TokenUsage,
+    /// Total context window of the active model, in tokens. Used by the
+    /// status bar to display a `used/window  pct%` meter. `None` when the
+    /// provider didn't surface a window size.
+    pub context_window: Option<u64>,
+    /// When the TUI session started — used by the status bar to display a
+    /// compact `1h2m` / `34m` / `12s` age label.
+    pub started_at: std::time::Instant,
     pub last_error: Option<String>,
     pub debug_mode: bool,
     /// Outbound channel to the `TuiAgentActor` for submitting turn requests.
@@ -64,6 +71,8 @@ impl TuiContext {
             input_buffer: String::new(),
             scroll_offset: 0,
             token_usage: TokenUsage::default(),
+            context_window: None,
+            started_at: std::time::Instant::now(),
             last_error: None,
             debug_mode: false,
             req_tx,
@@ -92,6 +101,23 @@ impl TuiContext {
     /// Append a user message to the in-memory list and persist it.
     pub fn append_user_message(&mut self, content: &str) -> Result<()> {
         let msg = Message::user(&self.session_id, content);
+        self.session_store.append_message(&msg)?;
+        self.messages.push(msg);
+        Ok(())
+    }
+
+    /// Append a system-role message (used for inline command output like
+    /// `/usage`, `/sessions`, etc.). Persisted to the session store so
+    /// scrollback + resume still show the line.
+    pub fn append_system_message(&mut self, content: &str) -> Result<()> {
+        let msg = Message {
+            id: 0,
+            session_id: self.session_id.clone(),
+            role: "system".to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            timestamp: chrono::Utc::now().timestamp(),
+        };
         self.session_store.append_message(&msg)?;
         self.messages.push(msg);
         Ok(())

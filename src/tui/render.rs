@@ -79,15 +79,22 @@ pub struct RenderTheme {
 
 impl Default for RenderTheme {
     fn default() -> Self {
+        // rantai-agents brand palette (matches src/onboard/branding.rs):
+        //   sky #5eb8ff (94,184,255) — accent / labels
+        //   blue #3b8cff (59,140,255) — assistant / titles
+        //   amber #ffbb5c (255,187,92) — system messages
+        //   mint #7ee2b3 (126,226,179) — tool ok
+        //   coral #ff7b7b (255,123,123) — tool error
+        //   muted #6b7280 (107,114,128) — secondary text
         Self {
-            user_label: Color::Green,
-            assistant_label: Color::Blue,
-            system_label: Color::Yellow,
-            tool_name: Color::Magenta,
-            tool_args: Color::DarkGray,
-            tool_result_ok: Color::Green,
-            tool_result_err: Color::Red,
-            code: Color::Cyan,
+            user_label: Color::Rgb(94, 184, 255),
+            assistant_label: Color::Rgb(59, 140, 255),
+            system_label: Color::Rgb(255, 187, 92),
+            tool_name: Color::Rgb(94, 184, 255),
+            tool_args: Color::Rgb(107, 114, 128),
+            tool_result_ok: Color::Rgb(126, 226, 179),
+            tool_result_err: Color::Rgb(255, 123, 123),
+            code: Color::Rgb(94, 184, 255),
         }
     }
 }

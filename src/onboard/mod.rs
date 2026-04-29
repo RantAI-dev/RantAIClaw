@@ -1,3 +1,4 @@
+pub mod branding;
 pub mod section;
 pub mod wizard;
 
