@@ -2,26 +2,25 @@
 """
 Generate the RantaiClaw CLI splash assets.
 
-Outputs three files under `src/onboard/assets/`:
+Outputs five files under `src/onboard/assets/`:
 
-* `banner.txt`   — figlet-style "RANTAICLAW" block-letter banner (raw text,
-  no ANSI). The Rust side wraps it in our brand colors at render time so the
-  asset stays toolchain-portable.
+* `banner_full.txt` — figlet "Rantaiclaw" in pyfiglet's `slant` font, sized
+  to fit ~72 columns. Used when the terminal has space for it.
+* `banner_small.txt` — same word in `small` font (~46 cols) for narrower
+  terminals.
+* `logo_braille.txt` — brand logo rendered as Braille pixel art
+  (Unicode 2800-28FF). Each character cell encodes an 8-pixel block
+  (2 wide × 4 tall) so silhouettes stay crisp at small sizes.
+* `logo_braille_gradient.txt` — same braille shape with a per-row color
+  marker (`@N@\\t<line>`) the Rust side maps to a 4-stop palette.
+* `logo_plain.txt` — glyph-only fallback for monochrome terminals.
 
-* `logo_ansi.txt` — colored half-block-character rendering of the brand logo
-  (`Logo-only Border or Stroke (1).png`) sized for a left-side splash panel.
-  ANSI 24-bit truecolor escapes are baked in; consoles without truecolor
-  degrade gracefully via the closest 256-color match.
+Production builds bake the assets — Pillow + pyfiglet are only invoked
+when intentionally regenerating.
 
-* `logo_plain.txt` — same logo as a glyph-only fallback (no ANSI) for
-  monochrome terminals or when colors are disabled via `NO_COLOR`.
-
-Run:
+Run after touching the source PNG or the dimensions:
 
     python3 scripts/branding/render_logo_ascii.py
-
-Re-run only when the source PNG or the desired dimensions change. The
-generated assets are committed.
 """
 
 from __future__ import annotations
@@ -36,96 +35,107 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 LOGO_SRC = REPO_ROOT.parent.parent / "Logo-only Border or Stroke (1).png"
 ASSETS = REPO_ROOT / "src" / "onboard" / "assets"
 
-# Brand palette — pulled from the rantai-agents web app.
-#   navy   #040b2e  (logo body / dark accent)
-#   sky    #5eb8ff  (logo squares / light accent)
-#   blue   #3b8cff  (web --accent oklch(0.55 0.2 250))
-#   bg     none — terminals provide it.
-LOGO_W = 24   # final ASCII width in *characters*
-LOGO_H = 12   # final ASCII height in *rows*; each row = 2 image pixels via half-blocks
+# Brand palette pulled from rantai-agents:
+#   navy  #040b2e — logo body / dark accent
+#   sky   #5eb8ff — logo squares / light accent
+#   blue  #3b8cff — primary brand accent (oklch(0.55 0.2 250))
+#   muted #6b7280 — secondary text
+
+LOGO_W_CHARS = 18
+LOGO_H_CHARS = 10
+SOURCE_W = LOGO_W_CHARS * 2   # 36 px
+SOURCE_H = LOGO_H_CHARS * 4   # 40 px
+
+# Per-row color gradient — index into the 4-color palette in branding.rs.
+# 0 = sky, 1 = blue, 2 = navy-bright, 3 = muted/dim.
+LOGO_GRADIENT = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3]
+assert len(LOGO_GRADIENT) == LOGO_H_CHARS
 
 
-def render_banner() -> str:
-    """ANSI Shadow figlet — chunky 3D block letters that read as a logo."""
-    fig = pyfiglet.figlet_format("RANTAICLAW", font="ansi_shadow")
-    # pyfiglet pads with trailing newline; trim to a single trailing newline.
-    return fig.rstrip("\n") + "\n"
+def render_banner(font: str, label: str = "Rantaiclaw") -> str:
+    fig = pyfiglet.figlet_format(label, font=font)
+    lines = [line.rstrip() for line in fig.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    while lines and not lines[0]:
+        lines.pop(0)
+    return "\n".join(lines) + "\n"
 
 
-def render_logo() -> tuple[str, str]:
-    """
-    Two-pass render:
-      pass 1 — colored ANSI using upper-half-block (`▀`) so each character
-               cell encodes two vertical pixels (foreground = top half,
-               background = bottom half).
-      pass 2 — glyph-only fallback using density mapping `█▓▒░ `.
-    """
+def render_braille() -> tuple[str, str, str]:
     if not LOGO_SRC.exists():
         sys.exit(f"missing source PNG: {LOGO_SRC}")
 
     img = Image.open(LOGO_SRC).convert("RGBA")
-    # Preserve aspect by treating each output row as 2 image pixels.
-    target_pixel_w = LOGO_W
-    target_pixel_h = LOGO_H * 2
-    img = img.resize((target_pixel_w, target_pixel_h), Image.LANCZOS)
+    img = img.resize((SOURCE_W, SOURCE_H), Image.LANCZOS)
+    rgba = img.load()
 
-    # Composite over the brand navy so transparent pixels read as
-    # "background", not as the terminal's default which can be anything.
-    bg = Image.new("RGB", img.size, (4, 11, 46))  # #040b2e
-    bg.paste(img, mask=img.split()[3])
-    pixels = bg.load()
+    # Braille dot bits within a 2×4 cell:
+    #   (0,0)→bit0   (1,0)→bit3
+    #   (0,1)→bit1   (1,1)→bit4
+    #   (0,2)→bit2   (1,2)→bit5
+    #   (0,3)→bit6   (1,3)→bit7
+    DOT_BITS = {
+        (0, 0): 0, (0, 1): 1, (0, 2): 2, (1, 0): 3,
+        (1, 1): 4, (1, 2): 5, (0, 3): 6, (1, 3): 7,
+    }
 
-    ansi_lines: list[str] = []
+    def cell_lit(cx: int, cy: int, dx: int, dy: int) -> bool:
+        x = cx * 2 + dx
+        y = cy * 4 + dy
+        if x >= SOURCE_W or y >= SOURCE_H:
+            return False
+        r, g, b, a = rgba[x, y]
+        if a < 80:
+            return False
+        # Treat anything darker than near-white as "lit". Both the navy body
+        # and cyan squares qualify; the white background does not.
+        return (r + g + b) / 3 < 235
+
+    braille_lines: list[str] = []
     plain_lines: list[str] = []
-    for row in range(0, target_pixel_h, 2):
-        ansi_row = ""
-        plain_row = ""
-        for col in range(target_pixel_w):
-            top = pixels[col, row]
-            bot = pixels[col, row + 1] if row + 1 < target_pixel_h else top
+    gradient_lines: list[str] = []
 
-            # ANSI: 24-bit truecolor escape per cell.
-            ansi_row += (
-                f"\x1b[38;2;{top[0]};{top[1]};{top[2]}m"
-                f"\x1b[48;2;{bot[0]};{bot[1]};{bot[2]}m"
-                "▀"
-            )
+    for cy in range(LOGO_H_CHARS):
+        b_row = ""
+        p_row = ""
+        for cx in range(LOGO_W_CHARS):
+            mask = 0
+            lit = 0
+            for (dx, dy), bit in DOT_BITS.items():
+                if cell_lit(cx, cy, dx, dy):
+                    mask |= 1 << bit
+                    lit += 1
+            b_row += chr(0x2800 + mask)
+            p_row += " ░▒▓█"[min(4, lit // 2)]
+        braille_lines.append(b_row)
+        plain_lines.append(p_row)
+        gradient_lines.append(f"@{LOGO_GRADIENT[cy]}@\t{b_row}")
 
-            # Plain glyph: density of the average luminance.
-            avg = (sum(top) + sum(bot)) / 6
-            plain_row += density_glyph(avg)
-        ansi_row += "\x1b[0m"
-        ansi_lines.append(ansi_row)
-        plain_lines.append(plain_row)
-
-    return "\n".join(ansi_lines) + "\n", "\n".join(plain_lines) + "\n"
-
-
-def density_glyph(luminance: float) -> str:
-    """Map 0-255 luminance to a Unicode block density character."""
-    if luminance < 32:
-        return " "
-    if luminance < 80:
-        return "░"  # ░
-    if luminance < 144:
-        return "▒"  # ▒
-    if luminance < 208:
-        return "▓"  # ▓
-    return "█"      # █
+    return (
+        "\n".join(braille_lines) + "\n",
+        "\n".join(gradient_lines) + "\n",
+        "\n".join(plain_lines) + "\n",
+    )
 
 
 def main() -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
 
-    banner = render_banner()
-    (ASSETS / "banner.txt").write_text(banner, encoding="utf-8")
-    print(f"wrote {ASSETS / 'banner.txt'} ({len(banner.splitlines())} lines)")
+    full = render_banner("slant", "Rantaiclaw")
+    small = render_banner("small", "Rantaiclaw")
+    (ASSETS / "banner_full.txt").write_text(full, encoding="utf-8")
+    (ASSETS / "banner_small.txt").write_text(small, encoding="utf-8")
+    print(f"wrote banner_full.txt  ({len(full.splitlines())} lines, max width {max(len(l) for l in full.splitlines())})")
+    print(f"wrote banner_small.txt ({len(small.splitlines())} lines, max width {max(len(l) for l in small.splitlines())})")
 
-    ansi, plain = render_logo()
-    (ASSETS / "logo_ansi.txt").write_text(ansi, encoding="utf-8")
+    braille, gradient, plain = render_braille()
+    (ASSETS / "logo_braille.txt").write_text(braille, encoding="utf-8")
+    (ASSETS / "logo_braille_gradient.txt").write_text(gradient, encoding="utf-8")
     (ASSETS / "logo_plain.txt").write_text(plain, encoding="utf-8")
-    print(f"wrote {ASSETS / 'logo_ansi.txt'} ({len(ansi.splitlines())} lines, ANSI 24-bit)")
-    print(f"wrote {ASSETS / 'logo_plain.txt'} ({len(plain.splitlines())} lines, glyph-only)")
+    print(f"wrote logo_braille.txt ({len(braille.splitlines())} lines × {LOGO_W_CHARS} chars)")
+    print(f"wrote logo_braille_gradient.txt (same shape with @N@ row tags)")
+    print(f"wrote logo_plain.txt   (density fallback)")
 
 
 if __name__ == "__main__":
