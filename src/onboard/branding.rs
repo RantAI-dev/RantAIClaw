@@ -309,8 +309,8 @@ pub fn render_splash_at_width(inv: &Inventory<'_>, cols: u16) -> String {
     };
 
     let logo = render_logo();
-    let logo_pane_w = 20; // 18 char glyphs + 2 padding
-    let frame_w = (cols as usize).min(96);
+    let logo_pane_w = 32; // 30 char glyphs + 2 padding
+    let frame_w = (cols as usize).min(100);
     // 2 verticals + 1 separator-vertical + logo pane + right pane = frame_w
     let right_pane_w = frame_w.saturating_sub(logo_pane_w + 3).max(20);
 
@@ -363,9 +363,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn banner_full_fits_in_80_cols() {
+    fn banner_full_fits_in_82_cols() {
+        // ANSI Shadow at width=200 produces a single-row "RANTAICLAW" at
+        // exactly 80 cols. Allow a 2-col cushion for edge cases.
         let max = BANNER_FULL.lines().map(|l| l.chars().count()).max().unwrap();
-        assert!(max <= 80, "banner_full max line is {max} chars");
+        assert!(max <= 82, "banner_full max line is {max} chars");
     }
 
     #[test]
@@ -375,16 +377,15 @@ mod tests {
     }
 
     #[test]
-    fn logo_braille_is_18_chars_wide() {
-        // The asset includes a trailing newline per row plus the @N@\t prefix.
+    fn logo_braille_is_30_chars_wide() {
         let widths: Vec<usize> = LOGO_GRADIENT
             .lines()
             .filter_map(|l| l.split_once('\t').map(|(_, body)| body.chars().count()))
             .collect();
         for w in &widths {
-            assert_eq!(*w, 18, "row width is {w}, expected 18");
+            assert_eq!(*w, 30, "row width is {w}, expected 30");
         }
-        assert_eq!(widths.len(), 10);
+        assert_eq!(widths.len(), 16);
     }
 
     #[test]

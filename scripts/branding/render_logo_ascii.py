@@ -41,20 +41,24 @@ ASSETS = REPO_ROOT / "src" / "onboard" / "assets"
 #   blue  #3b8cff — primary brand accent (oklch(0.55 0.2 250))
 #   muted #6b7280 — secondary text
 
-LOGO_W_CHARS = 18
-LOGO_H_CHARS = 10
-SOURCE_W = LOGO_W_CHARS * 2   # 36 px
-SOURCE_H = LOGO_H_CHARS * 4   # 40 px
+LOGO_W_CHARS = 30
+LOGO_H_CHARS = 16
+SOURCE_W = LOGO_W_CHARS * 2   # 60 px
+SOURCE_H = LOGO_H_CHARS * 4   # 64 px
 
 # Per-row color gradient — index into the 4-color palette in branding.rs.
 # 0 = sky, 1 = blue, 2 = navy-bright, 3 = muted/dim.
-LOGO_GRADIENT = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3]
+# Top → sky (the cyan accent squares); middle → blue; lower → deeper navy.
+LOGO_GRADIENT = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3]
 assert len(LOGO_GRADIENT) == LOGO_H_CHARS
 
 
-def render_banner(font: str, label: str = "Rantaiclaw") -> str:
-    fig = pyfiglet.figlet_format(label, font=font)
-    lines = [line.rstrip() for line in fig.splitlines()]
+def render_banner(font: str, label: str = "Rantaiclaw", width: int = 200) -> str:
+    """`width=200` so pyfiglet never wraps mid-word; the terminal layer
+    handles fallback to a smaller font for narrow viewports."""
+    fig = pyfiglet.Figlet(font=font, width=width)
+    out = fig.renderText(label)
+    lines = [line.rstrip() for line in out.splitlines()]
     while lines and not lines[-1]:
         lines.pop()
     while lines and not lines[0]:
@@ -122,7 +126,10 @@ def render_braille() -> tuple[str, str, str]:
 def main() -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
 
-    full = render_banner("slant", "Rantaiclaw")
+    # ANSI Shadow — the chunky 3D blocky font Hermes uses; visual anchor of
+    # the splash. Width: ~70 cols for "Rantaiclaw".
+    full = render_banner("ansi_shadow", "RANTAICLAW")
+    # `small` font as the medium fallback (~46 cols).
     small = render_banner("small", "Rantaiclaw")
     (ASSETS / "banner_full.txt").write_text(full, encoding="utf-8")
     (ASSETS / "banner_small.txt").write_text(small, encoding="utf-8")
