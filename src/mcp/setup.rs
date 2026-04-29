@@ -49,8 +49,21 @@ pub async fn run_interactive(profile: &Profile, config: &mut Config) -> Result<(
         .context("read zero-auth confirmation")?;
     if install_zero_auth {
         for server in NO_AUTH {
-            register_mcp(config, server, &[])?;
-            info!("MCP server registered: {}", server.slug);
+            // Spawn-and-validate the binary first so the user finds out at
+            // setup time (not at first agent run) when the install_command
+            // isn't on PATH or the binary is broken. Skip + warn on
+            // failure — same UX as the authed branch.
+            match validate_mcp_startup(server, &[]).await {
+                Ok(()) => {
+                    register_mcp(config, server, &[])?;
+                    info!("MCP server registered: {}", server.slug);
+                    println!("  added {}", server.display_name);
+                }
+                Err(e) => {
+                    warn!(slug = server.slug, error = %e, "skipping zero-auth MCP server");
+                    eprintln!("  skipped {} ({e})", server.display_name);
+                }
+            }
         }
     }
 
