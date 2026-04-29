@@ -171,44 +171,27 @@ impl TuiApp {
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.context.input_buffer.push('\n');
             }
-            // Plain Enter:
-            //   * On a slash-command buffer (`/foo …` on a single line) →
-            //     submit, so users don't need Ctrl+Enter for `/help`.
-            //   * Otherwise → newline (multi-line prompts still work).
-            //   * If the autocomplete dropdown is open and the highlighted
-            //     command differs from what the user typed, complete first
-            //     and submit on the *next* Enter; if the highlight already
-            //     matches, submit immediately.
+            // Plain Enter — Hermes / Claude Code convention:
+            //   * If the autocomplete dropdown is visible and the highlighted
+            //     command differs from what the user typed → complete first;
+            //     a second Enter then fires it. If it already matches, submit.
+            //   * Otherwise → submit. Period. Both prose and slash commands.
+            //
+            // Multi-line prompts work via Ctrl+J (handled above) or
+            // Shift+Enter on terminals with the kitty keyboard protocol.
             KeyCode::Enter => {
-                let buf = self.context.input_buffer.trim_end_matches(' ');
-                let is_single_line_slash = buf.starts_with('/') && !buf.contains('\n');
-                if is_single_line_slash {
-                    if self.autocomplete.is_visible() {
-                        // If the user's typed text already matches the
-                        // highlighted suggestion, just submit — they
-                        // intended to fire it. Otherwise complete to the
-                        // selection and let them confirm or add args.
-                        let typed_cmd = buf.trim_end_matches(' ').to_string();
-                        let selected = self
-                            .autocomplete
-                            .selected()
-                            .map(|s| s.to_string());
-                        if selected.as_deref() == Some(typed_cmd.as_str()) {
-                            self.autocomplete.hide();
-                            self.submit_input().await?;
-                        } else {
-                            self.complete_selected_command();
-                        }
-                    } else {
+                if self.autocomplete.is_visible() {
+                    let buf = self.context.input_buffer.trim_end_matches(' ').to_string();
+                    let selected =
+                        self.autocomplete.selected().map(str::to_string);
+                    if selected.as_deref() == Some(buf.as_str()) {
+                        self.autocomplete.hide();
                         self.submit_input().await?;
+                    } else {
+                        self.complete_selected_command();
                     }
-                } else if self.autocomplete.is_visible() {
-                    // Defensive: dropdown shouldn't be visible here, but if
-                    // it is, treat Enter as completion to match user
-                    // muscle memory.
-                    self.complete_selected_command();
                 } else {
-                    self.context.input_buffer.push('\n');
+                    self.submit_input().await?;
                 }
             }
             // Escape — dismiss the dropdown without changing the buffer.
