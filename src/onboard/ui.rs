@@ -82,18 +82,19 @@ pub fn print_section_header(current: u8, total: u8, title: &str) {
 }
 
 /// Render (without printing) the wizard welcome banner.
+///
+/// Uses the brand splash (figlet banner + logo + framed pane) so the
+/// setup wizard reads as the same product as `rantaiclaw agent`.
 pub fn render_welcome_banner() -> String {
-    let style = magenta().bold();
-    let mut out = String::new();
+    let inv = super::branding::Inventory {
+        title: concat!("RantaiClaw v", env!("CARGO_PKG_VERSION"), " · Setup Wizard"),
+        subtitle: Some("Press Ctrl-C to abort at any time."),
+        tools: &[],
+        skills: &[],
+        footer: Some("Let's get you configured."),
+    };
+    let mut out = super::branding::render_splash(&inv);
     out.push('\n');
-    let _ = writeln!(out, "{}", style.apply_to(format!("┌{BANNER_INNER}┐")));
-    let _ = writeln!(
-        out,
-        "{}",
-        style.apply_to("│            ⚙ RantaiClaw Setup Wizard                    │")
-    );
-    let _ = writeln!(out, "{}", style.apply_to(format!("└{BANNER_INNER}┘")));
-    out.push_str("  Let's get you configured. Press Ctrl-C to abort at any time.\n\n");
     out
 }
 
@@ -191,8 +192,8 @@ mod tests {
         let rendered = render_welcome_banner();
         let stripped = strip_ansi_codes(&rendered);
         assert!(
-            stripped.contains("RantaiClaw Setup Wizard"),
-            "got {stripped:?}"
+            stripped.contains("Setup Wizard"),
+            "should advertise the setup wizard: {stripped:?}"
         );
         assert!(
             stripped.contains("Ctrl-C"),

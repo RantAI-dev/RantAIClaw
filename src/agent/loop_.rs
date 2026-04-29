@@ -1930,7 +1930,19 @@ pub async fn run(
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
-        println!("🦀 RantaiClaw Interactive Mode");
+        // Brand splash — banner + logo + provider/model summary. Skip when
+        // single-shot (-m) since that path is meant to be pipeable.
+        let provider_label = format!("{provider_name} · {model_name}");
+        let tool_count = tools_registry.len();
+        let footer = format!("{tool_count} tools · /help for commands");
+        let inv = crate::onboard::branding::Inventory {
+            title: concat!("RantaiClaw v", env!("CARGO_PKG_VERSION")),
+            subtitle: Some(&provider_label),
+            tools: &[],
+            skills: &[],
+            footer: Some(&footer),
+        };
+        print!("{}", crate::onboard::branding::render_splash(&inv));
         println!("Type /help for commands.\n");
         let cli = crate::channels::CliChannel::new();
 
