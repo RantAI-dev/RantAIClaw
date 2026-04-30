@@ -5,6 +5,47 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] — 2026-04-30
+
+Model-default refresh — every provider's wizard menu and quick-mode
+default now points at the actually-current generation. Older
+generations stay in the menus as fallbacks for users on older API
+tiers (with explicit `(previous flagship)` / `(legacy)` suffixes).
+
+### Changed
+
+- **OpenAI**: `gpt-5.2` → `gpt-5.5`. Codex variant: `gpt-5-codex` →
+  `gpt-5.5-codex`. Menu adds gpt-5.3 / 5.2 / 5.1-codex-mini as
+  fallbacks. (#45)
+- **Anthropic**: `claude-sonnet-4-5-20250929` → `claude-sonnet-4-6`.
+  Menu adds `claude-opus-4-7` and keeps `haiku-4-5` + legacy
+  `sonnet-4-5`. (#40 → #45 verified)
+- **Gemini / Google**: `gemini-2.5-pro` → `gemini-3-pro`. Adds
+  `gemini-3-flash`; previous tier kept. (#45)
+- **Moonshot / Kimi**: `kimi-k2.5` → `kimi-k2.6`. Older revisions stay
+  in the menu. (#45)
+- **GLM / Z.AI**: `glm-5` → `glm-5.1`. (#45)
+- **MiniMax**: `MiniMax-M2.5` → `MiniMax-M2.7` (with M2.7-highspeed
+  variant). (#45)
+- **Qwen**: `qwen-plus` → `qwen3.6-plus`; coder track moves to
+  `qwen3.6-coder-plus`. (#45)
+- **Meta / Llama family** (groq, fireworks, together-ai, nvidia,
+  llamacpp): default flips from the `llama-3.3-70b` family to
+  **`llama-spark`** — Meta's latest generation. (#45)
+- **OpenRouter / Venice / Astrai** curated lists pick up
+  cross-provider entries: `gpt-5.5`, `gpt-5.5-codex`, `gemini-3-pro`,
+  `gemini-3-flash`, `kimi-k2.6`, `glm-5.1`, `meta-llama/llama-spark`.
+  (#45)
+- **Bedrock**: `…sonnet-4-5-20250929-v1:0` → `…sonnet-4-6-v1:0`. (#45)
+
+### Compatibility
+
+- **Backward compatible.** Explicit `--model` overrides and existing
+  configs are honored unchanged. Only the *next* `onboard` run picks
+  up the new default for users who didn't pin one.
+- DeepSeek left at V3.2 pending confirmation on the newer model id —
+  if you have it, drop the name and the wizard wires it in next.
+
 ## [0.5.2] — 2026-04-29
 
 Setup-flow polish + visual fixes from a real end-to-end audit. Every
