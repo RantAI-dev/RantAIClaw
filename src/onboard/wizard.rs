@@ -757,28 +757,28 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-6".into(),
-        "openai" => "gpt-5.3".into(),
-        "openai-codex" => "gpt-5.3-codex".into(),
-        "venice" => "zai-org-glm-5".into(),
-        "groq" => "llama-3.3-70b-versatile".into(),
+        "openai" => "gpt-5.5".into(),
+        "openai-codex" => "gpt-5.5-codex".into(),
+        "venice" => "zai-org-glm-5.1".into(),
+        "groq" => "llama-spark".into(),
         "mistral" => "mistral-large-latest".into(),
         "deepseek" => "deepseek-chat".into(),
         "xai" => "grok-4-1-fast-reasoning".into(),
         "perplexity" => "sonar-pro".into(),
-        "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct".into(),
-        "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
+        "fireworks" => "accounts/fireworks/models/llama-spark".into(),
+        "together-ai" => "meta-llama/Llama-Spark".into(),
         "cohere" => "command-a-03-2025".into(),
-        "moonshot" => "kimi-k2.5".into(),
-        "glm" | "zai" => "glm-5".into(),
-        "minimax" => "MiniMax-M2.5".into(),
-        "qwen" => "qwen-plus".into(),
-        "qwen-code" => "qwen3-coder-plus".into(),
-        "ollama" => "llama3.2".into(),
-        "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
-        "gemini" => "gemini-2.5-pro".into(),
+        "moonshot" => "kimi-k2.6".into(),
+        "glm" | "zai" => "glm-5.1".into(),
+        "minimax" => "MiniMax-M2.7".into(),
+        "qwen" => "qwen3.6-plus".into(),
+        "qwen-code" => "qwen3.6-coder-plus".into(),
+        "ollama" => "llama-spark".into(),
+        "llamacpp" => "ggml-org/llama-spark-GGUF".into(),
+        "gemini" => "gemini-3-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-6-v1:0".into(),
-        "nvidia" => "meta/llama-3.3-70b-instruct".into(),
+        "nvidia" => "meta/llama-spark".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
@@ -795,20 +795,24 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Claude Opus 4.7 (best quality)".to_string(),
             ),
             (
-                "openai/gpt-5.3".to_string(),
-                "GPT-5.3 (latest flagship)".to_string(),
+                "openai/gpt-5.5".to_string(),
+                "GPT-5.5 (latest flagship)".to_string(),
             ),
             (
-                "openai/gpt-5.3-codex".to_string(),
-                "GPT-5.3 Codex (agentic coding)".to_string(),
+                "openai/gpt-5.5-codex".to_string(),
+                "GPT-5.5 Codex (agentic coding flagship)".to_string(),
             ),
             (
                 "openai/gpt-5-mini".to_string(),
                 "GPT-5 mini (fast, cost-efficient)".to_string(),
             ),
             (
-                "google/gemini-3-pro-preview".to_string(),
-                "Gemini 3 Pro Preview (frontier reasoning)".to_string(),
+                "google/gemini-3-pro".to_string(),
+                "Gemini 3 Pro (frontier reasoning)".to_string(),
+            ),
+            (
+                "google/gemini-3-flash".to_string(),
+                "Gemini 3 Flash (best price/performance)".to_string(),
             ),
             (
                 "x-ai/grok-4.1-fast".to_string(),
@@ -819,8 +823,16 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "DeepSeek V3.2 (agentic + affordable)".to_string(),
             ),
             (
-                "meta-llama/llama-4-maverick".to_string(),
-                "Llama 4 Maverick (open model)".to_string(),
+                "meta-llama/llama-spark".to_string(),
+                "Llama Spark (Meta's latest open model)".to_string(),
+            ),
+            (
+                "moonshotai/kimi-k2.6".to_string(),
+                "Kimi K2.6 (latest reasoning + coding)".to_string(),
+            ),
+            (
+                "z-ai/glm-5.1".to_string(),
+                "GLM-5.1 (latest, high reasoning)".to_string(),
             ),
         ],
         "anthropic" => vec![
@@ -843,20 +855,24 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "openai" => vec![
             (
+                "gpt-5.5".to_string(),
+                "GPT-5.5 (latest flagship, recommended)".to_string(),
+            ),
+            (
+                "gpt-5.5-codex".to_string(),
+                "GPT-5.5 Codex (agentic coding flagship)".to_string(),
+            ),
+            (
                 "gpt-5.3".to_string(),
-                "GPT-5.3 (latest flagship, recommended)".to_string(),
+                "GPT-5.3 (previous flagship, stable)".to_string(),
             ),
             (
                 "gpt-5.3-codex".to_string(),
-                "GPT-5.3 Codex (agentic coding)".to_string(),
+                "GPT-5.3 Codex (previous coding)".to_string(),
             ),
             (
                 "gpt-5.2".to_string(),
-                "GPT-5.2 (previous flagship, stable)".to_string(),
-            ),
-            (
-                "gpt-5.2-codex".to_string(),
-                "GPT-5.2 Codex (previous codex)".to_string(),
+                "GPT-5.2 (older, stable)".to_string(),
             ),
             (
                 "gpt-5-mini".to_string(),
@@ -873,12 +889,16 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "openai-codex" => vec![
             (
+                "gpt-5.5-codex".to_string(),
+                "GPT-5.5 Codex (latest, recommended)".to_string(),
+            ),
+            (
                 "gpt-5.3-codex".to_string(),
-                "GPT-5.3 Codex (latest, recommended)".to_string(),
+                "GPT-5.3 Codex (previous flagship)".to_string(),
             ),
             (
                 "gpt-5.2-codex".to_string(),
-                "GPT-5.2 Codex (previous flagship)".to_string(),
+                "GPT-5.2 Codex (older flagship)".to_string(),
             ),
             (
                 "gpt-5.1-codex-mini".to_string(),
@@ -892,8 +912,8 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "venice" => vec![
             (
-                "zai-org-glm-5".to_string(),
-                "GLM-5 via Venice (agentic flagship)".to_string(),
+                "zai-org-glm-5.1".to_string(),
+                "GLM-5.1 via Venice (agentic flagship)".to_string(),
             ),
             (
                 "claude-sonnet-4-6".to_string(),
@@ -910,8 +930,12 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "groq" => vec![
             (
+                "llama-spark".to_string(),
+                "Llama Spark (Meta's latest, recommended)".to_string(),
+            ),
+            (
                 "llama-3.3-70b-versatile".to_string(),
-                "Llama 3.3 70B (fast, recommended)".to_string(),
+                "Llama 3.3 70B (previous flagship, stable)".to_string(),
             ),
             (
                 "openai/gpt-oss-120b".to_string(),
@@ -982,26 +1006,34 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "fireworks" => vec![
             (
+                "accounts/fireworks/models/llama-spark".to_string(),
+                "Llama Spark (Meta's latest, recommended)".to_string(),
+            ),
+            (
                 "accounts/fireworks/models/llama-v3p3-70b-instruct".to_string(),
-                "Llama 3.3 70B".to_string(),
+                "Llama 3.3 70B (previous flagship, stable)".to_string(),
             ),
             (
                 "accounts/fireworks/models/mixtral-8x22b-instruct".to_string(),
-                "Mixtral 8x22B".to_string(),
+                "Mixtral 8x22B (alternative open weight)".to_string(),
             ),
         ],
         "together-ai" => vec![
             (
+                "meta-llama/Llama-Spark".to_string(),
+                "Llama Spark (Meta's latest, recommended)".to_string(),
+            ),
+            (
                 "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
-                "Llama 3.3 70B Instruct Turbo (recommended)".to_string(),
+                "Llama 3.3 70B Instruct Turbo (previous flagship)".to_string(),
             ),
             (
-                "moonshotai/Kimi-K2.5".to_string(),
-                "Kimi K2.5 (reasoning + coding)".to_string(),
+                "moonshotai/Kimi-K2.6".to_string(),
+                "Kimi K2.6 (latest reasoning + coding)".to_string(),
             ),
             (
-                "deepseek-ai/DeepSeek-V3.1".to_string(),
-                "DeepSeek V3.1 (strong value)".to_string(),
+                "deepseek-ai/DeepSeek-V3.2".to_string(),
+                "DeepSeek V3.2 (strong value)".to_string(),
             ),
         ],
         "cohere" => vec![
@@ -1030,8 +1062,12 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "moonshot" => vec![
             (
+                "kimi-k2.6".to_string(),
+                "Kimi K2.6 (latest flagship, recommended)".to_string(),
+            ),
+            (
                 "kimi-k2.5".to_string(),
-                "Kimi K2.5 (latest flagship, recommended)".to_string(),
+                "Kimi K2.5 (previous flagship)".to_string(),
             ),
             (
                 "kimi-k2-thinking".to_string(),
@@ -1039,14 +1075,18 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
             (
                 "kimi-k2-0905-preview".to_string(),
-                "Kimi K2 0905 Preview (strong coding)".to_string(),
+                "Kimi K2 0905 Preview (legacy)".to_string(),
             ),
         ],
         "glm" | "zai" => vec![
-            ("glm-5".to_string(), "GLM-5 (high reasoning)".to_string()),
+            (
+                "glm-5.1".to_string(),
+                "GLM-5.1 (latest flagship, recommended)".to_string(),
+            ),
+            ("glm-5".to_string(), "GLM-5 (previous flagship)".to_string()),
             (
                 "glm-4.7".to_string(),
-                "GLM-4.7 (strong general-purpose quality)".to_string(),
+                "GLM-4.7 (strong general-purpose, stable)".to_string(),
             ),
             (
                 "glm-4.5-air".to_string(),
@@ -1055,33 +1095,49 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "minimax" => vec![
             (
-                "MiniMax-M2.5".to_string(),
-                "MiniMax M2.5 (latest flagship)".to_string(),
+                "MiniMax-M2.7".to_string(),
+                "MiniMax M2.7 (latest flagship, recommended)".to_string(),
             ),
             (
-                "MiniMax-M2.5-highspeed".to_string(),
-                "MiniMax M2.5 High-Speed (fast)".to_string(),
+                "MiniMax-M2.7-highspeed".to_string(),
+                "MiniMax M2.7 High-Speed (fast)".to_string(),
+            ),
+            (
+                "MiniMax-M2.5".to_string(),
+                "MiniMax M2.5 (previous flagship)".to_string(),
             ),
             (
                 "MiniMax-M2.1".to_string(),
-                "MiniMax M2.1 (strong coding/reasoning)".to_string(),
+                "MiniMax M2.1 (strong coding/reasoning, stable)".to_string(),
             ),
         ],
         "qwen" => vec![
             (
+                "qwen3.6-max".to_string(),
+                "Qwen 3.6 Max (latest flagship, highest quality)".to_string(),
+            ),
+            (
+                "qwen3.6-plus".to_string(),
+                "Qwen 3.6 Plus (balanced default)".to_string(),
+            ),
+            (
+                "qwen3.6-turbo".to_string(),
+                "Qwen 3.6 Turbo (fast, cost-efficient)".to_string(),
+            ),
+            (
                 "qwen-max".to_string(),
-                "Qwen Max (highest quality)".to_string(),
+                "Qwen Max (legacy 3.5)".to_string(),
             ),
             (
                 "qwen-plus".to_string(),
-                "Qwen Plus (balanced default)".to_string(),
-            ),
-            (
-                "qwen-turbo".to_string(),
-                "Qwen Turbo (fast and cost-efficient)".to_string(),
+                "Qwen Plus (legacy 3.5)".to_string(),
             ),
         ],
         "qwen-code" => vec![
+            (
+                "qwen3.6-coder-plus".to_string(),
+                "Qwen 3.6 Coder Plus (latest, recommended)".to_string(),
+            ),
             (
                 "qwen3-coder-plus".to_string(),
                 "Qwen3 Coder Plus (recommended for coding workflows)".to_string(),
@@ -1097,8 +1153,12 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "nvidia" => vec![
             (
+                "meta/llama-spark".to_string(),
+                "Llama Spark (Meta's latest, recommended)".to_string(),
+            ),
+            (
                 "meta/llama-3.3-70b-instruct".to_string(),
-                "Llama 3.3 70B Instruct (balanced default)".to_string(),
+                "Llama 3.3 70B Instruct (previous flagship, stable)".to_string(),
             ),
             (
                 "deepseek-ai/deepseek-v3.2".to_string(),
@@ -1110,7 +1170,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
             (
                 "nvidia/llama-3.1-nemotron-ultra-253b-v1".to_string(),
-                "Llama 3.1 Nemotron Ultra 253B v1 (max quality)".to_string(),
+                "Llama 3.1 Nemotron Ultra 253B v1 (max quality, legacy)".to_string(),
             ),
         ],
         "astrai" => vec![
@@ -1119,16 +1179,24 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Claude Sonnet 4.6 (balanced default)".to_string(),
             ),
             (
-                "openai/gpt-5.3".to_string(),
-                "GPT-5.3 (latest flagship)".to_string(),
+                "openai/gpt-5.5".to_string(),
+                "GPT-5.5 (latest flagship)".to_string(),
+            ),
+            (
+                "google/gemini-3-pro".to_string(),
+                "Gemini 3 Pro (frontier reasoning)".to_string(),
             ),
             (
                 "deepseek/deepseek-v3.2".to_string(),
                 "DeepSeek V3.2 (agentic + affordable)".to_string(),
             ),
             (
-                "z-ai/glm-5".to_string(),
-                "GLM-5 (high reasoning)".to_string(),
+                "z-ai/glm-5.1".to_string(),
+                "GLM-5.1 (high reasoning)".to_string(),
+            ),
+            (
+                "moonshotai/kimi-k2.6".to_string(),
+                "Kimi K2.6 (latest)".to_string(),
             ),
         ],
         "ollama" => vec![
@@ -1174,16 +1242,20 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "gemini" => vec![
             (
-                "gemini-3-pro-preview".to_string(),
-                "Gemini 3 Pro Preview (latest frontier reasoning)".to_string(),
+                "gemini-3-pro".to_string(),
+                "Gemini 3 Pro (latest frontier reasoning, recommended)".to_string(),
+            ),
+            (
+                "gemini-3-flash".to_string(),
+                "Gemini 3 Flash (best price/performance)".to_string(),
             ),
             (
                 "gemini-2.5-pro".to_string(),
-                "Gemini 2.5 Pro (stable reasoning)".to_string(),
+                "Gemini 2.5 Pro (previous flagship, stable)".to_string(),
             ),
             (
                 "gemini-2.5-flash".to_string(),
-                "Gemini 2.5 Flash (best price/performance)".to_string(),
+                "Gemini 2.5 Flash (legacy fast tier)".to_string(),
             ),
             (
                 "gemini-2.5-flash-lite".to_string(),
@@ -5805,20 +5877,20 @@ mod tests {
             default_model_for_provider("openrouter"),
             "anthropic/claude-sonnet-4.6"
         );
-        assert_eq!(default_model_for_provider("openai"), "gpt-5.3");
-        assert_eq!(default_model_for_provider("openai-codex"), "gpt-5.3-codex");
+        assert_eq!(default_model_for_provider("openai"), "gpt-5.5");
+        assert_eq!(default_model_for_provider("openai-codex"), "gpt-5.5-codex");
         assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-6"
         );
-        assert_eq!(default_model_for_provider("qwen"), "qwen-plus");
-        assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
-        assert_eq!(default_model_for_provider("qwen-code"), "qwen3-coder-plus");
-        assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
-        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.5");
-        assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
-        assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
-        assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
+        assert_eq!(default_model_for_provider("qwen"), "qwen3.6-plus");
+        assert_eq!(default_model_for_provider("qwen-intl"), "qwen3.6-plus");
+        assert_eq!(default_model_for_provider("qwen-code"), "qwen3.6-coder-plus");
+        assert_eq!(default_model_for_provider("glm-cn"), "glm-5.1");
+        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.7");
+        assert_eq!(default_model_for_provider("zai-cn"), "glm-5.1");
+        assert_eq!(default_model_for_provider("gemini"), "gemini-3-pro");
+        assert_eq!(default_model_for_provider("google"), "gemini-3-pro");
         assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
         assert_eq!(
             default_model_for_provider("bedrock"),
@@ -5826,21 +5898,21 @@ mod tests {
         );
         assert_eq!(
             default_model_for_provider("google-gemini"),
-            "gemini-2.5-pro"
+            "gemini-3-pro"
         );
-        assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
-        assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
+        assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5.1");
+        assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.6");
         assert_eq!(
             default_model_for_provider("nvidia"),
-            "meta/llama-3.3-70b-instruct"
+            "meta/llama-spark"
         );
         assert_eq!(
             default_model_for_provider("nvidia-nim"),
-            "meta/llama-3.3-70b-instruct"
+            "meta/llama-spark"
         );
         assert_eq!(
             default_model_for_provider("llamacpp"),
-            "ggml-org/gpt-oss-20b-GGUF"
+            "ggml-org/llama-spark-GGUF"
         );
         assert_eq!(
             default_model_for_provider("astrai"),
@@ -5876,10 +5948,11 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        // The 5.3 generation is the canonical default; older 5.2 + mini/nano
-        // stay in the list as fallbacks for users on older API tiers.
+        // 5.5 is the canonical default; older 5.3 / 5.2 / mini / nano stay
+        // in the list as fallbacks for users on older API tiers.
+        assert!(ids.contains(&"gpt-5.5".to_string()));
+        assert!(ids.contains(&"gpt-5.5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.3".to_string()));
-        assert!(ids.contains(&"gpt-5.3-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2".to_string()));
         assert!(ids.contains(&"gpt-5-mini".to_string()));
     }
@@ -5905,9 +5978,10 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        // 5.3-codex is the new canonical recommendation; previous codex
+        // 5.5-codex is the new canonical recommendation; previous codex
         // models stay in the list so users on older account tiers can pick
         // one that's actually enabled for them.
+        assert!(ids.contains(&"gpt-5.5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.3-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
         assert!(ids.contains(&"gpt-5.1-codex-mini".to_string()));
