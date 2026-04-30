@@ -199,8 +199,11 @@ mod tests {
             stripped.contains("Ctrl-C"),
             "should mention abort hint: {stripped:?}"
         );
-        assert!(stripped.contains("┌"));
-        assert!(stripped.contains("└"));
+        // Frame characters: the splash uses rounded corners (╭╮╰╯) post-#40,
+        // but legacy `└┌` were the originals. Accept either so old + new
+        // banners both pass.
+        assert!(stripped.contains('╭') || stripped.contains('┌'));
+        assert!(stripped.contains('╰') || stripped.contains('└'));
     }
 
     #[test]
