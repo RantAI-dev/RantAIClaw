@@ -2,7 +2,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::agent::events::AgentEvent;
-use crate::sessions::{Message, SessionStore};
+use crate::sessions::{derive_session_title, Message, SessionStore};
 use crate::tui::async_bridge::TurnRequest;
 
 /// Accumulated token usage for the current TUI session.
@@ -38,6 +38,29 @@ pub struct TuiContext {
     /// Number of turn requests currently queued at the actor (submitted but
     /// not yet completed). Incremented on submit, decremented on `Done`.
     pub queued_turns: usize,
+    /// Canonical names of providers detected as enabled (have an API key
+    /// configured) when the TUI launched. Used by `/model` to populate
+    /// the model picker. First entry is the primary/default provider.
+    pub available_providers: Vec<String>,
+    /// Skills loaded from the workspace at TUI startup. Used by
+    /// `/skills` to populate the skills picker.
+    pub available_skills: Vec<crate::skills::Skill>,
+    /// Snapshot of `(command_name, description)` pairs taken at TUI
+    /// startup. Used by `/help` to populate the help picker without
+    /// reaching back into the command registry from inside handlers.
+    pub available_commands: Vec<(String, String)>,
+    /// Submitted prompts in chronological order (oldest first). Used
+    /// by Up/Down to recall past prompts when the input is empty or
+    /// when already in history-navigation mode.
+    pub input_history: Vec<String>,
+    /// Current position in history navigation, indexed from the end:
+    /// `Some(0)` = most recent submission, `Some(1)` = next-most, etc.
+    /// `None` = not navigating history.
+    pub input_history_pos: Option<usize>,
+    /// Buffer contents at the moment the user started navigating
+    /// history (so Down past the newest entry restores what they were
+    /// typing). `None` when history navigation is inactive.
+    pub input_history_stash: Option<String>,
 }
 
 impl TuiContext {
@@ -78,7 +101,84 @@ impl TuiContext {
             req_tx,
             events_rx,
             queued_turns: 0,
+            available_providers: Vec::new(),
+            available_skills: Vec::new(),
+            available_commands: Vec::new(),
+            input_history: Vec::new(),
+            input_history_pos: None,
+            input_history_stash: None,
         })
+    }
+
+    /// Append a submission to the input-history ring. Skips empty
+    /// strings and adjacent duplicates. Caps the history at 200 entries
+    /// to bound memory.
+    pub fn push_input_history(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self
+            .input_history
+            .last()
+            .is_some_and(|prev| prev == trimmed)
+        {
+            return;
+        }
+        const MAX_HISTORY: usize = 200;
+        if self.input_history.len() >= MAX_HISTORY {
+            self.input_history.remove(0);
+        }
+        self.input_history.push(trimmed.to_string());
+    }
+
+    /// Advance one step deeper into history (older entry). On the first
+    /// call it stashes the current buffer so Down can restore it.
+    /// Returns the resulting buffer contents to display, or `None` when
+    /// no further history is available.
+    pub fn history_recall_older(&mut self) -> Option<String> {
+        if self.input_history.is_empty() {
+            return None;
+        }
+        let next_pos = match self.input_history_pos {
+            None => {
+                // Entering history mode — stash the live buffer.
+                self.input_history_stash = Some(self.input_buffer.clone());
+                0
+            }
+            Some(p) => p + 1,
+        };
+        if next_pos >= self.input_history.len() {
+            return None; // already at the oldest entry
+        }
+        self.input_history_pos = Some(next_pos);
+        let idx = self.input_history.len() - 1 - next_pos;
+        Some(self.input_history[idx].clone())
+    }
+
+    /// Step one toward the present (newer entry). Returns the buffer
+    /// contents to display, or `None` if not currently in history mode.
+    /// When stepping past the newest entry, the stashed live buffer
+    /// is restored and history mode exits.
+    pub fn history_recall_newer(&mut self) -> Option<String> {
+        let pos = self.input_history_pos?;
+        if pos == 0 {
+            // Past the newest → exit history mode, restore stash.
+            self.input_history_pos = None;
+            return self.input_history_stash.take();
+        }
+        let next = pos - 1;
+        self.input_history_pos = Some(next);
+        let idx = self.input_history.len() - 1 - next;
+        Some(self.input_history[idx].clone())
+    }
+
+    /// Drop history-navigation state without altering the buffer. Call
+    /// whenever the user edits the input (typing or backspace) so the
+    /// edits aren't clobbered by Up/Down.
+    pub fn exit_history_navigation(&mut self) {
+        self.input_history_pos = None;
+        self.input_history_stash = None;
     }
 
     /// Build a `TuiContext` suitable for unit tests, returning the peer ends
@@ -99,10 +199,23 @@ impl TuiContext {
     }
 
     /// Append a user message to the in-memory list and persist it.
+    ///
+    /// If this is the first message in the session and the session has no
+    /// title yet, derive a title from the message preview and persist it.
+    /// Title-write errors are swallowed — never block the user turn on a
+    /// best-effort UI affordance.
     pub fn append_user_message(&mut self, content: &str) -> Result<()> {
+        let is_first_message = self.messages.is_empty();
         let msg = Message::user(&self.session_id, content);
         self.session_store.append_message(&msg)?;
         self.messages.push(msg);
+
+        if is_first_message {
+            let title = derive_session_title(content);
+            if !title.is_empty() {
+                let _ = self.session_store.set_title(&self.session_id, &title);
+            }
+        }
         Ok(())
     }
 
@@ -151,6 +264,8 @@ impl TuiContext {
     }
 
     /// End the current session and start a fresh one, clearing in-memory state.
+    /// The active model is intentionally **preserved** — Hermes / Claude-Code
+    /// convention: model is a runtime preference that survives `/new`.
     pub fn clear_session(&mut self) -> Result<()> {
         self.session_store.end_session(&self.session_id)?;
         let session = self.session_store.new_session(&self.model.clone(), "tui")?;
@@ -173,6 +288,102 @@ mod tests {
         let (req_tx, _req_rx) = mpsc::channel(4);
         let (_events_tx, events_rx) = mpsc::channel(32);
         TuiContext::new(store, model, None, req_tx, events_rx).expect("context creation")
+    }
+
+    #[test]
+    fn first_user_message_auto_titles_session() {
+        let mut ctx = in_memory_context("test-model");
+        let sid = ctx.session_id.clone();
+
+        ctx.append_user_message("design the new picker overlay")
+            .unwrap();
+
+        let after = ctx.session_store.get_session(&sid).unwrap().unwrap();
+        assert_eq!(
+            after.title.as_deref(),
+            Some("design the new picker overlay")
+        );
+    }
+
+    #[test]
+    fn second_user_message_does_not_overwrite_title() {
+        let mut ctx = in_memory_context("test-model");
+        let sid = ctx.session_id.clone();
+        ctx.append_user_message("first prompt").unwrap();
+        ctx.session_store.set_title(&sid, "manually set").unwrap();
+        ctx.append_user_message("follow-up that should not retitle")
+            .unwrap();
+        let after = ctx.session_store.get_session(&sid).unwrap().unwrap();
+        assert_eq!(after.title.as_deref(), Some("manually set"));
+    }
+
+    #[test]
+    fn clear_session_preserves_active_model() {
+        let mut ctx = in_memory_context("minimax:MiniMax-M2.5");
+        // User switches model mid-session via /model.
+        ctx.model = "openrouter:anthropic/claude-sonnet-4.6".to_string();
+        ctx.clear_session().unwrap();
+        // Model preference survives /new (Hermes/CC convention).
+        assert_eq!(ctx.model, "openrouter:anthropic/claude-sonnet-4.6");
+    }
+
+    #[test]
+    fn input_history_skips_empty_and_duplicate_submissions() {
+        let mut ctx = in_memory_context("test-model");
+        ctx.push_input_history("first prompt");
+        ctx.push_input_history("first prompt"); // duplicate adjacent
+        ctx.push_input_history("");
+        ctx.push_input_history("   ");
+        ctx.push_input_history("second prompt");
+        assert_eq!(ctx.input_history, vec!["first prompt", "second prompt"]);
+    }
+
+    #[test]
+    fn history_recall_walks_oldest_to_newest() {
+        let mut ctx = in_memory_context("test-model");
+        ctx.push_input_history("alpha");
+        ctx.push_input_history("beta");
+        ctx.push_input_history("gamma");
+
+        // Up from empty buffer → newest first.
+        assert_eq!(ctx.history_recall_older().as_deref(), Some("gamma"));
+        assert_eq!(ctx.history_recall_older().as_deref(), Some("beta"));
+        assert_eq!(ctx.history_recall_older().as_deref(), Some("alpha"));
+        // Past the oldest → None, position stays.
+        assert_eq!(ctx.history_recall_older(), None);
+    }
+
+    #[test]
+    fn history_down_restores_stash_at_newest() {
+        let mut ctx = in_memory_context("test-model");
+        ctx.push_input_history("alpha");
+        ctx.push_input_history("beta");
+        ctx.input_buffer = "draft I was typing".to_string();
+
+        // Up → enter history at newest, stash the draft.
+        assert_eq!(ctx.history_recall_older().as_deref(), Some("beta"));
+        assert_eq!(ctx.history_recall_older().as_deref(), Some("alpha"));
+        // Down twice → back through newer, then stash.
+        assert_eq!(ctx.history_recall_newer().as_deref(), Some("beta"));
+        assert_eq!(
+            ctx.history_recall_newer().as_deref(),
+            Some("draft I was typing")
+        );
+        // Past the newest → None, history_pos cleared.
+        assert_eq!(ctx.history_recall_newer(), None);
+        assert!(ctx.input_history_pos.is_none());
+        assert!(ctx.input_history_stash.is_none());
+    }
+
+    #[test]
+    fn exit_history_navigation_drops_pos_and_stash() {
+        let mut ctx = in_memory_context("test-model");
+        ctx.push_input_history("alpha");
+        let _ = ctx.history_recall_older();
+        assert!(ctx.input_history_pos.is_some());
+        ctx.exit_history_navigation();
+        assert!(ctx.input_history_pos.is_none());
+        assert!(ctx.input_history_stash.is_none());
     }
 
     #[test]

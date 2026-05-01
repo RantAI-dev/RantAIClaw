@@ -28,6 +28,16 @@ pub enum CommandResult {
     /// The message is not appended to history again — the caller
     /// expects it to already live there (e.g. `/retry`).
     Resubmit(String),
+    /// Open an interactive list picker (Up/Down/Enter/Esc). The
+    /// `ListPicker.kind` tag tells the app's key handler which side
+    /// effect to run when the user presses Enter — switch model,
+    /// resume session, set personality, etc.
+    OpenListPicker(crate::tui::widgets::ListPicker),
+    /// Wipe the terminal's visible screen + scrollback in addition to
+    /// any side effect the command already performed (e.g. starting a
+    /// new session). The string is committed to scrollback after the
+    /// clear so the user sees a confirmation line on the fresh screen.
+    ClearTerminal(String),
 }
 
 /// Pre-rendered content for the modal help overlay. Multiple "tabs" can

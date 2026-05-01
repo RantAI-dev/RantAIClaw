@@ -3,8 +3,40 @@ use chrono::{TimeZone, Utc};
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
+use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 
-/// /sessions command — list past sessions
+/// Build picker items from a list of session metas. Skips the current
+/// session so the user doesn't accidentally "resume" it onto itself.
+fn build_session_items(
+    sessions: &[crate::sessions::SessionMeta],
+    current_session_id: &str,
+) -> Vec<ListPickerItem> {
+    sessions
+        .iter()
+        .filter(|s| s.id != current_session_id)
+        .map(|s| {
+            let date = Utc
+                .timestamp_opt(s.started_at, 0)
+                .single()
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let title = s
+                .title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .unwrap_or("(untitled)");
+            let short_id = &s.id[..s.id.len().min(8)];
+            ListPickerItem {
+                key: s.id.clone(),
+                primary: format!("{short_id} · {title}"),
+                secondary: format!("{date} · {} msgs · {}", s.message_count, s.model),
+            }
+        })
+        .collect()
+}
+
+/// /sessions command — open the interactive session picker. Selecting a
+/// session resumes it (same flow as `/resume`); Esc cancels.
 pub struct SessionsCommand;
 
 impl CommandHandler for SessionsCommand {
@@ -13,43 +45,30 @@ impl CommandHandler for SessionsCommand {
     }
 
     fn description(&self) -> &str {
-        "List past sessions"
+        "Browse and resume past sessions"
     }
 
     fn usage(&self) -> &str {
-        "/sessions [--days N]"
+        "/sessions"
     }
 
-    fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
-        let limit = if args.contains("--days") { 100 } else { 20 };
-        let sessions = ctx.session_store.list_sessions(limit)?;
-
-        if sessions.is_empty() {
-            return Ok(CommandResult::Message(
-                "No past sessions found.".to_string(),
-            ));
-        }
-
-        let mut lines = vec!["Past sessions:".to_string()];
-        for s in &sessions {
-            let date = Utc
-                .timestamp_opt(s.started_at, 0)
-                .single()
-                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let title = s.title.as_deref().unwrap_or("(untitled)");
-            let short_id = &s.id[..s.id.len().min(8)];
-            lines.push(format!(
-                "  {} | {} | {} msgs | {}",
-                short_id, date, s.message_count, title
-            ));
-        }
-
-        Ok(CommandResult::Message(lines.join("\n")))
+    fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+        let sessions = ctx.session_store.list_sessions(200)?;
+        let items = build_session_items(&sessions, &ctx.session_id);
+        let picker = ListPicker::new(
+            ListPickerKind::Session,
+            "Sessions",
+            items,
+            None,
+            "No past sessions to resume.",
+        );
+        Ok(CommandResult::OpenListPicker(picker))
     }
 }
 
-/// /resume command — resume a past session by ID prefix
+/// /resume command — open the session picker, optionally pre-selecting a
+/// session whose ID starts with the given prefix. Falls back to the full
+/// list when no prefix is given.
 pub struct ResumeCommand;
 
 impl CommandHandler for ResumeCommand {
@@ -58,66 +77,33 @@ impl CommandHandler for ResumeCommand {
     }
 
     fn description(&self) -> &str {
-        "Resume a past session by ID prefix"
+        "Resume a past session"
     }
 
     fn usage(&self) -> &str {
-        "/resume <id-prefix>"
+        "/resume [id-prefix]"
     }
 
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let prefix = args.trim();
-        if prefix.is_empty() {
-            return Ok(CommandResult::Message(
-                "Usage: /resume <id-prefix>".to_string(),
-            ));
-        }
-
-        // Search for sessions whose ID starts with the given prefix
         let sessions = ctx.session_store.list_sessions(200)?;
-        let matches: Vec<_> = sessions
-            .iter()
-            .filter(|s| s.id.starts_with(prefix))
-            .collect();
-
-        match matches.len() {
-            0 => Ok(CommandResult::Message(format!(
-                "No session found matching prefix: {}",
-                prefix
-            ))),
-            1 => {
-                let target = matches[0];
-                // Load the full session to get the model
-                let session = ctx
-                    .session_store
-                    .get_session(&target.id)?
-                    .ok_or_else(|| anyhow::anyhow!("session disappeared during resume"))?;
-
-                ctx.session_id = session.id.clone();
-                ctx.model = session.model.clone();
-                ctx.messages.clear();
-                ctx.load_session_messages()?;
-
-                Ok(CommandResult::Message(format!(
-                    "Resumed session {} ({} messages)",
-                    &session.id[..session.id.len().min(8)],
-                    ctx.messages.len()
-                )))
-            }
-            _ => {
-                let mut msg = format!(
-                    "Multiple sessions match prefix '{}'. Please use a longer prefix:\n",
-                    prefix
-                );
-                for s in &matches {
-                    let short_id = &s.id[..s.id.len().min(8)];
-                    let title = s.title.as_deref().unwrap_or("(untitled)");
-                    use std::fmt::Write as _;
-                    writeln!(msg, "  {} — {}", short_id, title).unwrap();
-                }
-                Ok(CommandResult::Message(msg.trim_end().to_string()))
-            }
-        }
+        let items = build_session_items(&sessions, &ctx.session_id);
+        let preselect = if prefix.is_empty() {
+            None
+        } else {
+            items
+                .iter()
+                .find(|i| i.key.starts_with(prefix))
+                .map(|i| i.key.clone())
+        };
+        let picker = ListPicker::new(
+            ListPickerKind::Session,
+            "Resume Session",
+            items,
+            preselect.as_deref(),
+            "No past sessions to resume.",
+        );
+        Ok(CommandResult::OpenListPicker(picker))
     }
 }
 
@@ -210,6 +196,7 @@ impl CommandHandler for TitleCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::ListPickerKind;
 
     fn test_context() -> TuiContext {
         let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
@@ -217,22 +204,33 @@ mod tests {
     }
 
     #[test]
-    fn sessions_command_lists_sessions() {
+    fn sessions_command_opens_picker() {
         let mut ctx = test_context();
-
-        // The current session already exists; add a message so it shows up with count
         ctx.append_user_message("hello").unwrap();
 
         let cmd = SessionsCommand;
         let result = cmd.execute("", &mut ctx).unwrap();
 
         match result {
-            CommandResult::Message(msg) => {
-                assert!(msg.contains("Past sessions:"));
-                // Should show the current session
-                assert!(msg.contains("msgs"));
+            CommandResult::OpenListPicker(picker) => {
+                assert_eq!(picker.kind, ListPickerKind::Session);
+                // Current session is filtered out → empty in this in-memory test.
+                assert!(picker.items.is_empty() || picker.items.iter().all(|i| !i.key.is_empty()));
             }
-            _ => panic!("Expected Message result"),
+            other => panic!("expected OpenListPicker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_command_opens_picker_even_with_no_args() {
+        let mut ctx = test_context();
+        let cmd = ResumeCommand;
+        let result = cmd.execute("", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenListPicker(picker) => {
+                assert_eq!(picker.kind, ListPickerKind::Session);
+            }
+            other => panic!("expected OpenListPicker, got {other:?}"),
         }
     }
 

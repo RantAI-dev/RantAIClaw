@@ -2,8 +2,9 @@ use anyhow::Result;
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
+use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind, ModelEntry};
 
-/// /model command — display or change the current model
+/// /model command — display, change, or interactively pick the active model.
 pub struct ModelCommand;
 
 impl CommandHandler for ModelCommand {
@@ -12,7 +13,7 @@ impl CommandHandler for ModelCommand {
     }
 
     fn description(&self) -> &str {
-        "Change or display current model"
+        "Pick or change the active model"
     }
 
     fn usage(&self) -> &str {
@@ -21,14 +22,52 @@ impl CommandHandler for ModelCommand {
 
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let model = args.trim();
-        if model.is_empty() {
-            return Ok(CommandResult::Message(format!(
-                "Current model: {}\n\nUsage: /model <provider:model>\nExamples:\n  /model anthropic:claude-sonnet-4-20250514\n  /model openai:gpt-4o\n  /model ollama:llama3",
-                ctx.model
-            )));
+        if !model.is_empty() {
+            ctx.model = model.to_string();
+            return Ok(CommandResult::Message(format!("Model set to: {model}")));
         }
-        ctx.model = model.to_string();
-        Ok(CommandResult::Message(format!("Model set to: {}", model)))
+
+        // No args → open the interactive picker. Build entries from the
+        // curated per-provider lists, restricted to providers detected as
+        // enabled at TUI startup.
+        let mut entries: Vec<ModelEntry> = Vec::new();
+        let providers = if ctx.available_providers.is_empty() {
+            ctx.model
+                .split(':')
+                .next()
+                .map(|s| vec![s.to_string()])
+                .unwrap_or_default()
+        } else {
+            ctx.available_providers.clone()
+        };
+
+        for provider in &providers {
+            for (id, desc) in crate::onboard::wizard::curated_models_for_provider(provider) {
+                entries.push(ModelEntry {
+                    provider: provider.clone(),
+                    model_id: id,
+                    description: desc,
+                });
+            }
+        }
+
+        let items: Vec<ListPickerItem> = entries
+            .iter()
+            .map(|e| ListPickerItem {
+                key: e.target(),
+                primary: e.target(),
+                secondary: e.description.clone(),
+            })
+            .collect();
+
+        let picker = ListPicker::new(
+            ListPickerKind::Model,
+            "Select Model",
+            items,
+            Some(&ctx.model),
+            "No providers with credentials detected. Run `rantaiclaw setup provider`.",
+        );
+        Ok(CommandResult::OpenListPicker(picker))
     }
 }
 
@@ -63,21 +102,6 @@ mod tests {
     }
 
     #[test]
-    fn model_command_shows_current_model() {
-        let cmd = ModelCommand;
-        let mut ctx = test_context();
-
-        let result = cmd.execute("", &mut ctx).unwrap();
-
-        match result {
-            CommandResult::Message(msg) => {
-                assert!(msg.contains("mock-model"));
-            }
-            _ => panic!("Expected Message result"),
-        }
-    }
-
-    #[test]
     fn model_command_changes_model() {
         let cmd = ModelCommand;
         let mut ctx = test_context();
@@ -90,6 +114,23 @@ mod tests {
                 assert!(msg.contains("openai:gpt-4o"));
             }
             _ => panic!("Expected Message result"),
+        }
+    }
+
+    #[test]
+    fn model_command_with_empty_args_opens_picker() {
+        let cmd = ModelCommand;
+        let mut ctx = test_context();
+        ctx.available_providers = vec!["openai".to_string()];
+
+        let result = cmd.execute("", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenListPicker(picker) => {
+                assert_eq!(picker.kind, ListPickerKind::Model);
+                assert!(!picker.items.is_empty());
+                assert!(picker.items.iter().all(|i| i.key.starts_with("openai:")));
+            }
+            other => panic!("expected OpenListPicker, got {other:?}"),
         }
     }
 }
