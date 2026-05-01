@@ -99,6 +99,64 @@ impl Default for RenderTheme {
     }
 }
 
+/// Render a single content line with block-level markdown awareness:
+/// strips ATX-style heading prefixes (`#`, `##`, `###`) and styles the
+/// remainder as a bold heading; recognises `- ` / `* ` bullets and styles
+/// the marker. Falls back to inline-markdown parsing for normal lines.
+pub fn render_block_line(text: &str, theme: &RenderTheme) -> Line<'static> {
+    let stripped = text.trim_start_matches(' ');
+    let leading_ws_len = text.len() - stripped.len();
+    let leading = &text[..leading_ws_len];
+
+    // ATX headings: `# `, `## `, `### `, `#### `, `##### `, `###### `.
+    if let Some(rest) = stripped
+        .strip_prefix("###### ")
+        .or_else(|| stripped.strip_prefix("##### "))
+        .or_else(|| stripped.strip_prefix("#### "))
+        .or_else(|| stripped.strip_prefix("### "))
+        .or_else(|| stripped.strip_prefix("## "))
+        .or_else(|| stripped.strip_prefix("# "))
+    {
+        let mut spans = Vec::new();
+        if !leading.is_empty() {
+            spans.push(Span::raw(leading.to_string()));
+        }
+        // Style the heading body bold + assistant-blue. Inline markdown
+        // inside the heading still parses (so `**foo**` inside `###`
+        // doesn't show literal stars).
+        let inner = parse_inline_markdown(rest, theme);
+        for span in inner {
+            let style = span
+                .style
+                .add_modifier(Modifier::BOLD)
+                .fg(theme.assistant_label);
+            spans.push(Span::styled(span.content.into_owned(), style));
+        }
+        return Line::from(spans);
+    }
+
+    // Bullet markers: `- ` / `* ` / `+ ` (unordered). Style the marker
+    // muted, parse the rest inline.
+    if let Some(rest) = stripped
+        .strip_prefix("- ")
+        .or_else(|| stripped.strip_prefix("* "))
+        .or_else(|| stripped.strip_prefix("+ "))
+    {
+        let mut spans = Vec::new();
+        if !leading.is_empty() {
+            spans.push(Span::raw(leading.to_string()));
+        }
+        spans.push(Span::styled(
+            "• ".to_string(),
+            Style::default().fg(theme.tool_args),
+        ));
+        spans.extend(parse_inline_markdown(rest, theme));
+        return Line::from(spans);
+    }
+
+    Line::from(parse_inline_markdown(text, theme))
+}
+
 /// Render a complete message (label + content + tool blocks) into one or
 /// more lines. Tool blocks render as indented sub-lines under the content.
 pub fn render_message_lines(
@@ -123,11 +181,12 @@ pub fn render_message_lines(
     )];
     let mut content_iter = content.split('\n');
     if let Some(first_para) = content_iter.next() {
-        first.extend(parse_inline_markdown(first_para, theme));
+        let body = render_block_line(first_para, theme);
+        first.extend(body.spans);
     }
     lines.push(Line::from(first));
     for rest in content_iter {
-        lines.push(Line::from(parse_inline_markdown(rest, theme)));
+        lines.push(render_block_line(rest, theme));
     }
 
     // Tool blocks (persisted from history first, then any in-progress

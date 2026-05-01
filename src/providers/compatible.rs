@@ -478,6 +478,75 @@ struct ResponsesContent {
 // Streaming support (SSE parser)
 // ---------------------------------------------------------------
 
+/// Strip `<think>...</think>` reasoning blocks from a streaming text delta
+/// so the user only ever sees the model's final answer. Tag boundaries can
+/// fall on chunk boundaries (e.g. one delta ends with `<thi` and the next
+/// starts with `nk>`), so the caller carries `in_think` and `partial` state
+/// across calls.
+pub(crate) fn filter_think_tags(
+    input: &str,
+    in_think: &mut bool,
+    partial: &mut String,
+) -> String {
+    let combined = format!("{partial}{input}");
+    partial.clear();
+    let mut out = String::new();
+    let bytes = combined.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if *in_think {
+            // Look for closing tag
+            if let Some(end_rel) = combined[i..].find("</think>") {
+                let end_abs = i + end_rel + "</think>".len();
+                i = end_abs;
+                *in_think = false;
+            } else {
+                // Maybe a partial closing tag at the tail — buffer it.
+                let tail = &combined[i..];
+                if "</think>".starts_with(tail) || tail.ends_with('<') {
+                    partial.push_str(tail);
+                }
+                return out;
+            }
+        } else {
+            if let Some(start_rel) = combined[i..].find("<think>") {
+                let start_abs = i + start_rel;
+                out.push_str(&combined[i..start_abs]);
+                i = start_abs + "<think>".len();
+                *in_think = true;
+            } else {
+                // Maybe a partial opening tag — buffer the tail if it
+                // could be the start of `<think>`.
+                let tail = &combined[i..];
+                let max_partial = "<think>".len() - 1;
+                let candidate_start = tail.len().saturating_sub(max_partial);
+                let suffix = &tail[candidate_start..];
+                if !suffix.is_empty() && "<think>".starts_with(suffix) {
+                    out.push_str(&tail[..candidate_start]);
+                    partial.push_str(suffix);
+                } else {
+                    out.push_str(tail);
+                }
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Split a chunk into smaller word-sized pieces for paced streaming.
+/// Emits one piece per whitespace-bounded word (kept inclusive so spaces
+/// are preserved). For chunks that are already small (≤16 chars) returns
+/// a single piece — no sense paying the per-piece overhead.
+pub(crate) fn split_for_streaming(text: &str) -> Vec<String> {
+    if text.len() <= 16 {
+        return vec![text.to_string()];
+    }
+    text.split_inclusive(char::is_whitespace)
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Server-Sent Event stream chunk for OpenAI-compatible streaming.
 #[derive(Debug, Deserialize)]
 struct StreamChunkResponse {
@@ -1404,6 +1473,129 @@ impl Provider for OpenAiCompatibleProvider {
 
     fn supports_streaming(&self) -> bool {
         true
+    }
+
+    /// Real SSE streaming override. The trait default just calls `chat`
+    /// and emits the entire response as one chunk, which defeats the
+    /// whole point of streaming for the TUI. This implementation hits
+    /// the `chat/completions` endpoint with `stream: true` and forwards
+    /// each `delta.content` token to `text_tx` as it arrives. Tool calls
+    /// in streaming responses are NOT yet handled — when `request.tools`
+    /// is non-empty we fall back to non-streaming `chat()` so tool plumbing
+    /// keeps working.
+    async fn chat_stream(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        text_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let credential = self
+            .credential
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} API key not set. Run `rantaiclaw onboard` or set the appropriate env var.",
+                    self.name
+                )
+            })?
+            .clone();
+
+        // Tools are forwarded with `stream: true`. The SSE parser only
+        // extracts text deltas (not tool_call deltas), so if the model
+        // chooses to emit tool calls in streaming mode the rest of the
+        // agent loop falls back to its prompt-guided / native-tool
+        // detection on the assembled `full_text`. This is the same
+        // behaviour as the non-streaming path for prompt-guided tools.
+        let tools = Self::convert_tool_specs(request.tools);
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(request.messages)
+        } else {
+            request.messages.to_vec()
+        };
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages_for_native(&effective_messages),
+            temperature,
+            stream: Some(true),
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+        };
+
+        let url = self.chat_completions_url();
+        let response = self
+            .apply_auth_header(
+                self.http_client().post(&url).json(&native_request),
+                &credential,
+            )
+            .header("Accept", "text/event-stream")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "{} API error ({status}): {}",
+                self.name,
+                super::sanitize_api_error(&error)
+            );
+        }
+
+        let mut full_text = String::new();
+        let mut bytes_stream = response.bytes_stream();
+        let mut buffer = String::new();
+        // Some servers (MiniMax in particular) "stream" by emitting one
+        // mega-chunk per response stage instead of true token-by-token
+        // SSE. We split each incoming delta into word-sized pieces and
+        // pace them out so the TUI's live preview feels like real
+        // streaming. Tracks <think>...</think> bracketing so we never
+        // forward reasoning content to the user.
+        let mut in_think = false;
+        let mut think_partial = String::new();
+        while let Some(item) = bytes_stream.next().await {
+            let bytes = item?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(pos) = buffer.find('\n') {
+                let line: String = buffer.drain(..=pos).collect();
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                let delta = match parse_sse_line(trimmed) {
+                    Ok(Some(d)) => d,
+                    _ => continue,
+                };
+                let visible = filter_think_tags(&delta, &mut in_think, &mut think_partial);
+                if visible.is_empty() {
+                    continue;
+                }
+                full_text.push_str(&visible);
+                // Pace out big chunks so TUI shows progressive streaming
+                // even when the server batches.
+                for piece in split_for_streaming(&visible) {
+                    if text_tx.send(piece).await.is_err() {
+                        return Ok(ProviderChatResponse {
+                            text: if full_text.is_empty() {
+                                None
+                            } else {
+                                Some(full_text)
+                            },
+                            tool_calls: vec![],
+                        });
+                    }
+                    if visible.len() > 16 {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        }
+
+        Ok(ProviderChatResponse {
+            text: if full_text.is_empty() {
+                None
+            } else {
+                Some(full_text)
+            },
+            tool_calls: vec![],
+        })
     }
 
     fn stream_chat_with_system(

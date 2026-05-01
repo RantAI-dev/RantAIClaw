@@ -783,7 +783,7 @@ fn default_model_for_provider(provider: &str) -> String {
     }
 }
 
-fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
+pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     match canonical_provider_name(provider_name) {
         "openrouter" => vec![
             (

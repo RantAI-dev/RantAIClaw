@@ -1,9 +1,14 @@
 use anyhow::Result;
 
-use super::{CommandHandler, CommandResult, OverlayContent, OverlayTab};
+use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
+use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 
-/// /help command
+/// /help command — open an interactive command picker. With no args,
+/// shows every registered command (filterable, paginated). Selecting a
+/// command pre-fills `/<name> ` into the input buffer so the user can
+/// type args and submit. With a name arg, shows a one-line description
+/// of that specific command (or a "no such command" message).
 pub struct HelpCommand;
 
 impl CommandHandler for HelpCommand {
@@ -11,93 +16,49 @@ impl CommandHandler for HelpCommand {
         "help"
     }
     fn description(&self) -> &str {
-        "Show help for commands"
+        "Browse commands"
     }
     fn usage(&self) -> &str {
         "/help [command]"
     }
 
-    fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
-        if !args.is_empty() {
-            return Ok(CommandResult::Message(format!(
-                "Help for /{args}: not yet documented per-command. Use /help to see all categories."
-            )));
+    fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+        let needle = args.trim().trim_start_matches('/');
+        if !needle.is_empty() {
+            // Show details for a specific command.
+            let found = ctx
+                .available_commands
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(needle));
+            return match found {
+                Some((name, desc)) => Ok(CommandResult::Message(format!("/{name} — {desc}"))),
+                None => Ok(CommandResult::Message(format!(
+                    "No command named '/{needle}'. Run /help to see all commands."
+                ))),
+            };
         }
 
-        // Claude-Code-style modal: title + tab strip + body.
-        // `general` pane mirrors their layout — short pitch, then a 3-column
-        // shortcuts grid. `commands` lists every registered slash command
-        // with its description. The renderer reads these as plain strings
-        // and styles them at draw time.
-        let general = OverlayTab {
-            label: "general".to_string(),
-            body: vec![
-                "Rantaiclaw understands your workspace, runs tools with your".to_string(),
-                "approval, and chats with the agent — right from your terminal.".to_string(),
-                String::new(),
-                "Shortcuts".to_string(),
-                "  /  for commands             Ctrl+Enter to send".to_string(),
-                "  ↑/↓ scrolls chat history    Ctrl+C cancels a running turn".to_string(),
-                "  Tab completes a command     Ctrl+D quits".to_string(),
-                "  Esc closes this overlay     Ctrl+L clears the screen".to_string(),
-                String::new(),
-                "Tips".to_string(),
-                "  • Type / and keep typing — the dropdown filters live.".to_string(),
-                "  • /retry re-runs the previous prompt against a fresh model call.".to_string(),
-                "  • /sessions resumes any past conversation by id.".to_string(),
-                "  • /doctor checks config + provider + channel health.".to_string(),
-                String::new(),
-                "For more help: https://github.com/RantAI-dev/RantAIClaw".to_string(),
-            ],
-        };
-
-        let commands = OverlayTab {
-            label: "commands".to_string(),
-            body: vec![
-                "Core".to_string(),
-                "  /help               Show this overlay".to_string(),
-                "  /quit, /exit        Exit the application".to_string(),
-                "  /new, /clear        Start a new session".to_string(),
-                String::new(),
-                "Model & usage".to_string(),
-                "  /model [name]       Change or show current model".to_string(),
-                "  /usage              Show token usage statistics".to_string(),
-                String::new(),
-                "Session".to_string(),
-                "  /sessions           List past sessions".to_string(),
-                "  /resume <id>        Resume a session".to_string(),
-                "  /search <query>     Search message history".to_string(),
-                "  /title <name>       Set session title".to_string(),
-                "  /insights           Show session analytics".to_string(),
-                String::new(),
-                "Conversation".to_string(),
-                "  /retry              Retry last response".to_string(),
-                "  /undo               Remove last exchange".to_string(),
-                "  /stop               Cancel streaming".to_string(),
-                String::new(),
-                "Memory & skills".to_string(),
-                "  /memory [action]    Manage persistent memory".to_string(),
-                "  /forget <key>       Remove a memory entry".to_string(),
-                "  /compress           Compress context".to_string(),
-                "  /skills             List available skills".to_string(),
-                "  /skill <name>       Run a skill".to_string(),
-                "  /personality        Set agent personality".to_string(),
-                String::new(),
-                "Config & diagnostics".to_string(),
-                "  /status             Show system status".to_string(),
-                "  /config [k] [v]     View or set config".to_string(),
-                "  /debug              Toggle debug mode".to_string(),
-                "  /doctor             Run diagnostics".to_string(),
-                "  /platforms          Show connected platforms".to_string(),
-                "  /cron [action]      Manage scheduled tasks".to_string(),
-            ],
-        };
-
-        Ok(CommandResult::Overlay(OverlayContent {
-            title: format!("Rantaiclaw v{}", env!("CARGO_PKG_VERSION")),
-            tabs: vec![general, commands],
-            active_tab: 0,
-        }))
+        // No args → open the interactive picker over all registered
+        // commands. The startup snapshot in `available_commands` keeps
+        // command-handler trait signatures unchanged (no need to pass
+        // the registry in here).
+        let items: Vec<ListPickerItem> = ctx
+            .available_commands
+            .iter()
+            .map(|(name, desc)| ListPickerItem {
+                key: name.clone(),
+                primary: format!("/{name}"),
+                secondary: desc.clone(),
+            })
+            .collect();
+        let picker = ListPicker::new(
+            ListPickerKind::Help,
+            "Commands",
+            items,
+            None,
+            "No commands registered.",
+        );
+        Ok(CommandResult::OpenListPicker(picker))
     }
 }
 
@@ -136,7 +97,9 @@ impl CommandHandler for NewCommand {
 
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         ctx.clear_session()?;
-        Ok(CommandResult::Message("Started new session".to_string()))
+        Ok(CommandResult::ClearTerminal(
+            "Started new session".to_string(),
+        ))
     }
 }
 
@@ -149,27 +112,55 @@ mod tests {
     }
 
     #[test]
-    fn help_command_returns_help_text() {
+    fn help_command_opens_command_picker() {
         let cmd = HelpCommand;
         let mut ctx = test_context();
-        let result = cmd.execute("", &mut ctx).unwrap();
+        // Seed the snapshot the picker reads from.
+        ctx.available_commands = vec![
+            ("help".to_string(), "Browse commands".to_string()),
+            ("quit".to_string(), "Exit the application".to_string()),
+            ("model".to_string(), "Pick or change the active model".to_string()),
+        ];
 
+        let result = cmd.execute("", &mut ctx).unwrap();
         match result {
-            CommandResult::Overlay(content) => {
-                // /help now opens a modal overlay with at least two tabs
-                // (general + commands). The commands tab must mention the
-                // basics so users can grep visually for what they need.
-                assert!(content.tabs.len() >= 2, "expected ≥2 tabs");
-                let body_text = content
-                    .tabs
-                    .iter()
-                    .flat_map(|t| t.body.iter().cloned())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                assert!(body_text.contains("/help"), "body should reference /help");
-                assert!(body_text.contains("/quit"), "body should reference /quit");
+            CommandResult::OpenListPicker(picker) => {
+                assert_eq!(picker.kind, crate::tui::widgets::ListPickerKind::Help);
+                assert_eq!(picker.items.len(), 3);
+                assert!(picker.items.iter().any(|i| i.key == "quit"));
+                assert!(picker.items.iter().any(|i| i.primary == "/quit"));
             }
-            _ => panic!("Expected Overlay result, got {result:?}"),
+            other => panic!("Expected OpenListPicker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_command_with_arg_shows_one_line_description() {
+        let cmd = HelpCommand;
+        let mut ctx = test_context();
+        ctx.available_commands = vec![("model".to_string(), "Pick or change the active model".to_string())];
+
+        let result = cmd.execute("model", &mut ctx).unwrap();
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("/model"));
+                assert!(msg.contains("Pick or change"));
+            }
+            _ => panic!("Expected Message result"),
+        }
+    }
+
+    #[test]
+    fn help_command_with_unknown_arg_returns_not_found() {
+        let cmd = HelpCommand;
+        let mut ctx = test_context();
+        let result = cmd.execute("nonexistent", &mut ctx).unwrap();
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(msg.to_lowercase().contains("no command"));
+                assert!(msg.contains("nonexistent"));
+            }
+            _ => panic!("Expected Message result"),
         }
     }
 
@@ -182,14 +173,20 @@ mod tests {
     }
 
     #[test]
-    fn new_command_creates_new_session() {
+    fn new_command_creates_new_session_and_signals_terminal_clear() {
         let cmd = NewCommand;
         let mut ctx = test_context();
         let old_id = ctx.session_id.clone();
 
-        cmd.execute("", &mut ctx).unwrap();
+        let result = cmd.execute("", &mut ctx).unwrap();
 
         assert_ne!(ctx.session_id, old_id);
         assert!(ctx.messages.is_empty());
+        match result {
+            CommandResult::ClearTerminal(msg) => {
+                assert!(msg.to_lowercase().contains("new session"));
+            }
+            other => panic!("Expected ClearTerminal, got {other:?}"),
+        }
     }
 }

@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, Stdout};
+use std::io::{self, IsTerminal, Stdout, Write};
 
 use anyhow::{bail, Result};
 use crossterm::{
@@ -8,11 +8,12 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
-    Terminal,
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Widget, Wrap},
+    Terminal, TerminalOptions, Viewport,
 };
 
 use tokio::sync::mpsc;
@@ -65,6 +66,33 @@ pub struct TuiApp {
     /// Active modal overlay (e.g. /help). `None` = no overlay shown.
     /// Esc dismisses; left/right arrows cycle tabs.
     pub overlay: Option<super::commands::OverlayContent>,
+    /// Active interactive list picker — Up/Down/Enter/Esc overlay used
+    /// by `/model`, `/sessions`, `/resume`, `/personality`, etc. The
+    /// `ListPicker.kind` tag tells the Enter handler what to do with the
+    /// selected key. `None` when no picker is open.
+    pub list_picker: Option<super::widgets::ListPicker>,
+    /// Inline-mode scrollback queue. The event loop drains this list
+    /// before each frame and emits each entry into the terminal's native
+    /// scrollback above the viewport. Each entry is `(role, content)`.
+    pub scrollback_queue: Vec<(String, String)>,
+    /// Bytes of the current streaming `partial` already flushed to
+    /// scrollback. Used to stream assistant output line-by-line into
+    /// terminal scrollback while the turn is still in progress. Reset
+    /// each time a new turn starts.
+    pub stream_committed_chars: usize,
+    /// Whether the `Assistant: ` header line for the current streaming
+    /// turn has already been written to scrollback. Reset per turn.
+    pub stream_header_committed: bool,
+    /// `true` when Ctrl+G was pressed and the run loop should suspend
+    /// the terminal, hand control to `$EDITOR`, and copy the resulting
+    /// file contents back into the input buffer. The key handler can't
+    /// run the editor itself because it doesn't own the `Terminal`.
+    pub editor_request: bool,
+    /// `true` when the run loop should wipe the terminal's screen and
+    /// scrollback before the next render (e.g. after `/new`/`/clear`).
+    /// Set by command handlers via `CommandResult::ClearTerminal` and
+    /// consumed once the wipe is performed.
+    pub clear_terminal_request: bool,
 }
 
 impl TuiApp {
@@ -81,8 +109,12 @@ impl TuiApp {
         std::fs::create_dir_all(&config.data_dir)?;
         let db_path = config.data_dir.join("sessions.db");
         let store = SessionStore::open(&db_path)?;
+        // Best-effort one-shot: derive titles for legacy sessions that
+        // never went through the auto-titling path. Idempotent — a no-op
+        // once every session has a title.
+        let _ = store.backfill_titles();
 
-        let context = TuiContext::new(
+        let mut context = TuiContext::new(
             store,
             &config.model,
             config.resume_session.as_deref(),
@@ -90,12 +122,28 @@ impl TuiApp {
             events_rx,
         )?;
 
+        // Snapshot of every registered command so /help can build its
+        // picker without reaching back into TuiApp from the command
+        // handler (which only sees TuiContext).
+        let command_registry = CommandRegistry::new();
+        context.available_commands = command_registry
+            .get_help()
+            .into_iter()
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect();
+
         Ok(Self {
             state: AppState::Ready,
             context,
-            command_registry: CommandRegistry::new(),
+            command_registry,
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            scrollback_queue: Vec::new(),
+            list_picker: None,
+            stream_committed_chars: 0,
+            stream_header_committed: false,
+            editor_request: false,
+            clear_terminal_request: false,
         })
     }
 
@@ -104,9 +152,7 @@ impl TuiApp {
     fn refresh_autocomplete(&mut self) {
         let buf = &self.context.input_buffer;
         if buf.starts_with('/') && !buf.contains(' ') && !buf.contains('\n') {
-            let suggestions = self
-                .command_registry
-                .autocomplete_with_descriptions(buf);
+            let suggestions = self.command_registry.autocomplete_with_descriptions(buf);
             self.autocomplete.update(suggestions);
         } else {
             self.autocomplete.hide();
@@ -156,6 +202,64 @@ impl TuiApp {
                     }
                 }
             }
+            // List picker active — intercepts arrows/enter/esc and
+            // routes printable chars to the search query. Up/Down move
+            // within the *filtered* view; Enter dispatches the selected
+            // item by kind; Esc dismisses; Backspace deletes from the
+            // query. All other keys are swallowed so the user can't
+            // type into the input buffer behind the picker.
+            KeyCode::Up if self.list_picker.is_some() => {
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.move_up();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Down if self.list_picker.is_some() => {
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.move_down();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Left if self.list_picker.is_some() => {
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.prev_page();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Right if self.list_picker.is_some() => {
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.next_page();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Enter if self.list_picker.is_some() => {
+                self.dispatch_list_picker_selection();
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Esc if self.list_picker.is_some() => {
+                self.list_picker = None;
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Backspace if self.list_picker.is_some() => {
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.pop_query_char();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Char(c)
+                if self.list_picker.is_some()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.push_query_char(c);
+                }
+                return Ok(EventResult::Continue);
+            }
+            _ if self.list_picker.is_some() => {
+                // Picker open — swallow everything else.
+                return Ok(EventResult::Continue);
+            }
             // Tab — completes the highlighted command from the dropdown.
             // Always wins over the cycling-tabs handler when typing a
             // slash command (the autocomplete is visible only then).
@@ -171,6 +275,12 @@ impl TuiApp {
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.context.input_buffer.push('\n');
             }
+            // Ctrl+G → suspend the TUI and open the current input
+            // buffer in $EDITOR. The actual swap happens in `run_loop`
+            // (which owns the Terminal); we just raise a flag here.
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.editor_request = true;
+            }
             // Plain Enter — Hermes / Claude Code convention:
             //   * If the autocomplete dropdown is visible and the highlighted
             //     command differs from what the user typed → complete first;
@@ -182,8 +292,7 @@ impl TuiApp {
             KeyCode::Enter => {
                 if self.autocomplete.is_visible() {
                     let buf = self.context.input_buffer.trim_end_matches(' ').to_string();
-                    let selected =
-                        self.autocomplete.selected().map(str::to_string);
+                    let selected = self.autocomplete.selected().map(str::to_string);
                     if selected.as_deref() == Some(buf.as_str()) {
                         self.autocomplete.hide();
                         self.submit_input().await?;
@@ -232,11 +341,13 @@ impl TuiApp {
             // Backspace
             KeyCode::Backspace => {
                 self.context.input_buffer.pop();
+                self.context.exit_history_navigation();
                 self.refresh_autocomplete();
             }
             // Regular character input
             KeyCode::Char(c) => {
                 self.context.input_buffer.push(c);
+                self.context.exit_history_navigation();
                 self.refresh_autocomplete();
             }
             // Up/Down navigate the dropdown when visible; otherwise scroll
@@ -247,12 +358,20 @@ impl TuiApp {
             KeyCode::Down if self.autocomplete.is_visible() => {
                 self.autocomplete.next();
             }
+            // Up/Down with no modal active recalls submitted prompts
+            // from history. Native terminal scrollback (mouse wheel /
+            // PgUp on the host terminal) handles chat scrolling.
             KeyCode::Up => {
-                self.context.scroll_offset = self.context.scroll_offset.saturating_add(1);
+                if let Some(text) = self.context.history_recall_older() {
+                    self.context.input_buffer = text;
+                    self.refresh_autocomplete();
+                }
             }
-            // Scroll down
             KeyCode::Down => {
-                self.context.scroll_offset = self.context.scroll_offset.saturating_sub(1);
+                if let Some(text) = self.context.history_recall_newer() {
+                    self.context.input_buffer = text;
+                    self.refresh_autocomplete();
+                }
             }
             _ => {}
         }
@@ -273,10 +392,20 @@ impl TuiApp {
         if trimmed.is_empty() {
             return Ok(());
         }
+        // Record this submission in input history so Up/Down can
+        // recall it later. Also reset history navigation state so the
+        // next Up press starts from the most recent entry.
+        self.context.push_input_history(trimmed);
+        self.context.exit_history_navigation();
 
         // Slash-commands bypass the bridge entirely (except `/retry`
         // which dispatches via `handle_command` → `dispatch_resubmit`).
         if let Some(cmd) = trimmed.strip_prefix('/') {
+            // Echo the slash command into scrollback first, so the user
+            // can see what they typed above the response (matches the
+            // normal user/assistant exchange flow).
+            self.scrollback_queue
+                .push(("user".to_string(), format!("/{cmd}", cmd = cmd.trim())));
             let cmd = cmd.trim().to_string();
             self.handle_command(&cmd).await?;
             self.context.scroll_offset = 0;
@@ -285,6 +414,10 @@ impl TuiApp {
 
         let text = trimmed.to_string();
         self.context.append_user_message(&text)?;
+        // Commit user message to scrollback so it appears inline like
+        // Hermes/Claude-Code chat output.
+        self.scrollback_queue
+            .push(("user".to_string(), text.clone()));
 
         // Dispatch to the actor. If the bridge is closed (e.g. actor has
         // exited), surface a visible error but do not propagate — the TUI
@@ -302,6 +435,8 @@ impl TuiApp {
                     tool_blocks: Vec::new(),
                     cancelling: false,
                 };
+                self.stream_committed_chars = 0;
+                self.stream_header_committed = false;
             }
             AppState::Streaming { .. } => {
                 self.context.queued_turns += 1;
@@ -419,6 +554,24 @@ impl TuiApp {
         {
             self.context.last_error = Some(format!("failed to persist reply: {e}"));
         }
+        // Commit assistant message to scrollback (inline mode).
+        // If we've already been streaming this turn line-by-line into
+        // scrollback, only emit the trailing partial-line tail (if any)
+        // plus a blank separator. Otherwise emit the full message.
+        if self.stream_header_committed {
+            let committed = self.stream_committed_chars.min(body.len());
+            let tail = body[committed..].to_string();
+            if !tail.is_empty() {
+                self.scrollback_queue
+                    .push(("_continuation".to_string(), tail));
+            } else {
+                self.scrollback_queue
+                    .push(("_continuation".to_string(), String::new()));
+            }
+        } else {
+            self.scrollback_queue
+                .push(("assistant".to_string(), body.clone()));
+        }
 
         if self.context.queued_turns > 0 {
             self.context.queued_turns -= 1;
@@ -427,6 +580,8 @@ impl TuiApp {
                 tool_blocks: Vec::new(),
                 cancelling: false,
             };
+            self.stream_committed_chars = 0;
+            self.stream_header_committed = false;
         } else {
             self.state = AppState::Ready;
         }
@@ -447,6 +602,9 @@ impl TuiApp {
         } else {
             self.context.last_error = Some(status_line);
         }
+        // Commit error message to scrollback so the user sees it inline.
+        self.scrollback_queue
+            .push(("system".to_string(), chat_body));
         self.state = AppState::Ready;
     }
 
@@ -461,9 +619,31 @@ impl TuiApp {
                 // renders properly. The status bar's `last_error` slot is
                 // reserved for errors only.
                 let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".to_string(), msg));
             }
             CmdResult::Overlay(content) => {
-                self.overlay = Some(content);
+                // Inline-mode: render the overlay's body straight into
+                // terminal scrollback (Hermes / Claude Code feel) so the
+                // user can scroll back through long output natively. We
+                // flatten the active tab plus a header line.
+                let mut out = String::new();
+                out.push_str(&format!("{}\n", content.title));
+                for (i, tab) in content.tabs.iter().enumerate() {
+                    if content.tabs.len() > 1 {
+                        let marker = if i == content.active_tab {
+                            "▸ "
+                        } else {
+                            "  "
+                        };
+                        out.push_str(&format!("\n{}{}\n", marker, tab.label));
+                    }
+                    for line in &tab.body {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+                let _ = self.context.append_system_message(&out);
+                self.scrollback_queue.push(("system".to_string(), out));
             }
             CmdResult::Continue | CmdResult::ClearError => {
                 self.context.last_error = None;
@@ -471,8 +651,102 @@ impl TuiApp {
             CmdResult::Resubmit(text) => {
                 self.dispatch_resubmit(text).await;
             }
+            CmdResult::OpenListPicker(picker) => {
+                self.list_picker = Some(picker);
+            }
+            CmdResult::ClearTerminal(announce) => {
+                // The actual screen+scrollback wipe runs in `run_loop`
+                // (which owns the Terminal). We just raise the flag and
+                // queue the announcement to be emitted on the fresh
+                // screen. Drop any pending scrollback so we don't echo
+                // the user's `/new` line into the cleared terminal.
+                self.scrollback_queue.clear();
+                self.clear_terminal_request = true;
+                let _ = self.context.append_system_message(&announce);
+                self.scrollback_queue
+                    .push(("system".to_string(), announce));
+            }
         }
         Ok(())
+    }
+
+    /// Apply the user's selection from the active list picker. Matches
+    /// on `ListPickerKind` so each picker type runs its own side effect
+    /// (switch model, resume session, set personality…). Always closes
+    /// the picker afterward.
+    fn dispatch_list_picker_selection(&mut self) {
+        use super::widgets::ListPickerKind;
+
+        let (kind, key) = match self
+            .list_picker
+            .as_ref()
+            .and_then(|p| p.current().map(|item| (p.kind, item.key.clone())))
+        {
+            Some(v) => v,
+            None => {
+                self.list_picker = None;
+                return;
+            }
+        };
+        self.list_picker = None;
+
+        match kind {
+            ListPickerKind::Model => {
+                self.context.model = key.clone();
+                let msg = format!("Model set to: {key}");
+                let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".to_string(), msg));
+            }
+            ListPickerKind::Session => {
+                let session = match self.context.session_store.get_session(&key) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        let msg = format!("Session {key} not found.");
+                        let _ = self.context.append_system_message(&msg);
+                        self.scrollback_queue.push(("system".to_string(), msg));
+                        return;
+                    }
+                    Err(e) => {
+                        self.context.last_error = Some(format!("resume failed: {e}"));
+                        return;
+                    }
+                };
+                self.context.session_id = session.id.clone();
+                self.context.model = session.model.clone();
+                self.context.messages.clear();
+                if let Err(e) = self.context.load_session_messages() {
+                    self.context.last_error = Some(format!("load_session failed: {e}"));
+                    return;
+                }
+                let short = &session.id[..session.id.len().min(8)];
+                let msg = format!(
+                    "Resumed session {short} ({} messages)",
+                    self.context.messages.len()
+                );
+                let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".to_string(), msg));
+            }
+            ListPickerKind::Personality => {
+                let msg = format!(
+                    "Personality set to: {key}\n(Full integration with system prompt pending)"
+                );
+                let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".to_string(), msg));
+            }
+            ListPickerKind::Skill => {
+                // Pre-fill an invocation prompt into the input buffer.
+                // The user can edit, append context, and Enter to send.
+                self.context.input_buffer = format!("Use the {key} skill: ");
+                self.refresh_autocomplete();
+            }
+            ListPickerKind::Help => {
+                // Pre-fill `/<command> ` into the input buffer so the
+                // user can add args and submit (or just press Enter for
+                // no-arg commands like /usage or /status).
+                self.context.input_buffer = format!("/{key} ");
+                self.refresh_autocomplete();
+            }
+        }
     }
 
     /// Dispatch a `/retry`-style resubmit: re-runs an existing user message
@@ -502,72 +776,208 @@ impl TuiApp {
         }
     }
 
-    /// Render the full UI into the terminal frame. Uses a disjoint-field
-    /// borrow so `&mut self.autocomplete` (needed for `ListState`) coexists
-    /// with `&self.context` / `&self.state` borrows for the other panes.
+    /// Render the inline viewport — only the bottom `INLINE_VIEWPORT_LINES`
+    /// rows of the terminal. Chat history is NOT rendered here; messages
+    /// commit to scrollback via `commit_message_to_scrollback` as they
+    /// arrive. The viewport just hosts: status bar, input box, and any
+    /// transient overlays (autocomplete dropdown, /help modal, streaming
+    /// spinner).
     pub fn render(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         let TuiApp {
             state,
             context,
             autocomplete,
             overlay,
+            list_picker,
+            stream_committed_chars,
             ..
         } = self;
 
         terminal.draw(|frame| {
             let area = frame.area();
 
+            // Original tight 6-row layout: preview + input + status.
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1), // header
-                    Constraint::Min(3),    // chat
-                    Constraint::Length(5), // input
-                    Constraint::Length(1), // status
+                    Constraint::Length(STREAM_PREVIEW_LINES),
+                    Constraint::Length(4),
+                    Constraint::Length(1),
                 ])
                 .split(area);
 
-            render_header_pane(context, frame, chunks[0]);
-            render_chat_pane(state, context, frame, chunks[1]);
-            render_input_pane(context, frame, chunks[2]);
-            render_status_pane(context, frame, chunks[3]);
+            render_stream_preview_pane(state, *stream_committed_chars, frame, chunks[0]);
+            render_input_pane(context, frame, chunks[1]);
+            render_status_pane(context, frame, chunks[2]);
 
-            // Modal overlay — when open, occupies most of the chat area.
-            // Drawn before the dropdown so the dropdown wins focus visually
-            // if both are open (rare; the user closes one before toggling
-            // the other).
+            // Modal overlay (e.g. /help) takes over the entire viewport.
             if let Some(content) = overlay.as_ref() {
-                render_overlay_pane(content, frame, chunks[1]);
+                render_overlay_pane(content, frame, area);
+            }
+
+            // List picker overlay — covers the entire 6-row viewport.
+            if let Some(picker) = list_picker.as_mut() {
+                picker.render(frame, area);
             }
 
             // Slash-command dropdown — anchored just above the input box,
-            // grows upward into the chat area like a Hermes / Claude-Code
-            // popup.
+            // clamped to stay strictly inside the inline viewport.
             if autocomplete.is_visible() {
-                let input_area = chunks[2];
-                let chat_area = chunks[1];
-                // 8 rows max + 2 frame chars; clamp to available chat space.
-                let max_rows = chat_area.height.saturating_sub(1).max(3) as usize;
-                let popup_height =
-                    ((max_rows + 2).min(10)) as u16;
-                let popup_y = input_area.y.saturating_sub(popup_height);
-                let popup_area = Rect {
-                    x: input_area.x,
-                    y: popup_y,
-                    width: input_area.width,
-                    height: popup_height,
-                };
-                autocomplete.render(frame, popup_area);
+                let input_area = chunks[1];
+                let space_above = input_area.y.saturating_sub(area.y);
+                let max_rows: u16 = 8;
+                let desired = (max_rows + 2).min(area.height.saturating_sub(1));
+                let popup_height = desired.min(space_above.max(input_area.height));
+                if popup_height >= 3 {
+                    let popup_y = if space_above >= popup_height {
+                        input_area.y - popup_height
+                    } else {
+                        input_area.y
+                    };
+                    let popup_area = Rect {
+                        x: input_area.x,
+                        y: popup_y,
+                        width: input_area.width,
+                        height: popup_height,
+                    };
+                    autocomplete.render(frame, popup_area);
+                }
             }
         })?;
         Ok(())
     }
 
+    /// Render path while the list picker is open. Uses the full
+    /// terminal area (alt-screen mode) so the picker can show a search
+    /// bar, many list rows, and a hotkey footer — Hermes / Claude-Code
+    /// style. The status bar and input box are intentionally hidden
+    /// here; the user is in modal selection mode.
+    pub fn render_fullscreen_picker(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        let TuiApp { list_picker, .. } = self;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            if let Some(picker) = list_picker.as_mut() {
+                picker.render_fullscreen(frame, area);
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Commit a finalized message to the terminal's scrollback (above the
+    /// inline viewport). This is the inline-mode equivalent of "append to
+    /// chat history" — once committed the line is permanent and scrolls
+    /// naturally with the terminal, exactly like Hermes / Claude Code.
+    pub fn commit_message_to_scrollback(
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        role: &str,
+        content: &str,
+    ) -> Result<()> {
+        let size = terminal.size()?;
+        let theme = super::render::RenderTheme::default();
+        let mut lines = if role == "_continuation" {
+            // Bare content lines (no role header) — used to flush the
+            // trailing partial line after a streaming turn.
+            content
+                .split('\n')
+                .map(|l| super::render::render_block_line(l, &theme))
+                .collect::<Vec<_>>()
+        } else {
+            super::render::render_message_lines(role, content, &[], &[], &theme)
+        };
+        lines.push(Line::from(""));
+        commit_lines_to_scrollback(terminal, lines, size.width, size.height)
+    }
+
+    /// Flush newly-completed lines from the active streaming `partial`
+    /// into the terminal scrollback, splitting on `\n`. Each call commits
+    /// only the bytes that have a trailing newline since the last flush;
+    /// the still-incomplete tail stays in `partial` until either more
+    /// data arrives or the turn finalizes. Idempotent on a finalized
+    /// state.
+    pub fn flush_stream_to_scrollback(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        let partial = match &self.state {
+            AppState::Streaming { partial, .. } => partial.clone(),
+            _ => return Ok(()),
+        };
+        if self.stream_committed_chars > partial.len() {
+            self.stream_committed_chars = 0;
+        }
+        let remaining = &partial[self.stream_committed_chars..];
+        let last_nl = match remaining.rfind('\n') {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let chunk = remaining[..=last_nl].to_string();
+        let abs_end = self.stream_committed_chars + last_nl + 1;
+
+        let theme = super::render::RenderTheme::default();
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut iter = chunk.split_inclusive('\n');
+        if !self.stream_header_committed {
+            if let Some(first_line) = iter.next() {
+                let trimmed = first_line.trim_end_matches('\n');
+                let body = super::render::render_block_line(trimmed, &theme);
+                let mut spans = vec![Span::styled(
+                    "Assistant: ",
+                    Style::default()
+                        .fg(theme.assistant_label)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                spans.extend(body.spans);
+                lines.push(Line::from(spans));
+            }
+            self.stream_header_committed = true;
+        }
+        for rest in iter {
+            let trimmed = rest.trim_end_matches('\n');
+            lines.push(super::render::render_block_line(trimmed, &theme));
+        }
+
+        if !lines.is_empty() {
+            let size = terminal.size()?;
+            commit_lines_to_scrollback(terminal, lines, size.width, size.height)?;
+        }
+        self.stream_committed_chars = abs_end;
+        Ok(())
+    }
+
+    /// Print the splash banner + welcome line once, into scrollback,
+    /// before the inline viewport takes over the bottom of the terminal.
+    pub fn commit_splash_to_scrollback(
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        ctx: &TuiContext,
+    ) -> Result<()> {
+        let size = terminal.size()?;
+        let lines = render_splash_lines();
+        let session_short = &ctx.session_id[..8.min(ctx.session_id.len())];
+        let mut all_lines = lines;
+        all_lines.push(Line::from(""));
+        all_lines.push(Line::from(vec![
+            Span::styled(
+                format!("Rantaiclaw v{}", env!("CARGO_PKG_VERSION")),
+                Style::default()
+                    .fg(Color::Rgb(94, 184, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  · session {} ", session_short),
+                Style::default().fg(Color::Rgb(107, 114, 128)),
+            ),
+        ]));
+        all_lines.push(Line::from(""));
+        commit_lines_to_scrollback(terminal, all_lines, size.width, size.height)
+    }
+
     /// Original `render_header` shape, kept for backward callers.
     #[allow(dead_code)]
     fn render_header(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let session_short = &self.context.session_id
-            [..8.min(self.context.session_id.len())];
+        let session_short = &self.context.session_id[..8.min(self.context.session_id.len())];
         let header = Paragraph::new(Line::from(vec![
             Span::styled(
                 "  Rantaiclaw  ",
@@ -597,9 +1007,7 @@ impl TuiApp {
         let mut items: Vec<ListItem> = Vec::with_capacity(self.context.messages.len() + 1);
 
         // Empty-state splash — figlet wordmark + welcome line.
-        if self.context.messages.is_empty()
-            && !matches!(self.state, AppState::Streaming { .. })
-        {
+        if self.context.messages.is_empty() && !matches!(self.state, AppState::Streaming { .. }) {
             for line in render_splash_lines() {
                 items.push(ListItem::new(line));
             }
@@ -644,10 +1052,7 @@ impl TuiApp {
                         .fg(Color::Rgb(94, 184, 255))
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    "thinking…",
-                    Style::default().fg(Color::Rgb(107, 114, 128)),
-                ),
+                Span::styled("thinking…", Style::default().fg(Color::Rgb(107, 114, 128))),
             ]);
             items.push(ListItem::new(header));
             let lines =
@@ -799,7 +1204,10 @@ Set one of the following before sending a message:\n\
   • Run `rantaiclaw onboard` outside the TUI to save it to config\n\
   • Type `/quit`, then `rantaiclaw setup provider` for the guided flow"
             .to_string();
-        return (body, "missing API key — set OPENROUTER_API_KEY or run setup".into());
+        return (
+            body,
+            "missing API key — set OPENROUTER_API_KEY or run setup".into(),
+        );
     }
 
     if lower.contains("429") || lower.contains("rate limit") || lower.contains("rate-limit") {
@@ -845,10 +1253,7 @@ fn compact_provider_error(s: &str) -> String {
     if !s.contains("All providers/models failed") {
         return s.to_string();
     }
-    let attempts: Vec<&str> = s
-        .lines()
-        .filter(|l| l.contains("attempt"))
-        .collect();
+    let attempts: Vec<&str> = s.lines().filter(|l| l.contains("attempt")).collect();
     let primary = attempts
         .first()
         .map(|l| l.trim().to_string())
@@ -889,8 +1294,7 @@ fn install_tui_tracing() {
         return;
     };
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let subscriber = tracing_subscriber::fmt::Subscriber::builder()
         .with_env_filter(filter)
         .with_writer(std::sync::Mutex::new(file))
@@ -950,13 +1354,8 @@ fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Fra
             .as_deref()
             .map(super::render::parse_persisted_tool_calls)
             .unwrap_or_default();
-        let lines = super::render::render_message_lines(
-            &msg.role,
-            &msg.content,
-            &persisted,
-            &[],
-            &theme,
-        );
+        let lines =
+            super::render::render_message_lines(&msg.role, &msg.content, &persisted, &[], &theme);
         items.push(ListItem::new(lines));
     }
 
@@ -979,10 +1378,7 @@ fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Fra
                     .fg(Color::Rgb(94, 184, 255))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "thinking…",
-                Style::default().fg(Color::Rgb(107, 114, 128)),
-            ),
+            Span::styled("thinking…", Style::default().fg(Color::Rgb(107, 114, 128))),
         ]);
         items.push(ListItem::new(header));
         let lines =
@@ -1007,6 +1403,138 @@ fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Fra
             .border_style(Style::default().fg(Color::Rgb(40, 70, 140))),
     );
     frame.render_widget(list, area);
+}
+
+/// Commit a block of `Line`s to the terminal scrollback above the inline
+/// viewport. Splits across multiple `insert_before` calls so we never
+/// exceed ratatui's max-insert-height (terminal height − viewport height),
+/// which otherwise panics with `index outside of buffer`.
+fn commit_lines_to_scrollback(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    lines: Vec<Line<'static>>,
+    width: u16,
+    term_height: u16,
+) -> Result<()> {
+    if lines.is_empty() || width == 0 {
+        return Ok(());
+    }
+    // Max rows we can safely reserve in one insert_before call. ratatui
+    // requires this to fit between the top of the screen and the top of
+    // the inline viewport; leave a 1-row buffer for safety.
+    let max_chunk: u16 = term_height
+        .saturating_sub(INLINE_VIEWPORT_LINES)
+        .saturating_sub(1)
+        .max(1);
+
+    let mut buf: Vec<Line<'static>> = Vec::new();
+    let mut buf_rows: u16 = 0;
+
+    let flush = |terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+                 chunk: &mut Vec<Line<'static>>,
+                 rows: &mut u16|
+     -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let p = Paragraph::new(std::mem::take(chunk)).wrap(Wrap { trim: false });
+        let height = (*rows).max(1);
+        *rows = 0;
+        terminal.insert_before(height, |b: &mut Buffer| {
+            p.render(b.area, b);
+        })?;
+        Ok(())
+    };
+
+    for line in lines {
+        // Estimate how many wrapped rows this line takes at `width`.
+        // Use Paragraph::line_count for accuracy.
+        let single = Paragraph::new(vec![line.clone()]).wrap(Wrap { trim: false });
+        let row_count = single.line_count(width).max(1) as u16;
+
+        // If a single line is taller than the chunk limit (extreme cases
+        // like a 300-col line on a tall narrow terminal), cap it — we'd
+        // rather lose tail rows than panic.
+        let row_count = row_count.min(max_chunk);
+
+        if buf_rows + row_count > max_chunk {
+            flush(terminal, &mut buf, &mut buf_rows)?;
+        }
+        buf.push(line);
+        buf_rows += row_count;
+    }
+    flush(terminal, &mut buf, &mut buf_rows)?;
+    Ok(())
+}
+
+/// Render the live "stream preview" pane — sits above the input box and
+/// shows the still-uncommitted tail of the assistant's reply as it
+/// arrives. Empty when not streaming. The first row also shows a Braille
+/// spinner so the user has motion to look at while bytes accumulate.
+fn render_stream_preview_pane(
+    state: &AppState,
+    committed_chars: usize,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+) {
+    let (partial, cancelling) = match state {
+        AppState::Streaming {
+            partial,
+            cancelling,
+            ..
+        } => (partial.clone(), *cancelling),
+        _ => return,
+    };
+
+    let frame_idx = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as usize / 100)
+        .unwrap_or(0))
+        % SPINNER_FRAMES.len();
+    let spinner = SPINNER_FRAMES[frame_idx];
+    let label = if cancelling {
+        "cancelling…"
+    } else if partial.len() == committed_chars {
+        "thinking…"
+    } else {
+        "streaming…"
+    };
+    let muted = Style::default().fg(Color::Rgb(107, 114, 128));
+    let sky = Style::default()
+        .fg(Color::Rgb(94, 184, 255))
+        .add_modifier(Modifier::BOLD);
+
+    // Single-row layout: `[spinner] streaming…   <last few words of the
+    // in-progress line>`. Completed lines flow into scrollback so the
+    // preview never grows beyond one row — keeps the viewport tight and
+    // matches Hermes / Claude Code feel.
+    let safe_committed = committed_chars.min(partial.len());
+    let tail = &partial[safe_committed..];
+    let last_line = tail.rsplit('\n').next().unwrap_or("");
+    let snippet = if last_line.chars().count() > 60 {
+        let total = last_line.chars().count();
+        let skip = total.saturating_sub(58);
+        let suffix: String = last_line.chars().skip(skip).collect();
+        format!("…{suffix}")
+    } else {
+        last_line.to_string()
+    };
+
+    let mut spans = vec![
+        Span::styled(format!("  {spinner} "), sky),
+        Span::styled(label.to_string(), muted),
+    ];
+    if !snippet.trim().is_empty() {
+        spans.push(Span::styled("    ".to_string(), muted));
+        spans.push(Span::styled(
+            snippet,
+            Style::default().fg(Color::Rgb(180, 200, 220)),
+        ));
+    } else {
+        spans.push(Span::styled("    Ctrl+C to cancel".to_string(), muted));
+    }
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(line);
+    frame.render_widget(paragraph, area);
 }
 
 fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
@@ -1276,7 +1804,9 @@ fn render_overlay_pane(
         })
         .unwrap_or_default();
 
-    let body = Paragraph::new(body_lines).block(block).wrap(Wrap { trim: false });
+    let body = Paragraph::new(body_lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(body, panel_area);
 }
 
@@ -1318,21 +1848,201 @@ fn format_duration_short(secs: u64) -> String {
     }
 }
 
-/// Set up the terminal for raw/alternate-screen mode.
+/// Lines reserved at the bottom of the terminal for the live inline
+/// viewport (status bar + input box + spinner room). Everything else flows
+/// into the terminal's native scrollback.
+/// Inline viewport height. Reverted to a tight 6-row layout because
+/// any static "leave room for the dropdown below input" approach
+/// in ratatui's inline mode leaves visible blank rows in scrollback.
+/// Dropdown renders ABOVE the input within these 6 rows.
+pub const INLINE_VIEWPORT_LINES: u16 = 6;
+/// Rows reserved at the top of the inline viewport for the live streaming
+/// preview (the still-uncommitted tail of the assistant's reply). Always
+/// present so the viewport size doesn't need to resize between idle and
+/// streaming states. Just one row — the spinner and current in-progress
+/// snippet share it. Completed lines flow up into permanent scrollback.
+pub const STREAM_PREVIEW_LINES: u16 = 1;
+
+/// Set up the terminal in **inline mode** — no alternate screen takeover.
+///
+/// The bottom `INLINE_VIEWPORT_LINES` rows of the terminal are reserved
+/// for the TUI's live region (status bar + input box). Everything emitted
+/// via `terminal.insert_before(...)` or plain `println!` lands in the
+/// terminal's normal scrollback above that region. On exit the viewport
+/// is consumed and the terminal returns to its prompt.
+///
+/// This is the Hermes / Claude-Code-style flow: chat history is the
+/// terminal's own scrollback, not a ratatui List widget that fights it.
 pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let terminal = Terminal::new(backend)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
+        },
+    )?;
     Ok(terminal)
 }
 
-/// Restore the terminal to its original state.
-pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+/// Suspend the TUI, hand control to `$EDITOR` (or `EDITOR`/`VISUAL`,
+/// falling back to `nano`/`vi`/`notepad`), and copy the resulting
+/// file contents back into `app.context.input_buffer` on success.
+///
+/// Best-effort: on any error (no editor on PATH, editor exited
+/// non-zero, file IO failure) the original buffer is preserved and a
+/// status-bar message surfaces the cause. Always restores raw mode
+/// before returning so the caller can resume drawing.
+fn run_external_editor(
+    app: &mut TuiApp,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<()> {
+    use std::io::Read as _;
+    use std::process::Command;
+
+    // Resolve editor command: $EDITOR > $VISUAL > nano > vi > notepad.
+    let editor_cmd = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "windows") {
+                "notepad".to_string()
+            } else if which_program("nano") {
+                "nano".to_string()
+            } else {
+                "vi".to_string()
+            }
+        });
+
+    // Write current buffer to a temp file; the editor edits in place.
+    // Use a unique filename in the OS temp dir (no extra dep needed).
+    let pid = std::process::id();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = std::env::temp_dir()
+        .join(format!("rantaiclaw-prompt-{pid}-{nonce}.md"));
+    std::fs::write(&tmp_path, &app.context.input_buffer)?;
+
+    // Suspend the TUI: flush, leave alt-screen if needed, drop raw mode.
+    let was_fullscreen = app.list_picker.is_some();
+    if was_fullscreen {
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+    }
+    let _ = terminal.flush();
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let _ = io::stdout().flush();
+
+    // Run the editor. Inherit stdio so the user sees / interacts with it.
+    let mut parts = editor_cmd.split_whitespace();
+    let bin = parts.next().unwrap_or("vi");
+    let args: Vec<&str> = parts.collect();
+    let status = Command::new(bin)
+        .args(&args)
+        .arg(&tmp_path)
+        .status();
+
+    // Always restore raw mode + alt-screen (if we were in it).
+    enable_raw_mode()?;
+    if was_fullscreen {
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        terminal.clear()?;
+    } else {
+        // Inline mode: re-claim a fresh terminal so the inline viewport
+        // is re-laid-out cleanly after the editor printed to the tty.
+        *terminal = Terminal::with_options(
+            CrosstermBackend::new(io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
+            },
+        )?;
+    }
+
+    let result = match status {
+        Ok(s) if s.success() => {
+            let mut buf = String::new();
+            std::fs::File::open(&tmp_path)
+                .and_then(|mut f| f.read_to_string(&mut buf))?;
+            if buf.ends_with('\n') {
+                buf.pop();
+            }
+            app.context.input_buffer = buf;
+            app.context.exit_history_navigation();
+            Ok(())
+        }
+        Ok(s) => {
+            app.context.last_error = Some(format!(
+                "editor exited with status {} — buffer unchanged",
+                s.code().unwrap_or(-1)
+            ));
+            Ok(())
+        }
+        Err(e) => {
+            app.context.last_error = Some(format!("editor '{bin}' failed to launch: {e}"));
+            Ok(())
+        }
+    };
+    // Best-effort cleanup; file is in $TMPDIR so leftovers are harmless.
+    let _ = std::fs::remove_file(&tmp_path);
+    result
+}
+
+/// Cheap PATH check so we can prefer `nano` over `vi` when available.
+fn which_program(name: &str) -> bool {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Swap the terminal into alt-screen / fullscreen mode. Used while a
+/// list picker is open so it can claim the entire terminal height
+/// instead of fighting for space inside the 6-row inline viewport.
+/// The original scrollback is preserved by the terminal emulator and
+/// restored automatically on `swap_to_inline`.
+pub fn swap_to_fullscreen(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    let _ = terminal.flush();
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    *terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    terminal.clear()?;
+    Ok(())
+}
+
+/// Swap the terminal back to the inline 6-row viewport after leaving the
+/// alt-screen picker. The inline viewport is re-created fresh; existing
+/// terminal scrollback (committed via `insert_before` before the picker
+/// opened) is automatically restored by the terminal when alt-screen is
+/// left.
+pub fn swap_to_inline(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    let _ = terminal.flush();
+    execute!(io::stdout(), LeaveAlternateScreen)?;
+    *terminal = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
+        },
+    )?;
+    Ok(())
+}
+
+/// Restore the terminal to its original state. Inline mode means no
+/// alt-screen to leave; we just flush the viewport (so the cursor lands
+/// below it cleanly) and disable raw mode.
+pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    // Move cursor to a fresh line below the viewport so the user's shell
+    // prompt doesn't print on top of our last frame.
+    terminal.clear()?;
+    let _ = terminal.show_cursor();
+    disable_raw_mode()?;
+    let _ = io::stdout().flush();
+    println!();
     Ok(())
 }
 
@@ -1367,6 +2077,20 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     let mut app_config = crate::config::Config::load_or_init().await?;
     app_config.apply_env_overrides();
 
+    // If TuiConfig still has its compile-time default (no /model flag was
+    // passed), surface the active config's provider:model so the status
+    // bar reflects what the agent will actually use.
+    let mut tui_config = tui_config;
+    if tui_config.model == TuiConfig::default().model {
+        let provider = app_config.default_provider.clone().unwrap_or_default();
+        let model = app_config.default_model.clone().unwrap_or_default();
+        if !provider.is_empty() && !model.is_empty() {
+            tui_config.model = format!("{}:{}", provider, model);
+        } else if !model.is_empty() {
+            tui_config.model = model;
+        }
+    }
+
     let agent = Agent::from_config(&app_config)?;
 
     // Channel capacities are intentionally small on the request side (user
@@ -1378,8 +2102,42 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     let actor = TuiAgentActor::new(agent, req_rx, events_tx);
     let actor_handle = tokio::spawn(actor.run());
 
+    // Compute the list of providers visible to /model. Starts with the
+    // primary `default_provider`, then any unique providers used by
+    // `model_routes`. This is the "enabled" set surfaced in the picker.
+    let mut available_providers: Vec<String> = Vec::new();
+    if let Some(p) = app_config.default_provider.clone() {
+        available_providers.push(p);
+    }
+    for route in &app_config.model_routes {
+        if !available_providers.iter().any(|p| p == &route.provider) {
+            available_providers.push(route.provider.clone());
+        }
+    }
+
     let mut app = TuiApp::new(&tui_config, req_tx, events_rx)?;
+    app.context.available_providers = available_providers;
+
+    // Idempotent first-run skill seeding: if the workspace skills dir
+    // is empty, drop the 5-skill starter pack (web-search, summarizer,
+    // research-assistant, scheduler-reminders, meeting-notes) so the
+    // /skills picker has real content out of the box. Mirrors Hermes'
+    // bundled-skills-on-install UX. Best-effort — failure is logged but
+    // doesn't block startup.
+    if let Ok(profile) = crate::profile::ProfileManager::active() {
+        let _ = crate::skills::bundled::install_starter_pack(&profile);
+    }
+    // Load skills from the active workspace so /skills can browse them.
+    // load_skills_with_config falls back to an empty vec on any error
+    // (missing dir, malformed manifest, etc.) — never blocks startup.
+    app.context.available_skills =
+        crate::skills::load_skills_with_config(&app_config.workspace_dir, &app_config);
     let mut terminal = setup_terminal()?;
+
+    // Splash banner — committed once to the terminal's scrollback before
+    // the inline viewport takes over. Becomes permanent history above the
+    // status bar / input region.
+    let _ = TuiApp::commit_splash_to_scrollback(&mut terminal, &app.context);
 
     let result = run_loop(&mut app, &mut terminal).await;
 
@@ -1407,13 +2165,62 @@ async fn run_loop(
         // reflects the latest streaming state.
         app.drain_events();
 
+        // /new and /clear request a full screen+scrollback wipe so
+        // the next session starts on a clean terminal — same intent
+        // as running `clear` at the shell. ESC[3J clears the xterm
+        // scrollback buffer; ESC[2J clears the visible screen; ESC[H
+        // homes the cursor. Then re-claim a fresh inline viewport and
+        // re-print the splash banner so the user lands on the same
+        // welcome screen as a cold launch (`./rantaiclaw`).
+        if app.clear_terminal_request {
+            app.clear_terminal_request = false;
+            let _ = terminal.flush();
+            let mut out = io::stdout();
+            let _ = out.write_all(b"\x1b[3J\x1b[2J\x1b[H");
+            let _ = out.flush();
+            *terminal = Terminal::with_options(
+                CrosstermBackend::new(io::stdout()),
+                TerminalOptions {
+                    viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
+                },
+            )?;
+            let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
+        }
+
+        // Stream completed lines into scrollback and flush any queued
+        // message commits ABOVE the viewport before rendering this frame.
+        app.flush_stream_to_scrollback(terminal)?;
+        let pending: Vec<(String, String)> = std::mem::take(&mut app.scrollback_queue);
+        for (role, content) in pending {
+            TuiApp::commit_message_to_scrollback(terminal, &role, &content)?;
+        }
+
         app.render(terminal)?;
 
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // Tighten the poll interval during streaming so the live preview
+        // updates fast enough to feel like word-by-word streaming. When
+        // idle, poll less aggressively to keep CPU near zero.
+        let poll_ms = if matches!(app.state, AppState::Streaming { .. }) {
+            16
+        } else {
+            100
+        };
+        if event::poll(std::time::Duration::from_millis(poll_ms))? {
             let ev = event::read()?;
             match app.handle_event(ev).await? {
                 EventResult::Quit => break,
                 EventResult::Continue => {}
+            }
+        }
+
+        // Handle deferred editor request raised by Ctrl+G. Done after
+        // event handling so the buffer reflects the user's latest
+        // keystrokes, and before the next render so the new contents
+        // appear on the next frame.
+        if app.editor_request {
+            app.editor_request = false;
+            if let Err(e) = run_external_editor(app, terminal) {
+                app.context.last_error = Some(format!("editor flow error: {e}"));
             }
         }
 
@@ -1480,6 +2287,12 @@ mod tests {
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            scrollback_queue: Vec::new(),
+            list_picker: None,
+            stream_committed_chars: 0,
+            stream_header_committed: false,
+            editor_request: false,
+            clear_terminal_request: false,
         }
     }
 
@@ -1543,6 +2356,12 @@ mod submit_tests {
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            scrollback_queue: Vec::new(),
+            list_picker: None,
+            stream_committed_chars: 0,
+            stream_header_committed: false,
+            editor_request: false,
+            clear_terminal_request: false,
         }
     }
 
@@ -1617,6 +2436,12 @@ mod ctrl_c_tests {
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            scrollback_queue: Vec::new(),
+            list_picker: None,
+            stream_committed_chars: 0,
+            stream_header_committed: false,
+            editor_request: false,
+            clear_terminal_request: false,
         }
     }
 
@@ -1674,6 +2499,12 @@ mod drain_tests {
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            scrollback_queue: Vec::new(),
+            list_picker: None,
+            stream_committed_chars: 0,
+            stream_header_committed: false,
+            editor_request: false,
+            clear_terminal_request: false,
         }
     }
 
@@ -1801,6 +2632,12 @@ mod retry_tests {
             command_registry: CommandRegistry::new(),
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            scrollback_queue: Vec::new(),
+            list_picker: None,
+            stream_committed_chars: 0,
+            stream_header_committed: false,
+            editor_request: false,
+            clear_terminal_request: false,
         }
     }
 

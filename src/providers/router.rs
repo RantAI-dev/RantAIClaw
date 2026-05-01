@@ -164,6 +164,30 @@ impl Provider for RouterProvider {
             .any(|(_, provider)| provider.supports_vision())
     }
 
+    fn supports_streaming(&self) -> bool {
+        self.providers
+            .get(self.default_index)
+            .map(|(_, p)| p.supports_streaming())
+            .unwrap_or(false)
+    }
+
+    /// Streaming pass-through to the resolved provider. Without this
+    /// override the trait default is used, which calls non-streaming
+    /// `chat()` and emits one big chunk — defeating SSE streaming.
+    async fn chat_stream(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        text_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<ChatResponse> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider
+            .chat_stream(request, &resolved_model, temperature, text_tx)
+            .await
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = name, "Warming up routed provider");
