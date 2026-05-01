@@ -653,6 +653,54 @@ impl Provider for ReliableProvider {
             .unwrap_or(false)
     }
 
+    /// Streaming pass-through. The trait default for `chat_stream` calls
+    /// `chat()` and emits one big chunk — which kills real streaming for
+    /// the TUI. Delegate to the first provider's own `chat_stream` so SSE
+    /// deltas reach the caller token-by-token. Retry/fallback is skipped
+    /// here to keep streaming linear; if the streaming call fails, we
+    /// fall back to the non-streaming `chat()` (which has full
+    /// retry/fallback) and emit its result as a single chunk.
+    async fn chat_stream(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        text_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<ChatResponse> {
+        if let Some((_, provider)) = self.providers.first() {
+            if provider.supports_streaming() {
+                let req = ChatRequest {
+                    messages: request.messages,
+                    tools: request.tools,
+                };
+                match provider
+                    .chat_stream(req, model, temperature, text_tx.clone())
+                    .await
+                {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "chat_stream failed, falling back to non-streaming chat"
+                        );
+                    }
+                }
+            }
+        }
+        // Fallback: non-streaming chat with full retry/fallback machinery.
+        let req = ChatRequest {
+            messages: request.messages,
+            tools: request.tools,
+        };
+        let response = self.chat(req, model, temperature).await?;
+        if let Some(text) = response.text.as_deref() {
+            if !text.is_empty() {
+                let _ = text_tx.send(text.to_string()).await;
+            }
+        }
+        Ok(response)
+    }
+
     fn supports_vision(&self) -> bool {
         self.providers
             .iter()

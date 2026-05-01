@@ -553,32 +553,80 @@ impl Agent {
             }
 
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let chat_future = self.provider.chat(
-                ChatRequest {
-                    messages: &messages,
-                    tools: if self.tool_dispatcher.should_send_tool_specs() {
-                        Some(&self.tool_specs)
-                    } else {
-                        None
-                    },
+            let request = ChatRequest {
+                messages: &messages,
+                tools: if self.tool_dispatcher.should_send_tool_specs() {
+                    Some(&self.tool_specs)
+                } else {
+                    None
                 },
-                &effective_model,
-                self.temperature,
-            );
+            };
 
-            let response = if let Some(token) = cancel {
-                tokio::select! {
-                    () = token.cancelled() => {
-                        return Ok(TurnResult {
-                            text: String::new(),
-                            usage: empty_usage(&effective_model),
-                            cancelled: true,
-                        });
+            // True streaming path: when an events consumer is attached and
+            // the provider supports SSE, use chat_stream so deltas reach
+            // the TUI as the model produces them. Tool-call detection
+            // still works on the assembled `full_text` for prompt-guided
+            // dispatchers; native tool_call deltas are not yet parsed
+            // mid-stream and will be picked up only at end-of-stream.
+            let streamed_inline =
+                events.is_some() && self.provider.supports_streaming();
+
+            let response = if streamed_inline {
+                let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
+                let events_clone = events.cloned();
+                let forwarder = async move {
+                    while let Some(piece) = text_rx.recv().await {
+                        if let Some(ref tx) = events_clone {
+                            if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
-                    result = chat_future => result?,
+                };
+                let stream_future = self.provider.chat_stream(
+                    request,
+                    &effective_model,
+                    self.temperature,
+                    text_tx,
+                );
+                let combined = async {
+                    let (r, ()) = tokio::join!(stream_future, forwarder);
+                    r
+                };
+                if let Some(token) = cancel {
+                    tokio::select! {
+                        () = token.cancelled() => {
+                            return Ok(TurnResult {
+                                text: String::new(),
+                                usage: empty_usage(&effective_model),
+                                cancelled: true,
+                            });
+                        }
+                        result = combined => result?,
+                    }
+                } else {
+                    combined.await?
                 }
             } else {
-                chat_future.await?
+                let chat_future = self.provider.chat(
+                    request,
+                    &effective_model,
+                    self.temperature,
+                );
+                if let Some(token) = cancel {
+                    tokio::select! {
+                        () = token.cancelled() => {
+                            return Ok(TurnResult {
+                                text: String::new(),
+                                usage: empty_usage(&effective_model),
+                                cancelled: true,
+                            });
+                        }
+                        result = chat_future => result?,
+                    }
+                } else {
+                    chat_future.await?
+                }
             };
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
@@ -589,12 +637,13 @@ impl Agent {
                     text
                 };
 
-                // Emit final text as a single chunk when an events channel is
-                // provided. The inline loop does not stream mid-response, so
-                // one chunk per turn is the honest representation.
-                if let Some(tx) = events {
-                    if !final_text.is_empty() {
-                        let _ = tx.send(AgentEvent::Chunk(final_text.clone())).await;
+                // When we already streamed deltas inline, don't re-emit
+                // the whole text — the TUI already has it via Chunk events.
+                if !streamed_inline {
+                    if let Some(tx) = events {
+                        if !final_text.is_empty() {
+                            let _ = tx.send(AgentEvent::Chunk(final_text.clone())).await;
+                        }
                     }
                 }
 
