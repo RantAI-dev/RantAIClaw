@@ -7,6 +7,29 @@ use uuid::Uuid;
 use super::migrations::run_migrations;
 use super::types::{Message, SearchResult, Session, SessionMeta};
 
+/// Maximum displayable length of an auto-derived session title.
+const MAX_AUTO_TITLE_CHARS: usize = 50;
+
+/// Derive a session title from a user message: pick the first non-empty
+/// line, collapse whitespace, truncate to `MAX_AUTO_TITLE_CHARS` chars,
+/// and append `…` when truncated. Returns an empty string for content
+/// that has no usable text.
+pub fn derive_session_title(content: &str) -> String {
+    let first_line = content
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = collapsed.chars().count();
+    if count <= MAX_AUTO_TITLE_CHARS {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(MAX_AUTO_TITLE_CHARS).collect();
+        format!("{truncated}…")
+    }
+}
+
 /// Persistent store for TUI sessions and messages backed by SQLite.
 pub struct SessionStore {
     conn: Connection,
@@ -104,6 +127,44 @@ impl SessionStore {
             params![title, id],
         )?;
         Ok(())
+    }
+
+    /// One-shot backfill: for every session whose title is NULL or empty,
+    /// derive a title from the earliest user message (first 50 chars of
+    /// the first non-empty line, whitespace collapsed). Sessions with no
+    /// user messages are left untitled. Idempotent — re-running it on a
+    /// store with no untitled sessions is a no-op.
+    ///
+    /// Returns the number of rows updated.
+    pub fn backfill_titles(&self) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, m.content
+             FROM sessions s
+             JOIN messages m ON m.session_id = s.id AND m.role = 'user'
+             WHERE (s.title IS NULL OR s.title = '')
+             AND m.id = (
+                 SELECT MIN(id) FROM messages
+                 WHERE session_id = s.id AND role = 'user'
+             )",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(Result::ok)
+            .collect();
+
+        let mut updated = 0;
+        for (id, content) in rows {
+            let title = derive_session_title(&content);
+            if title.is_empty() {
+                continue;
+            }
+            self.conn.execute(
+                "UPDATE sessions SET title = ?1 WHERE id = ?2",
+                params![title, id],
+            )?;
+            updated += 1;
+        }
+        Ok(updated)
     }
 
     /// Insert a message into the store and increment the session's `message_count`.
@@ -385,5 +446,59 @@ mod tests {
 
         let updated = s.get_session(&sess.id).unwrap().unwrap();
         assert!(updated.ended_at.is_some());
+    }
+
+    #[test]
+    fn derive_session_title_collapses_and_truncates() {
+        assert_eq!(derive_session_title(""), "");
+        assert_eq!(derive_session_title("\n\n  \n"), "");
+        assert_eq!(derive_session_title("hello world"), "hello world");
+        assert_eq!(
+            derive_session_title("  hello   world  \nsecond line"),
+            "hello world"
+        );
+        let long = "a".repeat(80);
+        let result = derive_session_title(&long);
+        assert!(result.ends_with('…'));
+        assert_eq!(result.chars().count(), MAX_AUTO_TITLE_CHARS + 1);
+    }
+
+    #[test]
+    fn backfill_titles_sets_titles_for_untitled_sessions() {
+        let s = store();
+        let sess = s.new_session("gpt-4o", "tui").unwrap();
+        assert!(sess.title.is_none());
+
+        s.append_message(&Message::user(&sess.id, "fix the bug in payments"))
+            .unwrap();
+        s.append_message(&Message::assistant(&sess.id, "ok let me look"))
+            .unwrap();
+        // A second user message — backfill should pick the FIRST one.
+        s.append_message(&Message::user(&sess.id, "actually nevermind"))
+            .unwrap();
+
+        let updated = s.backfill_titles().unwrap();
+        assert_eq!(updated, 1);
+
+        let after = s.get_session(&sess.id).unwrap().unwrap();
+        assert_eq!(after.title.as_deref(), Some("fix the bug in payments"));
+
+        // Idempotent — second call updates nothing.
+        let again = s.backfill_titles().unwrap();
+        assert_eq!(again, 0);
+    }
+
+    #[test]
+    fn backfill_skips_sessions_with_no_user_message() {
+        let s = store();
+        let sess = s.new_session("gpt-4o", "tui").unwrap();
+        s.append_message(&Message::assistant(&sess.id, "hi there"))
+            .unwrap();
+
+        let updated = s.backfill_titles().unwrap();
+        assert_eq!(updated, 0);
+
+        let after = s.get_session(&sess.id).unwrap().unwrap();
+        assert!(after.title.is_none());
     }
 }
