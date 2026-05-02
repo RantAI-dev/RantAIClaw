@@ -18,6 +18,9 @@ pub use app::run_tui;
 pub use async_bridge::{TuiAgentActor, TurnRequest};
 #[cfg(feature = "tui")]
 pub use commands::{CommandHandler, CommandRegistry, CommandResult};
+#[cfg(feature = "tui")]
+#[allow(unused_imports)]
+pub use widgets::SetupOverlayState;
 
 use std::path::PathBuf;
 
