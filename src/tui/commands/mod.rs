@@ -5,6 +5,7 @@ mod cron;
 mod memory;
 mod model;
 mod session;
+mod setup;
 mod skills;
 
 use anyhow::Result;
@@ -33,6 +34,11 @@ pub enum CommandResult {
     /// effect to run when the user presses Enter — switch model,
     /// resume session, set personality, etc.
     OpenListPicker(crate::tui::widgets::ListPicker),
+    /// Open the setup overlay. `provisioner` is `None` to show the picker
+    /// of all available provisioners, or a specific name to jump straight in.
+    OpenSetupOverlay {
+        provisioner: Option<String>,
+    },
     /// Wipe the terminal's visible screen + scrollback in addition to
     /// any side effect the command already performed (e.g. starting a
     /// new session). The string is committed to scrollback after the
@@ -113,6 +119,7 @@ impl CommandRegistry {
         self.register(Box::new(skills::SkillCommand));
         self.register(Box::new(skills::PersonalityCommand));
         self.register(Box::new(skills::InsightsCommand));
+        self.register(Box::new(setup::SetupCommand));
     }
 
     pub fn register(&mut self, handler: Box<dyn CommandHandler>) {
@@ -179,9 +186,7 @@ impl CommandRegistry {
             }
         }
         for (alias, canonical) in &self.aliases {
-            if alias.starts_with(&partial)
-                && !canonical.starts_with(&partial)
-            {
+            if alias.starts_with(&partial) && !canonical.starts_with(&partial) {
                 if let Some(handler) = self.commands.get(canonical) {
                     out.push((format!("/{alias}"), handler.description().to_string()));
                 }

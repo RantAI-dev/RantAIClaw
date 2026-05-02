@@ -654,6 +654,9 @@ impl TuiApp {
             CmdResult::OpenListPicker(picker) => {
                 self.list_picker = Some(picker);
             }
+            CmdResult::OpenSetupOverlay { .. } => {
+                // Wired in Task 5 — placeholder so we stay compilable.
+            }
             CmdResult::ClearTerminal(announce) => {
                 // The actual screen+scrollback wipe runs in `run_loop`
                 // (which owns the Terminal). We just raise the flag and
@@ -663,8 +666,7 @@ impl TuiApp {
                 self.scrollback_queue.clear();
                 self.clear_terminal_request = true;
                 let _ = self.context.append_system_message(&announce);
-                self.scrollback_queue
-                    .push(("system".to_string(), announce));
+                self.scrollback_queue.push(("system".to_string(), announce));
             }
         }
         Ok(())
@@ -890,11 +892,11 @@ impl TuiApp {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1),  // top margin
-                    Constraint::Length(4),  // input box
-                    Constraint::Length(1),  // spacer
-                    Constraint::Min(3),     // dropdown
-                    Constraint::Length(1),  // status bar
+                    Constraint::Length(1), // top margin
+                    Constraint::Length(4), // input box
+                    Constraint::Length(1), // spacer
+                    Constraint::Min(3),    // dropdown
+                    Constraint::Length(1), // status bar
                 ])
                 .split(area);
 
@@ -1961,8 +1963,7 @@ fn run_external_editor(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_path = std::env::temp_dir()
-        .join(format!("rantaiclaw-prompt-{pid}-{nonce}.md"));
+    let tmp_path = std::env::temp_dir().join(format!("rantaiclaw-prompt-{pid}-{nonce}.md"));
     std::fs::write(&tmp_path, &app.context.input_buffer)?;
 
     // Suspend the TUI: flush, leave alt-screen if needed, drop raw mode.
@@ -1978,10 +1979,7 @@ fn run_external_editor(
     let mut parts = editor_cmd.split_whitespace();
     let bin = parts.next().unwrap_or("vi");
     let args: Vec<&str> = parts.collect();
-    let status = Command::new(bin)
-        .args(&args)
-        .arg(&tmp_path)
-        .status();
+    let status = Command::new(bin).args(&args).arg(&tmp_path).status();
 
     // Always restore raw mode + alt-screen (if we were in it).
     enable_raw_mode()?;
@@ -2002,8 +2000,7 @@ fn run_external_editor(
     let result = match status {
         Ok(s) if s.success() => {
             let mut buf = String::new();
-            std::fs::File::open(&tmp_path)
-                .and_then(|mut f| f.read_to_string(&mut buf))?;
+            std::fs::File::open(&tmp_path).and_then(|mut f| f.read_to_string(&mut buf))?;
             if buf.ends_with('\n') {
                 buf.pop();
             }
@@ -2292,9 +2289,51 @@ async fn run_loop(
         };
         if event::poll(std::time::Duration::from_millis(poll_ms))? {
             let ev = event::read()?;
-            match app.handle_event(ev).await? {
-                EventResult::Quit => break,
-                EventResult::Continue => {}
+            // Inline mode pins a 6-row viewport to the bottom of the
+            // terminal. When the terminal is resized, ratatui repaints
+            // the viewport at the new bottom row, but the previous
+            // viewport's rows remain in the terminal buffer above as
+            // ghost copies. Drain any coalesced Resize events, then
+            // wipe the screen+scrollback and replay splash + messages
+            // so the terminal looks like a fresh launch at the new
+            // size. While in alt-screen the picker handles its own
+            // sizing; just trigger a repaint there.
+            if matches!(ev, Event::Resize(_, _)) {
+                while event::poll(std::time::Duration::from_millis(0))? {
+                    let next = event::read()?;
+                    if !matches!(next, Event::Resize(_, _)) {
+                        match app.handle_event(next).await? {
+                            EventResult::Quit => break,
+                            EventResult::Continue => {}
+                        }
+                        break;
+                    }
+                }
+                if alt.is_none() {
+                    let _ = terminal.flush();
+                    let mut out = io::stdout();
+                    let _ = out.write_all(b"\x1b[3J\x1b[2J\x1b[H");
+                    let _ = out.flush();
+                    *terminal = Terminal::with_options(
+                        CrosstermBackend::new(io::stdout()),
+                        TerminalOptions {
+                            viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
+                        },
+                    )?;
+                    let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
+                    let messages = app.context.messages.clone();
+                    for msg in messages {
+                        let _ =
+                            TuiApp::commit_message_to_scrollback(terminal, &msg.role, &msg.content);
+                    }
+                } else {
+                    let _ = terminal.clear();
+                }
+            } else {
+                match app.handle_event(ev).await? {
+                    EventResult::Quit => break,
+                    EventResult::Continue => {}
+                }
             }
         }
 
