@@ -111,11 +111,13 @@ impl Autocomplete {
             return;
         }
 
-        // 6 rows + 2 frame chars by default; collapse smaller if fewer
-        // suggestions or less space.
-        let max_visible = ((area.height as usize).saturating_sub(2)).min(8).max(1);
+        // Cap visible rows at the available height (minus borders) so
+        // the dropdown can scale up in alt-screen mode without an
+        // arbitrary 8-item ceiling. Inline mode passes a tight area
+        // and gets its small dropdown naturally.
+        let max_visible = (area.height as usize).saturating_sub(2).max(1);
         let visible_count = self.suggestions.len().min(max_visible);
-        let height: u16 = (visible_count + 2).try_into().unwrap_or(8);
+        let height: u16 = (visible_count + 2).try_into().unwrap_or(area.height);
 
         let popup = Rect {
             x: area.x,

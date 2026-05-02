@@ -866,6 +866,45 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Render path while the slash-command autocomplete dropdown is
+    /// visible (alt-screen mode). Layout: input box at top, dropdown
+    /// below (taking the bulk of the screen so many commands are
+    /// visible at once), status bar at bottom — matches the Claude-Code
+    /// reference image. The user keeps typing into the input; the
+    /// dropdown re-filters live as they go.
+    pub fn render_fullscreen_autocomplete(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        let TuiApp {
+            context,
+            autocomplete,
+            ..
+        } = self;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            // Layout: 1 row top margin · 4 rows input · 1 row spacer ·
+            // remaining rows for dropdown · 1 row status. Input pinned
+            // near the top so typing position stays consistent with
+            // inline mode; dropdown gets all the leftover height.
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),  // top margin
+                    Constraint::Length(4),  // input box
+                    Constraint::Length(1),  // spacer
+                    Constraint::Min(3),     // dropdown
+                    Constraint::Length(1),  // status bar
+                ])
+                .split(area);
+
+            render_input_pane(context, frame, chunks[1]);
+            autocomplete.render(frame, chunks[3]);
+            render_status_pane(context, frame, chunks[4]);
+        })?;
+        Ok(())
+    }
+
     /// Commit a finalized message to the terminal's scrollback (above the
     /// inline viewport). This is the inline-mode equivalent of "append to
     /// chat history" — once committed the line is permanent and scrolls
@@ -2160,10 +2199,39 @@ async fn run_loop(
     app: &mut TuiApp,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
+    // Temporary fullscreen Terminal instantiated only while a list
+    // picker is open. The inline `terminal` (parameter) is NEVER
+    // dropped/recreated during alt-screen swaps — that's what caused
+    // the scrollback whitespace bug. Instead we send the alt-screen
+    // escape and use a separate Fullscreen Terminal sharing stdout for
+    // the duration. Returning to inline just drops `alt` and emits
+    // LeaveAlternateScreen — the original screen state (including the
+    // inline viewport rows) is restored by the terminal emulator.
+    let mut alt: Option<Terminal<CrosstermBackend<Stdout>>> = None;
     loop {
         // Drain any buffered agent events before rendering so the frame
         // reflects the latest streaming state.
         app.drain_events();
+
+        // Alt-screen entry/exit covers TWO triggers — list picker open
+        // OR slash-autocomplete dropdown visible. Edge-triggered via
+        // option presence so we don't churn buffers on every keystroke.
+        let want_alt = app.list_picker.is_some() || app.autocomplete.is_visible();
+        let in_alt = alt.is_some();
+        if want_alt && !in_alt {
+            execute!(io::stdout(), EnterAlternateScreen)?;
+            let mut t = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+            t.clear()?;
+            alt = Some(t);
+        } else if !want_alt && in_alt {
+            // Drop the temp fullscreen terminal first so its final flush
+            // happens INSIDE alt-screen, then leave alt-screen, then
+            // force the inline terminal to repaint cleanly on top of
+            // the restored screen.
+            drop(alt.take());
+            execute!(io::stdout(), LeaveAlternateScreen)?;
+            terminal.clear()?;
+        }
 
         // /new and /clear request a full screen+scrollback wipe so
         // the next session starts on a clean terminal — same intent
@@ -2172,7 +2240,7 @@ async fn run_loop(
         // homes the cursor. Then re-claim a fresh inline viewport and
         // re-print the splash banner so the user lands on the same
         // welcome screen as a cold launch (`./rantaiclaw`).
-        if app.clear_terminal_request {
+        if app.clear_terminal_request && alt.is_none() {
             app.clear_terminal_request = false;
             let _ = terminal.flush();
             let mut out = io::stdout();
@@ -2187,15 +2255,32 @@ async fn run_loop(
             let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
         }
 
-        // Stream completed lines into scrollback and flush any queued
-        // message commits ABOVE the viewport before rendering this frame.
-        app.flush_stream_to_scrollback(terminal)?;
-        let pending: Vec<(String, String)> = std::mem::take(&mut app.scrollback_queue);
-        for (role, content) in pending {
-            TuiApp::commit_message_to_scrollback(terminal, &role, &content)?;
+        // Inline-only: stream completed lines into scrollback and flush
+        // any queued message commits ABOVE the viewport. Skipped while
+        // the picker has us in alt-screen — those commits would write
+        // into the alt buffer and be lost when we return.
+        if alt.is_none() {
+            app.flush_stream_to_scrollback(terminal)?;
+            let pending: Vec<(String, String)> = std::mem::take(&mut app.scrollback_queue);
+            for (role, content) in pending {
+                TuiApp::commit_message_to_scrollback(terminal, &role, &content)?;
+            }
         }
 
-        app.render(terminal)?;
+        if let Some(ref mut alt_term) = alt {
+            // While in alt-screen, render whichever overlay drove us in.
+            // Picker takes precedence over autocomplete (since the
+            // picker is modal — autocomplete can't actually be active
+            // simultaneously, but if both flags happened to coincide
+            // the picker is what the user is interacting with).
+            if app.list_picker.is_some() {
+                app.render_fullscreen_picker(alt_term)?;
+            } else {
+                app.render_fullscreen_autocomplete(alt_term)?;
+            }
+        } else {
+            app.render(terminal)?;
+        }
 
         // Tighten the poll interval during streaming so the live preview
         // updates fast enough to feel like word-by-word streaming. When
