@@ -567,7 +567,17 @@ impl TuiApp {
                 }
             }
             // First-run wizard Enter handling — non-provisioner phases only.
-            KeyCode::Enter if self.first_run_wizard.is_some() => {
+            // Wizard Enter is only meaningful for non-running phases.
+            // During RunningProvisioner, Enter belongs to the active
+            // setup_overlay (Choose submit / Prompt submit) — yield via
+            // the guard so the overlay-Enter arms below can match.
+            KeyCode::Enter
+                if self.first_run_wizard.is_some()
+                    && !matches!(
+                        self.first_run_wizard.as_ref().unwrap().phase,
+                        super::first_run_wizard::WizardPhase::RunningProvisioner { .. }
+                    ) =>
+            {
                 let wizard = self.first_run_wizard.as_mut().unwrap();
                 match wizard.phase {
                     super::first_run_wizard::WizardPhase::Welcome => {
@@ -590,7 +600,7 @@ impl TuiApp {
                         self.first_run_wizard = None;
                     }
                     super::first_run_wizard::WizardPhase::RunningProvisioner { .. } => {
-                        // Provisioner overlay handles Enter
+                        // Unreachable due to guard; kept for exhaustiveness.
                     }
                 }
             }
