@@ -8,18 +8,29 @@ pub struct DaemonRegistrationCheck;
 
 #[async_trait]
 impl DoctorCheck for DaemonRegistrationCheck {
-    fn name(&self) -> &'static str { "daemon.registration" }
-    fn category(&self) -> &'static str { "system" }
+    fn name(&self) -> &'static str {
+        "daemon.registration"
+    }
+    fn category(&self) -> &'static str {
+        "system"
+    }
     async fn run(&self, _ctx: &DoctorContext) -> CheckResult {
         let cat = self.category();
         match detect_registration() {
-            DaemonState::Registered { backend } => CheckResult::ok(
-                self.name(), format!("daemon registered via {backend}")).with_category(cat),
+            DaemonState::Registered { backend } => {
+                CheckResult::ok(self.name(), format!("daemon registered via {backend}"))
+                    .with_category(cat)
+            }
             DaemonState::NotRegistered { backend } => CheckResult::info(
-                self.name(), format!("daemon not registered with {backend} (optional)"))
-                .with_category(cat).with_hint("run: rantaiclaw service install"),
-            DaemonState::Unsupported => CheckResult::info(
-                self.name(), "init system not detected (skipped)").with_category(cat),
+                self.name(),
+                format!("daemon not registered with {backend} (optional)"),
+            )
+            .with_category(cat)
+            .with_hint("run: rantaiclaw service install"),
+            DaemonState::Unsupported => {
+                CheckResult::info(self.name(), "init system not detected (skipped)")
+                    .with_category(cat)
+            }
         }
     }
 }
@@ -39,8 +50,12 @@ pub fn detect_registration() -> DaemonState {
                 .args(["--user", "status", "rantaiclaw"])
                 .output();
             return match out {
-                Ok(o) if o.status.success() => DaemonState::Registered { backend: "systemd (user)" },
-                Ok(_) => DaemonState::NotRegistered { backend: "systemd (user)" },
+                Ok(o) if o.status.success() => DaemonState::Registered {
+                    backend: "systemd (user)",
+                },
+                Ok(_) => DaemonState::NotRegistered {
+                    backend: "systemd (user)",
+                },
                 Err(_) => DaemonState::Unsupported,
             };
         }
@@ -81,7 +96,10 @@ mod tests {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         let ctx = DoctorContext {
-            profile: Profile { name: "test".into(), root: tmp.path().to_path_buf() },
+            profile: Profile {
+                name: "test".into(),
+                root: tmp.path().to_path_buf(),
+            },
             config: Config::default(),
             offline: false,
         };

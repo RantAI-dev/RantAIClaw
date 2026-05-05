@@ -16,9 +16,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use rantaiclaw::config::Config;
-use rantaiclaw::mcp::curated::{
-    AuthMethod, CuratedMcpServer, OAuthProvider, AUTHED, NO_AUTH,
-};
+use rantaiclaw::mcp::curated::{AuthMethod, CuratedMcpServer, OAuthProvider, AUTHED, NO_AUTH};
 use rantaiclaw::mcp::setup::{register_mcp, validate_mcp_startup};
 
 #[test]
@@ -41,7 +39,14 @@ fn curated_lists_have_no_overlapping_slugs() {
 #[test]
 fn curated_authed_covers_required_providers() {
     // Spec: Notion, Google Drive, Slack, Google Calendar, Gmail, GitHub.
-    let must = ["notion", "google-drive", "slack", "google-calendar", "gmail", "github"];
+    let must = [
+        "notion",
+        "google-drive",
+        "slack",
+        "google-calendar",
+        "gmail",
+        "github",
+    ];
     let actual: HashSet<&str> = AUTHED.iter().map(|s| s.slug).collect();
     for slug in must {
         assert!(actual.contains(slug), "missing curated server: {slug}");

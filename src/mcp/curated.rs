@@ -160,10 +160,7 @@ pub const fn curated_count() -> usize {
 }
 
 pub fn find_by_slug(slug: &str) -> Option<&'static CuratedMcpServer> {
-    NO_AUTH
-        .iter()
-        .chain(AUTHED.iter())
-        .find(|s| s.slug == slug)
+    NO_AUTH.iter().chain(AUTHED.iter()).find(|s| s.slug == slug)
 }
 
 #[cfg(test)]

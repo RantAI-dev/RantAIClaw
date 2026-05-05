@@ -7,6 +7,8 @@ mod commands;
 #[cfg(feature = "tui")]
 mod context;
 #[cfg(feature = "tui")]
+pub mod first_run_wizard;
+#[cfg(feature = "tui")]
 mod render;
 #[cfg(feature = "tui")]
 mod widgets;
@@ -20,6 +22,9 @@ pub use async_bridge::{TuiAgentActor, TurnRequest};
 pub use commands::{CommandHandler, CommandRegistry, CommandResult};
 #[cfg(feature = "tui")]
 #[allow(unused_imports)]
+pub use first_run_wizard::FirstRunWizard;
+#[cfg(feature = "tui")]
+#[allow(unused_imports)]
 pub use widgets::SetupOverlayState;
 
 use std::path::PathBuf;
@@ -30,6 +35,11 @@ pub struct TuiConfig {
     pub data_dir: PathBuf,
     pub model: String,
     pub resume_session: Option<String>,
+    /// Open a provisioner overlay on startup.
+    /// `None` = no overlay (bare chat).
+    /// `Some("")` = open the SetupTopic category picker.
+    /// `Some(name)` = open that specific provisioner's overlay.
+    pub setup_provisioner: Option<String>,
 }
 
 impl Default for TuiConfig {
@@ -42,6 +52,7 @@ impl Default for TuiConfig {
             data_dir,
             model: "anthropic:claude-sonnet-4-20250514".to_string(),
             resume_session: None,
+            setup_provisioner: None,
         }
     }
 }

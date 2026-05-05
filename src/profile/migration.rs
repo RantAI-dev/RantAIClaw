@@ -81,8 +81,7 @@ pub fn needs_migration() -> bool {
 fn perform_migration() -> Result<()> {
     let root = paths::rantaiclaw_root();
     let dest = paths::profile_dir("default");
-    fs::create_dir_all(&dest)
-        .with_context(|| format!("create profile dir {}", dest.display()))?;
+    fs::create_dir_all(&dest).with_context(|| format!("create profile dir {}", dest.display()))?;
 
     // Anything that lived at `~/.rantaiclaw/<name>` and now lives at
     // `~/.rantaiclaw/profiles/default/<name>`.
@@ -121,9 +120,8 @@ fn perform_migration() -> Result<()> {
                     // best-effort remove src so we don't leave a stale copy.
                     let _ = remove_recursive(&src);
                 } else {
-                    return Err(e).with_context(|| {
-                        format!("move {} -> {}", src.display(), dst.display())
-                    });
+                    return Err(e)
+                        .with_context(|| format!("move {} -> {}", src.display(), dst.display()));
                 }
             }
         }
@@ -147,10 +145,8 @@ fn perform_migration() -> Result<()> {
         }
     }
 
-    fs::write(paths::active_profile_file(), "default\n")
-        .context("write active_profile marker")?;
-    fs::write(paths::version_file(), env!("CARGO_PKG_VERSION"))
-        .context("write version stamp")?;
+    fs::write(paths::active_profile_file(), "default\n").context("write active_profile marker")?;
+    fs::write(paths::version_file(), env!("CARGO_PKG_VERSION")).context("write version stamp")?;
     fs::write(
         root.join("MIGRATION_NOTICE.md"),
         include_str!("migration_notice.md"),

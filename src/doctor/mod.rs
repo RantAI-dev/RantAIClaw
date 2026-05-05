@@ -12,9 +12,9 @@ pub mod checks;
 pub mod legacy;
 pub mod report;
 
-pub use legacy::run_models;
 #[allow(unused_imports)]
 pub use legacy::run;
+pub use legacy::run_models;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -55,20 +55,57 @@ pub struct CheckResult {
 
 impl CheckResult {
     pub fn ok(name: impl Into<String>, msg: impl Into<String>) -> Self {
-        Self { name: name.into(), severity: Severity::Ok, message: msg.into(), hint: None, duration_ms: 0, category: "config" }
+        Self {
+            name: name.into(),
+            severity: Severity::Ok,
+            message: msg.into(),
+            hint: None,
+            duration_ms: 0,
+            category: "config",
+        }
     }
     pub fn warn(name: impl Into<String>, msg: impl Into<String>) -> Self {
-        Self { name: name.into(), severity: Severity::Warn, message: msg.into(), hint: None, duration_ms: 0, category: "config" }
+        Self {
+            name: name.into(),
+            severity: Severity::Warn,
+            message: msg.into(),
+            hint: None,
+            duration_ms: 0,
+            category: "config",
+        }
     }
     pub fn fail(name: impl Into<String>, msg: impl Into<String>) -> Self {
-        Self { name: name.into(), severity: Severity::Fail, message: msg.into(), hint: None, duration_ms: 0, category: "config" }
+        Self {
+            name: name.into(),
+            severity: Severity::Fail,
+            message: msg.into(),
+            hint: None,
+            duration_ms: 0,
+            category: "config",
+        }
     }
     pub fn info(name: impl Into<String>, msg: impl Into<String>) -> Self {
-        Self { name: name.into(), severity: Severity::Info, message: msg.into(), hint: None, duration_ms: 0, category: "config" }
+        Self {
+            name: name.into(),
+            severity: Severity::Info,
+            message: msg.into(),
+            hint: None,
+            duration_ms: 0,
+            category: "config",
+        }
     }
-    pub fn with_hint(mut self, hint: impl Into<String>) -> Self { self.hint = Some(hint.into()); self }
-    pub fn with_category(mut self, category: &'static str) -> Self { self.category = category; self }
-    pub fn with_duration_ms(mut self, ms: u64) -> Self { self.duration_ms = ms; self }
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+    pub fn with_category(mut self, category: &'static str) -> Self {
+        self.category = category;
+        self
+    }
+    pub fn with_duration_ms(mut self, ms: u64) -> Self {
+        self.duration_ms = ms;
+        self
+    }
 }
 
 pub struct DoctorContext {
@@ -88,7 +125,9 @@ async fn run_one(check: &dyn DoctorCheck, ctx: &DoctorContext) -> CheckResult {
     let started = std::time::Instant::now();
     let mut result = check.run(ctx).await;
     let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    if result.duration_ms == 0 { result.duration_ms = elapsed; }
+    if result.duration_ms == 0 {
+        result.duration_ms = elapsed;
+    }
     if result.category == "config" && check.category() != "config" {
         result.category = check.category();
     }
@@ -108,7 +147,9 @@ pub async fn run_all(ctx: DoctorContext, brief: bool) -> Vec<CheckResult> {
     ];
     let mut results = Vec::with_capacity(registry.len());
     for check in &registry {
-        if brief && check.category() == "live" { continue; }
+        if brief && check.category() == "live" {
+            continue;
+        }
         results.push(run_one(check.as_ref(), &ctx).await);
     }
     results

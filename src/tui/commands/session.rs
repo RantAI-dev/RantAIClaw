@@ -3,7 +3,7 @@ use chrono::{TimeZone, Utc};
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
-use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+use crate::tui::widgets::{ListPicker, ListPickerEntry, ListPickerItem, ListPickerKind};
 
 /// Build picker items from a list of session metas. Skips the current
 /// session so the user doesn't accidentally "resume" it onto itself.
@@ -215,7 +215,13 @@ mod tests {
             CommandResult::OpenListPicker(picker) => {
                 assert_eq!(picker.kind, ListPickerKind::Session);
                 // Current session is filtered out → empty in this in-memory test.
-                assert!(picker.items.is_empty() || picker.items.iter().all(|i| !i.key.is_empty()));
+                assert!(
+                    picker.entries().is_empty()
+                        || picker
+                            .entries()
+                            .iter()
+                            .all(|e| matches!(e, ListPickerEntry::Item(i) if !i.key.is_empty()))
+                );
             }
             other => panic!("expected OpenListPicker, got {other:?}"),
         }

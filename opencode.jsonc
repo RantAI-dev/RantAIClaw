@@ -1,0 +1,240 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "model": "minimax-coding-plan/MiniMax-M2.7",
+
+  "instructions": [
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".opencode/skills/*.md"
+  ],
+
+  "permission": {
+    "read": {
+      "*": "allow",
+      ".env": "deny",
+      ".env.*": "deny",
+      "**/*.pem": "deny",
+      "**/*.key": "deny",
+      "**/id_rsa": "deny",
+      "**/id_ed25519": "deny",
+      "**/*token*": "ask",
+      "**/*secret*": "ask"
+    },
+
+    "edit": {
+      "*": "ask",
+
+      "src/providers/**": "allow",
+      "src/channels/**": "allow",
+      "src/memory/**": "allow",
+      "src/observability/**": "allow",
+      "src/peripherals/**": "ask",
+
+      "src/config/**": "ask",
+      "src/agent/**": "ask",
+      "src/tools/**": "ask",
+      "src/security/**": "ask",
+      "src/runtime/**": "ask",
+      "src/gateway/**": "ask",
+
+      "tests/**": "allow",
+      "test_helpers/**": "allow",
+      "benches/**": "ask",
+      "docs/**": "allow",
+      "examples/**": "allow",
+      "scripts/**": "ask",
+      "dev/**": "ask",
+
+      "README.md": "ask",
+      "README.*.md": "ask",
+      "AGENTS.md": "ask",
+      "CLAUDE.md": "ask",
+      "CONTRIBUTING.md": "ask",
+
+      "Cargo.toml": "ask",
+      "Cargo.lock": "ask",
+      "deny.toml": "ask",
+      "clippy.toml": "ask",
+      "rustfmt.toml": "ask",
+      ".github/workflows/**": "ask",
+
+      ".env": "deny",
+      ".env.*": "deny",
+      "**/*.pem": "deny",
+      "**/*.key": "deny",
+      "**/id_rsa": "deny",
+      "**/id_ed25519": "deny"
+    },
+
+    "bash": {
+      "*": "ask",
+
+      "pwd": "allow",
+      "ls*": "allow",
+      "find *": "allow",
+      "rg *": "allow",
+      "grep *": "allow",
+
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git branch*": "allow",
+      "git worktree list*": "allow",
+
+      "cargo fmt --all -- --check": "allow",
+      "cargo fmt --all": "ask",
+      "cargo check*": "allow",
+      "cargo test*": "allow",
+      "cargo clippy --all-targets -- -D warnings": "allow",
+      "cargo clippy*": "ask",
+      "cargo build*": "ask",
+      "cargo bench*": "ask",
+      "cargo deny*": "ask",
+
+      "./dev/ci.sh all": "ask",
+      "./dev/ci.sh *": "ask",
+
+      "bash -n bootstrap.sh scripts/bootstrap.sh scripts/install.sh": "allow",
+
+      "rm *": "deny",
+      "rm -rf *": "deny",
+      "sudo *": "deny",
+      "chmod *": "ask",
+      "chown *": "deny",
+      "git push*": "deny",
+      "git reset --hard*": "deny",
+      "git clean*": "deny",
+      "cargo publish*": "deny",
+      "docker system prune*": "deny"
+    },
+
+    "external_directory": "ask",
+    "webfetch": "ask",
+    "websearch": "ask",
+    "doom_loop": "ask"
+  },
+
+  "formatter": {
+    "rustfmt": {
+      "command": ["cargo", "fmt", "--all"],
+      "extensions": [".rs"]
+    }
+  },
+
+  "agent": {
+    "architect": {
+      "description": "Read-only RantAIClaw architecture planner. Use for design, module boundaries, trait/factory decisions, and risky changes.",
+      "mode": "subagent",
+      "temperature": 1,
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "bash": {
+          "git status*": "allow",
+          "git diff*": "allow",
+          "rg *": "allow",
+          "grep *": "allow",
+          "cargo check*": "allow",
+          "*": "ask"
+        }
+      }
+    },
+
+    "builder": {
+      "description": "Main implementation agent for focused Rust changes.",
+      "mode": "primary",
+      "temperature": 1,
+      "permission": {
+        "read": "allow",
+        "edit": "ask",
+        "bash": {
+          "git status*": "allow",
+          "git diff*": "allow",
+          "cargo fmt --all -- --check": "allow",
+          "cargo check*": "allow",
+          "cargo test*": "allow",
+          "cargo clippy --all-targets -- -D warnings": "allow",
+          "./dev/ci.sh all": "ask",
+          "rm *": "deny",
+          "sudo *": "deny",
+          "git push*": "deny",
+          "*": "ask"
+        }
+      }
+    },
+
+    "reviewer": {
+      "description": "Read-only reviewer for correctness, security, rollback, docs impact, and trait/factory boundaries.",
+      "mode": "subagent",
+      "temperature": 1,
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "bash": {
+          "git status*": "allow",
+          "git diff*": "allow",
+          "cargo check*": "allow",
+          "cargo test*": "allow",
+          "*": "ask"
+        }
+      }
+    },
+
+    "security": {
+      "description": "Security-boundary reviewer for gateway, runtime, tools, shell, filesystem, policy, pairing, secret handling, and webhook behavior.",
+      "mode": "subagent",
+      "temperature": 1,
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "bash": {
+          "git diff*": "allow",
+          "rg *": "allow",
+          "cargo test*": "allow",
+          "*": "ask"
+        }
+      }
+    },
+
+    "tester": {
+      "description": "Test specialist. Adds focused deterministic tests without broad product rewrites.",
+      "mode": "subagent",
+      "temperature": 1,
+      "permission": {
+        "read": "allow",
+        "edit": {
+          "tests/**": "allow",
+          "test_helpers/**": "allow",
+          "src/**/*.rs": "ask",
+          "*": "ask"
+        },
+        "bash": {
+          "cargo test*": "allow",
+          "cargo check*": "allow",
+          "cargo fmt --all -- --check": "allow",
+          "*": "ask"
+        }
+      }
+    },
+
+    "docs": {
+      "description": "Documentation sync agent. Updates docs when CLI/config/provider/channel/runtime behavior changes.",
+      "mode": "subagent",
+      "temperature": 1,
+      "permission": {
+        "read": "allow",
+        "edit": {
+          "README.md": "ask",
+          "README.*.md": "ask",
+          "docs/**": "allow",
+          "*.md": "ask"
+        },
+        "bash": {
+          "bash -n bootstrap.sh scripts/bootstrap.sh scripts/install.sh": "allow",
+          "*": "ask"
+        }
+      }
+    }
+  }
+}

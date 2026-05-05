@@ -284,14 +284,7 @@ pub fn render_splash_at_width(inv: &Inventory<'_>, cols: u16) -> String {
     if cols < 60 {
         let mut out = String::new();
         out.push('\n');
-        let _ = writeln!(
-            out,
-            "{}{}▎ {}{}",
-            bold(),
-            fg(0),
-            inv.title,
-            r,
-        );
+        let _ = writeln!(out, "{}{}▎ {}{}", bold(), fg(0), inv.title, r,);
         if let Some(sub) = inv.subtitle {
             let _ = writeln!(out, "  {}{}{}", dim(), sub, r);
         }
@@ -366,13 +359,21 @@ mod tests {
     fn banner_full_fits_in_82_cols() {
         // ANSI Shadow at width=200 produces a single-row "RANTAICLAW" at
         // exactly 80 cols. Allow a 2-col cushion for edge cases.
-        let max = BANNER_FULL.lines().map(|l| l.chars().count()).max().unwrap();
+        let max = BANNER_FULL
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap();
         assert!(max <= 82, "banner_full max line is {max} chars");
     }
 
     #[test]
     fn banner_small_fits_in_60_cols() {
-        let max = BANNER_SMALL.lines().map(|l| l.chars().count()).max().unwrap();
+        let max = BANNER_SMALL
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap();
         assert!(max <= 60, "banner_small max line is {max} chars");
     }
 
@@ -392,7 +393,10 @@ mod tests {
     fn wide_splash_uses_frame() {
         let inv = Inventory::minimal("Rantaiclaw v0.5.0", Some("test"));
         let s = render_splash_at_width(&inv, 100);
-        assert!(s.contains('╭'), "wide splash should have rounded frame: {s:?}");
+        assert!(
+            s.contains('╭'),
+            "wide splash should have rounded frame: {s:?}"
+        );
         assert!(s.contains('╯'));
     }
 

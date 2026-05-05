@@ -1,0 +1,15 @@
+pub mod dingtalk;
+pub mod discord;
+pub mod email;
+pub mod imessage;
+pub mod irc;
+pub mod lark;
+pub mod linq;
+pub mod matrix;
+pub mod mattermost;
+pub mod nextcloud_talk;
+pub mod qq;
+pub mod signal;
+pub mod slack;
+pub mod telegram;
+pub mod whatsapp_cloud;

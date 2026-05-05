@@ -38,7 +38,10 @@ async fn main() -> anyhow::Result<()> {
                 chunks_seen += 1;
                 eprintln!("[{elapsed:>5}ms] Chunk({:?}) len={}", &s, s.len());
             }
-            AgentEvent::Done { final_text, cancelled } => {
+            AgentEvent::Done {
+                final_text,
+                cancelled,
+            } => {
                 eprintln!(
                     "[{elapsed:>5}ms] Done cancelled={cancelled} text_len={}",
                     final_text.len()

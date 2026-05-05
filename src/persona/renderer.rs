@@ -24,9 +24,7 @@ pub fn render(
     avoid: Option<&str>,
 ) -> String {
     // First decide whether the avoid block should survive.
-    let keep_avoid = avoid
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
+    let keep_avoid = avoid.map(|s| !s.trim().is_empty()).unwrap_or(false);
 
     let stripped = if keep_avoid {
         // Keep the inner content, drop just the guard markers.

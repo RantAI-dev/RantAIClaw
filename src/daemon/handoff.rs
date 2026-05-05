@@ -169,18 +169,13 @@ pub fn restart_daemon_for_profile(profile: &str) -> Result<()> {
 /// Test seam — same as `restart_daemon_for_profile` but with a caller-chosen
 /// `DaemonControl`. Exposed `pub` so integration tests can substitute a
 /// recording stub.
-pub fn restart_daemon_for_profile_with(
-    profile: &str,
-    control: &dyn DaemonControl,
-) -> Result<()> {
+pub fn restart_daemon_for_profile_with(profile: &str, control: &dyn DaemonControl) -> Result<()> {
     let Some(sentinel) = sentinel::read_sentinel(profile).ok().flatten() else {
         // Either no sentinel, or unparseable — both mean "nothing live for
         // this profile". `read_sentinel` returns Ok(None) for absent;
         // `.ok().flatten()` also handles parse failures the same way
         // (advisory file).
-        tracing::debug!(
-            "No daemon sentinel for profile {profile:?}; skipping handoff"
-        );
+        tracing::debug!("No daemon sentinel for profile {profile:?}; skipping handoff");
         return Ok(());
     };
 

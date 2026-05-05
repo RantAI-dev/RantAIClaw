@@ -8,27 +8,39 @@ pub struct McpStartupCheck;
 
 #[async_trait]
 impl DoctorCheck for McpStartupCheck {
-    fn name(&self) -> &'static str { "mcp.startup" }
-    fn category(&self) -> &'static str { "live" }
+    fn name(&self) -> &'static str {
+        "mcp.startup"
+    }
+    fn category(&self) -> &'static str {
+        "live"
+    }
     async fn run(&self, ctx: &DoctorContext) -> CheckResult {
         let servers = &ctx.config.mcp_servers;
         if servers.is_empty() {
-            return CheckResult::info(self.name(), "no MCP servers configured").with_category(self.category());
+            return CheckResult::info(self.name(), "no MCP servers configured")
+                .with_category(self.category());
         }
 
         let mut missing: Vec<String> = Vec::new();
         let mut ok_count = 0usize;
         for (name, srv) in servers {
-            if which::which(&srv.command).is_ok() { ok_count += 1; }
-            else { missing.push(format!("{name} ({})", srv.command)); }
+            if which::which(&srv.command).is_ok() {
+                ok_count += 1;
+            } else {
+                missing.push(format!("{name} ({})", srv.command));
+            }
         }
 
         if missing.is_empty() {
-            CheckResult::ok(self.name(), format!("{ok_count} MCP server(s) launchable")).with_category(self.category())
-        } else {
-            CheckResult::fail(self.name(), format!("commands not on PATH: {}", missing.join(", ")))
+            CheckResult::ok(self.name(), format!("{ok_count} MCP server(s) launchable"))
                 .with_category(self.category())
-                .with_hint("install the missing binaries or run: rantaiclaw setup mcp")
+        } else {
+            CheckResult::fail(
+                self.name(),
+                format!("commands not on PATH: {}", missing.join(", ")),
+            )
+            .with_category(self.category())
+            .with_hint("install the missing binaries or run: rantaiclaw setup mcp")
         }
     }
 }
@@ -43,8 +55,18 @@ mod tests {
 
     fn ctx(cfg: Config) -> (DoctorContext, TempDir) {
         let tmp = TempDir::new().unwrap();
-        let p = Profile { name: "test".into(), root: tmp.path().to_path_buf() };
-        (DoctorContext { profile: p, config: cfg, offline: false }, tmp)
+        let p = Profile {
+            name: "test".into(),
+            root: tmp.path().to_path_buf(),
+        };
+        (
+            DoctorContext {
+                profile: p,
+                config: cfg,
+                offline: false,
+            },
+            tmp,
+        )
     }
 
     #[tokio::test]

@@ -28,10 +28,10 @@ pub mod matrix;
 pub mod mattermost;
 pub mod nextcloud_talk;
 pub mod qq;
+pub mod qr_terminal;
 pub mod signal;
 pub mod slack;
 pub mod telegram;
-pub mod qr_terminal;
 pub mod traits;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]

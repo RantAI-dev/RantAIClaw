@@ -175,15 +175,12 @@ pub fn run_setup(
     // Topic dispatch — single-section path.
     if let Some(name) = topic.as_deref() {
         let valid: Vec<&'static str> = sections.iter().map(|s| s.name()).collect();
-        let section = sections
-            .iter()
-            .find(|s| s.name() == name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown setup topic '{name}'. valid topics: {}",
-                    valid.join(", ")
-                )
-            })?;
+        let section = sections.iter().find(|s| s.name() == name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown setup topic '{name}'. valid topics: {}",
+                valid.join(", ")
+            )
+        })?;
         let mut report = SetupReport::default();
         run_one(
             section.as_ref(),
@@ -870,10 +867,7 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
                 "gpt-5.3-codex".to_string(),
                 "GPT-5.3 Codex (previous coding)".to_string(),
             ),
-            (
-                "gpt-5.2".to_string(),
-                "GPT-5.2 (older, stable)".to_string(),
-            ),
+            ("gpt-5.2".to_string(), "GPT-5.2 (older, stable)".to_string()),
             (
                 "gpt-5-mini".to_string(),
                 "GPT-5 mini (faster, cheaper)".to_string(),
@@ -908,7 +902,10 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
                 "gpt-5-codex".to_string(),
                 "GPT-5 Codex (legacy, stable)".to_string(),
             ),
-            ("o4-mini".to_string(), "o4-mini (reasoning fallback)".to_string()),
+            (
+                "o4-mini".to_string(),
+                "o4-mini (reasoning fallback)".to_string(),
+            ),
         ],
         "venice" => vec![
             (
@@ -1124,10 +1121,7 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
                 "qwen3.6-turbo".to_string(),
                 "Qwen 3.6 Turbo (fast, cost-efficient)".to_string(),
             ),
-            (
-                "qwen-max".to_string(),
-                "Qwen Max (legacy 3.5)".to_string(),
-            ),
+            ("qwen-max".to_string(), "Qwen Max (legacy 3.5)".to_string()),
             (
                 "qwen-plus".to_string(),
                 "Qwen Plus (legacy 3.5)".to_string(),
@@ -3756,20 +3750,17 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                         println!(
                             "  {} {}",
                             style("⚠").yellow().bold(),
-                            style(
-                                "This binary was built WITHOUT --features whatsapp-web."
-                            )
-                            .yellow()
+                            style("This binary was built WITHOUT --features whatsapp-web.")
+                                .yellow()
                         );
                         println!(
                             "    Re-build with `cargo build --release --features whatsapp-web`"
                         );
-                        println!(
-                            "    or install via the script with WHATSAPP_WEB=1 set in env."
-                        );
+                        println!("    or install via the script with WHATSAPP_WEB=1 set in env.");
                         println!(
                             "    {}",
-                            style("Continuing will save config but no WhatsApp daemon will run.").dim()
+                            style("Continuing will save config but no WhatsApp daemon will run.")
+                                .dim()
                         );
                         let proceed = dialoguer::Confirm::new()
                             .with_prompt("  Continue saving config anyway?")
@@ -5879,13 +5870,13 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.5");
         assert_eq!(default_model_for_provider("openai-codex"), "gpt-5.5-codex");
-        assert_eq!(
-            default_model_for_provider("anthropic"),
-            "claude-sonnet-4-6"
-        );
+        assert_eq!(default_model_for_provider("anthropic"), "claude-sonnet-4-6");
         assert_eq!(default_model_for_provider("qwen"), "qwen3.6-plus");
         assert_eq!(default_model_for_provider("qwen-intl"), "qwen3.6-plus");
-        assert_eq!(default_model_for_provider("qwen-code"), "qwen3.6-coder-plus");
+        assert_eq!(
+            default_model_for_provider("qwen-code"),
+            "qwen3.6-coder-plus"
+        );
         assert_eq!(default_model_for_provider("glm-cn"), "glm-5.1");
         assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.7");
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5.1");
@@ -5896,20 +5887,11 @@ mod tests {
             default_model_for_provider("bedrock"),
             "anthropic.claude-sonnet-4-6-v1:0"
         );
-        assert_eq!(
-            default_model_for_provider("google-gemini"),
-            "gemini-3-pro"
-        );
+        assert_eq!(default_model_for_provider("google-gemini"), "gemini-3-pro");
         assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5.1");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.6");
-        assert_eq!(
-            default_model_for_provider("nvidia"),
-            "meta/llama-spark"
-        );
-        assert_eq!(
-            default_model_for_provider("nvidia-nim"),
-            "meta/llama-spark"
-        );
+        assert_eq!(default_model_for_provider("nvidia"), "meta/llama-spark");
+        assert_eq!(default_model_for_provider("nvidia-nim"), "meta/llama-spark");
         assert_eq!(
             default_model_for_provider("llamacpp"),
             "ggml-org/llama-spark-GGUF"

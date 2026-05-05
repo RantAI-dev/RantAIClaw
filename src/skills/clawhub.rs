@@ -107,8 +107,7 @@ fn write_cache(items: &[ClawHubSkill]) -> Result<()> {
         items: items.to_vec(),
     };
     let json = serde_json::to_vec_pretty(&env)?;
-    std::fs::write(&path, json)
-        .with_context(|| format!("write cache {}", path.display()))?;
+    std::fs::write(&path, json).with_context(|| format!("write cache {}", path.display()))?;
     Ok(())
 }
 
@@ -277,8 +276,7 @@ async fn install_one_inner(
                 .with_context(|| format!("hash check failed for {}", file.path))?;
         }
 
-        std::fs::write(&target, &bytes)
-            .with_context(|| format!("write {}", target.display()))?;
+        std::fs::write(&target, &bytes).with_context(|| format!("write {}", target.display()))?;
     }
 
     // Defensive: ClawHub manifests are required to ship a SKILL.md per the
@@ -355,7 +353,10 @@ fn validate_slug(slug: &str) -> Result<()> {
     if slug.contains('/') || slug.contains('\\') || slug.contains("..") {
         anyhow::bail!("invalid clawhub slug {slug:?}");
     }
-    if !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         anyhow::bail!("clawhub slug {slug:?} has illegal characters");
     }
     Ok(())

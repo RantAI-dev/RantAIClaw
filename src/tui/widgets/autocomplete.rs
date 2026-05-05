@@ -47,9 +47,7 @@ impl Autocomplete {
                 .selected()
                 .and_then(|i| self.suggestions.get(i).cloned());
             let new_idx = prev_selected
-                .and_then(|(name, _)| {
-                    self.suggestions.iter().position(|(n, _)| n == &name)
-                })
+                .and_then(|(name, _)| self.suggestions.iter().position(|(n, _)| n == &name))
                 .unwrap_or(0);
             self.state.select(Some(new_idx));
         } else {
@@ -142,9 +140,7 @@ impl Autocomplete {
                 let line = Line::from(vec![
                     Span::styled(
                         name.clone(),
-                        Style::default()
-                            .fg(NAME_COLOR)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(NAME_COLOR).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" ".repeat(name_pad)),
                     Span::styled(truncated_desc, Style::default().fg(DESC_COLOR)),

@@ -32,9 +32,7 @@ use crate::profile::Profile;
 /// when Wave 3 wires up `Commands::Setup { topic = persona }`) maps strings
 /// to variants. `serde(rename_all = "snake_case")` matches the on-disk
 /// representation in `persona/persona.toml`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "snake_case")]
 pub enum PresetId {
@@ -71,10 +69,14 @@ impl PresetId {
     pub fn description(self) -> &'static str {
         match self {
             PresetId::Default => "Balanced general-purpose helper. Good if you're not sure.",
-            PresetId::ConcisePro => "Short, formal, lead-with-the-answer. For busy professional use.",
+            PresetId::ConcisePro => {
+                "Short, formal, lead-with-the-answer. For busy professional use."
+            }
             PresetId::FriendlyCompanion => "Warm and conversational. Good for daily-life support.",
             PresetId::ResearchAnalyst => "Evidence-driven, cites sources, flags uncertainty.",
-            PresetId::ExecutiveAssistant => "Anticipatory, time-conscious, drafts ready-to-send replies.",
+            PresetId::ExecutiveAssistant => {
+                "Anticipatory, time-conscious, drafts ready-to-send replies."
+            }
         }
     }
 }
@@ -147,11 +149,9 @@ impl PersonaToml {
 /// directory if missing.
 pub fn write_persona_toml(profile: &Profile, persona: &PersonaToml) -> Result<()> {
     let dir = profile.persona_dir();
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("create persona dir {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("create persona dir {}", dir.display()))?;
     let path = dir.join("persona.toml");
-    let body = toml::to_string_pretty(persona)
-        .context("serialize persona.toml")?;
+    let body = toml::to_string_pretty(persona).context("serialize persona.toml")?;
     let tmp = path.with_extension("toml.tmp");
     fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
@@ -165,10 +165,9 @@ pub fn read_persona_toml(profile: &Profile) -> Result<Option<PersonaToml>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let persona: PersonaToml = toml::from_str(&raw)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let persona: PersonaToml =
+        toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(persona))
 }
 
@@ -177,8 +176,7 @@ pub fn read_persona_toml(profile: &Profile) -> Result<Option<PersonaToml>> {
 /// updating `name` or `timezone` so SYSTEM.md never drifts.
 pub fn render_system_md(profile: &Profile, persona: &PersonaToml) -> Result<()> {
     let dir = profile.persona_dir();
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("create persona dir {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("create persona dir {}", dir.display()))?;
     let path = dir.join("SYSTEM.md");
     let body = persona.render();
     let tmp = path.with_extension("md.tmp");

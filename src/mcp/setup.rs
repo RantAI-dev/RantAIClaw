@@ -113,7 +113,10 @@ async fn collect_and_register(
         }
         AuthMethod::OAuth { provider, scopes } => {
             let token = oauth::run_oauth(*provider, scopes).await?;
-            let env_key = format!("{}_OAUTH_TOKEN", server.slug.replace('-', "_").to_uppercase());
+            let env_key = format!(
+                "{}_OAUTH_TOKEN",
+                server.slug.replace('-', "_").to_uppercase()
+            );
             vec![(env_key, token)]
         }
     };
@@ -254,8 +257,7 @@ pub fn write_secrets_to(path: &Path, env: &[(String, String)]) -> Result<()> {
     for (k, v) in env {
         doc.insert(k.clone(), toml::Value::String(v.clone()));
     }
-    let serialised =
-        toml::to_string_pretty(&doc).context("serialise secrets table")?;
+    let serialised = toml::to_string_pretty(&doc).context("serialise secrets table")?;
     std::fs::write(path, serialised)
         .with_context(|| format!("write secrets file {}", path.display()))?;
 
@@ -305,6 +307,9 @@ mod tests {
         .unwrap();
         let entry = config.mcp_servers.get("notion").unwrap();
         assert_eq!(entry.command, "npx");
-        assert_eq!(entry.env.get("NOTION_API_KEY").map(String::as_str), Some("secret"));
+        assert_eq!(
+            entry.env.get("NOTION_API_KEY").map(String::as_str),
+            Some("secret")
+        );
     }
 }

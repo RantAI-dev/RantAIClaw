@@ -163,11 +163,15 @@ fn setup_with_unknown_topic_errors_with_valid_topic_list() {
             "error should call out unknown topic: {msg}"
         );
         // The error must enumerate the valid topics so the user can recover.
-        for s in ["provider", "approvals", "channels", "persona", "skills", "mcp"] {
-            assert!(
-                msg.contains(s),
-                "error should list valid topic {s}: {msg}",
-            );
+        for s in [
+            "provider",
+            "approvals",
+            "channels",
+            "persona",
+            "skills",
+            "mcp",
+        ] {
+            assert!(msg.contains(s), "error should list valid topic {s}: {msg}",);
         }
     });
 }
@@ -218,19 +222,17 @@ fn onboard_alias_dispatches_to_setup_with_no_topic() {
 
 #[test]
 fn welcome_banner_snapshot() {
-    let banner = console::strip_ansi_codes(&rantaiclaw::onboard::ui::render_welcome_banner())
-        .into_owned();
+    let banner =
+        console::strip_ansi_codes(&rantaiclaw::onboard::ui::render_welcome_banner()).into_owned();
     insta::assert_snapshot!("setup_welcome_banner", banner);
 }
 
 #[test]
 fn completion_banner_snapshot() {
-    let banner = console::strip_ansi_codes(&rantaiclaw::onboard::ui::render_completion_banner(
-        &[
-            "rantaiclaw doctor — verify the install",
-            "rantaiclaw chat   — start a session",
-        ],
-    ))
+    let banner = console::strip_ansi_codes(&rantaiclaw::onboard::ui::render_completion_banner(&[
+        "rantaiclaw doctor — verify the install",
+        "rantaiclaw chat   — start a session",
+    ]))
     .into_owned();
     insta::assert_snapshot!("setup_completion_banner", banner);
 }

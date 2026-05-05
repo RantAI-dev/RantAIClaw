@@ -9,31 +9,44 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-/// Driver-facing events emitted by a provisioner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionerCategory {
+    Core,
+    Channel,
+    Integration,
+    Runtime,
+    Hardware,
+    Routing,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProvisionEvent {
-    /// Plain status line.
-    Message { severity: Severity, text: String },
-    /// Render a QR code. `payload` is the raw string to encode.
-    QrCode { payload: String, caption: String },
-    /// Prompt the user for a text value.
+    Message {
+        severity: Severity,
+        text: String,
+    },
+    QrCode {
+        payload: String,
+        caption: String,
+    },
     Prompt {
         id: String,
         label: String,
         default: Option<String>,
         secret: bool,
     },
-    /// Multi-select list.
     Choose {
         id: String,
         label: String,
         options: Vec<String>,
         multi: bool,
     },
-    /// Provisioner finished successfully.
-    Done { summary: String },
-    /// Provisioner failed.
-    Failed { error: String },
+    Done {
+        summary: String,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,7 +57,6 @@ pub enum Severity {
     Success,
 }
 
-/// Responses sent back to a provisioner.
 #[derive(Debug, Clone)]
 pub enum ProvisionResponse {
     Text(String),
@@ -52,8 +64,6 @@ pub enum ProvisionResponse {
     Cancelled,
 }
 
-/// Channels handed to a provisioner. It emits events on `events` and
-/// awaits responses on `responses`.
 pub struct ProvisionIo {
     pub events: mpsc::Sender<ProvisionEvent>,
     pub responses: mpsc::Receiver<ProvisionResponse>,
@@ -61,11 +71,11 @@ pub struct ProvisionIo {
 
 #[async_trait]
 pub trait TuiProvisioner: Send {
-    /// Stable kebab-case identifier — used for `rantaiclaw setup <name>`.
     fn name(&self) -> &'static str;
-    /// One-line description for the picker.
     fn description(&self) -> &'static str;
-    /// Run to completion. Mutates `config` on success; caller persists.
+    fn category(&self) -> ProvisionerCategory {
+        ProvisionerCategory::Core
+    }
     async fn run(
         &self,
         config: &mut crate::config::Config,
@@ -77,6 +87,44 @@ pub trait TuiProvisioner: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn category_variants_are_distinct() {
+        assert_ne!(ProvisionerCategory::Core, ProvisionerCategory::Channel);
+        assert_ne!(
+            ProvisionerCategory::Channel,
+            ProvisionerCategory::Integration
+        );
+        assert_ne!(
+            ProvisionerCategory::Integration,
+            ProvisionerCategory::Runtime
+        );
+        assert_ne!(ProvisionerCategory::Runtime, ProvisionerCategory::Hardware);
+        assert_ne!(ProvisionerCategory::Hardware, ProvisionerCategory::Routing);
+    }
+
+    #[test]
+    fn default_category_is_core() {
+        struct DummyProvisioner;
+        #[async_trait]
+        impl TuiProvisioner for DummyProvisioner {
+            fn name(&self) -> &'static str {
+                "dummy"
+            }
+            fn description(&self) -> &'static str {
+                "dummy"
+            }
+            async fn run(
+                &self,
+                _: &mut crate::config::Config,
+                _: &crate::profile::Profile,
+                _: ProvisionIo,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(DummyProvisioner.category(), ProvisionerCategory::Core);
+    }
 
     #[test]
     fn provision_event_message_carries_severity() {

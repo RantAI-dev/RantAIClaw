@@ -2,7 +2,9 @@ use anyhow::Result;
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
-use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind, ModelEntry};
+use crate::tui::widgets::{
+    ListPicker, ListPickerEntry, ListPickerItem, ListPickerKind, ModelEntry,
+};
 
 /// /model command — display, change, or interactively pick the active model.
 pub struct ModelCommand;
@@ -127,8 +129,10 @@ mod tests {
         match result {
             CommandResult::OpenListPicker(picker) => {
                 assert_eq!(picker.kind, ListPickerKind::Model);
-                assert!(!picker.items.is_empty());
-                assert!(picker.items.iter().all(|i| i.key.starts_with("openai:")));
+                assert!(!picker.entries().is_empty());
+                assert!(picker.entries().iter().all(
+                    |e| matches!(e, ListPickerEntry::Item(i) if i.key.starts_with("openai:"))
+                ));
             }
             other => panic!("expected OpenListPicker, got {other:?}"),
         }

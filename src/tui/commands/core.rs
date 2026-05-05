@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
-use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+use crate::tui::widgets::{ListPicker, ListPickerEntry, ListPickerItem, ListPickerKind};
 
 /// /help command — open an interactive command picker. With no args,
 /// shows every registered command (filterable, paginated). Selecting a
@@ -119,16 +119,25 @@ mod tests {
         ctx.available_commands = vec![
             ("help".to_string(), "Browse commands".to_string()),
             ("quit".to_string(), "Exit the application".to_string()),
-            ("model".to_string(), "Pick or change the active model".to_string()),
+            (
+                "model".to_string(),
+                "Pick or change the active model".to_string(),
+            ),
         ];
 
         let result = cmd.execute("", &mut ctx).unwrap();
         match result {
             CommandResult::OpenListPicker(picker) => {
                 assert_eq!(picker.kind, crate::tui::widgets::ListPickerKind::Help);
-                assert_eq!(picker.items.len(), 3);
-                assert!(picker.items.iter().any(|i| i.key == "quit"));
-                assert!(picker.items.iter().any(|i| i.primary == "/quit"));
+                assert_eq!(picker.entries().len(), 3);
+                assert!(picker
+                    .entries()
+                    .iter()
+                    .any(|e| matches!(e, ListPickerEntry::Item(i) if i.key == "quit")));
+                assert!(picker
+                    .entries()
+                    .iter()
+                    .any(|e| matches!(e, ListPickerEntry::Item(i) if i.primary == "/quit")));
             }
             other => panic!("Expected OpenListPicker, got {other:?}"),
         }
@@ -138,7 +147,10 @@ mod tests {
     fn help_command_with_arg_shows_one_line_description() {
         let cmd = HelpCommand;
         let mut ctx = test_context();
-        ctx.available_commands = vec![("model".to_string(), "Pick or change the active model".to_string())];
+        ctx.available_commands = vec![(
+            "model".to_string(),
+            "Pick or change the active model".to_string(),
+        )];
 
         let result = cmd.execute("model", &mut ctx).unwrap();
         match result {

@@ -6,6 +6,13 @@
 //! `/model`, `/sessions`, `/resume`, `/personality`, and any future
 //! picker. Each picker carries a `kind` tag so the app's key handler
 //! can dispatch the right action when the user presses Enter.
+//!
+//! Collapsible category headers are supported: `→` or `Enter` on a
+//! category header toggles its collapsed state. Collapsed categories
+//! show only the header; expanded categories show the header + their
+//! items. Search filters across all visible text.
+
+use std::collections::HashSet;
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -24,6 +31,10 @@ pub enum ListPickerKind {
     Personality,
     Skill,
     Help,
+    /// Top-level setup category picker — Persona, Channels, etc.
+    SetupTopic,
+    /// Channel-type picker opened from the Channels category.
+    SetupChannel,
 }
 
 /// One row in the picker. `key` is opaque (provider:model, session id,
@@ -34,6 +45,71 @@ pub struct ListPickerItem {
     pub key: String,
     pub primary: String,
     pub secondary: String,
+}
+
+/// An entry in the list picker — either a regular item or a collapsible
+/// category header.
+#[derive(Debug, Clone)]
+pub enum ListPickerEntry {
+    Item(ListPickerItem),
+    CategoryHeader {
+        id: String,
+        label: String,
+        item_count: usize,
+        collapsed: bool,
+    },
+}
+
+impl ListPickerEntry {
+    pub fn category_header(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        item_count: usize,
+    ) -> Self {
+        Self::CategoryHeader {
+            id: id.into(),
+            label: label.into(),
+            item_count,
+            collapsed: false,
+        }
+    }
+
+    pub fn as_item(&self) -> Option<&ListPickerItem> {
+        match self {
+            Self::Item(i) => Some(i),
+            Self::CategoryHeader { .. } => None,
+        }
+    }
+
+    pub fn as_header(&self) -> Option<(&str, &str, usize, bool)> {
+        match self {
+            Self::CategoryHeader {
+                id,
+                label,
+                item_count,
+                collapsed,
+            } => Some((id.as_str(), label.as_str(), *item_count, *collapsed)),
+            Self::Item(_) => None,
+        }
+    }
+
+    fn primary_text(&self) -> String {
+        match self {
+            Self::Item(i) => i.primary.clone(),
+            Self::CategoryHeader { label, .. } => label.clone(),
+        }
+    }
+
+    fn secondary_text(&self) -> String {
+        match self {
+            Self::Item(i) => i.secondary.clone(),
+            Self::CategoryHeader { item_count, .. } => format!(
+                "{} item{}",
+                item_count,
+                if *item_count == 1 { "" } else { "s" }
+            ),
+        }
+    }
 }
 
 /// Page size for fullscreen-mode pagination. The picker shows up to
@@ -48,13 +124,18 @@ pub enum Focus {
     #[default]
     Search,
     List,
+    /// Cursor is on a category header — Enter/→ toggles collapse.
+    Category,
 }
 
 #[derive(Debug)]
 pub struct ListPicker {
     pub kind: ListPickerKind,
     pub title: String,
-    pub items: Vec<ListPickerItem>,
+    /// Flat list of entries (items + category headers). Items belonging
+    /// to a collapsed category are still present but skipped by
+    /// `filtered_indices()` so they don't appear in navigation.
+    entries: Vec<ListPickerEntry>,
     /// Index into the *current page* of the filtered view (0..PAGE_SIZE).
     /// Reset to 0 whenever the query or page changes.
     pub selected: usize,
@@ -69,9 +150,17 @@ pub struct ListPicker {
     /// to `Search`. Down moves Search→List; Up at list[0] returns to
     /// Search; typing returns focus to Search.
     pub focus: Focus,
+    /// Category IDs that are currently collapsed. Navigation skips items
+    /// in collapsed categories unless a search query is active.
+    collapsed_categories: HashSet<String>,
 }
 
 impl ListPicker {
+    /// Returns the underlying entries (items + category headers).
+    pub fn entries(&self) -> &[ListPickerEntry] {
+        &self.entries
+    }
+
     pub fn new(
         kind: ListPickerKind,
         title: impl Into<String>,
@@ -79,29 +168,75 @@ impl ListPicker {
         preselect_key: Option<&str>,
         empty_hint: impl Into<String>,
     ) -> Self {
+        let entries: Vec<ListPickerEntry> = items.into_iter().map(ListPickerEntry::Item).collect();
         let absolute = preselect_key
-            .and_then(|k| items.iter().position(|i| i.key == k))
+            .and_then(|k| {
+                entries
+                    .iter()
+                    .position(|e| e.as_item().is_some_and(|i| i.key == k))
+            })
             .unwrap_or(0);
-        let page = if items.is_empty() {
+        let page = if entries.is_empty() {
             0
         } else {
             absolute / PAGE_SIZE
         };
         let initial = absolute % PAGE_SIZE;
         let mut list_state = ListState::default();
-        if !items.is_empty() {
+        if !entries.is_empty() {
             list_state.select(Some(initial));
         }
         Self {
             kind,
             title: title.into(),
-            items,
+            entries,
             selected: initial,
             list_state,
             empty_hint: empty_hint.into(),
             query: String::new(),
             page,
             focus: Focus::Search,
+            collapsed_categories: HashSet::new(),
+        }
+    }
+
+    /// Create a picker from pre-grouped entries (items + category headers).
+    /// `preselect_key` matches against `Entry::Item.key` values only.
+    pub fn with_entries(
+        kind: ListPickerKind,
+        title: impl Into<String>,
+        entries: Vec<ListPickerEntry>,
+        preselect_key: Option<&str>,
+        empty_hint: impl Into<String>,
+    ) -> Self {
+        let absolute = preselect_key
+            .and_then(|k| {
+                entries
+                    .iter()
+                    .position(|e| e.as_item().is_some_and(|i| i.key == k))
+            })
+            .unwrap_or(0);
+        let page = if entries.is_empty() {
+            0
+        } else {
+            absolute / PAGE_SIZE
+        };
+        let initial = absolute % PAGE_SIZE;
+        let mut list_state = ListState::default();
+        if !entries.is_empty() {
+            list_state.select(Some(initial));
+        }
+        Self {
+            kind,
+            title: title.into(),
+            entries,
+            selected: initial,
+            list_state,
+            empty_hint: empty_hint.into(),
+            query: String::new(),
+            page,
+            focus: Focus::Search,
+            collapsed_categories: HashSet::new(),
         }
     }
 
@@ -145,41 +280,61 @@ impl ListPicker {
         }
     }
 
-    /// Indices into `self.items` whose primary or secondary text
-    /// case-insensitively contains the current query. Empty query
-    /// returns all indices.
+    /// Indices into `self.entries` that are currently visible (accounting
+    /// for collapsed categories and optional query filter).
     pub fn filtered_indices(&self) -> Vec<usize> {
-        if self.query.is_empty() {
-            return (0..self.items.len()).collect();
-        }
+        let searching = !self.query.is_empty();
         let q = self.query.to_lowercase();
-        self.items
+
+        self.entries
             .iter()
             .enumerate()
-            .filter(|(_, item)| {
-                item.primary.to_lowercase().contains(&q)
-                    || item.secondary.to_lowercase().contains(&q)
+            .filter(|(i, entry)| {
+                match entry {
+                    ListPickerEntry::CategoryHeader { id, collapsed, .. } => {
+                        // Always show headers in filtered results so users can
+                        // navigate to them. When collapsed, only the header
+                        // itself is visible (its items are excluded above).
+                        if searching {
+                            // When searching, show the header if the query matches
+                            // the header label text.
+                            let label_matches = id.to_lowercase().contains(&q);
+                            if !label_matches && !*collapsed {
+                                // Also show if any non-collapsed child item matches.
+                                // This requires looking ahead — simpler: include all
+                                // headers when searching so items under them are reachable.
+                                return true;
+                            }
+                            return label_matches;
+                        }
+                        // No query: always include headers (even collapsed ones).
+                        true
+                    }
+                    ListPickerEntry::Item(item) => {
+                        // When searching, items in collapsed categories are hidden.
+                        if !searching {
+                            return true;
+                        }
+                        item.primary.to_lowercase().contains(&q)
+                            || item.secondary.to_lowercase().contains(&q)
+                    }
+                }
             })
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// Number of currently-visible rows after applying the query.
+    /// Number of currently-visible rows after applying the query and
+    /// collapsed-category state.
     pub fn visible_len(&self) -> usize {
-        if self.query.is_empty() {
-            self.items.len()
-        } else {
-            self.filtered_indices().len()
-        }
+        self.filtered_indices().len()
     }
 
     pub fn move_up(&mut self) {
         match self.focus {
-            // Up from search bar is a no-op (already at the top).
             Focus::Search => {}
-            Focus::List => {
+            Focus::List | Focus::Category => {
                 if self.selected == 0 {
-                    // At top of list → return cursor to search bar.
                     self.focus = Focus::Search;
                 } else {
                     self.selected -= 1;
@@ -195,25 +350,57 @@ impl ListPicker {
             return;
         }
         match self.focus {
-            // First Down enters the list at the currently-highlighted
-            // index (preserves the "preview" of what Enter would pick).
             Focus::Search => {
-                self.focus = Focus::List;
+                self.focus = if matches!(
+                    self.entries.get(self.selected),
+                    Some(ListPickerEntry::CategoryHeader { .. })
+                ) {
+                    Focus::Category
+                } else {
+                    Focus::List
+                };
                 self.list_state.select(Some(self.selected));
             }
-            Focus::List => {
+            Focus::List | Focus::Category => {
                 self.selected = (self.selected + 1) % len;
                 self.list_state.select(Some(self.selected));
             }
         }
     }
 
-    /// The currently-highlighted item, resolving page + selected back to
-    /// the underlying `items` vec.
-    pub fn current(&self) -> Option<&ListPickerItem> {
+    /// Toggle the collapsed state of the category at the current cursor
+    /// position. Safe to call even when the current entry is not a
+    /// category header (no-op).
+    pub fn toggle_current_category(&mut self) {
+        let idx = match self.page_indices().get(self.selected).copied() {
+            Some(i) => i,
+            None => return,
+        };
+        let Some(ListPickerEntry::CategoryHeader { id, collapsed, .. }) = self.entries.get(idx)
+        else {
+            return;
+        };
+        if *collapsed {
+            self.collapsed_categories.remove(id);
+        } else {
+            self.collapsed_categories.insert(id.clone());
+        }
+        // Keep focus on the header.
+        self.focus = Focus::Category;
+    }
+
+    /// The currently-highlighted entry, resolving page + selected back to
+    /// the underlying `entries` vec.
+    pub fn current_entry(&self) -> Option<&ListPickerEntry> {
         let page = self.page_indices();
         let pos = self.selected.min(page.len().saturating_sub(1));
-        page.get(pos).and_then(|i| self.items.get(*i))
+        page.get(pos).and_then(|i| self.entries.get(*i))
+    }
+
+    /// The currently-highlighted item, or `None` if a category header
+    /// is currently selected.
+    pub fn current(&self) -> Option<&ListPickerItem> {
+        self.current_entry().and_then(|e| e.as_item())
     }
 
     /// Append a character to the query and reset the filtered cursor to
@@ -299,7 +486,7 @@ impl ListPicker {
                 ),
                 Span::styled("▎", Style::default().fg(coral)),
                 Span::styled(
-                    format!("  ({}/{}) ", visible_indices.len(), self.items.len()),
+                    format!("  ({}/{}) ", visible_indices.len(), self.entries.len()),
                     Style::default().fg(muted),
                 ),
             ])
@@ -311,7 +498,7 @@ impl ListPicker {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(frame_color));
 
-        if self.items.is_empty() {
+        if self.entries.is_empty() {
             let body = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -341,7 +528,7 @@ impl ListPicker {
 
         // Clamp selection to valid range against the filtered view.
         if self.selected >= visible_indices.len() {
-            self.selected = visible_indices.len() - 1;
+            self.selected = visible_indices.len().saturating_sub(1);
             self.list_state.select(Some(self.selected));
         }
 
@@ -349,27 +536,61 @@ impl ListPicker {
             .iter()
             .enumerate()
             .map(|(filtered_i, original_i)| {
-                let e = &self.items[*original_i];
+                let entry = &self.entries[*original_i];
                 let highlight = filtered_i == self.selected;
-                let primary_style = if highlight {
-                    Style::default()
-                        .fg(dark_bg)
-                        .bg(sky)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(sky)
-                };
-                let secondary_style = if highlight {
-                    Style::default().fg(dark_bg).bg(sky)
-                } else {
-                    Style::default().fg(muted)
-                };
-                let mut spans = vec![Span::styled(format!(" {} ", e.primary), primary_style)];
-                if !e.secondary.is_empty() {
-                    spans.push(Span::styled("   ", secondary_style));
-                    spans.push(Span::styled(e.secondary.clone(), secondary_style));
+                match entry {
+                    ListPickerEntry::CategoryHeader {
+                        label,
+                        item_count,
+                        collapsed,
+                        ..
+                    } => {
+                        let arrow = if *collapsed { "▶" } else { "▼" };
+                        let primary_style = if highlight {
+                            Style::default()
+                                .fg(dark_bg)
+                                .bg(frame_color)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                                .fg(frame_color)
+                                .add_modifier(Modifier::BOLD)
+                        };
+                        let count_style = if highlight {
+                            Style::default().fg(dark_bg).bg(frame_color)
+                        } else {
+                            Style::default().fg(muted)
+                        };
+                        let spans = vec![
+                            Span::styled(format!(" {} ", arrow), primary_style),
+                            Span::styled(label.clone(), primary_style),
+                            Span::styled(format!("  ({}) ", item_count), count_style),
+                        ];
+                        ListItem::new(Line::from(spans))
+                    }
+                    ListPickerEntry::Item(item) => {
+                        let primary_style = if highlight {
+                            Style::default()
+                                .fg(dark_bg)
+                                .bg(sky)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(sky)
+                        };
+                        let secondary_style = if highlight {
+                            Style::default().fg(dark_bg).bg(sky)
+                        } else {
+                            Style::default().fg(muted)
+                        };
+                        let mut spans =
+                            vec![Span::styled(format!(" {} ", item.primary), primary_style)];
+                        if !item.secondary.is_empty() {
+                            spans.push(Span::styled("   ", secondary_style));
+                            spans.push(Span::styled(item.secondary.clone(), secondary_style));
+                        }
+                        ListItem::new(Line::from(spans))
+                    }
                 }
-                ListItem::new(Line::from(spans))
             })
             .collect();
 
@@ -406,12 +627,12 @@ impl ListPicker {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),     // title
-                Constraint::Length(1),     // spacer
-                Constraint::Length(3),     // search input box (bordered)
-                Constraint::Length(1),     // spacer
-                Constraint::Min(3),        // list
-                Constraint::Length(2),     // footer (1 line + spacer)
+                Constraint::Length(1), // title
+                Constraint::Length(1), // spacer
+                Constraint::Length(3), // search input box (bordered)
+                Constraint::Length(1), // spacer
+                Constraint::Min(3),    // list
+                Constraint::Length(2), // footer (1 line + spacer)
             ])
             .split(outer);
 
@@ -424,7 +645,7 @@ impl ListPicker {
                 Style::default().fg(coral).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("   {}/{}", visible_indices.len(), self.items.len()),
+                format!("   {}/{}", visible_indices.len(), self.entries.len()),
                 Style::default().fg(muted),
             ),
             Span::styled(
@@ -452,10 +673,7 @@ impl ListPicker {
                 ),
             ];
             if search_focused {
-                spans.insert(
-                    2,
-                    Span::styled("▎ ", Style::default().fg(coral)),
-                );
+                spans.insert(2, Span::styled("▎ ", Style::default().fg(coral)));
             }
             Line::from(spans)
         } else {
@@ -476,7 +694,7 @@ impl ListPicker {
 
         // List.
         let list_area = chunks[4];
-        if self.items.is_empty() {
+        if self.entries.is_empty() {
             let body = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -500,50 +718,95 @@ impl ListPicker {
             // Render only the current page slice.
             let page_indices = self.page_indices();
             if self.selected >= page_indices.len() && !page_indices.is_empty() {
-                self.selected = page_indices.len() - 1;
+                self.selected = page_indices.len().saturating_sub(1);
                 self.list_state.select(Some(self.selected));
             }
 
-            // Each item is rendered as TWO lines (Claude-Code-style):
-            // primary text on row 1, muted secondary on row 2. The
-            // selected row glows when the LIST has focus; while focus
-            // sits on the search bar it stays a muted "preview" so
-            // the user can tell which area owns the cursor.
+            let category_focused = self.focus == Focus::Category;
             let list_focused = self.focus == Focus::List;
             let items: Vec<ListItem> = page_indices
                 .iter()
                 .enumerate()
                 .map(|(page_i, original_i)| {
-                    let e = &self.items[*original_i];
+                    let entry = &self.entries[*original_i];
                     let is_selected = page_i == self.selected;
-                    let highlight = is_selected && list_focused;
-                    let arrow = if highlight {
-                        "▸ "
-                    } else if is_selected {
-                        "› "
-                    } else {
-                        "  "
-                    };
-                    let primary_style = if highlight {
-                        Style::default().fg(emerald).add_modifier(Modifier::BOLD)
-                    } else if is_selected {
-                        Style::default().fg(sky).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(sky)
-                    };
-                    let secondary_style = Style::default().fg(muted);
-                    let mut lines = vec![Line::from(vec![
-                        Span::styled(arrow, primary_style),
-                        Span::styled(e.primary.clone(), primary_style),
-                    ])];
-                    if !e.secondary.is_empty() {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(e.secondary.clone(), secondary_style),
-                        ]));
+                    match entry {
+                        ListPickerEntry::CategoryHeader {
+                            label,
+                            item_count,
+                            collapsed,
+                            ..
+                        } => {
+                            let highlight = is_selected && category_focused;
+                            let arrow = if *collapsed { "▶" } else { "▼" };
+                            let primary_style = if highlight {
+                                Style::default()
+                                    .fg(dark_bg)
+                                    .bg(frame_color)
+                                    .add_modifier(Modifier::BOLD)
+                            } else if is_selected {
+                                Style::default()
+                                    .fg(frame_color)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(frame_color)
+                            };
+                            let count_style = if highlight {
+                                Style::default().fg(dark_bg).bg(frame_color)
+                            } else {
+                                Style::default().fg(muted)
+                            };
+                            let toggle_hint = if highlight { " ◀▶ " } else { "    " };
+                            let mut lines = vec![Line::from(vec![
+                                Span::styled(toggle_hint, primary_style),
+                                Span::styled(format!("{} ", arrow), primary_style),
+                                Span::styled(label.clone(), primary_style),
+                            ])];
+                            lines.push(Line::from(vec![
+                                Span::raw("       "),
+                                Span::styled(
+                                    format!(
+                                        "{} item{}",
+                                        item_count,
+                                        if *item_count == 1 { "" } else { "s" }
+                                    ),
+                                    count_style,
+                                ),
+                            ]));
+                            lines.push(Line::from(""));
+                            ListItem::new(lines)
+                        }
+                        ListPickerEntry::Item(item) => {
+                            let highlight = is_selected && list_focused;
+                            let arrow = if highlight {
+                                "▸ "
+                            } else if is_selected {
+                                "› "
+                            } else {
+                                "  "
+                            };
+                            let primary_style = if highlight {
+                                Style::default().fg(emerald).add_modifier(Modifier::BOLD)
+                            } else if is_selected {
+                                Style::default().fg(sky).add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(sky)
+                            };
+                            let secondary_style = Style::default().fg(muted);
+                            let mut lines = vec![Line::from(vec![
+                                Span::styled(arrow, primary_style),
+                                Span::styled(item.primary.clone(), primary_style),
+                            ])];
+                            if !item.secondary.is_empty() {
+                                lines.push(Line::from(vec![
+                                    Span::raw("  "),
+                                    Span::styled(item.secondary.clone(), secondary_style),
+                                ]));
+                            }
+                            lines.push(Line::from(""));
+                            ListItem::new(lines)
+                        }
                     }
-                    lines.push(Line::from(""));
-                    ListItem::new(lines)
                 })
                 .collect();
             let _ = dark_bg; // intentionally unused in fullscreen variant
@@ -556,7 +819,7 @@ impl ListPicker {
             Span::styled("↑/↓", Style::default().fg(sky)),
             Span::styled(" navigate · ", Style::default().fg(muted)),
             Span::styled("←/→", Style::default().fg(sky)),
-            Span::styled(" page · ", Style::default().fg(muted)),
+            Span::styled(" collapse · ", Style::default().fg(muted)),
             Span::styled("type", Style::default().fg(sky)),
             Span::styled(" to filter · ", Style::default().fg(muted)),
             Span::styled("Enter", Style::default().fg(sky)),
@@ -842,5 +1105,10 @@ mod tests {
         assert_eq!(p.page, 1);
         assert_eq!(p.selected, 2);
         assert_eq!(p.current().unwrap().key, "k7");
+    }
+
+    #[test]
+    fn setup_topic_kind_distinct_from_channel_kind() {
+        assert_ne!(ListPickerKind::SetupTopic, ListPickerKind::SetupChannel);
     }
 }

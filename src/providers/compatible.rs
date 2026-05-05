@@ -483,11 +483,7 @@ struct ResponsesContent {
 /// fall on chunk boundaries (e.g. one delta ends with `<thi` and the next
 /// starts with `nk>`), so the caller carries `in_think` and `partial` state
 /// across calls.
-pub(crate) fn filter_think_tags(
-    input: &str,
-    in_think: &mut bool,
-    partial: &mut String,
-) -> String {
+pub(crate) fn filter_think_tags(input: &str, in_think: &mut bool, partial: &mut String) -> String {
     let combined = format!("{partial}{input}");
     partial.clear();
     let mut out = String::new();

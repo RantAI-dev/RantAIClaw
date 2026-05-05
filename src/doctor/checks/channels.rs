@@ -102,7 +102,11 @@ pub fn inspect_channels(config: &crate::config::Config) -> ChannelSummary {
             .as_deref()
             .map(|t| !t.trim().is_empty())
             .unwrap_or(false);
-        let web_ok = c.session_path.as_deref().map(|p| !p.trim().is_empty()).unwrap_or(false);
+        let web_ok = c
+            .session_path
+            .as_deref()
+            .map(|p| !p.trim().is_empty())
+            .unwrap_or(false);
         if cloud_ok || web_ok {
             configured.push("whatsapp");
         } else {
@@ -170,7 +174,9 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
     }
     if let Some(c) = cc.whatsapp.as_ref() {
         // Cloud API path: probe Graph if access_token + phone_number_id set.
-        if let (Some(token), Some(phone_id)) = (c.access_token.as_deref(), c.phone_number_id.as_deref()) {
+        if let (Some(token), Some(phone_id)) =
+            (c.access_token.as_deref(), c.phone_number_id.as_deref())
+        {
             if !token.trim().is_empty() && !phone_id.trim().is_empty() {
                 match probe_whatsapp_cloud(&client, token, phone_id).await {
                     Ok(()) => ok.push("whatsapp (cloud-api)".to_string()),
@@ -185,9 +191,7 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
                 ProbeWebResult::SessionMissing => {
                     warn.push("whatsapp web: no session — needs QR pairing on next run".to_string())
                 }
-                ProbeWebResult::SessionPathBad(e) => {
-                    bad.push(format!("whatsapp web session: {e}"))
-                }
+                ProbeWebResult::SessionPathBad(e) => bad.push(format!("whatsapp web session: {e}")),
             }
         }
     }
@@ -280,7 +284,10 @@ async fn probe_slack(client: &reqwest::Client, token: &str) -> Result<String, St
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
     if !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let err = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let err = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         return Err(format!("slack-side: {err}"));
     }
     Ok(body

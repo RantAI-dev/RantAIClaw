@@ -80,8 +80,7 @@ pub fn install_starter_pack(profile: &Profile) -> Result<Vec<String>> {
         if dir.exists() {
             continue;
         }
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("create skill dir {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| format!("create skill dir {}", dir.display()))?;
         let skill_md = dir.join("SKILL.md");
         fs::write(&skill_md, skill.skill_md)
             .with_context(|| format!("write {}", skill_md.display()))?;

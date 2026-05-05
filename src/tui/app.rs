@@ -1,6 +1,6 @@
 use std::io::{self, IsTerminal, Stdout, Write};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -60,12 +60,26 @@ pub struct TuiApp {
     pub state: AppState,
     pub context: TuiContext,
     pub command_registry: CommandRegistry,
+    /// Active config, cloned for provisioner use.
+    pub config: crate::config::Config,
+    /// Active profile, cloned for provisioner use.
+    pub profile: crate::profile::Profile,
     /// Slash-command dropdown — visible whenever the input buffer starts
     /// with `/`. Filtered by prefix on every keystroke.
     pub autocomplete: super::widgets::autocomplete::Autocomplete,
     /// Active modal overlay (e.g. /help). `None` = no overlay shown.
     /// Esc dismisses; left/right arrows cycle tabs.
     pub overlay: Option<super::commands::OverlayContent>,
+    /// Active setup provisioner overlay. When `Some`, the chat input is
+    /// suppressed and key events route to the overlay. The provisioner
+    /// runs on a tokio task and emits `ProvisionEvent`s received here.
+    pub setup_overlay: Option<super::SetupOverlayState>,
+    /// Receiver for events emitted by the active provisioner.
+    pub setup_event_rx:
+        Option<tokio::sync::mpsc::Receiver<crate::onboard::provision::ProvisionEvent>>,
+    /// Sender for responses (prompt answers) back to the provisioner.
+    pub setup_response_tx:
+        Option<tokio::sync::mpsc::Sender<crate::onboard::provision::ProvisionResponse>>,
     /// Active interactive list picker — Up/Down/Enter/Esc overlay used
     /// by `/model`, `/sessions`, `/resume`, `/personality`, etc. The
     /// `ListPicker.kind` tag tells the Enter handler what to do with the
@@ -93,6 +107,40 @@ pub struct TuiApp {
     /// Set by command handlers via `CommandResult::ClearTerminal` and
     /// consumed once the wipe is performed.
     pub clear_terminal_request: bool,
+    /// First-run wizard. When `Some`, the app renders the wizard
+    /// instead of the normal chat UI. Provisioner steps use the
+    /// existing `setup_overlay` mechanism.
+    pub first_run_wizard: Option<super::FirstRunWizard>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetupTopicAction {
+    TuiProvisioner(String),
+    OpenChannelSubPicker,
+    Unknown,
+}
+
+pub fn dispatch_setup_topic_key(key: &str) -> SetupTopicAction {
+    if key == "channels" {
+        return SetupTopicAction::OpenChannelSubPicker;
+    }
+    if crate::onboard::provision::provisioner_for(key).is_some() {
+        return SetupTopicAction::TuiProvisioner(key.to_string());
+    }
+    SetupTopicAction::Unknown
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetupChannelAction {
+    TuiProvisioner(String),
+    Unknown,
+}
+
+pub fn dispatch_setup_channel_key(key: &str) -> SetupChannelAction {
+    if crate::onboard::provision::provisioner_for(key).is_some() {
+        return SetupChannelAction::TuiProvisioner(key.to_string());
+    }
+    SetupChannelAction::Unknown
 }
 
 impl TuiApp {
@@ -102,12 +150,14 @@ impl TuiApp {
     /// `TuiAgentActor`. The actor owns the paired `req_rx`/`events_tx` and is
     /// spawned by `run_tui` before the app is constructed.
     pub fn new(
-        config: &TuiConfig,
+        tui_config: &TuiConfig,
+        config: crate::config::Config,
+        profile: crate::profile::Profile,
         req_tx: mpsc::Sender<TurnRequest>,
         events_rx: mpsc::Receiver<AgentEvent>,
     ) -> Result<Self> {
-        std::fs::create_dir_all(&config.data_dir)?;
-        let db_path = config.data_dir.join("sessions.db");
+        std::fs::create_dir_all(&tui_config.data_dir)?;
+        let db_path = tui_config.data_dir.join("sessions.db");
         let store = SessionStore::open(&db_path)?;
         // Best-effort one-shot: derive titles for legacy sessions that
         // never went through the auto-titling path. Idempotent — a no-op
@@ -116,8 +166,8 @@ impl TuiApp {
 
         let mut context = TuiContext::new(
             store,
-            &config.model,
-            config.resume_session.as_deref(),
+            &tui_config.model,
+            tui_config.resume_session.as_deref(),
             req_tx,
             events_rx,
         )?;
@@ -136,14 +186,20 @@ impl TuiApp {
             state: AppState::Ready,
             context,
             command_registry,
+            config,
+            profile,
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            setup_overlay: None,
+            setup_event_rx: None,
+            setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            first_run_wizard: None,
         })
     }
 
@@ -289,7 +345,7 @@ impl TuiApp {
             //
             // Multi-line prompts work via Ctrl+J (handled above) or
             // Shift+Enter on terminals with the kitty keyboard protocol.
-            KeyCode::Enter => {
+            KeyCode::Enter if self.setup_overlay.is_none() => {
                 if self.autocomplete.is_visible() {
                     let buf = self.context.input_buffer.trim_end_matches(' ').to_string();
                     let selected = self.autocomplete.selected().map(str::to_string);
@@ -339,13 +395,13 @@ impl TuiApp {
                 }
             }
             // Backspace
-            KeyCode::Backspace => {
+            KeyCode::Backspace if self.setup_overlay.is_none() => {
                 self.context.input_buffer.pop();
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
             }
             // Regular character input
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if self.setup_overlay.is_none() => {
                 self.context.input_buffer.push(c);
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
@@ -361,17 +417,246 @@ impl TuiApp {
             // Up/Down with no modal active recalls submitted prompts
             // from history. Native terminal scrollback (mouse wheel /
             // PgUp on the host terminal) handles chat scrolling.
-            KeyCode::Up => {
+            KeyCode::Up if self.setup_overlay.is_none() => {
                 if let Some(text) = self.context.history_recall_older() {
                     self.context.input_buffer = text;
                     self.refresh_autocomplete();
                 }
             }
-            KeyCode::Down => {
+            KeyCode::Down if self.setup_overlay.is_none() => {
                 if let Some(text) = self.context.history_recall_newer() {
                     self.context.input_buffer = text;
                     self.refresh_autocomplete();
                 }
+            }
+            // Esc — close the setup overlay or cancel the wizard.
+            KeyCode::Esc if self.setup_overlay.is_some() || self.first_run_wizard.is_some() => {
+                // If wizard is active, cancel the entire wizard.
+                if self.first_run_wizard.is_some() {
+                    let was_finished = self
+                        .setup_overlay
+                        .as_ref()
+                        .map(|o| o.finished)
+                        .unwrap_or(false);
+                    if !was_finished {
+                        if let Some(tx) = self.setup_response_tx.take() {
+                            let _ = tx
+                                .send(crate::onboard::provision::ProvisionResponse::Cancelled)
+                                .await;
+                        }
+                    }
+                    self.first_run_wizard = None;
+                    self.setup_overlay = None;
+                    self.setup_event_rx = None;
+                    self.setup_response_tx = None;
+                    if let Err(e) = self.reload_config() {
+                        tracing::warn!("failed to reload config after wizard cancel: {}", e);
+                    }
+                    return Ok(EventResult::Continue);
+                }
+                let was_finished = self
+                    .setup_overlay
+                    .as_ref()
+                    .map(|o| o.finished)
+                    .unwrap_or(false);
+                // Cancel only if the provisioner is still running. If
+                // `finished` is set, the task has already exited and
+                // sending Cancelled would be a no-op (and may panic
+                // if the receiver has been dropped).
+                if !was_finished {
+                    if let Some(tx) = self.setup_response_tx.take() {
+                        let _ = tx
+                            .send(crate::onboard::provision::ProvisionResponse::Cancelled)
+                            .await;
+                    }
+                }
+                self.setup_overlay = None;
+                self.setup_event_rx = None;
+                self.setup_response_tx = None;
+                // Reload config so freshly-written sections take effect.
+                if let Err(e) = self.reload_config() {
+                    tracing::warn!("failed to reload config after setup: {}", e);
+                }
+            }
+            // Enter — submit the active prompt response.
+            KeyCode::Enter
+                if self.setup_overlay.is_some()
+                    && self
+                        .setup_overlay
+                        .as_ref()
+                        .is_some_and(|o| o.active_prompt().is_some()) =>
+            {
+                let (_id, value) = {
+                    let overlay = self.setup_overlay.as_mut().unwrap();
+                    overlay
+                        .submit_prompt()
+                        .unwrap_or_else(|| ("".into(), "".into()))
+                };
+                if let Some(tx) = &self.setup_response_tx {
+                    let _ = tx
+                        .send(crate::onboard::provision::ProvisionResponse::Text(value))
+                        .await;
+                }
+                // Also drain the event that carries the prompt to the overlay.
+                if let Some(rx) = &mut self.setup_event_rx {
+                    while let Ok(ev) = rx.try_recv() {
+                        if let Some(o) = &mut self.setup_overlay {
+                            o.handle_event(ev);
+                        }
+                    }
+                }
+            }
+            // Char input — route to overlay input when a prompt is active.
+            KeyCode::Char(c)
+                if self.setup_overlay.is_some()
+                    && self
+                        .setup_overlay
+                        .as_ref()
+                        .is_some_and(|o| o.active_prompt().is_some()) =>
+            {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.push_char(c);
+                }
+            }
+            // Backspace — delete from overlay input when a prompt is active.
+            KeyCode::Backspace
+                if self.setup_overlay.is_some()
+                    && self
+                        .setup_overlay
+                        .as_ref()
+                        .is_some_and(|o| o.active_prompt().is_some()) =>
+            {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.pop_char();
+                }
+            }
+            // Up — choose navigation.
+            KeyCode::Up
+                if self.setup_overlay.is_some()
+                    && self
+                        .setup_overlay
+                        .as_ref()
+                        .is_some_and(|o| o.active_choose().is_some()) =>
+            {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.choose_move_up();
+                }
+            }
+            // Down — choose navigation.
+            KeyCode::Down
+                if self.setup_overlay.is_some()
+                    && self
+                        .setup_overlay
+                        .as_ref()
+                        .is_some_and(|o| o.active_choose().is_some()) =>
+            {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.choose_move_down();
+                }
+            }
+            // Space — toggle in multi-select choose.
+            KeyCode::Char(' ')
+                if self.setup_overlay.is_some()
+                    && self
+                        .setup_overlay
+                        .as_ref()
+                        .is_some_and(|o| o.active_choose().is_some()) =>
+            {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.choose_toggle();
+                }
+            }
+            // First-run wizard Enter handling — non-provisioner phases only.
+            KeyCode::Enter if self.first_run_wizard.is_some() => {
+                let wizard = self.first_run_wizard.as_mut().unwrap();
+                match wizard.phase {
+                    super::first_run_wizard::WizardPhase::Welcome => {
+                        wizard.phase =
+                            super::first_run_wizard::WizardPhase::RunningProvisioner { idx: 0 };
+                        if let Some(name) = wizard.current_provisioner_name() {
+                            if let Err(e) = self.open_setup_overlay(name.to_string()) {
+                                let msg = format!("Failed to open provisioner: {}", e);
+                                let _ = self.context.append_system_message(&msg);
+                            }
+                        }
+                    }
+                    super::first_run_wizard::WizardPhase::ProjectContext => {
+                        wizard.finish_project_context();
+                    }
+                    super::first_run_wizard::WizardPhase::ScaffoldFiles => {
+                        wizard.finish();
+                    }
+                    super::first_run_wizard::WizardPhase::Complete => {
+                        self.first_run_wizard = None;
+                    }
+                    super::first_run_wizard::WizardPhase::RunningProvisioner { .. } => {
+                        // Provisioner overlay handles Enter
+                    }
+                }
+            }
+            // Enter — submit choose or submit prompt.
+            KeyCode::Enter
+                if self.setup_overlay.is_some()
+                    && (self
+                        .setup_overlay
+                        .as_ref()
+                        .is_some_and(|o| o.active_choose().is_some())
+                        || self
+                            .setup_overlay
+                            .as_ref()
+                            .is_some_and(|o| o.active_prompt().is_some())) =>
+            {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    if let Some((id, sel)) = o.submit_choose() {
+                        if let Some(tx) = &self.setup_response_tx {
+                            let _ = tx
+                                .send(crate::onboard::provision::ProvisionResponse::Selection(sel));
+                        }
+                    } else if let Some((id, val)) = o.submit_prompt() {
+                        if let Some(tx) = &self.setup_response_tx {
+                            let _ =
+                                tx.send(crate::onboard::provision::ProvisionResponse::Text(val));
+                        }
+                    }
+                }
+            }
+            // Setup overlay open with no active prompt/choose — Up/Down/
+            // PageUp/PageDown/Home/End scroll the overlay so the user can
+            // see content (especially the QR + status log) that exceeds
+            // the terminal height.
+            KeyCode::Up if self.setup_overlay.is_some() => {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.scroll_up();
+                }
+            }
+            KeyCode::Down if self.setup_overlay.is_some() => {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.scroll_down();
+                }
+            }
+            KeyCode::PageUp if self.setup_overlay.is_some() => {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.scroll_page_up();
+                }
+            }
+            KeyCode::PageDown if self.setup_overlay.is_some() => {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.scroll_page_down();
+                }
+            }
+            KeyCode::Home if self.setup_overlay.is_some() => {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.scroll_home();
+                }
+            }
+            KeyCode::End if self.setup_overlay.is_some() => {
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    o.scroll_end();
+                }
+            }
+            // Catch-all for any other key while overlay is open — swallow.
+            _ if self.setup_overlay.is_some() => {
+                return Ok(EventResult::Continue);
             }
             _ => {}
         }
@@ -459,6 +744,56 @@ impl TuiApp {
         while let Ok(ev) = self.context.events_rx.try_recv() {
             self.handle_agent_event(ev);
         }
+        if let Some(rx) = &mut self.setup_event_rx {
+            while let Ok(ev) = rx.try_recv() {
+                if let Some(overlay) = &mut self.setup_overlay {
+                    overlay.handle_event(ev.clone());
+                }
+                if let Some(wizard) = &mut self.first_run_wizard {
+                    wizard.handle_provisioner_event(ev);
+                }
+            }
+        }
+        // Wizard auto-advance: when the current provisioner finishes,
+        // spawn the next one or advance to the next wizard phase.
+        if let Some(wizard) = &mut self.first_run_wizard {
+            if matches!(
+                wizard.phase,
+                super::first_run_wizard::WizardPhase::RunningProvisioner { .. }
+            ) {
+                if self.setup_overlay.as_ref().is_some_and(|o| o.finished) {
+                    self.setup_overlay = None;
+                    self.setup_event_rx = None;
+                    self.setup_response_tx = None;
+                    wizard.advance();
+                    if matches!(
+                        wizard.phase,
+                        super::first_run_wizard::WizardPhase::RunningProvisioner { .. }
+                    ) {
+                        if let Some(name) = wizard.current_provisioner_name() {
+                            if let Err(e) = self.open_setup_overlay(name.to_string()) {
+                                let msg = format!("Failed to open provisioner: {}", e);
+                                let _ = self.context.append_system_message(&msg);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Note: we no longer auto-clear the overlay when the provisioner
+        // sets `finished = true`. The user dismisses via Esc so they can
+        // read the success/failure summary at their own pace. The Esc
+        // handler does the cleanup (clear overlay state + reload config).
+    }
+
+    fn reload_config(&mut self) -> anyhow::Result<()> {
+        let path = self.profile.config_toml();
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read config from {}", path.display()))?;
+        let config: crate::config::Config =
+            toml::from_str(&contents).context("failed to parse config file")?;
+        self.config = config;
+        Ok(())
     }
 
     /// Apply a single `AgentEvent` to the app state.
@@ -654,8 +989,14 @@ impl TuiApp {
             CmdResult::OpenListPicker(picker) => {
                 self.list_picker = Some(picker);
             }
-            CmdResult::OpenSetupOverlay { .. } => {
-                // Wired in Task 5 — placeholder so we stay compilable.
+            CmdResult::OpenSetupOverlay { provisioner } => {
+                if let Some(name) = provisioner {
+                    if let Err(e) = self.open_setup_overlay(name) {
+                        let msg = format!("Failed to open setup: {}", e);
+                        let _ = self.context.append_system_message(&msg);
+                        self.scrollback_queue.push(("system".to_string(), msg));
+                    }
+                }
             }
             CmdResult::ClearTerminal(announce) => {
                 // The actual screen+scrollback wipe runs in `run_loop`
@@ -748,7 +1089,79 @@ impl TuiApp {
                 self.context.input_buffer = format!("/{key} ");
                 self.refresh_autocomplete();
             }
+            ListPickerKind::SetupTopic => match dispatch_setup_topic_key(&key) {
+                SetupTopicAction::TuiProvisioner(ref name) => {
+                    let name = name.clone();
+                    match self.open_setup_overlay(name.clone()) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            let msg = format!("Failed to open {name} setup: {e}");
+                            let _ = self.context.append_system_message(&msg);
+                            self.scrollback_queue.push(("system".into(), msg));
+                        }
+                    }
+                }
+                SetupTopicAction::OpenChannelSubPicker => self.open_channel_sub_picker(),
+                SetupTopicAction::Unknown => {
+                    let msg = format!("Unknown setup topic: {key}");
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".into(), msg));
+                }
+            },
+            ListPickerKind::SetupChannel => match dispatch_setup_channel_key(&key) {
+                SetupChannelAction::TuiProvisioner(ref name) => {
+                    let name = name.clone();
+                    match self.open_setup_overlay(name.clone()) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            let msg = format!("Failed to open {name} setup: {e}");
+                            let _ = self.context.append_system_message(&msg);
+                            self.scrollback_queue.push(("system".into(), msg));
+                        }
+                    }
+                }
+                SetupChannelAction::Unknown => {
+                    let msg = format!(
+                        "Channel {key} is not yet available in-TUI. Run `rantaiclaw setup channels --non-interactive` from a shell to use the legacy CLI flow."
+                    );
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".into(), msg));
+                }
+            },
         }
+    }
+
+    fn open_setup_overlay(&mut self, name: String) -> anyhow::Result<()> {
+        use crate::onboard::provision::provisioner_for;
+
+        let prov =
+            provisioner_for(&name).ok_or_else(|| anyhow::anyhow!("unknown provisioner: {name}"))?;
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(32);
+        let (response_tx, response_rx) = tokio::sync::mpsc::channel(8);
+
+        let mut config = self.config.clone();
+        let profile = self.profile.clone();
+
+        let prov_name = prov.name().to_string();
+        let overlay_state = crate::tui::SetupOverlayState::new(format!("Setup — {prov_name}"));
+
+        self.setup_overlay = Some(overlay_state);
+        self.setup_event_rx = Some(events_rx);
+        self.setup_response_tx = Some(response_tx);
+
+        let events_tx = events_tx;
+        tokio::spawn(async move {
+            let io = crate::onboard::provision::ProvisionIo {
+                events: events_tx,
+                responses: response_rx,
+            };
+            if let Err(e) = prov.run(&mut config, &profile, io).await {
+                tracing::error!(provisioner = prov_name, "provisioner error: {e}");
+            }
+        });
+
+        Ok(())
     }
 
     /// Dispatch a `/retry`-style resubmit: re-runs an existing user message
@@ -776,6 +1189,35 @@ impl TuiApp {
             }
             AppState::Quitting => {}
         }
+    }
+
+    fn open_channel_sub_picker(&mut self) {
+        use crate::onboard::provision::{available, provisioner_for, ProvisionerCategory};
+        use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+
+        let items: Vec<ListPickerItem> = available()
+            .into_iter()
+            .filter_map(|(name, desc)| {
+                let p = provisioner_for(name)?;
+                if p.category() == ProvisionerCategory::Channel {
+                    Some(ListPickerItem {
+                        key: name.to_string(),
+                        primary: name.to_string(),
+                        secondary: desc.to_string(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let picker = ListPicker::new(
+            ListPickerKind::SetupChannel,
+            "Select channel type",
+            items,
+            None,
+            "no channel provisioners available",
+        );
+        self.list_picker = Some(picker);
     }
 
     /// Render the inline viewport — only the bottom `INLINE_VIEWPORT_LINES`
@@ -820,6 +1262,16 @@ impl TuiApp {
             // List picker overlay — covers the entire 6-row viewport.
             if let Some(picker) = list_picker.as_mut() {
                 picker.render(frame, area);
+            }
+
+            // Setup overlay — full terminal coverage while active.
+            if let Some(overlay_state) = self.setup_overlay.as_mut() {
+                overlay_state.render(frame, area);
+            }
+
+            // First-run wizard — full terminal coverage, renders over everything.
+            if let Some(wizard) = &mut self.first_run_wizard {
+                wizard.render_fullscreen(frame, area);
             }
 
             // Slash-command dropdown — anchored just above the input box,
@@ -2129,6 +2581,12 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
 
     let agent = Agent::from_config(&app_config)?;
 
+    let profile =
+        crate::profile::ProfileManager::active().unwrap_or_else(|_| crate::profile::Profile {
+            name: "default".to_string(),
+            root: crate::profile::paths::profile_dir("default"),
+        });
+
     // Channel capacities are intentionally small on the request side (user
     // input is human-paced) and larger on the event side (streaming chunks
     // burst quickly per turn).
@@ -2151,8 +2609,24 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         }
     }
 
-    let mut app = TuiApp::new(&tui_config, req_tx, events_rx)?;
+    let mut app = TuiApp::new(
+        &tui_config,
+        app_config.clone(),
+        profile.clone(),
+        req_tx,
+        events_rx,
+    )?;
     app.context.available_providers = available_providers;
+
+    if let Some(topic) = tui_config.setup_provisioner.take() {
+        if let Err(e) = app.open_setup_overlay(topic) {
+            let msg = format!("Failed to open setup: {}", e);
+            let _ = app.context.append_system_message(&msg);
+            app.scrollback_queue.push(("system".to_string(), msg));
+        }
+    } else if app_config.api_key.is_none() && app_config.default_provider.is_none() {
+        app.first_run_wizard = Some(crate::tui::FirstRunWizard::new(profile.clone()));
+    }
 
     // Idempotent first-run skill seeding: if the workspace skills dir
     // is empty, drop the 5-skill starter pack (web-search, summarizer,
@@ -2160,9 +2634,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // /skills picker has real content out of the box. Mirrors Hermes'
     // bundled-skills-on-install UX. Best-effort — failure is logged but
     // doesn't block startup.
-    if let Ok(profile) = crate::profile::ProfileManager::active() {
-        let _ = crate::skills::bundled::install_starter_pack(&profile);
-    }
+    let _ = crate::skills::bundled::install_starter_pack(&profile);
     // Load skills from the active workspace so /skills can browse them.
     // load_skills_with_config falls back to an empty vec on any error
     // (missing dir, malformed manifest, etc.) — never blocks startup.
@@ -2213,7 +2685,9 @@ async fn run_loop(
         // Alt-screen entry/exit covers TWO triggers — list picker open
         // OR slash-autocomplete dropdown visible. Edge-triggered via
         // option presence so we don't churn buffers on every keystroke.
-        let want_alt = app.list_picker.is_some() || app.autocomplete.is_visible();
+        let want_alt = app.list_picker.is_some()
+            || app.autocomplete.is_visible()
+            || app.setup_overlay.is_some();
         let in_alt = alt.is_some();
         if want_alt && !in_alt {
             execute!(io::stdout(), EnterAlternateScreen)?;
@@ -2266,11 +2740,16 @@ async fn run_loop(
 
         if let Some(ref mut alt_term) = alt {
             // While in alt-screen, render whichever overlay drove us in.
-            // Picker takes precedence over autocomplete (since the
-            // picker is modal — autocomplete can't actually be active
-            // simultaneously, but if both flags happened to coincide
-            // the picker is what the user is interacting with).
-            if app.list_picker.is_some() {
+            // Setup overlay takes precedence (it's the most modal — owns
+            // a provisioner task), then picker, then autocomplete.
+            if app.setup_overlay.is_some() {
+                alt_term.draw(|frame| {
+                    let area = frame.area();
+                    if let Some(o) = app.setup_overlay.as_mut() {
+                        o.render(frame, area);
+                    }
+                })?;
+            } else if app.list_picker.is_some() {
                 app.render_fullscreen_picker(alt_term)?;
             } else {
                 app.render_fullscreen_autocomplete(alt_term)?;
@@ -2409,14 +2888,23 @@ mod tests {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
+            config: crate::config::Config::default(),
+            profile: crate::profile::Profile {
+                name: "default".to_string(),
+                root: crate::profile::paths::profile_dir("default"),
+            },
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            setup_overlay: None,
+            setup_event_rx: None,
+            setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            first_run_wizard: None,
         }
     }
 
@@ -2478,14 +2966,23 @@ mod submit_tests {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
+            config: crate::config::Config::default(),
+            profile: crate::profile::Profile {
+                name: "default".to_string(),
+                root: crate::profile::paths::profile_dir("default"),
+            },
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            setup_overlay: None,
+            setup_event_rx: None,
+            setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            first_run_wizard: None,
         }
     }
 
@@ -2558,14 +3055,23 @@ mod ctrl_c_tests {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
+            config: crate::config::Config::default(),
+            profile: crate::profile::Profile {
+                name: "default".to_string(),
+                root: crate::profile::paths::profile_dir("default"),
+            },
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            setup_overlay: None,
+            setup_event_rx: None,
+            setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            first_run_wizard: None,
         }
     }
 
@@ -2621,14 +3127,23 @@ mod drain_tests {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
+            config: crate::config::Config::default(),
+            profile: crate::profile::Profile {
+                name: "default".to_string(),
+                root: crate::profile::paths::profile_dir("default"),
+            },
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            setup_overlay: None,
+            setup_event_rx: None,
+            setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            first_run_wizard: None,
         }
     }
 
@@ -2754,14 +3269,23 @@ mod retry_tests {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
+            config: crate::config::Config::default(),
+            profile: crate::profile::Profile {
+                name: "default".to_string(),
+                root: crate::profile::paths::profile_dir("default"),
+            },
             autocomplete: crate::tui::widgets::Autocomplete::new(),
             overlay: None,
+            setup_overlay: None,
+            setup_event_rx: None,
+            setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            first_run_wizard: None,
         }
     }
 

@@ -34,17 +34,28 @@ pub fn diagnose_allowlist(file: &Path) -> AllowlistDiagnosis {
         return AllowlistDiagnosis::Empty;
     }
     let has_wildcard = entries.iter().any(|v| v.as_str() == Some("*"));
-    AllowlistDiagnosis::Healthy { count: entries.len(), has_wildcard }
+    AllowlistDiagnosis::Healthy {
+        count: entries.len(),
+        has_wildcard,
+    }
 }
 
 pub struct AllowlistCheck;
 
 #[async_trait]
 impl DoctorCheck for AllowlistCheck {
-    fn name(&self) -> &'static str { "policy.allowlist" }
-    fn category(&self) -> &'static str { "config" }
+    fn name(&self) -> &'static str {
+        "policy.allowlist"
+    }
+    fn category(&self) -> &'static str {
+        "config"
+    }
     async fn run(&self, ctx: &DoctorContext) -> CheckResult {
-        let file = ctx.profile.root.join("policy").join("command_allowlist.toml");
+        let file = ctx
+            .profile
+            .root
+            .join("policy")
+            .join("command_allowlist.toml");
         let diag = diagnose_allowlist(&file);
         let strict_like = matches!(
             ctx.config.autonomy.level,
@@ -118,7 +129,10 @@ mod tests {
         std::fs::write(&file, "commands = [\"git status\", \"ls -la\"]\n").unwrap();
         assert_eq!(
             diagnose_allowlist(&file),
-            AllowlistDiagnosis::Healthy { count: 2, has_wildcard: false }
+            AllowlistDiagnosis::Healthy {
+                count: 2,
+                has_wildcard: false
+            }
         );
     }
 
@@ -129,7 +143,10 @@ mod tests {
         std::fs::write(&file, "commands = [\"*\"]\n").unwrap();
         assert_eq!(
             diagnose_allowlist(&file),
-            AllowlistDiagnosis::Healthy { count: 1, has_wildcard: true }
+            AllowlistDiagnosis::Healthy {
+                count: 1,
+                has_wildcard: true
+            }
         );
     }
 

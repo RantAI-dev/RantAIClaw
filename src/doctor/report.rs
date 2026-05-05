@@ -54,7 +54,10 @@ pub fn render_text(results: &[CheckResult], colors: bool) -> String {
 pub fn render_brief(results: &[CheckResult]) -> String {
     let t = totals(results);
     let total = results.len();
-    format!("doctor: {}/{} ok, {} warn, {} fail", t.ok, total, t.warn, t.fail)
+    format!(
+        "doctor: {}/{} ok, {} warn, {} fail",
+        t.ok, total, t.warn, t.fail
+    )
 }
 
 pub fn render_json(results: &[CheckResult]) -> Value {
@@ -86,8 +89,7 @@ pub fn render_json(results: &[CheckResult]) -> Value {
 }
 
 fn render_json_string(results: &[CheckResult]) -> String {
-    serde_json::to_string_pretty(&render_json(results))
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string_pretty(&render_json(results)).unwrap_or_else(|_| "{}".to_string())
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -125,7 +127,11 @@ fn colorize(sev: Severity, icon: &str, colors: bool) -> String {
 }
 
 fn colorize_arrow(colors: bool) -> String {
-    if colors { "\x1b[2m→\x1b[0m".to_string() } else { "→".to_string() }
+    if colors {
+        "\x1b[2m→\x1b[0m".to_string()
+    } else {
+        "→".to_string()
+    }
 }
 
 pub fn has_failures(results: &[CheckResult]) -> bool {

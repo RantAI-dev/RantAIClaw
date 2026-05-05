@@ -36,7 +36,11 @@ fn fixture_results() -> Vec<CheckResult> {
     ]
 }
 
-fn ctx_with_provider(provider: &str, api_key: Option<&str>, offline: bool) -> (DoctorContext, TempDir) {
+fn ctx_with_provider(
+    provider: &str,
+    api_key: Option<&str>,
+    offline: bool,
+) -> (DoctorContext, TempDir) {
     let tmp = TempDir::new().unwrap();
     let mut cfg = Config::default();
     cfg.default_provider = Some(provider.to_string());

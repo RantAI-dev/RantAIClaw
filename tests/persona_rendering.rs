@@ -67,7 +67,8 @@ const TONE: &str = "neutral";
 
 #[test]
 fn snapshot_default_no_avoid() {
-    let out = persona::renderer::render(template_for(PresetId::Default), NAME, TZ, ROLE, TONE, None);
+    let out =
+        persona::renderer::render(template_for(PresetId::Default), NAME, TZ, ROLE, TONE, None);
     assert!(!out.contains("Things to avoid"));
     assert_snapshot("default_no_avoid", &out);
 }

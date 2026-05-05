@@ -172,8 +172,14 @@ pub fn migrate_to_profile(
         );
     }
 
-    ProfileManager::create_clone_from_path(profile_name, &source.root, force)
-        .with_context(|| format!("create profile {profile_name:?} from {}", source.root.display()))?;
+    ProfileManager::create_clone_from_path(profile_name, &source.root, force).with_context(
+        || {
+            format!(
+                "create profile {profile_name:?} from {}",
+                source.root.display()
+            )
+        },
+    )?;
 
     let config_blocks_migrated = count_translated_config_blocks(&source.config_toml())?;
     let skills_migrated = count_skill_dirs(&source.skills_dir())?;
@@ -271,8 +277,8 @@ fn count_skill_dirs(skills_dir: &Path) -> Result<usize> {
         return Ok(0);
     }
     let mut count = 0;
-    for entry in fs::read_dir(skills_dir)
-        .with_context(|| format!("read_dir {}", skills_dir.display()))?
+    for entry in
+        fs::read_dir(skills_dir).with_context(|| format!("read_dir {}", skills_dir.display()))?
     {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
@@ -289,8 +295,8 @@ fn count_secret_files(secrets_dir: &Path) -> Result<usize> {
         return Ok(0);
     }
     let mut count = 0;
-    for entry in fs::read_dir(secrets_dir)
-        .with_context(|| format!("read_dir {}", secrets_dir.display()))?
+    for entry in
+        fs::read_dir(secrets_dir).with_context(|| format!("read_dir {}", secrets_dir.display()))?
     {
         let entry = entry?;
         if entry.file_type()?.is_file() {
@@ -422,6 +428,10 @@ mod tests {
     #[test]
     fn detection_paths_lists_all_four_candidates() {
         let paths = detection_paths();
-        assert_eq!(paths.len(), 4, "must probe ~/.openclaw, ~/.zeroclaw, ~/.config/openclaw, ~/.config/zeroclaw");
+        assert_eq!(
+            paths.len(),
+            4,
+            "must probe ~/.openclaw, ~/.zeroclaw, ~/.config/openclaw, ~/.config/zeroclaw"
+        );
     }
 }

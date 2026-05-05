@@ -144,7 +144,11 @@ struct MockState {
 
 /// Spawn a single-shot HTTP server that responds to GET requests with a
 /// canned ClawHub listing. Returns `(base_url, state, shutdown_handle)`.
-async fn spawn_mock_clawhub() -> (String, std::sync::Arc<MockState>, tokio::task::JoinHandle<()>) {
+async fn spawn_mock_clawhub() -> (
+    String,
+    std::sync::Arc<MockState>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = std::sync::Arc::new(MockState::default());
@@ -170,7 +174,8 @@ async fn spawn_mock_clawhub() -> (String, std::sync::Arc<MockState>, tokio::task
                     .and_then(|l| l.split_whitespace().nth(1))
                     .unwrap_or("/")
                     .to_string();
-                st.requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                st.requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 st.paths.lock().unwrap().push(path);
 
                 let body = serde_json::json!({
@@ -279,7 +284,11 @@ async fn clawhub_list_top_uses_stars_sort_and_caches() {
 async fn spawn_mock_clawhub_full(
     skill_md_body: Vec<u8>,
     skill_md_sha: String,
-) -> (String, std::sync::Arc<MockState>, tokio::task::JoinHandle<()>) {
+) -> (
+    String,
+    std::sync::Arc<MockState>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = std::sync::Arc::new(MockState::default());
@@ -326,14 +335,22 @@ async fn spawn_mock_clawhub_full(
                                 }]
                             }
                         });
-                        ("200 OK", "application/json", manifest.to_string().into_bytes())
+                        (
+                            "200 OK",
+                            "application/json",
+                            manifest.to_string().into_bytes(),
+                        )
                     } else {
                         // /skills/<slug> detail
                         let detail = serde_json::json!({
                             "skill": {"slug": "demo"},
                             "latestVersion": {"version": "1.0.0"}
                         });
-                        ("200 OK", "application/json", detail.to_string().into_bytes())
+                        (
+                            "200 OK",
+                            "application/json",
+                            detail.to_string().into_bytes(),
+                        )
                     };
 
                 let header = format!(
@@ -393,8 +410,7 @@ async fn clawhub_install_one_writes_real_skill_body() {
     let content = std::fs::read(&installed).expect("SKILL.md must exist");
     assert_eq!(content, body, "installed SKILL.md must match upstream body");
     assert!(
-        !String::from_utf8_lossy(&content).starts_with("# demo skill\n\nReal")
-            == false,
+        !String::from_utf8_lossy(&content).starts_with("# demo skill\n\nReal") == false,
         "content {:?}",
         String::from_utf8_lossy(&content)
     );
@@ -434,8 +450,7 @@ async fn clawhub_install_one_aborts_on_sha_mismatch_and_cleans_up() {
         .await
         .expect_err("sha mismatch must error");
     assert!(
-        err.to_string().contains("sha256")
-            || err.chain().any(|e| e.to_string().contains("sha256")),
+        err.to_string().contains("sha256") || err.chain().any(|e| e.to_string().contains("sha256")),
         "expected sha256 error chain, got {err:?}",
     );
     assert!(

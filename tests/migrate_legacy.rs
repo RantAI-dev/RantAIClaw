@@ -271,7 +271,10 @@ fn migration_carries_secrets_directory() {
         assert!(did);
 
         let dest = paths::secrets_dir("default").join("api_keys.toml");
-        assert!(dest.exists(), "secrets/api_keys.toml should move into profile dir");
+        assert!(
+            dest.exists(),
+            "secrets/api_keys.toml should move into profile dir"
+        );
         assert!(
             !root.join("secrets").is_dir(),
             "legacy secrets/ should be gone after migration",

@@ -568,8 +568,7 @@ impl Agent {
             // still works on the assembled `full_text` for prompt-guided
             // dispatchers; native tool_call deltas are not yet parsed
             // mid-stream and will be picked up only at end-of-stream.
-            let streamed_inline =
-                events.is_some() && self.provider.supports_streaming();
+            let streamed_inline = events.is_some() && self.provider.supports_streaming();
 
             let response = if streamed_inline {
                 let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -583,12 +582,9 @@ impl Agent {
                         }
                     }
                 };
-                let stream_future = self.provider.chat_stream(
-                    request,
-                    &effective_model,
-                    self.temperature,
-                    text_tx,
-                );
+                let stream_future =
+                    self.provider
+                        .chat_stream(request, &effective_model, self.temperature, text_tx);
                 let combined = async {
                     let (r, ()) = tokio::join!(stream_future, forwarder);
                     r
@@ -608,11 +604,9 @@ impl Agent {
                     combined.await?
                 }
             } else {
-                let chat_future = self.provider.chat(
-                    request,
-                    &effective_model,
-                    self.temperature,
-                );
+                let chat_future = self
+                    .provider
+                    .chat(request, &effective_model, self.temperature);
                 if let Some(token) = cancel {
                     tokio::select! {
                         () = token.cancelled() => {

@@ -16,14 +16,20 @@ pub struct ProviderPingCheck {
 
 impl ProviderPingCheck {
     pub fn with_endpoint(url: impl Into<String>) -> Self {
-        Self { endpoint_override: Some(url.into()) }
+        Self {
+            endpoint_override: Some(url.into()),
+        }
     }
 }
 
 #[async_trait]
 impl DoctorCheck for ProviderPingCheck {
-    fn name(&self) -> &'static str { "provider.ping" }
-    fn category(&self) -> &'static str { "live" }
+    fn name(&self) -> &'static str {
+        "provider.ping"
+    }
+    fn category(&self) -> &'static str {
+        "live"
+    }
     async fn run(&self, ctx: &DoctorContext) -> CheckResult {
         if ctx.offline {
             return CheckResult::info(self.name(), "skipped (offline)")

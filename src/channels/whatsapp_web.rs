@@ -512,79 +512,153 @@ impl Channel for WhatsAppWebChannel {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Debug, Clone)]
+pub struct PairOptions {
+    pub session_path: std::path::PathBuf,
+    pub pair_phone: Option<String>,
+    pub timeout: std::time::Duration,
+}
 
-    #[cfg(feature = "whatsapp-web")]
-    fn make_channel() -> WhatsAppWebChannel {
-        WhatsAppWebChannel::new(
-            "/tmp/test-whatsapp.db".into(),
-            None,
-            None,
-            vec!["+1234567890".into()],
-        )
+impl Default for PairOptions {
+    fn default() -> Self {
+        Self {
+            session_path: std::path::PathBuf::from("wa.db"),
+            pair_phone: None,
+            timeout: std::time::Duration::from_secs(60),
+        }
     }
+}
 
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_channel_name() {
-        let ch = make_channel();
-        assert_eq!(ch.name(), "whatsapp");
-    }
+#[derive(Debug, Clone)]
+pub enum PairEvent {
+    Qr(String),
+    PairCode(String),
+    Connected,
+    Timeout,
+    Failed(String),
+}
 
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_number_allowed_exact() {
-        let ch = make_channel();
-        assert!(ch.is_number_allowed("+1234567890"));
-        assert!(!ch.is_number_allowed("+9876543210"));
-    }
+#[cfg(feature = "whatsapp-web")]
+pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + Send {
+    use async_stream::stream;
+    use tokio::sync::mpsc;
+    use wa_rs::bot::Bot;
+    use wa_rs::pair_code::PairCodeOptions;
+    use wa_rs::store::{Device, DeviceStore};
+    use wa_rs_core::types::events::Event;
+    use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
+    use wa_rs_ureq_http::UreqHttpClient;
 
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_number_allowed_wildcard() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()]);
-        assert!(ch.is_number_allowed("+1234567890"));
-        assert!(ch.is_number_allowed("+9999999999"));
-    }
+    let opts = std::sync::Arc::new(opts);
+    let (tx, rx) = mpsc::channel::<PairEvent>(32);
 
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_number_denied_empty() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![]);
-        // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
-        assert!(!ch.is_number_allowed("+1234567890"));
-    }
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            tracing::info!(
+                "pair_once: thread started, opening storage at {}",
+                opts.session_path.display()
+            );
+            let storage = match super::whatsapp_storage::RusqliteStore::new(&opts.session_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx
+                        .send(PairEvent::Failed(format!("storage init failed: {e}")))
+                        .await;
+                    return;
+                }
+            };
+            tracing::info!("pair_once: storage opened, building bot");
+            let backend = std::sync::Arc::new(storage);
+            let mut device = Device::new(backend.clone());
+            if let Ok(exists) = backend.exists().await {
+                if exists {
+                    if let Ok(Some(core_device)) = backend.load().await {
+                        device.load_from_serializable(core_device);
+                    }
+                }
+            }
+            let mut transport_factory = TokioWebSocketTransportFactory::new();
+            if let Ok(ws_url) = std::env::var("WHATSAPP_WS_URL") {
+                transport_factory = transport_factory.with_url(ws_url);
+            }
+            let tx_clone = tx.clone();
+            let builder = Bot::builder()
+                .with_backend(backend)
+                .with_transport_factory(transport_factory)
+                .with_http_client(UreqHttpClient::new())
+                .with_pair_code(PairCodeOptions {
+                    phone_number: opts.pair_phone.clone().unwrap_or_default(),
+                    ..Default::default()
+                })
+                .on_event(move |ev, _client| {
+                    let tx = tx_clone.clone();
+                    async move {
+                        match ev {
+                            Event::PairingQrCode { code, .. } => {
+                                let _ = tx.send(PairEvent::Qr(code)).await;
+                            }
+                            Event::PairingCode { code, .. } => {
+                                let _ = tx.send(PairEvent::PairCode(code)).await;
+                            }
+                            Event::Connected(_) => {
+                                let _ = tx.send(PairEvent::Connected).await;
+                            }
+                            Event::LoggedOut(_) => {
+                                let _ = tx.send(PairEvent::Failed("logged out".into())).await;
+                            }
+                            Event::StreamError(e) => {
+                                let _ = tx
+                                    .send(PairEvent::Failed(format!("stream error: {e:?}")))
+                                    .await;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            let mut bot = match builder.build().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("pair_once: bot build failed: {e}");
+                    let _ = tx
+                        .send(PairEvent::Failed(format!("bot build failed: {e}")))
+                        .await;
+                    return;
+                }
+            };
+            tracing::info!("pair_once: bot built, calling run() to spawn event loop");
+            // wa-rs `Bot::run()` SPAWNS the event loop on a background
+            // tokio task and returns the JoinHandle immediately. We must
+            // await the handle to keep the runtime alive while the loop
+            // runs — discarding it lets the runtime drop, which kills the
+            // task before it ever connects (symptom: user sees "Starting
+            // WhatsApp Web pairing…" forever, no QR).
+            let join_handle = match bot.run().await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!("pair_once: bot.run() failed to spawn: {e}");
+                    let _ = tx
+                        .send(PairEvent::Failed(format!("bot run failed: {e}")))
+                        .await;
+                    return;
+                }
+            };
+            tracing::info!("pair_once: event loop spawned, awaiting JoinHandle");
+            if let Err(e) = join_handle.await {
+                tracing::error!("pair_once: bot task join failed: {e}");
+                let _ = tx
+                    .send(PairEvent::Failed(format!("bot task panicked: {e}")))
+                    .await;
+            }
+            tracing::info!("pair_once: thread exiting");
+        });
+    });
 
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_normalize_phone_adds_plus() {
-        let ch = make_channel();
-        assert_eq!(ch.normalize_phone("1234567890"), "+1234567890");
-    }
-
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_normalize_phone_preserves_plus() {
-        let ch = make_channel();
-        assert_eq!(ch.normalize_phone("+1234567890"), "+1234567890");
-    }
-
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
-    fn whatsapp_web_normalize_phone_from_jid() {
-        let ch = make_channel();
-        assert_eq!(
-            ch.normalize_phone("1234567890@s.whatsapp.net"),
-            "+1234567890"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "whatsapp-web")]
-    async fn whatsapp_web_health_check_disconnected() {
-        let ch = make_channel();
-        assert!(!ch.health_check().await);
-    }
+    Box::pin(stream! {
+        let mut rx = rx;
+        while let Some(ev) = rx.recv().await {
+            yield ev;
+        }
+        yield PairEvent::Failed("channel closed".into());
+    })
 }

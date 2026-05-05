@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
-use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+use crate::tui::widgets::{ListPicker, ListPickerEntry, ListPickerItem, ListPickerKind};
 
 /// Built-in personality presets surfaced in the `/personality` picker.
 /// Each tuple is `(key, summary shown as the muted secondary line)`.
@@ -281,8 +281,11 @@ mod tests {
                     picker.kind,
                     crate::tui::widgets::ListPickerKind::Personality
                 );
-                assert!(!picker.items.is_empty());
-                assert!(picker.items.iter().any(|i| i.key == "default"));
+                assert!(!picker.entries().is_empty());
+                assert!(picker
+                    .entries()
+                    .iter()
+                    .any(|e| matches!(e, ListPickerEntry::Item(i) if i.key == "default")));
             }
             other => panic!("Expected OpenListPicker, got {other:?}"),
         }

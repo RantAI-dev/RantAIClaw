@@ -10,8 +10,12 @@ pub struct ConfigSchemaCheck;
 
 #[async_trait]
 impl DoctorCheck for ConfigSchemaCheck {
-    fn name(&self) -> &'static str { "config.schema" }
-    fn category(&self) -> &'static str { "config" }
+    fn name(&self) -> &'static str {
+        "config.schema"
+    }
+    fn category(&self) -> &'static str {
+        "config"
+    }
     async fn run(&self, ctx: &DoctorContext) -> CheckResult {
         let mut problems = Vec::new();
         let cfg = &ctx.config;
@@ -58,18 +62,28 @@ pub struct PathsCheck;
 
 #[async_trait]
 impl DoctorCheck for PathsCheck {
-    fn name(&self) -> &'static str { "config.paths" }
-    fn category(&self) -> &'static str { "config" }
+    fn name(&self) -> &'static str {
+        "config.paths"
+    }
+    fn category(&self) -> &'static str {
+        "config"
+    }
     async fn run(&self, ctx: &DoctorContext) -> CheckResult {
         let ws = &ctx.config.workspace_dir;
         if !ws.exists() {
-            return CheckResult::fail(self.name(), format!("workspace_dir missing: {}", ws.display()))
-                .with_category(self.category())
-                .with_hint("run: rantaiclaw onboard --interactive");
+            return CheckResult::fail(
+                self.name(),
+                format!("workspace_dir missing: {}", ws.display()),
+            )
+            .with_category(self.category())
+            .with_hint("run: rantaiclaw onboard --interactive");
         }
         match writable_probe(ws) {
-            Ok(()) => CheckResult::ok(self.name(), format!("workspace at {} is writable", ws.display()))
-                .with_category(self.category()),
+            Ok(()) => CheckResult::ok(
+                self.name(),
+                format!("workspace at {} is writable", ws.display()),
+            )
+            .with_category(self.category()),
             Err(e) => CheckResult::fail(self.name(), format!("workspace_dir not writable: {e}"))
                 .with_category(self.category())
                 .with_hint("check directory permissions"),
@@ -83,7 +97,10 @@ fn writable_probe(dir: &Path) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let probe = dir.join(format!(".doctor_probe_{}_{}", std::process::id(), nanos));
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&probe)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
     f.write_all(b"probe")?;
     drop(f);
     let _ = std::fs::remove_file(&probe);
@@ -93,7 +110,13 @@ fn writable_probe(dir: &Path) -> std::io::Result<()> {
 fn provider_validation_error(name: &str) -> Option<String> {
     match crate::providers::create_provider(name, None) {
         Ok(_) => None,
-        Err(err) => Some(err.to_string().lines().next().unwrap_or("invalid provider").to_string()),
+        Err(err) => Some(
+            err.to_string()
+                .lines()
+                .next()
+                .unwrap_or("invalid provider")
+                .to_string(),
+        ),
     }
 }
 
@@ -108,8 +131,18 @@ mod tests {
 
     fn ctx_with_config(cfg: Config) -> (DoctorContext, TempDir) {
         let tmp = TempDir::new().unwrap();
-        let profile = Profile { name: "test".into(), root: tmp.path().to_path_buf() };
-        (DoctorContext { profile, config: cfg, offline: false }, tmp)
+        let profile = Profile {
+            name: "test".into(),
+            root: tmp.path().to_path_buf(),
+        };
+        (
+            DoctorContext {
+                profile,
+                config: cfg,
+                offline: false,
+            },
+            tmp,
+        )
     }
 
     #[tokio::test]

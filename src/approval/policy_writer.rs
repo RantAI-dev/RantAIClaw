@@ -124,8 +124,7 @@ struct SectionPatterns {
 ///   * `forbidden_paths.toml`   — patterns array
 pub fn write_policy_files(profile: &Profile, preset: PolicyPreset, force: bool) -> Result<()> {
     let dir = profile.policy_dir();
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("create policy dir {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("create policy dir {}", dir.display()))?;
 
     let bundle: PolicyBundle = toml::from_str(preset.bundle()).with_context(|| {
         format!(
@@ -166,19 +165,15 @@ pub fn write_policy_files(profile: &Profile, preset: PolicyPreset, force: bool) 
     // Only verify the files this call actually wrote — when `force=false`
     // and a file already exists on disk we leave the user's edits alone,
     // and that file is no longer the writer's responsibility to validate.
-    verify_written_policy(
-        &dir,
-        wrote_autonomy,
-        wrote_allowlist,
-        wrote_forbidden,
-    )
-    .with_context(|| {
-        format!(
-            "approval preset {} wrote policy files but they failed parse-back \
+    verify_written_policy(&dir, wrote_autonomy, wrote_allowlist, wrote_forbidden).with_context(
+        || {
+            format!(
+                "approval preset {} wrote policy files but they failed parse-back \
              — preset bundles or writer drift",
-            preset.id()
-        )
-    })?;
+                preset.id()
+            )
+        },
+    )?;
 
     Ok(())
 }
@@ -210,7 +205,11 @@ fn verify_written_policy(
     }
 
     let pattern_files: &[(bool, &str, &str)] = &[
-        (check_allowlist, "command_allowlist.toml", "command_allowlist"),
+        (
+            check_allowlist,
+            "command_allowlist.toml",
+            "command_allowlist",
+        ),
         (check_forbidden, "forbidden_paths.toml", "forbidden_paths"),
     ];
     for &(should_check, name, key) in pattern_files {
@@ -221,18 +220,18 @@ fn verify_written_policy(
         let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let parsed: toml::value::Table =
             toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-        let block = parsed.get(key).ok_or_else(|| {
-            anyhow::anyhow!("{} missing required [{key}] block", path.display())
-        })?;
+        let block = parsed
+            .get(key)
+            .ok_or_else(|| anyhow::anyhow!("{} missing required [{key}] block", path.display()))?;
         let table = block
             .as_table()
             .ok_or_else(|| anyhow::anyhow!("{} [{key}] is not a table", path.display()))?;
         let patterns = table
             .get("patterns")
             .ok_or_else(|| anyhow::anyhow!("{} [{key}].patterns missing", path.display()))?;
-        let arr = patterns
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("{} [{key}].patterns is not an array", path.display()))?;
+        let arr = patterns.as_array().ok_or_else(|| {
+            anyhow::anyhow!("{} [{key}].patterns is not an array", path.display())
+        })?;
         for (i, item) in arr.iter().enumerate() {
             if !item.is_str() {
                 anyhow::bail!(
@@ -290,9 +289,8 @@ fn write_autonomy(
         "approvals".to_string(),
         toml::Value::Table(bundle.approvals.clone()),
     );
-    let body = toml::to_string_pretty(&doc).with_context(|| {
-        format!("serialise autonomy section for preset {}", preset.id())
-    })?;
+    let body = toml::to_string_pretty(&doc)
+        .with_context(|| format!("serialise autonomy section for preset {}", preset.id()))?;
     let out = format!("{AUTONOMY_HEADER}\n{body}");
     fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
@@ -417,9 +415,8 @@ mod tests {
             )
             .expect("write forbidden_paths");
 
-            verify_written_policy(tmp.path(), true, true, true).unwrap_or_else(|e| {
-                panic!("preset {} round-trip self-check failed: {e}", p.id())
-            });
+            verify_written_policy(tmp.path(), true, true, true)
+                .unwrap_or_else(|e| panic!("preset {} round-trip self-check failed: {e}", p.id()));
         }
     }
 

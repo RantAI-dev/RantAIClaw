@@ -5554,10 +5554,7 @@ default_temperature = 0.7
         // Source is still `DefaultConfigDir`, but the dirs now point at the
         // active profile under `<HOME>/.rantaiclaw/profiles/default/`.
         assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
-        assert_eq!(
-            config_dir,
-            temp_home.join(".rantaiclaw/profiles/default")
-        );
+        assert_eq!(config_dir, temp_home.join(".rantaiclaw/profiles/default"));
         assert_eq!(
             resolved_workspace_dir,
             temp_home.join(".rantaiclaw/profiles/default/workspace")

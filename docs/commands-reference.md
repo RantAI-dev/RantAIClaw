@@ -8,7 +8,8 @@ Last verified: **February 20, 2026**.
 
 | Command | Purpose |
 |---|---|
-| `onboard` | Initialize workspace/config quickly or interactively |
+| `setup` | Canonical setup wizard (replaces `onboard`) |
+| `onboard` | Legacy alias for `setup` |
 | `agent` | Run interactive chat or single-message mode |
 | `gateway` | Start webhook and WhatsApp HTTP gateway |
 | `daemon` | Start supervised runtime (gateway + channels + optional heartbeat/scheduler) |
@@ -28,6 +29,24 @@ Last verified: **February 20, 2026**.
 | `peripheral` | Configure and flash peripherals |
 
 ## Command Groups
+
+### `setup`
+
+- `rantaiclaw setup`
+- `rantaiclaw setup --force`
+- `rantaiclaw setup <topic>`
+- `rantaiclaw setup <topic> --force`
+- `rantaiclaw setup --non-interactive`
+- `rantaiclaw setup whatsapp-web --non-interactive`
+
+`setup` walks every wired section (provider, channels, persona, skills, mcp) skipping any that are already configured. Pass `--force` to re-run already-configured sections. Pass `--non-interactive` (or run in non-TTY context) to emit each section's headless hint and exit rather than prompting.
+
+Single-topic examples:
+- `rantaiclaw setup provider` — re-run provider section only
+- `rantaiclaw setup channels` — re-run channels section only
+- `rantaiclaw setup whatsapp-web --non-interactive` — headless WhatsApp Web QR pairing (120s timeout)
+
+`onboard` is a legacy alias for `setup`; its behaviour is unchanged.
 
 ### `onboard`
 

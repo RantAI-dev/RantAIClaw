@@ -11,15 +11,22 @@ pub struct SystemDepsCheck;
 
 #[async_trait]
 impl DoctorCheck for SystemDepsCheck {
-    fn name(&self) -> &'static str { "system.deps" }
-    fn category(&self) -> &'static str { "system" }
+    fn name(&self) -> &'static str {
+        "system.deps"
+    }
+    fn category(&self) -> &'static str {
+        "system"
+    }
     async fn run(&self, _ctx: &DoctorContext) -> CheckResult {
         let report = probe_binaries(REQUIRED, RECOMMENDED);
 
         if !report.required_missing.is_empty() {
             return CheckResult::fail(
                 self.name(),
-                format!("required binaries missing: {}", report.required_missing.join(", ")),
+                format!(
+                    "required binaries missing: {}",
+                    report.required_missing.join(", ")
+                ),
             )
             .with_category(self.category())
             .with_hint("install missing binaries via your OS package manager");
@@ -29,8 +36,14 @@ impl DoctorCheck for SystemDepsCheck {
             return CheckResult {
                 name: self.name().to_string(),
                 severity: Severity::Warn,
-                message: format!("recommended binaries missing: {}", report.recommended_missing.join(", ")),
-                hint: Some("install for full functionality (docker → runtime, cosign → signed downloads)".to_string()),
+                message: format!(
+                    "recommended binaries missing: {}",
+                    report.recommended_missing.join(", ")
+                ),
+                hint: Some(
+                    "install for full functionality (docker → runtime, cosign → signed downloads)"
+                        .to_string(),
+                ),
                 duration_ms: 0,
                 category: self.category(),
             };
@@ -38,7 +51,11 @@ impl DoctorCheck for SystemDepsCheck {
 
         CheckResult::ok(
             self.name(),
-            format!("{} required + {} recommended binaries present", REQUIRED.len(), RECOMMENDED.len()),
+            format!(
+                "{} required + {} recommended binaries present",
+                REQUIRED.len(),
+                RECOMMENDED.len()
+            ),
         )
         .with_category(self.category())
     }
@@ -53,10 +70,14 @@ pub struct DepsReport {
 pub fn probe_binaries(required: &[&str], recommended: &[&str]) -> DepsReport {
     let mut report = DepsReport::default();
     for bin in required {
-        if which::which(bin).is_err() { report.required_missing.push((*bin).to_string()); }
+        if which::which(bin).is_err() {
+            report.required_missing.push((*bin).to_string());
+        }
     }
     for bin in recommended {
-        if which::which(bin).is_err() { report.recommended_missing.push((*bin).to_string()); }
+        if which::which(bin).is_err() {
+            report.recommended_missing.push((*bin).to_string());
+        }
     }
     report
 }

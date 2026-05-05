@@ -36,7 +36,7 @@ use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -929,11 +929,10 @@ async fn main() -> Result<()> {
 
     // ── Wave-3 Setup orchestrator ───────────────────────────────────
     //
-    // The canonical entry point. Walks the SetupSection list (or
-    // dispatches to a single section) and persists the resulting Config.
-    // Wraps `run_setup` in `spawn_blocking` because the underlying
-    // sections still call `reqwest::blocking` + `dialoguer::Input`, which
-    // panic if invoked inside the tokio runtime.
+    // When `--non-interactive` is set (or stdin is not a TTY), fall back
+    // to the section-by-section wizard on a blocking thread (original
+    // behaviour).  Otherwise launch the TUI with the setup overlay
+    // pre-opened so the user sees it immediately on startup.
     if let Some(Commands::Setup {
         topic,
         force,
@@ -943,41 +942,75 @@ async fn main() -> Result<()> {
         let topic = topic.clone();
         let force = *force;
         let non_interactive = *non_interactive;
+        let is_headless = non_interactive || !std::io::stdin().is_terminal();
 
-        // Load (or initialise) config + resolve the active profile in
-        // async land so the section bodies (which use blocking IO +
-        // dialoguer) can run on a dedicated blocking thread.
-        let mut config = Config::load_or_init().await.unwrap_or_default();
-        let profile = profile::ProfileManager::active()?;
+        // Headless / CI path.
+        if is_headless {
+            // Route provisioners through a dedicated headless runner;
+            // fall back to the section-by-section wizard for topics
+            // that are SetupSections (provider, channels, persona, …).
+            if let Some(ref topic_name) = topic {
+                if let Some(provisioner) = onboard::provision::provisioner_for(topic_name) {
+                    // Headless provisioner — runs on a dedicated async task,
+                    // prints events to stdout, waits for Done/Fail/timeout.
+                    let mut config = Config::load_or_init().await?;
+                    let profile = profile::ProfileManager::active()?;
+                    run_provisioner_headless(provisioner.as_ref(), &mut config, &profile).await?;
+                    config.save().await?;
+                    return Ok(());
+                }
+            }
 
-        let mut owned_config = config.clone();
-        let profile_for_task = profile.clone();
-        let report = tokio::task::spawn_blocking(move || {
-            let r = onboard::wizard::run_setup(
-                &profile_for_task,
-                &mut owned_config,
-                topic,
-                force,
-                non_interactive,
-            )?;
-            anyhow::Ok((owned_config, r))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("setup task failed: {e}"))?;
+            // Not a provisioner — run the section wizard.
+            let mut config = Config::load_or_init().await.unwrap_or_default();
+            let profile = profile::ProfileManager::active()?;
 
-        let (updated_config, report) = report?;
-        config = updated_config;
-        config.save().await?;
+            let mut owned_config = config.clone();
+            let profile_for_task = profile.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                let r = onboard::wizard::run_setup(
+                    &profile_for_task,
+                    &mut owned_config,
+                    topic,
+                    force,
+                    non_interactive,
+                )?;
+                anyhow::Ok((owned_config, r))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("setup task failed: {e}"))?;
 
-        // Single-line summary for scripts / CI.
-        if !report.visited.is_empty() || !report.skipped.is_empty() {
-            eprintln!(
-                "setup: visited=[{}] skipped=[{}]",
-                report.visited.join(","),
-                report.skipped.join(","),
-            );
+            let (updated_config, report) = report?;
+            config = updated_config;
+            config.save().await?;
+
+            if !report.visited.is_empty() || !report.skipped.is_empty() {
+                eprintln!(
+                    "setup: visited=[{}] skipped=[{}]",
+                    report.visited.join(","),
+                    report.skipped.join(","),
+                );
+            }
+            return Ok(());
         }
-        return Ok(());
+
+        // Interactive TUI path — launch with setup overlay.
+        #[cfg(feature = "tui")]
+        {
+            use rantaiclaw::tui::{run_tui, TuiConfig};
+
+            let tui_config = TuiConfig {
+                setup_provisioner: Some(topic.unwrap_or_default()),
+                ..Default::default()
+            };
+            run_tui(tui_config).await?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "tui"))]
+        {
+            eprintln!("TUI feature not enabled. Rebuild with --features tui");
+            return Ok(());
+        }
     }
 
     // Onboard runs quick setup by default, or the interactive wizard with --interactive.
@@ -1046,11 +1079,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None
-        | Some(
-            Commands::Onboard { .. }
-            | Commands::Setup { .. }
-            | Commands::Completions { .. },
-        ) => unreachable!(),
+        | Some(Commands::Onboard { .. } | Commands::Setup { .. } | Commands::Completions { .. }) => {
+            unreachable!()
+        }
 
         Some(Commands::Agent {
             message,
@@ -1956,4 +1987,97 @@ mod tests {
             other => panic!("expected onboard command, got {other:?}"),
         }
     }
+}
+
+/// Run a provisioner in headless mode, printing events to stdout and
+/// waiting for completion or a timeout. Used by `rantaiclaw setup <name>
+/// --non-interactive`.
+async fn run_provisioner_headless(
+    provisioner: &dyn onboard::provision::TuiProvisioner,
+    config: &mut Config,
+    profile: &profile::Profile,
+) -> Result<()> {
+    use onboard::provision::{ProvisionEvent, ProvisionIo};
+
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+    let (_response_tx, response_rx) = tokio::sync::mpsc::channel(8);
+
+    let io = ProvisionIo {
+        events: events_tx,
+        responses: response_rx,
+    };
+
+    let prov_name = provisioner.name().to_string();
+    let prov_future = provisioner.run(config, profile, io);
+
+    tokio::pin!(prov_future);
+
+    // Drive the provisioner future and the event-render loop
+    // CONCURRENTLY. The previous code only awaited the event loop;
+    // `prov_future` was pinned but never polled, so it never ran until
+    // after the 120s timeout fired — events never arrived and the user
+    // saw silence followed by a timeout error.
+    let render_loop = async {
+        while let Some(ev) = events_rx.recv().await {
+            match ev {
+                ProvisionEvent::Message { severity, text } => {
+                    eprintln!("[{prov_name}] {severity:?}: {text}");
+                }
+                ProvisionEvent::QrCode { payload, caption } => {
+                    println!("\n=== WhatsApp Web Pairing QR ===");
+                    println!("{caption}");
+                    println!("Raw payload (for debugging): {payload}");
+                    println!("=============================\n");
+                    println!(
+                        "Scan the QR code above with WhatsApp > Linked Devices > Link a Device"
+                    );
+                    println!("Or open: https://web.whatsapp.com");
+                    println!("Waiting for scan...\n");
+                    let _ = std::io::stdout().flush();
+                }
+                ProvisionEvent::Done { summary } => {
+                    println!("\n✅ {summary}");
+                    let _ = std::io::stdout().flush();
+                }
+                ProvisionEvent::Failed { error } => {
+                    eprintln!("\n❌ {error}");
+                    let _ = std::io::stderr().flush();
+                }
+                ProvisionEvent::Prompt {
+                    id,
+                    label,
+                    default,
+                    secret,
+                } => {
+                    if secret {
+                        eprintln!("[headless] secret prompt '{label}' ({id}) — using default");
+                    } else if let Some(def) = default {
+                        eprintln!("[headless] prompt '{label}' ({id}) — using default: {def}");
+                    } else {
+                        eprintln!("[headless] prompt '{label}' ({id}) — no default available");
+                    }
+                }
+                ProvisionEvent::Choose { id, label, .. } => {
+                    eprintln!("[headless] choose '{label}' ({id}) — skipped in headless mode");
+                }
+            }
+        }
+    };
+
+    let timed = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        tokio::join!(prov_future, render_loop)
+    });
+
+    match timed.await {
+        Ok((prov_result, _)) => {
+            if let Err(e) = prov_result {
+                eprintln!("\n❌ provisioner error: {e}");
+            }
+        }
+        Err(_) => {
+            eprintln!("\nTimeout waiting for provisioning. The pairing session is still active — run again to retry.");
+        }
+    }
+
+    Ok(())
 }

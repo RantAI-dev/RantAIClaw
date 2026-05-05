@@ -39,14 +39,14 @@ pub fn migrate_from_external(
             )
         }),
         None => match source {
-            MigrationSource::OpenClaw => detect_with_filter(|v| {
-                matches!(v, openclaw::SourceVariant::OpenClaw)
-            })
-            .context("no OpenClaw install detected"),
-            MigrationSource::ZeroClaw => detect_with_filter(|v| {
-                matches!(v, openclaw::SourceVariant::ZeroClaw)
-            })
-            .context("no ZeroClaw install detected"),
+            MigrationSource::OpenClaw => {
+                detect_with_filter(|v| matches!(v, openclaw::SourceVariant::OpenClaw))
+                    .context("no OpenClaw install detected")
+            }
+            MigrationSource::ZeroClaw => {
+                detect_with_filter(|v| matches!(v, openclaw::SourceVariant::ZeroClaw))
+                    .context("no ZeroClaw install detected")
+            }
             MigrationSource::Auto => match openclaw::detect() {
                 Some(d) => Ok(d),
                 None => return Ok(None),

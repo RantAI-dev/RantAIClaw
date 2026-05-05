@@ -101,7 +101,14 @@ impl ProfileManager {
         // Subdirectories — create lazily but unconditionally so partial
         // trees from earlier crashed runs are healed on next launch.
         for sub in &[
-            "workspace", "memory", "sessions", "skills", "persona", "policy", "secrets", "runtime",
+            "workspace",
+            "memory",
+            "sessions",
+            "skills",
+            "persona",
+            "policy",
+            "secrets",
+            "runtime",
         ] {
             let p = dir.join(sub);
             if !p.exists() {

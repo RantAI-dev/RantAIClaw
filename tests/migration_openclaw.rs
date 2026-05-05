@@ -145,7 +145,10 @@ fn translate_v03_fixture_preserves_provider_and_gateway() {
     assert!(out.contains("[gateway]"));
     assert!(out.contains("port = 8765"));
     // synthesised blocks added
-    assert!(out.contains("level = \"smart\""), "L2-Smart autonomy injected");
+    assert!(
+        out.contains("level = \"smart\""),
+        "L2-Smart autonomy injected"
+    );
     assert!(out.contains("[approvals]"));
     // 3 source blocks (preamble, [provider], [gateway]) + 2 synthesised
     assert_eq!(blocks, 5);
@@ -170,14 +173,10 @@ fn migrate_from_external_creates_profile_and_copies_skills_and_secrets() {
         let root = home.join(".openclaw");
         copy_tree(&fixture("openclaw_v0.4"), &root);
 
-        let summary = migration::migrate_from_external(
-            MigrationSource::Auto,
-            "imported",
-            false,
-            None,
-        )
-        .expect("auto-detect + migrate should succeed")
-        .expect("Auto must return Some when a candidate is present");
+        let summary =
+            migration::migrate_from_external(MigrationSource::Auto, "imported", false, None)
+                .expect("auto-detect + migrate should succeed")
+                .expect("Auto must return Some when a candidate is present");
 
         assert_eq!(summary.profile_name, "imported");
         assert_eq!(summary.skills_migrated, 2);
@@ -231,15 +230,14 @@ fn migrate_from_external_auto_returns_none_when_no_source_present() {
 fn migrate_from_external_explicit_openclaw_errors_when_only_zeroclaw_present() {
     with_home(|home| {
         copy_tree(&fixture("openclaw_v0.3"), &home.join(".zeroclaw"));
-        let err = migration::migrate_from_external(
-            MigrationSource::OpenClaw,
-            "imported",
-            false,
-            None,
-        )
-        .expect_err("--from openclaw must not match a ~/.zeroclaw install");
+        let err =
+            migration::migrate_from_external(MigrationSource::OpenClaw, "imported", false, None)
+                .expect_err("--from openclaw must not match a ~/.zeroclaw install");
         let msg = format!("{err:#}");
-        assert!(msg.contains("OpenClaw"), "error mentions the requested source: {msg}");
+        assert!(
+            msg.contains("OpenClaw"),
+            "error mentions the requested source: {msg}"
+        );
     });
 }
 
@@ -255,9 +253,8 @@ fn migrate_from_external_refuses_existing_profile_without_force() {
             .unwrap();
 
         // Second migration into the same name: must error without --force.
-        let err =
-            migration::migrate_from_external(MigrationSource::Auto, "alpha", false, None)
-                .expect_err("re-migrating into existing profile must fail");
+        let err = migration::migrate_from_external(MigrationSource::Auto, "alpha", false, None)
+            .expect_err("re-migrating into existing profile must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("already exists"), "error: {msg}");
 

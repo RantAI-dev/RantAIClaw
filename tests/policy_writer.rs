@@ -48,7 +48,11 @@ fn with_home<F: FnOnce()>(f: F) {
 
 fn assert_policy_files_exist(profile: &rantaiclaw::profile::Profile) {
     let dir = profile.policy_dir();
-    for f in ["autonomy.toml", "command_allowlist.toml", "forbidden_paths.toml"] {
+    for f in [
+        "autonomy.toml",
+        "command_allowlist.toml",
+        "forbidden_paths.toml",
+    ] {
         assert!(
             dir.join(f).exists(),
             "expected {} under {}",

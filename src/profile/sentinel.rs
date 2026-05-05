@@ -54,8 +54,7 @@ pub fn write_sentinel(profile: &str, sentinel: &DaemonSentinel) -> Result<()> {
     let body = toml::to_string_pretty(sentinel).context("serialize sentinel")?;
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("rename to {}", path.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
     Ok(())
 }
 
