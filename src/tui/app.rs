@@ -345,7 +345,7 @@ impl TuiApp {
             //
             // Multi-line prompts work via Ctrl+J (handled above) or
             // Shift+Enter on terminals with the kitty keyboard protocol.
-            KeyCode::Enter if self.setup_overlay.is_none() => {
+            KeyCode::Enter if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 if self.autocomplete.is_visible() {
                     let buf = self.context.input_buffer.trim_end_matches(' ').to_string();
                     let selected = self.autocomplete.selected().map(str::to_string);
@@ -395,13 +395,13 @@ impl TuiApp {
                 }
             }
             // Backspace
-            KeyCode::Backspace if self.setup_overlay.is_none() => {
+            KeyCode::Backspace if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 self.context.input_buffer.pop();
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
             }
             // Regular character input
-            KeyCode::Char(c) if self.setup_overlay.is_none() => {
+            KeyCode::Char(c) if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 self.context.input_buffer.push(c);
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
@@ -417,13 +417,13 @@ impl TuiApp {
             // Up/Down with no modal active recalls submitted prompts
             // from history. Native terminal scrollback (mouse wheel /
             // PgUp on the host terminal) handles chat scrolling.
-            KeyCode::Up if self.setup_overlay.is_none() => {
+            KeyCode::Up if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 if let Some(text) = self.context.history_recall_older() {
                     self.context.input_buffer = text;
                     self.refresh_autocomplete();
                 }
             }
-            KeyCode::Down if self.setup_overlay.is_none() => {
+            KeyCode::Down if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 if let Some(text) = self.context.history_recall_newer() {
                     self.context.input_buffer = text;
                     self.refresh_autocomplete();
