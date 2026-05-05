@@ -2727,7 +2727,8 @@ async fn run_loop(
         // option presence so we don't churn buffers on every keystroke.
         let want_alt = app.list_picker.is_some()
             || app.autocomplete.is_visible()
-            || app.setup_overlay.is_some();
+            || app.setup_overlay.is_some()
+            || app.first_run_wizard.is_some();
         let in_alt = alt.is_some();
         if want_alt && !in_alt {
             execute!(io::stdout(), EnterAlternateScreen)?;
@@ -2782,7 +2783,14 @@ async fn run_loop(
             // While in alt-screen, render whichever overlay drove us in.
             // Setup overlay takes precedence (it's the most modal — owns
             // a provisioner task), then picker, then autocomplete.
-            if app.setup_overlay.is_some() {
+            if app.first_run_wizard.is_some() {
+                alt_term.draw(|frame| {
+                    let area = frame.area();
+                    if let Some(w) = app.first_run_wizard.as_ref() {
+                        w.render_fullscreen(frame, area);
+                    }
+                })?;
+            } else if app.setup_overlay.is_some() {
                 alt_term.draw(|frame| {
                     let area = frame.area();
                     if let Some(o) = app.setup_overlay.as_mut() {
