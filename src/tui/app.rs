@@ -2780,21 +2780,23 @@ async fn run_loop(
         }
 
         if let Some(ref mut alt_term) = alt {
-            // While in alt-screen, render whichever overlay drove us in.
-            // Setup overlay takes precedence (it's the most modal — owns
-            // a provisioner task), then picker, then autocomplete.
-            if app.first_run_wizard.is_some() {
-                alt_term.draw(|frame| {
-                    let area = frame.area();
-                    if let Some(w) = app.first_run_wizard.as_ref() {
-                        w.render_fullscreen(frame, area);
-                    }
-                })?;
-            } else if app.setup_overlay.is_some() {
+            // Render priority: setup_overlay first. During the first-run
+            // wizard's RunningProvisioner phase BOTH wizard and overlay
+            // are active — the wizard intentionally renders nothing in
+            // that phase and delegates the screen to the overlay. If the
+            // wizard won the priority race, the screen would go black.
+            if app.setup_overlay.is_some() {
                 alt_term.draw(|frame| {
                     let area = frame.area();
                     if let Some(o) = app.setup_overlay.as_mut() {
                         o.render(frame, area);
+                    }
+                })?;
+            } else if app.first_run_wizard.is_some() {
+                alt_term.draw(|frame| {
+                    let area = frame.area();
+                    if let Some(w) = app.first_run_wizard.as_ref() {
+                        w.render_fullscreen(frame, area);
                     }
                 })?;
             } else if app.list_picker.is_some() {
