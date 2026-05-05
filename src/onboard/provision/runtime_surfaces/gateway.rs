@@ -147,19 +147,11 @@ impl TuiProvisioner for GatewayProvisioner {
             s.first().copied() != Some(1)
         };
 
-        // Optional webhook secret
-        send(
-            &events,
-            ProvisionEvent::Prompt {
-                id: "webhook_secret".into(),
-                label: "Webhook signing secret (Enter to skip)".into(),
-                default: None,
-                secret: true,
-            },
-        )
-        .await?;
-
-        let _secret = recv_text(&mut responses).await?;
+        // Note: webhook signing secret prompt was removed. The current
+        // `GatewayConfig` schema has no `webhook_secret` field — gateway
+        // pairing uses `paired_tokens` (managed automatically by the
+        // /pair flow). If a user-managed webhook signing secret is added
+        // to the schema later, re-introduce the prompt here.
 
         let host_for_summary = host.clone();
 

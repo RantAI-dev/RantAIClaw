@@ -594,9 +594,13 @@ impl TuiApp {
                     }
                 }
             }
-            // Enter — submit choose or submit prompt.
+            // Enter — submit choose or submit prompt. Skip if wizard is in Welcome
+            // phase (the wizard Enter handler takes over in that case).
             KeyCode::Enter
                 if self.setup_overlay.is_some()
+                    && !self.first_run_wizard.as_ref().is_some_and(|w| {
+                        matches!(w.phase, super::first_run_wizard::WizardPhase::Welcome)
+                    })
                     && (self
                         .setup_overlay
                         .as_ref()
@@ -998,6 +1002,9 @@ impl TuiApp {
                     }
                 }
             }
+            CmdResult::OpenFirstRunWizard => {
+                self.first_run_wizard = Some(super::FirstRunWizard::new(self.profile.clone()));
+            }
             CmdResult::ClearTerminal(announce) => {
                 // The actual screen+scrollback wipe runs in `run_loop`
                 // (which owns the Terminal). We just raise the flag and
@@ -1152,12 +1159,39 @@ impl TuiApp {
 
         let events_tx = events_tx;
         tokio::spawn(async move {
+            // Clone events_tx so we can still report save failures to the
+            // overlay after `prov.run` consumes the original via ProvisionIo.
+            let save_failure_tx = events_tx.clone();
             let io = crate::onboard::provision::ProvisionIo {
                 events: events_tx,
                 responses: response_rx,
             };
-            if let Err(e) = prov.run(&mut config, &profile, io).await {
-                tracing::error!(provisioner = prov_name, "provisioner error: {e}");
+            match prov.run(&mut config, &profile, io).await {
+                Ok(()) => {
+                    // Persist the mutated config to disk. Without this,
+                    // every provisioner mutation is lost when the spawned
+                    // task drops `config`. Config::save() also handles
+                    // secret encryption (see config/schema.rs:save) so
+                    // plaintext API keys captured during the flow get
+                    // encrypted before hitting disk.
+                    if let Err(e) = config.save().await {
+                        tracing::error!(
+                            provisioner = prov_name,
+                            "failed to save config after provisioner: {e}"
+                        );
+                        // Best-effort surface to the overlay log so the
+                        // user sees the failure instead of a phantom
+                        // success.
+                        let _ = save_failure_tx
+                            .send(crate::onboard::provision::ProvisionEvent::Failed {
+                                error: format!("Config save failed: {e}"),
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(provisioner = prov_name, "provisioner error: {e}");
+                }
             }
         });
 
