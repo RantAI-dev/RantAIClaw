@@ -581,8 +581,7 @@ impl TuiApp {
                 let wizard = self.first_run_wizard.as_mut().unwrap();
                 match wizard.phase {
                     super::first_run_wizard::WizardPhase::Welcome => {
-                        wizard.phase =
-                            super::first_run_wizard::WizardPhase::RunningProvisioner { idx: 0 };
+                        wizard.start_provisioners();
                         if let Some(name) = wizard.current_provisioner_name() {
                             if let Err(e) = self.open_setup_overlay(name.to_string()) {
                                 let msg = format!("Failed to open provisioner: {}", e);
@@ -590,13 +589,12 @@ impl TuiApp {
                             }
                         }
                     }
-                    super::first_run_wizard::WizardPhase::ProjectContext => {
-                        wizard.finish_project_context();
-                    }
-                    super::first_run_wizard::WizardPhase::ScaffoldFiles => {
-                        wizard.finish();
-                    }
                     super::first_run_wizard::WizardPhase::Complete => {
+                        // Reload config so the freshly-saved provisioner
+                        // sections take effect in the running TUI.
+                        if let Err(e) = self.reload_config() {
+                            tracing::warn!("failed to reload config after wizard: {}", e);
+                        }
                         self.first_run_wizard = None;
                     }
                     super::first_run_wizard::WizardPhase::RunningProvisioner { .. } => {
@@ -761,25 +759,26 @@ impl TuiApp {
         if let Some(rx) = &mut self.setup_event_rx {
             while let Ok(ev) = rx.try_recv() {
                 if let Some(overlay) = &mut self.setup_overlay {
-                    overlay.handle_event(ev.clone());
-                }
-                if let Some(wizard) = &mut self.first_run_wizard {
-                    wizard.handle_provisioner_event(ev);
+                    overlay.handle_event(ev);
                 }
             }
         }
-        // Wizard auto-advance: when the current provisioner finishes,
-        // spawn the next one or advance to the next wizard phase.
+        // Wizard auto-advance: when the current provisioner finishes
+        // SUCCESSFULLY, close the overlay and open the next provisioner
+        // (or advance to Complete if this was the last one). On
+        // failure, keep the overlay open so the user reads the error
+        // and decides what to do (Esc aborts the wizard).
         if let Some(wizard) = &mut self.first_run_wizard {
-            if matches!(
-                wizard.phase,
-                super::first_run_wizard::WizardPhase::RunningProvisioner { .. }
-            ) {
-                if self.setup_overlay.as_ref().is_some_and(|o| o.finished) {
+            if wizard.is_provisioner_running() {
+                let overlay_state = self.setup_overlay.as_ref();
+                let is_finished = overlay_state.is_some_and(|o| o.finished);
+                let has_failure = overlay_state.is_some_and(|o| o.failure_reason.is_some());
+                if is_finished && !has_failure {
+                    // Clean success → advance.
                     self.setup_overlay = None;
                     self.setup_event_rx = None;
                     self.setup_response_tx = None;
-                    wizard.advance();
+                    wizard.advance_after_success();
                     if matches!(
                         wizard.phase,
                         super::first_run_wizard::WizardPhase::RunningProvisioner { .. }
@@ -792,6 +791,8 @@ impl TuiApp {
                         }
                     }
                 }
+                // Failed: do nothing — overlay stays open showing the
+                // error; user dismisses with Esc which exits the wizard.
             }
         }
         // Note: we no longer auto-clear the overlay when the provisioner
@@ -1201,6 +1202,16 @@ impl TuiApp {
                 }
                 Err(e) => {
                     tracing::error!(provisioner = prov_name, "provisioner error: {e}");
+                    // Surface the error to the overlay so the user
+                    // sees what went wrong and the wizard's failure
+                    // detection (overlay.failure_reason) fires.
+                    // Without this the overlay's `finished` flag is
+                    // never set and the wizard freezes forever.
+                    let _ = save_failure_tx
+                        .send(crate::onboard::provision::ProvisionEvent::Failed {
+                            error: format!("Provisioner error: {e}"),
+                        })
+                        .await;
                 }
             }
         });

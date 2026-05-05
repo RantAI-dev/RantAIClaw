@@ -1,341 +1,295 @@
 //! First-run wizard state machine.
 //!
-//! Minimal: just tracks phase and decides what to render.
-//! The app drives provisioner execution using `open_setup_overlay`.
+//! Drives the user through every registered provisioner in
+//! `wizard_provisioner_order()` in sequence, then lands on a Complete
+//! screen. The wizard itself only tracks phase + progress; per-step
+//! UI lives in the setup_overlay (which the app opens for each
+//! provisioner via `open_setup_overlay`).
 //!
 //! Phase flow:
-//!   Welcome → Provisioner0 → Provisioner1 → ... → ProvisionerN → ProjectContext → ScaffoldFiles → Complete
+//!   Welcome → RunningProvisioner{0} → … → RunningProvisioner{N-1} → Complete
+//!
+//! On Done → wizard auto-advances to the next provisioner.
+//! On Failed → wizard halts in the current RunningProvisioner phase;
+//! the overlay shows the error and the user picks a path forward
+//! (Esc to abort the wizard, or — future — a retry action).
 
 use crate::profile::Profile;
-use std::path::PathBuf;
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    Frame,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WizardPhase {
     Welcome,
     RunningProvisioner { idx: usize },
-    ProjectContext,
-    ScaffoldFiles,
     Complete,
 }
 
 #[derive(Debug)]
 pub struct FirstRunWizard {
     pub phase: WizardPhase,
-    pub step: usize,
-    pub total_steps: usize,
     pub provisioner_idx: usize,
     pub provisioner_total: usize,
     pub profile: Profile,
-    pub workspace_dir: Option<PathBuf>,
-    pub user_name: String,
-    pub timezone: String,
-    pub agent_name: String,
-    pub communication_style: String,
 }
 
 impl FirstRunWizard {
     pub fn new(profile: Profile) -> Self {
         let provisioner_total = wizard_provisioner_order().len();
-        let total = 2 + provisioner_total + 4 + 1;
         Self {
             phase: WizardPhase::Welcome,
-            step: 1,
-            total_steps: total,
             provisioner_idx: 0,
             provisioner_total,
             profile,
-            workspace_dir: None,
-            user_name: String::new(),
-            timezone: String::new(),
-            agent_name: String::new(),
-            communication_style: String::new(),
         }
     }
 
     pub fn current_provisioner_name(&self) -> Option<&'static str> {
-        let order = wizard_provisioner_order();
-        order.get(self.provisioner_idx).copied()
+        wizard_provisioner_order()
+            .get(self.provisioner_idx)
+            .copied()
     }
 
-    pub fn is_provisioner_done(&self) -> bool {
+    pub fn is_provisioner_running(&self) -> bool {
         matches!(self.phase, WizardPhase::RunningProvisioner { .. })
     }
 
-    /// Call after a provisioner finishes. Advances to next step.
-    /// Returns true if wizard is complete.
-    pub fn advance(&mut self) {
-        self.provisioner_idx += 1;
-        self.step += 1;
+    /// Step number (1-based) for the header label.
+    /// Welcome = 1, each provisioner = 2 + idx, Complete = 2 + total.
+    pub fn step(&self) -> usize {
+        match self.phase {
+            WizardPhase::Welcome => 1,
+            WizardPhase::RunningProvisioner { idx } => 2 + idx,
+            WizardPhase::Complete => 2 + self.provisioner_total,
+        }
+    }
 
+    pub fn total_steps(&self) -> usize {
+        // Welcome + N provisioners + Complete
+        2 + self.provisioner_total
+    }
+
+    /// Call when the active provisioner emits Done. Advances to the next
+    /// provisioner, or to Complete if this was the last one.
+    pub fn advance_after_success(&mut self) {
+        self.provisioner_idx += 1;
         if self.provisioner_idx < self.provisioner_total {
             self.phase = WizardPhase::RunningProvisioner {
                 idx: self.provisioner_idx,
             };
         } else {
-            self.phase = WizardPhase::ProjectContext;
+            self.phase = WizardPhase::Complete;
         }
     }
 
-    /// Call after project context is collected.
-    pub fn finish_project_context(&mut self) {
-        self.step += 1;
-        self.phase = WizardPhase::ScaffoldFiles;
+    /// Begin the provisioner sequence from the Welcome screen.
+    pub fn start_provisioners(&mut self) {
+        self.provisioner_idx = 0;
+        self.phase = WizardPhase::RunningProvisioner { idx: 0 };
     }
 
-    /// Call after scaffolding is done.
-    pub fn finish(&mut self) {
-        self.step += 1;
-        self.phase = WizardPhase::Complete;
-    }
-
-    pub fn handle_provisioner_event(&mut self, ev: crate::onboard::provision::ProvisionEvent) {
-        if let crate::onboard::provision::ProvisionEvent::Done { .. }
-        | crate::onboard::provision::ProvisionEvent::Failed { .. } = ev
-        {
-            self.advance();
+    pub fn render_fullscreen(&self, frame: &mut Frame, area: Rect) {
+        if area.height < 8 || area.width < 30 {
+            return;
         }
-    }
-
-    pub fn render_fullscreen(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-        use ratatui::{
-            layout::{Constraint, Direction, Layout, Rect},
-            style::{Color, Modifier, Style},
-            text::{Line, Span},
-            widgets::{Block, Borders, Clear, Paragraph, Wrap},
-        };
 
         let coral = Color::Rgb(255, 138, 101);
         let sky = Color::Rgb(94, 184, 255);
         let muted = Color::Rgb(107, 114, 128);
+        let frame_color = Color::Rgb(40, 70, 140);
         let emerald = Color::Rgb(52, 211, 153);
 
         frame.render_widget(Clear, area);
 
+        // Outer 2-col / 1-row margin so the wizard breathes — same
+        // breathing room the list_picker fullscreen render uses.
         let outer = Rect {
-            x: area.x + 3,
-            y: area.y + 2,
-            width: area.width.saturating_sub(6),
-            height: area.height.saturating_sub(4),
+            x: area.x + 2,
+            y: area.y + 1,
+            width: area.width.saturating_sub(4),
+            height: area.height.saturating_sub(2),
         };
 
+        // Vertical layout: title row, spacer, content area, spacer, footer.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // 0: title row
+                Constraint::Length(1), // 1: spacer
+                Constraint::Min(3),    // 2: content
+                Constraint::Length(1), // 3: spacer
+                Constraint::Length(1), // 4: footer
+            ])
+            .split(outer);
+
+        // ── Title row ──────────────────────────────────────────────
+        let title_text = match self.phase {
+            WizardPhase::Welcome => "First-Run Setup".to_string(),
+            WizardPhase::RunningProvisioner { idx } => format!(
+                "Setup: {}",
+                self.current_provisioner_name().unwrap_or("?"),
+            )
+            .replace("Setup: ", &format!("Setup: ({}/{}) ", idx + 1, self.provisioner_total)),
+            WizardPhase::Complete => "Setup Complete!".to_string(),
+        };
+        let title_color = match self.phase {
+            WizardPhase::Complete => emerald,
+            _ => coral,
+        };
+        let step_label = format!(
+            "Step {}/{}",
+            self.step(),
+            self.total_steps(),
+        );
+        let title_line = Line::from(vec![
+            Span::styled("⚡ ", Style::default().fg(title_color)),
+            Span::styled(
+                title_text,
+                Style::default()
+                    .fg(title_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   ", Style::default()),
+            Span::styled(step_label, Style::default().fg(muted)),
+        ]);
+        frame.render_widget(Paragraph::new(title_line), chunks[0]);
+
+        // ── Content ────────────────────────────────────────────────
         match self.phase {
             WizardPhase::Welcome => {
-                let heading = Line::from(Span::styled(
-                    "⚡ RantaiClaw First-Run Setup ⚡",
-                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
-                ));
+                let bullet = |text: &str| {
+                    Line::from(vec![
+                        Span::styled("  · ", Style::default().fg(sky)),
+                        Span::styled(text.to_string(), Style::default().fg(muted)),
+                    ])
+                };
                 let lines: Vec<Line> = vec![
-                    Line::from(""),
                     Line::from(Span::styled(
-                        "Let's get you set up. This wizard will:",
-                        Style::default().fg(sky),
-                    )),
-                    Line::from(Span::styled(
-                        "  · Configure your AI provider and API key",
-                        Style::default().fg(muted),
-                    )),
-                    Line::from(Span::styled(
-                        "  · Set up messaging channels (optional)",
-                        Style::default().fg(muted),
-                    )),
-                    Line::from(Span::styled(
-                        "  · Personalize your agent's personality",
-                        Style::default().fg(muted),
-                    )),
-                    Line::from(Span::styled(
-                        "  · Configure memory, tools, and security",
-                        Style::default().fg(muted),
-                    )),
-                    Line::from(Span::styled(
-                        "  · Create your workspace files",
-                        Style::default().fg(muted),
+                        "Welcome to RantaiClaw. This wizard will walk you through:",
+                        Style::default().fg(sky).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
-                    Line::from(Span::raw("")),
-                    Line::from(
-                        Span::styled("Press ", Style::default().fg(muted))
-                            + Span::styled(
-                                "Enter",
-                                Style::default().fg(emerald).add_modifier(Modifier::BOLD),
-                            )
-                            + Span::styled(" to begin setup", Style::default().fg(muted)),
-                    ),
-                    Line::from(
-                        Span::styled("Press ", Style::default().fg(muted))
-                            + Span::styled(
-                                "Esc",
-                                Style::default().fg(coral).add_modifier(Modifier::BOLD),
-                            )
-                            + Span::styled(" to exit", Style::default().fg(muted)),
-                    ),
+                    bullet("Provider, model, and API key"),
+                    bullet("Approval / autonomy tier"),
+                    bullet("Persona, skills, and MCP servers"),
+                    bullet("Memory, runtime, proxy, tunnel, gateway"),
+                    bullet("Browser, web search, integrations"),
+                    bullet("Sub-agents and routing"),
+                    bullet("Secrets, multimodal, hardware"),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!(
+                            "{} provisioners total · skip any with Esc · resume later via /setup full",
+                            self.provisioner_total,
+                        ),
+                        Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+                    )),
                 ];
-                let all_lines: Vec<Line> = std::iter::once(heading)
-                    .chain(std::iter::once(Line::from("")))
-                    .chain(lines)
-                    .collect();
-                let content = Paragraph::new(all_lines)
+                let body = Paragraph::new(lines)
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(sky)),
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(frame_color)),
                     )
                     .wrap(Wrap { trim: false });
-                frame.render_widget(content, outer);
+                frame.render_widget(body, chunks[2]);
             }
+
             WizardPhase::RunningProvisioner { .. } => {
-                // Provisioner overlay handles its own rendering
+                // Intentionally empty — the active setup_overlay covers
+                // this whole frame. The alt-screen render dispatch in
+                // app.rs draws the overlay before the wizard during
+                // RunningProvisioner; this render is a fallback only,
+                // shown briefly between provisioners while the next
+                // overlay is being spawned.
+                let placeholder = Paragraph::new(Line::from(Span::styled(
+                    "  Loading next step…",
+                    Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+                )))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(frame_color)),
+                );
+                frame.render_widget(placeholder, chunks[2]);
             }
-            WizardPhase::ProjectContext => {
-                let heading = Line::from(vec![
-                    Span::styled("Step ", Style::default().fg(muted)),
-                    Span::styled(
-                        format!("{}/{} ", self.step, self.total_steps),
-                        Style::default().fg(sky).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "— Project Context",
-                        Style::default().fg(coral).add_modifier(Modifier::BOLD),
-                    ),
-                ]);
-                let lines: Vec<Line> = vec![
-                    Line::from(""),
-                    Line::from(Span::raw("  This step is in progress.")),
-                    Line::from(Span::raw("")),
-                    Line::from(
-                        Span::styled("Press ", Style::default().fg(muted))
-                            + Span::styled(
-                                "Enter",
-                                Style::default().fg(emerald).add_modifier(Modifier::BOLD),
-                            )
-                            + Span::styled(" to continue", Style::default().fg(muted)),
-                    ),
-                ];
-                let all_lines: Vec<Line> = std::iter::once(heading).chain(lines).collect();
-                let content = Paragraph::new(all_lines)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(sky)),
-                    )
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(content, outer);
-            }
-            WizardPhase::ScaffoldFiles => {
-                let heading = Line::from(vec![
-                    Span::styled("Step ", Style::default().fg(Color::Rgb(107, 114, 128))),
-                    Span::styled(
-                        format!("{}/{} ", self.step, self.total_steps),
-                        Style::default().fg(sky).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "— Creating Workspace Files",
-                        Style::default().fg(coral).add_modifier(Modifier::BOLD),
-                    ),
-                ]);
-                let lines: Vec<Line> = vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "Creating workspace files...",
-                        Style::default().fg(sky),
-                    )),
-                    Line::from(Span::styled("✓ Done", Style::default().fg(emerald))),
-                    Line::from(Span::raw("")),
-                    Line::from(
-                        Span::styled("Press ", Style::default().fg(muted))
-                            + Span::styled(
-                                "Enter",
-                                Style::default().fg(emerald).add_modifier(Modifier::BOLD),
-                            )
-                            + Span::styled(" to continue", Style::default().fg(muted)),
-                    ),
-                ];
-                let all_lines: Vec<Line> = std::iter::once(heading).chain(lines).collect();
-                let content = Paragraph::new(all_lines)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(sky)),
-                    )
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(content, outer);
-            }
+
             WizardPhase::Complete => {
-                let heading = Line::from(Span::styled(
-                    "⚡ Setup Complete! ⚡",
-                    Style::default().fg(emerald).add_modifier(Modifier::BOLD),
-                ));
+                let bullet = |key: &str, text: &str| {
+                    Line::from(vec![
+                        Span::styled("  · ", Style::default().fg(emerald)),
+                        Span::styled(
+                            key.to_string(),
+                            Style::default().fg(sky).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(" — {text}"),
+                            Style::default().fg(muted),
+                        ),
+                    ])
+                };
                 let lines: Vec<Line> = vec![
-                    Line::from(""),
                     Line::from(Span::styled(
                         "Your RantaiClaw workspace is ready.",
-                        Style::default().fg(sky),
+                        Style::default().fg(emerald).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
                     Line::from(Span::styled(
                         "Next steps:",
                         Style::default().fg(coral).add_modifier(Modifier::BOLD),
                     )),
-                    Line::from(Span::styled(
-                        "  · rantaiclaw chat  — start a conversation",
-                        Style::default().fg(muted),
-                    )),
-                    Line::from(Span::styled(
-                        "  · rantaiclaw agent — run the autonomous agent",
-                        Style::default().fg(muted),
-                    )),
-                    Line::from(Span::styled(
-                        "  · rantaiclaw setup — reconfigure any topic",
-                        Style::default().fg(muted),
-                    )),
                     Line::from(""),
-                    Line::from(
-                        Span::styled("Press ", Style::default().fg(muted))
-                            + Span::styled(
-                                "Enter",
-                                Style::default().fg(emerald).add_modifier(Modifier::BOLD),
-                            )
-                            + Span::styled(" to start chatting", Style::default().fg(muted)),
-                    ),
+                    bullet("rantaiclaw", "open the chat TUI"),
+                    bullet("/setup", "reconfigure any topic from inside the TUI"),
+                    bullet("rantaiclaw setup <topic>", "reconfigure a single topic from a shell"),
                 ];
-                let all_lines: Vec<Line> = std::iter::once(heading).chain(lines).collect();
-                let content = Paragraph::new(all_lines)
+                let body = Paragraph::new(lines)
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
                             .border_style(Style::default().fg(emerald)),
                     )
                     .wrap(Wrap { trim: false });
-                frame.render_widget(content, outer);
+                frame.render_widget(body, chunks[2]);
             }
         }
-    }
 
-    pub fn current_step_display(&self) -> String {
-        match self.phase {
-            WizardPhase::Welcome => format!("Step {}/{} — Welcome", self.step, self.total_steps),
-            WizardPhase::RunningProvisioner { idx } => {
-                let name = self.current_provisioner_name().unwrap_or("?");
-                format!(
-                    "Step {}/{} — Setup: {} ({}/{})",
-                    self.step,
-                    self.total_steps,
-                    name,
-                    idx + 1,
-                    self.provisioner_total
-                )
-            }
-            WizardPhase::ProjectContext => {
-                format!("Step {}/{} — Project Context", self.step, self.total_steps)
-            }
-            WizardPhase::ScaffoldFiles => format!(
-                "Step {}/{} — Creating Workspace Files",
-                self.step, self.total_steps
-            ),
-            WizardPhase::Complete => "Setup Complete!".to_string(),
-        }
+        // ── Footer ─────────────────────────────────────────────────
+        let footer_spans: Vec<Span> = match self.phase {
+            WizardPhase::Welcome => vec![
+                Span::styled("Enter", Style::default().fg(emerald).add_modifier(Modifier::BOLD)),
+                Span::styled(" begin · ", Style::default().fg(muted)),
+                Span::styled("Esc", Style::default().fg(coral).add_modifier(Modifier::BOLD)),
+                Span::styled(" exit", Style::default().fg(muted)),
+            ],
+            WizardPhase::RunningProvisioner { .. } => vec![
+                Span::styled(
+                    "(provisioner overlay active)",
+                    Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+                ),
+            ],
+            WizardPhase::Complete => vec![
+                Span::styled("Enter", Style::default().fg(emerald).add_modifier(Modifier::BOLD)),
+                Span::styled(" close · ", Style::default().fg(muted)),
+                Span::styled("Esc", Style::default().fg(coral).add_modifier(Modifier::BOLD)),
+                Span::styled(" close", Style::default().fg(muted)),
+            ],
+        };
+        frame.render_widget(Paragraph::new(Line::from(footer_spans)), chunks[4]);
     }
 }
 
+/// Order of provisioners run by `setup full`. Append-only: any
+/// reordering or insertion changes the wizard sequence as seen by
+/// existing users mid-onboarding.
 pub fn wizard_provisioner_order() -> Vec<&'static str> {
     vec![
         "provider",

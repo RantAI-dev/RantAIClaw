@@ -48,6 +48,10 @@ pub struct SetupOverlayState {
     /// stays open in this state so the user can read the final
     /// summary; Esc dismisses (handled by the app, not auto-close).
     pub finished: bool,
+    /// `Some(reason)` when the provisioner ended via `Failed`, `None`
+    /// for clean Done. Lets the wizard distinguish success from
+    /// failure so it can halt vs auto-advance accordingly.
+    pub failure_reason: Option<String>,
     /// Legacy alias so older code that reads `closed` keeps compiling.
     /// Will be removed in a follow-up.
     pub closed: bool,
@@ -115,6 +119,7 @@ impl SetupOverlayState {
                 self.log.push(String::new());
                 self.log.push("Press Esc to close.".to_string());
                 self.finished = true;
+                self.failure_reason = Some(error);
             }
         }
     }
