@@ -2653,7 +2653,13 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     app.context.available_providers = available_providers;
 
     if let Some(topic) = tui_config.setup_provisioner.take() {
-        if let Err(e) = app.open_setup_overlay(topic) {
+        // `rantaiclaw setup` (no topic) and `rantaiclaw setup full` both
+        // boot the first-run wizard — the canonical "set everything up"
+        // entry point. Named topics route to the overlay for that one
+        // provisioner; unknown names surface the existing error.
+        if topic.is_empty() || topic.eq_ignore_ascii_case("full") {
+            app.first_run_wizard = Some(crate::tui::FirstRunWizard::new(profile.clone()));
+        } else if let Err(e) = app.open_setup_overlay(topic) {
             let msg = format!("Failed to open setup: {}", e);
             let _ = app.context.append_system_message(&msg);
             app.scrollback_queue.push(("system".to_string(), msg));
