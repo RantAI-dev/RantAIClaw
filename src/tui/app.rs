@@ -864,8 +864,13 @@ impl TuiApp {
         let path = self.profile.config_toml();
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config from {}", path.display()))?;
-        let config: crate::config::Config =
+        let mut config: crate::config::Config =
             toml::from_str(&contents).context("failed to parse config file")?;
+        // `config_path` is `#[serde(skip)]` so deserialization leaves
+        // it as PathBuf::default(). Restore from the path we just
+        // loaded — without this, the next config.save() bails with
+        // "Config path must have a parent directory".
+        config.config_path = path.clone();
         // Refresh the status-bar model label so the running TUI shows
         // the freshly-saved provider/model. Without this, a wizard run
         // that switches provider (e.g. openrouter → minimax) would
@@ -1275,6 +1280,15 @@ impl TuiApp {
                     // secret encryption (see config/schema.rs:save) so
                     // plaintext API keys captured during the flow get
                     // encrypted before hitting disk.
+                    //
+                    // Defensive: if `config.config_path` somehow ended
+                    // up empty (e.g. a Default::default() Config slipped
+                    // through, or a serde-skipped reload), fall back to
+                    // the profile's known config.toml path so save()
+                    // can compute a parent dir.
+                    if config.config_path.parent().is_none() {
+                        config.config_path = profile.config_toml();
+                    }
                     if let Err(e) = config.save().await {
                         tracing::error!(
                             provisioner = prov_name,

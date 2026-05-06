@@ -303,15 +303,21 @@ impl TuiProvisioner for ProviderProvisioner {
                 )
                 .await?;
 
-                let validation_url = format!(
-                    "https://{}{}/v1/models",
-                    provider_base_url(provider_name),
-                    if provider_name == "openrouter" {
-                        ""
-                    } else {
-                        "/v1"
-                    }
-                );
+                // Build a `/v1/models` URL from the provider's base.
+                // Some bases already include `/v1` (e.g. openai →
+                // `api.openai.com/v1`) and some don't (e.g. minimax →
+                // `api.minimax.io`). The previous logic
+                // unconditionally appended `/v1/models` AND added
+                // another `/v1` for non-openrouter providers, producing
+                // `api.minimax.io/v1/v1/models` and
+                // `api.openai.com/v1/v1/v1/models`. Detect what's
+                // already present and only append the missing segments.
+                let base = provider_base_url(provider_name);
+                let validation_url = if base.contains("/v1") {
+                    format!("https://{base}/models")
+                } else {
+                    format!("https://{base}/v1/models")
+                };
 
                 let probe = probe_get(
                     &validation_url,
