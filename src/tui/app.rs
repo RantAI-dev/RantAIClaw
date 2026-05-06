@@ -883,6 +883,20 @@ impl TuiApp {
         if !model_label.is_empty() {
             self.context.model = model_label;
         }
+        // Recompute the /model picker's available-providers list from
+        // the new config. Same logic as the startup-time computation
+        // in run_tui — without this, /model still shows the old
+        // provider's models after the wizard switched providers.
+        let mut available_providers: Vec<String> = Vec::new();
+        if let Some(p) = config.default_provider.clone() {
+            available_providers.push(p);
+        }
+        for route in &config.model_routes {
+            if !available_providers.iter().any(|p| p == &route.provider) {
+                available_providers.push(route.provider.clone());
+            }
+        }
+        self.context.available_providers = available_providers;
         self.config = config;
         Ok(())
     }
