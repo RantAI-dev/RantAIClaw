@@ -116,13 +116,16 @@ pub struct TuiApp {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetupTopicAction {
     TuiProvisioner(String),
-    OpenChannelSubPicker,
+    /// Drill down into a category sub-picker. The string is the
+    /// category key (`core`, `channel`, `integration`, `runtime`,
+    /// `hardware`, `routing`).
+    OpenCategorySubPicker(String),
     Unknown,
 }
 
 pub fn dispatch_setup_topic_key(key: &str) -> SetupTopicAction {
-    if key == "channels" {
-        return SetupTopicAction::OpenChannelSubPicker;
+    if let Some(cat) = key.strip_prefix("cat:") {
+        return SetupTopicAction::OpenCategorySubPicker(cat.to_string());
     }
     if crate::onboard::provision::provisioner_for(key).is_some() {
         return SetupTopicAction::TuiProvisioner(key.to_string());
@@ -1229,7 +1232,9 @@ impl TuiApp {
                         }
                     }
                 }
-                SetupTopicAction::OpenChannelSubPicker => self.open_channel_sub_picker(),
+                SetupTopicAction::OpenCategorySubPicker(ref cat_key) => {
+                    self.open_category_sub_picker(cat_key);
+                }
                 SetupTopicAction::Unknown => {
                     let msg = format!("Unknown setup topic: {key}");
                     let _ = self.context.append_system_message(&msg);
@@ -1365,15 +1370,26 @@ impl TuiApp {
         }
     }
 
-    fn open_channel_sub_picker(&mut self) {
-        use crate::onboard::provision::{available, provisioner_for, ProvisionerCategory};
+    /// Build and open a sub-picker showing only items in the given
+    /// category. `cat_key` is one of `core` / `channel` /
+    /// `integration` / `runtime` / `hardware` / `routing`.
+    fn open_category_sub_picker(&mut self, cat_key: &str) {
+        use crate::onboard::provision::{available, provisioner_for};
+        use crate::tui::commands::setup::{cat_label, category_from_key};
         use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+
+        let Some(category) = category_from_key(cat_key) else {
+            let msg = format!("Unknown setup category: {cat_key}");
+            let _ = self.context.append_system_message(&msg);
+            self.scrollback_queue.push(("system".into(), msg));
+            return;
+        };
 
         let items: Vec<ListPickerItem> = available()
             .into_iter()
             .filter_map(|(name, desc)| {
                 let p = provisioner_for(name)?;
-                if p.category() == ProvisionerCategory::Channel {
+                if p.category() == category {
                     Some(ListPickerItem {
                         key: name.to_string(),
                         primary: name.to_string(),
@@ -1384,12 +1400,16 @@ impl TuiApp {
                 }
             })
             .collect();
+
+        let title = format!("{} setup", cat_label(category));
+        let empty_hint = format!("no {} provisioners available", cat_label(category).to_lowercase());
+
         let picker = ListPicker::new(
-            ListPickerKind::SetupChannel,
-            "Select channel type",
+            ListPickerKind::SetupChannel, // re-used as the generic "category sub-picker" kind
+            title,
             items,
             None,
-            "no channel provisioners available",
+            empty_hint,
         );
         self.list_picker = Some(picker);
     }

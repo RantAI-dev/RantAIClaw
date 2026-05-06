@@ -3,7 +3,7 @@ use anyhow::Result;
 use super::{CommandHandler, CommandResult};
 use crate::onboard::provision::{available, provisioner_for, ProvisionerCategory};
 use crate::tui::context::TuiContext;
-use crate::tui::widgets::{ListPicker, ListPickerEntry, ListPickerItem, ListPickerKind};
+use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 
 pub struct SetupCommand;
 
@@ -17,69 +17,88 @@ impl CommandHandler for SetupCommand {
     }
 
     fn usage(&self) -> &str {
-        "setup [topic]"
+        "setup [topic|full]"
+    }
+
+    fn aliases(&self) -> Vec<&str> {
+        vec!["wizard"]
     }
 
     fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
         let arg = args.trim();
+        if arg.eq_ignore_ascii_case("full") {
+            return Ok(CommandResult::OpenFirstRunWizard);
+        }
         if !arg.is_empty() {
             return Ok(CommandResult::OpenSetupOverlay {
                 provisioner: Some(arg.to_string()),
             });
         }
 
+        // Top picker shows ONE entry per category. Six items, no
+        // pagination, no in-list section headers — drill down into a
+        // sub-picker on Enter. Replaces the previous 41-item flat list
+        // that paginated awkwardly across 9 pages.
         let all = available();
-        let mut entries: Vec<ListPickerEntry> = Vec::with_capacity(all.len());
 
-        let mut categories: Vec<(ProvisionerCategory, &'static str)> = Vec::new();
-        for &(name, _) in &all {
+        let mut categories: Vec<ProvisionerCategory> = Vec::new();
+        for (name, _) in &all {
             let cat = provisioner_for(name)
                 .map(|p| p.category())
                 .unwrap_or(ProvisionerCategory::Core);
-            if !categories.iter().any(|(c, _)| *c == cat) {
-                categories.push((cat, cat_label(cat)));
+            if !categories.contains(&cat) {
+                categories.push(cat);
             }
         }
-        categories.sort_by_key(|(c, _)| cat_order(*c));
+        categories.sort_by_key(|c| cat_order(*c));
 
-        for (cat, label) in categories {
-            let cat_items: Vec<_> = all
-                .iter()
-                .filter(|(name, desc)| {
-                    let c = provisioner_for(name)
-                        .map(|p| p.category())
-                        .unwrap_or(ProvisionerCategory::Core);
-                    c == cat
-                })
-                .collect();
+        let items: Vec<ListPickerItem> = categories
+            .into_iter()
+            .map(|cat| {
+                let cat_items: Vec<&str> = all
+                    .iter()
+                    .filter_map(|(name, _)| {
+                        let c = provisioner_for(name)
+                            .map(|p| p.category())
+                            .unwrap_or(ProvisionerCategory::Core);
+                        (c == cat).then_some(*name)
+                    })
+                    .collect();
 
-            entries.push(ListPickerEntry::category_header(
-                cat_label(cat).to_lowercase(),
-                label,
-                cat_items.len(),
-            ));
+                // Show count + a teaser of the first 4 names.
+                let count = cat_items.len();
+                let teaser = {
+                    let mut shown: Vec<&str> = cat_items.iter().take(4).copied().collect();
+                    if cat_items.len() > 4 {
+                        shown.push("…");
+                    }
+                    shown.join(", ")
+                };
+                let secondary = format!(
+                    "{count} {} · {teaser}",
+                    if count == 1 { "item" } else { "items" }
+                );
 
-            for (name, desc) in cat_items {
-                entries.push(ListPickerEntry::Item(ListPickerItem {
-                    key: name.to_string(),
-                    primary: name.to_string(),
-                    secondary: desc.to_string(),
-                }));
-            }
-        }
+                ListPickerItem {
+                    key: format!("cat:{}", category_key(cat)),
+                    primary: cat_label(cat).to_string(),
+                    secondary,
+                }
+            })
+            .collect();
 
-        let picker = ListPicker::with_entries(
+        let picker = ListPicker::new(
             ListPickerKind::SetupTopic,
-            "Select setup topic",
-            entries,
+            "Setup",
+            items,
             None,
-            "no setup topics available",
+            "no setup categories available",
         );
         Ok(CommandResult::OpenListPicker(picker))
     }
 }
 
-fn cat_label(c: ProvisionerCategory) -> &'static str {
+pub fn cat_label(c: ProvisionerCategory) -> &'static str {
     match c {
         ProvisionerCategory::Core => "Core",
         ProvisionerCategory::Channel => "Channels",
@@ -87,6 +106,29 @@ fn cat_label(c: ProvisionerCategory) -> &'static str {
         ProvisionerCategory::Runtime => "Runtime",
         ProvisionerCategory::Hardware => "Hardware",
         ProvisionerCategory::Routing => "Routing",
+    }
+}
+
+pub fn category_key(c: ProvisionerCategory) -> &'static str {
+    match c {
+        ProvisionerCategory::Core => "core",
+        ProvisionerCategory::Channel => "channel",
+        ProvisionerCategory::Integration => "integration",
+        ProvisionerCategory::Runtime => "runtime",
+        ProvisionerCategory::Hardware => "hardware",
+        ProvisionerCategory::Routing => "routing",
+    }
+}
+
+pub fn category_from_key(key: &str) -> Option<ProvisionerCategory> {
+    match key {
+        "core" => Some(ProvisionerCategory::Core),
+        "channel" => Some(ProvisionerCategory::Channel),
+        "integration" => Some(ProvisionerCategory::Integration),
+        "runtime" => Some(ProvisionerCategory::Runtime),
+        "hardware" => Some(ProvisionerCategory::Hardware),
+        "routing" => Some(ProvisionerCategory::Routing),
+        _ => None,
     }
 }
 
