@@ -5,6 +5,52 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1-alpha] — 2026-05-06
+
+Alpha cut for **Sulthan + Alifia** to start E2E testing on real hardware. No
+runtime behavior changes vs v0.5.3; this is a docs + PM-alignment build that
+ships the first feature-grouped task structure under v0.6.0 — Product
+Completeness Beta in ClickUp.
+
+### Added
+
+- **9 pillar docs** under `docs/pillars/` — one per product surface, with
+  competitor-parity matrix vs OpenClaw + Hermes-agent, maturity table,
+  architecture diagram, trait extension point, CLI/config, and roadmap.
+  Pillar 1 = Setup, 2 = Providers, 3 = Tools/Approvals, 4 = Skills/MCP,
+  5 = Channels, 6 = Memory/Profiles, 7 = Gateway/Daemon, 8 = Install/Release,
+  9 = Documentation.
+- **`docs/project/codebase-bloat-audit-2026-05-06.md`** — date-stamped
+  source-code bloat audit (top 10 findings, dep hit list, module split
+  candidates, niche features to feature-gate).
+- **`docs/project/docs-cleanup-plan-2026-05-06.md`** — proposed lean docs
+  structure aligned with ClickUp pillars (Phase A delivery).
+
+### Changed
+
+- `docs/README.md` rewritten as a 30-second decision-tree entry hub. Dropped
+  the multilingual mirror claim that was never implemented.
+- `docs/SUMMARY.md` rewritten as a unified TOC reflecting the new IA
+  (start / reference / pillars / operations / security / hardware /
+  contributing / project).
+- `CLAUDE.md` §4.1 amended to drop EN/ZH/JA/RU parity claim and document the
+  new pillar-anchored doc system + archive convention for superseded planning
+  artifacts.
+
+### Moved
+
+- `docs/superpowers/{plans,specs}/*` (9 files, ~7,600 LoC of dated planning
+  artifacts that were superseded by shipped releases v0.5.0–v0.5.3) →
+  `docs/project/archive/superpowers/{plans,specs}/`. Content preserved per
+  CLAUDE.md §4.1 archive convention.
+
+### Compatibility
+
+- **No runtime changes.** Configs and on-disk state from v0.5.3 load
+  unchanged.
+- Binary version string is now `0.6.1-alpha`; downstream tooling that
+  pin-matches on `0.5.x` will need to widen the pattern.
+
 ## [0.5.3] — 2026-04-30
 
 Model-default refresh — every provider's wizard menu and quick-mode

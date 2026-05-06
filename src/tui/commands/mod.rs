@@ -5,7 +5,7 @@ mod cron;
 mod memory;
 mod model;
 mod session;
-mod setup;
+pub mod setup;
 mod skills;
 
 use anyhow::Result;
@@ -39,6 +39,8 @@ pub enum CommandResult {
     OpenSetupOverlay {
         provisioner: Option<String>,
     },
+    /// Launch the first-run wizard — sequential setup covering all topics.
+    OpenFirstRunWizard,
     /// Wipe the terminal's visible screen + scrollback in addition to
     /// any side effect the command already performed (e.g. starting a
     /// new session). The string is committed to scrollback after the

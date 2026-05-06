@@ -176,10 +176,10 @@ mod provider {
         let events = run_provisioner_headless(
             "provider",
             vec![
-                ProvisionResponse::Selection(vec![0]),
-                ProvisionResponse::Selection(vec![0]),
-                ProvisionResponse::Text(String::new()),
-                ProvisionResponse::Text(String::new()),
+                ProvisionResponse::Selection(vec![0]), // tier
+                ProvisionResponse::Selection(vec![0]), // specific provider
+                ProvisionResponse::Text(String::new()), // api key (empty)
+                ProvisionResponse::Selection(vec![0]), // default model (Choose)
             ],
         )
         .await

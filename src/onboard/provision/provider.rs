@@ -303,15 +303,21 @@ impl TuiProvisioner for ProviderProvisioner {
                 )
                 .await?;
 
-                let validation_url = format!(
-                    "https://{}{}/v1/models",
-                    provider_base_url(provider_name),
-                    if provider_name == "openrouter" {
-                        ""
-                    } else {
-                        "/v1"
-                    }
-                );
+                // Build a `/v1/models` URL from the provider's base.
+                // Some bases already include `/v1` (e.g. openai →
+                // `api.openai.com/v1`) and some don't (e.g. minimax →
+                // `api.minimax.io`). The previous logic
+                // unconditionally appended `/v1/models` AND added
+                // another `/v1` for non-openrouter providers, producing
+                // `api.minimax.io/v1/v1/models` and
+                // `api.openai.com/v1/v1/v1/models`. Detect what's
+                // already present and only append the missing segments.
+                let base = provider_base_url(provider_name);
+                let validation_url = if base.contains("/v1") {
+                    format!("https://{base}/models")
+                } else {
+                    format!("https://{base}/v1/models")
+                };
 
                 let probe = probe_get(
                     &validation_url,
@@ -381,25 +387,43 @@ impl TuiProvisioner for ProviderProvisioner {
         )
         .await?;
 
-        let default_model = default_model_for_provider(provider_name);
+        // Use the curated model list shared with the legacy wizard so
+        // the names stay in sync across both setup paths. Returns
+        // `(model_id, description)` tuples; we render description as
+        // the Choose option, then map back to the id via `model_ids`.
+        let curated = crate::onboard::wizard::curated_models_for_provider(provider_name);
+        let (model_ids, model_labels): (Vec<String>, Vec<String>) = if curated.is_empty() {
+            // Provider has no curated list — fall back to a single
+            // "default" option so the user still has something to pick.
+            let fallback = default_model_for_provider(provider_name);
+            (vec![fallback.clone()], vec![format!("{fallback} (default)")])
+        } else {
+            curated
+                .into_iter()
+                .map(|(id, desc)| {
+                    let label = format!("{id}  —  {desc}");
+                    (id, label)
+                })
+                .unzip()
+        };
 
         send(
             &events,
-            ProvisionEvent::Prompt {
+            ProvisionEvent::Choose {
                 id: "model".into(),
-                label: "Default model".into(),
-                default: Some(default_model.clone()),
-                secret: false,
+                label: "Select default model".into(),
+                options: model_labels,
+                multi: false,
             },
         )
         .await?;
 
-        let model = recv_text(&mut responses).await?;
-        let model = if model.trim().is_empty() {
-            default_model
-        } else {
-            model.trim().to_string()
-        };
+        let model_sel = recv_selection(&mut responses).await?;
+        let model_idx = model_sel.first().copied().unwrap_or(0);
+        let model = model_ids
+            .get(model_idx)
+            .cloned()
+            .unwrap_or_else(|| default_model_for_provider(provider_name));
 
         // ── Write config ────────────────────────────────────────────
         config.default_provider = Some(provider_name.to_string());

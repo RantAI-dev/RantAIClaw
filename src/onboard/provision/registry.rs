@@ -251,10 +251,10 @@ pub fn test_responses_for(name: &str) -> Vec<ProvisionResponse> {
             ProvisionResponse::Text(String::new()),
         ],
         "provider" => vec![
-            ProvisionResponse::Selection(vec![0]),
-            ProvisionResponse::Selection(vec![0]),
-            ProvisionResponse::Text(String::new()),
-            ProvisionResponse::Text(String::new()),
+            ProvisionResponse::Selection(vec![0]), // tier
+            ProvisionResponse::Selection(vec![0]), // specific provider
+            ProvisionResponse::Text(String::new()), // api key (empty → skip validation)
+            ProvisionResponse::Selection(vec![0]), // default model (now a Choose)
         ],
         "approvals" => vec![ProvisionResponse::Selection(vec![0])],
         "mcp" => vec![

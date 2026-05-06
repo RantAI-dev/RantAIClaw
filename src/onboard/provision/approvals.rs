@@ -90,6 +90,7 @@ impl TuiProvisioner for ApprovalsProvisioner {
             0 => PolicyPreset::L1Manual,
             1 => PolicyPreset::L2Smart,
             2 => PolicyPreset::L3Strict,
+            3 => PolicyPreset::L4Off,
             _ => PolicyPreset::L2Smart,
         };
 

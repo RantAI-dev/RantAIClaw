@@ -32,6 +32,8 @@ credentials.json
 
 # Local Claude Code harness state
 .claude/
+memory/
+state/
 
 # Agent implementation plans (scratchpad — not product docs)
 docs/superpowers/plans/

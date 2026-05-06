@@ -151,21 +151,22 @@ Required:
 
 Treat documentation as a first-class product surface, not a post-merge artifact.
 
-Canonical entry points:
+Canonical entry points (English-only — multilingual parity was claimed in earlier iterations but never implemented; do not promise translations the repo does not actually ship):
 
-- root READMEs: `README.md`, `README.zh-CN.md`, `README.ja.md`, `README.ru.md`
-- docs hubs: `docs/README.md`, `docs/README.zh-CN.md`, `docs/README.ja.md`, `docs/README.ru.md`
+- root README: `README.md`
+- docs hub: `docs/README.md`
 - unified TOC: `docs/SUMMARY.md`
+- pillar docs: `docs/pillars/1-setup.md` … `docs/pillars/9-docs-adoption.md` — one doc per product pillar, mirrors the ClickUp `[Product]` task
 
-Collection indexes (category navigation):
+Collection trees (forthcoming Phase B — files currently still at `docs/` root):
 
-- `docs/getting-started/README.md`
-- `docs/reference/README.md`
-- `docs/operations/README.md`
-- `docs/security/README.md`
-- `docs/hardware/README.md`
-- `docs/contributing/README.md`
-- `docs/project/README.md`
+- `docs/start/` — install, first-run, troubleshooting
+- `docs/reference/` — commands, config, providers, channels, tools, extending
+- `docs/operations/` — runbook, deployment, proxy, resource-limits
+- `docs/security/` — model, audit, sandboxing, threats/
+- `docs/hardware/` — README, boards/, adding-boards, datasheets/
+- `docs/contributing/` — pr-workflow, reviewer, release, ci, actions-policy
+- `docs/project/` — date-stamped snapshots; `docs/project/archive/` for superseded planning artifacts
 
 Runtime-contract references (must track behavior changes):
 
@@ -180,9 +181,10 @@ Runtime-contract references (must track behavior changes):
 Required docs governance rules:
 
 - Keep README/hub top navigation and quick routes intuitive and non-duplicative.
-- Keep EN/ZH/JA/RU entry-point parity when changing navigation architecture.
+- This is an English-only doc system. Do not promise multilingual parity that does not exist.
 - Keep proposal/roadmap docs explicitly labeled; avoid mixing proposal text into runtime-contract docs.
-- Keep project snapshots date-stamped and immutable once superseded by a newer date.
+- Keep project snapshots date-stamped and immutable once superseded by a newer date. Move superseded planning artifacts under `docs/project/archive/<topic>/` rather than deleting.
+- Pillar docs link to ClickUp release tasks; when a release ships, the pillar's "Current state by maturity" table updates to reflect what moved.
 
 ## 5) Risk Tiers by Path (Review Depth Contract)
 

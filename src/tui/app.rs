@@ -116,13 +116,16 @@ pub struct TuiApp {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetupTopicAction {
     TuiProvisioner(String),
-    OpenChannelSubPicker,
+    /// Drill down into a category sub-picker. The string is the
+    /// category key (`core`, `channel`, `integration`, `runtime`,
+    /// `hardware`, `routing`).
+    OpenCategorySubPicker(String),
     Unknown,
 }
 
 pub fn dispatch_setup_topic_key(key: &str) -> SetupTopicAction {
-    if key == "channels" {
-        return SetupTopicAction::OpenChannelSubPicker;
+    if let Some(cat) = key.strip_prefix("cat:") {
+        return SetupTopicAction::OpenCategorySubPicker(cat.to_string());
     }
     if crate::onboard::provision::provisioner_for(key).is_some() {
         return SetupTopicAction::TuiProvisioner(key.to_string());
@@ -345,7 +348,7 @@ impl TuiApp {
             //
             // Multi-line prompts work via Ctrl+J (handled above) or
             // Shift+Enter on terminals with the kitty keyboard protocol.
-            KeyCode::Enter if self.setup_overlay.is_none() => {
+            KeyCode::Enter if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 if self.autocomplete.is_visible() {
                     let buf = self.context.input_buffer.trim_end_matches(' ').to_string();
                     let selected = self.autocomplete.selected().map(str::to_string);
@@ -395,13 +398,13 @@ impl TuiApp {
                 }
             }
             // Backspace
-            KeyCode::Backspace if self.setup_overlay.is_none() => {
+            KeyCode::Backspace if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 self.context.input_buffer.pop();
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
             }
             // Regular character input
-            KeyCode::Char(c) if self.setup_overlay.is_none() => {
+            KeyCode::Char(c) if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 self.context.input_buffer.push(c);
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
@@ -417,13 +420,13 @@ impl TuiApp {
             // Up/Down with no modal active recalls submitted prompts
             // from history. Native terminal scrollback (mouse wheel /
             // PgUp on the host terminal) handles chat scrolling.
-            KeyCode::Up if self.setup_overlay.is_none() => {
+            KeyCode::Up if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 if let Some(text) = self.context.history_recall_older() {
                     self.context.input_buffer = text;
                     self.refresh_autocomplete();
                 }
             }
-            KeyCode::Down if self.setup_overlay.is_none() => {
+            KeyCode::Down if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 if let Some(text) = self.context.history_recall_newer() {
                     self.context.input_buffer = text;
                     self.refresh_autocomplete();
@@ -567,36 +570,74 @@ impl TuiApp {
                 }
             }
             // First-run wizard Enter handling — non-provisioner phases only.
-            KeyCode::Enter if self.first_run_wizard.is_some() => {
+            // Wizard picker (PickChannels / PickIntegrations): route
+            // navigation/toggle keys to the wizard's own multi-select
+            // state. Enter is handled by the wizard Enter arm below.
+            KeyCode::Up
+                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+            {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    w.picker_move_up();
+                }
+            }
+            KeyCode::Down
+                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+            {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    w.picker_move_down();
+                }
+            }
+            KeyCode::Char(' ')
+                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+            {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    w.picker_toggle();
+                }
+            }
+            // Wizard Enter is only meaningful for non-running phases.
+            // During RunningProvisioner, Enter belongs to the active
+            // setup_overlay (Choose submit / Prompt submit) — yield via
+            // the guard so the overlay-Enter arms below can match.
+            KeyCode::Enter
+                if self.first_run_wizard.is_some()
+                    && !matches!(
+                        self.first_run_wizard.as_ref().unwrap().phase,
+                        super::first_run_wizard::WizardPhase::RunningProvisioner { .. }
+                    ) =>
+            {
                 let wizard = self.first_run_wizard.as_mut().unwrap();
-                match wizard.phase {
+                match wizard.phase.clone() {
                     super::first_run_wizard::WizardPhase::Welcome => {
-                        wizard.phase =
-                            super::first_run_wizard::WizardPhase::RunningProvisioner { idx: 0 };
-                        if let Some(name) = wizard.current_provisioner_name() {
-                            if let Err(e) = self.open_setup_overlay(name.to_string()) {
-                                let msg = format!("Failed to open provisioner: {}", e);
-                                let _ = self.context.append_system_message(&msg);
-                            }
-                        }
+                        wizard.start_provisioners();
+                        self.react_to_wizard_phase();
                     }
-                    super::first_run_wizard::WizardPhase::ProjectContext => {
-                        wizard.finish_project_context();
-                    }
-                    super::first_run_wizard::WizardPhase::ScaffoldFiles => {
-                        wizard.finish();
+                    super::first_run_wizard::WizardPhase::PickChannels
+                    | super::first_run_wizard::WizardPhase::PickIntegrations => {
+                        // Submit the multi-select; map indices to names;
+                        // queue selected provisioners; advance.
+                        wizard.apply_picker_selection();
+                        self.react_to_wizard_phase();
                     }
                     super::first_run_wizard::WizardPhase::Complete => {
+                        // Reload config so the freshly-saved provisioner
+                        // sections take effect in the running TUI.
+                        if let Err(e) = self.reload_config() {
+                            tracing::warn!("failed to reload config after wizard: {}", e);
+                        }
                         self.first_run_wizard = None;
                     }
                     super::first_run_wizard::WizardPhase::RunningProvisioner { .. } => {
-                        // Provisioner overlay handles Enter
+                        // Unreachable due to guard; kept for exhaustiveness.
                     }
                 }
             }
-            // Enter — submit choose or submit prompt.
+            // Enter — submit choose or submit prompt. Skip if wizard is in Welcome
+            // phase (the wizard Enter handler takes over in that case).
             KeyCode::Enter
                 if self.setup_overlay.is_some()
+                    && !self.first_run_wizard.as_ref().is_some_and(|w| {
+                        matches!(w.phase, super::first_run_wizard::WizardPhase::Welcome)
+                    })
                     && (self
                         .setup_overlay
                         .as_ref()
@@ -606,18 +647,24 @@ impl TuiApp {
                             .as_ref()
                             .is_some_and(|o| o.active_prompt().is_some())) =>
             {
-                if let Some(o) = self.setup_overlay.as_mut() {
-                    if let Some((id, sel)) = o.submit_choose() {
-                        if let Some(tx) = &self.setup_response_tx {
-                            let _ = tx
-                                .send(crate::onboard::provision::ProvisionResponse::Selection(sel));
-                        }
-                    } else if let Some((id, val)) = o.submit_prompt() {
-                        if let Some(tx) = &self.setup_response_tx {
-                            let _ =
-                                tx.send(crate::onboard::provision::ProvisionResponse::Text(val));
-                        }
+                // Submit (and clear) choose/prompt state, then forward
+                // the response to the provisioner. Awaited so the
+                // future actually runs — without `.await`, the send
+                // future is dropped, the provisioner blocks on
+                // recv_selection/recv_text forever, and the user is
+                // left staring at an empty overlay with no way to
+                // advance.
+                let outgoing = self.setup_overlay.as_mut().and_then(|o| {
+                    if let Some((_id, sel)) = o.submit_choose() {
+                        Some(crate::onboard::provision::ProvisionResponse::Selection(sel))
+                    } else {
+                        o.submit_prompt().map(|(_id, val)| {
+                            crate::onboard::provision::ProvisionResponse::Text(val)
+                        })
                     }
+                });
+                if let (Some(resp), Some(tx)) = (outgoing, self.setup_response_tx.as_ref()) {
+                    let _ = tx.send(resp).await;
                 }
             }
             // Setup overlay open with no active prompt/choose — Up/Down/
@@ -747,52 +794,128 @@ impl TuiApp {
         if let Some(rx) = &mut self.setup_event_rx {
             while let Ok(ev) = rx.try_recv() {
                 if let Some(overlay) = &mut self.setup_overlay {
-                    overlay.handle_event(ev.clone());
-                }
-                if let Some(wizard) = &mut self.first_run_wizard {
-                    wizard.handle_provisioner_event(ev);
+                    overlay.handle_event(ev);
                 }
             }
         }
-        // Wizard auto-advance: when the current provisioner finishes,
-        // spawn the next one or advance to the next wizard phase.
-        if let Some(wizard) = &mut self.first_run_wizard {
-            if matches!(
-                wizard.phase,
-                super::first_run_wizard::WizardPhase::RunningProvisioner { .. }
-            ) {
-                if self.setup_overlay.as_ref().is_some_and(|o| o.finished) {
-                    self.setup_overlay = None;
-                    self.setup_event_rx = None;
-                    self.setup_response_tx = None;
-                    wizard.advance();
-                    if matches!(
-                        wizard.phase,
-                        super::first_run_wizard::WizardPhase::RunningProvisioner { .. }
-                    ) {
-                        if let Some(name) = wizard.current_provisioner_name() {
-                            if let Err(e) = self.open_setup_overlay(name.to_string()) {
-                                let msg = format!("Failed to open provisioner: {}", e);
-                                let _ = self.context.append_system_message(&msg);
-                            }
-                        }
-                    }
-                }
+        // Wizard auto-advance: when the current provisioner finishes
+        // SUCCESSFULLY, close the overlay and open the next provisioner
+        // (or advance to Complete if this was the last one). On
+        // failure, keep the overlay open so the user reads the error
+        // and decides what to do (Esc aborts the wizard).
+        let need_advance = self
+            .first_run_wizard
+            .as_ref()
+            .is_some_and(|w| w.is_provisioner_running())
+            && {
+                let o = self.setup_overlay.as_ref();
+                o.is_some_and(|s| s.finished) && o.is_some_and(|s| s.failure_reason.is_none())
+            };
+        if need_advance {
+            // Clean success → close overlay, advance wizard, react.
+            self.setup_overlay = None;
+            self.setup_event_rx = None;
+            self.setup_response_tx = None;
+            if let Some(wizard) = self.first_run_wizard.as_mut() {
+                wizard.advance_to_next_in_queue_or_picker();
             }
+            self.react_to_wizard_phase();
         }
+        // Failed: do nothing — overlay stays open showing the error;
+        // user dismisses with Esc which exits the wizard.
         // Note: we no longer auto-clear the overlay when the provisioner
         // sets `finished = true`. The user dismisses via Esc so they can
         // read the success/failure summary at their own pace. The Esc
         // handler does the cleanup (clear overlay state + reload config).
     }
 
+    /// Inspect the wizard's current phase and take the side-effect that
+    /// matches it — open a setup overlay for a queued provisioner,
+    /// open the multi-select picker for PickChannels / PickIntegrations,
+    /// or do nothing for Welcome / Complete (handled by the Enter
+    /// handler) or RunningProvisioner without a queued name yet.
+    /// Called after every wizard transition.
+    fn react_to_wizard_phase(&mut self) {
+        let phase = match self.first_run_wizard.as_ref() {
+            Some(w) => w.phase.clone(),
+            None => return,
+        };
+        match phase {
+            super::first_run_wizard::WizardPhase::RunningProvisioner { name } => {
+                if let Err(e) = self.open_setup_overlay(name.clone()) {
+                    let msg = format!("Failed to open provisioner '{name}': {e}");
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".to_string(), msg));
+                }
+            }
+            super::first_run_wizard::WizardPhase::PickChannels => {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    w.open_picker(super::first_run_wizard::channel_options());
+                }
+            }
+            super::first_run_wizard::WizardPhase::PickIntegrations => {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    w.open_picker(super::first_run_wizard::integration_options());
+                }
+            }
+            super::first_run_wizard::WizardPhase::Welcome
+            | super::first_run_wizard::WizardPhase::Complete => {}
+        }
+    }
+
     fn reload_config(&mut self) -> anyhow::Result<()> {
         let path = self.profile.config_toml();
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config from {}", path.display()))?;
-        let config: crate::config::Config =
+        let mut config: crate::config::Config =
             toml::from_str(&contents).context("failed to parse config file")?;
-        self.config = config;
+        // `config_path` is `#[serde(skip)]` so deserialization leaves
+        // it as PathBuf::default(). Restore from the path we just
+        // loaded — without this, the next config.save() bails with
+        // "Config path must have a parent directory".
+        config.config_path = path.clone();
+        // Refresh the status-bar model label so the running TUI shows
+        // the freshly-saved provider/model. Without this, a wizard run
+        // that switches provider (e.g. openrouter → minimax) would
+        // leave the status bar showing the old provider until the
+        // next launch.
+        let provider = config.default_provider.clone().unwrap_or_default();
+        let model = config.default_model.clone().unwrap_or_default();
+        let model_label = if !provider.is_empty() && !model.is_empty() {
+            format!("{provider}:{model}")
+        } else if !model.is_empty() {
+            model
+        } else {
+            self.context.model.clone()
+        };
+        if !model_label.is_empty() {
+            self.context.model = model_label;
+        }
+        // Recompute the /model picker's available-providers list from
+        // the new config. Same logic as the startup-time computation
+        // in run_tui — without this, /model still shows the old
+        // provider's models after the wizard switched providers.
+        let mut available_providers: Vec<String> = Vec::new();
+        if let Some(p) = config.default_provider.clone() {
+            available_providers.push(p);
+        }
+        for route in &config.model_routes {
+            if !available_providers.iter().any(|p| p == &route.provider) {
+                available_providers.push(route.provider.clone());
+            }
+        }
+        self.context.available_providers = available_providers;
+        self.config = config.clone();
+        // Push the new config to the agent actor so the next turn uses
+        // the freshly-saved provider/api_key/model. Without this the
+        // agent stays pinned to the launch-time config and reports
+        // "Missing API key" even though the wizard saved one.
+        let req_tx = self.context.req_tx.clone();
+        tokio::spawn(async move {
+            let _ = req_tx
+                .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                .await;
+        });
         Ok(())
     }
 
@@ -931,7 +1054,12 @@ impl TuiApp {
     /// short, actionable line so the chat doesn't get a wall of stack
     /// trace. Unknown errors fall through verbatim.
     fn finalize_error(&mut self, msg: String) {
-        let (chat_body, status_line) = format_agent_error(&msg);
+        let provider_hint = self
+            .config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string());
+        let (chat_body, status_line) = format_agent_error(&msg, &provider_hint);
         if let Err(e) = self.context.append_assistant_message(&chat_body) {
             self.context.last_error = Some(format!("failed to persist error: {e}"));
         } else {
@@ -997,6 +1125,9 @@ impl TuiApp {
                         self.scrollback_queue.push(("system".to_string(), msg));
                     }
                 }
+            }
+            CmdResult::OpenFirstRunWizard => {
+                self.first_run_wizard = Some(super::FirstRunWizard::new(self.profile.clone()));
             }
             CmdResult::ClearTerminal(announce) => {
                 // The actual screen+scrollback wipe runs in `run_loop`
@@ -1101,7 +1232,9 @@ impl TuiApp {
                         }
                     }
                 }
-                SetupTopicAction::OpenChannelSubPicker => self.open_channel_sub_picker(),
+                SetupTopicAction::OpenCategorySubPicker(ref cat_key) => {
+                    self.open_category_sub_picker(cat_key);
+                }
                 SetupTopicAction::Unknown => {
                     let msg = format!("Unknown setup topic: {key}");
                     let _ = self.context.append_system_message(&msg);
@@ -1152,12 +1285,58 @@ impl TuiApp {
 
         let events_tx = events_tx;
         tokio::spawn(async move {
+            // Clone events_tx so we can still report save failures to the
+            // overlay after `prov.run` consumes the original via ProvisionIo.
+            let save_failure_tx = events_tx.clone();
             let io = crate::onboard::provision::ProvisionIo {
                 events: events_tx,
                 responses: response_rx,
             };
-            if let Err(e) = prov.run(&mut config, &profile, io).await {
-                tracing::error!(provisioner = prov_name, "provisioner error: {e}");
+            match prov.run(&mut config, &profile, io).await {
+                Ok(()) => {
+                    // Persist the mutated config to disk. Without this,
+                    // every provisioner mutation is lost when the spawned
+                    // task drops `config`. Config::save() also handles
+                    // secret encryption (see config/schema.rs:save) so
+                    // plaintext API keys captured during the flow get
+                    // encrypted before hitting disk.
+                    //
+                    // Defensive: if `config.config_path` somehow ended
+                    // up empty (e.g. a Default::default() Config slipped
+                    // through, or a serde-skipped reload), fall back to
+                    // the profile's known config.toml path so save()
+                    // can compute a parent dir.
+                    if config.config_path.parent().is_none() {
+                        config.config_path = profile.config_toml();
+                    }
+                    if let Err(e) = config.save().await {
+                        tracing::error!(
+                            provisioner = prov_name,
+                            "failed to save config after provisioner: {e}"
+                        );
+                        // Best-effort surface to the overlay log so the
+                        // user sees the failure instead of a phantom
+                        // success.
+                        let _ = save_failure_tx
+                            .send(crate::onboard::provision::ProvisionEvent::Failed {
+                                error: format!("Config save failed: {e}"),
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(provisioner = prov_name, "provisioner error: {e}");
+                    // Surface the error to the overlay so the user
+                    // sees what went wrong and the wizard's failure
+                    // detection (overlay.failure_reason) fires.
+                    // Without this the overlay's `finished` flag is
+                    // never set and the wizard freezes forever.
+                    let _ = save_failure_tx
+                        .send(crate::onboard::provision::ProvisionEvent::Failed {
+                            error: format!("Provisioner error: {e}"),
+                        })
+                        .await;
+                }
             }
         });
 
@@ -1191,15 +1370,26 @@ impl TuiApp {
         }
     }
 
-    fn open_channel_sub_picker(&mut self) {
-        use crate::onboard::provision::{available, provisioner_for, ProvisionerCategory};
+    /// Build and open a sub-picker showing only items in the given
+    /// category. `cat_key` is one of `core` / `channel` /
+    /// `integration` / `runtime` / `hardware` / `routing`.
+    fn open_category_sub_picker(&mut self, cat_key: &str) {
+        use crate::onboard::provision::{available, provisioner_for};
+        use crate::tui::commands::setup::{cat_label, category_from_key};
         use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+
+        let Some(category) = category_from_key(cat_key) else {
+            let msg = format!("Unknown setup category: {cat_key}");
+            let _ = self.context.append_system_message(&msg);
+            self.scrollback_queue.push(("system".into(), msg));
+            return;
+        };
 
         let items: Vec<ListPickerItem> = available()
             .into_iter()
             .filter_map(|(name, desc)| {
                 let p = provisioner_for(name)?;
-                if p.category() == ProvisionerCategory::Channel {
+                if p.category() == category {
                     Some(ListPickerItem {
                         key: name.to_string(),
                         primary: name.to_string(),
@@ -1210,12 +1400,16 @@ impl TuiApp {
                 }
             })
             .collect();
+
+        let title = format!("{} setup", cat_label(category));
+        let empty_hint = format!("no {} provisioners available", cat_label(category).to_lowercase());
+
         let picker = ListPicker::new(
-            ListPickerKind::SetupChannel,
-            "Select channel type",
+            ListPickerKind::SetupChannel, // re-used as the generic "category sub-picker" kind
+            title,
             items,
             None,
-            "no channel provisioners available",
+            empty_hint,
         );
         self.list_picker = Some(picker);
     }
@@ -1681,25 +1875,59 @@ impl TuiApp {
 /// of the brand's Unicode-forward look.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Provider → conventional env-var name. Matches what each provider's
+/// auth path looks for in `apply_env_overrides` and the legacy CLI
+/// instructions, so the "Missing API key" hint points the user at the
+/// right thing instead of always saying OPENROUTER_API_KEY.
+fn provider_env_var_name(provider: &str) -> String {
+    match provider {
+        "openrouter" => "OPENROUTER_API_KEY".into(),
+        "anthropic" => "ANTHROPIC_API_KEY".into(),
+        "openai" => "OPENAI_API_KEY".into(),
+        "deepseek" => "DEEPSEEK_API_KEY".into(),
+        "mistral" => "MISTRAL_API_KEY".into(),
+        "xai" => "XAI_API_KEY".into(),
+        "perplexity" => "PERPLEXITY_API_KEY".into(),
+        "gemini" => "GEMINI_API_KEY".into(),
+        "groq" => "GROQ_API_KEY".into(),
+        "fireworks" => "FIREWORKS_API_KEY".into(),
+        "together-ai" => "TOGETHER_API_KEY".into(),
+        "nvidia" => "NVIDIA_API_KEY".into(),
+        "vercel" => "VERCEL_AI_API_KEY".into(),
+        "cloudflare" => "CLOUDFLARE_API_KEY".into(),
+        "bedrock" => "AWS_ACCESS_KEY_ID".into(),
+        "moonshot" | "moonshot-intl" => "MOONSHOT_API_KEY".into(),
+        "glm" | "zai" => "GLM_API_KEY".into(),
+        "minimax" => "MINIMAX_API_KEY".into(),
+        "qwen" => "DASHSCOPE_API_KEY".into(),
+        "qianfan" => "QIANFAN_API_KEY".into(),
+        "cohere" => "COHERE_API_KEY".into(),
+        "ollama" | "llamacpp" => "RANTAICLAW_API_KEY (no key needed)".into(),
+        _ => "RANTAICLAW_API_KEY".into(),
+    }
+}
+
 /// Recognise a handful of common agent error shapes and rewrite them as a
 /// short, actionable chat message + a one-liner for the status bar.
 /// Unknown errors fall through verbatim so we never lose information.
 ///
 /// Returns `(chat_message_body, status_line)`.
-fn format_agent_error(raw: &str) -> (String, String) {
+fn format_agent_error(raw: &str, provider: &str) -> (String, String) {
     let lower = raw.to_lowercase();
 
     if lower.contains("api key not set") || lower.contains("api_key not set") {
-        let body = "✗ Missing API key.\n\
+        let env_name = provider_env_var_name(provider);
+        let body = format!(
+            "✗ Missing API key for `{provider}`.\n\
 \n\
 Set one of the following before sending a message:\n\
-  • Export `OPENROUTER_API_KEY=…` (or the equivalent for your provider)\n\
-  • Run `rantaiclaw onboard` outside the TUI to save it to config\n\
+  • Export `{env_name}=…`\n\
+  • Run `/setup provider` to save it to config\n\
   • Type `/quit`, then `rantaiclaw setup provider` for the guided flow"
-            .to_string();
+        );
         return (
             body,
-            "missing API key — set OPENROUTER_API_KEY or run setup".into(),
+            format!("missing API key — set {env_name} or run /setup provider"),
         );
     }
 
@@ -2619,7 +2847,13 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     app.context.available_providers = available_providers;
 
     if let Some(topic) = tui_config.setup_provisioner.take() {
-        if let Err(e) = app.open_setup_overlay(topic) {
+        // `rantaiclaw setup` (no topic) and `rantaiclaw setup full` both
+        // boot the first-run wizard — the canonical "set everything up"
+        // entry point. Named topics route to the overlay for that one
+        // provisioner; unknown names surface the existing error.
+        if topic.is_empty() || topic.eq_ignore_ascii_case("full") {
+            app.first_run_wizard = Some(crate::tui::FirstRunWizard::new(profile.clone()));
+        } else if let Err(e) = app.open_setup_overlay(topic) {
             let msg = format!("Failed to open setup: {}", e);
             let _ = app.context.append_system_message(&msg);
             app.scrollback_queue.push(("system".to_string(), msg));
@@ -2687,7 +2921,8 @@ async fn run_loop(
         // option presence so we don't churn buffers on every keystroke.
         let want_alt = app.list_picker.is_some()
             || app.autocomplete.is_visible()
-            || app.setup_overlay.is_some();
+            || app.setup_overlay.is_some()
+            || app.first_run_wizard.is_some();
         let in_alt = alt.is_some();
         if want_alt && !in_alt {
             execute!(io::stdout(), EnterAlternateScreen)?;
@@ -2739,14 +2974,23 @@ async fn run_loop(
         }
 
         if let Some(ref mut alt_term) = alt {
-            // While in alt-screen, render whichever overlay drove us in.
-            // Setup overlay takes precedence (it's the most modal — owns
-            // a provisioner task), then picker, then autocomplete.
+            // Render priority: setup_overlay first. During the first-run
+            // wizard's RunningProvisioner phase BOTH wizard and overlay
+            // are active — the wizard intentionally renders nothing in
+            // that phase and delegates the screen to the overlay. If the
+            // wizard won the priority race, the screen would go black.
             if app.setup_overlay.is_some() {
                 alt_term.draw(|frame| {
                     let area = frame.area();
                     if let Some(o) = app.setup_overlay.as_mut() {
                         o.render(frame, area);
+                    }
+                })?;
+            } else if app.first_run_wizard.is_some() {
+                alt_term.draw(|frame| {
+                    let area = frame.area();
+                    if let Some(w) = app.first_run_wizard.as_ref() {
+                        w.render_fullscreen(frame, area);
                     }
                 })?;
             } else if app.list_picker.is_some() {
@@ -2841,7 +3085,7 @@ mod error_format_tests {
     #[test]
     fn api_key_missing_gets_friendly_chat_body() {
         let raw = "All providers/models failed. Attempts:\nprovider=openrouter model=anthropic/claude-sonnet-4.6 attempt 1/3: non_retryable; error=OpenRouter API key not set. Run `rantaiclaw onboard` or set OPENROUTER_API_KEY env var.";
-        let (chat, status) = format_agent_error(raw);
+        let (chat, status) = format_agent_error(raw, "openrouter");
         assert!(chat.contains("Missing API key"));
         assert!(chat.contains("OPENROUTER_API_KEY"));
         assert!(!chat.contains("attempt 1/3"));
@@ -2851,7 +3095,7 @@ mod error_format_tests {
     #[test]
     fn rate_limit_gets_short_message() {
         let raw = "All providers/models failed. Attempts:\nprovider=openrouter model=x attempt 1/3: rate-limited; HTTP 429";
-        let (chat, status) = format_agent_error(raw);
+        let (chat, status) = format_agent_error(raw, "openrouter");
         assert!(chat.contains("Rate-limited"));
         assert!(status.contains("rate limit"));
     }
@@ -2859,14 +3103,14 @@ mod error_format_tests {
     #[test]
     fn unknown_error_compacts_attempts_tail() {
         let raw = "All providers/models failed. Attempts:\nprovider=p1 model=m attempt 1/3: foo\nprovider=p2 model=m attempt 1/3: bar";
-        let (chat, _status) = format_agent_error(raw);
+        let (chat, _status) = format_agent_error(raw, "openrouter");
         // Compacted to first attempt plus +N more rather than full transcript.
         assert!(chat.contains("(+1 more attempts)"), "got {chat:?}");
     }
 
     #[test]
     fn non_provider_error_passes_through_with_prefix() {
-        let (chat, _) = format_agent_error("something else broke");
+        let (chat, _) = format_agent_error("something else broke", "openrouter");
         assert!(chat.starts_with("✗ something else broke"));
     }
 }
@@ -3001,6 +3245,7 @@ mod submit_tests {
         match req {
             TurnRequest::Submit(text) => assert_eq!(text, "hello"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
+            TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
         }
     }
 
@@ -3023,6 +3268,7 @@ mod submit_tests {
         match req {
             TurnRequest::Submit(text) => assert_eq!(text, "queued"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
+            TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
         }
     }
 
@@ -3307,6 +3553,7 @@ mod retry_tests {
         match req {
             TurnRequest::Submit(text) => assert_eq!(text, "previous prompt"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
+            TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
         }
         assert!(app.context.last_error.is_none());
     }
