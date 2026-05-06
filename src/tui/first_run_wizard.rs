@@ -1,8 +1,9 @@
-//! First-run wizard state machine.
+//! First-run wizard state machine + render.
 //!
-//! Curated flow — only the four high-impact provisioners run by default,
-//! plus two opt-in multi-select gates for channels and integrations.
-//! Everything else is reachable via `/setup <topic>` later.
+//! Visual direction: research-instrument minimalism. Asymmetric layout
+//! with a persistent step rail on the left, generous negative space,
+//! sharp coral/emerald accents on a frame_color/muted base. Sentence-case
+//! display headings, small-caps section labels, Unicode glyph hierarchy.
 //!
 //! Phase flow:
 //!   Welcome
@@ -10,7 +11,7 @@
 //!     → RunningProvisioner ("approvals")          quick, skippable
 //!     → RunningProvisioner ("persona")            quick, skippable
 //!     → RunningProvisioner ("skills")             quick, skippable
-//!     → PickChannels                              multi-select over 16 channels
+//!     → PickChannels                              multi-select over channels
 //!     → RunningProvisioner (each chosen channel)
 //!     → PickIntegrations                          multi-select over mcp / web-search / memory
 //!     → RunningProvisioner (each chosen integration)
@@ -38,26 +39,10 @@ pub enum WizardPhase {
 #[derive(Debug)]
 pub struct FirstRunWizard {
     pub phase: WizardPhase,
-    /// Provisioners still pending. The head is the next one to run.
-    /// The queue is mutated as the wizard advances or as the user
-    /// makes selections in the picker phases.
     pub queue: Vec<String>,
-    /// Active multi-select picker (only Some during PickChannels /
-    /// PickIntegrations). Reuses the ActiveChoose state shape from
-    /// setup_overlay so the render code is consistent.
     pub picker: Option<ActiveChoose>,
-    /// Parallel to `picker.options`: provisioner names to push onto
-    /// the queue for selected indices. Populated alongside
-    /// `open_picker`; cleared on submit.
     pub picker_names: Vec<String>,
     pub profile: Profile,
-    /// 1-based step counter shown in the header. We can only know the
-    /// upper bound at run-time once channel/integration picks are
-    /// made, so this is "best effort": before pickers run, it's the
-    /// guaranteed-mandatory count + already-chosen optional count;
-    /// after Complete, it's the final number.
-    pub step: usize,
-    pub total_estimate: usize,
 }
 
 const REQUIRED_PROVISIONERS: &[&str] = &["provider", "approvals", "persona", "skills"];
@@ -67,23 +52,50 @@ const INTEGRATION_OPTIONS: &[(&str, &str)] = &[
     ("memory", "Memory backend (sqlite / postgres / markdown)"),
 ];
 
+/// Abstract steps shown in the left rail. Stays fixed across the
+/// session so the user has a stable map of where they are. Real
+/// provisioner names map to one of these via `phase_to_rail_idx`.
+const RAIL: &[(&str, &str)] = &[
+    ("01", "Provider"),
+    ("02", "Approvals"),
+    ("03", "Persona"),
+    ("04", "Skills"),
+    ("05", "Channels"),
+    ("06", "Integrations"),
+    ("07", "Complete"),
+];
+
+const CHANNEL_PROVISIONER_NAMES: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "whatsapp-web",
+    "whatsapp-cloud",
+    "signal",
+    "matrix",
+    "mattermost",
+    "imessage",
+    "lark",
+    "dingtalk",
+    "nextcloud-talk",
+    "qq",
+    "email",
+    "irc",
+    "linq",
+];
+
 impl FirstRunWizard {
     pub fn new(profile: Profile) -> Self {
         let queue: Vec<String> = REQUIRED_PROVISIONERS
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        // Estimate: Welcome + 4 required + PickChannels + PickIntegrations + Complete
-        // = 8. Real total grows when the user picks channels/integrations.
-        let total_estimate = REQUIRED_PROVISIONERS.len() + 4;
         Self {
             phase: WizardPhase::Welcome,
             queue,
             picker: None,
             picker_names: Vec::new(),
             profile,
-            step: 1,
-            total_estimate,
         }
     }
 
@@ -105,58 +117,56 @@ impl FirstRunWizard {
         )
     }
 
-    pub fn step(&self) -> usize {
-        self.step
-    }
-
-    pub fn total_steps(&self) -> usize {
-        self.total_estimate.max(self.step)
-    }
-
-    /// Begin the wizard's provisioner sequence from the Welcome screen.
     pub fn start_provisioners(&mut self) {
         self.advance_to_next_in_queue_or_picker();
     }
 
-    /// Pop the next provisioner off the queue. If empty, transition to
-    /// the appropriate picker phase based on what's already happened.
-    /// Called both when starting from Welcome and after each successful
-    /// provisioner completion.
     pub fn advance_to_next_in_queue_or_picker(&mut self) {
-        self.step += 1;
         if let Some(next) = self.queue_pop_front() {
             self.phase = WizardPhase::RunningProvisioner { name: next };
         } else {
-            // Queue drained — figure out which picker (if any) comes next.
             match self.phase {
-                WizardPhase::Welcome
-                | WizardPhase::RunningProvisioner { .. } => {
-                    // First time queue drained: show channel picker.
-                    self.phase = WizardPhase::PickChannels;
+                WizardPhase::Welcome | WizardPhase::RunningProvisioner { .. } => {
+                    if matches!(self.phase, WizardPhase::Welcome)
+                        || matches!(
+                            self.phase,
+                            WizardPhase::RunningProvisioner { ref name }
+                            if !is_channel_name(name) && !is_integration_name(name)
+                        )
+                    {
+                        self.phase = WizardPhase::PickChannels;
+                    } else if self
+                        .phase_provisioner_was_channel()
+                        .unwrap_or(false)
+                    {
+                        self.phase = WizardPhase::PickIntegrations;
+                    } else {
+                        self.phase = WizardPhase::Complete;
+                    }
                 }
                 WizardPhase::PickChannels => {
-                    // Channel picker done + all chosen channels run:
-                    // show integration picker.
                     self.phase = WizardPhase::PickIntegrations;
                 }
                 WizardPhase::PickIntegrations => {
-                    // All done.
                     self.phase = WizardPhase::Complete;
                 }
-                WizardPhase::Complete => {} // already done
+                WizardPhase::Complete => {}
             }
         }
     }
 
-    /// Called by the app when the user's multi-select is submitted.
-    /// Reads the picker's selection indices, maps them to names via
-    /// `picker_names`, pushes onto the queue, and advances.
+    fn phase_provisioner_was_channel(&self) -> Option<bool> {
+        match &self.phase {
+            WizardPhase::RunningProvisioner { name } => Some(is_channel_name(name)),
+            _ => None,
+        }
+    }
+
     pub fn apply_picker_selection(&mut self) {
         let indices = self.picker_submit().unwrap_or_default();
         for i in &indices {
             if let Some(n) = self.picker_names.get(*i) {
                 self.queue.push(n.clone());
-                self.total_estimate += 1;
             }
         }
         self.picker_names.clear();
@@ -171,10 +181,6 @@ impl FirstRunWizard {
         }
     }
 
-    /// Initialize the picker for the current phase. `options` is a
-    /// parallel list of `(name, label)` pairs — names go to
-    /// `picker_names` for later index→name mapping; labels are what
-    /// the picker renders.
     pub fn open_picker(&mut self, options: Vec<(String, String)>) {
         self.picker_names = options.iter().map(|(name, _)| name.clone()).collect();
         let labels: Vec<String> = options.into_iter().map(|(_, label)| label).collect();
@@ -185,11 +191,9 @@ impl FirstRunWizard {
                 _ => "unknown".into(),
             },
             label: match self.phase {
-                WizardPhase::PickChannels => "Add channels (Space toggles, Enter confirms)".into(),
-                WizardPhase::PickIntegrations => {
-                    "Set up integrations now (Space toggles, Enter confirms)".into()
-                }
-                _ => "Choose options".into(),
+                WizardPhase::PickChannels => "Add channels".into(),
+                WizardPhase::PickIntegrations => "Set up integrations".into(),
+                _ => "Choose".into(),
             },
             options: labels,
             multi: true,
@@ -226,30 +230,48 @@ impl FirstRunWizard {
         }
     }
 
-    /// Take the picker selection (clears the picker) and return the
-    /// indices the user toggled on. Caller then maps indices back to
-    /// provisioner names via the parallel options vec passed to
-    /// `open_picker`.
     pub fn picker_submit(&mut self) -> Option<Vec<usize>> {
         self.picker.take().map(|p| p.selected)
     }
 
+    /// Map current phase to an index into RAIL.
+    fn rail_index(&self) -> Option<usize> {
+        match &self.phase {
+            WizardPhase::Welcome => None,
+            WizardPhase::RunningProvisioner { name } => match name.as_str() {
+                "provider" => Some(0),
+                "approvals" => Some(1),
+                "persona" => Some(2),
+                "skills" => Some(3),
+                n if is_channel_name(n) => Some(4),
+                n if is_integration_name(n) => Some(5),
+                _ => None,
+            },
+            WizardPhase::PickChannels => Some(4),
+            WizardPhase::PickIntegrations => Some(5),
+            WizardPhase::Complete => Some(6),
+        }
+    }
+
     pub fn render_fullscreen(&self, frame: &mut Frame, area: Rect) {
-        if area.height < 8 || area.width < 30 {
-            return;
+        if area.height < 16 || area.width < 64 {
+            return self.render_compact(frame, area);
         }
 
+        // ── Palette ──────────────────────────────────────────────
         let coral = Color::Rgb(255, 138, 101);
         let sky = Color::Rgb(94, 184, 255);
         let muted = Color::Rgb(107, 114, 128);
         let frame_color = Color::Rgb(40, 70, 140);
         let emerald = Color::Rgb(52, 211, 153);
+        let dim = Color::Rgb(60, 70, 90);
 
         frame.render_widget(Clear, area);
 
+        // Outer breathing room.
         let outer = Rect {
-            x: area.x + 2,
-            y: area.y + 1,
+            x: area.x.saturating_add(2),
+            y: area.y.saturating_add(1),
             width: area.width.saturating_sub(4),
             height: area.height.saturating_sub(2),
         };
@@ -257,159 +279,524 @@ impl FirstRunWizard {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // 0: title
-                Constraint::Length(1), // 1: spacer
-                Constraint::Min(3),    // 2: content
-                Constraint::Length(1), // 3: spacer
-                Constraint::Length(1), // 4: footer
+                Constraint::Length(2), // 0: top brand bar
+                Constraint::Length(1), // 1: separator rule
+                Constraint::Length(1), // 2: spacer
+                Constraint::Min(8),    // 3: body (rail + content)
+                Constraint::Length(1), // 4: spacer
+                Constraint::Length(1), // 5: separator rule
+                Constraint::Length(1), // 6: footer
             ])
             .split(outer);
 
-        // ── Title ──────────────────────────────────────────────────
-        let title_text = match &self.phase {
-            WizardPhase::Welcome => "First-Run Setup".to_string(),
-            WizardPhase::RunningProvisioner { name } => format!("Setup: {name}"),
-            WizardPhase::PickChannels => "Add channels".to_string(),
-            WizardPhase::PickIntegrations => "Set up integrations".to_string(),
-            WizardPhase::Complete => "Setup Complete!".to_string(),
+        // ── Top brand bar ─────────────────────────────────────────
+        self.render_brand_bar(frame, chunks[0], coral, sky, muted, dim);
+
+        // ── Top rule ──────────────────────────────────────────────
+        render_horizontal_rule(frame, chunks[1], dim);
+
+        // ── Body: rail + content ──────────────────────────────────
+        let body_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(24), // rail
+                Constraint::Length(2),  // gutter
+                Constraint::Min(20),    // content
+            ])
+            .split(chunks[3]);
+
+        self.render_rail(frame, body_chunks[0], coral, sky, emerald, muted, dim);
+        self.render_content(
+            frame,
+            body_chunks[2],
+            coral,
+            sky,
+            muted,
+            frame_color,
+            emerald,
+            dim,
+        );
+
+        // ── Bottom rule ───────────────────────────────────────────
+        render_horizontal_rule(frame, chunks[5], dim);
+
+        // ── Footer ────────────────────────────────────────────────
+        self.render_footer(frame, chunks[6], coral, sky, emerald, muted);
+    }
+
+    fn render_brand_bar(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        muted: Color,
+        dim: Color,
+    ) {
+        let total = RAIL.len();
+        let current_idx = self.rail_index();
+
+        let bullet_glyph = "◆";
+        let separator = "·";
+        let phase_name = match &self.phase {
+            WizardPhase::Welcome => "welcome",
+            WizardPhase::RunningProvisioner { .. } => "in progress",
+            WizardPhase::PickChannels => "select channels",
+            WizardPhase::PickIntegrations => "select integrations",
+            WizardPhase::Complete => "complete",
         };
-        let title_color = match self.phase {
-            WizardPhase::Complete => emerald,
-            _ => coral,
+
+        let step_text = match current_idx {
+            Some(i) => format!("step {:02} ▸ {:02}", i + 1, total),
+            None => format!("step 00 ▸ {total:02}"),
         };
-        let step_label = format!("Step {}/{}", self.step(), self.total_steps());
-        let title_line = Line::from(vec![
-            Span::styled("⚡ ", Style::default().fg(title_color)),
+
+        let line1 = Line::from(vec![
+            Span::styled(format!("{bullet_glyph}  "), Style::default().fg(coral)),
             Span::styled(
-                title_text,
-                Style::default()
-                    .fg(title_color)
-                    .add_modifier(Modifier::BOLD),
+                "RANTAICLAW",
+                Style::default().fg(coral).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("   ", Style::default()),
-            Span::styled(step_label, Style::default().fg(muted)),
+            Span::styled("  ", Style::default()),
+            Span::styled(separator, Style::default().fg(dim)),
+            Span::styled(
+                "  first-run setup",
+                Style::default().fg(sky).add_modifier(Modifier::ITALIC),
+            ),
         ]);
-        frame.render_widget(Paragraph::new(title_line), chunks[0]);
+        let line2 = Line::from(vec![
+            Span::styled(
+                format!("{:<width$}", step_text, width = 28),
+                Style::default().fg(muted),
+            ),
+            Span::styled(separator, Style::default().fg(dim)),
+            Span::styled(
+                format!("  {phase_name}"),
+                Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(vec![line1, line2]), area);
+    }
 
-        // ── Content ────────────────────────────────────────────────
-        match self.phase {
-            WizardPhase::Welcome => {
-                let bullet = |text: &str| {
-                    Line::from(vec![
-                        Span::styled("  · ", Style::default().fg(sky)),
-                        Span::styled(text.to_string(), Style::default().fg(muted)),
-                    ])
-                };
-                let lines: Vec<Line> = vec![
-                    Line::from(Span::styled(
-                        "Welcome. Quick first-run setup walks through:",
-                        Style::default().fg(sky).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                    bullet("Provider, model, and API key"),
-                    bullet("Approval / autonomy tier"),
-                    bullet("Agent persona"),
-                    bullet("Skills (bundled + ClawHub)"),
-                    bullet("Channels you want to enable (optional)"),
-                    bullet("Extra integrations: MCP, web-search, memory (optional)"),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "Skip any step with Esc. Configure anything later via /setup <topic>.",
-                        Style::default().fg(muted).add_modifier(Modifier::ITALIC),
-                    )),
-                ];
-                let body = Paragraph::new(lines)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(frame_color)),
-                    )
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(body, chunks[2]);
+    fn render_rail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        emerald: Color,
+        muted: Color,
+        dim: Color,
+    ) {
+        let cur = self.rail_index();
+        let mut lines: Vec<Line> = Vec::new();
+
+        // Section label.
+        lines.push(Line::from(Span::styled(
+            "  ROUTE  ",
+            Style::default().fg(muted).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+
+        for (i, (num, label)) in RAIL.iter().enumerate() {
+            let state = match cur {
+                Some(idx) if i < idx => RailState::Done,
+                Some(idx) if i == idx => RailState::Current,
+                _ => RailState::Pending,
+            };
+
+            // Connector line above each row except the first — gives
+            // the rail a continuous spine.
+            if i > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(
+                        "│",
+                        Style::default().fg(match state {
+                            RailState::Done => emerald,
+                            _ => dim,
+                        }),
+                    ),
+                ]));
             }
 
-            WizardPhase::RunningProvisioner { .. } => {
-                // Active provisioner overlay covers this frame; this is
-                // a brief loading placeholder shown between provisioners.
-                let body = Paragraph::new(Line::from(Span::styled(
-                    "  Loading next step…",
-                    Style::default().fg(muted).add_modifier(Modifier::ITALIC),
-                )))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(frame_color)),
-                );
-                frame.render_widget(body, chunks[2]);
-            }
+            let (glyph, glyph_style, num_style, label_style) = match state {
+                RailState::Done => (
+                    "●",
+                    Style::default().fg(emerald),
+                    Style::default().fg(muted),
+                    Style::default().fg(muted),
+                ),
+                RailState::Current => (
+                    "◆",
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                    Style::default().fg(coral),
+                    Style::default().fg(sky).add_modifier(Modifier::BOLD),
+                ),
+                RailState::Pending => (
+                    "○",
+                    Style::default().fg(dim),
+                    Style::default().fg(dim),
+                    Style::default().fg(muted),
+                ),
+            };
 
-            WizardPhase::PickChannels | WizardPhase::PickIntegrations => {
-                self.render_picker(frame, chunks[2], sky, muted, frame_color, emerald);
-            }
+            let arrow = if matches!(state, RailState::Current) {
+                Span::styled(" ▸ ", Style::default().fg(coral).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled("   ", Style::default())
+            };
 
-            WizardPhase::Complete => {
-                let bullet = |key: &str, text: &str| {
-                    Line::from(vec![
-                        Span::styled("  · ", Style::default().fg(emerald)),
-                        Span::styled(
-                            key.to_string(),
-                            Style::default().fg(sky).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(format!(" — {text}"), Style::default().fg(muted)),
-                    ])
-                };
-                let lines: Vec<Line> = vec![
-                    Line::from(Span::styled(
-                        "Your RantaiClaw workspace is ready.",
-                        Style::default().fg(emerald).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "Next steps:",
-                        Style::default().fg(coral).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                    bullet("rantaiclaw", "open the chat TUI"),
-                    bullet("/setup", "interactive setup picker inside the TUI"),
-                    bullet("rantaiclaw setup <topic>", "reconfigure a single topic from a shell"),
-                ];
-                let body = Paragraph::new(lines)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(emerald)),
-                    )
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(body, chunks[2]);
-            }
+            lines.push(Line::from(vec![
+                arrow,
+                Span::styled(glyph, glyph_style),
+                Span::styled("  ", Style::default()),
+                Span::styled(format!("{num}  "), num_style),
+                Span::styled(label.to_string(), label_style),
+            ]));
         }
 
-        // ── Footer ─────────────────────────────────────────────────
-        let footer_spans: Vec<Span> = match self.phase {
-            WizardPhase::Welcome => vec![
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    fn render_content(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        muted: Color,
+        frame_color: Color,
+        emerald: Color,
+        dim: Color,
+    ) {
+        match self.phase {
+            WizardPhase::Welcome => {
+                self.render_welcome(frame, area, coral, sky, muted, frame_color, emerald, dim);
+            }
+            WizardPhase::RunningProvisioner { .. } => {
+                self.render_loading(frame, area, sky, muted, dim);
+            }
+            WizardPhase::PickChannels | WizardPhase::PickIntegrations => {
+                self.render_picker(frame, area, coral, sky, muted, frame_color, emerald, dim);
+            }
+            WizardPhase::Complete => {
+                self.render_complete(frame, area, coral, sky, muted, frame_color, emerald, dim);
+            }
+        }
+    }
+
+    fn render_welcome(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        muted: Color,
+        _frame_color: Color,
+        emerald: Color,
+        dim: Color,
+    ) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // section label
+                Constraint::Length(1), // spacer
+                Constraint::Length(2), // huge headline
+                Constraint::Length(1), // sub-rule
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // subhead
+                Constraint::Length(1), // spacer
+                Constraint::Min(7),    // bullet body
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // hint
+            ])
+            .split(area);
+
+        // Section label (small caps via Unicode caps).
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("⌗  ", Style::default().fg(coral)),
+                Span::styled(
+                    "FIRST · RUN",
+                    Style::default()
+                        .fg(coral)
+                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                ),
+            ])),
+            chunks[0],
+        );
+
+        // Display headline — sentence-case, two lines for vertical weight.
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Welcome.",
+                    Style::default().fg(sky).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "Let's wire up your agent.",
+                    Style::default().fg(muted),
+                )),
+            ]),
+            chunks[2],
+        );
+
+        // Sub-rule under headline (short accent rule, not full width).
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─── ⌐",
+                Style::default().fg(coral),
+            ))),
+            chunks[3],
+        );
+
+        // Subhead.
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "Four required steps,",
+                    Style::default().fg(sky),
+                ),
+                Span::styled(
+                    "  two optional pickers,",
+                    Style::default().fg(muted),
+                ),
+                Span::styled(
+                    "  one polished agent.",
+                    Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+                ),
+            ])),
+            chunks[5],
+        );
+
+        // Body bullets — two-column, left side = key, right side = label.
+        let bullet = |num: &str, key: &str, desc: &str, accent: Color| {
+            Line::from(vec![
+                Span::styled(format!(" {num}  "), Style::default().fg(dim)),
+                Span::styled(
+                    format!("{key:<14}"),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(desc.to_string(), Style::default().fg(muted)),
+            ])
+        };
+        let body = vec![
+            bullet("01", "Provider", "model + key", coral),
+            bullet("02", "Approvals", "autonomy tier", coral),
+            bullet("03", "Persona", "agent name & template", coral),
+            bullet("04", "Skills", "bundled + ClawHub", coral),
+            bullet("05", "Channels", "telegram, discord, whatsapp, …", emerald),
+            bullet("06", "Integrations", "mcp, web-search, memory", emerald),
+            bullet("07", "Complete", "ship it", sky),
+        ];
+        frame.render_widget(Paragraph::new(body), chunks[7]);
+
+        // Hint line.
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "Press ",
+                    Style::default().fg(muted),
+                ),
                 Span::styled(
                     "Enter",
                     Style::default().fg(emerald).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" begin · ", Style::default().fg(muted)),
+                Span::styled(
+                    " to begin · skip any step with ",
+                    Style::default().fg(muted),
+                ),
                 Span::styled(
                     "Esc",
                     Style::default().fg(coral).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" exit", Style::default().fg(muted)),
-            ],
-            WizardPhase::RunningProvisioner { .. } => vec![Span::styled(
-                "(provisioner overlay active)",
-                Style::default().fg(muted).add_modifier(Modifier::ITALIC),
-            )],
-            WizardPhase::PickChannels | WizardPhase::PickIntegrations => vec![
-                Span::styled("↑/↓", Style::default().fg(sky)),
-                Span::styled(" navigate · ", Style::default().fg(muted)),
-                Span::styled("Space", Style::default().fg(sky)),
-                Span::styled(" toggle · ", Style::default().fg(muted)),
+                Span::styled(
+                    " · resume later via /setup full",
+                    Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+                ),
+            ])),
+            chunks[9],
+        );
+    }
+
+    fn render_loading(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        sky: Color,
+        muted: Color,
+        _dim: Color,
+    ) {
+        // Brief placeholder shown between provisioners while the next
+        // overlay is being spawned. The active overlay covers the
+        // full screen most of the time; this only flashes briefly.
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  loading next step…",
+                Style::default()
+                    .fg(sky)
+                    .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+            )),
+            Line::from(Span::styled(
+                "  (the provisioner overlay will take over)",
+                Style::default().fg(muted),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn render_picker(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        muted: Color,
+        _frame_color: Color,
+        emerald: Color,
+        dim: Color,
+    ) {
+        let Some(p) = &self.picker else {
+            return self.render_loading(frame, area, sky, muted, dim);
+        };
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // section label
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // headline
+                Constraint::Length(1), // accent rule
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // subhead
+                Constraint::Length(1), // spacer
+                Constraint::Min(4),    // option list
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // hint
+            ])
+            .split(area);
+
+        let (section, headline, subhead) = match self.phase {
+            WizardPhase::PickChannels => (
+                "STEP · CHANNELS",
+                "Add channels.",
+                "Pick the platforms you want this agent to be reachable on.",
+            ),
+            WizardPhase::PickIntegrations => (
+                "STEP · INTEGRATIONS",
+                "Set up integrations.",
+                "Optional capability layers — each ships with safe defaults.",
+            ),
+            _ => ("STEP", "—", ""),
+        };
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("⌗  ", Style::default().fg(coral)),
+                Span::styled(
+                    section,
+                    Style::default()
+                        .fg(coral)
+                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                ),
+            ])),
+            chunks[0],
+        );
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                headline,
+                Style::default().fg(sky).add_modifier(Modifier::BOLD),
+            ))),
+            chunks[2],
+        );
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─── ⌐",
+                Style::default().fg(coral),
+            ))),
+            chunks[3],
+        );
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                subhead,
+                Style::default().fg(muted),
+            ))),
+            chunks[5],
+        );
+
+        // Option rows.
+        let mut option_lines: Vec<Line> = Vec::new();
+        for (i, opt) in p.options.iter().enumerate() {
+            let is_cursor = i == p.cursor;
+            let is_checked = p.selected.contains(&i);
+            let arrow = if is_cursor { "▸" } else { " " };
+            let arrow_style = if is_cursor {
+                Style::default().fg(coral).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let marker = if is_checked { "▣" } else { "□" };
+            let marker_style = if is_checked {
+                Style::default().fg(emerald)
+            } else if is_cursor {
+                Style::default().fg(coral)
+            } else {
+                Style::default().fg(dim)
+            };
+            let label_style = if is_cursor {
+                Style::default().fg(sky).add_modifier(Modifier::BOLD)
+            } else if is_checked {
+                Style::default().fg(sky)
+            } else {
+                Style::default().fg(muted)
+            };
+
+            option_lines.push(Line::from(vec![
+                Span::styled(format!(" {arrow}  "), arrow_style),
+                Span::styled(format!("{marker}  "), marker_style),
+                Span::styled(opt.clone(), label_style),
+            ]));
+        }
+        if p.selected.is_empty() {
+            option_lines.push(Line::from(""));
+            option_lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(
+                    "Nothing selected — Enter to skip this step.",
+                    Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        } else {
+            option_lines.push(Line::from(""));
+            option_lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(
+                    format!("{} selected", p.selected.len()),
+                    Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  · Enter to confirm",
+                    Style::default().fg(muted),
+                ),
+            ]));
+        }
+        frame.render_widget(
+            Paragraph::new(option_lines).wrap(Wrap { trim: false }),
+            chunks[7],
+        );
+
+        // Hint.
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("↑/↓ ", Style::default().fg(sky)),
+                Span::styled("navigate · ", Style::default().fg(muted)),
+                Span::styled("Space ", Style::default().fg(sky)),
+                Span::styled("toggle · ", Style::default().fg(muted)),
                 Span::styled(
                     "Enter",
                     Style::default().fg(emerald).add_modifier(Modifier::BOLD),
@@ -420,93 +807,255 @@ impl FirstRunWizard {
                     Style::default().fg(coral).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" skip", Style::default().fg(muted)),
-            ],
-            WizardPhase::Complete => vec![
+            ])),
+            chunks[9],
+        );
+    }
+
+    fn render_complete(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        muted: Color,
+        _frame_color: Color,
+        emerald: Color,
+        dim: Color,
+    ) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // section label
+                Constraint::Length(1), // spacer
+                Constraint::Length(2), // headline (2 lines)
+                Constraint::Length(1), // accent rule
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // subhead
+                Constraint::Length(1), // spacer
+                Constraint::Min(5),    // next-steps body
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // hint
+            ])
+            .split(area);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("✦  ", Style::default().fg(emerald)),
+                Span::styled(
+                    "STATUS · OPERATIONAL",
+                    Style::default()
+                        .fg(emerald)
+                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                ),
+            ])),
+            chunks[0],
+        );
+
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "All wired up.",
+                    Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "Your workspace is ready.",
+                    Style::default().fg(muted),
+                )),
+            ]),
+            chunks[2],
+        );
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─── ⌐",
+                Style::default().fg(emerald),
+            ))),
+            chunks[3],
+        );
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Next moves",
+                Style::default().fg(coral).add_modifier(Modifier::BOLD),
+            ))),
+            chunks[5],
+        );
+
+        let row = |key: &str, desc: &str| {
+            Line::from(vec![
+                Span::styled(" ▸  ", Style::default().fg(emerald)),
+                Span::styled(
+                    format!("{key:<28}"),
+                    Style::default().fg(sky).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(desc.to_string(), Style::default().fg(muted)),
+            ])
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                row("rantaiclaw", "open the chat TUI"),
+                row("/setup", "interactive picker inside the TUI"),
+                row("rantaiclaw setup <topic>", "reconfigure a single topic from a shell"),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(
+                        "config saved · agent reloaded · ready",
+                        Style::default().fg(dim).add_modifier(Modifier::ITALIC),
+                    ),
+                ]),
+            ]),
+            chunks[7],
+        );
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Press ", Style::default().fg(muted)),
                 Span::styled(
                     "Enter",
                     Style::default().fg(emerald).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" close · ", Style::default().fg(muted)),
-                Span::styled(
-                    "Esc",
-                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" close", Style::default().fg(muted)),
-            ],
-        };
-        frame.render_widget(Paragraph::new(Line::from(footer_spans)), chunks[4]);
+                Span::styled(" to enter chat", Style::default().fg(muted)),
+            ])),
+            chunks[9],
+        );
     }
 
-    fn render_picker(
+    fn render_footer(
         &self,
         frame: &mut Frame,
         area: Rect,
+        coral: Color,
         sky: Color,
-        muted: Color,
-        frame_color: Color,
         emerald: Color,
+        muted: Color,
     ) {
-        let Some(p) = &self.picker else {
-            // Picker phase but no picker built yet — show placeholder.
-            let body = Paragraph::new(Line::from(Span::styled(
-                "  Loading…",
+        let spans: Vec<Span> = match self.phase {
+            WizardPhase::Welcome => vec![
+                Span::styled(
+                    "↩ Enter ",
+                    Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("begin    ", Style::default().fg(muted)),
+                Span::styled(
+                    "⎋ Esc ",
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("exit", Style::default().fg(muted)),
+            ],
+            WizardPhase::RunningProvisioner { .. } => vec![Span::styled(
+                "▣  provisioner overlay active — interact above",
                 Style::default().fg(muted).add_modifier(Modifier::ITALIC),
-            )))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(frame_color)),
-            );
-            frame.render_widget(body, area);
-            return;
+            )],
+            WizardPhase::PickChannels | WizardPhase::PickIntegrations => vec![
+                Span::styled("↑/↓ ", Style::default().fg(sky)),
+                Span::styled("navigate    ", Style::default().fg(muted)),
+                Span::styled("Space ", Style::default().fg(sky)),
+                Span::styled("toggle    ", Style::default().fg(muted)),
+                Span::styled(
+                    "↩ Enter ",
+                    Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("confirm    ", Style::default().fg(muted)),
+                Span::styled(
+                    "⎋ Esc ",
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("skip", Style::default().fg(muted)),
+            ],
+            WizardPhase::Complete => vec![
+                Span::styled(
+                    "↩ Enter ",
+                    Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("close    ", Style::default().fg(muted)),
+                Span::styled(
+                    "⎋ Esc ",
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("close", Style::default().fg(muted)),
+            ],
+        };
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// Compact fallback for narrow / short terminals — the structured
+    /// layout collapses gracefully to a single bordered card.
+    fn render_compact(&self, frame: &mut Frame, area: Rect) {
+        let coral = Color::Rgb(255, 138, 101);
+        let sky = Color::Rgb(94, 184, 255);
+        let muted = Color::Rgb(107, 114, 128);
+        let frame_color = Color::Rgb(40, 70, 140);
+
+        frame.render_widget(Clear, area);
+        let title = match &self.phase {
+            WizardPhase::Welcome => "First-Run Setup".to_string(),
+            WizardPhase::RunningProvisioner { name } => format!("Setup · {name}"),
+            WizardPhase::PickChannels => "Add channels".to_string(),
+            WizardPhase::PickIntegrations => "Set up integrations".to_string(),
+            WizardPhase::Complete => "Setup Complete".to_string(),
+        };
+        let body = match self.phase {
+            WizardPhase::Welcome => "Press Enter to begin.\nEsc to exit.",
+            WizardPhase::RunningProvisioner { .. } => "Provisioner overlay active.",
+            WizardPhase::PickChannels => "↑/↓ Space toggle · Enter confirm · Esc skip",
+            WizardPhase::PickIntegrations => "↑/↓ Space toggle · Enter confirm · Esc skip",
+            WizardPhase::Complete => "Configuration saved. Press Enter to close.",
         };
 
-        let mut lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                p.label.clone(),
-                Style::default().fg(sky).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-        ];
-        for (i, opt) in p.options.iter().enumerate() {
-            let is_cursor = i == p.cursor;
-            let is_checked = p.selected.contains(&i);
-            let arrow = if is_cursor { "▸ " } else { "  " };
-            let marker = if is_checked { "[x] " } else { "[ ] " };
-            let style = if is_cursor {
-                Style::default().fg(emerald).add_modifier(Modifier::BOLD)
-            } else if is_checked {
-                Style::default().fg(sky)
-            } else {
-                Style::default().fg(muted)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(arrow, style),
-                Span::styled(marker, style),
-                Span::styled(opt.clone(), style),
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(frame_color))
+            .title(Line::from(vec![
+                Span::styled(" ", Style::default()),
+                Span::styled(title, Style::default().fg(coral).add_modifier(Modifier::BOLD)),
+                Span::styled(" ", Style::default()),
             ]));
-        }
-        if p.selected.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  Nothing selected — Enter to skip this step.",
+        let para = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(body, Style::default().fg(sky))),
+            Line::from(""),
+            Line::from(Span::styled(
+                "(Window too small for full layout — resize for the full wizard.)",
                 Style::default().fg(muted).add_modifier(Modifier::ITALIC),
-            )));
-        }
-        let body = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(frame_color)),
-            )
-            .wrap(Wrap { trim: false });
-        frame.render_widget(body, area);
+            )),
+        ])
+        .block(block)
+        .wrap(Wrap { trim: false });
+        frame.render_widget(para, area);
     }
 }
 
-/// List of integration names + display labels for the picker.
+#[derive(Debug, Clone, Copy)]
+enum RailState {
+    Done,
+    Current,
+    Pending,
+}
+
+fn render_horizontal_rule(frame: &mut Frame, area: Rect, dim: Color) {
+    let w = area.width as usize;
+    if w == 0 {
+        return;
+    }
+    let line: String = std::iter::repeat('─').take(w).collect();
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(line, Style::default().fg(dim)))),
+        area,
+    );
+}
+
+fn is_channel_name(name: &str) -> bool {
+    CHANNEL_PROVISIONER_NAMES.contains(&name)
+}
+
+fn is_integration_name(name: &str) -> bool {
+    INTEGRATION_OPTIONS.iter().any(|(k, _)| *k == name)
+}
+
+/// Integration option list — `(name, description)` pairs.
 pub fn integration_options() -> Vec<(String, String)> {
     INTEGRATION_OPTIONS
         .iter()
@@ -514,10 +1063,8 @@ pub fn integration_options() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Channel options pulled from the provisioner registry, filtered to
-/// `ProvisionerCategory::Channel`. Returns `(name, description)` pairs
-/// — the wizard renders descriptions and maps the chosen indices back
-/// to names.
+/// Channel option list — pulled live from the provisioner registry,
+/// filtered by `ProvisionerCategory::Channel`.
 pub fn channel_options() -> Vec<(String, String)> {
     use crate::onboard::provision::{available, provisioner_for, ProvisionerCategory};
     available()
