@@ -902,7 +902,17 @@ impl TuiApp {
             }
         }
         self.context.available_providers = available_providers;
-        self.config = config;
+        self.config = config.clone();
+        // Push the new config to the agent actor so the next turn uses
+        // the freshly-saved provider/api_key/model. Without this the
+        // agent stays pinned to the launch-time config and reports
+        // "Missing API key" even though the wizard saved one.
+        let req_tx = self.context.req_tx.clone();
+        tokio::spawn(async move {
+            let _ = req_tx
+                .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                .await;
+        });
         Ok(())
     }
 
@@ -1041,7 +1051,12 @@ impl TuiApp {
     /// short, actionable line so the chat doesn't get a wall of stack
     /// trace. Unknown errors fall through verbatim.
     fn finalize_error(&mut self, msg: String) {
-        let (chat_body, status_line) = format_agent_error(&msg);
+        let provider_hint = self
+            .config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string());
+        let (chat_body, status_line) = format_agent_error(&msg, &provider_hint);
         if let Err(e) = self.context.append_assistant_message(&chat_body) {
             self.context.last_error = Some(format!("failed to persist error: {e}"));
         } else {
@@ -1840,25 +1855,59 @@ impl TuiApp {
 /// of the brand's Unicode-forward look.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Provider → conventional env-var name. Matches what each provider's
+/// auth path looks for in `apply_env_overrides` and the legacy CLI
+/// instructions, so the "Missing API key" hint points the user at the
+/// right thing instead of always saying OPENROUTER_API_KEY.
+fn provider_env_var_name(provider: &str) -> String {
+    match provider {
+        "openrouter" => "OPENROUTER_API_KEY".into(),
+        "anthropic" => "ANTHROPIC_API_KEY".into(),
+        "openai" => "OPENAI_API_KEY".into(),
+        "deepseek" => "DEEPSEEK_API_KEY".into(),
+        "mistral" => "MISTRAL_API_KEY".into(),
+        "xai" => "XAI_API_KEY".into(),
+        "perplexity" => "PERPLEXITY_API_KEY".into(),
+        "gemini" => "GEMINI_API_KEY".into(),
+        "groq" => "GROQ_API_KEY".into(),
+        "fireworks" => "FIREWORKS_API_KEY".into(),
+        "together-ai" => "TOGETHER_API_KEY".into(),
+        "nvidia" => "NVIDIA_API_KEY".into(),
+        "vercel" => "VERCEL_AI_API_KEY".into(),
+        "cloudflare" => "CLOUDFLARE_API_KEY".into(),
+        "bedrock" => "AWS_ACCESS_KEY_ID".into(),
+        "moonshot" | "moonshot-intl" => "MOONSHOT_API_KEY".into(),
+        "glm" | "zai" => "GLM_API_KEY".into(),
+        "minimax" => "MINIMAX_API_KEY".into(),
+        "qwen" => "DASHSCOPE_API_KEY".into(),
+        "qianfan" => "QIANFAN_API_KEY".into(),
+        "cohere" => "COHERE_API_KEY".into(),
+        "ollama" | "llamacpp" => "RANTAICLAW_API_KEY (no key needed)".into(),
+        _ => "RANTAICLAW_API_KEY".into(),
+    }
+}
+
 /// Recognise a handful of common agent error shapes and rewrite them as a
 /// short, actionable chat message + a one-liner for the status bar.
 /// Unknown errors fall through verbatim so we never lose information.
 ///
 /// Returns `(chat_message_body, status_line)`.
-fn format_agent_error(raw: &str) -> (String, String) {
+fn format_agent_error(raw: &str, provider: &str) -> (String, String) {
     let lower = raw.to_lowercase();
 
     if lower.contains("api key not set") || lower.contains("api_key not set") {
-        let body = "✗ Missing API key.\n\
+        let env_name = provider_env_var_name(provider);
+        let body = format!(
+            "✗ Missing API key for `{provider}`.\n\
 \n\
 Set one of the following before sending a message:\n\
-  • Export `OPENROUTER_API_KEY=…` (or the equivalent for your provider)\n\
-  • Run `rantaiclaw onboard` outside the TUI to save it to config\n\
+  • Export `{env_name}=…`\n\
+  • Run `/setup provider` to save it to config\n\
   • Type `/quit`, then `rantaiclaw setup provider` for the guided flow"
-            .to_string();
+        );
         return (
             body,
-            "missing API key — set OPENROUTER_API_KEY or run setup".into(),
+            format!("missing API key — set {env_name} or run /setup provider"),
         );
     }
 
@@ -3016,7 +3065,7 @@ mod error_format_tests {
     #[test]
     fn api_key_missing_gets_friendly_chat_body() {
         let raw = "All providers/models failed. Attempts:\nprovider=openrouter model=anthropic/claude-sonnet-4.6 attempt 1/3: non_retryable; error=OpenRouter API key not set. Run `rantaiclaw onboard` or set OPENROUTER_API_KEY env var.";
-        let (chat, status) = format_agent_error(raw);
+        let (chat, status) = format_agent_error(raw, "openrouter");
         assert!(chat.contains("Missing API key"));
         assert!(chat.contains("OPENROUTER_API_KEY"));
         assert!(!chat.contains("attempt 1/3"));
@@ -3026,7 +3075,7 @@ mod error_format_tests {
     #[test]
     fn rate_limit_gets_short_message() {
         let raw = "All providers/models failed. Attempts:\nprovider=openrouter model=x attempt 1/3: rate-limited; HTTP 429";
-        let (chat, status) = format_agent_error(raw);
+        let (chat, status) = format_agent_error(raw, "openrouter");
         assert!(chat.contains("Rate-limited"));
         assert!(status.contains("rate limit"));
     }
@@ -3034,14 +3083,14 @@ mod error_format_tests {
     #[test]
     fn unknown_error_compacts_attempts_tail() {
         let raw = "All providers/models failed. Attempts:\nprovider=p1 model=m attempt 1/3: foo\nprovider=p2 model=m attempt 1/3: bar";
-        let (chat, _status) = format_agent_error(raw);
+        let (chat, _status) = format_agent_error(raw, "openrouter");
         // Compacted to first attempt plus +N more rather than full transcript.
         assert!(chat.contains("(+1 more attempts)"), "got {chat:?}");
     }
 
     #[test]
     fn non_provider_error_passes_through_with_prefix() {
-        let (chat, _) = format_agent_error("something else broke");
+        let (chat, _) = format_agent_error("something else broke", "openrouter");
         assert!(chat.starts_with("✗ something else broke"));
     }
 }
@@ -3176,6 +3225,7 @@ mod submit_tests {
         match req {
             TurnRequest::Submit(text) => assert_eq!(text, "hello"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
+            TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
         }
     }
 
@@ -3198,6 +3248,7 @@ mod submit_tests {
         match req {
             TurnRequest::Submit(text) => assert_eq!(text, "queued"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
+            TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
         }
     }
 
@@ -3482,6 +3533,7 @@ mod retry_tests {
         match req {
             TurnRequest::Submit(text) => assert_eq!(text, "previous prompt"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
+            TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
         }
         assert!(app.context.last_error.is_none());
     }

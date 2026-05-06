@@ -11,6 +11,11 @@ use crate::agent::events::AgentEventSender;
 pub enum TurnRequest {
     Submit(String),
     Cancel,
+    /// Replace the actor's `Agent` with one built from the supplied
+    /// config. Used after the first-run wizard or `/setup` saves new
+    /// provider/api_key/model so the running session picks up the
+    /// new credentials without a `/quit` + relaunch.
+    Reload(Box<crate::config::Config>),
 }
 
 pub struct TuiAgentActor {
@@ -19,6 +24,9 @@ pub struct TuiAgentActor {
     events_tx: AgentEventSender,
     queue: VecDeque<String>,
     current: Option<CancellationToken>,
+    /// Reload deferred until the in-flight turn completes — replacing
+    /// `self.agent` mid-turn would invalidate the borrow.
+    pending_reload: Option<Box<crate::config::Config>>,
 }
 
 impl TuiAgentActor {
@@ -33,6 +41,7 @@ impl TuiAgentActor {
             events_tx,
             queue: VecDeque::new(),
             current: None,
+            pending_reload: None,
         }
     }
 
@@ -52,6 +61,17 @@ impl TuiAgentActor {
                 match self.req_rx.recv().await {
                     Some(TurnRequest::Submit(text)) => self.queue.push_back(text),
                     Some(TurnRequest::Cancel) => { /* no-op while idle */ }
+                    Some(TurnRequest::Reload(config)) => {
+                        match crate::agent::Agent::from_config(&config) {
+                            Ok(new_agent) => {
+                                self.agent = new_agent;
+                                tracing::info!("agent reloaded with new config");
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to reload agent: {e}");
+                            }
+                        }
+                    }
                     None => return, // channel closed
                 }
             }
@@ -63,39 +83,59 @@ impl TuiAgentActor {
                     self.current = Some(token.clone());
                     let events = self.events_tx.clone();
 
-                    // Pin the turn future so we can poll it alongside req_rx.
-                    // turn_streaming takes &mut self, so the future borrows
-                    // self.agent exclusively for its lifetime.
-                    let mut turn_fut = Box::pin(self.agent.turn_streaming(
-                        &text,
-                        Some(events),
-                        Some(token.clone()),
-                    ));
-
                     // Drain incoming requests while the turn runs. On channel
                     // close, stop draining but still let the turn finish.
                     let mut senders_dropped = false;
-                    loop {
-                        tokio::select! {
-                            biased;
-                            maybe_req = self.req_rx.recv(), if !senders_dropped => {
-                                match maybe_req {
-                                    Some(TurnRequest::Submit(more)) => {
-                                        self.queue.push_back(more);
-                                    }
-                                    Some(TurnRequest::Cancel) => token.cancel(),
-                                    None => {
-                                        // All senders dropped — stop polling
-                                        // req_rx but keep awaiting turn_fut.
-                                        senders_dropped = true;
+                    {
+                        // Pin the turn future so we can poll it alongside
+                        // req_rx. turn_streaming takes &mut self, so the
+                        // future borrows self.agent exclusively for its
+                        // lifetime — confined to this inner block so
+                        // self.agent is free for post-turn reload.
+                        let mut turn_fut = Box::pin(self.agent.turn_streaming(
+                            &text,
+                            Some(events),
+                            Some(token.clone()),
+                        ));
+                        loop {
+                            tokio::select! {
+                                biased;
+                                maybe_req = self.req_rx.recv(), if !senders_dropped => {
+                                    match maybe_req {
+                                        Some(TurnRequest::Submit(more)) => {
+                                            self.queue.push_back(more);
+                                        }
+                                        Some(TurnRequest::Cancel) => token.cancel(),
+                                        Some(TurnRequest::Reload(config)) => {
+                                            // Defer until the active turn
+                                            // ends — replacing self.agent
+                                            // mid-turn would invalidate
+                                            // turn_fut's &mut self.agent borrow.
+                                            self.pending_reload = Some(config);
+                                        }
+                                        None => {
+                                            senders_dropped = true;
+                                        }
                                     }
                                 }
+                                res = &mut turn_fut => {
+                                    let _ = res;
+                                    self.current = None;
+                                    break;
+                                }
                             }
-                            res = &mut turn_fut => {
-                                // TurnResult / Error already surfaced via events.
-                                let _ = res;
-                                self.current = None;
-                                break;
+                        }
+                    } // turn_fut dropped here — self.agent no longer borrowed.
+
+                    // Apply any reload that arrived during the turn.
+                    if let Some(config) = self.pending_reload.take() {
+                        match crate::agent::Agent::from_config(&config) {
+                            Ok(new_agent) => {
+                                self.agent = new_agent;
+                                tracing::info!("agent reloaded with new config (post-turn)");
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to reload agent post-turn: {e}");
                             }
                         }
                     }
