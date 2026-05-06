@@ -618,18 +618,24 @@ impl TuiApp {
                             .as_ref()
                             .is_some_and(|o| o.active_prompt().is_some())) =>
             {
-                if let Some(o) = self.setup_overlay.as_mut() {
-                    if let Some((id, sel)) = o.submit_choose() {
-                        if let Some(tx) = &self.setup_response_tx {
-                            let _ = tx
-                                .send(crate::onboard::provision::ProvisionResponse::Selection(sel));
-                        }
-                    } else if let Some((id, val)) = o.submit_prompt() {
-                        if let Some(tx) = &self.setup_response_tx {
-                            let _ =
-                                tx.send(crate::onboard::provision::ProvisionResponse::Text(val));
-                        }
+                // Submit (and clear) choose/prompt state, then forward
+                // the response to the provisioner. Awaited so the
+                // future actually runs — without `.await`, the send
+                // future is dropped, the provisioner blocks on
+                // recv_selection/recv_text forever, and the user is
+                // left staring at an empty overlay with no way to
+                // advance.
+                let outgoing = self.setup_overlay.as_mut().and_then(|o| {
+                    if let Some((_id, sel)) = o.submit_choose() {
+                        Some(crate::onboard::provision::ProvisionResponse::Selection(sel))
+                    } else {
+                        o.submit_prompt().map(|(_id, val)| {
+                            crate::onboard::provision::ProvisionResponse::Text(val)
+                        })
                     }
+                });
+                if let (Some(resp), Some(tx)) = (outgoing, self.setup_response_tx.as_ref()) {
+                    let _ = tx.send(resp).await;
                 }
             }
             // Setup overlay open with no active prompt/choose — Up/Down/
