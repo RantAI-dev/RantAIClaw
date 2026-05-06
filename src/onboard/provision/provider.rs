@@ -381,25 +381,43 @@ impl TuiProvisioner for ProviderProvisioner {
         )
         .await?;
 
-        let default_model = default_model_for_provider(provider_name);
+        // Use the curated model list shared with the legacy wizard so
+        // the names stay in sync across both setup paths. Returns
+        // `(model_id, description)` tuples; we render description as
+        // the Choose option, then map back to the id via `model_ids`.
+        let curated = crate::onboard::wizard::curated_models_for_provider(provider_name);
+        let (model_ids, model_labels): (Vec<String>, Vec<String>) = if curated.is_empty() {
+            // Provider has no curated list — fall back to a single
+            // "default" option so the user still has something to pick.
+            let fallback = default_model_for_provider(provider_name);
+            (vec![fallback.clone()], vec![format!("{fallback} (default)")])
+        } else {
+            curated
+                .into_iter()
+                .map(|(id, desc)| {
+                    let label = format!("{id}  —  {desc}");
+                    (id, label)
+                })
+                .unzip()
+        };
 
         send(
             &events,
-            ProvisionEvent::Prompt {
+            ProvisionEvent::Choose {
                 id: "model".into(),
-                label: "Default model".into(),
-                default: Some(default_model.clone()),
-                secret: false,
+                label: "Select default model".into(),
+                options: model_labels,
+                multi: false,
             },
         )
         .await?;
 
-        let model = recv_text(&mut responses).await?;
-        let model = if model.trim().is_empty() {
-            default_model
-        } else {
-            model.trim().to_string()
-        };
+        let model_sel = recv_selection(&mut responses).await?;
+        let model_idx = model_sel.first().copied().unwrap_or(0);
+        let model = model_ids
+            .get(model_idx)
+            .cloned()
+            .unwrap_or_else(|| default_model_for_provider(provider_name));
 
         // ── Write config ────────────────────────────────────────────
         config.default_provider = Some(provider_name.to_string());
