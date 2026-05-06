@@ -866,6 +866,23 @@ impl TuiApp {
             .with_context(|| format!("failed to read config from {}", path.display()))?;
         let config: crate::config::Config =
             toml::from_str(&contents).context("failed to parse config file")?;
+        // Refresh the status-bar model label so the running TUI shows
+        // the freshly-saved provider/model. Without this, a wizard run
+        // that switches provider (e.g. openrouter → minimax) would
+        // leave the status bar showing the old provider until the
+        // next launch.
+        let provider = config.default_provider.clone().unwrap_or_default();
+        let model = config.default_model.clone().unwrap_or_default();
+        let model_label = if !provider.is_empty() && !model.is_empty() {
+            format!("{provider}:{model}")
+        } else if !model.is_empty() {
+            model
+        } else {
+            self.context.model.clone()
+        };
+        if !model_label.is_empty() {
+            self.context.model = model_label;
+        }
         self.config = config;
         Ok(())
     }
