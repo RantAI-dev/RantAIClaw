@@ -567,6 +567,30 @@ impl TuiApp {
                 }
             }
             // First-run wizard Enter handling — non-provisioner phases only.
+            // Wizard picker (PickChannels / PickIntegrations): route
+            // navigation/toggle keys to the wizard's own multi-select
+            // state. Enter is handled by the wizard Enter arm below.
+            KeyCode::Up
+                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+            {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    w.picker_move_up();
+                }
+            }
+            KeyCode::Down
+                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+            {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    w.picker_move_down();
+                }
+            }
+            KeyCode::Char(' ')
+                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+            {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    w.picker_toggle();
+                }
+            }
             // Wizard Enter is only meaningful for non-running phases.
             // During RunningProvisioner, Enter belongs to the active
             // setup_overlay (Choose submit / Prompt submit) — yield via
@@ -579,15 +603,17 @@ impl TuiApp {
                     ) =>
             {
                 let wizard = self.first_run_wizard.as_mut().unwrap();
-                match wizard.phase {
+                match wizard.phase.clone() {
                     super::first_run_wizard::WizardPhase::Welcome => {
                         wizard.start_provisioners();
-                        if let Some(name) = wizard.current_provisioner_name() {
-                            if let Err(e) = self.open_setup_overlay(name.to_string()) {
-                                let msg = format!("Failed to open provisioner: {}", e);
-                                let _ = self.context.append_system_message(&msg);
-                            }
-                        }
+                        self.react_to_wizard_phase();
+                    }
+                    super::first_run_wizard::WizardPhase::PickChannels
+                    | super::first_run_wizard::WizardPhase::PickIntegrations => {
+                        // Submit the multi-select; map indices to names;
+                        // queue selected provisioners; advance.
+                        wizard.apply_picker_selection();
+                        self.react_to_wizard_phase();
                     }
                     super::first_run_wizard::WizardPhase::Complete => {
                         // Reload config so the freshly-saved provisioner
@@ -774,37 +800,64 @@ impl TuiApp {
         // (or advance to Complete if this was the last one). On
         // failure, keep the overlay open so the user reads the error
         // and decides what to do (Esc aborts the wizard).
-        if let Some(wizard) = &mut self.first_run_wizard {
-            if wizard.is_provisioner_running() {
-                let overlay_state = self.setup_overlay.as_ref();
-                let is_finished = overlay_state.is_some_and(|o| o.finished);
-                let has_failure = overlay_state.is_some_and(|o| o.failure_reason.is_some());
-                if is_finished && !has_failure {
-                    // Clean success → advance.
-                    self.setup_overlay = None;
-                    self.setup_event_rx = None;
-                    self.setup_response_tx = None;
-                    wizard.advance_after_success();
-                    if matches!(
-                        wizard.phase,
-                        super::first_run_wizard::WizardPhase::RunningProvisioner { .. }
-                    ) {
-                        if let Some(name) = wizard.current_provisioner_name() {
-                            if let Err(e) = self.open_setup_overlay(name.to_string()) {
-                                let msg = format!("Failed to open provisioner: {}", e);
-                                let _ = self.context.append_system_message(&msg);
-                            }
-                        }
-                    }
-                }
-                // Failed: do nothing — overlay stays open showing the
-                // error; user dismisses with Esc which exits the wizard.
+        let need_advance = self
+            .first_run_wizard
+            .as_ref()
+            .is_some_and(|w| w.is_provisioner_running())
+            && {
+                let o = self.setup_overlay.as_ref();
+                o.is_some_and(|s| s.finished) && o.is_some_and(|s| s.failure_reason.is_none())
+            };
+        if need_advance {
+            // Clean success → close overlay, advance wizard, react.
+            self.setup_overlay = None;
+            self.setup_event_rx = None;
+            self.setup_response_tx = None;
+            if let Some(wizard) = self.first_run_wizard.as_mut() {
+                wizard.advance_to_next_in_queue_or_picker();
             }
+            self.react_to_wizard_phase();
         }
+        // Failed: do nothing — overlay stays open showing the error;
+        // user dismisses with Esc which exits the wizard.
         // Note: we no longer auto-clear the overlay when the provisioner
         // sets `finished = true`. The user dismisses via Esc so they can
         // read the success/failure summary at their own pace. The Esc
         // handler does the cleanup (clear overlay state + reload config).
+    }
+
+    /// Inspect the wizard's current phase and take the side-effect that
+    /// matches it — open a setup overlay for a queued provisioner,
+    /// open the multi-select picker for PickChannels / PickIntegrations,
+    /// or do nothing for Welcome / Complete (handled by the Enter
+    /// handler) or RunningProvisioner without a queued name yet.
+    /// Called after every wizard transition.
+    fn react_to_wizard_phase(&mut self) {
+        let phase = match self.first_run_wizard.as_ref() {
+            Some(w) => w.phase.clone(),
+            None => return,
+        };
+        match phase {
+            super::first_run_wizard::WizardPhase::RunningProvisioner { name } => {
+                if let Err(e) = self.open_setup_overlay(name.clone()) {
+                    let msg = format!("Failed to open provisioner '{name}': {e}");
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".to_string(), msg));
+                }
+            }
+            super::first_run_wizard::WizardPhase::PickChannels => {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    w.open_picker(super::first_run_wizard::channel_options());
+                }
+            }
+            super::first_run_wizard::WizardPhase::PickIntegrations => {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    w.open_picker(super::first_run_wizard::integration_options());
+                }
+            }
+            super::first_run_wizard::WizardPhase::Welcome
+            | super::first_run_wizard::WizardPhase::Complete => {}
+        }
     }
 
     fn reload_config(&mut self) -> anyhow::Result<()> {
