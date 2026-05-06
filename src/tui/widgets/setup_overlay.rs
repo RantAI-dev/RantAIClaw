@@ -238,88 +238,332 @@ impl SetupOverlayState {
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
-        if area.height < 6 || area.width < 30 {
-            return;
+        if area.height < 10 || area.width < 50 {
+            return self.render_compact(f, area);
         }
 
+        // ── Palette ──────────────────────────────────────────────
+        let coral = Color::Rgb(255, 138, 101);
         let sky = Color::Rgb(94, 184, 255);
         let muted = Color::Rgb(107, 114, 128);
-        let frame_color = Color::Rgb(40, 70, 140);
-        let coral = Color::Rgb(255, 138, 101);
         let emerald = Color::Rgb(52, 211, 153);
+        let dim = Color::Rgb(60, 70, 90);
 
         f.render_widget(Clear, area);
 
-        // Outer 1-col / 1-row margin so the overlay doesn't kiss the
-        // terminal edges — same breathing room as `/sessions`.
+        // Breathing room around the entire overlay.
         let outer = Rect {
-            x: area.x + 2,
-            y: area.y + 1,
+            x: area.x.saturating_add(2),
+            y: area.y.saturating_add(1),
             width: area.width.saturating_sub(4),
             height: area.height.saturating_sub(2),
         };
 
-        // Reserve fixed rows for prompt and choose blocks if they're
-        // active; remaining space is the scrollable content area.
-        let prompt_h: u16 = if self.prompt.is_some() { 3 } else { 0 };
+        // Compute the heights of the optional prompt + choose blocks
+        // so the surrounding spacers can collapse cleanly when empty.
+        let prompt_block_h: u16 = if self.prompt.is_some() { 3 } else { 0 };
         let choose_h: u16 = self
             .choose
             .as_ref()
-            .map(|c| (c.options.len() as u16).saturating_add(2)) // label + options
+            .map(|c| (c.options.len() as u16).saturating_add(4)) // section + headline + rule + spacer
             .unwrap_or(0);
-        let prompt_spacer: u16 = if prompt_h > 0 { 1 } else { 0 };
-        let choose_spacer: u16 = if choose_h > 0 { 1 } else { 0 };
+        let interactive_h = prompt_block_h.saturating_add(choose_h);
+        let interactive_spacer: u16 = if interactive_h > 0 { 1 } else { 0 };
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),             // 0: title row
-                Constraint::Length(1),             // 1: spacer
-                Constraint::Length(prompt_h),      // 2: prompt input box
-                Constraint::Length(prompt_spacer), // 3: spacer
-                Constraint::Length(choose_h),      // 4: choose options
-                Constraint::Length(choose_spacer), // 5: spacer
-                Constraint::Min(3),                // 6: scrollable content
-                Constraint::Length(1),             // 7: footer
+                Constraint::Length(2),                  // 0: brand bar
+                Constraint::Length(1),                  // 1: top rule
+                Constraint::Length(1),                  // 2: spacer
+                Constraint::Length(interactive_h),      // 3: prompt + choose region
+                Constraint::Length(interactive_spacer), // 4: spacer
+                Constraint::Min(3),                     // 5: status log (scrollable)
+                Constraint::Length(1),                  // 6: bottom rule
+                Constraint::Length(1),                  // 7: footer
             ])
             .split(outer);
 
-        // Build scrollable content (status log + QR caption + QR rows).
+        // ── Brand bar ────────────────────────────────────────────
+        self.render_brand_bar(f, chunks[0], coral, sky, muted, dim);
+
+        // ── Top rule ─────────────────────────────────────────────
+        render_horizontal_rule(f, chunks[1], dim);
+
+        // ── Interactive region (prompt + choose stacked) ─────────
+        if interactive_h > 0 {
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(prompt_block_h),
+                    Constraint::Length(choose_h),
+                ])
+                .split(chunks[3]);
+
+            if self.prompt.is_some() {
+                self.render_prompt_block(f, parts[0], coral, sky, muted);
+            }
+            if self.choose.is_some() {
+                self.render_choose_block(f, parts[1], coral, sky, muted, emerald, dim);
+            }
+        }
+
+        // ── Status log + QR (scrollable) ─────────────────────────
+        self.render_status_log(f, chunks[5], coral, sky, muted, emerald, dim);
+
+        // ── Bottom rule ──────────────────────────────────────────
+        render_horizontal_rule(f, chunks[6], dim);
+
+        // ── Footer ───────────────────────────────────────────────
+        self.render_footer(f, chunks[7], coral, sky, emerald, muted);
+    }
+
+    fn render_brand_bar(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        muted: Color,
+        dim: Color,
+    ) {
+        // The provisioner name is the trailing word of the title
+        // (titles look like "Setup — provider"); fall back to the
+        // full title if the format is unexpected.
+        let prov_name = self
+            .title
+            .rsplit_once("— ")
+            .map(|(_, n)| n.trim().to_string())
+            .unwrap_or_else(|| self.title.clone());
+
+        let status_word = if self.finished {
+            if self.failure_reason.is_some() {
+                "failed"
+            } else {
+                "complete"
+            }
+        } else if self.choose.is_some() {
+            "awaiting choice"
+        } else if self.prompt.is_some() {
+            "awaiting input"
+        } else {
+            "in progress"
+        };
+
+        let line1 = Line::from(vec![
+            Span::styled("◆  ", Style::default().fg(coral)),
+            Span::styled(
+                "RANTAICLAW",
+                Style::default().fg(coral).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled("·", Style::default().fg(dim)),
+            Span::styled(
+                "  setup",
+                Style::default().fg(sky).add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+        let line2 = Line::from(vec![
+            Span::styled(
+                format!("{:<width$}", format!("module · {prov_name}"), width = 28),
+                Style::default().fg(muted),
+            ),
+            Span::styled("·", Style::default().fg(dim)),
+            Span::styled(
+                format!("  {status_word}"),
+                Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(vec![line1, line2]), area);
+    }
+
+    fn render_prompt_block(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        muted: Color,
+    ) {
+        let Some(p) = self.prompt.as_ref() else {
+            return;
+        };
+        let masked = if p.secret {
+            "•".repeat(self.input.len())
+        } else {
+            self.input.clone()
+        };
+        let label_span = Span::styled(
+            format!("  {}  ", p.label),
+            Style::default().fg(sky).add_modifier(Modifier::BOLD),
+        );
+        let value_span = Span::styled(masked.clone(), Style::default().fg(coral));
+        let cursor_span = Span::styled("▎", Style::default().fg(coral));
+
+        let line = if self.input.is_empty() {
+            let placeholder = p
+                .default
+                .as_ref()
+                .map(|d| {
+                    Span::styled(
+                        format!("{d} "),
+                        Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+                    )
+                })
+                .unwrap_or_else(|| Span::raw(""));
+            Line::from(vec![label_span, placeholder, cursor_span])
+        } else {
+            Line::from(vec![label_span, value_span, cursor_span])
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(coral));
+        f.render_widget(Paragraph::new(line).block(block), area);
+    }
+
+    fn render_choose_block(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        muted: Color,
+        emerald: Color,
+        dim: Color,
+    ) {
+        let Some(c) = self.choose.as_ref() else {
+            return;
+        };
+
+        // Layout inside the choose region: section label, headline,
+        // accent rule, options.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // section label
+                Constraint::Length(1), // headline
+                Constraint::Length(1), // accent rule
+                Constraint::Min(1),    // options
+            ])
+            .split(area);
+
+        let kind_label = if c.multi { "MULTI · CHOOSE" } else { "CHOOSE" };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("⌗  ", Style::default().fg(coral)),
+                Span::styled(
+                    kind_label,
+                    Style::default()
+                        .fg(coral)
+                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                ),
+            ])),
+            chunks[0],
+        );
+
+        // Headline = the choose label, sentence-case-friendly with a
+        // period appended if missing.
+        let headline = if c.label.ends_with('.') || c.label.ends_with('?') {
+            c.label.clone()
+        } else {
+            format!("{}.", c.label)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                headline,
+                Style::default().fg(sky).add_modifier(Modifier::BOLD),
+            ))),
+            chunks[1],
+        );
+
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─── ⌐",
+                Style::default().fg(coral),
+            ))),
+            chunks[2],
+        );
+
+        // Options — column-aligned with refined glyphs.
+        let mut option_lines: Vec<Line> = Vec::with_capacity(c.options.len());
+        for (i, opt) in c.options.iter().enumerate() {
+            let is_cursor = i == c.cursor;
+            let is_checked = c.selected.contains(&i);
+
+            let arrow = if is_cursor { "▸" } else { " " };
+            let arrow_style = if is_cursor {
+                Style::default().fg(coral).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            let marker = if c.multi {
+                if is_checked {
+                    "▣"
+                } else {
+                    "□"
+                }
+            } else if is_cursor {
+                "◆"
+            } else {
+                "◇"
+            };
+            let marker_style = if is_checked {
+                Style::default().fg(emerald)
+            } else if is_cursor {
+                Style::default().fg(coral).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(dim)
+            };
+
+            let label_style = if is_cursor {
+                Style::default().fg(sky).add_modifier(Modifier::BOLD)
+            } else if is_checked {
+                Style::default().fg(sky)
+            } else {
+                Style::default().fg(muted)
+            };
+
+            option_lines.push(Line::from(vec![
+                Span::styled(format!(" {arrow}  "), arrow_style),
+                Span::styled(format!("{marker}  "), marker_style),
+                Span::styled(opt.clone(), label_style),
+            ]));
+        }
+        f.render_widget(
+            Paragraph::new(option_lines).wrap(Wrap { trim: false }),
+            chunks[3],
+        );
+    }
+
+    fn render_status_log(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        muted: Color,
+        emerald: Color,
+        dim: Color,
+    ) {
+        // Layout: section label / spacer / scroll content.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(area);
+
+        // Section label with right-aligned scroll position.
+        // Calculate scroll bounds first so the label can show "row N/M".
         let mut content_lines: Vec<Line> = self
             .log
             .iter()
-            .map(|l| {
-                // Color the prefix glyphs by severity for a quick visual scan.
-                if let Some(rest) = l.strip_prefix("· ") {
-                    Line::from(vec![
-                        Span::styled("· ", Style::default().fg(sky)),
-                        Span::raw(rest.to_string()),
-                    ])
-                } else if let Some(rest) = l.strip_prefix("✓ ") {
-                    Line::from(vec![
-                        Span::styled(
-                            "✓ ",
-                            Style::default().fg(emerald).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(rest.to_string()),
-                    ])
-                } else if let Some(rest) = l.strip_prefix("✗ ") {
-                    Line::from(vec![
-                        Span::styled(
-                            "✗ ",
-                            Style::default().fg(coral).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(rest.to_string()),
-                    ])
-                } else if let Some(rest) = l.strip_prefix("! ") {
-                    Line::from(vec![
-                        Span::styled("! ", Style::default().fg(Color::Yellow)),
-                        Span::raw(rest.to_string()),
-                    ])
-                } else {
-                    Line::from(l.as_str())
-                }
-            })
+            .map(|l| style_log_line(l, coral, sky, emerald))
             .collect();
 
         if let Some((qr, cap)) = &self.qr {
@@ -337,175 +581,205 @@ impl SetupOverlayState {
             }
         }
 
-        // Capture heights for scroll-bound calculations. Note we record
-        // the LINE count (not visual rows after wrapping) — it's a tight
-        // estimate for our content (QR rows are fixed-width, logs are
-        // typically one line each).
         self.last_content_height = content_lines.len() as u16;
-        self.last_viewport_height = chunks[6].height;
-
-        // Title row — name on the left, scroll status on the right when
-        // content overflows.
-        let inner_h = self.last_viewport_height;
-        let max_scroll = self.last_content_height.saturating_sub(inner_h);
-        let mut title_spans: Vec<Span> = vec![Span::styled(
-            self.title.clone(),
-            Style::default().fg(coral).add_modifier(Modifier::BOLD),
-        )];
-        if max_scroll > 0 {
-            title_spans.push(Span::styled(
-                format!(
-                    "   row {}/{}",
-                    self.scroll.saturating_add(1),
-                    self.last_content_height,
-                ),
-                Style::default().fg(muted),
-            ));
-            // Position bar arrows
-            let at_top = self.scroll == 0;
-            let at_bot = self.scroll >= max_scroll;
-            title_spans.push(Span::styled(
-                format!(
-                    "  · {}{}",
-                    if !at_top { "↑" } else { " " },
-                    if !at_bot { "↓" } else { " " },
-                ),
-                Style::default().fg(if at_top && at_bot { muted } else { sky }),
-            ));
-        }
-        f.render_widget(Paragraph::new(Line::from(title_spans)), chunks[0]);
-
-        // Prompt input box — bordered, focus-coloured, search-style.
-        if let Some(p) = self.prompt.as_ref() {
-            let masked = if p.secret {
-                "•".repeat(self.input.len())
-            } else {
-                self.input.clone()
-            };
-            let label = Span::styled(
-                format!("  {} ", p.label),
-                Style::default().fg(sky).add_modifier(Modifier::BOLD),
-            );
-            let value = Span::styled(masked, Style::default().fg(coral));
-            let cursor = Span::styled("▎", Style::default().fg(coral));
-            let placeholder = if self.input.is_empty() {
-                p.default
-                    .as_ref()
-                    .map(|d| {
-                        Span::styled(
-                            format!("{} ", d),
-                            Style::default().fg(muted).add_modifier(Modifier::ITALIC),
-                        )
-                    })
-                    .unwrap_or_else(|| Span::raw(""))
-            } else {
-                Span::raw("")
-            };
-            let line = if self.input.is_empty() {
-                Line::from(vec![label, placeholder, cursor])
-            } else {
-                Line::from(vec![label, value, cursor])
-            };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(coral));
-            f.render_widget(Paragraph::new(line).block(block), chunks[2]);
-        }
-
-        // Choose options — list-picker-style rows with cursor highlight.
-        if let Some(c) = self.choose.as_ref() {
-            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-                c.label.clone(),
-                Style::default().fg(sky).add_modifier(Modifier::BOLD),
-            ))];
-            for (i, opt) in c.options.iter().enumerate() {
-                let is_cursor = i == c.cursor;
-                let is_checked = c.selected.contains(&i);
-                let arrow = if is_cursor { "▸ " } else { "  " };
-                let marker = if c.multi {
-                    if is_checked {
-                        "[x] "
-                    } else {
-                        "[ ] "
-                    }
-                } else if is_cursor {
-                    "(•) "
-                } else {
-                    "( ) "
-                };
-                let style = if is_cursor {
-                    Style::default().fg(emerald).add_modifier(Modifier::BOLD)
-                } else if is_checked {
-                    Style::default().fg(sky)
-                } else {
-                    Style::default().fg(muted)
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(arrow, style),
-                    Span::styled(marker, style),
-                    Span::styled(opt.clone(), style),
-                ]));
-            }
-            f.render_widget(Paragraph::new(lines), chunks[4]);
-        }
-
-        // Re-clamp scroll in case content shrank.
+        self.last_viewport_height = chunks[2].height;
+        let max_scroll = self
+            .last_content_height
+            .saturating_sub(self.last_viewport_height);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
 
-        // Scrollable content area.
-        let content_block = Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(frame_color));
-        let content = Paragraph::new(content_lines)
-            .block(content_block)
-            .wrap(Wrap { trim: false })
-            .scroll((self.scroll, 0));
-        f.render_widget(content, chunks[6]);
+        let mut header_spans = vec![
+            Span::styled("⌗  ", Style::default().fg(dim)),
+            Span::styled(
+                "RECENT",
+                Style::default().fg(muted).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+        ];
+        if max_scroll > 0 {
+            header_spans.push(Span::styled(
+                format!(
+                    "row {}/{}",
+                    self.scroll.saturating_add(1),
+                    self.last_content_height,
+                ),
+                Style::default().fg(dim),
+            ));
+            let at_top = self.scroll == 0;
+            let at_bot = self.scroll >= max_scroll;
+            header_spans.push(Span::styled(
+                format!(
+                    "  {}{}",
+                    if !at_top { "↑" } else { " " },
+                    if !at_bot { "↓" } else { " " },
+                ),
+                Style::default().fg(if at_top && at_bot { dim } else { sky }),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
 
-        // Footer with hotkeys — context-dependent.
-        let footer_spans: Vec<Span> = if self.choose.is_some() {
+        // Spacer — leave blank.
+        let _ = chunks[1];
+
+        // Content — left rail in dim, padded body.
+        if content_lines.is_empty() {
+            let placeholder = Paragraph::new(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    "(no messages yet — provisioner is starting…)",
+                    Style::default().fg(dim).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+            f.render_widget(placeholder, chunks[2]);
+        } else {
+            let block = Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(dim));
+            let content = Paragraph::new(content_lines)
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .scroll((self.scroll, 0));
+            f.render_widget(content, chunks[2]);
+        }
+    }
+
+    fn render_footer(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        coral: Color,
+        sky: Color,
+        emerald: Color,
+        muted: Color,
+    ) {
+        let spans: Vec<Span> = if self.choose.is_some() {
             let multi = self.choose.as_ref().is_some_and(|c| c.multi);
             let mut v = vec![
-                Span::styled("↑/↓", Style::default().fg(sky)),
-                Span::styled(" navigate", Style::default().fg(muted)),
+                Span::styled("↑/↓ ", Style::default().fg(sky)),
+                Span::styled("navigate    ", Style::default().fg(muted)),
             ];
             if multi {
-                v.push(Span::styled(" · ", Style::default().fg(muted)));
-                v.push(Span::styled("Space", Style::default().fg(sky)));
-                v.push(Span::styled(" toggle", Style::default().fg(muted)));
+                v.push(Span::styled("Space ", Style::default().fg(sky)));
+                v.push(Span::styled("toggle    ", Style::default().fg(muted)));
             }
-            v.push(Span::styled(" · ", Style::default().fg(muted)));
-            v.push(Span::styled("Enter", Style::default().fg(sky)));
-            v.push(Span::styled(" confirm · ", Style::default().fg(muted)));
-            v.push(Span::styled("Esc", Style::default().fg(sky)));
-            v.push(Span::styled(" cancel", Style::default().fg(muted)));
+            v.push(Span::styled(
+                "↩ Enter ",
+                Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+            ));
+            v.push(Span::styled("confirm    ", Style::default().fg(muted)));
+            v.push(Span::styled(
+                "⎋ Esc ",
+                Style::default().fg(coral).add_modifier(Modifier::BOLD),
+            ));
+            v.push(Span::styled("cancel", Style::default().fg(muted)));
             v
         } else if self.prompt.is_some() {
             vec![
-                Span::styled("type", Style::default().fg(sky)),
-                Span::styled(" to enter value · ", Style::default().fg(muted)),
-                Span::styled("Enter", Style::default().fg(sky)),
-                Span::styled(" submit · ", Style::default().fg(muted)),
-                Span::styled("Esc", Style::default().fg(sky)),
-                Span::styled(" cancel", Style::default().fg(muted)),
+                Span::styled("type ", Style::default().fg(sky)),
+                Span::styled("to enter value    ", Style::default().fg(muted)),
+                Span::styled(
+                    "↩ Enter ",
+                    Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("submit    ", Style::default().fg(muted)),
+                Span::styled(
+                    "⎋ Esc ",
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("cancel", Style::default().fg(muted)),
             ]
         } else {
             vec![
-                Span::styled("↑/↓", Style::default().fg(sky)),
-                Span::styled(" scroll · ", Style::default().fg(muted)),
-                Span::styled("PgUp/PgDn", Style::default().fg(sky)),
-                Span::styled(" page · ", Style::default().fg(muted)),
-                Span::styled("Home/End", Style::default().fg(sky)),
-                Span::styled(" jump · ", Style::default().fg(muted)),
-                Span::styled("Esc", Style::default().fg(sky)),
-                Span::styled(" close", Style::default().fg(muted)),
+                Span::styled("↑/↓ ", Style::default().fg(sky)),
+                Span::styled("scroll    ", Style::default().fg(muted)),
+                Span::styled("PgUp/PgDn ", Style::default().fg(sky)),
+                Span::styled("page    ", Style::default().fg(muted)),
+                Span::styled("Home/End ", Style::default().fg(sky)),
+                Span::styled("jump    ", Style::default().fg(muted)),
+                Span::styled(
+                    "⎋ Esc ",
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("close", Style::default().fg(muted)),
             ]
         };
-        f.render_widget(Paragraph::new(Line::from(footer_spans)), chunks[7]);
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
+
+    /// Compact fallback for narrow / short terminals.
+    fn render_compact(&self, f: &mut Frame, area: Rect) {
+        let coral = Color::Rgb(255, 138, 101);
+        let muted = Color::Rgb(107, 114, 128);
+        let frame_color = Color::Rgb(40, 70, 140);
+
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(frame_color))
+            .title(Line::from(vec![
+                Span::styled(" ", Style::default()),
+                Span::styled(
+                    self.title.clone(),
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ", Style::default()),
+            ]));
+        let lines: Vec<Line> = self
+            .log
+            .iter()
+            .map(|l| Line::from(l.as_str()))
+            .collect();
+        let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        f.render_widget(para, area);
+        let _ = muted;
+    }
+}
+
+fn style_log_line<'a>(l: &'a str, coral: Color, sky: Color, emerald: Color) -> Line<'a> {
+    if let Some(rest) = l.strip_prefix("· ") {
+        Line::from(vec![
+            Span::styled("· ", Style::default().fg(sky)),
+            Span::raw(rest),
+        ])
+    } else if let Some(rest) = l.strip_prefix("✓ ") {
+        Line::from(vec![
+            Span::styled(
+                "✓ ",
+                Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(rest),
+        ])
+    } else if let Some(rest) = l.strip_prefix("✗ ") {
+        Line::from(vec![
+            Span::styled(
+                "✗ ",
+                Style::default().fg(coral).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(rest),
+        ])
+    } else if let Some(rest) = l.strip_prefix("! ") {
+        Line::from(vec![
+            Span::styled("! ", Style::default().fg(Color::Yellow)),
+            Span::raw(rest),
+        ])
+    } else {
+        Line::from(l)
+    }
+}
+
+fn render_horizontal_rule(f: &mut Frame, area: Rect, dim: Color) {
+    let w = area.width as usize;
+    if w == 0 {
+        return;
+    }
+    let line: String = std::iter::repeat('─').take(w).collect();
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(line, Style::default().fg(dim)))),
+        area,
+    );
 }
 
 fn render_qr_block(payload: &str) -> String {
