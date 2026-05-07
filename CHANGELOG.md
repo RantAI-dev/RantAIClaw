@@ -5,6 +5,60 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2-alpha] — 2026-05-06
+
+Lifecycle commands — closes the "how do I uninstall?" / "how do I update?"
+completeness gap surfaced during v0.6.1-alpha tester onboarding. New module
+`src/lifecycle/` with two commands.
+
+### Added
+
+- **`rantaiclaw uninstall`** — remove profile data, optionally the binary.
+  Default scope is the active profile only; `--all` removes the entire
+  `~/.rantaiclaw/` tree; `--purge` adds binary self-deletion. `--keep-secrets`
+  preserves `.secret_key` for re-install. `--dry-run` prints the plan and
+  exits 0. Coordinates with the daemon service unit (calls `service uninstall`
+  automatically when present). Best-effort: comments out PATH amendments the
+  installer may have added to `~/.bashrc` / `~/.zshrc` / `~/.profile` /
+  `~/.config/fish/config.fish` with a date-stamped marker.
+- **`rantaiclaw update`** — self-replace the binary against a published
+  GitHub release. Verifies SHA256 against `SHA256SUMS`. Atomic swap on
+  Unix (rename + rename, with `.old` backup and rollback on failure). On
+  Windows, stages the new binary as `<exe>.new.exe`; the next launch
+  detects and self-swaps before doing anything else.
+  Flags: `--check`, `--channel stable|prerelease`, `--to <tag>`,
+  `--allow-downgrade`, `-y/--yes`. Honors `RANTAICLAW_RELEASE_BASE_URL`
+  for testing against staging or self-hosted releases.
+- Refuses self-modification on cargo-managed binaries (`~/.cargo/bin/`)
+  with a hint to use `cargo install rantaiclaw --force` or
+  `cargo uninstall rantaiclaw` instead.
+
+### Changed
+
+- `src/main.rs` short-circuits `Update` and `Uninstall` before
+  `Config::load_or_init` so they work on partially broken installs.
+- Every launch applies a pending Windows update before doing anything
+  else (no-op on Unix; cheap stat call on Windows).
+
+### Compatibility
+
+- **No deps added.** Implementation reuses existing `reqwest`, `sha2`,
+  `hex`, `tempfile`. Archive extraction shells out to `tar` (Linux/macOS
+  native, ships in Windows 10 1803+). This keeps the Cargo.toml dep
+  surface unchanged from v0.6.1-alpha — a deliberate alignment with the
+  bloat-audit "no new deps for one feature" rule.
+- Configs and on-disk state from v0.6.1-alpha load unchanged.
+
+### Tests
+
+- `src/lifecycle/binary_path.rs` — InstallKind classification + cargo
+  refusal.
+- `src/lifecycle/uninstall.rs` — dry-run, default-active-profile-only,
+  `--all` full wipe, `--keep-secrets` preserves `.secret_key`, shell rc
+  amendment is commented out (not deleted).
+- `src/lifecycle/update.rs` — semver comparison incl. prerelease ordering,
+  SHA256SUMS line parsing for multiple formats, tag normalization.
+
 ## [0.6.1-alpha] — 2026-05-06
 
 Alpha cut for **Sulthan + Alifia** to start E2E testing on real hardware. No

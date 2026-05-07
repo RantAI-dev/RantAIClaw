@@ -505,6 +505,75 @@ Examples:
         config_command: ConfigCommands,
     },
 
+    /// Self-replace the binary against a published GitHub release
+    #[command(long_about = "\
+Self-replace the rantaiclaw binary against a published GitHub release.
+
+Verifies SHA256 against SHA256SUMS, swaps the binary atomically on Unix,
+stages the new binary on Windows for self-swap on next launch.
+
+Examples:
+  rantaiclaw update                          # latest stable
+  rantaiclaw update --check                  # version delta only, exit 1 if newer
+  rantaiclaw update --channel prerelease     # latest including alpha/beta/rc
+  rantaiclaw update --to v0.6.2-alpha        # pin to a specific tag
+  rantaiclaw update --allow-downgrade --to v0.5.3
+  RANTAICLAW_RELEASE_BASE_URL=https://my.mirror/path rantaiclaw update")]
+    Update {
+        /// Print version delta only; do not download. Exit 1 if newer
+        /// version is available, 0 if already up-to-date.
+        #[arg(long)]
+        check: bool,
+        /// `stable` (default) or `prerelease` (includes alpha/beta/rc).
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        /// Pin to a specific tag (e.g. `v0.6.2-alpha`). Overrides `channel`.
+        #[arg(long)]
+        to: Option<String>,
+        /// Allow installing an older version than the current one.
+        #[arg(long)]
+        allow_downgrade: bool,
+        /// Skip confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Remove rantaiclaw profile data, optionally the binary itself
+    #[command(long_about = "\
+Remove rantaiclaw profile data, optionally the binary itself.
+
+By default, removes only the active profile (~/.rantaiclaw/profiles/<active>/).
+Pass --all to remove the entire ~/.rantaiclaw/ tree. Pass --purge to also
+self-delete the binary.
+
+Coordinates with the daemon service unit if installed (calls `service
+uninstall` automatically). Best-effort: comments out PATH amendments the
+installer may have added to your shell rc files.
+
+Examples:
+  rantaiclaw uninstall                  # active profile only, prompts
+  rantaiclaw uninstall --all --yes      # full wipe, no prompt
+  rantaiclaw uninstall --all --keep-secrets  # wipe profiles, keep .secret_key
+  rantaiclaw uninstall --purge          # full wipe + remove binary
+  rantaiclaw uninstall --dry-run        # show plan, change nothing")]
+    Uninstall {
+        /// Remove every profile + the global ~/.rantaiclaw/ root.
+        #[arg(long)]
+        all: bool,
+        /// Implies --all + self-delete the binary.
+        #[arg(long)]
+        purge: bool,
+        /// Preserve ~/.rantaiclaw/.secret_key for re-install.
+        #[arg(long)]
+        keep_secrets: bool,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Print what would be removed; touch nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Generate shell completion script to stdout
     #[command(long_about = "\
 Generate shell completion scripts for `rantaiclaw`.
@@ -869,6 +938,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Apply any pending Windows update from a prior `rantaiclaw update` run
+    // before doing anything else (no-op on Unix). Best-effort; failure is
+    // not fatal — the staged file just stays put for next time.
+    let _ = rantaiclaw::lifecycle::update::apply_pending_windows_update();
+
     if let Some(config_dir) = &cli.config_dir {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
@@ -916,6 +990,50 @@ async fn main() -> Result<()> {
     // does not hit a half-initialised config flow.
     if let Some(Commands::Profile { cmd }) = cli.command {
         return profile::commands::run(cmd);
+    }
+
+    // Lifecycle commands also short-circuit before Config::load_or_init.
+    // `uninstall` must work on a partially-broken install; `update` is a
+    // pre-config self-replace and shouldn't touch user data.
+    if let Some(Commands::Uninstall {
+        all,
+        purge,
+        keep_secrets,
+        yes,
+        dry_run,
+    }) = &cli.command
+    {
+        return rantaiclaw::lifecycle::uninstall::run(
+            rantaiclaw::lifecycle::uninstall::UninstallOpts {
+                all: *all,
+                purge: *purge,
+                keep_secrets: *keep_secrets,
+                yes: *yes,
+                dry_run: *dry_run,
+            },
+        );
+    }
+    if let Some(Commands::Update {
+        check,
+        channel,
+        to,
+        allow_downgrade,
+        yes,
+    }) = &cli.command
+    {
+        let channel = match channel.as_str() {
+            "stable" => rantaiclaw::lifecycle::update::Channel::Stable,
+            "prerelease" | "pre" => rantaiclaw::lifecycle::update::Channel::Prerelease,
+            other => bail!("unknown channel: {other} (expected `stable` or `prerelease`)"),
+        };
+        return rantaiclaw::lifecycle::update::run(rantaiclaw::lifecycle::update::UpdateOpts {
+            check: *check,
+            channel,
+            to: to.clone(),
+            allow_downgrade: *allow_downgrade,
+            release_base_url: std::env::var("RANTAICLAW_RELEASE_BASE_URL").ok(),
+            yes: *yes,
+        });
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
@@ -1384,10 +1502,12 @@ async fn main() -> Result<()> {
             }
         },
 
-        // Already short-circuited above before Config::load_or_init; this
-        // arm exists solely to make the match exhaustive without touching
+        // Already short-circuited above before Config::load_or_init; these
+        // arms exist solely to make the match exhaustive without touching
         // the other Commands arms.
         Some(Commands::Profile { .. }) => unreachable!("Profile dispatched earlier"),
+        Some(Commands::Uninstall { .. }) => unreachable!("Uninstall dispatched earlier"),
+        Some(Commands::Update { .. }) => unreachable!("Update dispatched earlier"),
     }
 }
 
