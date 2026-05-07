@@ -164,7 +164,80 @@ impl CommandHandler for DoctorCommand {
     }
 }
 
-/// /platforms command — show which communication platforms are active
+/// /channels command — show installed channels and whether they're being
+/// polled by this process. Pre-v0.6.4 the TUI did not auto-start channel
+/// listeners, so a configured Telegram bot would never reply unless the
+/// user separately ran `rantaiclaw daemon`. v0.6.4 spawns listeners
+/// alongside the TUI; this command makes that visible.
+pub struct ChannelsCommand;
+
+fn render_channels(ctx: &TuiContext) -> String {
+    let rows: Vec<(&str, bool)> = ctx
+        .channels_summary
+        .iter()
+        .map(|(n, c)| (n.as_str(), *c))
+        .collect();
+    let active_count = ctx.channels_autostart_count;
+
+    let mut out = String::new();
+    out.push_str("Channels (transports the agent can speak on):\n\n");
+    out.push_str("  ✅ CLI / TUI — always available (this terminal)\n\n");
+
+    let configured: Vec<_> = rows.iter().filter(|(_, c)| *c).collect();
+    let not_configured: Vec<_> = rows.iter().filter(|(_, c)| !*c).collect();
+
+    if configured.is_empty() {
+        out.push_str(
+            "  No external channels configured.\n  \
+             Run `/setup channels` to add Telegram, Discord, Slack, etc.\n",
+        );
+    } else {
+        out.push_str("  Configured:\n");
+        for (name, _) in &configured {
+            // After v0.6.4 the auto-start path runs all configured
+            // channels in the same process. Status reflects that
+            // (best-effort — actual liveness probe lives in /doctor).
+            let status = if active_count > 0 {
+                "polling"
+            } else {
+                "configured (run `rantaiclaw daemon` for full mode)"
+            };
+            out.push_str(&format!("    · {name:<16} {status}\n"));
+        }
+    }
+
+    if !not_configured.is_empty() {
+        out.push_str("\n  Not configured:\n    ");
+        let names: Vec<&str> = not_configured.iter().map(|(n, _)| *n).collect();
+        out.push_str(&names.join(", "));
+        out.push('\n');
+    }
+
+    out.push_str("\nUse `/setup channels` to add or reconfigure.\n");
+    out
+}
+
+impl CommandHandler for ChannelsCommand {
+    fn name(&self) -> &str {
+        "channels"
+    }
+
+    fn description(&self) -> &str {
+        "Show installed and active channels (Telegram, Discord, etc.)"
+    }
+
+    fn aliases(&self) -> Vec<&str> {
+        vec!["platforms"]
+    }
+
+    fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+        Ok(CommandResult::Message(render_channels(ctx)))
+    }
+}
+
+/// /platforms command — kept as an alias for /channels so existing
+/// muscle memory works; the command registry also exposes /platforms
+/// via ChannelsCommand::aliases().
 pub struct PlatformsCommand;
 
 impl CommandHandler for PlatformsCommand {
@@ -173,13 +246,11 @@ impl CommandHandler for PlatformsCommand {
     }
 
     fn description(&self) -> &str {
-        "Show active communication platforms"
+        "Alias for /channels — show installed and active channels"
     }
 
-    fn execute(&self, _args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
-        Ok(CommandResult::Message(
-            "Active platforms:\n  TUI (terminal user interface) — active".to_string(),
-        ))
+    fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+        ChannelsCommand.execute(args, ctx)
     }
 }
 

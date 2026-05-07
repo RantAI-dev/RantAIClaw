@@ -43,6 +43,13 @@ pub struct FirstRunWizard {
     pub picker: Option<ActiveChoose>,
     pub picker_names: Vec<String>,
     pub profile: Profile,
+    /// Phase history for the back button. Each completed phase transition
+    /// pushes the previous phase here; `back()` pops one and restores it.
+    /// v0.6.4 covers the safe cases (PickChannels ↔ PickIntegrations and
+    /// PickChannels → previous required provisioner). RunningProvisioner
+    /// rewind is forward-only for now — the running task can't be
+    /// surgically rewound without leaking partial state.
+    pub history: Vec<WizardPhase>,
 }
 
 const REQUIRED_PROVISIONERS: &[&str] = &["provider", "approvals", "persona", "skills"];
@@ -96,7 +103,32 @@ impl FirstRunWizard {
             picker: None,
             picker_names: Vec::new(),
             profile,
+            history: Vec::new(),
         }
+    }
+
+    /// Go back one step. Returns `true` if the phase changed, `false` if
+    /// already at the earliest restorable point. Safe to call from any
+    /// phase — RunningProvisioner steps are skipped (we can't surgically
+    /// rewind a task that wrote to config.toml mid-flight). The user can
+    /// always Esc + re-run a section if they need to redo a required step.
+    pub fn back(&mut self) -> bool {
+        // Walk history backwards skipping RunningProvisioner entries.
+        while let Some(prev) = self.history.pop() {
+            match prev {
+                WizardPhase::RunningProvisioner { .. } => {
+                    // Required provisioners already wrote to config.toml.
+                    // Going back to one would mean re-running, which is
+                    // forward-only via the queue. Skip and keep walking.
+                    continue;
+                }
+                phase => {
+                    self.phase = phase;
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn current_provisioner_name(&self) -> Option<&str> {
@@ -122,6 +154,8 @@ impl FirstRunWizard {
     }
 
     pub fn advance_to_next_in_queue_or_picker(&mut self) {
+        // Record the prior phase for back-navigation before mutating.
+        let prev = self.phase.clone();
         if let Some(next) = self.queue_pop_front() {
             self.phase = WizardPhase::RunningProvisioner { name: next };
         } else {
@@ -152,6 +186,9 @@ impl FirstRunWizard {
                 }
                 WizardPhase::Complete => {}
             }
+        }
+        if prev != self.phase {
+            self.history.push(prev);
         }
     }
 

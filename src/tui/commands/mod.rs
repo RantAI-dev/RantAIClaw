@@ -112,6 +112,7 @@ impl CommandRegistry {
         self.register(Box::new(config::DebugCommand));
         self.register(Box::new(config::ConfigCommand));
         self.register(Box::new(config::DoctorCommand));
+        self.register(Box::new(config::ChannelsCommand));
         self.register(Box::new(config::PlatformsCommand));
         self.register(Box::new(memory::MemoryCommand));
         self.register(Box::new(memory::ForgetCommand));

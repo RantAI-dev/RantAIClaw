@@ -340,6 +340,26 @@ impl TuiApp {
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.editor_request = true;
             }
+            // Ctrl+B — back. While the first-run wizard is open, walk the
+            // phase history one step back. Skips RunningProvisioner phases
+            // (those wrote to config; rewinding mid-task isn't safe). The
+            // user can Esc + re-run a section if they need to redo a
+            // required step. Tester ask: "please the back button should
+            // avail" (bugs-123 page 3).
+            KeyCode::Char('b')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.first_run_wizard.is_some() =>
+            {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    if w.back() {
+                        // History pop succeeded — clear any stale picker
+                        // state so the destination phase re-initializes
+                        // cleanly on next render.
+                        w.picker = None;
+                        w.picker_names.clear();
+                    }
+                }
+            }
             // Plain Enter — Hermes / Claude Code convention:
             //   * If the autocomplete dropdown is visible and the highlighted
             //     command differs from what the user typed → complete first;
@@ -950,6 +970,13 @@ impl TuiApp {
             }
         }
         self.context.available_providers = available_providers;
+        // Refresh the channels snapshot so /channels and /platforms reflect
+        // any wizard-driven add/remove since launch.
+        self.context.channels_summary = channel_status_summary(&config)
+            .into_iter()
+            .map(|(name, configured)| (name.to_string(), configured))
+            .collect();
+        self.context.channels_autostart_count = count_configured_channels(&config);
         self.config = config.clone();
         // Push the new config to the agent actor so the next turn uses
         // the freshly-saved provider/api_key/model. Without this the
@@ -2830,6 +2857,71 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
 /// On exit we drop the `TuiApp` (which releases `req_tx`), giving the actor
 /// `None` from `req_rx.recv()` so it can finish its current turn and return.
 /// A bounded timeout avoids hanging shutdown if the actor is stuck.
+/// Count how many transport channels have a non-empty configuration in
+/// `config.channels_config`. Used by the TUI auto-start path to decide
+/// whether to spawn `start_channels` and by `/channels` + `/platforms`
+/// to render the active set. The CLI surface is implicit (always on)
+/// and is not counted here.
+pub(crate) fn count_configured_channels(c: &crate::config::Config) -> usize {
+    let mut n = 0;
+    let cc = &c.channels_config;
+    if cc.telegram.is_some() { n += 1; }
+    if cc.discord.is_some() { n += 1; }
+    if cc.slack.is_some() { n += 1; }
+    if cc.mattermost.is_some() { n += 1; }
+    if cc.webhook.is_some() { n += 1; }
+    if cc.imessage.is_some() { n += 1; }
+    if cc.signal.is_some() { n += 1; }
+    if cc.whatsapp.is_some() { n += 1; }
+    if cc.linq.is_some() { n += 1; }
+    if cc.nextcloud_talk.is_some() { n += 1; }
+    if cc.email.is_some() { n += 1; }
+    if cc.irc.is_some() { n += 1; }
+    if cc.dingtalk.is_some() { n += 1; }
+    #[cfg(feature = "channel-matrix")]
+    {
+        if cc.matrix.is_some() { n += 1; }
+    }
+    #[cfg(feature = "channel-lark")]
+    {
+        if cc.lark.is_some() { n += 1; }
+    }
+    n
+}
+
+/// Per-channel state for the `/channels` and `/platforms` commands.
+/// `(name, configured, transport-hint)`. `configured=true` means the
+/// channel has a config block in `config.toml`; whether it's actually
+/// polling depends on whether `channels_autostart_count > 0` was true
+/// at TUI startup.
+pub(crate) fn channel_status_summary(c: &crate::config::Config) -> Vec<(&'static str, bool)> {
+    let cc = &c.channels_config;
+    let mut rows: Vec<(&'static str, bool)> = vec![
+        ("Telegram", cc.telegram.is_some()),
+        ("Discord", cc.discord.is_some()),
+        ("Slack", cc.slack.is_some()),
+        ("WhatsApp", cc.whatsapp.is_some()),
+        ("Mattermost", cc.mattermost.is_some()),
+        ("Signal", cc.signal.is_some()),
+        ("Email", cc.email.is_some()),
+        ("IRC", cc.irc.is_some()),
+        ("DingTalk", cc.dingtalk.is_some()),
+        ("Webhook", cc.webhook.is_some()),
+        ("Linq", cc.linq.is_some()),
+        ("Nextcloud Talk", cc.nextcloud_talk.is_some()),
+        ("iMessage", cc.imessage.is_some()),
+    ];
+    #[cfg(feature = "channel-matrix")]
+    {
+        rows.push(("Matrix", cc.matrix.is_some()));
+    }
+    #[cfg(feature = "channel-lark")]
+    {
+        rows.push(("Lark / Feishu", cc.lark.is_some()));
+    }
+    rows
+}
+
 pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("TUI requires an interactive terminal (stdin is not a TTY)");
@@ -2927,6 +3019,37 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // (missing dir, malformed manifest, etc.) — never blocks startup.
     app.context.available_skills =
         crate::skills::load_skills_with_config(&app_config.workspace_dir, &app_config);
+
+    // Auto-start configured channel listeners alongside the TUI. Before
+    // v0.6.4 the TUI was a single local-chat surface — Telegram / Discord /
+    // Slack / etc. configured via the wizard would never receive messages
+    // because nothing was polling them; users had to run a separate
+    // `rantaiclaw daemon`. Tester reports surfaced this as "bot doesn't
+    // reply outside the TUI." Now bare `rantaiclaw` is the canonical
+    // multi-channel runtime: TUI owns the local terminal, channels run as
+    // a background task in the same process.
+    //
+    // Failure-mode discipline: never block the TUI on channel startup.
+    // If start_channels errors (bad token, network, missing creds), the
+    // user can still chat locally; the failure is logged + surfaced via
+    // /channels.
+    let configured_channels = count_configured_channels(&app_config);
+    app.context.channels_summary = channel_status_summary(&app_config)
+        .into_iter()
+        .map(|(name, configured)| (name.to_string(), configured))
+        .collect();
+    if configured_channels > 0 {
+        let cfg_for_channels = app_config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::channels::start_channels(cfg_for_channels).await {
+                tracing::warn!(
+                    "auto-start channels failed (TUI continues; channels will not respond until daemon is running separately): {e:#}"
+                );
+            }
+        });
+        app.context.channels_autostart_count = configured_channels;
+    }
+
     let mut terminal = setup_terminal()?;
 
     // Splash banner — committed once to the terminal's scrollback before

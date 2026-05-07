@@ -5,6 +5,49 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4-alpha] — 2026-05-07
+
+Follow-up to v0.6.3-alpha tester feedback. Fixes the channel deadlock
+(Telegram bot configured but never replied), makes the channel state
+visible, and lands the deferred back button.
+
+### Fixed
+
+- **Telegram / Discord / Slack / etc. don't reply when running bare
+  `rantaiclaw`** — the TUI process was the canonical "all-in-one"
+  runtime in user expectations, but it was only running the local-chat
+  agent actor. Configured channels needed a separate `rantaiclaw daemon`
+  to be polled, which wasn't documented or discoverable. v0.6.4 spawns
+  `start_channels` as a background task alongside the TUI when any
+  channel is configured. Failure-mode discipline: channel-startup
+  errors are logged but don't crash the TUI; the user can still chat
+  locally. (`src/tui/app.rs` `run_tui`.)
+- **`/platforms` always reported "TUI active" only** — was a hardcoded
+  string. Now reflects the actual `channels_config` from
+  `<profile>/config.toml` and indicates whether each channel is
+  configured + whether the TUI is polling it. Refreshes on
+  `reload_config` so post-`/setup` runs see the new state.
+  (`src/tui/commands/config.rs`.)
+
+### Added
+
+- **`/channels` command** — first-class command to list configured +
+  active channels. `/platforms` now aliases to `/channels`.
+- **Back button in the first-run wizard** — `Ctrl+B` walks the phase
+  history one step back. Safe cases (PickChannels ↔ PickIntegrations
+  ↔ Welcome) work fully. RunningProvisioner steps are skipped on
+  rewind (the running task wrote to `config.toml`; surgical rewind
+  isn't safe). For redoing a required section, `Esc` + re-run with
+  `/setup <section>` remains the supported path. (`src/tui/first_run_wizard.rs`
+  `back()`, `src/tui/app.rs` Ctrl+B handler.)
+
+### Compatibility
+
+- No new deps. No on-disk-state changes vs v0.6.3-alpha.
+- Bare `rantaiclaw` now uses more memory + CPU when channels are
+  configured (it spawns the channel listeners). For TUI-only mode
+  with no channels, the auto-start branch is a no-op.
+
 ## [0.6.3-alpha] — 2026-05-07
 
 Bug-fix cut driven by Sulthan + Alifia's first round of v0.6.1-alpha
