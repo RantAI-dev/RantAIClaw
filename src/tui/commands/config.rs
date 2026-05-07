@@ -172,16 +172,52 @@ impl CommandHandler for DoctorCommand {
 pub struct ChannelsCommand;
 
 fn render_channels(ctx: &TuiContext) -> String {
+    use crate::channels::auto_start_state::{snapshot, AutoStartState};
+
     let rows: Vec<(&str, bool)> = ctx
         .channels_summary
         .iter()
         .map(|(n, c)| (n.as_str(), *c))
         .collect();
-    let active_count = ctx.channels_autostart_count;
 
     let mut out = String::new();
     out.push_str("Channels (transports the agent can speak on):\n\n");
     out.push_str("  ✅ CLI / TUI — always available (this terminal)\n\n");
+
+    // Surface the actual auto-start state, not just "we dispatched".
+    // Pre-v0.6.6 the table reported "polling" purely because spawn was
+    // dispatched, even when start_channels errored mid-build. The user
+    // saw "polling" and assumed everything was wired; in reality the
+    // listener never made a single getUpdates call.
+    let (status_label, footer_hint) = match snapshot() {
+        AutoStartState::NotDispatched => (
+            "configured · not started in this process",
+            Some(
+                "TUI launched without auto-start (no channels were configured at startup, \
+                 or this build pre-dates v0.6.4). Restart `rantaiclaw` to pick up the \
+                 channel-start path.",
+            ),
+        ),
+        AutoStartState::Starting { since_unix } => {
+            let elapsed = now_unix().saturating_sub(since_unix);
+            if elapsed < 5 {
+                ("starting…", None)
+            } else {
+                ("running", None)
+            }
+        }
+        AutoStartState::Terminated { .. } => (
+            "stopped (dispatch loop exited)",
+            Some(
+                "The channel runtime exited cleanly. This usually means a graceful \
+                 shutdown was requested. Restart `rantaiclaw` to bring it back.",
+            ),
+        ),
+        AutoStartState::Failed { ref message, .. } => (
+            "FAILED — see error below",
+            Some(message.as_str()),
+        ),
+    };
 
     let configured: Vec<_> = rows.iter().filter(|(_, c)| *c).collect();
     let not_configured: Vec<_> = rows.iter().filter(|(_, c)| !*c).collect();
@@ -194,15 +230,7 @@ fn render_channels(ctx: &TuiContext) -> String {
     } else {
         out.push_str("  Configured:\n");
         for (name, _) in &configured {
-            // After v0.6.4 the auto-start path runs all configured
-            // channels in the same process. Status reflects that
-            // (best-effort — actual liveness probe lives in /doctor).
-            let status = if active_count > 0 {
-                "polling"
-            } else {
-                "configured (run `rantaiclaw daemon` for full mode)"
-            };
-            out.push_str(&format!("    · {name:<16} {status}\n"));
+            out.push_str(&format!("    · {name:<16} {status_label}\n"));
         }
     }
 
@@ -213,8 +241,24 @@ fn render_channels(ctx: &TuiContext) -> String {
         out.push('\n');
     }
 
-    out.push_str("\nUse `/setup channels` to add or reconfigure.\n");
+    if let Some(hint) = footer_hint {
+        out.push_str("\nNote:\n");
+        for line in hint.lines() {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+
+    out.push_str("\nLogs: `~/.rantaiclaw/logs/tui-YYYY-MM-DD.log` (search for `auto-start` and `Compiling`).\n");
+    out.push_str("Use `/setup channels` to add or reconfigure.\n");
     out
+}
+
+fn now_unix() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl CommandHandler for ChannelsCommand {

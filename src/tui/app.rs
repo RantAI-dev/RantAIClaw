@@ -3040,11 +3040,19 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         .collect();
     if configured_channels > 0 {
         let cfg_for_channels = app_config.clone();
+        crate::channels::auto_start_state::mark_starting();
         tokio::spawn(async move {
-            if let Err(e) = crate::channels::start_channels(cfg_for_channels).await {
-                tracing::warn!(
-                    "auto-start channels failed (TUI continues; channels will not respond until daemon is running separately): {e:#}"
-                );
+            match crate::channels::start_channels(cfg_for_channels).await {
+                Ok(()) => {
+                    crate::channels::auto_start_state::mark_terminated();
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    tracing::warn!(
+                        "auto-start channels failed (TUI continues; channels will not respond until daemon is running separately): {msg}"
+                    );
+                    crate::channels::auto_start_state::mark_failed(msg);
+                }
             }
         });
         app.context.channels_autostart_count = configured_channels;

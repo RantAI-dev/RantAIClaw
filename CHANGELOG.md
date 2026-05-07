@@ -5,6 +5,40 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6-alpha] — 2026-05-07
+
+Diagnostic upgrade for the channel auto-start path. Tester reported v0.6.5
+showed "polling" for Telegram in `/channels` but the bot still didn't
+reply — meaning the dispatch happened but `start_channels` either errored
+mid-build or the listener silently failed. Pre-v0.6.6 had no way for the
+user to see what went wrong; the warn was logged to a file the user
+didn't know to check.
+
+### Added
+
+- `src/channels/auto_start_state.rs` — global Mutex<AutoStartState> with
+  variants `NotDispatched`, `Starting`, `Terminated`, `Failed{message}`.
+  The TUI auto-start callback marks the state through the spawn lifecycle.
+- `/channels` now reads the snapshot and shows one of:
+  - `running` — start_channels is past the build phase and likely in the
+    dispatch loop
+  - `starting…` — within the first 5 seconds of startup
+  - `FAILED — see error below` + the formatted error chain
+  - `stopped (dispatch loop exited)`
+  - `configured · not started in this process`
+- Footer hint at the bottom of `/channels` always points at
+  `~/.rantaiclaw/logs/tui-YYYY-MM-DD.log` for full provenance.
+
+### Fixed
+
+- `/channels` no longer reports `polling` when the spawn task errored.
+  Tester report: "Telegram still not working even though it reports to
+  polling." Status was misleading; this gives an honest answer.
+
+### Compatibility
+
+- No on-disk-state changes. No new deps.
+
 ## [0.6.5-alpha] — 2026-05-07
 
 Build-pipeline fix. v0.6.3-alpha and v0.6.4-alpha binaries reported their
