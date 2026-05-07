@@ -202,6 +202,20 @@ jobs:
                   sudo apt-get update -qq
                   sudo apt-get install -y ${{ matrix.cross_compiler }}
 
+            # Force rantaiclaw recompile so CARGO_PKG_VERSION re-expands
+            # against the current Cargo.toml. Without this, Swatinem/rust-cache
+            # restores a target/ that contains a stale binary compiled with the
+            # OLD version string baked in via env!(). v0.6.3 + v0.6.4 alpha
+            # cuts both produced "rantaiclaw 0.6.2-alpha" output until this was
+            # added — the cache hit on the bumped Cargo.toml but cargo's
+            # incremental compilation didn't re-emit main.rs with the new
+            # CARGO_PKG_VERSION. We only invalidate the rantaiclaw package
+            # itself; deps stay cached.
+            - name: Force rantaiclaw recompile (CARGO_PKG_VERSION freshness)
+              shell: bash
+              run: |
+                  cargo clean --target ${{ matrix.target }} -p rantaiclaw || true
+
             - name: Build release
               shell: bash
               env:

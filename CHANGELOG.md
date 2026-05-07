@@ -5,6 +5,35 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.5-alpha] — 2026-05-07
+
+Build-pipeline fix. v0.6.3-alpha and v0.6.4-alpha binaries reported their
+version as `0.6.2-alpha` because Swatinem/rust-cache was restoring a
+target/ from a previous v0.6.2-alpha build, and cargo's incremental
+compilation didn't re-emit `main.rs` with the new `CARGO_PKG_VERSION`
+even though Cargo.toml had been bumped. The binaries were otherwise
+identical functionally — they had all the v0.6.3 + v0.6.4 fixes — but
+the version string was wrong, which testers flagged as confusing.
+
+### Fixed
+
+- **Wrong `--version` output on alpha builds** — `pub-release.yml` now
+  runs `cargo clean -p rantaiclaw --target <target>` between the cache
+  restore step and the build step. This invalidates only the
+  `rantaiclaw` package's incremental-compilation fingerprint while
+  leaving dependency builds cached, so `env!("CARGO_PKG_VERSION")`
+  re-expands fresh against the current `Cargo.toml`. Build-time impact:
+  ~30-60 sec extra on cache-warm runs (the rantaiclaw crate recompiles
+  from scratch instead of incrementally). Negligible on cache-cold
+  runs. (`.github/workflows/pub-release.yml`.)
+
+### Compatibility
+
+- **No source code changes.** This is a CI-only fix. The shipped binary
+  is functionally identical to v0.6.4-alpha; only the `--version` output
+  is corrected. If you trust your v0.6.4-alpha build is doing the right
+  thing functionally (e.g. Telegram replies), it's the same code.
+
 ## [0.6.4-alpha] — 2026-05-07
 
 Follow-up to v0.6.3-alpha tester feedback. Fixes the channel deadlock
