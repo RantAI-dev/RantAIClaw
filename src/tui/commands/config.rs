@@ -189,13 +189,14 @@ fn render_channels(ctx: &TuiContext) -> String {
     // dispatched, even when start_channels errored mid-build. The user
     // saw "polling" and assumed everything was wired; in reality the
     // listener never made a single getUpdates call.
-    let (status_label, footer_hint) = match snapshot() {
+    let (status_label, footer_hint): (&str, Option<String>) = match snapshot() {
         AutoStartState::NotDispatched => (
             "configured · not started in this process",
             Some(
                 "TUI launched without auto-start (no channels were configured at startup, \
                  or this build pre-dates v0.6.4). Restart `rantaiclaw` to pick up the \
-                 channel-start path.",
+                 channel-start path."
+                    .to_string(),
             ),
         ),
         AutoStartState::Starting { since_unix } => {
@@ -210,13 +211,14 @@ fn render_channels(ctx: &TuiContext) -> String {
             "stopped (dispatch loop exited)",
             Some(
                 "The channel runtime exited cleanly. This usually means a graceful \
-                 shutdown was requested. Restart `rantaiclaw` to bring it back.",
+                 shutdown was requested. Restart `rantaiclaw` to bring it back."
+                    .to_string(),
             ),
         ),
-        AutoStartState::Failed { ref message, .. } => (
-            "FAILED — see error below",
-            Some(message.as_str()),
-        ),
+        AutoStartState::Failed { message, .. } => {
+            // Owned String — survives past the match.
+            ("FAILED — see error below", Some(message))
+        }
     };
 
     let configured: Vec<_> = rows.iter().filter(|(_, c)| *c).collect();
