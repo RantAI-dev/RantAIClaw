@@ -86,11 +86,29 @@ impl CommandHandler for UsageCommand {
     }
 
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
-        let usage = &ctx.token_usage;
-        Ok(CommandResult::Message(format!(
-            "Token usage this session:\n  Prompt tokens: {}\n  Completion tokens: {}\n  Total tokens: {}",
-            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-        )))
+        use crate::tui::widgets::{InfoPanel, InfoSection};
+
+        let u = &ctx.token_usage;
+        let panel = InfoPanel::new("Token Usage")
+            .with_subtitle("this session")
+            .with_footer("Esc close · `/insights` for cumulative stats")
+            .section(
+                InfoSection::new("Tokens")
+                    .key_value("Prompt", u.prompt_tokens.to_string())
+                    .key_value("Completion", u.completion_tokens.to_string())
+                    .key_value("Total", u.total_tokens.to_string()),
+            )
+            .section(
+                InfoSection::new("Model")
+                    .key_value("Active", &ctx.model)
+                    .key_value(
+                        "Context window",
+                        ctx.context_window
+                            .map(|w| format!("{w} tokens"))
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    ),
+            );
+        Ok(CommandResult::OpenInfoPanel(panel))
     }
 }
 

@@ -60,7 +60,7 @@ impl CommandHandler for SkillsCommand {
             "Skills",
             items,
             None,
-            "No skills loaded. Drop a SKILL.toml in ~/.rantaiclaw/workspace/skills/<name>/.",
+            "No skills loaded. Drop a SKILL.md in ~/.rantaiclaw/profiles/<profile>/skills/<name>/, or run `/setup skills`.",
         );
         Ok(CommandResult::OpenListPicker(picker))
     }
@@ -84,33 +84,77 @@ impl CommandHandler for SkillCommand {
     }
 
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+        use crate::tui::widgets::{InfoPanel, InfoSection};
+
         let name = args.trim();
         if name.is_empty() {
-            // Same as /skills — open the picker.
-            let items = build_skill_items(&ctx.available_skills);
-            let picker = ListPicker::new(
-                ListPickerKind::Skill,
-                "Skills",
-                items,
-                None,
-                "No skills loaded. Drop a SKILL.toml in ~/.rantaiclaw/workspace/skills/<name>/.",
+            // /skill (no args) opens an InfoPanel with usage + loaded
+            // skill list. /skills opens the interactive picker. v0.6.8
+            // moves both surfaces off the chat-blob layout in favor of
+            // proper TUI panels.
+            let mut panel = InfoPanel::new("Skills")
+                .with_subtitle(format!("{} loaded", ctx.available_skills.len()))
+                .with_footer("Esc close · `/skills` opens the interactive picker");
+            if ctx.available_skills.is_empty() {
+                panel = panel.section(
+                    InfoSection::new("Loaded")
+                        .plain("No skills are loaded yet.")
+                        .plain("Run `/setup skills` to install the starter pack."),
+                );
+            } else {
+                let mut sec = InfoSection::new("Loaded");
+                for s in &ctx.available_skills {
+                    let title = if s.version.is_empty() {
+                        s.name.clone()
+                    } else {
+                        format!("{} · v{}", s.name, s.version)
+                    };
+                    if s.description.is_empty() {
+                        sec = sec.bullet(title);
+                    } else {
+                        sec = sec.bullet_with(title, s.description.clone());
+                    }
+                }
+                panel = panel.section(sec);
+            }
+            panel = panel.section(
+                InfoSection::new("Usage")
+                    .key_value("/skill <name>", "show metadata for a skill")
+                    .key_value("/skills", "interactive picker (search + select)"),
             );
-            return Ok(CommandResult::OpenListPicker(picker));
+            return Ok(CommandResult::OpenInfoPanel(panel));
         }
 
-        // With a name arg, find it in the loaded list and surface a
-        // helpful message. The actual "invoke" lives in the picker
-        // selection handler so both /skill <name> and the picker share
-        // the same activation path.
+        // With a name arg, find it and render its detail in an InfoPanel.
         let found = ctx
             .available_skills
             .iter()
             .find(|s| s.name.eq_ignore_ascii_case(name));
         match found {
-            Some(s) => Ok(CommandResult::Message(format!(
-                "Skill '{}' (v{})\n  {}\nType /skill to open the picker, or just describe what you want and the agent will use this skill.",
-                s.name, s.version, s.description
-            ))),
+            Some(s) => {
+                let mut panel = InfoPanel::new(format!("Skill · {}", s.name))
+                    .with_subtitle(if s.version.is_empty() {
+                        "no version".to_string()
+                    } else {
+                        format!("v{}", s.version)
+                    })
+                    .with_footer("Esc close · `/skills` for full picker");
+                let mut sec = InfoSection::new("Detail");
+                if !s.description.is_empty() {
+                    sec = sec.plain(s.description.clone());
+                }
+                if !s.tags.is_empty() {
+                    sec = sec.spacer().key_value("Tags", s.tags.join(", "));
+                }
+                panel = panel.section(sec).section(
+                    InfoSection::new("Activate")
+                        .plain(
+                            "Describe what you want and the agent will use this \
+                             skill — e.g. `summarize today's standup notes`.",
+                        ),
+                );
+                Ok(CommandResult::OpenInfoPanel(panel))
+            }
             None => Ok(CommandResult::Message(format!(
                 "No skill named '{name}'. Run /skills to browse the loaded list."
             ))),
@@ -143,19 +187,53 @@ impl CommandHandler for PersonalityCommand {
             )));
         }
 
+        // v0.6.8: read the active persona from `<profile>/persona/persona.toml`
+        // so the picker (a) opens with the cursor on the current preset and
+        // (b) annotates that row with `· current` so the user can tell at a
+        // glance what's loaded — pre-v0.6.8 the picker hardcoded `Some("default")`
+        // as preselect even when the actual persona was something else.
+        //
+        // Note: `PresetId::slug()` uses snake_case (`concise_pro`,
+        // `friendly_companion`) while the picker keys here use kebab-case
+        // (`friendly-companion`). Match by lowercasing + normalizing `_`
+        // to `-`. The picker also has `concise` and `verbose` keys with
+        // no exact PresetId mapping; those rows just won't get the
+        // `· current` marker, which is acceptable.
+        let active_preset_slug = {
+            let profile = crate::profile::ProfileManager::active().ok();
+            profile.and_then(|p| {
+                crate::persona::read_persona_toml(&p)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.preset.slug().replace('_', "-").to_string())
+            })
+        };
+
         let items: Vec<ListPickerItem> = PERSONALITY_PRESETS
             .iter()
-            .map(|(key, summary)| ListPickerItem {
-                key: (*key).to_string(),
-                primary: (*key).to_string(),
-                secondary: (*summary).to_string(),
+            .map(|(key, summary)| {
+                let is_current = active_preset_slug
+                    .as_deref()
+                    .map(|p| p == *key)
+                    .unwrap_or(false);
+                let secondary = if is_current {
+                    format!("{summary}  · current")
+                } else {
+                    (*summary).to_string()
+                };
+                ListPickerItem {
+                    key: (*key).to_string(),
+                    primary: (*key).to_string(),
+                    secondary,
+                }
             })
             .collect();
+        let preselect = active_preset_slug.as_deref().or(Some("default"));
         let picker = ListPicker::new(
             ListPickerKind::Personality,
             "Personality",
             items,
-            Some("default"),
+            preselect,
             "No personality presets registered.",
         );
         Ok(CommandResult::OpenListPicker(picker))
@@ -179,15 +257,52 @@ impl CommandHandler for InsightsCommand {
     }
 
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+        use crate::tui::widgets::{InfoPanel, InfoSection};
+
         let sessions = ctx.session_store.list_sessions(100)?;
         let total_sessions = sessions.len();
         let total_messages: i64 = sessions.iter().map(|s| s.message_count).sum();
         let current_messages = ctx.messages.len();
+        let avg_per_session = if total_sessions > 0 {
+            (total_messages as f64) / (total_sessions as f64)
+        } else {
+            0.0
+        };
+        let session_age = ctx.started_at.elapsed();
+        let age_label = format_duration(session_age);
 
-        Ok(CommandResult::Message(format!(
-            "Session insights:\n  Total sessions: {}\n  Total messages: {}\n  Current session messages: {}",
-            total_sessions, total_messages, current_messages
-        )))
+        let panel = InfoPanel::new("Insights")
+            .with_subtitle("session + message stats")
+            .with_footer("Esc close · `/usage` for token-level breakdown")
+            .section(
+                InfoSection::new("Sessions")
+                    .key_value("Total", total_sessions.to_string())
+                    .key_value("Current age", age_label),
+            )
+            .section(
+                InfoSection::new("Messages")
+                    .key_value("Total", total_messages.to_string())
+                    .key_value("This session", current_messages.to_string())
+                    .key_value("Per session avg", format!("{:.1}", avg_per_session)),
+            )
+            .section(
+                InfoSection::new("Tokens (this session)")
+                    .key_value("Prompt", ctx.token_usage.prompt_tokens.to_string())
+                    .key_value("Completion", ctx.token_usage.completion_tokens.to_string())
+                    .key_value("Total", ctx.token_usage.total_tokens.to_string()),
+            );
+        Ok(CommandResult::OpenInfoPanel(panel))
+    }
+}
+
+fn format_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
     }
 }
 

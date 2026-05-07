@@ -3179,7 +3179,7 @@ async fn resolve_runtime_config_dirs(
     ))
 }
 
-fn decrypt_optional_secret(
+pub(crate) fn decrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
     field_name: &str,

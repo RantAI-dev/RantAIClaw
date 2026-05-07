@@ -334,6 +334,17 @@ impl ListPicker {
         match self.focus {
             Focus::Search => {}
             Focus::List | Focus::Category => {
+                // v0.6.8: at the first item of a page that's not the
+                // first page, move to the last item of the previous
+                // page (mirror of the cross-page move_down). On page 0
+                // the existing "back to search" behavior is preserved.
+                if self.selected == 0 && self.page > 0 {
+                    self.page -= 1;
+                    let prev_len = self.page_indices().len();
+                    self.selected = prev_len.saturating_sub(1);
+                    self.list_state.select(Some(self.selected));
+                    return;
+                }
                 if self.selected == 0 {
                     self.focus = Focus::Search;
                 } else {
@@ -362,7 +373,25 @@ impl ListPicker {
                 self.list_state.select(Some(self.selected));
             }
             Focus::List | Focus::Category => {
-                self.selected = (self.selected + 1) % len;
+                // v0.6.8: at the last item of the current page, advance
+                // to the next page instead of wrapping to top of same
+                // page. Tester report (bug-hunt round 2): "user should
+                // be able to scroll down" — they pressed ↓ at item 3/3
+                // expecting more items, got page-1 row 1 instead of
+                // page-2 row 1. Cross-page traversal matches every
+                // other list-style TUI dialect.
+                if self.selected + 1 >= len {
+                    if self.page + 1 < self.page_count() {
+                        self.page += 1;
+                        self.selected = 0;
+                    } else {
+                        // Already on last item of last page — keep
+                        // wrap-to-top behavior for cyclic browsing.
+                        self.selected = 0;
+                    }
+                } else {
+                    self.selected += 1;
+                }
                 self.list_state.select(Some(self.selected));
             }
         }

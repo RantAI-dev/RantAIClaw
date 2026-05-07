@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod auto_start_state;
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
@@ -1320,10 +1321,17 @@ async fn process_channel_message(
         return;
     }
 
-    println!(
-        "  💬 [{}] from {}: {}",
-        msg.channel,
-        msg.sender,
+    // Pre-v0.6.7 used `println!` here, which leaks into the TUI's
+    // alt-screen and corrupts rendering when channels are auto-started
+    // alongside `rantaiclaw` (see screenshot in v0.6.6 tester report:
+    // "[telegram] from sulthannauval: can you help me here?" appearing
+    // in the local chat surface). Tracing routes to the log file in TUI
+    // mode and to whatever subscriber daemon mode installs — operator
+    // can `RUST_LOG=info` + tail the log file.
+    tracing::info!(
+        channel = %msg.channel,
+        sender = %msg.sender,
+        "channel message received: {}",
         truncate_with_ellipsis(&msg.content, 80)
     );
 
@@ -1370,7 +1378,7 @@ async fn process_channel_message(
             .await;
     }
 
-    println!("  ⏳ Processing message...");
+    tracing::info!("processing channel message");
     let started_at = Instant::now();
 
     let had_prior_history = ctx
@@ -1559,9 +1567,9 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
-            println!(
-                "  🤖 Reply ({}ms): {}",
-                started_at.elapsed().as_millis(),
+            tracing::info!(
+                ms = started_at.elapsed().as_millis() as u64,
+                "channel reply: {}",
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
@@ -1585,7 +1593,7 @@ async fn process_channel_message(
                     )
                     .await
                 {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                    tracing::error!(channel = %channel.name(), "failed to reply: {e}");
                 }
             }
         }

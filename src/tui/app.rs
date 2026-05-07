@@ -85,6 +85,11 @@ pub struct TuiApp {
     /// `ListPicker.kind` tag tells the Enter handler what to do with the
     /// selected key. `None` when no picker is open.
     pub list_picker: Option<super::widgets::ListPicker>,
+    /// Read-only info panel (channels / config / doctor / insights / status
+    /// / usage / skill). Mutually exclusive with `list_picker` and
+    /// `setup_overlay` — the key handler refuses to open one while another
+    /// modal is up. v0.6.8 introduced this surface.
+    pub info_panel: Option<super::widgets::InfoPanel>,
     /// Inline-mode scrollback queue. The event loop drains this list
     /// before each frame and emits each entry into the terminal's native
     /// scrollback above the viewport. Each entry is `(role, content)`.
@@ -198,6 +203,7 @@ impl TuiApp {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
@@ -319,6 +325,41 @@ impl TuiApp {
                 // Picker open — swallow everything else.
                 return Ok(EventResult::Continue);
             }
+            // Info panel active — read-only modal, so the keymap is just
+            // scroll + close. Mirrors the list_picker pattern so the user
+            // doesn't have to learn two modal-key dialects.
+            KeyCode::Up if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.scroll_up();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Down if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.scroll_down();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::PageUp if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.page_up();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::PageDown if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.page_down();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Esc if self.info_panel.is_some() => {
+                self.info_panel = None;
+                return Ok(EventResult::Continue);
+            }
+            _ if self.info_panel.is_some() => {
+                // Info panel open — swallow everything else (read-only).
+                return Ok(EventResult::Continue);
+            }
             // Tab — completes the highlighted command from the dropdown.
             // Always wins over the cycling-tabs handler when typing a
             // slash command (the autocomplete is visible only then).
@@ -339,6 +380,26 @@ impl TuiApp {
             // (which owns the Terminal); we just raise a flag here.
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.editor_request = true;
+            }
+            // Ctrl+B — back. While the first-run wizard is open, walk the
+            // phase history one step back. Skips RunningProvisioner phases
+            // (those wrote to config; rewinding mid-task isn't safe). The
+            // user can Esc + re-run a section if they need to redo a
+            // required step. Tester ask: "please the back button should
+            // avail" (bugs-123 page 3).
+            KeyCode::Char('b')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.first_run_wizard.is_some() =>
+            {
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    if w.back() {
+                        // History pop succeeded — clear any stale picker
+                        // state so the destination phase re-initializes
+                        // cleanly on next render.
+                        w.picker = None;
+                        w.picker_names.clear();
+                    }
+                }
             }
             // Plain Enter — Hermes / Claude Code convention:
             //   * If the autocomplete dropdown is visible and the highlighted
@@ -874,6 +935,51 @@ impl TuiApp {
         // loaded — without this, the next config.save() bails with
         // "Config path must have a parent directory".
         config.config_path = path.clone();
+        // Decrypt secrets before pushing to the agent. Without this the
+        // agent receives encrypted blobs in `config.api_key` and friends
+        // and every API call returns 401 "Missing Authentication header"
+        // because the request builder rejects the malformed header. This
+        // mirrors the decrypt pass that `Config::load_or_init` runs at
+        // startup; without it, `/setup provider` saves a fresh key and
+        // the running TUI immediately fails to use it.
+        let rantaiclaw_dir = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let store = crate::security::SecretStore::new(&rantaiclaw_dir, config.secrets.encrypt);
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.api_key,
+            "config.api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.composio.api_key,
+            "config.composio.api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.browser.computer_use.api_key,
+            "config.browser.computer_use.api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.web_search.brave_api_key,
+            "config.web_search.brave_api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.storage.provider.config.db_url,
+            "config.storage.provider.config.db_url",
+        )?;
+        for agent in config.agents.values_mut() {
+            crate::config::schema::decrypt_optional_secret(
+                &store,
+                &mut agent.api_key,
+                "config.agents.*.api_key",
+            )?;
+        }
+        config.apply_env_overrides();
         // Refresh the status-bar model label so the running TUI shows
         // the freshly-saved provider/model. Without this, a wizard run
         // that switches provider (e.g. openrouter → minimax) would
@@ -905,6 +1011,36 @@ impl TuiApp {
             }
         }
         self.context.available_providers = available_providers;
+        // Refresh the channels snapshot so /channels and /platforms reflect
+        // any wizard-driven add/remove since launch.
+        let prev_channels_count = count_configured_channels(&self.config);
+        self.context.channels_summary = channel_status_summary(&config)
+            .into_iter()
+            .map(|(name, configured)| (name.to_string(), configured))
+            .collect();
+        let new_channels_count = count_configured_channels(&config);
+        self.context.channels_autostart_count = new_channels_count;
+        // v0.6.7: surface the restart-needed cue when channels were added
+        // or removed mid-session. Auto-restart is a v0.6.8 deliverable —
+        // the existing `start_channels` task can't be cleanly cancelled
+        // mid-flight without leaking the supervised listener tasks. Tell
+        // the user to restart for now.
+        if new_channels_count != prev_channels_count {
+            let msg = if new_channels_count > prev_channels_count {
+                format!(
+                    "⚠ {} new channel(s) configured. Restart `rantaiclaw` to start polling them. \
+                     `/channels` shows the current state.",
+                    new_channels_count - prev_channels_count
+                )
+            } else {
+                format!(
+                    "⚠ {} channel(s) removed. Restart `rantaiclaw` for the listener(s) to stop.",
+                    prev_channels_count - new_channels_count
+                )
+            };
+            let _ = self.context.append_system_message(&msg);
+            self.scrollback_queue.push(("system".to_string(), msg));
+        }
         self.config = config.clone();
         // Push the new config to the agent actor so the next turn uses
         // the freshly-saved provider/api_key/model. Without this the
@@ -1117,6 +1253,9 @@ impl TuiApp {
             CmdResult::OpenListPicker(picker) => {
                 self.list_picker = Some(picker);
             }
+            CmdResult::OpenInfoPanel(panel) => {
+                self.info_panel = Some(panel);
+            }
             CmdResult::OpenSetupOverlay { provisioner } => {
                 if let Some(name) = provisioner {
                     if let Err(e) = self.open_setup_overlay(name) {
@@ -1199,6 +1338,14 @@ impl TuiApp {
                 );
                 let _ = self.context.append_system_message(&msg);
                 self.scrollback_queue.push(("system".to_string(), msg));
+                // Replay the loaded messages into the scrollback so the
+                // user can actually see the history. Without this, the
+                // resume just shows "Resumed session ... (N messages)"
+                // and an empty chat — the v0.6.1-alpha bug.
+                for m in &self.context.messages {
+                    self.scrollback_queue
+                        .push((m.role.clone(), m.content.clone()));
+                }
             }
             ListPickerKind::Personality => {
                 let msg = format!(
@@ -1427,6 +1574,7 @@ impl TuiApp {
             autocomplete,
             overlay,
             list_picker,
+            info_panel,
             stream_committed_chars,
             ..
         } = self;
@@ -1456,6 +1604,13 @@ impl TuiApp {
             // List picker overlay — covers the entire 6-row viewport.
             if let Some(picker) = list_picker.as_mut() {
                 picker.render(frame, area);
+            }
+
+            // Info panel overlay — read-only modal for /channels, /config,
+            // /doctor, /insights, /status, /usage, /skill (no args).
+            // Visually consistent with the list picker; same key dialect.
+            if let Some(panel) = info_panel.as_ref() {
+                panel.render(frame, area);
             }
 
             // Setup overlay — full terminal coverage while active.
@@ -1509,6 +1664,24 @@ impl TuiApp {
             let area = frame.area();
             if let Some(picker) = list_picker.as_mut() {
                 picker.render_fullscreen(frame, area);
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Fullscreen render for the read-only info panel. Mirrors the
+    /// list-picker fullscreen path so /channels, /config, /doctor, etc.
+    /// occupy the entire viewport while open and don't compete with the
+    /// chat scrollback for screen real estate.
+    pub fn render_fullscreen_info_panel(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        let TuiApp { info_panel, .. } = self;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            if let Some(panel) = info_panel.as_ref() {
+                panel.render(frame, area);
             }
         })?;
         Ok(())
@@ -2647,7 +2820,7 @@ fn run_external_editor(
     std::fs::write(&tmp_path, &app.context.input_buffer)?;
 
     // Suspend the TUI: flush, leave alt-screen if needed, drop raw mode.
-    let was_fullscreen = app.list_picker.is_some();
+    let was_fullscreen = app.list_picker.is_some() || app.info_panel.is_some();
     if was_fullscreen {
         execute!(io::stdout(), LeaveAlternateScreen)?;
     }
@@ -2777,6 +2950,71 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
 /// On exit we drop the `TuiApp` (which releases `req_tx`), giving the actor
 /// `None` from `req_rx.recv()` so it can finish its current turn and return.
 /// A bounded timeout avoids hanging shutdown if the actor is stuck.
+/// Count how many transport channels have a non-empty configuration in
+/// `config.channels_config`. Used by the TUI auto-start path to decide
+/// whether to spawn `start_channels` and by `/channels` + `/platforms`
+/// to render the active set. The CLI surface is implicit (always on)
+/// and is not counted here.
+pub(crate) fn count_configured_channels(c: &crate::config::Config) -> usize {
+    let mut n = 0;
+    let cc = &c.channels_config;
+    if cc.telegram.is_some() { n += 1; }
+    if cc.discord.is_some() { n += 1; }
+    if cc.slack.is_some() { n += 1; }
+    if cc.mattermost.is_some() { n += 1; }
+    if cc.webhook.is_some() { n += 1; }
+    if cc.imessage.is_some() { n += 1; }
+    if cc.signal.is_some() { n += 1; }
+    if cc.whatsapp.is_some() { n += 1; }
+    if cc.linq.is_some() { n += 1; }
+    if cc.nextcloud_talk.is_some() { n += 1; }
+    if cc.email.is_some() { n += 1; }
+    if cc.irc.is_some() { n += 1; }
+    if cc.dingtalk.is_some() { n += 1; }
+    #[cfg(feature = "channel-matrix")]
+    {
+        if cc.matrix.is_some() { n += 1; }
+    }
+    #[cfg(feature = "channel-lark")]
+    {
+        if cc.lark.is_some() { n += 1; }
+    }
+    n
+}
+
+/// Per-channel state for the `/channels` and `/platforms` commands.
+/// `(name, configured, transport-hint)`. `configured=true` means the
+/// channel has a config block in `config.toml`; whether it's actually
+/// polling depends on whether `channels_autostart_count > 0` was true
+/// at TUI startup.
+pub(crate) fn channel_status_summary(c: &crate::config::Config) -> Vec<(&'static str, bool)> {
+    let cc = &c.channels_config;
+    let mut rows: Vec<(&'static str, bool)> = vec![
+        ("Telegram", cc.telegram.is_some()),
+        ("Discord", cc.discord.is_some()),
+        ("Slack", cc.slack.is_some()),
+        ("WhatsApp", cc.whatsapp.is_some()),
+        ("Mattermost", cc.mattermost.is_some()),
+        ("Signal", cc.signal.is_some()),
+        ("Email", cc.email.is_some()),
+        ("IRC", cc.irc.is_some()),
+        ("DingTalk", cc.dingtalk.is_some()),
+        ("Webhook", cc.webhook.is_some()),
+        ("Linq", cc.linq.is_some()),
+        ("Nextcloud Talk", cc.nextcloud_talk.is_some()),
+        ("iMessage", cc.imessage.is_some()),
+    ];
+    #[cfg(feature = "channel-matrix")]
+    {
+        rows.push(("Matrix", cc.matrix.is_some()));
+    }
+    #[cfg(feature = "channel-lark")]
+    {
+        rows.push(("Lark / Feishu", cc.lark.is_some()));
+    }
+    rows
+}
+
 pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("TUI requires an interactive terminal (stdin is not a TTY)");
@@ -2874,6 +3112,45 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // (missing dir, malformed manifest, etc.) — never blocks startup.
     app.context.available_skills =
         crate::skills::load_skills_with_config(&app_config.workspace_dir, &app_config);
+
+    // Auto-start configured channel listeners alongside the TUI. Before
+    // v0.6.4 the TUI was a single local-chat surface — Telegram / Discord /
+    // Slack / etc. configured via the wizard would never receive messages
+    // because nothing was polling them; users had to run a separate
+    // `rantaiclaw daemon`. Tester reports surfaced this as "bot doesn't
+    // reply outside the TUI." Now bare `rantaiclaw` is the canonical
+    // multi-channel runtime: TUI owns the local terminal, channels run as
+    // a background task in the same process.
+    //
+    // Failure-mode discipline: never block the TUI on channel startup.
+    // If start_channels errors (bad token, network, missing creds), the
+    // user can still chat locally; the failure is logged + surfaced via
+    // /channels.
+    let configured_channels = count_configured_channels(&app_config);
+    app.context.channels_summary = channel_status_summary(&app_config)
+        .into_iter()
+        .map(|(name, configured)| (name.to_string(), configured))
+        .collect();
+    if configured_channels > 0 {
+        let cfg_for_channels = app_config.clone();
+        crate::channels::auto_start_state::mark_starting();
+        tokio::spawn(async move {
+            match crate::channels::start_channels(cfg_for_channels).await {
+                Ok(()) => {
+                    crate::channels::auto_start_state::mark_terminated();
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    tracing::warn!(
+                        "auto-start channels failed (TUI continues; channels will not respond until daemon is running separately): {msg}"
+                    );
+                    crate::channels::auto_start_state::mark_failed(msg);
+                }
+            }
+        });
+        app.context.channels_autostart_count = configured_channels;
+    }
+
     let mut terminal = setup_terminal()?;
 
     // Splash banner — committed once to the terminal's scrollback before
@@ -2920,6 +3197,7 @@ async fn run_loop(
         // OR slash-autocomplete dropdown visible. Edge-triggered via
         // option presence so we don't churn buffers on every keystroke.
         let want_alt = app.list_picker.is_some()
+            || app.info_panel.is_some()
             || app.autocomplete.is_visible()
             || app.setup_overlay.is_some()
             || app.first_run_wizard.is_some();
@@ -2995,6 +3273,8 @@ async fn run_loop(
                 })?;
             } else if app.list_picker.is_some() {
                 app.render_fullscreen_picker(alt_term)?;
+            } else if app.info_panel.is_some() {
+                app.render_fullscreen_info_panel(alt_term)?;
             } else {
                 app.render_fullscreen_autocomplete(alt_term)?;
             }
@@ -3144,6 +3424,7 @@ mod tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
@@ -3222,6 +3503,7 @@ mod submit_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
@@ -3313,6 +3595,7 @@ mod ctrl_c_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
@@ -3385,6 +3668,7 @@ mod drain_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
@@ -3527,6 +3811,7 @@ mod retry_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,

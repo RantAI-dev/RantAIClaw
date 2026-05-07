@@ -52,6 +52,15 @@ pub struct TuiContext {
     /// Submitted prompts in chronological order (oldest first). Used
     /// by Up/Down to recall past prompts when the input is empty or
     /// when already in history-navigation mode.
+    /// How many configured channels were dispatched to `start_channels`
+    /// when the TUI launched. Surfaced by `/channels` and `/platforms`
+    /// so the user can see whether their Telegram / Discord / etc. is
+    /// actually being polled by this process. `0` means TUI-only mode.
+    pub channels_autostart_count: usize,
+    /// Snapshot of `(name, configured)` rows at TUI startup. Used by
+    /// `/channels` and `/platforms` to render the table without needing
+    /// live access to the on-disk config. Refreshed by `reload_config`.
+    pub channels_summary: Vec<(String, bool)>,
     pub input_history: Vec<String>,
     /// Current position in history navigation, indexed from the end:
     /// `Some(0)` = most recent submission, `Some(1)` = next-most, etc.
@@ -104,6 +113,8 @@ impl TuiContext {
             available_providers: Vec::new(),
             available_skills: Vec::new(),
             available_commands: Vec::new(),
+            channels_autostart_count: 0,
+            channels_summary: Vec::new(),
             input_history: Vec::new(),
             input_history_pos: None,
             input_history_stash: None,
