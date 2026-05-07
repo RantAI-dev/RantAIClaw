@@ -5,6 +5,63 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3-alpha] — 2026-05-07
+
+Bug-fix cut driven by Sulthan + Alifia's first round of v0.6.1-alpha
+testing (`bugs-123.pdf`). Five tester-reported bugs fixed; one
+deferred (back-button navigation needs wizard rework).
+
+### Fixed
+
+- **Provider 401 immediately after `/setup provider`** — `reload_config`
+  was reading the encrypted `config.toml` and pushing it straight to
+  the agent actor without running the secret-decrypt pass that
+  `Config::load_or_init` performs at startup. The agent received an
+  encrypted blob in `config.api_key`, the HTTP request builder rejected
+  the malformed Authorization header, and OpenRouter / OpenAI
+  responded "401 Unauthorized: Missing Authentication header". Reload
+  now runs the same `decrypt_optional_secret` pass for `api_key`,
+  `composio.api_key`, `browser.computer_use.api_key`,
+  `web_search.brave_api_key`, `storage.provider.config.db_url`, and
+  every `agents.*.api_key`. (`src/tui/app.rs` `reload_config`)
+- **`/skills` shows "No skills loaded" even after the starter pack
+  installed** — v0.5.0 introduced a per-profile skills dir
+  (`<profile>/skills/`) but the loader still looked at the v0.4.x
+  workspace-level path (`<workspace>/skills/`). The bundled installer
+  + ClawHub both write to the new path; the picker was reading from
+  the old one. Loader now checks both, profile-level wins on conflict,
+  deduped by name. Empty-state hint corrected to point at the actual
+  v0.5.0+ path. (`src/skills/mod.rs` `load_workspace_skills`,
+  `src/tui/commands/skills.rs`)
+- **`/skill` and `/skills` produced identical output** — both opened
+  the same picker. `/skill` (no args) now prints usage + an inline
+  list of loaded skills; `/skills` keeps the interactive picker.
+  `/skill <name>` unchanged. (`src/tui/commands/skills.rs`)
+- **`/resume` shows "Resumed session ... (N messages)" but no
+  history** — messages were loaded into `context.messages` but never
+  pushed into the scrollback display queue. The user saw a fresh-looking
+  TUI even though the agent had the history. Resume now replays each
+  loaded message into `scrollback_queue` so the conversation actually
+  appears. (`src/tui/app.rs` `ListPickerKind::Session` arm)
+- **ClawHub install fails with 404 on auxiliary files** — a stale
+  upstream `README.md` reference in a manifest was breaking the entire
+  install. SKILL.md remains required (a skill without it is rejected
+  per the bundled-format contract); other files (README, LICENSE, etc.)
+  are now best-effort with a `tracing::warn!` on 404. (`src/skills/clawhub.rs`)
+
+### Deferred
+
+- **No back button in the wizard / setup picker** — substantial state-
+  machine work to add reverse navigation across the seven setup steps.
+  Filed as a follow-up; for now testers can `Esc` to cancel and re-run
+  the section.
+
+### Compatibility
+
+- No new deps. No on-disk-state changes vs v0.6.2-alpha.
+- Skills installed under the v0.4.x `<workspace>/skills/` layout still
+  load (back-compat path retained).
+
 ## [0.6.2-alpha] — 2026-05-06
 
 Lifecycle commands — closes the "how do I uninstall?" / "how do I update?"

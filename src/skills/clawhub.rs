@@ -265,7 +265,26 @@ async fn install_one_inner(
             version,
             urlencoding::encode(&file.path),
         );
-        let resp = fetch_with_retry(client, &file_url).await?;
+        // SKILL.md is required; auxiliary files (README.md, LICENSE, etc.)
+        // are best-effort. If the upstream manifest references a file that
+        // 404s, treat non-SKILL.md as a warning so the install still
+        // succeeds. This was the v0.6.1-alpha "Clawhub Error Install" bug
+        // — a stale README.md reference broke the entire install.
+        let is_required = file.path.eq_ignore_ascii_case("SKILL.md");
+        let resp = match fetch_with_retry(client, &file_url).await {
+            Ok(r) => r,
+            Err(e) if !is_required => {
+                tracing::warn!(
+                    "clawhub: skipping optional file {} for {}/{}: {}",
+                    file.path,
+                    slug,
+                    version,
+                    e
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let bytes = resp
             .bytes()
             .await

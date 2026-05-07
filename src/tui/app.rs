@@ -874,6 +874,51 @@ impl TuiApp {
         // loaded — without this, the next config.save() bails with
         // "Config path must have a parent directory".
         config.config_path = path.clone();
+        // Decrypt secrets before pushing to the agent. Without this the
+        // agent receives encrypted blobs in `config.api_key` and friends
+        // and every API call returns 401 "Missing Authentication header"
+        // because the request builder rejects the malformed header. This
+        // mirrors the decrypt pass that `Config::load_or_init` runs at
+        // startup; without it, `/setup provider` saves a fresh key and
+        // the running TUI immediately fails to use it.
+        let rantaiclaw_dir = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let store = crate::security::SecretStore::new(&rantaiclaw_dir, config.secrets.encrypt);
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.api_key,
+            "config.api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.composio.api_key,
+            "config.composio.api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.browser.computer_use.api_key,
+            "config.browser.computer_use.api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.web_search.brave_api_key,
+            "config.web_search.brave_api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.storage.provider.config.db_url,
+            "config.storage.provider.config.db_url",
+        )?;
+        for agent in config.agents.values_mut() {
+            crate::config::schema::decrypt_optional_secret(
+                &store,
+                &mut agent.api_key,
+                "config.agents.*.api_key",
+            )?;
+        }
+        config.apply_env_overrides();
         // Refresh the status-bar model label so the running TUI shows
         // the freshly-saved provider/model. Without this, a wizard run
         // that switches provider (e.g. openrouter → minimax) would
@@ -1199,6 +1244,14 @@ impl TuiApp {
                 );
                 let _ = self.context.append_system_message(&msg);
                 self.scrollback_queue.push(("system".to_string(), msg));
+                // Replay the loaded messages into the scrollback so the
+                // user can actually see the history. Without this, the
+                // resume just shows "Resumed session ... (N messages)"
+                // and an empty chat — the v0.6.1-alpha bug.
+                for m in &self.context.messages {
+                    self.scrollback_queue
+                        .push((m.role.clone(), m.content.clone()));
+                }
             }
             ListPickerKind::Personality => {
                 let msg = format!(

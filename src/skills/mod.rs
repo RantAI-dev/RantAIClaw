@@ -104,8 +104,35 @@ fn load_skills_with_open_skills_config(
 }
 
 fn load_workspace_skills(workspace_dir: &Path) -> Vec<Skill> {
-    let skills_dir = workspace_dir.join("skills");
-    load_skills_from_directory(&skills_dir)
+    // v0.5.0 introduced a per-profile skills dir at `<profile>/skills/`
+    // (sibling to `<profile>/workspace/`). The bundled-skills installer
+    // and ClawHub both write there. The old code path kept looking at
+    // `<workspace>/skills/` which is the v0.4.x layout — so the starter
+    // pack installs successfully but `/skills` shows "No skills loaded".
+    // Surfaced in v0.6.1-alpha tester onboarding.
+    //
+    // Look in both. Dedupe by name so a migrated install doesn't render
+    // duplicates. Profile-level wins on conflict.
+    let mut skills = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    if let Some(profile_root) = workspace_dir.parent() {
+        let profile_skills = profile_root.join("skills");
+        for s in load_skills_from_directory(&profile_skills) {
+            if seen.insert(s.name.clone()) {
+                skills.push(s);
+            }
+        }
+    }
+
+    let workspace_skills = workspace_dir.join("skills");
+    for s in load_skills_from_directory(&workspace_skills) {
+        if seen.insert(s.name.clone()) {
+            skills.push(s);
+        }
+    }
+
+    skills
 }
 
 fn load_skills_from_directory(skills_dir: &Path) -> Vec<Skill> {

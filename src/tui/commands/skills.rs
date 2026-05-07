@@ -60,7 +60,7 @@ impl CommandHandler for SkillsCommand {
             "Skills",
             items,
             None,
-            "No skills loaded. Drop a SKILL.toml in ~/.rantaiclaw/workspace/skills/<name>/.",
+            "No skills loaded. Drop a SKILL.md in ~/.rantaiclaw/profiles/<profile>/skills/<name>/, or run `/setup skills`.",
         );
         Ok(CommandResult::OpenListPicker(picker))
     }
@@ -86,16 +86,33 @@ impl CommandHandler for SkillCommand {
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let name = args.trim();
         if name.is_empty() {
-            // Same as /skills — open the picker.
-            let items = build_skill_items(&ctx.available_skills);
-            let picker = ListPicker::new(
-                ListPickerKind::Skill,
-                "Skills",
-                items,
-                None,
-                "No skills loaded. Drop a SKILL.toml in ~/.rantaiclaw/workspace/skills/<name>/.",
+            // /skill (no args) shows usage + the loaded list inline.
+            // /skills opens the interactive picker. Differentiating these
+            // two prevents the "two commands, same output" surprise that
+            // testers hit in v0.6.1-alpha — previously both opened the
+            // identical empty picker.
+            if ctx.available_skills.is_empty() {
+                return Ok(CommandResult::Message(
+                    "Usage: /skill <name>   — show metadata for a skill\n\
+                     Usage: /skills         — open the interactive picker\n\n\
+                     No skills are loaded yet. Run `/setup skills` to install \
+                     the starter pack."
+                        .to_string(),
+                ));
+            }
+            let mut out = String::from(
+                "Usage: /skill <name>   — show metadata for a skill\n\
+                 Usage: /skills         — open the interactive picker\n\n\
+                 Loaded skills:\n",
             );
-            return Ok(CommandResult::OpenListPicker(picker));
+            for s in &ctx.available_skills {
+                if s.version.is_empty() {
+                    out.push_str(&format!("  · {}\n", s.name));
+                } else {
+                    out.push_str(&format!("  · {} (v{})\n", s.name, s.version));
+                }
+            }
+            return Ok(CommandResult::Message(out));
         }
 
         // With a name arg, find it in the loaded list and surface a
