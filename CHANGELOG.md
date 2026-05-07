@@ -5,6 +5,49 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.7-alpha] — 2026-05-07
+
+Two TUI fixes from v0.6.6-alpha tester feedback. One UX gap deferred
+(ClawHub picker default selection) for v0.6.8.
+
+### Fixed
+
+- **Channel events leak into the local TUI scrollback** — every incoming
+  channel message ("[telegram] from @user: ..."), the "Processing
+  message..." progress line, every reply ("Reply (4208ms): ..."), and
+  delivery failures were `println!`/`eprintln!` to stdout. In TUI mode
+  stdout is the alt-screen, so the channel chatter corrupted the
+  rendering and exposed Telegram conversations the local user wasn't
+  meant to see. v0.6.7 routes all four through `tracing::info!` /
+  `tracing::error!` instead. Channel activity is now visible only in
+  `~/.rantaiclaw/logs/tui-YYYY-MM-DD.log`. Daemon-mode operators who
+  relied on stdout for live message tracing should now `RUST_LOG=info`
+  + tail the log file. (`src/channels/mod.rs` lines ~1324, ~1374,
+  ~1563, ~1589.)
+
+### Added
+
+- **Restart-needed cue when channels are added/removed mid-session** —
+  `reload_config` now compares channel count before vs after and pushes
+  a `⚠` system message into chat scrollback if it changed. Tester report
+  was "Telegram works only after restarting `rantaiclaw`" — true, and
+  the cue makes the requirement visible. Auto-restart of the
+  `start_channels` task is the v0.6.8 follow-up; doing it cleanly needs
+  `start_channels` to accept a cancellation token to avoid orphaning
+  supervised listener tasks.
+
+### Deferred
+
+- ClawHub picker installs 0 skills despite "✓ Installed from ClawHub"
+  banner. Picker likely defaults to nothing-selected; user pressed
+  Enter without picking. Fix is a UX adjustment in `src/onboard/section/skills.rs`
+  — either default-check top-3 skills or warn on empty selection. Will
+  land in v0.6.8.
+
+### Compatibility
+
+- No on-disk-state changes. No new deps.
+
 ## [0.6.6-alpha] — 2026-05-07
 
 Diagnostic upgrade for the channel auto-start path. Tester reported v0.6.5

@@ -972,11 +972,34 @@ impl TuiApp {
         self.context.available_providers = available_providers;
         // Refresh the channels snapshot so /channels and /platforms reflect
         // any wizard-driven add/remove since launch.
+        let prev_channels_count = count_configured_channels(&self.config);
         self.context.channels_summary = channel_status_summary(&config)
             .into_iter()
             .map(|(name, configured)| (name.to_string(), configured))
             .collect();
-        self.context.channels_autostart_count = count_configured_channels(&config);
+        let new_channels_count = count_configured_channels(&config);
+        self.context.channels_autostart_count = new_channels_count;
+        // v0.6.7: surface the restart-needed cue when channels were added
+        // or removed mid-session. Auto-restart is a v0.6.8 deliverable —
+        // the existing `start_channels` task can't be cleanly cancelled
+        // mid-flight without leaking the supervised listener tasks. Tell
+        // the user to restart for now.
+        if new_channels_count != prev_channels_count {
+            let msg = if new_channels_count > prev_channels_count {
+                format!(
+                    "⚠ {} new channel(s) configured. Restart `rantaiclaw` to start polling them. \
+                     `/channels` shows the current state.",
+                    new_channels_count - prev_channels_count
+                )
+            } else {
+                format!(
+                    "⚠ {} channel(s) removed. Restart `rantaiclaw` for the listener(s) to stop.",
+                    prev_channels_count - new_channels_count
+                )
+            };
+            let _ = self.context.append_system_message(&msg);
+            self.scrollback_queue.push(("system".to_string(), msg));
+        }
         self.config = config.clone();
         // Push the new config to the agent actor so the next turn uses
         // the freshly-saved provider/api_key/model. Without this the
