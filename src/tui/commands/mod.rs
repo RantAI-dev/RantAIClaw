@@ -34,6 +34,12 @@ pub enum CommandResult {
     /// effect to run when the user presses Enter — switch model,
     /// resume session, set personality, etc.
     OpenListPicker(crate::tui::widgets::ListPicker),
+    /// Open a read-only info panel (Up/Down scroll, Esc close). Used by
+    /// /channels, /config, /doctor, /insights, /status, /usage, /skill.
+    /// Replaces the v0.6.7-and-earlier pattern of dumping data as a
+    /// `System:` chat blob — visually inconsistent with the rest of the
+    /// TUI, per v0.6.7 tester feedback.
+    OpenInfoPanel(crate::tui::widgets::InfoPanel),
     /// Open the setup overlay. `provisioner` is `None` to show the picker
     /// of all available provisioners, or a specific name to jump straight in.
     OpenSetupOverlay {
@@ -113,7 +119,8 @@ impl CommandRegistry {
         self.register(Box::new(config::ConfigCommand));
         self.register(Box::new(config::DoctorCommand));
         self.register(Box::new(config::ChannelsCommand));
-        self.register(Box::new(config::PlatformsCommand));
+        // /platforms alias dropped in v0.6.8 — was redundant with /channels
+        // (literally the same output) per tester feedback.
         self.register(Box::new(memory::MemoryCommand));
         self.register(Box::new(memory::ForgetCommand));
         self.register(Box::new(memory::CompressCommand));

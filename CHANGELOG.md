@@ -5,6 +5,76 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.8-alpha] — 2026-05-07
+
+UI consistency cut driven by the v0.6.7 tester recommendation: *"Change
+the shitty on chat ui or infos to proper tui comp ui."* Seven info
+commands now open dedicated TUI panels instead of dumping `System:`
+chat blobs. Three picker/wizard polish fixes. One alias dropped.
+
+### Added
+
+- **`InfoPanel` widget** at `src/tui/widgets/info_panel.rs` — bordered
+  modal matching the `list_picker` visual language: sky-bold title,
+  optional subtitle, sectioned typed rows (`KeyValue` / `Status` / `Bullet`
+  / `InlineList` / `Plain` / `Spacer`), scrollable when content overflows,
+  Esc closes, ↑/↓/PgUp/PgDn scroll. Brand colors stay in sync with
+  `list_picker` and `setup_overlay` so the surfaces feel like one app.
+- New `CommandResult::OpenInfoPanel(InfoPanel)` variant; `TuiApp.info_panel`
+  field; render integration in both inline and fullscreen paths;
+  alt-screen toggle picks up the panel.
+
+### Changed
+
+- **`/channels`** — text-blob → InfoPanel. Sections: Always available /
+  Runtime (auto-start state) / Configured (per-channel status with the
+  same icon-vocabulary as `/doctor`) / Not configured (compact comma-
+  list) / Logs.
+- **`/config`** — text-blob → InfoPanel. Sections: Runtime / Persisted
+  with pointer at `~/.rantaiclaw/profiles/<active>/config.toml`.
+- **`/doctor`** — text-blob → InfoPanel + content expansion. Was
+  3 trivial checks (session store, model, TUI); now adds Channels
+  (auto-start state + each configured channel), Skills (count loaded),
+  Workspace (`~/.rantaiclaw/`, `profiles/`).
+- **`/insights`** — text-blob → InfoPanel. Sections: Sessions (total +
+  current age) / Messages (total + current + per-session avg) / Tokens
+  (this session).
+- **`/status`** — text-blob → InfoPanel. Sections: Agent / Session.
+- **`/usage`** — text-blob → InfoPanel. Sections: Tokens / Model
+  (active + context window).
+- **`/skill`** (no args) — text-blob → InfoPanel listing all loaded
+  skills with descriptions; usage hint section. `/skill <name>` opens
+  a per-skill detail panel.
+
+### Polish
+
+- **First-run wizard welcome footer**: "skip any step with Esc" → "Esc
+  to cancel". Esc on Welcome quits the wizard (there's nothing to skip
+  yet); the wording was misleading. Mid-step screens still say "skip"
+  which is correct semantics there.
+- **List picker cross-page navigation**: pressing ↓ at the last item
+  of a page now advances to the first item of the next page (and
+  symmetric for ↑ at the first item of a non-first page). Pre-v0.6.8
+  ↓ wrapped to row 1 of the same page, leaving testers stuck on
+  page 1 of 3 in the ClawHub picker without realizing PgDn was
+  required to advance.
+- **`/personality` picker** now opens on the actual current preset and
+  marks that row with `· current` in the secondary line. Pre-v0.6.8
+  the picker hardcoded `Some("default")` as the preselect, ignoring
+  whatever was actually saved in `<profile>/persona/persona.toml`.
+
+### Removed
+
+- **`/platforms` alias** — was a v0.6.4 alias for `/channels` for
+  muscle memory, but tester feedback flagged the duplicate output as
+  noise. The single canonical command is `/channels`.
+
+### Compatibility
+
+- No on-disk-state changes. No new deps.
+- `CommandResult::OpenInfoPanel(...)` is additive; existing callers
+  using `Message(...)` continue to render as inline chat lines.
+
 ## [0.6.7-alpha] — 2026-05-07
 
 Two TUI fixes from v0.6.6-alpha tester feedback. One UX gap deferred

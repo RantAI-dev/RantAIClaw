@@ -85,6 +85,11 @@ pub struct TuiApp {
     /// `ListPicker.kind` tag tells the Enter handler what to do with the
     /// selected key. `None` when no picker is open.
     pub list_picker: Option<super::widgets::ListPicker>,
+    /// Read-only info panel (channels / config / doctor / insights / status
+    /// / usage / skill). Mutually exclusive with `list_picker` and
+    /// `setup_overlay` — the key handler refuses to open one while another
+    /// modal is up. v0.6.8 introduced this surface.
+    pub info_panel: Option<super::widgets::InfoPanel>,
     /// Inline-mode scrollback queue. The event loop drains this list
     /// before each frame and emits each entry into the terminal's native
     /// scrollback above the viewport. Each entry is `(role, content)`.
@@ -198,6 +203,7 @@ impl TuiApp {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
@@ -317,6 +323,41 @@ impl TuiApp {
             }
             _ if self.list_picker.is_some() => {
                 // Picker open — swallow everything else.
+                return Ok(EventResult::Continue);
+            }
+            // Info panel active — read-only modal, so the keymap is just
+            // scroll + close. Mirrors the list_picker pattern so the user
+            // doesn't have to learn two modal-key dialects.
+            KeyCode::Up if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.scroll_up();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Down if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.scroll_down();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::PageUp if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.page_up();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::PageDown if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.page_down();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Esc if self.info_panel.is_some() => {
+                self.info_panel = None;
+                return Ok(EventResult::Continue);
+            }
+            _ if self.info_panel.is_some() => {
+                // Info panel open — swallow everything else (read-only).
                 return Ok(EventResult::Continue);
             }
             // Tab — completes the highlighted command from the dropdown.
@@ -1212,6 +1253,9 @@ impl TuiApp {
             CmdResult::OpenListPicker(picker) => {
                 self.list_picker = Some(picker);
             }
+            CmdResult::OpenInfoPanel(panel) => {
+                self.info_panel = Some(panel);
+            }
             CmdResult::OpenSetupOverlay { provisioner } => {
                 if let Some(name) = provisioner {
                     if let Err(e) = self.open_setup_overlay(name) {
@@ -1530,6 +1574,7 @@ impl TuiApp {
             autocomplete,
             overlay,
             list_picker,
+            info_panel,
             stream_committed_chars,
             ..
         } = self;
@@ -1559,6 +1604,13 @@ impl TuiApp {
             // List picker overlay — covers the entire 6-row viewport.
             if let Some(picker) = list_picker.as_mut() {
                 picker.render(frame, area);
+            }
+
+            // Info panel overlay — read-only modal for /channels, /config,
+            // /doctor, /insights, /status, /usage, /skill (no args).
+            // Visually consistent with the list picker; same key dialect.
+            if let Some(panel) = info_panel.as_ref() {
+                panel.render(frame, area);
             }
 
             // Setup overlay — full terminal coverage while active.
@@ -1612,6 +1664,24 @@ impl TuiApp {
             let area = frame.area();
             if let Some(picker) = list_picker.as_mut() {
                 picker.render_fullscreen(frame, area);
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Fullscreen render for the read-only info panel. Mirrors the
+    /// list-picker fullscreen path so /channels, /config, /doctor, etc.
+    /// occupy the entire viewport while open and don't compete with the
+    /// chat scrollback for screen real estate.
+    pub fn render_fullscreen_info_panel(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        let TuiApp { info_panel, .. } = self;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            if let Some(panel) = info_panel.as_ref() {
+                panel.render(frame, area);
             }
         })?;
         Ok(())
@@ -2750,7 +2820,7 @@ fn run_external_editor(
     std::fs::write(&tmp_path, &app.context.input_buffer)?;
 
     // Suspend the TUI: flush, leave alt-screen if needed, drop raw mode.
-    let was_fullscreen = app.list_picker.is_some();
+    let was_fullscreen = app.list_picker.is_some() || app.info_panel.is_some();
     if was_fullscreen {
         execute!(io::stdout(), LeaveAlternateScreen)?;
     }
@@ -3127,6 +3197,7 @@ async fn run_loop(
         // OR slash-autocomplete dropdown visible. Edge-triggered via
         // option presence so we don't churn buffers on every keystroke.
         let want_alt = app.list_picker.is_some()
+            || app.info_panel.is_some()
             || app.autocomplete.is_visible()
             || app.setup_overlay.is_some()
             || app.first_run_wizard.is_some();
@@ -3202,6 +3273,8 @@ async fn run_loop(
                 })?;
             } else if app.list_picker.is_some() {
                 app.render_fullscreen_picker(alt_term)?;
+            } else if app.info_panel.is_some() {
+                app.render_fullscreen_info_panel(alt_term)?;
             } else {
                 app.render_fullscreen_autocomplete(alt_term)?;
             }
@@ -3351,6 +3424,7 @@ mod tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
@@ -3429,6 +3503,7 @@ mod submit_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
@@ -3520,6 +3595,7 @@ mod ctrl_c_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
@@ -3592,6 +3668,7 @@ mod drain_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
@@ -3734,6 +3811,7 @@ mod retry_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,

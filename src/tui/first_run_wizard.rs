@@ -641,7 +641,7 @@ impl FirstRunWizard {
                     Style::default().fg(emerald).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    " to begin · skip any step with ",
+                    " to begin · ",
                     Style::default().fg(muted),
                 ),
                 Span::styled(
@@ -649,7 +649,7 @@ impl FirstRunWizard {
                     Style::default().fg(coral).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    " · resume later via /setup full",
+                    " to cancel · resume later via /setup full",
                     Style::default().fg(muted).add_modifier(Modifier::ITALIC),
                 ),
             ])),
