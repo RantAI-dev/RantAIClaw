@@ -49,6 +49,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod gateway;
 pub(crate) mod hardware;
+pub mod lifecycle;
 pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub(crate) mod identity;
