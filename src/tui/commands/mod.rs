@@ -60,6 +60,11 @@ pub enum CommandResult {
     /// new session). The string is committed to scrollback after the
     /// clear so the user sees a confirmation line on the fresh screen.
     ClearTerminal(String),
+    /// Replace the input buffer with the given text, leaving the cursor
+    /// at the end so the user can finish typing and submit. Used by the
+    /// `/<skill-name>` direct-invoke fallback to pre-fill a "Use the
+    /// <skill> skill: " prompt.
+    SetInput(String),
 }
 
 /// Pre-rendered content for the modal help overlay. Multiple "tabs" can
@@ -161,16 +166,48 @@ impl CommandRegistry {
             .unwrap_or(cmd_name.clone());
 
         if let Some(handler) = self.commands.get(&canonical_name) {
-            handler.execute(args, ctx)
-        } else {
-            Ok(CommandResult::Message(format!(
-                "Unknown command: /{}",
-                cmd_name
-            )))
+            return handler.execute(args, ctx);
         }
+
+        // Fallback: `/<skill-name> [args]` — direct skill invoke.
+        // Looks up an installed skill whose canonical name (or its
+        // dash-or-underscore-normalised form) matches `cmd_name`. If found,
+        // pre-fill the input buffer with a "Use the <name> skill: <args>"
+        // prompt the user can tweak before submitting. Mirrors Hermes'
+        // `/<skill>` shortcut without committing to broader Hermes
+        // alignment — purely a UX win on top of the existing /skills flow.
+        let normalised = |s: &str| s.to_lowercase().replace('-', "_");
+        if let Some(skill) = ctx
+            .available_skills
+            .iter()
+            .find(|s| normalised(&s.name) == normalised(&cmd_name))
+        {
+            let prefill = if args.is_empty() {
+                format!("Use the {} skill: ", skill.name)
+            } else {
+                format!("Use the {} skill: {}", skill.name, args)
+            };
+            return Ok(CommandResult::SetInput(prefill));
+        }
+
+        Ok(CommandResult::Message(format!(
+            "Unknown command: /{}",
+            cmd_name
+        )))
     }
 
     pub fn autocomplete(&self, partial: &str) -> Vec<String> {
+        self.autocomplete_with_skills(partial, &[])
+    }
+
+    /// Autocomplete that also surfaces installed skill names as
+    /// `/<skill-name>` (direct-invoke shortcut). Skills appear in
+    /// addition to built-in commands; both share alphabetical order.
+    pub fn autocomplete_with_skills(
+        &self,
+        partial: &str,
+        skills: &[crate::skills::Skill],
+    ) -> Vec<String> {
         let partial = partial.trim_start_matches('/').to_lowercase();
         let mut matches: Vec<String> = self
             .commands
@@ -185,6 +222,14 @@ impl CommandRegistry {
             }
         }
 
+        for skill in skills {
+            let key = skill.name.to_lowercase().replace('-', "_");
+            // Don't duplicate if a built-in command already covers it.
+            if !self.commands.contains_key(&key) && key.starts_with(&partial) {
+                matches.push(format!("/{}", skill.name));
+            }
+        }
+
         matches.sort();
         matches.dedup();
         matches
@@ -195,6 +240,18 @@ impl CommandRegistry {
     /// match without their canonical name also matching, and inherit the
     /// canonical command's description.
     pub fn autocomplete_with_descriptions(&self, partial: &str) -> Vec<(String, String)> {
+        self.autocomplete_with_descriptions_and_skills(partial, &[])
+    }
+
+    /// Description-flavoured autocomplete that also surfaces installed
+    /// skills as `/<skill-name>` rows.  The skill's frontmatter
+    /// description is used as the row's secondary text so the
+    /// dropdown reads the same as a built-in command.
+    pub fn autocomplete_with_descriptions_and_skills(
+        &self,
+        partial: &str,
+        skills: &[crate::skills::Skill],
+    ) -> Vec<(String, String)> {
         let partial = partial.trim_start_matches('/').to_lowercase();
         let mut out: Vec<(String, String)> = Vec::new();
 
@@ -209,6 +266,23 @@ impl CommandRegistry {
                     out.push((format!("/{alias}"), handler.description().to_string()));
                 }
             }
+        }
+
+        for skill in skills {
+            let key = skill.name.to_lowercase().replace('-', "_");
+            if self.commands.contains_key(&key) || self.aliases.contains_key(&key) {
+                continue;
+            }
+            if !key.starts_with(&partial) {
+                continue;
+            }
+            let desc = if skill.description.is_empty() {
+                format!("Invoke the `{}` skill", skill.name)
+            } else {
+                let chars: String = skill.description.chars().take(80).collect();
+                format!("[skill] {chars}")
+            };
+            out.push((format!("/{}", skill.name), desc));
         }
 
         out.sort_by(|a, b| a.0.cmp(&b.0));

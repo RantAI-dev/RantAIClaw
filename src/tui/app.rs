@@ -266,7 +266,9 @@ impl TuiApp {
     fn refresh_autocomplete(&mut self) {
         let buf = &self.context.input_buffer;
         if buf.starts_with('/') && !buf.contains(' ') && !buf.contains('\n') {
-            let suggestions = self.command_registry.autocomplete_with_descriptions(buf);
+            let suggestions = self
+                .command_registry
+                .autocomplete_with_descriptions_and_skills(buf, &self.context.available_skills);
             self.autocomplete.update(suggestions);
         } else {
             self.autocomplete.hide();
@@ -1478,6 +1480,11 @@ impl TuiApp {
                 self.clear_terminal_request = true;
                 let _ = self.context.append_system_message(&announce);
                 self.scrollback_queue.push(("system".to_string(), announce));
+            }
+            CmdResult::SetInput(text) => {
+                // Replace input buffer; cursor will land at end on next
+                // render. Used by `/<skill-name>` direct-invoke shortcut.
+                self.context.input_buffer = text;
             }
         }
         Ok(())

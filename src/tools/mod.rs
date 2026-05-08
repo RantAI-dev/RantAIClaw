@@ -212,8 +212,13 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let skill_env = compose_skill_env(root_config);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(ShellTool::with_skill_env(
+            security.clone(),
+            runtime,
+            skill_env,
+        )),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(GlobSearchTool::new(security.clone())),
@@ -389,6 +394,103 @@ pub fn all_tools_with_runtime(
     }
 
     boxed_registry_from_arcs(tool_arcs)
+}
+
+/// Build the per-skill env overlay merged onto every shell exec.
+///
+/// For each enabled skill (`[skills.entries.<name>]`), we surface:
+///
+/// * `env` table — copied verbatim onto the child process. User-controlled
+///   raw values; useful for `OPENROUTER_API_KEY = "..."` style entries.
+/// * `api_key` block — when `source = "env"` we re-export the named env
+///   var from the parent process onto the child (skill scripts often
+///   read e.g. `GEMINI_API_KEY` directly). When `source = "literal"` we
+///   set the env var to the literal `value`. The env-var name is taken
+///   from `id` (or, falling back, the upper-snake-cased skill name +
+///   "_API_KEY").
+/// * `config.*` — exposed as `RANTAICLAW_SKILL_<NAME>_<KEY>` in upper
+///   snake-case so skill scripts can read structured config without
+///   needing a YAML/TOML parser. Mirrors OpenClaw's
+///   `OPENCLAW_SKILL_<NAME>_<KEY>` convention.
+///
+/// Disabled skills (`enabled = false`) contribute nothing — gating
+/// happens at the loader, this is a cheap sanity check.
+fn compose_skill_env(config: &crate::config::Config) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+
+    for (name, entry) in &config.skills.entries {
+        if !entry.enabled {
+            continue;
+        }
+
+        // env: <key> = <value>
+        for (k, v) in &entry.env {
+            out.insert(k.clone(), v.clone());
+        }
+
+        // api_key: env-source re-export, literal-source direct set.
+        if let Some(api_key) = &entry.api_key {
+            let var_name = api_key
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("{}_API_KEY", skill_env_prefix(name)));
+            match api_key.source.as_str() {
+                "env" => {
+                    if let Ok(val) = std::env::var(&var_name) {
+                        if !val.is_empty() {
+                            out.insert(var_name, val);
+                        }
+                    }
+                }
+                "literal" => {
+                    if let Some(val) = api_key.value.clone() {
+                        out.insert(var_name, val);
+                    }
+                }
+                other => {
+                    tracing::warn!(
+                        skill = %name,
+                        source = %other,
+                        "unknown api_key.source; expected `env` or `literal`"
+                    );
+                }
+            }
+        }
+
+        // config.<key> = <value>  →  RANTAICLAW_SKILL_<NAME>_<KEY>
+        let prefix = format!("RANTAICLAW_SKILL_{}", skill_env_prefix(name));
+        for (k, v) in &entry.config {
+            let var_name = format!("{prefix}_{}", upper_snake(k));
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            out.insert(var_name, value);
+        }
+    }
+
+    out
+}
+
+/// Convert a skill slug (`weather`, `image-lab`, `multi-search-engine`)
+/// into the SCREAMING_SNAKE form used in env-var names.
+fn skill_env_prefix(slug: &str) -> String {
+    upper_snake(slug)
+}
+
+fn upper_snake(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

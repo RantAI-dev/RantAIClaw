@@ -20,11 +20,38 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    /// Per-skill env overlay merged onto every shell exec on top of
+    /// `SAFE_ENV_VARS`. Built from `[skills.entries.<n>].env`,
+    /// `.api_key`, and `.config.*` of every *enabled* skill at tool
+    /// construction time. See `compose_skill_env` in `src/tools/mod.rs`.
+    /// `OpenClaw`-parity behavior: a skill that declares
+    /// `api_key.source = "env"` and the user has set the matching
+    /// outer env var gets that value re-exported into the child
+    /// process; `config.*` values become `RANTAICLAW_SKILL_<NAME>_<KEY>`.
+    skill_env: std::collections::HashMap<String, String>,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+        Self {
+            security,
+            runtime,
+            skill_env: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Construct with a precomputed skill-env overlay. Used by
+    /// `all_tools_with_runtime` after consulting `[skills.entries]`.
+    pub fn with_skill_env(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        skill_env: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            skill_env,
+        }
     }
 }
 
@@ -115,6 +142,14 @@ impl Tool for ShellTool {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
+        }
+
+        // Per-skill env overlay (`[skills.entries.<n>]` from config). User
+        // explicitly opts in by writing values into config; this is *not*
+        // an automatic leak of process env. SAFE_ENV_VARS comes first so
+        // skills can override PATH (intentional, e.g. add brew to PATH).
+        for (k, v) in &self.skill_env {
+            cmd.env(k, v);
         }
 
         let result =
