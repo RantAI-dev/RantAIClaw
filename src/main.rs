@@ -83,6 +83,7 @@ mod providers;
 mod runtime;
 mod security;
 mod service;
+mod services;
 mod skillforge;
 mod skills;
 mod tasks;

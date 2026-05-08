@@ -167,6 +167,11 @@ pub struct Config {
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// Auto-managed external services (Docker containers, sidecars).
+    /// Deny-by-default: each service must set `auto_launch = true` explicitly (`[services]`).
+    #[serde(default)]
+    pub services: ServicesConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -1013,12 +1018,18 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo" (free, no API key), "brave" (requires API key),
+    /// or "searxng" (auto-launched via `[services.searxng]` or pointed at a custom URL).
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// SearXNG endpoint URL — only consulted when `provider = "searxng"` and
+    /// `[services.searxng] auto_launch = false`. When auto-launch is on, the
+    /// supervised container's URL takes precedence over this field.
+    #[serde(default)]
+    pub searxng_url: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
@@ -1045,8 +1056,54 @@ impl Default for WebSearchConfig {
             enabled: false,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            searxng_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+        }
+    }
+}
+
+// ── Auto-managed external services ──────────────────────────────
+
+/// Top-level container for opt-in auto-managed dependencies.
+/// Each service is `Option<...>` and absent by default — the daemon only spawns
+/// services that the user has explicitly opted into with `auto_launch = true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ServicesConfig {
+    /// SearXNG meta-search engine, run as a local Docker container.
+    /// Powers `[web_search] provider = "searxng"` without the user pasting a URL.
+    #[serde(default)]
+    pub searxng: Option<SearxngServiceConfig>,
+}
+
+/// SearXNG service launcher.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SearxngServiceConfig {
+    /// Spawn the container at daemon boot. Defaults to false — must be opted into.
+    #[serde(default)]
+    pub auto_launch: bool,
+    /// Local port on 127.0.0.1 to bind. Default 8888.
+    #[serde(default = "default_searxng_port")]
+    pub port: u16,
+    /// Docker image to run. Default `searxng/searxng:latest`.
+    #[serde(default = "default_searxng_image")]
+    pub image: String,
+}
+
+fn default_searxng_port() -> u16 {
+    8888
+}
+
+fn default_searxng_image() -> String {
+    "searxng/searxng:latest".into()
+}
+
+impl Default for SearxngServiceConfig {
+    fn default() -> Self {
+        Self {
+            auto_launch: false,
+            port: default_searxng_port(),
+            image: default_searxng_image(),
         }
     }
 }
@@ -2923,6 +2980,7 @@ impl Default for Config {
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            services: ServicesConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -4110,6 +4168,7 @@ default_temperature = 0.7
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            services: ServicesConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -4282,6 +4341,7 @@ tool_dispatcher = "xml"
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            services: ServicesConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),

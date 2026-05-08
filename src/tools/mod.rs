@@ -274,11 +274,18 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Web search tool (enabled by default for GLM and other models)
+    // Web search tool (enabled by default for GLM and other models).
+    // For provider = "searxng", the endpoint comes from the supervised
+    // service when auto-launch is on, otherwise from web_search.searxng_url.
     if root_config.web_search.enabled {
+        let searxng_url = match root_config.services.searxng.as_ref() {
+            Some(s) if s.auto_launch => Some(format!("http://127.0.0.1:{}", s.port)),
+            _ => root_config.web_search.searxng_url.clone(),
+        };
         tool_arcs.push(Arc::new(WebSearchTool::new(
             root_config.web_search.provider.clone(),
             root_config.web_search.brave_api_key.clone(),
+            searxng_url,
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
         )));

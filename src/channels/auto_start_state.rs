@@ -59,7 +59,9 @@ pub fn mark_starting() {
 
 pub fn mark_terminated() {
     let mut g = cell().lock().unwrap_or_else(|e| e.into_inner());
-    *g = AutoStartState::Terminated { at_unix: now_unix() };
+    *g = AutoStartState::Terminated {
+        at_unix: now_unix(),
+    };
     tracing::info!("auto-start: terminated");
 }
 
@@ -91,7 +93,10 @@ mod tests {
 
     #[test]
     fn default_is_not_dispatched() {
-        assert!(matches!(AutoStartState::default(), AutoStartState::NotDispatched));
+        assert!(matches!(
+            AutoStartState::default(),
+            AutoStartState::NotDispatched
+        ));
     }
 
     #[test]

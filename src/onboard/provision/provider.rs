@@ -396,7 +396,10 @@ impl TuiProvisioner for ProviderProvisioner {
             // Provider has no curated list — fall back to a single
             // "default" option so the user still has something to pick.
             let fallback = default_model_for_provider(provider_name);
-            (vec![fallback.clone()], vec![format!("{fallback} (default)")])
+            (
+                vec![fallback.clone()],
+                vec![format!("{fallback} (default)")],
+            )
         } else {
             curated
                 .into_iter()
