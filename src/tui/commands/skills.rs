@@ -393,6 +393,7 @@ mod tests {
             tools: vec![],
             prompts: vec![],
             location: None,
+            requires: Default::default(),
         });
         let result = cmd.execute("summarizer", &mut ctx).unwrap();
         match result {

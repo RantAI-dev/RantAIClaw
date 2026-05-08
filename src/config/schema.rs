@@ -445,6 +445,76 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// Per-skill configuration entries keyed by slug. Mirrors OpenClaw's
+    /// `skills.entries.<name>` JSON shape so the same skill works in
+    /// either runtime with the same config block.
+    ///
+    /// ```toml
+    /// [skills.entries.weather]
+    /// enabled = true
+    ///
+    /// [skills.entries.image-lab]
+    /// enabled = true
+    /// [skills.entries.image-lab.api_key]
+    /// source = "env"
+    /// id = "GEMINI_API_KEY"
+    /// [skills.entries.image-lab.config]
+    /// endpoint = "https://example.com"
+    /// ```
+    ///
+    /// Skills with `enabled = false` are excluded by the loader. Skills
+    /// without an entry are loaded by default (enabled). The `api_key`,
+    /// `env`, and `config` sub-tables are read by skill scripts (or
+    /// surfaced in `skills inspect`) — the loader itself only consults
+    /// `enabled`.
+    #[serde(default)]
+    pub entries: std::collections::HashMap<String, SkillEntryConfig>,
+}
+
+/// Per-skill configuration entry — OpenClaw `skills.entries.<name>` parity.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkillEntryConfig {
+    /// Whether the skill is loaded into the agent's context. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional API-key wiring. `source = "env"` resolves at run time from
+    /// the named env var; `source = "literal"` uses `value` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SkillApiKey>,
+    /// Extra environment variables to expose to the skill's scripts when
+    /// the agent shells out. Mapped onto the child process at exec time.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub env: std::collections::HashMap<String, String>,
+    /// Free-form per-skill config. Skill-specific schema; rantaiclaw does
+    /// not validate the keys. Stored as JSON values for schema-derive
+    /// compatibility — TOML deserialises seamlessly into these.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub config: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl Default for SkillEntryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            api_key: None,
+            env: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// API-key resolution shape used inside `[skills.entries.<name>.api_key]`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct SkillApiKey {
+    /// `env` (recommended) or `literal`.
+    pub source: String,
+    /// When `source = "env"`, the env var name to read. Ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// When `source = "literal"`, the API key value. **Avoid** — prefer env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).

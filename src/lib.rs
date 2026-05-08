@@ -165,6 +165,19 @@ pub(crate) enum SkillCommands {
         /// Skill name to remove
         name: String,
     },
+    /// Re-pull installed ClawHub skill(s) at their latest version
+    Update {
+        /// Specific skill slug to update; omit with --all
+        slug: Option<String>,
+        /// Update every installed skill
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show ClawHub metadata + security scan for a skill before installing
+    Inspect {
+        /// ClawHub skill slug
+        slug: String,
+    },
 }
 
 /// Migration subcommands

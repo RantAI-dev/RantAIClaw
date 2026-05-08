@@ -968,6 +968,23 @@ enum SkillCommands {
         /// Skill name
         name: String,
     },
+    /// Re-pull installed ClawHub skill(s) at their latest version.
+    /// With `--all`, updates every installed skill. With a slug, updates
+    /// just that one. Local-path / git skills are skipped (you can `git pull`
+    /// or re-install those manually).
+    Update {
+        /// Specific skill slug to update; omit with `--all` to update every skill.
+        slug: Option<String>,
+        /// Update every installed skill.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show ClawHub metadata + security scan for a skill *before* installing.
+    /// Hits ClawHub's public API; no install side-effect.
+    Inspect {
+        /// ClawHub skill slug.
+        slug: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

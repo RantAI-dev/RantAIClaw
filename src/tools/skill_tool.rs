@@ -343,6 +343,7 @@ mod tests {
             ],
             prompts: vec![],
             location: None,
+            requires: Default::default(),
         }];
         let tools = skill_tools_from_skills(&skills);
         assert_eq!(tools.len(), 2);

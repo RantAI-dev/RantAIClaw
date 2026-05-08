@@ -191,6 +191,128 @@ pub async fn search(query: &str) -> Result<Vec<ClawHubSkill>> {
         .collect())
 }
 
+/// Pretty-print a skill's ClawHub metadata + security-scan summary to
+/// stdout. Used by `rantaiclaw skills inspect <slug>` so a user can vet
+/// a skill before installing.
+pub async fn inspect_to_stdout(slug: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build reqwest client")?;
+
+    // Detail
+    let detail_url = format!("{}/skills/{}", base_url(), slug);
+    let detail: serde_json::Value = client
+        .get(&detail_url)
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("clawhub skill `{slug}` not found"))?
+        .json()
+        .await?;
+
+    let skill = detail.get("skill").unwrap_or(&detail);
+    let display = skill
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .unwrap_or(slug);
+    let summary = skill
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let stars = skill
+        .get("stats")
+        .and_then(|v| v.get("stars"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let installs = skill
+        .get("stats")
+        .and_then(|v| v.get("installsAllTime"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let latest = detail
+        .get("latestVersion")
+        .and_then(|v| v.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let owner = detail
+        .get("owner")
+        .and_then(|v| v.get("handle"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+
+    println!("{display} ({slug})  ★{stars}  installs:{installs}");
+    println!("  latest:    {latest}");
+    println!("  owner:     {owner}");
+    if !summary.is_empty() {
+        println!("  summary:   {summary}");
+    }
+
+    // Version manifest — files + security scan.
+    let version_url = format!("{}/skills/{}/versions/{}", base_url(), slug, latest);
+    let manifest: serde_json::Value = client
+        .get(&version_url)
+        .send()
+        .await?
+        .error_for_status()
+        .context("fetch version manifest")?
+        .json()
+        .await?;
+
+    let version = manifest.get("version").unwrap_or(&manifest);
+
+    if let Some(files) = version.get("files").and_then(|v| v.as_array()) {
+        println!("  files:     {} file(s)", files.len());
+        for f in files.iter().take(10) {
+            let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let size = f.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("    - {path}  ({size} bytes)");
+        }
+        if files.len() > 10 {
+            println!("    … {} more", files.len() - 10);
+        }
+    }
+
+    if let Some(security) = version.get("security") {
+        let status = security
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let warnings = security
+            .get("hasWarnings")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        println!(
+            "  security:  {status}{}",
+            if warnings { " (with warnings)" } else { "" }
+        );
+        if let Some(scanners) = security.get("scanners") {
+            for (name, body) in scanners.as_object().into_iter().flatten() {
+                let s = body.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                let v = body.get("verdict").and_then(|v| v.as_str()).unwrap_or("");
+                println!(
+                    "    - {name:<6}  {s}{}",
+                    if v.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ({v})")
+                    }
+                );
+            }
+        }
+    } else {
+        println!("  security:  (no scan info available)");
+    }
+
+    if let Some(metadata) = manifest.get("metadata").or_else(|| version.get("metadata")) {
+        if !metadata.is_null() {
+            println!("  metadata:  {}", metadata);
+        }
+    }
+
+    Ok(())
+}
+
 /// Install a batch of ClawHub skills by slug. Errors on individual slugs
 /// are logged but do not abort the batch — the function returns the slugs
 /// that successfully installed.
