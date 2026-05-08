@@ -1,7 +1,7 @@
 pub mod bundled;
 pub mod clawhub;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -408,16 +408,68 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         .unwrap_or("unknown")
         .to_string();
 
+    let frontmatter = parse_yaml_frontmatter(&content);
+    let description = frontmatter
+        .get("description")
+        .cloned()
+        .unwrap_or_else(|| extract_description(&content));
+    let version = frontmatter
+        .get("version")
+        .cloned()
+        .unwrap_or_else(|| "0.1.0".to_string());
+    let tags = frontmatter
+        .get("tags")
+        .map(|s| parse_yaml_list(s))
+        .unwrap_or_default();
+    let frontmatter_name = frontmatter.get("name").cloned();
+
     Ok(Skill {
-        name,
-        description: extract_description(&content),
-        version: "0.1.0".to_string(),
-        author: None,
-        tags: Vec::new(),
+        name: frontmatter_name.unwrap_or(name),
+        description,
+        version,
+        author: frontmatter.get("author").cloned(),
+        tags,
         tools: Vec::new(),
         prompts: vec![content],
         location: Some(path.to_path_buf()),
     })
+}
+
+/// Parse a minimal YAML frontmatter block at the top of a SKILL.md file.
+/// Recognizes the `---\nkey: value\n...\n---` shape and extracts simple
+/// scalar key/value pairs. Lists like `tags: [a, b]` are kept as the raw
+/// string (callers parse with `parse_yaml_list`). Not a full YAML parser —
+/// covers the SKILL.md frontmatter convention used by ClawHub skills.
+fn parse_yaml_frontmatter(content: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let trimmed = content.trim_start();
+    let Some(rest) = trimmed.strip_prefix("---\n").or_else(|| trimmed.strip_prefix("---\r\n"))
+    else {
+        return out;
+    };
+    let Some(end) = rest.find("\n---") else {
+        return out;
+    };
+    for line in rest[..end].lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim().to_string();
+            let value = v.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !key.is_empty() && !value.is_empty() {
+                out.insert(key, value);
+            }
+        }
+    }
+    out
+}
+
+fn parse_yaml_list(raw: &str) -> Vec<String> {
+    let s = raw.trim();
+    let inner = s.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(s);
+    inner
+        .split(',')
+        .map(|p| p.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 fn load_open_skill_md(path: &Path) -> Result<Skill> {
@@ -764,6 +816,49 @@ pub(crate) fn handle_command(
             let skills_path = skills_dir(workspace_dir);
             std::fs::create_dir_all(&skills_path)?;
 
+            // Bare slug (e.g. "weather") with no path separator and no URL
+            // scheme → try ClawHub. This mirrors the TUI `/skills install <slug>`
+            // path and keeps CLI/TUI surfaces in parity.
+            if !is_git_source(&source)
+                && !source.contains('/')
+                && !source.contains('\\')
+                && !source.starts_with('.')
+                && !source.starts_with('~')
+            {
+                let profile = crate::profile::ProfileManager::active()
+                    .context("resolve active profile for ClawHub install")?;
+                // Caller is already inside a tokio runtime (main is `#[tokio::main]`),
+                // so `Runtime::new().block_on` would panic. Spawn a fresh OS thread
+                // for an isolated runtime — the install is short, so the
+                // synchronous wait is acceptable.
+                let slug_for_thread = source.clone();
+                let profile_for_thread = profile.clone();
+                eprintln!(
+                    "  → ClawHub install: profile={} skills_dir={}",
+                    profile.name,
+                    profile.skills_dir().display()
+                );
+                let join = std::thread::spawn(move || -> Result<()> {
+                    let rt = tokio::runtime::Runtime::new()
+                        .context("build tokio runtime for clawhub install")?;
+                    rt.block_on(crate::skills::clawhub::install_one(
+                        &profile_for_thread,
+                        &slug_for_thread,
+                    ))
+                    .with_context(|| format!("install_one({slug_for_thread})"))?;
+                    Ok(())
+                });
+                let inner_result = join
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("ClawHub install thread panicked"))?;
+                inner_result.with_context(|| format!("ClawHub install of `{source}` failed"))?;
+                println!(
+                    "  {} Installed `{source}` from ClawHub.",
+                    console::style("✓").green().bold()
+                );
+                return Ok(());
+            }
+
             if is_git_source(&source) {
                 // Git clone
                 let output = std::process::Command::new("git")
@@ -855,23 +950,35 @@ pub(crate) fn handle_command(
                 anyhow::bail!("Invalid skill name: {name}");
             }
 
-            let skill_path = skills_dir(workspace_dir).join(&name);
+            let skills_root = skills_dir(workspace_dir);
+            let skill_path = skills_root.join(&name);
 
-            // Verify the resolved path is actually inside the skills directory
-            let canonical_skills = skills_dir(workspace_dir)
+            // Verify the path *itself* (not the symlink target) lives directly
+            // under <skills_root>. Pre-fix code canonicalized the symlink target
+            // and rejected legit installs whose source was outside the workspace
+            // (the common `skills install /tmp/foo` flow).
+            let canonical_skills = skills_root
                 .canonicalize()
-                .unwrap_or_else(|_| skills_dir(workspace_dir));
-            if let Ok(canonical_skill) = skill_path.canonicalize() {
-                if !canonical_skill.starts_with(&canonical_skills) {
-                    anyhow::bail!("Skill path escapes skills directory: {name}");
+                .unwrap_or_else(|_| skills_root.clone());
+            // Use `parent().canonicalize()` to verify containment without
+            // resolving a symlink target.
+            if let Some(parent) = skill_path.parent() {
+                if let Ok(canonical_parent) = parent.canonicalize() {
+                    if canonical_parent != canonical_skills {
+                        anyhow::bail!("Skill path escapes skills directory: {name}");
+                    }
                 }
             }
 
-            if !skill_path.exists() {
-                anyhow::bail!("Skill not found: {name}");
-            }
+            // Use symlink_metadata so we don't fail on dangling symlinks.
+            let meta = std::fs::symlink_metadata(&skill_path)
+                .map_err(|_| anyhow::anyhow!("Skill not found: {name}"))?;
 
-            std::fs::remove_dir_all(&skill_path)?;
+            if meta.file_type().is_symlink() {
+                std::fs::remove_file(&skill_path)?;
+            } else {
+                std::fs::remove_dir_all(&skill_path)?;
+            }
             println!(
                 "  {} Skill '{}' removed.",
                 console::style("✓").green().bold(),

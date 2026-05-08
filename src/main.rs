@@ -1597,7 +1597,27 @@ async fn main() -> Result<()> {
                 tui_config.resume_session = resume;
 
                 if let Some(msg) = message {
-                    println!("Single message mode not yet implemented: {msg}");
+                    // Single-shot path delegates to the same agent loop the
+                    // `agent -m` subcommand uses — keeps both surfaces
+                    // consistent and avoids spinning up the full TUI for a
+                    // one-shot LLM call.
+                    let model_override = if tui_config.model.is_empty() {
+                        None
+                    } else {
+                        Some(tui_config.model.clone())
+                    };
+                    let response = agent::loop_::run(
+                        config.clone(),
+                        Some(msg),
+                        None,
+                        model_override,
+                        config.default_temperature,
+                        Vec::new(),
+                    )
+                    .await?;
+                    if !response.is_empty() {
+                        println!("{response}");
+                    }
                     return Ok(());
                 }
 
@@ -2254,7 +2274,7 @@ async fn run_provisioner_headless(
     use onboard::provision::{ProvisionEvent, ProvisionIo};
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
-    let (_response_tx, response_rx) = tokio::sync::mpsc::channel(8);
+    let (response_tx, response_rx) = tokio::sync::mpsc::channel(8);
 
     let io = ProvisionIo {
         events: events_tx,
@@ -2303,16 +2323,33 @@ async fn run_provisioner_headless(
                     default,
                     secret,
                 } => {
-                    if secret {
-                        eprintln!("[headless] secret prompt '{label}' ({id}) — using default");
+                    let value = if secret {
+                        eprintln!("[headless] secret prompt '{label}' ({id}) — using empty");
+                        String::new()
                     } else if let Some(def) = default {
                         eprintln!("[headless] prompt '{label}' ({id}) — using default: {def}");
+                        def
                     } else {
-                        eprintln!("[headless] prompt '{label}' ({id}) — no default available");
-                    }
+                        eprintln!("[headless] prompt '{label}' ({id}) — no default; sending empty");
+                        String::new()
+                    };
+                    let _ = response_tx
+                        .send(onboard::provision::ProvisionResponse::Text(value))
+                        .await;
                 }
                 ProvisionEvent::Choose { id, label, .. } => {
-                    eprintln!("[headless] choose '{label}' ({id}) — skipped in headless mode");
+                    // Headless default: pick option 0 (the affirmative
+                    // / first choice). The provisioner authors order options
+                    // with the YES path first, so this gives sensible
+                    // automation behaviour. Pre-fix code skipped silently
+                    // and let the provisioner block on `recv_selection`
+                    // until the 120s timeout.
+                    eprintln!(
+                        "[headless] choose '{label}' ({id}) — defaulting to option 0"
+                    );
+                    let _ = response_tx
+                        .send(onboard::provision::ProvisionResponse::Selection(vec![0]))
+                        .await;
                 }
                 ProvisionEvent::OpenSkillInstallPicker { label } => {
                     eprintln!(

@@ -278,10 +278,17 @@ pub fn all_tools_with_runtime(
     // For provider = "searxng", the endpoint comes from the supervised
     // service when auto-launch is on, otherwise from web_search.searxng_url.
     if root_config.web_search.enabled {
-        let searxng_url = match root_config.services.searxng.as_ref() {
-            Some(s) if s.auto_launch => Some(format!("http://127.0.0.1:{}", s.port)),
-            _ => root_config.web_search.searxng_url.clone(),
-        };
+        // Explicit `web_search.searxng_url` always wins — operators who already
+        // run SearXNG on a fixed host/port shouldn't have `auto_launch=true`
+        // silently override them. Auto-launch only kicks in when no URL is set.
+        let searxng_url = root_config
+            .web_search
+            .searxng_url
+            .clone()
+            .or_else(|| match root_config.services.searxng.as_ref() {
+                Some(s) if s.auto_launch => Some(format!("http://127.0.0.1:{}", s.port)),
+                _ => None,
+            });
         tool_arcs.push(Arc::new(WebSearchTool::new(
             root_config.web_search.provider.clone(),
             root_config.web_search.brave_api_key.clone(),
