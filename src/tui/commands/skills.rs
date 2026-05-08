@@ -101,7 +101,23 @@ impl CommandHandler for SkillCommand {
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         use crate::tui::widgets::{InfoPanel, InfoSection};
 
-        let name = args.trim();
+        let trimmed = args.trim();
+
+        // `/skill install [query]` mirrors `/skills install [query]` so
+        // typing the singular doesn't fall through to the
+        // "/<skill-name>" lookup. Tester ask: "/skill should mirror
+        // /skills" — same args, same surfaces.
+        if let Some(rest) = trimmed.strip_prefix("install") {
+            let query = rest.trim();
+            let initial_query = if query.is_empty() {
+                None
+            } else {
+                Some(query.to_string())
+            };
+            return Ok(CommandResult::OpenClawhubInstallPicker { initial_query });
+        }
+
+        let name = trimmed;
         if name.is_empty() {
             // /skill (no args) — open the same interactive picker as `/skills`.
             // Pre-v0.6.23 this opened a static InfoPanel which felt out of

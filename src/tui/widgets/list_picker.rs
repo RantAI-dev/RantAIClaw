@@ -156,6 +156,13 @@ pub struct ListPicker {
     /// Category IDs that are currently collapsed. Navigation skips items
     /// in collapsed categories unless a search query is active.
     collapsed_categories: HashSet<String>,
+    /// `true` when the user has typed into the search bar but not yet
+    /// pressed Enter to fire a remote search. Only meaningful for
+    /// `ClawhubInstall` (server-side search) — surfaced as a "Press Enter
+    /// to search ClawHub" banner so users don't think the picker is
+    /// stuck. App sets this on every keystroke and clears it when the
+    /// search task is dispatched.
+    pub search_pending: bool,
 }
 
 impl ListPicker {
@@ -216,6 +223,7 @@ impl ListPicker {
             page,
             focus: Focus::Search,
             collapsed_categories: HashSet::new(),
+            search_pending: false,
         }
     }
 
@@ -256,6 +264,7 @@ impl ListPicker {
             page,
             focus: Focus::Search,
             collapsed_categories: HashSet::new(),
+            search_pending: false,
         }
     }
 
@@ -718,11 +727,21 @@ impl ListPicker {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(search_border_color));
+        // ClawHub picker hits the network on Enter, not on every
+        // keystroke — pre-fix users typed and stared at the picker
+        // wondering why nothing happened. Use a kind-aware placeholder
+        // and a "banner" (rendered just below the search box) when a
+        // pending query is sitting unsubmitted.
+        let placeholder = if self.kind == ListPickerKind::ClawhubInstall {
+            "Type query, press Enter to search ClawHub…"
+        } else {
+            "Search…"
+        };
         let search_line = if self.query.is_empty() {
             let mut spans = vec![
                 Span::styled(" 🔎 ", Style::default().fg(sky)),
                 Span::styled(
-                    "Search…",
+                    placeholder,
                     Style::default().fg(muted).add_modifier(Modifier::ITALIC),
                 ),
             ];
@@ -740,6 +759,17 @@ impl ListPicker {
             ];
             if search_focused {
                 spans.push(Span::styled("▎", Style::default().fg(coral)));
+            }
+            // Inline call-to-action when a search is pending. Renders
+            // immediately to the right of the typed query so it sits at
+            // the natural eye-line after typing.
+            if self.kind == ListPickerKind::ClawhubInstall && self.search_pending {
+                spans.push(Span::styled(
+                    "   ↵ Enter to search ClawHub",
+                    Style::default()
+                        .fg(emerald)
+                        .add_modifier(Modifier::BOLD),
+                ));
             }
             Line::from(spans)
         };

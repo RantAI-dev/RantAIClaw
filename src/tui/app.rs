@@ -428,6 +428,13 @@ impl TuiApp {
             KeyCode::Backspace if self.list_picker.is_some() => {
                 if let Some(p) = self.list_picker.as_mut() {
                     p.pop_query_char();
+                    // Mark a search as pending for the ClawHub picker so
+                    // the "↵ Enter to search ClawHub" hint shows up next
+                    // to the typed query — pre-fix users typed and saw
+                    // nothing happen, since search only fires on Enter.
+                    if p.kind == crate::tui::widgets::ListPickerKind::ClawhubInstall {
+                        p.search_pending = !p.query.is_empty();
+                    }
                 }
                 return Ok(EventResult::Continue);
             }
@@ -438,6 +445,9 @@ impl TuiApp {
             {
                 if let Some(p) = self.list_picker.as_mut() {
                     p.push_query_char(c);
+                    if p.kind == crate::tui::widgets::ListPickerKind::ClawhubInstall {
+                        p.search_pending = true;
+                    }
                 }
                 return Ok(EventResult::Continue);
             }
@@ -1670,6 +1680,11 @@ impl TuiApp {
         let Some(tx) = self.clawhub_install_results_tx.clone() else {
             return;
         };
+        // Clear the "↵ Enter to search ClawHub" hint — a search is
+        // about to fire, so the typed query is no longer pending.
+        if let Some(p) = self.list_picker.as_mut() {
+            p.search_pending = false;
+        }
         self.clawhub_install_search_version =
             self.clawhub_install_search_version.wrapping_add(1);
         let version = self.clawhub_install_search_version;
