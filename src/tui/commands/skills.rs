@@ -53,7 +53,22 @@ impl CommandHandler for SkillsCommand {
         "Browse available skills"
     }
 
-    fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+    fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+        // `/skills install [query]` is an alias for `/install [query]` so
+        // both discoverability paths reach the ClawHub browser. Anything
+        // else (no args, or args that aren't `install*`) opens the local
+        // skills picker as before.
+        let trimmed = args.trim();
+        if let Some(rest) = trimmed.strip_prefix("install") {
+            let query = rest.trim();
+            let initial_query = if query.is_empty() {
+                None
+            } else {
+                Some(query.to_string())
+            };
+            return Ok(CommandResult::OpenClawhubInstallPicker { initial_query });
+        }
+
         let items = build_skill_items(&ctx.available_skills);
         let picker = ListPicker::new(
             ListPickerKind::Skill,
@@ -159,6 +174,40 @@ impl CommandHandler for SkillCommand {
                 "No skill named '{name}'. Run /skills to browse the loaded list."
             ))),
         }
+    }
+}
+
+/// /install command — open an interactive ClawHub catalogue browser.
+/// Mirrors the `/sessions` pattern: built-in search bar + paginated list.
+/// Selecting a row installs that skill via `clawhub::install_one`.
+///
+/// Aliases:
+///   - `/install`              → open with empty search
+///   - `/install <query>`      → open with search bar pre-filled
+///   - `/skills install`       → also routed here for discoverability
+pub struct InstallCommand;
+
+impl CommandHandler for InstallCommand {
+    fn name(&self) -> &str {
+        "install"
+    }
+
+    fn description(&self) -> &str {
+        "Browse and install skills from ClawHub"
+    }
+
+    fn usage(&self) -> &str {
+        "/install [query]"
+    }
+
+    fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
+        let query = args.trim();
+        let initial_query = if query.is_empty() {
+            None
+        } else {
+            Some(query.to_string())
+        };
+        Ok(CommandResult::OpenClawhubInstallPicker { initial_query })
     }
 }
 
@@ -326,6 +375,58 @@ mod tests {
                 assert_eq!(picker.kind, crate::tui::widgets::ListPickerKind::Skill);
             }
             other => panic!("Expected OpenListPicker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skills_command_install_subcommand_routes_to_clawhub_picker() {
+        let cmd = SkillsCommand;
+        let mut ctx = test_context();
+        let result = cmd.execute("install", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenClawhubInstallPicker { initial_query } => {
+                assert!(initial_query.is_none());
+            }
+            other => panic!("Expected OpenClawhubInstallPicker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skills_command_install_with_query_passes_through() {
+        let cmd = SkillsCommand;
+        let mut ctx = test_context();
+        let result = cmd.execute("install github", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenClawhubInstallPicker { initial_query } => {
+                assert_eq!(initial_query.as_deref(), Some("github"));
+            }
+            other => panic!("Expected OpenClawhubInstallPicker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_command_no_args_opens_clawhub_picker() {
+        let cmd = InstallCommand;
+        let mut ctx = test_context();
+        let result = cmd.execute("", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenClawhubInstallPicker { initial_query } => {
+                assert!(initial_query.is_none());
+            }
+            other => panic!("Expected OpenClawhubInstallPicker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_command_with_query_opens_clawhub_picker_with_prefill() {
+        let cmd = InstallCommand;
+        let mut ctx = test_context();
+        let result = cmd.execute("self-improving", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenClawhubInstallPicker { initial_query } => {
+                assert_eq!(initial_query.as_deref(), Some("self-improving"));
+            }
+            other => panic!("Expected OpenClawhubInstallPicker, got {other:?}"),
         }
     }
 

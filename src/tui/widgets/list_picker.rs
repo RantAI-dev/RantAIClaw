@@ -35,6 +35,9 @@ pub enum ListPickerKind {
     SetupTopic,
     /// Channel-type picker opened from the Channels category.
     SetupChannel,
+    /// ClawHub install browser — opens via `/install` and `/skills install`.
+    /// Selecting a row installs that skill via `clawhub::install_one`.
+    ClawhubInstall,
 }
 
 /// One row in the picker. `key` is opaque (provider:model, session id,

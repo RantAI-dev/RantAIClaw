@@ -47,6 +47,14 @@ pub enum CommandResult {
     },
     /// Launch the first-run wizard — sequential setup covering all topics.
     OpenFirstRunWizard,
+    /// Fetch the ClawHub catalogue and open an interactive install picker.
+    /// Mirrors the `/sessions` pattern (search + paginate via ListPicker)
+    /// but fetches asynchronously since the catalogue lives on the network.
+    /// `initial_query` pre-fills the search bar — empty for `/install`,
+    /// populated for `/install <query>` invocations.
+    OpenClawhubInstallPicker {
+        initial_query: Option<String>,
+    },
     /// Wipe the terminal's visible screen + scrollback in addition to
     /// any side effect the command already performed (e.g. starting a
     /// new session). The string is committed to scrollback after the
@@ -127,6 +135,7 @@ impl CommandRegistry {
         self.register(Box::new(cron::CronCommand));
         self.register(Box::new(skills::SkillsCommand));
         self.register(Box::new(skills::SkillCommand));
+        self.register(Box::new(skills::InstallCommand));
         self.register(Box::new(skills::PersonalityCommand));
         self.register(Box::new(skills::InsightsCommand));
         self.register(Box::new(setup::SetupCommand));

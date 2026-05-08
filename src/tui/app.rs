@@ -298,7 +298,7 @@ impl TuiApp {
                 return Ok(EventResult::Continue);
             }
             KeyCode::Enter if self.list_picker.is_some() => {
-                self.dispatch_list_picker_selection();
+                self.dispatch_list_picker_selection().await;
                 return Ok(EventResult::Continue);
             }
             KeyCode::Esc if self.list_picker.is_some() => {
@@ -1311,6 +1311,9 @@ impl TuiApp {
             CmdResult::OpenFirstRunWizard => {
                 self.first_run_wizard = Some(super::FirstRunWizard::new(self.profile.clone()));
             }
+            CmdResult::OpenClawhubInstallPicker { initial_query } => {
+                self.open_clawhub_install_picker(initial_query).await;
+            }
             CmdResult::ClearTerminal(announce) => {
                 // The actual screen+scrollback wipe runs in `run_loop`
                 // (which owns the Terminal). We just raise the flag and
@@ -1330,7 +1333,7 @@ impl TuiApp {
     /// on `ListPickerKind` so each picker type runs its own side effect
     /// (switch model, resume session, set personality…). Always closes
     /// the picker afterward.
-    fn dispatch_list_picker_selection(&mut self) {
+    async fn dispatch_list_picker_selection(&mut self) {
         use super::widgets::ListPickerKind;
 
         let (kind, key) = match self
@@ -1451,7 +1454,98 @@ impl TuiApp {
                     self.scrollback_queue.push(("system".into(), msg));
                 }
             },
+            ListPickerKind::ClawhubInstall => {
+                // Network-bound; install_one is fast on cached SKILL.md
+                // (~200ms) and ~1-3s for fresh installs. Awaiting blocks
+                // the UI for that duration, which is the same UX the
+                // wizard's install_many already presents — acceptable for
+                // a deliberate user action behind an Enter press.
+                let kickoff = format!("Installing {key} from ClawHub…");
+                let _ = self.context.append_system_message(&kickoff);
+                self.scrollback_queue.push(("system".into(), kickoff));
+
+                let result = crate::skills::clawhub::install_one(&self.profile, &key).await;
+                let msg = match result {
+                    Ok(()) => format!("✓ Installed {key}. Run /skills to see it."),
+                    Err(e) => format!("✗ Install failed for {key}: {e}"),
+                };
+                let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".into(), msg));
+            }
         }
+    }
+
+    /// Fetch the ClawHub catalogue and open an interactive install picker.
+    /// Cached at 24h on disk so repeat opens are instant. Failure to
+    /// fetch surfaces as a system message rather than blocking the UI.
+    async fn open_clawhub_install_picker(&mut self, initial_query: Option<String>) {
+        use super::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+
+        // Fetch a generous catalogue slice. Server caps the listing at a
+        // few hundred; this gives the search bar enough material to work
+        // with without paying the wire cost of "give me everything".
+        let skills = match crate::skills::clawhub::list_top(500).await {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("Failed to load ClawHub catalogue: {e}");
+                let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".into(), msg));
+                return;
+            }
+        };
+
+        if skills.is_empty() {
+            let msg = "ClawHub catalogue returned no skills.".to_string();
+            let _ = self.context.append_system_message(&msg);
+            self.scrollback_queue.push(("system".into(), msg));
+            return;
+        }
+
+        // Build picker rows mirroring /sessions: `key` is the slug
+        // (used for install), `primary` is the display name + stars,
+        // `secondary` is a one-liner summary. ListPicker handles search
+        // by matching across all visible text, so search "github" finds
+        // both Github and any skill whose summary mentions GitHub.
+        let items: Vec<ListPickerItem> = skills
+            .into_iter()
+            .map(|s| {
+                let name = if s.display_name.is_empty() {
+                    s.slug.clone()
+                } else {
+                    s.display_name.clone()
+                };
+                let primary = format!("{name}  (★{})", s.stats.stars);
+                let secondary = if s.summary.is_empty() {
+                    String::new()
+                } else {
+                    let cleaned = s.summary.replace('\n', " ");
+                    let cleaned = cleaned.trim();
+                    if cleaned.chars().count() > 90 {
+                        let head: String = cleaned.chars().take(87).collect();
+                        format!("{head}…")
+                    } else {
+                        cleaned.to_string()
+                    }
+                };
+                ListPickerItem {
+                    key: s.slug,
+                    primary,
+                    secondary,
+                }
+            })
+            .collect();
+
+        let mut picker = ListPicker::new(
+            ListPickerKind::ClawhubInstall,
+            "Install Skill",
+            items,
+            None,
+            "ClawHub catalogue is empty.",
+        );
+        if let Some(q) = initial_query.as_deref() {
+            picker.query = q.to_string();
+        }
+        self.list_picker = Some(picker);
     }
 
     fn open_setup_overlay(&mut self, name: String) -> anyhow::Result<()> {
