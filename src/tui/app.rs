@@ -102,6 +102,20 @@ pub struct TuiApp {
     pub clawhub_install_results_tx: Option<
         tokio::sync::mpsc::UnboundedSender<(u64, anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>)>,
     >,
+    /// Slug currently being installed from ClawHub, plus the spinner frame
+    /// index (advanced each render tick). `None` when no install is in
+    /// flight. While `Some`, the picker title shows a Braille-spinner
+    /// "Installing …" line that animates per tick.
+    pub clawhub_install_in_progress: Option<(String, usize)>,
+    /// Completion channel for spawned ClawHub install tasks. `Ok(slug)` on
+    /// success, `Err(message)` on failure. The render loop drains this
+    /// each tick — when a result arrives, the install picker swaps to the
+    /// Skill picker (success) or its title flips to an error string
+    /// (failure).
+    pub clawhub_install_completion_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<Result<String, String>>>,
+    pub clawhub_install_completion_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<Result<String, String>>>,
     /// True while the install picker was opened from inside the first-run
     /// wizard's skills step. On picker close (Esc), we send
     /// `ProvisionResponse::InstalledSkills(installed_slugs)` back to the
@@ -233,6 +247,9 @@ impl TuiApp {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -365,71 +382,37 @@ impl TuiApp {
                         Some(s) => s,
                         None => return Ok(EventResult::Continue),
                     };
-                    // Show "Installing …" in the picker title so the user
-                    // sees feedback without having to close the overlay
-                    // and read chat. Pre-v0.6.23 install progress was
-                    // dumped to chat, which forced the user to Esc out
-                    // of the install overlay to see what happened.
-                    if let Some(p) = self.list_picker.as_mut() {
-                        p.title = format!("Installing {slug}…");
+                    if self.clawhub_install_in_progress.is_some() {
+                        // Already installing — ignore the second Enter so
+                        // we don't fire two parallel installs.
+                        return Ok(EventResult::Continue);
                     }
-                    let result =
-                        crate::skills::clawhub::install_one(&self.profile, &slug).await;
-                    if result.is_ok() {
-                        // Hot-reload the in-memory skill list so /skills
-                        // and any in-flight agent turn see the new skill
-                        // without restarting rantaiclaw.
-                        self.context.available_skills =
-                            crate::skills::load_skills_with_config(
-                                &self.config.workspace_dir,
-                                &self.config,
-                            );
-                    }
-                    if result.is_ok() && self.wizard_install_in_progress {
-                        self.wizard_installed_slugs.push(slug.clone());
-                    }
-                    match &result {
-                        Ok(()) => {
-                            // Tester ask: "throw us to the /skills (that
-                            // sees the installed skills)" after install.
-                            // Swap the ClawhubInstall picker for the
-                            // standard Skill picker, preselecting the
-                            // freshly-installed slug so it's visible.
-                            self.close_clawhub_install_picker_state();
-                            let items: Vec<crate::tui::widgets::ListPickerItem> =
-                                self.context
-                                    .available_skills
-                                    .iter()
-                                    .map(|s| {
-                                        let primary = if s.version.is_empty() {
-                                            s.name.clone()
-                                        } else {
-                                            format!("{} · v{}", s.name, s.version)
-                                        };
-                                        crate::tui::widgets::ListPickerItem {
-                                            key: s.name.clone(),
-                                            primary,
-                                            secondary: s.description.clone(),
-                                        }
-                                    })
-                                    .collect();
-                            self.list_picker = Some(crate::tui::widgets::ListPicker::new(
-                                crate::tui::widgets::ListPickerKind::Skill,
-                                format!("Skills · ✓ Installed {slug}"),
-                                items,
-                                Some(&slug),
-                                "No skills loaded.",
-                            ));
-                        }
-                        Err(e) => {
-                            // Surface the failure in the picker title so
-                            // the user can see it without leaving the
-                            // overlay. Picker stays open for retry.
-                            if let Some(p) = self.list_picker.as_mut() {
-                                p.title = format!("✗ Install failed: {e}");
-                            }
-                        }
-                    }
+                    // Spawn install in a background tokio task and return
+                    // immediately. The render loop's tick handler polls
+                    // `clawhub_install_completion_rx` each frame, advances
+                    // the spinner animation, and swaps the picker when the
+                    // install finishes.  Pre-fix code awaited install
+                    // inline, which froze the entire TUI for the whole
+                    // network round-trip — no spinner, no animation, just
+                    // instant flicker into the next picker.
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
+                    self.clawhub_install_completion_rx = Some(rx);
+                    self.clawhub_install_completion_tx = Some(tx.clone());
+                    self.clawhub_install_in_progress = Some((slug.clone(), 0));
+                    let profile = self.profile.clone();
+                    let slug_for_task = slug.clone();
+                    tokio::spawn(async move {
+                        let send = match crate::skills::clawhub::install_one(
+                            &profile,
+                            &slug_for_task,
+                        )
+                        .await
+                        {
+                            Ok(()) => Ok(slug_for_task),
+                            Err(e) => Err(format!("{e:#}")),
+                        };
+                        let _ = tx.send(send);
+                    });
                     return Ok(EventResult::Continue);
                 }
                 self.dispatch_list_picker_selection().await;
@@ -1069,6 +1052,10 @@ impl TuiApp {
         // background task. Drain on each render tick so newly-arrived
         // results land between user actions, not just after the next key.
         self.drain_clawhub_search_results();
+        // Same idea for install completion + spinner animation: advance
+        // the spinner frame and check whether the spawned install task
+        // has produced a result.
+        self.tick_clawhub_install();
         // Wizard auto-advance: when the current provisioner finishes
         // SUCCESSFULLY, close the overlay and open the next provisioner
         // (or advance to Complete if this was the last one). On
@@ -1763,6 +1750,95 @@ impl TuiApp {
             }
             Err(e) => {
                 tracing::warn!("ClawHub search failed: {e}");
+            }
+        }
+    }
+
+    /// Per-frame poll for ClawHub install progress: advances the spinner
+    /// animation (visible as the picker title) and reacts to completion
+    /// when the spawned install task posts its result. Called from
+    /// `drain_events`, which itself runs at the start of each render
+    /// frame, so the spinner advances every poll tick (~100 ms idle,
+    /// ~16 ms while streaming).
+    fn tick_clawhub_install(&mut self) {
+        // Braille-dot spinner. Same set used by `cargo`, so it's visually
+        // familiar and renders cleanly in any monospace font.
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+        let Some((slug, frame)) = self.clawhub_install_in_progress.as_mut() else {
+            return;
+        };
+
+        // Drain completion channel — only the most recent result matters
+        // (only one install can be in flight at a time, but be defensive).
+        let mut completion: Option<Result<String, String>> = None;
+        if let Some(rx) = self.clawhub_install_completion_rx.as_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                completion = Some(msg);
+            }
+        }
+
+        match completion {
+            None => {
+                // Still installing — animate the spinner.
+                *frame = (*frame + 1) % SPINNER.len();
+                let glyph = SPINNER[*frame];
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.title = format!("{glyph}  Installing {slug}…");
+                }
+            }
+            Some(Ok(installed_slug)) => {
+                // Reload skills so the new one is visible to /skills and
+                // to the next agent turn.
+                self.context.available_skills = crate::skills::load_skills_with_config(
+                    &self.config.workspace_dir,
+                    &self.config,
+                );
+                if self.wizard_install_in_progress {
+                    self.wizard_installed_slugs.push(installed_slug.clone());
+                }
+
+                // Swap the ClawhubInstall picker for the standard Skill
+                // picker, preselecting the freshly-installed slug — this
+                // is the "throw us to /skills" UX the tester asked for.
+                self.close_clawhub_install_picker_state();
+                self.clawhub_install_in_progress = None;
+                self.clawhub_install_completion_rx = None;
+                self.clawhub_install_completion_tx = None;
+                let items: Vec<crate::tui::widgets::ListPickerItem> = self
+                    .context
+                    .available_skills
+                    .iter()
+                    .map(|s| {
+                        let primary = if s.version.is_empty() {
+                            s.name.clone()
+                        } else {
+                            format!("{} · v{}", s.name, s.version)
+                        };
+                        crate::tui::widgets::ListPickerItem {
+                            key: s.name.clone(),
+                            primary,
+                            secondary: s.description.clone(),
+                        }
+                    })
+                    .collect();
+                self.list_picker = Some(crate::tui::widgets::ListPicker::new(
+                    crate::tui::widgets::ListPickerKind::Skill,
+                    format!("Skills · ✓ Installed {installed_slug}"),
+                    items,
+                    Some(&installed_slug),
+                    "No skills loaded.",
+                ));
+            }
+            Some(Err(error_msg)) => {
+                // Surface failure in the picker title; keep the overlay
+                // open so the user can pick a different slug or retry.
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.title = format!("✗ Install failed: {error_msg}");
+                }
+                self.clawhub_install_in_progress = None;
+                self.clawhub_install_completion_rx = None;
+                self.clawhub_install_completion_tx = None;
             }
         }
     }
@@ -3676,9 +3752,13 @@ async fn run_loop(
 
         // Tighten the poll interval during streaming so the live preview
         // updates fast enough to feel like word-by-word streaming. When
-        // idle, poll less aggressively to keep CPU near zero.
+        // idle, poll less aggressively to keep CPU near zero. Also tighten
+        // while a ClawHub install is in flight so the spinner animation
+        // ticks smoothly (~12 fps).
         let poll_ms = if matches!(app.state, AppState::Streaming { .. }) {
             16
+        } else if app.clawhub_install_in_progress.is_some() {
+            80
         } else {
             100
         };
@@ -3820,6 +3900,9 @@ mod tests {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -3905,6 +3988,9 @@ mod submit_tests {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4003,6 +4089,9 @@ mod ctrl_c_tests {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4082,6 +4171,9 @@ mod drain_tests {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4231,6 +4323,9 @@ mod retry_tests {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
