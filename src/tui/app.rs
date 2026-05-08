@@ -370,15 +370,23 @@ impl TuiApp {
                     self.scrollback_queue.push(("system".into(), kickoff));
                     let result =
                         crate::skills::clawhub::install_one(&self.profile, &slug).await;
+                    if result.is_ok() {
+                        // Hot-reload the in-memory skill list so /skills
+                        // and any in-flight agent turn see the new skill
+                        // without restarting rantaiclaw. Tester ask: "the
+                        // skill needs to hot reload after install".
+                        self.context.available_skills =
+                            crate::skills::load_skills_with_config(
+                                &self.config.workspace_dir,
+                                &self.config,
+                            );
+                    }
                     let msg = match &result {
-                        Ok(()) => format!("✓ Installed {slug}. /skills to see it."),
+                        Ok(()) => format!("✓ Installed {slug}. Loaded — /skills to browse."),
                         Err(e) => format!("✗ Install failed for {slug}: {e}"),
                     };
                     let _ = self.context.append_system_message(&msg);
                     self.scrollback_queue.push(("system".into(), msg));
-                    // Track installs from inside a wizard install picker
-                    // session so the wizard sees the full list when the
-                    // user closes the picker.
                     if result.is_ok() && self.wizard_install_in_progress {
                         self.wizard_installed_slugs.push(slug);
                     }
