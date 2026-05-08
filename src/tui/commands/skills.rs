@@ -177,40 +177,6 @@ impl CommandHandler for SkillCommand {
     }
 }
 
-/// /install command — open an interactive ClawHub catalogue browser.
-/// Mirrors the `/sessions` pattern: built-in search bar + paginated list.
-/// Selecting a row installs that skill via `clawhub::install_one`.
-///
-/// Aliases:
-///   - `/install`              → open with empty search
-///   - `/install <query>`      → open with search bar pre-filled
-///   - `/skills install`       → also routed here for discoverability
-pub struct InstallCommand;
-
-impl CommandHandler for InstallCommand {
-    fn name(&self) -> &str {
-        "install"
-    }
-
-    fn description(&self) -> &str {
-        "Browse and install skills from ClawHub"
-    }
-
-    fn usage(&self) -> &str {
-        "/install [query]"
-    }
-
-    fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
-        let query = args.trim();
-        let initial_query = if query.is_empty() {
-            None
-        } else {
-            Some(query.to_string())
-        };
-        Ok(CommandResult::OpenClawhubInstallPicker { initial_query })
-    }
-}
-
 /// /personality command — show or switch the agent personality
 pub struct PersonalityCommand;
 
@@ -404,31 +370,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn install_command_no_args_opens_clawhub_picker() {
-        let cmd = InstallCommand;
-        let mut ctx = test_context();
-        let result = cmd.execute("", &mut ctx).unwrap();
-        match result {
-            CommandResult::OpenClawhubInstallPicker { initial_query } => {
-                assert!(initial_query.is_none());
-            }
-            other => panic!("Expected OpenClawhubInstallPicker, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn install_command_with_query_opens_clawhub_picker_with_prefill() {
-        let cmd = InstallCommand;
-        let mut ctx = test_context();
-        let result = cmd.execute("self-improving", &mut ctx).unwrap();
-        match result {
-            CommandResult::OpenClawhubInstallPicker { initial_query } => {
-                assert_eq!(initial_query.as_deref(), Some("self-improving"));
-            }
-            other => panic!("Expected OpenClawhubInstallPicker, got {other:?}"),
-        }
-    }
 
     #[test]
     fn skill_command_with_no_args_opens_picker() {

@@ -85,6 +85,23 @@ pub struct TuiApp {
     /// `ListPicker.kind` tag tells the Enter handler what to do with the
     /// selected key. `None` when no picker is open.
     pub list_picker: Option<super::widgets::ListPicker>,
+    /// Last query we kicked off a ClawHub server-side search for. Used to
+    /// detect when the picker's query has changed since the last fetch so
+    /// we can fire a fresh `clawhub::search` and replace results live.
+    pub clawhub_install_last_query: String,
+    /// Monotonic version counter for ClawHub search tasks. Each task tags
+    /// its result with the version it was spawned for; the receiver only
+    /// applies results matching the current version, so stale completions
+    /// from rapid typing are dropped instead of overwriting newer results.
+    pub clawhub_install_search_version: u64,
+    /// Channel for ClawHub search results posted back from spawned tasks.
+    /// `None` when the install picker isn't open.
+    pub clawhub_install_results_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<(u64, anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>)>>,
+    /// Sender side of the results channel above. Cloned per spawned task.
+    pub clawhub_install_results_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<(u64, anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>)>,
+    >,
     /// Read-only info panel (channels / config / doctor / insights / status
     /// / usage / skill). Mutually exclusive with `list_picker` and
     /// `setup_overlay` — the key handler refuses to open one while another
@@ -203,6 +220,10 @@ impl TuiApp {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -242,6 +263,10 @@ impl TuiApp {
 
     /// Dispatch a key event.
     pub async fn handle_key(&mut self, key: KeyEvent) -> Result<EventResult> {
+        // Drain any pending ClawHub search results before processing the
+        // next key — late-arriving results land in the picker before the
+        // user's next action so they always see the freshest state.
+        self.drain_clawhub_search_results();
         match key.code {
             // Ctrl+D → always quit
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -303,12 +328,14 @@ impl TuiApp {
             }
             KeyCode::Esc if self.list_picker.is_some() => {
                 self.list_picker = None;
+                self.close_clawhub_install_picker_state();
                 return Ok(EventResult::Continue);
             }
             KeyCode::Backspace if self.list_picker.is_some() => {
                 if let Some(p) = self.list_picker.as_mut() {
                     p.pop_query_char();
                 }
+                self.maybe_refresh_clawhub_search();
                 return Ok(EventResult::Continue);
             }
             KeyCode::Char(c)
@@ -319,6 +346,7 @@ impl TuiApp {
                 if let Some(p) = self.list_picker.as_mut() {
                     p.push_query_char(c);
                 }
+                self.maybe_refresh_clawhub_search();
                 return Ok(EventResult::Continue);
             }
             _ if self.list_picker.is_some() => {
@@ -1344,10 +1372,12 @@ impl TuiApp {
             Some(v) => v,
             None => {
                 self.list_picker = None;
+                self.close_clawhub_install_picker_state();
                 return;
             }
         };
         self.list_picker = None;
+        self.close_clawhub_install_picker_state();
 
         match kind {
             ListPickerKind::Model => {
@@ -1475,77 +1505,171 @@ impl TuiApp {
         }
     }
 
-    /// Fetch the ClawHub catalogue and open an interactive install picker.
-    /// Cached at 24h on disk so repeat opens are instant. Failure to
-    /// fetch surfaces as a system message rather than blocking the UI.
+    /// Open the ClawHub install picker. Empty query starts with the
+    /// top-by-stars listing; once the user types in the search bar, the
+    /// picker switches to live server-side search via `clawhub::search`.
+    /// Stale results from rapid typing are dropped via a version tag.
     async fn open_clawhub_install_picker(&mut self, initial_query: Option<String>) {
-        use super::widgets::{ListPicker, ListPickerItem, ListPickerKind};
+        use super::widgets::{ListPicker, ListPickerKind};
 
-        // Fetch a generous catalogue slice. Server caps the listing at a
-        // few hundred; this gives the search bar enough material to work
-        // with without paying the wire cost of "give me everything".
-        let skills = match crate::skills::clawhub::list_top(500).await {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = format!("Failed to load ClawHub catalogue: {e}");
-                let _ = self.context.append_system_message(&msg);
-                self.scrollback_queue.push(("system".into(), msg));
-                return;
-            }
-        };
+        // Spin up the result channel before any task is spawned so the
+        // first search has somewhere to deliver to.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.clawhub_install_results_rx = Some(rx);
+        self.clawhub_install_results_tx = Some(tx);
+        self.clawhub_install_search_version = 0;
+        self.clawhub_install_last_query = String::new();
 
-        if skills.is_empty() {
-            let msg = "ClawHub catalogue returned no skills.".to_string();
-            let _ = self.context.append_system_message(&msg);
-            self.scrollback_queue.push(("system".into(), msg));
-            return;
-        }
-
-        // Build picker rows mirroring /sessions: `key` is the slug
-        // (used for install), `primary` is the display name + stars,
-        // `secondary` is a one-liner summary. ListPicker handles search
-        // by matching across all visible text, so search "github" finds
-        // both Github and any skill whose summary mentions GitHub.
-        let items: Vec<ListPickerItem> = skills
-            .into_iter()
-            .map(|s| {
-                let name = if s.display_name.is_empty() {
-                    s.slug.clone()
-                } else {
-                    s.display_name.clone()
-                };
-                let primary = format!("{name}  (★{})", s.stats.stars);
-                let secondary = if s.summary.is_empty() {
-                    String::new()
-                } else {
-                    let cleaned = s.summary.replace('\n', " ");
-                    let cleaned = cleaned.trim();
-                    if cleaned.chars().count() > 90 {
-                        let head: String = cleaned.chars().take(87).collect();
-                        format!("{head}…")
-                    } else {
-                        cleaned.to_string()
-                    }
-                };
-                ListPickerItem {
-                    key: s.slug,
-                    primary,
-                    secondary,
-                }
-            })
-            .collect();
-
+        // Open the picker empty — initial fetch lands via the channel
+        // below. Showing an empty picker for a beat is fine; it has the
+        // search bar + a "loading…" hint via empty state.
         let mut picker = ListPicker::new(
             ListPickerKind::ClawhubInstall,
             "Install Skill",
-            items,
+            Vec::new(),
             None,
-            "ClawHub catalogue is empty.",
+            "Loading ClawHub catalogue…",
         );
         if let Some(q) = initial_query.as_deref() {
             picker.query = q.to_string();
         }
+        let starting_query = picker.query.clone();
         self.list_picker = Some(picker);
+
+        // Kick off the first search. If the picker opened with an
+        // initial_query, search for that; otherwise fetch top-by-stars.
+        self.spawn_clawhub_search(&starting_query);
+    }
+
+    /// Spawn an async ClawHub fetch for the given query. Empty string
+    /// means "give me the top-by-stars listing". Each spawn bumps the
+    /// search version so older inflight tasks' results are dropped on
+    /// arrival (avoids races when the user types quickly).
+    fn spawn_clawhub_search(&mut self, query: &str) {
+        let Some(tx) = self.clawhub_install_results_tx.clone() else {
+            return;
+        };
+        self.clawhub_install_search_version =
+            self.clawhub_install_search_version.wrapping_add(1);
+        let version = self.clawhub_install_search_version;
+        let q = query.to_string();
+        tokio::spawn(async move {
+            let result = if q.trim().is_empty() {
+                crate::skills::clawhub::list_top(50).await
+            } else {
+                crate::skills::clawhub::search(&q).await
+            };
+            let _ = tx.send((version, result));
+        });
+    }
+
+    /// Drain any pending ClawHub search results and apply the latest one
+    /// matching the current search version. Called on each event loop
+    /// tick (after a key is processed) so results land before the next
+    /// render. Stale results (older versions) are silently discarded.
+    fn drain_clawhub_search_results(&mut self) {
+        use super::widgets::{ListPickerItem, ListPickerKind};
+
+        let current_version = self.clawhub_install_search_version;
+        let Some(rx) = self.clawhub_install_results_rx.as_mut() else {
+            return;
+        };
+
+        let mut latest: Option<anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>> = None;
+        while let Ok((version, result)) = rx.try_recv() {
+            if version == current_version {
+                latest = Some(result);
+            }
+        }
+
+        let Some(result) = latest else {
+            return;
+        };
+
+        let Some(picker) = self.list_picker.as_mut() else {
+            return;
+        };
+        if picker.kind != ListPickerKind::ClawhubInstall {
+            return;
+        }
+
+        match result {
+            Ok(skills) => {
+                let items: Vec<ListPickerItem> = skills
+                    .into_iter()
+                    .map(|s| {
+                        let name = if s.display_name.is_empty() {
+                            s.slug.clone()
+                        } else {
+                            s.display_name.clone()
+                        };
+                        // Listings include star counts; search results
+                        // don't (server returns score, not stats), so
+                        // omit the (★N) suffix when stars is zero to
+                        // avoid showing a misleading "0 stars" for every
+                        // search hit.
+                        let primary = if s.stats.stars > 0 {
+                            format!("{name}  (★{})", s.stats.stars)
+                        } else {
+                            name
+                        };
+                        let secondary = if s.summary.is_empty() {
+                            String::new()
+                        } else {
+                            let cleaned = s.summary.replace('\n', " ");
+                            let cleaned = cleaned.trim();
+                            if cleaned.chars().count() > 90 {
+                                let head: String = cleaned.chars().take(87).collect();
+                                format!("{head}…")
+                            } else {
+                                cleaned.to_string()
+                            }
+                        };
+                        ListPickerItem {
+                            key: s.slug,
+                            primary,
+                            secondary,
+                        }
+                    })
+                    .collect();
+                picker.set_items(items);
+            }
+            Err(e) => {
+                tracing::warn!("ClawHub search failed: {e}");
+            }
+        }
+    }
+
+    /// Detect query changes in the ClawHub install picker and re-fetch.
+    /// Called after each key event that may have mutated picker.query.
+    /// Empty query → fetch top listing; non-empty → server search.
+    fn maybe_refresh_clawhub_search(&mut self) {
+        use super::widgets::ListPickerKind;
+        let Some(picker) = self.list_picker.as_ref() else {
+            return;
+        };
+        if picker.kind != ListPickerKind::ClawhubInstall {
+            return;
+        }
+        if picker.query == self.clawhub_install_last_query {
+            return;
+        }
+        self.clawhub_install_last_query = picker.query.clone();
+        let q = self.clawhub_install_last_query.clone();
+        self.spawn_clawhub_search(&q);
+    }
+
+    /// Tear down ClawHub install picker async state. Called when the
+    /// picker closes (Enter/Esc) so any inflight task's result can't
+    /// resurrect a closed picker.
+    fn close_clawhub_install_picker_state(&mut self) {
+        self.clawhub_install_results_rx = None;
+        self.clawhub_install_results_tx = None;
+        self.clawhub_install_last_query = String::new();
+        // Don't reset version — keep it monotonic so any straggling
+        // task's send to a since-dropped tx is a no-op AND if the user
+        // reopens the picker mid-flight, fresh searches don't collide
+        // with old version numbers.
     }
 
     fn open_setup_overlay(&mut self, name: String) -> anyhow::Result<()> {
@@ -3561,6 +3685,10 @@ mod tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -3640,6 +3768,10 @@ mod submit_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -3732,6 +3864,10 @@ mod ctrl_c_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -3805,6 +3941,10 @@ mod drain_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -3948,6 +4088,10 @@ mod retry_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,

@@ -164,6 +164,22 @@ impl ListPicker {
         &self.entries
     }
 
+    /// Replace the picker's items in-place. Used by live server-side
+    /// search (e.g. ClawHub install picker): the user keeps typing in
+    /// the search bar while results stream in from the network. Resets
+    /// page/selection but preserves the query and focus so the user's
+    /// typing context isn't disturbed.
+    pub fn set_items(&mut self, items: Vec<ListPickerItem>) {
+        self.entries = items.into_iter().map(ListPickerEntry::Item).collect();
+        self.page = 0;
+        self.selected = 0;
+        if self.visible_len() == 0 {
+            self.list_state.select(None);
+        } else {
+            self.list_state.select(Some(0));
+        }
+    }
+
     pub fn new(
         kind: ListPickerKind,
         title: impl Into<String>,

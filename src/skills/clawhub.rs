@@ -139,6 +139,58 @@ pub async fn list_top(n: usize) -> Result<Vec<ClawHubSkill>> {
     Ok(listing.items.into_iter().take(n).collect())
 }
 
+/// Server-side search across the ClawHub catalogue. Hits
+/// `/api/v1/search?q=<q>&type=skill` which returns results ranked by a
+/// fuzzy-match score (covers display name, slug, summary, tags). Empty
+/// query returns an empty list — callers should fall back to `list_top`
+/// when the user hasn't typed anything yet.
+///
+/// Result entries don't include the `stats` block that listing returns,
+/// so `stars`/`downloads` will be 0 — fine, the picker labels search
+/// results by relevance, not popularity.
+pub async fn search(query: &str) -> Result<Vec<ClawHubSkill>> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let url = format!("{}/search?q={}&type=skill", base_url(), urlencoding::encode(query));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("build reqwest client")?;
+    let response = client.get(&url).send().await.context("GET clawhub search")?;
+    if !response.status().is_success() {
+        anyhow::bail!("clawhub search returned status {}", response.status());
+    }
+
+    #[derive(Deserialize)]
+    struct SearchEnvelope {
+        #[serde(default)]
+        results: Vec<SearchResult>,
+    }
+    #[derive(Deserialize)]
+    struct SearchResult {
+        slug: String,
+        #[serde(default, alias = "displayName", alias = "display_name")]
+        display_name: String,
+        #[serde(default)]
+        summary: String,
+    }
+
+    let env: SearchEnvelope = response.json().await.context("parse clawhub search response")?;
+    Ok(env
+        .results
+        .into_iter()
+        .map(|r| ClawHubSkill {
+            slug: r.slug,
+            display_name: r.display_name,
+            summary: r.summary,
+            stats: ClawHubStats::default(),
+            tags: serde_json::Value::Null,
+        })
+        .collect())
+}
+
 /// Install a batch of ClawHub skills by slug. Errors on individual slugs
 /// are logged but do not abort the batch — the function returns the slugs
 /// that successfully installed.
@@ -503,5 +555,16 @@ mod tests {
     fn verify_sha256_is_case_insensitive() {
         let upper = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
         verify_sha256(b"abc", upper).unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_returns_empty_for_blank_query() {
+        // Server-side search with blank query is a guaranteed waste of a
+        // round-trip — the function short-circuits and returns []. This
+        // is also the contract callers rely on to fall back to list_top.
+        let result = search("").await.unwrap();
+        assert!(result.is_empty());
+        let result = search("   ").await.unwrap();
+        assert!(result.is_empty());
     }
 }

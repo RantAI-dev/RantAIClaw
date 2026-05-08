@@ -135,7 +135,6 @@ impl CommandRegistry {
         self.register(Box::new(cron::CronCommand));
         self.register(Box::new(skills::SkillsCommand));
         self.register(Box::new(skills::SkillCommand));
-        self.register(Box::new(skills::InstallCommand));
         self.register(Box::new(skills::PersonalityCommand));
         self.register(Box::new(skills::InsightsCommand));
         self.register(Box::new(setup::SetupCommand));
