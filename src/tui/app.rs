@@ -1941,6 +1941,15 @@ impl TuiApp {
                 render_overlay_pane(content, frame, area);
             }
 
+            // Setup overlay — full terminal coverage while active. Drawn
+            // BEFORE the list picker so that when the wizard's skills
+            // step opens the install picker, the picker covers the
+            // overlay (ClawhubInstall hand-off path) — otherwise the
+            // user just sees the overlay's "Fetching…" log forever.
+            if let Some(overlay_state) = self.setup_overlay.as_mut() {
+                overlay_state.render(frame, area);
+            }
+
             // List picker overlay — covers the entire 6-row viewport.
             if let Some(picker) = list_picker.as_mut() {
                 picker.render(frame, area);
@@ -1951,11 +1960,6 @@ impl TuiApp {
             // Visually consistent with the list picker; same key dialect.
             if let Some(panel) = info_panel.as_ref() {
                 panel.render(frame, area);
-            }
-
-            // Setup overlay — full terminal coverage while active.
-            if let Some(overlay_state) = self.setup_overlay.as_mut() {
-                overlay_state.render(frame, area);
             }
 
             // First-run wizard — full terminal coverage, renders over everything.
