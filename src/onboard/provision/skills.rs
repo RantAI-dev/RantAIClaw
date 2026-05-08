@@ -176,6 +176,22 @@ impl TuiProvisioner for SkillsProvisioner {
                 )
                 .await?;
             } else {
+                // Compact label: "Name (★N) — first sentence". ClawHub
+                // summaries can be 300+ chars; full prose belongs on the
+                // skill detail page, not the picker. Cap at ~60 chars so
+                // each option fits one row at 100-col terminal width.
+                fn short_summary(s: &str) -> String {
+                    let cleaned = s.replace('\n', " ").trim().to_string();
+                    let head = cleaned.split('.').next().unwrap_or(&cleaned).trim();
+                    let candidate = if head.is_empty() { cleaned.as_str() } else { head };
+                    if candidate.chars().count() <= 60 {
+                        candidate.to_string()
+                    } else {
+                        let truncated: String = candidate.chars().take(57).collect();
+                        format!("{truncated}…")
+                    }
+                }
+
                 let labels: Vec<String> = top
                     .iter()
                     .map(|s| {
@@ -185,9 +201,9 @@ impl TuiProvisioner for SkillsProvisioner {
                             &s.display_name
                         };
                         if s.summary.is_empty() {
-                            format!("{}  ({} stars)", name, s.stats.stars)
+                            format!("{name}  (★{})", s.stats.stars)
                         } else {
-                            format!("{}  ({} stars) — {}", name, s.stats.stars, s.summary)
+                            format!("{name}  (★{}) — {}", s.stats.stars, short_summary(&s.summary))
                         }
                     })
                     .collect();

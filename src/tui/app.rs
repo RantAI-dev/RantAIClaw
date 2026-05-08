@@ -764,24 +764,45 @@ impl TuiApp {
                     o.scroll_down();
                 }
             }
+            // PageUp/PageDown/Home/End — when the choose picker is active,
+            // route to picker navigation (jump cursor a page at a time);
+            // otherwise scroll the log panel. Lets the user fly through
+            // long lists like ClawHub's 20-skill picker without one ↓ at
+            // a time. Tester ask: "no good pagination, user can't scroll".
             KeyCode::PageUp if self.setup_overlay.is_some() => {
                 if let Some(o) = self.setup_overlay.as_mut() {
-                    o.scroll_page_up();
+                    if o.active_choose().is_some() {
+                        o.choose_page_up();
+                    } else {
+                        o.scroll_page_up();
+                    }
                 }
             }
             KeyCode::PageDown if self.setup_overlay.is_some() => {
                 if let Some(o) = self.setup_overlay.as_mut() {
-                    o.scroll_page_down();
+                    if o.active_choose().is_some() {
+                        o.choose_page_down();
+                    } else {
+                        o.scroll_page_down();
+                    }
                 }
             }
             KeyCode::Home if self.setup_overlay.is_some() => {
                 if let Some(o) = self.setup_overlay.as_mut() {
-                    o.scroll_home();
+                    if o.active_choose().is_some() {
+                        o.choose_home();
+                    } else {
+                        o.scroll_home();
+                    }
                 }
             }
             KeyCode::End if self.setup_overlay.is_some() => {
                 if let Some(o) = self.setup_overlay.as_mut() {
-                    o.scroll_end();
+                    if o.active_choose().is_some() {
+                        o.choose_end();
+                    } else {
+                        o.scroll_end();
+                    }
                 }
             }
             // Catch-all for any other key while overlay is open — swallow.
