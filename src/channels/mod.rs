@@ -2887,8 +2887,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if !skills.is_empty() {
-        println!(
-            "  🧩 Skills:   {}",
+        tracing::info!(
+            "Skills loaded: {}",
             skills
                 .iter()
                 .map(|s| s.name.as_str())
@@ -3083,32 +3083,26 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
-        println!("No channels configured. Run `rantaiclaw onboard` to set up channels.");
+        tracing::info!("No channels configured. Run `rantaiclaw onboard` to set up channels.");
         return Ok(());
     }
 
-    println!("🦀 RantaiClaw Channel Server");
-    println!("  🤖 Model:    {model}");
     let effective_backend = memory::effective_memory_backend_name(
         &config.memory.backend,
         Some(&config.storage.provider.config),
     );
-    println!(
-        "  🧠 Memory:   {} (auto-save: {})",
+    tracing::info!(
+        "RantaiClaw Channel Server: model={} memory={} (auto-save={}) channels={}",
+        model,
         effective_backend,
-        if config.memory.auto_save { "on" } else { "off" }
-    );
-    println!(
-        "  📡 Channels: {}",
+        if config.memory.auto_save { "on" } else { "off" },
         channels
             .iter()
             .map(|c| c.name())
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!();
-    println!("  Listening for messages... (Ctrl+C to stop)");
-    println!();
+    tracing::info!("Channel listeners running (Ctrl+C to stop)");
 
     crate::health::mark_component_ok("channels");
 
@@ -3144,7 +3138,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     );
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
-    println!("  🚦 In-flight message limit: {max_in_flight_messages}");
+    tracing::info!("In-flight message limit: {max_in_flight_messages}");
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
