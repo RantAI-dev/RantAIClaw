@@ -721,6 +721,43 @@ pub(crate) fn handle_command(
             println!();
             Ok(())
         }
+        crate::SkillCommands::Show { name } => {
+            let skills = load_skills_with_config(workspace_dir, config);
+            let found = skills
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(&name));
+            match found {
+                Some(s) => {
+                    println!(
+                        "{} {}",
+                        console::style(&s.name).white().bold(),
+                        if s.version.is_empty() {
+                            String::new()
+                        } else {
+                            console::style(format!("· v{}", s.version)).dim().to_string()
+                        }
+                    );
+                    if !s.description.is_empty() {
+                        println!("  {}", s.description);
+                    }
+                    if !s.tags.is_empty() {
+                        println!("  Tags:  {}", s.tags.join(", "));
+                    }
+                    if !s.tools.is_empty() {
+                        println!(
+                            "  Tools: {}",
+                            s.tools
+                                .iter()
+                                .map(|t| t.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    Ok(())
+                }
+                None => anyhow::bail!("No skill named '{name}'. Run `rantaiclaw skills list`."),
+            }
+        }
         crate::SkillCommands::Install { source } => {
             println!("Installing skill from: {source}");
 

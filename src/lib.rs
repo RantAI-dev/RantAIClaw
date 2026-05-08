@@ -150,6 +150,11 @@ Examples:
 pub(crate) enum SkillCommands {
     /// List all installed skills
     List,
+    /// Show metadata for a single installed skill
+    Show {
+        /// Skill name (case-insensitive)
+        name: String,
+    },
     /// Install a new skill from a URL or local path
     Install {
         /// Source URL or local path

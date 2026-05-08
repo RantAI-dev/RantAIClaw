@@ -591,6 +591,37 @@ Examples:
         shell: CompletionShell,
     },
 
+    /// Browse, search, or rename past sessions (CLI parity for TUI `/sessions /search /title`).
+    #[command(long_about = "\
+Browse, search, or rename past sessions stored in ~/.local/share/rantaiclaw/sessions.db.
+
+Examples:
+  rantaiclaw session list                       # 50 most recent
+  rantaiclaw session list --limit 200
+  rantaiclaw session get <id-prefix>            # show messages
+  rantaiclaw session search 'docker compose'    # full-text across all sessions
+  rantaiclaw session title <id-prefix> 'Docker debugging'")]
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCommands,
+    },
+
+    /// Show cumulative session/message statistics (CLI parity for TUI `/insights`).
+    Insights,
+
+    /// Show, list, or switch the agent persona preset (CLI parity for TUI `/personality`).
+    #[command(long_about = "\
+Manage the active persona preset.
+
+Examples:
+  rantaiclaw personality show                   # current preset for active profile
+  rantaiclaw personality list                   # all available presets
+  rantaiclaw personality set concise_pro        # switch")]
+    Personality {
+        #[command(subcommand)]
+        cmd: PersonalityCommands,
+    },
+
     /// Manage RantaiClaw profiles (multi-profile storage layout, v0.5.0+)
     #[command(long_about = "\
 Manage profiles. Each profile is a self-contained \
@@ -873,9 +904,57 @@ enum ChannelCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum SessionCommands {
+    /// List recent sessions
+    List {
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Show messages for a session (id prefix accepted)
+    Get {
+        /// Session id or prefix
+        id: String,
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
+    /// Full-text search across all session messages
+    Search {
+        /// Query string
+        query: String,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Set the title of a session (id prefix accepted)
+    Title {
+        /// Session id or prefix
+        id: String,
+        /// New title
+        title: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PersonalityCommands {
+    /// Show the active persona for the current profile
+    Show,
+    /// List available persona presets
+    List,
+    /// Set the persona preset for the current profile
+    Set {
+        #[arg(value_enum)]
+        preset: rantaiclaw::persona::PresetId,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum SkillCommands {
     /// List installed skills
     List,
+    /// Show metadata for a single installed skill (CLI parity for TUI `/skill <name>`)
+    Show {
+        /// Skill name (case-insensitive)
+        name: String,
+    },
     /// Install a skill from a GitHub URL or local path
     Install {
         /// GitHub URL or local path
@@ -1457,6 +1536,25 @@ async fn main() -> Result<()> {
         }) => integrations::handle_command(integration_command, &config),
 
         Some(Commands::Skills { skill_command }) => skills::handle_command(skill_command, &config),
+
+        Some(Commands::Session { cmd }) => match cmd {
+            SessionCommands::List { limit } => rantaiclaw::sessions::cli::list(limit),
+            SessionCommands::Get { id, limit } => rantaiclaw::sessions::cli::get(&id, limit),
+            SessionCommands::Search { query, limit } => {
+                rantaiclaw::sessions::cli::search(&query, limit)
+            }
+            SessionCommands::Title { id, title } => {
+                rantaiclaw::sessions::cli::set_title(&id, &title)
+            }
+        },
+
+        Some(Commands::Insights) => rantaiclaw::sessions::cli::insights(),
+
+        Some(Commands::Personality { cmd }) => match cmd {
+            PersonalityCommands::Show => rantaiclaw::persona::cli::show(),
+            PersonalityCommands::List => rantaiclaw::persona::cli::list(),
+            PersonalityCommands::Set { preset } => rantaiclaw::persona::cli::set(preset),
+        },
 
         Some(Commands::Migrate {
             migrate_command,

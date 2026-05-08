@@ -15,6 +15,7 @@
 //! exposes the data, the renderer, the interview, and the section module
 //! against the stub trait.
 
+pub mod cli;
 pub mod interview;
 pub mod renderer;
 
