@@ -382,15 +382,37 @@ impl TuiApp {
                 self.editor_request = true;
             }
             // Ctrl+B — back. While the first-run wizard is open, walk the
-            // phase history one step back. Skips RunningProvisioner phases
-            // (those wrote to config; rewinding mid-task isn't safe). The
-            // user can Esc + re-run a section if they need to redo a
-            // required step. Tester ask: "please the back button should
-            // avail" (bugs-123 page 3).
+            // phase history one step back. If a provisioner is currently
+            // running, first send Cancelled so the task exits cleanly and
+            // tear down the overlay state, then walk history (which skips
+            // RunningProvisioner entries because the task already wrote to
+            // config — rewinding mid-task isn't safe). Tester ask:
+            // "setup should can have back mechanism" (bugs-123).
             KeyCode::Char('b')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && self.first_run_wizard.is_some() =>
             {
+                let was_running_provisioner = self
+                    .first_run_wizard
+                    .as_ref()
+                    .is_some_and(|w| w.is_provisioner_running());
+                if was_running_provisioner {
+                    let was_finished = self
+                        .setup_overlay
+                        .as_ref()
+                        .map(|o| o.finished)
+                        .unwrap_or(false);
+                    if !was_finished {
+                        if let Some(tx) = self.setup_response_tx.take() {
+                            let _ = tx
+                                .send(crate::onboard::provision::ProvisionResponse::Cancelled)
+                                .await;
+                        }
+                    }
+                    self.setup_overlay = None;
+                    self.setup_event_rx = None;
+                    self.setup_response_tx = None;
+                }
                 if let Some(w) = self.first_run_wizard.as_mut() {
                     if w.back() {
                         // History pop succeeded — clear any stale picker

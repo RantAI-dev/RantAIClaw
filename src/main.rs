@@ -1037,14 +1037,46 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .finish();
+    // Initialize logging — respects RUST_LOG env var, defaults to INFO.
+    //
+    // When stdout is a TTY, route tracing to a daily file under
+    // `~/.rantaiclaw/logs/`. Otherwise tracing's default-stderr writer bleeds
+    // straight into the TUI's alt-screen frame whenever any subsystem emits a
+    // warn/error during render (the v0.6.x "log spam in wizard footer" bug).
+    // Override with `RANTAICLAW_LOG_STDERR=1` for piped/CI runs that want
+    // human-readable logs on stderr regardless of TTY detection.
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let force_stderr = std::env::var_os("RANTAICLAW_LOG_STDERR").is_some();
+    let stdout_is_tty = std::io::stdout().is_terminal();
 
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    let log_file = if stdout_is_tty && !force_stderr {
+        let log_dir = rantaiclaw::profile::paths::rantaiclaw_root().join("logs");
+        std::fs::create_dir_all(&log_dir).ok().and_then(|_| {
+            let date = chrono::Utc::now().format("%Y-%m-%d");
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join(format!("rantaiclaw-{date}.log")))
+                .ok()
+        })
+    } else {
+        None
+    };
+
+    if let Some(file) = log_file {
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
+    } else {
+        let subscriber = fmt::Subscriber::builder().with_env_filter(env_filter).finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
+    }
 
     // ── Wave-3 Setup orchestrator ───────────────────────────────────
     //
