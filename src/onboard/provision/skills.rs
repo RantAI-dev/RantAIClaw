@@ -11,7 +11,6 @@ use super::traits::{ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, Tu
 use crate::config::Config;
 use crate::profile::Profile;
 use crate::skills::bundled::{self, STARTER_PACK};
-use crate::skills::clawhub;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -114,102 +113,32 @@ impl TuiProvisioner for SkillsProvisioner {
             }
         }
 
-        // Step 2: Browse ClawHub?
+        // Step 2: Point the user to `/skills install`. The provisioner
+        // protocol (Choose / Prompt) is request-response by design — the
+        // wizard sends options, the user picks. ClawHub install is
+        // interactive, network-driven, and stateful in a way that
+        // doesn't fit that mold cleanly. Rather than build a parallel
+        // mini-picker inside the overlay, point the user at the
+        // already-working `/skills install` command, which has live
+        // search, install-and-stay-open, and predictable Enter semantics.
         send(
             &events,
-            ProvisionEvent::Choose {
-                id: "browse_clawhub".into(),
-                label: "Browse ClawHub for more skills?".into(),
-                options: vec!["Yes — browse ClawHub".to_string(), "No — skip".to_string()],
-                multi: false,
+            ProvisionEvent::Message {
+                severity: Severity::Info,
+                text: "Run `/skills install` after setup to browse ClawHub \
+                       (live search, install one or many, Esc to close)."
+                    .into(),
             },
         )
         .await?;
 
-        let browse = {
-            let sel = recv_selection(&mut responses).await?;
-            sel.first().copied() == Some(0)
-        };
-
-        if browse {
-            send(
-                &events,
-                ProvisionEvent::Message {
-                    severity: Severity::Info,
-                    text: "Fetching top ClawHub skills…".into(),
-                },
-            )
-            .await?;
-
-            let top = match clawhub::list_top(20).await {
-                Ok(items) => items,
-                Err(err) => {
-                    send(
-                        &events,
-                        ProvisionEvent::Message {
-                            severity: Severity::Warn,
-                            text: format!("ClawHub fetch failed: {err}; skipping browse step."),
-                        },
-                    )
-                    .await?;
-                    send(
-                        &events,
-                        ProvisionEvent::Done {
-                            summary: format!(
-                                "Skills installed: {} from starter pack",
-                                installed_names.len()
-                            ),
-                        },
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
-
-            if top.is_empty() {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Info,
-                        text: "ClawHub returned no skills.".into(),
-                    },
-                )
-                .await?;
-            } else {
-                // Hand off to the live ClawHub install picker — same UX as
-                // `/skills install`: search bar at top, server-side search
-                // on Enter, top-by-stars when query empty. Picker drives
-                // installs inline; we receive the list of installed slugs
-                // when the user closes it.
-                send(
-                    &events,
-                    ProvisionEvent::OpenSkillInstallPicker {
-                        label: "Install ClawHub skills".into(),
-                    },
-                )
-                .await?;
-                let installed = recv_installed_skills(&mut responses).await?;
-                if !installed.is_empty() {
-                    send(
-                        &events,
-                        ProvisionEvent::Message {
-                            severity: Severity::Success,
-                            text: format!(
-                                "Installed from ClawHub: {}",
-                                installed.join(", ")
-                            ),
-                        },
-                    )
-                    .await?;
-                    installed_names.extend(installed);
-                }
-            }
-        }
-
         send(
             &events,
             ProvisionEvent::Done {
-                summary: format!("Skills installed: {} total", installed_names.len()),
+                summary: format!(
+                    "Skills installed: {} from starter pack — `/skills install` for more",
+                    installed_names.len()
+                ),
             },
         )
         .await?;
@@ -239,25 +168,6 @@ async fn recv_selection(
     }
 }
 
-async fn recv_selection_multi(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    recv_selection(responses).await
-}
-
-async fn recv_installed_skills(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<Vec<String>> {
-    match responses.recv().await {
-        Some(ProvisionResponse::InstalledSkills(slugs)) => Ok(slugs),
-        // Esc-from-picker is treated the same as "user installed nothing"
-        // — the wizard advances rather than aborting, since the user has
-        // already gotten a starter pack from the bundled step.
-        Some(ProvisionResponse::Cancelled) => Ok(Vec::new()),
-        Some(_) => anyhow::bail!("unexpected response"),
-        None => anyhow::bail!("channel closed"),
-    }
-}
 
 #[cfg(test)]
 mod tests {
