@@ -175,7 +175,7 @@ struct VersionFile {
 /// Three-step fetch:
 /// 1. `GET /skills/:slug` → resolve the latest version string.
 /// 2. `GET /skills/:slug/versions/:v` → list `version.files[*]` (path + size + sha256).
-/// 3. For each file: `GET /skills/:slug/versions/:v/files/<path>` → write to disk,
+/// 3. For each file: `GET /skills/:slug/file?version=:v&path=<path>` → write to disk,
 ///    verify SHA-256 against the manifest.
 ///
 /// On any failure (network, hash mismatch, path traversal in the manifest)
@@ -258,11 +258,14 @@ async fn install_one_inner(
                 .with_context(|| format!("create {}", parent.display()))?;
         }
 
+        // ClawHub serves file bytes via a singular `/file` endpoint with the
+        // version and path as query parameters. The plural `/versions/:v/files/:path`
+        // shape returns 404 — that was the v0.6.x install regression.
         let file_url = format!(
-            "{}/skills/{}/versions/{}/files/{}",
+            "{}/skills/{}/file?version={}&path={}",
             base_url(),
             slug,
-            version,
+            urlencoding::encode(&version),
             urlencoding::encode(&file.path),
         );
         // SKILL.md is required; auxiliary files (README.md, LICENSE, etc.)
