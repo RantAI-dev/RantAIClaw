@@ -365,30 +365,70 @@ impl TuiApp {
                         Some(s) => s,
                         None => return Ok(EventResult::Continue),
                     };
-                    let kickoff = format!("Installing {slug}…");
-                    let _ = self.context.append_system_message(&kickoff);
-                    self.scrollback_queue.push(("system".into(), kickoff));
+                    // Show "Installing …" in the picker title so the user
+                    // sees feedback without having to close the overlay
+                    // and read chat. Pre-v0.6.23 install progress was
+                    // dumped to chat, which forced the user to Esc out
+                    // of the install overlay to see what happened.
+                    if let Some(p) = self.list_picker.as_mut() {
+                        p.title = format!("Installing {slug}…");
+                    }
                     let result =
                         crate::skills::clawhub::install_one(&self.profile, &slug).await;
                     if result.is_ok() {
                         // Hot-reload the in-memory skill list so /skills
                         // and any in-flight agent turn see the new skill
-                        // without restarting rantaiclaw. Tester ask: "the
-                        // skill needs to hot reload after install".
+                        // without restarting rantaiclaw.
                         self.context.available_skills =
                             crate::skills::load_skills_with_config(
                                 &self.config.workspace_dir,
                                 &self.config,
                             );
                     }
-                    let msg = match &result {
-                        Ok(()) => format!("✓ Installed {slug}. Loaded — /skills to browse."),
-                        Err(e) => format!("✗ Install failed for {slug}: {e}"),
-                    };
-                    let _ = self.context.append_system_message(&msg);
-                    self.scrollback_queue.push(("system".into(), msg));
                     if result.is_ok() && self.wizard_install_in_progress {
-                        self.wizard_installed_slugs.push(slug);
+                        self.wizard_installed_slugs.push(slug.clone());
+                    }
+                    match &result {
+                        Ok(()) => {
+                            // Tester ask: "throw us to the /skills (that
+                            // sees the installed skills)" after install.
+                            // Swap the ClawhubInstall picker for the
+                            // standard Skill picker, preselecting the
+                            // freshly-installed slug so it's visible.
+                            self.close_clawhub_install_picker_state();
+                            let items: Vec<crate::tui::widgets::ListPickerItem> =
+                                self.context
+                                    .available_skills
+                                    .iter()
+                                    .map(|s| {
+                                        let primary = if s.version.is_empty() {
+                                            s.name.clone()
+                                        } else {
+                                            format!("{} · v{}", s.name, s.version)
+                                        };
+                                        crate::tui::widgets::ListPickerItem {
+                                            key: s.name.clone(),
+                                            primary,
+                                            secondary: s.description.clone(),
+                                        }
+                                    })
+                                    .collect();
+                            self.list_picker = Some(crate::tui::widgets::ListPicker::new(
+                                crate::tui::widgets::ListPickerKind::Skill,
+                                format!("Skills · ✓ Installed {slug}"),
+                                items,
+                                Some(&slug),
+                                "No skills loaded.",
+                            ));
+                        }
+                        Err(e) => {
+                            // Surface the failure in the picker title so
+                            // the user can see it without leaving the
+                            // overlay. Picker stays open for retry.
+                            if let Some(p) = self.list_picker.as_mut() {
+                                p.title = format!("✗ Install failed: {e}");
+                            }
+                        }
                     }
                     return Ok(EventResult::Continue);
                 }

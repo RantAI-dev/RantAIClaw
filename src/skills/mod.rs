@@ -104,17 +104,35 @@ fn load_skills_with_open_skills_config(
 }
 
 fn load_workspace_skills(workspace_dir: &Path) -> Vec<Skill> {
-    // v0.5.0 introduced a per-profile skills dir at `<profile>/skills/`
-    // (sibling to `<profile>/workspace/`). The bundled-skills installer
-    // and ClawHub both write there. The old code path kept looking at
-    // `<workspace>/skills/` which is the v0.4.x layout — so the starter
-    // pack installs successfully but `/skills` shows "No skills loaded".
-    // Surfaced in v0.6.1-alpha tester onboarding.
+    // Skills can live in three places:
+    //   1. `<active_profile>/skills/`        — clawhub::install_one,
+    //                                          bundled::install_starter_pack
+    //   2. `<workspace_dir>/../skills/`      — profile-relative when
+    //                                          workspace_dir is the canonical
+    //                                          `<profile>/workspace/` shape
+    //   3. `<workspace_dir>/skills/`         — v0.4.x layout, also used by the
+    //                                          local-path `skills install`
+    //                                          which symlinks into here
     //
-    // Look in both. Dedupe by name so a migrated install doesn't render
-    // duplicates. Profile-level wins on conflict.
+    // (1) and (2) collapse to the same path in default user setups, but split
+    // when `active_workspace.toml` overrides `workspace_dir` to a non-profile
+    // path — in that case (1) is the only place install_one writes to and
+    // skipping it makes `/skills` look empty after a successful install.
+    // Pre-v0.6.23 the loader only checked (2) and (3), causing the
+    // "/skills shows nothing after clawhub install" bug.
+    //
+    // Dedupe by name. Order: profile → workspace-parent → workspace.
+    // Earlier sources win on conflict.
     let mut skills = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    if let Ok(profile) = crate::profile::ProfileManager::active() {
+        for s in load_skills_from_directory(&profile.skills_dir()) {
+            if seen.insert(s.name.clone()) {
+                skills.push(s);
+            }
+        }
+    }
 
     if let Some(profile_root) = workspace_dir.parent() {
         let profile_skills = profile_root.join("skills");

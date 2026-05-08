@@ -103,41 +103,21 @@ impl CommandHandler for SkillCommand {
 
         let name = args.trim();
         if name.is_empty() {
-            // /skill (no args) opens an InfoPanel with usage + loaded
-            // skill list. /skills opens the interactive picker. v0.6.8
-            // moves both surfaces off the chat-blob layout in favor of
-            // proper TUI panels.
-            let mut panel = InfoPanel::new("Skills")
-                .with_subtitle(format!("{} loaded", ctx.available_skills.len()))
-                .with_footer("Esc close · `/skills` opens the interactive picker");
-            if ctx.available_skills.is_empty() {
-                panel = panel.section(
-                    InfoSection::new("Loaded")
-                        .plain("No skills are loaded yet.")
-                        .plain("Run `/setup skills` to install the starter pack."),
-                );
-            } else {
-                let mut sec = InfoSection::new("Loaded");
-                for s in &ctx.available_skills {
-                    let title = if s.version.is_empty() {
-                        s.name.clone()
-                    } else {
-                        format!("{} · v{}", s.name, s.version)
-                    };
-                    if s.description.is_empty() {
-                        sec = sec.bullet(title);
-                    } else {
-                        sec = sec.bullet_with(title, s.description.clone());
-                    }
-                }
-                panel = panel.section(sec);
-            }
-            panel = panel.section(
-                InfoSection::new("Usage")
-                    .key_value("/skill <name>", "show metadata for a skill")
-                    .key_value("/skills", "interactive picker (search + select)"),
+            // /skill (no args) — open the same interactive picker as `/skills`.
+            // Pre-v0.6.23 this opened a static InfoPanel which felt out of
+            // place next to the picker that `/skills` shows. Tester ask:
+            // "make /skill same as /skills (with the same UI)".
+            let items = build_skill_items(&ctx.available_skills);
+            let picker = ListPicker::new(
+                ListPickerKind::Skill,
+                "Skills",
+                items,
+                None,
+                "No skills loaded. Drop a SKILL.md in \
+                 ~/.rantaiclaw/profiles/<profile>/skills/<name>/, or run \
+                 `/skills install <slug>` to grab one from ClawHub.",
             );
-            return Ok(CommandResult::OpenInfoPanel(panel));
+            return Ok(CommandResult::OpenListPicker(picker));
         }
 
         // With a name arg, find it and render its detail in an InfoPanel.
