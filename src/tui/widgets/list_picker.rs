@@ -301,8 +301,14 @@ impl ListPicker {
 
     /// Indices into `self.entries` that are currently visible (accounting
     /// for collapsed categories and optional query filter).
+    ///
+    /// `ClawhubInstall` opts out of local filtering: the query buffer is
+    /// only consulted on Enter (which fires a server-side search). Any
+    /// in-flight typing leaves the visible list unchanged so the user
+    /// isn't confused by results narrowing without an explicit search.
     pub fn filtered_indices(&self) -> Vec<usize> {
-        let searching = !self.query.is_empty();
+        let server_search_picker = self.kind == ListPickerKind::ClawhubInstall;
+        let searching = !server_search_picker && !self.query.is_empty();
         let q = self.query.to_lowercase();
 
         self.entries
@@ -907,6 +913,55 @@ mod tests {
 
     fn picker(items: Vec<ListPickerItem>) -> ListPicker {
         ListPicker::new(ListPickerKind::Model, "Test", items, None, "empty")
+    }
+
+    fn clawhub_picker(items: Vec<ListPickerItem>) -> ListPicker {
+        ListPicker::new(
+            ListPickerKind::ClawhubInstall,
+            "Install",
+            items,
+            None,
+            "empty",
+        )
+    }
+
+    #[test]
+    fn clawhub_picker_does_not_filter_locally_when_typing() {
+        // Tester contract: typing in the ClawhubInstall picker only
+        // updates the query buffer. Visible items must NOT shrink — the
+        // server search fires on Enter, and the picker stays put until
+        // results actually arrive. Local filtering would confuse users.
+        let mut p = clawhub_picker(vec![
+            item("github", "github"),
+            item("obsidian", "obsidian"),
+            item("weather", "weather"),
+        ]);
+        assert_eq!(p.visible_len(), 3);
+        p.push_query_char('g');
+        p.push_query_char('h');
+        // Query updated, but visible count unchanged — no local filter.
+        assert_eq!(p.query, "gh");
+        assert_eq!(p.visible_len(), 3);
+        p.push_query_char('z'); // garbage chars; still no filter
+        assert_eq!(p.visible_len(), 3);
+    }
+
+    #[test]
+    fn non_clawhub_picker_still_filters_locally() {
+        // Sanity: model/session/etc pickers retain local filter
+        // semantics — only ClawhubInstall opts out.
+        let mut p = picker(vec![
+            item("alpha", "alpha"),
+            item("beta", "beta"),
+            item("gamma", "gamma"),
+        ]);
+        assert_eq!(p.visible_len(), 3);
+        p.push_query_char('a');
+        // "alpha" and "gamma" both contain 'a', "beta" does too.
+        assert!(p.visible_len() < 4);
+        p.push_query_char('l');
+        // "al" only matches "alpha".
+        assert_eq!(p.visible_len(), 1);
     }
 
     #[test]
