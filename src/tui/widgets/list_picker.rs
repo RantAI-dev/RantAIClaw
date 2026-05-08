@@ -862,19 +862,33 @@ impl ListPicker {
             frame.render_stateful_widget(list, list_area, &mut self.list_state);
         }
 
-        // Footer with hotkey help.
-        let footer = Line::from(vec![
-            Span::styled("↑/↓", Style::default().fg(sky)),
-            Span::styled(" navigate · ", Style::default().fg(muted)),
-            Span::styled("←/→", Style::default().fg(sky)),
-            Span::styled(" collapse · ", Style::default().fg(muted)),
-            Span::styled("type", Style::default().fg(sky)),
-            Span::styled(" to filter · ", Style::default().fg(muted)),
-            Span::styled("Enter", Style::default().fg(sky)),
-            Span::styled(" select · ", Style::default().fg(muted)),
-            Span::styled("Esc", Style::default().fg(sky)),
-            Span::styled(" cancel", Style::default().fg(muted)),
-        ]);
+        // Footer with hotkey help. ClawhubInstall has a two-mode Enter
+        // (search vs install depending on focus) so its hint differs.
+        let footer = if self.kind == ListPickerKind::ClawhubInstall {
+            Line::from(vec![
+                Span::styled("type + Enter", Style::default().fg(sky)),
+                Span::styled(" search · ", Style::default().fg(muted)),
+                Span::styled("↑/↓", Style::default().fg(sky)),
+                Span::styled(" navigate · ", Style::default().fg(muted)),
+                Span::styled("Enter", Style::default().fg(sky)),
+                Span::styled(" install · ", Style::default().fg(muted)),
+                Span::styled("Esc", Style::default().fg(sky)),
+                Span::styled(" close", Style::default().fg(muted)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("↑/↓", Style::default().fg(sky)),
+                Span::styled(" navigate · ", Style::default().fg(muted)),
+                Span::styled("←/→", Style::default().fg(sky)),
+                Span::styled(" collapse · ", Style::default().fg(muted)),
+                Span::styled("type", Style::default().fg(sky)),
+                Span::styled(" to filter · ", Style::default().fg(muted)),
+                Span::styled("Enter", Style::default().fg(sky)),
+                Span::styled(" select · ", Style::default().fg(muted)),
+                Span::styled("Esc", Style::default().fg(sky)),
+                Span::styled(" cancel", Style::default().fg(muted)),
+            ])
+        };
         frame.render_widget(Paragraph::new(footer), chunks[5]);
     }
 }

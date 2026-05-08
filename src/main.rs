@@ -2213,6 +2213,12 @@ async fn run_provisioner_headless(
                 ProvisionEvent::Choose { id, label, .. } => {
                     eprintln!("[headless] choose '{label}' ({id}) — skipped in headless mode");
                 }
+                ProvisionEvent::OpenSkillInstallPicker { label } => {
+                    eprintln!(
+                        "[headless] install picker '{label}' — skipped in headless mode \
+                         (use the TUI for live ClawHub search/install)"
+                    );
+                }
             }
         }
     };

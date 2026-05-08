@@ -41,6 +41,14 @@ pub enum ProvisionEvent {
         options: Vec<String>,
         multi: bool,
     },
+    /// Open the live ClawHub install picker. Same UX as `/skills install`:
+    /// search bar at top, server-side search on Enter, top-by-stars listing
+    /// when query is empty. The picker stays open until the user presses
+    /// Esc, after which the wizard receives `ProvisionResponse::InstalledSkills`
+    /// with the slugs installed during the picker session.
+    OpenSkillInstallPicker {
+        label: String,
+    },
     Done {
         summary: String,
     },
@@ -61,6 +69,9 @@ pub enum Severity {
 pub enum ProvisionResponse {
     Text(String),
     Selection(Vec<usize>),
+    /// Slugs installed during the install-picker session. Empty if the
+    /// user closed the picker without installing anything.
+    InstalledSkills(Vec<String>),
     Cancelled,
 }
 

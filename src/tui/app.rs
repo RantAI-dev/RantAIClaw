@@ -102,6 +102,15 @@ pub struct TuiApp {
     pub clawhub_install_results_tx: Option<
         tokio::sync::mpsc::UnboundedSender<(u64, anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>)>,
     >,
+    /// True while the install picker was opened from inside the first-run
+    /// wizard's skills step. On picker close (Esc), we send
+    /// `ProvisionResponse::InstalledSkills(installed_slugs)` back to the
+    /// wizard's response channel so the wizard can advance.
+    pub wizard_install_in_progress: bool,
+    /// Slugs successfully installed during the current install-picker
+    /// session. Reset when the picker opens; consumed when it closes
+    /// during a wizard install step.
+    pub wizard_installed_slugs: Vec<String>,
     /// Read-only info panel (channels / config / doctor / insights / status
     /// / usage / skill). Mutually exclusive with `list_picker` and
     /// `setup_overlay` — the key handler refuses to open one while another
@@ -224,6 +233,8 @@ impl TuiApp {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -323,6 +334,56 @@ impl TuiApp {
                 return Ok(EventResult::Continue);
             }
             KeyCode::Enter if self.list_picker.is_some() => {
+                use super::widgets::list_picker::Focus;
+                use super::widgets::ListPickerKind;
+                let (kind, focus, query) = match self.list_picker.as_ref() {
+                    Some(p) => (p.kind, p.focus, p.query.clone()),
+                    None => return Ok(EventResult::Continue),
+                };
+                // ClawhubInstall picker has a two-mode Enter:
+                //   1. Focus::Search → fire a fresh ClawHub search.
+                //      Empty query falls back to top-by-stars listing.
+                //      Picker stays open.
+                //   2. Focus::List → install the highlighted skill. Picker
+                //      stays open afterwards so the user can search again
+                //      and install more without re-running the command.
+                if kind == ListPickerKind::ClawhubInstall {
+                    if focus == Focus::Search {
+                        self.spawn_clawhub_search(&query);
+                        // After firing, move focus to the list so the
+                        // next Enter installs (when results arrive).
+                        if let Some(p) = self.list_picker.as_mut() {
+                            p.focus = Focus::List;
+                        }
+                        return Ok(EventResult::Continue);
+                    }
+                    let slug = match self
+                        .list_picker
+                        .as_ref()
+                        .and_then(|p| p.current().map(|i| i.key.clone()))
+                    {
+                        Some(s) => s,
+                        None => return Ok(EventResult::Continue),
+                    };
+                    let kickoff = format!("Installing {slug}…");
+                    let _ = self.context.append_system_message(&kickoff);
+                    self.scrollback_queue.push(("system".into(), kickoff));
+                    let result =
+                        crate::skills::clawhub::install_one(&self.profile, &slug).await;
+                    let msg = match &result {
+                        Ok(()) => format!("✓ Installed {slug}. /skills to see it."),
+                        Err(e) => format!("✗ Install failed for {slug}: {e}"),
+                    };
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".into(), msg));
+                    // Track installs from inside a wizard install picker
+                    // session so the wizard sees the full list when the
+                    // user closes the picker.
+                    if result.is_ok() && self.wizard_install_in_progress {
+                        self.wizard_installed_slugs.push(slug);
+                    }
+                    return Ok(EventResult::Continue);
+                }
                 self.dispatch_list_picker_selection().await;
                 return Ok(EventResult::Continue);
             }
@@ -335,7 +396,6 @@ impl TuiApp {
                 if let Some(p) = self.list_picker.as_mut() {
                     p.pop_query_char();
                 }
-                self.maybe_refresh_clawhub_search();
                 return Ok(EventResult::Continue);
             }
             KeyCode::Char(c)
@@ -346,7 +406,6 @@ impl TuiApp {
                 if let Some(p) = self.list_picker.as_mut() {
                     p.push_query_char(c);
                 }
-                self.maybe_refresh_clawhub_search();
                 return Ok(EventResult::Continue);
             }
             _ if self.list_picker.is_some() => {
@@ -924,12 +983,44 @@ impl TuiApp {
             self.handle_agent_event(ev);
         }
         if let Some(rx) = &mut self.setup_event_rx {
+            // Two-phase drain: first sweep events into a buffer so we can
+            // intercept OpenSkillInstallPicker (which the overlay shouldn't
+            // see — it hands off to the install picker, not the choose
+            // render). Other events forward to setup_overlay as before.
+            let mut buffered = Vec::new();
             while let Ok(ev) = rx.try_recv() {
-                if let Some(overlay) = &mut self.setup_overlay {
-                    overlay.handle_event(ev);
+                buffered.push(ev);
+            }
+            for ev in buffered {
+                match ev {
+                    crate::onboard::provision::ProvisionEvent::OpenSkillInstallPicker {
+                        ..
+                    } => {
+                        // Hand off to the live install picker. We track that
+                        // we're in "wizard install" mode so the picker's
+                        // close path knows to send InstalledSkills back to
+                        // the wizard's response channel.
+                        self.wizard_install_in_progress = true;
+                        self.wizard_installed_slugs.clear();
+                        // Fire-and-forget: open_clawhub_install_picker is
+                        // async, but we're inside drain_events (sync). Use
+                        // a tiny future-now: spawn the prep that doesn't
+                        // need awaiting (state init), defer the network
+                        // fetch to drain_clawhub_search_results.
+                        self.open_clawhub_install_picker_sync(None);
+                    }
+                    other => {
+                        if let Some(overlay) = &mut self.setup_overlay {
+                            overlay.handle_event(other);
+                        }
+                    }
                 }
             }
         }
+        // ClawHub install picker — async search results stream in via a
+        // background task. Drain on each render tick so newly-arrived
+        // results land between user actions, not just after the next key.
+        self.drain_clawhub_search_results();
         // Wizard auto-advance: when the current provisioner finishes
         // SUCCESSFULLY, close the overlay and open the next provisioner
         // (or advance to Complete if this was the last one). On
@@ -1485,59 +1576,47 @@ impl TuiApp {
                 }
             },
             ListPickerKind::ClawhubInstall => {
-                // Network-bound; install_one is fast on cached SKILL.md
-                // (~200ms) and ~1-3s for fresh installs. Awaiting blocks
-                // the UI for that duration, which is the same UX the
-                // wizard's install_many already presents — acceptable for
-                // a deliberate user action behind an Enter press.
-                let kickoff = format!("Installing {key} from ClawHub…");
-                let _ = self.context.append_system_message(&kickoff);
-                self.scrollback_queue.push(("system".into(), kickoff));
-
-                let result = crate::skills::clawhub::install_one(&self.profile, &key).await;
-                let msg = match result {
-                    Ok(()) => format!("✓ Installed {key}. Run /skills to see it."),
-                    Err(e) => format!("✗ Install failed for {key}: {e}"),
-                };
-                let _ = self.context.append_system_message(&msg);
-                self.scrollback_queue.push(("system".into(), msg));
+                // ClawhubInstall Enter is handled inline in handle_key
+                // (split between Focus::Search → search and Focus::List
+                // → install) so it never reaches dispatch. This arm is
+                // unreachable; left as a defensive no-op.
             }
         }
     }
 
-    /// Open the ClawHub install picker. Empty query starts with the
-    /// top-by-stars listing; once the user types in the search bar, the
-    /// picker switches to live server-side search via `clawhub::search`.
-    /// Stale results from rapid typing are dropped via a version tag.
+    /// Open the ClawHub install picker. Empty query → top-by-stars listing.
+    /// Search fires only on Enter while focused on the search bar (per
+    /// tester request — keystroke-fire churned the network too aggressively).
     async fn open_clawhub_install_picker(&mut self, initial_query: Option<String>) {
+        self.open_clawhub_install_picker_sync(initial_query);
+    }
+
+    /// Sync variant — same as `open_clawhub_install_picker` but callable
+    /// from inside synchronous contexts like `drain_events`. Spawns the
+    /// initial fetch via `tokio::spawn` so we never block the render loop.
+    fn open_clawhub_install_picker_sync(&mut self, initial_query: Option<String>) {
         use super::widgets::{ListPicker, ListPickerKind};
 
-        // Spin up the result channel before any task is spawned so the
-        // first search has somewhere to deliver to.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.clawhub_install_results_rx = Some(rx);
         self.clawhub_install_results_tx = Some(tx);
-        self.clawhub_install_search_version = 0;
         self.clawhub_install_last_query = String::new();
+        // Note: don't reset `search_version` — keep monotonic so any
+        // straggling task from a prior picker session can't resurrect
+        // its results into this one.
 
-        // Open the picker empty — initial fetch lands via the channel
-        // below. Showing an empty picker for a beat is fine; it has the
-        // search bar + a "loading…" hint via empty state.
         let mut picker = ListPicker::new(
             ListPickerKind::ClawhubInstall,
             "Install Skill",
             Vec::new(),
             None,
-            "Loading ClawHub catalogue…",
+            "Loading top ClawHub skills…",
         );
         if let Some(q) = initial_query.as_deref() {
             picker.query = q.to_string();
         }
         let starting_query = picker.query.clone();
         self.list_picker = Some(picker);
-
-        // Kick off the first search. If the picker opened with an
-        // initial_query, search for that; otherwise fetch top-by-stars.
         self.spawn_clawhub_search(&starting_query);
     }
 
@@ -1640,25 +1719,6 @@ impl TuiApp {
         }
     }
 
-    /// Detect query changes in the ClawHub install picker and re-fetch.
-    /// Called after each key event that may have mutated picker.query.
-    /// Empty query → fetch top listing; non-empty → server search.
-    fn maybe_refresh_clawhub_search(&mut self) {
-        use super::widgets::ListPickerKind;
-        let Some(picker) = self.list_picker.as_ref() else {
-            return;
-        };
-        if picker.kind != ListPickerKind::ClawhubInstall {
-            return;
-        }
-        if picker.query == self.clawhub_install_last_query {
-            return;
-        }
-        self.clawhub_install_last_query = picker.query.clone();
-        let q = self.clawhub_install_last_query.clone();
-        self.spawn_clawhub_search(&q);
-    }
-
     /// Tear down ClawHub install picker async state. Called when the
     /// picker closes (Enter/Esc) so any inflight task's result can't
     /// resurrect a closed picker.
@@ -1670,6 +1730,25 @@ impl TuiApp {
         // task's send to a since-dropped tx is a no-op AND if the user
         // reopens the picker mid-flight, fresh searches don't collide
         // with old version numbers.
+
+        // If this picker was opened from inside the first-run wizard's
+        // skills step, the wizard is awaiting an InstalledSkills response.
+        // Send it now (with whatever was installed during the session)
+        // so the wizard can advance to the next provisioner.
+        if self.wizard_install_in_progress {
+            self.wizard_install_in_progress = false;
+            let installed = std::mem::take(&mut self.wizard_installed_slugs);
+            if let Some(tx) = self.setup_response_tx.as_ref() {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(crate::onboard::provision::ProvisionResponse::InstalledSkills(
+                            installed,
+                        ))
+                        .await;
+                });
+            }
+        }
     }
 
     fn open_setup_overlay(&mut self, name: String) -> anyhow::Result<()> {
@@ -3689,6 +3768,8 @@ mod tests {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -3772,6 +3853,8 @@ mod submit_tests {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -3868,6 +3951,8 @@ mod ctrl_c_tests {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -3945,6 +4030,8 @@ mod drain_tests {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -4092,6 +4179,8 @@ mod retry_tests {
             clawhub_install_search_version: 0,
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,

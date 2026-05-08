@@ -176,83 +176,32 @@ impl TuiProvisioner for SkillsProvisioner {
                 )
                 .await?;
             } else {
-                // Compact label: "Name (★N) — first sentence". ClawHub
-                // summaries can be 300+ chars; full prose belongs on the
-                // skill detail page, not the picker. Cap at ~60 chars so
-                // each option fits one row at 100-col terminal width.
-                fn short_summary(s: &str) -> String {
-                    let cleaned = s.replace('\n', " ").trim().to_string();
-                    let head = cleaned.split('.').next().unwrap_or(&cleaned).trim();
-                    let candidate = if head.is_empty() { cleaned.as_str() } else { head };
-                    if candidate.chars().count() <= 60 {
-                        candidate.to_string()
-                    } else {
-                        let truncated: String = candidate.chars().take(57).collect();
-                        format!("{truncated}…")
-                    }
-                }
-
-                let labels: Vec<String> = top
-                    .iter()
-                    .map(|s| {
-                        let name = if s.display_name.is_empty() {
-                            &s.slug
-                        } else {
-                            &s.display_name
-                        };
-                        if s.summary.is_empty() {
-                            format!("{name}  (★{})", s.stats.stars)
-                        } else {
-                            format!("{name}  (★{}) — {}", s.stats.stars, short_summary(&s.summary))
-                        }
-                    })
-                    .collect();
-
+                // Hand off to the live ClawHub install picker — same UX as
+                // `/skills install`: search bar at top, server-side search
+                // on Enter, top-by-stars when query empty. Picker drives
+                // installs inline; we receive the list of installed slugs
+                // when the user closes it.
                 send(
                     &events,
-                    ProvisionEvent::Choose {
-                        id: "clawhub_picks".into(),
-                        label: "Select ClawHub skills to install (multi-select)".into(),
-                        options: labels,
-                        multi: true,
+                    ProvisionEvent::OpenSkillInstallPicker {
+                        label: "Install ClawHub skills".into(),
                     },
                 )
                 .await?;
-
-                let picks = recv_selection_multi(&mut responses).await?;
-
-                if !picks.is_empty() {
-                    let slugs: Vec<String> = picks
-                        .into_iter()
-                        .filter_map(|i| top.get(i).map(|s| s.slug.clone()))
-                        .collect();
-
-                    match clawhub::install_many(profile, &slugs).await {
-                        Ok(installed) => {
-                            installed_names.extend(installed.clone());
-                            send(
-                                &events,
-                                ProvisionEvent::Message {
-                                    severity: Severity::Success,
-                                    text: format!(
-                                        "Installed from ClawHub: {}",
-                                        installed.join(", ")
-                                    ),
-                                },
-                            )
-                            .await?;
-                        }
-                        Err(err) => {
-                            send(
-                                &events,
-                                ProvisionEvent::Message {
-                                    severity: Severity::Warn,
-                                    text: format!("ClawHub install failed: {err}"),
-                                },
-                            )
-                            .await?;
-                        }
-                    }
+                let installed = recv_installed_skills(&mut responses).await?;
+                if !installed.is_empty() {
+                    send(
+                        &events,
+                        ProvisionEvent::Message {
+                            severity: Severity::Success,
+                            text: format!(
+                                "Installed from ClawHub: {}",
+                                installed.join(", ")
+                            ),
+                        },
+                    )
+                    .await?;
+                    installed_names.extend(installed);
                 }
             }
         }
@@ -294,6 +243,20 @@ async fn recv_selection_multi(
     responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
 ) -> Result<Vec<usize>> {
     recv_selection(responses).await
+}
+
+async fn recv_installed_skills(
+    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
+) -> Result<Vec<String>> {
+    match responses.recv().await {
+        Some(ProvisionResponse::InstalledSkills(slugs)) => Ok(slugs),
+        // Esc-from-picker is treated the same as "user installed nothing"
+        // — the wizard advances rather than aborting, since the user has
+        // already gotten a starter pack from the bundled step.
+        Some(ProvisionResponse::Cancelled) => Ok(Vec::new()),
+        Some(_) => anyhow::bail!("unexpected response"),
+        None => anyhow::bail!("channel closed"),
+    }
 }
 
 #[cfg(test)]

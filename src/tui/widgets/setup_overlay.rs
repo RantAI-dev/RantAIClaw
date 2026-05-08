@@ -115,6 +115,11 @@ impl SetupOverlayState {
                     selected: Vec::new(),
                 });
             }
+            ProvisionEvent::OpenSkillInstallPicker { .. } => {
+                // Intercepted upstream by the App's drain_events — should
+                // not reach the overlay. Treat any leak as a no-op so the
+                // overlay doesn't get confused by an unexpected variant.
+            }
             ProvisionEvent::Done { summary } => {
                 self.log.push(format!("✓ {summary}"));
                 self.log.push(String::new());

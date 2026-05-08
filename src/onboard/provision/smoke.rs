@@ -74,6 +74,13 @@ async fn run_provisioner_headless(
                                 let _ = handle.await;
                                 break;
                             }
+                            ProvisionEvent::OpenSkillInstallPicker { .. } => {
+                                // Headless smoke: no live install picker. Pretend
+                                // the user closed it without installing anything.
+                                let _ = resp_tx
+                                    .send(ProvisionResponse::InstalledSkills(Vec::new()))
+                                    .await;
+                            }
                             ProvisionEvent::Message { .. } | ProvisionEvent::QrCode { .. } => {}
                         }
                     }
