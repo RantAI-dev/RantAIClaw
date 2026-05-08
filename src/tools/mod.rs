@@ -508,6 +508,81 @@ mod tests {
     }
 
     #[test]
+    fn compose_skill_env_passes_through_explicit_env_table() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let mut entry = crate::config::SkillEntryConfig::default();
+        entry
+            .env
+            .insert("WEATHER_KEY".into(), "value-from-config".into());
+        config
+            .skills
+            .entries
+            .insert("weather".into(), entry);
+
+        let env = compose_skill_env(&config);
+        assert_eq!(env.get("WEATHER_KEY"), Some(&"value-from-config".into()));
+    }
+
+    #[test]
+    fn compose_skill_env_resolves_literal_api_key() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let mut entry = crate::config::SkillEntryConfig::default();
+        entry.api_key = Some(crate::config::SkillApiKey {
+            source: "literal".into(),
+            id: Some("MY_API_KEY".into()),
+            value: Some("lit-abc".into()),
+        });
+        config.skills.entries.insert("test-skill".into(), entry);
+
+        let env = compose_skill_env(&config);
+        assert_eq!(env.get("MY_API_KEY"), Some(&"lit-abc".into()));
+    }
+
+    #[test]
+    fn compose_skill_env_emits_screaming_snake_for_config_keys() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let mut entry = crate::config::SkillEntryConfig::default();
+        entry
+            .config
+            .insert("default_city".into(), serde_json::json!("Tokyo"));
+        entry
+            .config
+            .insert("max_results".into(), serde_json::json!(10));
+        config
+            .skills
+            .entries
+            .insert("multi-search-engine".into(), entry);
+
+        let env = compose_skill_env(&config);
+        assert_eq!(
+            env.get("RANTAICLAW_SKILL_MULTI_SEARCH_ENGINE_DEFAULT_CITY"),
+            Some(&"Tokyo".into())
+        );
+        assert_eq!(
+            env.get("RANTAICLAW_SKILL_MULTI_SEARCH_ENGINE_MAX_RESULTS"),
+            Some(&"10".into())
+        );
+    }
+
+    #[test]
+    fn compose_skill_env_skips_disabled_skills() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let mut entry = crate::config::SkillEntryConfig::default();
+        entry.enabled = false;
+        entry
+            .env
+            .insert("DISABLED_KEY".into(), "should-not-appear".into());
+        config.skills.entries.insert("disabled".into(), entry);
+
+        let env = compose_skill_env(&config);
+        assert!(env.get("DISABLED_KEY").is_none());
+    }
+
+    #[test]
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);

@@ -120,6 +120,20 @@ fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
 
+/// Open the same `sessions.db` the TUI uses so single-shot CLI agent
+/// turns (`agent -m`) get recorded alongside TUI sessions. Returns
+/// `None` on any I/O failure — sessions are a "nice-to-have" persistence
+/// layer; never block the actual turn.
+fn open_cli_session_store() -> Option<crate::sessions::SessionStore> {
+    let data_dir = directories::ProjectDirs::from("", "", "rantaiclaw")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from(".rantaiclaw"));
+    if std::fs::create_dir_all(&data_dir).is_err() {
+        return None;
+    }
+    crate::sessions::SessionStore::open(&data_dir.join("sessions.db")).ok()
+}
+
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
 fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
@@ -1888,6 +1902,26 @@ pub async fn run(
                 .await;
         }
 
+        // Open the same SessionStore the TUI uses so headless `agent -m`
+        // calls show up in `session list`, `session search`, and the
+        // `/api/v1/sessions*` endpoints. Pre-fix, sessions.db only saw
+        // TUI traffic — CLI/API turns were invisible to the rest of the
+        // sessions surface, which broke the parity story.  Best-effort:
+        // any failure here just falls back to "don't record" so the
+        // turn itself never gets blocked on session persistence.
+        let session_store = open_cli_session_store();
+        let session_id = session_store
+            .as_ref()
+            .and_then(|s| {
+                s.new_session(model_name, "cli")
+                    .ok()
+                    .map(|sess| sess.id)
+            });
+        if let (Some(store), Some(id)) = (session_store.as_ref(), session_id.as_deref()) {
+            let user_msg = crate::sessions::Message::user(id, &msg);
+            let _ = store.append_message(&user_msg);
+        }
+
         // Inject memory + hardware RAG context into user message
         let mem_context =
             build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
@@ -1927,6 +1961,19 @@ pub async fn run(
         )
         .await?;
         final_output = response.clone();
+
+        if let (Some(store), Some(id)) = (session_store.as_ref(), session_id.as_deref()) {
+            let asst_msg = crate::sessions::Message::assistant(id, &response);
+            let _ = store.append_message(&asst_msg);
+            // Auto-derive a title from the first user message so
+            // `session list` doesn't show a wall of "(untitled)" rows.
+            let title = crate::sessions::derive_session_title(&msg);
+            if !title.is_empty() {
+                let _ = store.set_title(id, &title);
+            }
+            let _ = store.end_session(id);
+        }
+
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {

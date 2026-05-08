@@ -33,6 +33,11 @@ impl SystemPromptBuilder {
     pub fn with_defaults() -> Self {
         Self {
             sections: vec![
+                // Persona renders FIRST so its tone/role guidance frames
+                // everything that follows. The other sections lay out
+                // tools, skills, workspace, etc. — operational scaffolding
+                // that the persona's voice then governs.
+                Box::new(PersonaSection),
                 Box::new(IdentitySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
@@ -63,6 +68,7 @@ impl SystemPromptBuilder {
     }
 }
 
+pub struct PersonaSection;
 pub struct IdentitySection;
 pub struct ToolsSection;
 pub struct SafetySection;
@@ -70,6 +76,42 @@ pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
+
+impl PromptSection for PersonaSection {
+    fn name(&self) -> &str {
+        "persona"
+    }
+
+    /// Inject the active profile's persona — `persona.toml` rendered to
+    /// SYSTEM.md by the persona writer. Pre-fix the persona system was
+    /// effectively decorative because no agent code path read it; only the
+    /// TUI's `/personality` picker showed the values back to the user.
+    /// Now `personality set <preset>` actually reshapes the agent's voice
+    /// for both `agent -m` and `/api/v1/agent/chat`.
+    ///
+    /// Resolution: read the active profile's persona.toml via the same
+    /// reader the CLI uses. Fall through to an empty section when no
+    /// persona is configured (fresh installs, headless tests, profile
+    /// without a `persona/` dir) — silent rather than noisy.
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        let profile = match crate::profile::ProfileManager::active() {
+            Ok(p) => p,
+            Err(_) => return Ok(String::new()),
+        };
+        let persona = match crate::persona::read_persona_toml(&profile) {
+            Ok(Some(p)) => p,
+            _ => return Ok(String::new()),
+        };
+        let rendered = persona.render();
+        if rendered.trim().is_empty() {
+            return Ok(String::new());
+        }
+        // Wrap in an explicit section header so model output reflects
+        // intent (otherwise the persona body is just an unmarked
+        // markdown blob with no provenance).
+        Ok(format!("## Persona\n\n{}\n", rendered.trim()))
+    }
+}
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {

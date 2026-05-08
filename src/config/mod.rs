@@ -12,7 +12,8 @@ pub use schema::{
     ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig,
     PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
     ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
-    SchedulerConfig, SecretsConfig, SecurityConfig, SkillsConfig, SkillsPromptInjectionMode,
+    SchedulerConfig, SecretsConfig, SecurityConfig, SkillApiKey, SkillEntryConfig,
+    SkillsConfig, SkillsPromptInjectionMode,
     SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
     TasksConfig, TelegramConfig, TunnelConfig, WebSearchConfig, WebhookConfig,
 };
