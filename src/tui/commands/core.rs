@@ -133,11 +133,11 @@ mod tests {
                 assert!(picker
                     .entries()
                     .iter()
-                    .any(|e| matches!(e, ListPickerEntry::Item(i) if i.key == "quit")));
+                    .any(|e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.key == "quit")));
                 assert!(picker
                     .entries()
                     .iter()
-                    .any(|e| matches!(e, ListPickerEntry::Item(i) if i.primary == "/quit")));
+                    .any(|e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.primary == "/quit")));
             }
             other => panic!("Expected OpenListPicker, got {other:?}"),
         }

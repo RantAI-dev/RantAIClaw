@@ -220,7 +220,7 @@ mod tests {
                         || picker
                             .entries()
                             .iter()
-                            .all(|e| matches!(e, ListPickerEntry::Item(i) if !i.key.is_empty()))
+                            .all(|e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if !i.key.is_empty()))
                 );
             }
             other => panic!("expected OpenListPicker, got {other:?}"),

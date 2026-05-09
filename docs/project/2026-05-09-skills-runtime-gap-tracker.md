@@ -122,6 +122,7 @@ a backlog, not a snapshot.
 | **GV-01** | Doc-pass — runtime-contract refs out of sync | L | P2 | ✅ Shipped 2026-05-09 — updated commands, config, providers, runbook, troubleshooting, and bootstrap refs for sessions/API persistence, skills install-deps, env injection, install recipes, and credential precedence. |
 | **GV-02** | `dev/tui-smoke.sh` permanent test harness | XS | P1 | ✅ Shipped 2026-05-09 — launches the TUI in tmux under an isolated temp profile and verifies `/skills` renders. |
 | **GV-03** | CI hook for `dev/tui-smoke.sh` | S | P3 | ✅ Shipped 2026-05-09 — `dev/ci.sh tui-smoke` builds the debug binary and runs the tmux harness, skipping gracefully when host tmux/cargo is unavailable; `all` includes the stage. |
+| **UP-01** | Update strategy parity with Hermes — pre-swap snapshot, rollback CLI, systemd/launchd auto-restart, `--backup` opt-in, richer `--check`, auto-update doc page | M | P1 | ✅ Shipped 2026-05-10 in v0.6.32-alpha — `rantaiclaw rollback` restores latest snapshot + previous binary; pre-swap snapshot to `~/.rantaiclaw/.update-snapshots/<UTC>/` covers config + active-profile state + persona; `update --backup` writes full-profile tar.gz; `update --check` prints release notes URL + first 12 lines of body; `docs/operations/auto-update.md` covers cron + systemd-timer + launchd patterns. 3 snapshot tests pass. |
 
 ---
 

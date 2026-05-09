@@ -540,6 +540,38 @@ Examples:
         /// Skip confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Take a full-profile tarball backup before swapping the binary.
+        /// Slower than the lightweight pre-update snapshot (which always
+        /// runs); covers sessions.db + skills/* + secrets too. Mirrors
+        /// `hermes update --backup`.
+        #[arg(long)]
+        backup: bool,
+    },
+
+    /// Restore the previous binary + profile state from a pre-update snapshot.
+    #[command(long_about = "\
+Restore from a pre-update snapshot.
+
+Every `rantaiclaw update` writes a lightweight snapshot of config + active
+profile state to ~/.rantaiclaw/.update-snapshots/<timestamp>/ AND keeps the
+previous binary as `rantaiclaw.old` next to the live one. `rollback` undoes
+both: by default it picks the most recent snapshot.
+
+Examples:
+  rantaiclaw rollback                 # restore latest snapshot, prompt first
+  rantaiclaw rollback -y              # skip prompt
+  rantaiclaw rollback --list          # show available snapshots, no restore
+  rantaiclaw rollback --snapshot ~/.rantaiclaw/.update-snapshots/2026-05-09T03-21-00Z")]
+    Rollback {
+        /// Show available snapshots and exit without restoring.
+        #[arg(long)]
+        list: bool,
+        /// Restore from a specific snapshot dir (default: most recent).
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Skip confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Remove rantaiclaw profile data, optionally the binary itself
@@ -1131,6 +1163,7 @@ async fn main() -> Result<()> {
         to,
         allow_downgrade,
         yes,
+        backup,
     }) = &cli.command
     {
         let channel = match channel.as_str() {
@@ -1145,7 +1178,22 @@ async fn main() -> Result<()> {
             allow_downgrade: *allow_downgrade,
             release_base_url: std::env::var("RANTAICLAW_RELEASE_BASE_URL").ok(),
             yes: *yes,
+            backup: *backup,
         });
+    }
+    if let Some(Commands::Rollback {
+        list,
+        snapshot,
+        yes,
+    }) = &cli.command
+    {
+        return rantaiclaw::lifecycle::update::rollback(
+            rantaiclaw::lifecycle::update::RollbackOpts {
+                list: *list,
+                snapshot: snapshot.clone(),
+                yes: *yes,
+            },
+        );
     }
 
     // Initialize logging — respects RUST_LOG env var, defaults to INFO.
@@ -1691,6 +1739,7 @@ async fn main() -> Result<()> {
         Some(Commands::Profile { .. }) => unreachable!("Profile dispatched earlier"),
         Some(Commands::Uninstall { .. }) => unreachable!("Uninstall dispatched earlier"),
         Some(Commands::Update { .. }) => unreachable!("Update dispatched earlier"),
+        Some(Commands::Rollback { .. }) => unreachable!("Rollback dispatched earlier"),
     }
 }
 

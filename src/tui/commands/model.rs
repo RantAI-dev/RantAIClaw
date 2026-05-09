@@ -149,7 +149,7 @@ mod tests {
                 assert_eq!(picker.kind, ListPickerKind::Model);
                 assert!(!picker.entries().is_empty());
                 assert!(picker.entries().iter().all(
-                    |e| matches!(e, ListPickerEntry::Item(i) if i.key.starts_with("openai:"))
+                    |e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.key.starts_with("openai:"))
                 ));
             }
             other => panic!("expected OpenListPicker, got {other:?}"),
