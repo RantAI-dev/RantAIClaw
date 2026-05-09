@@ -153,12 +153,20 @@ pub async fn search(query: &str) -> Result<Vec<ClawHubSkill>> {
         return Ok(Vec::new());
     }
 
-    let url = format!("{}/search?q={}&type=skill", base_url(), urlencoding::encode(query));
+    let url = format!(
+        "{}/search?q={}&type=skill",
+        base_url(),
+        urlencoding::encode(query)
+    );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .context("build reqwest client")?;
-    let response = client.get(&url).send().await.context("GET clawhub search")?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("GET clawhub search")?;
     if !response.status().is_success() {
         anyhow::bail!("clawhub search returned status {}", response.status());
     }
@@ -177,7 +185,10 @@ pub async fn search(query: &str) -> Result<Vec<ClawHubSkill>> {
         summary: String,
     }
 
-    let env: SearchEnvelope = response.json().await.context("parse clawhub search response")?;
+    let env: SearchEnvelope = response
+        .json()
+        .await
+        .context("parse clawhub search response")?;
     Ok(env
         .results
         .into_iter()
@@ -216,10 +227,7 @@ pub async fn inspect_to_stdout(slug: &str) -> Result<()> {
         .get("displayName")
         .and_then(|v| v.as_str())
         .unwrap_or(slug);
-    let summary = skill
-        .get("summary")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let summary = skill.get("summary").and_then(|v| v.as_str()).unwrap_or("");
     let stars = skill
         .get("stats")
         .and_then(|v| v.get("stars"))

@@ -2,7 +2,7 @@
 
 This guide focuses on common setup/runtime failures and fast resolution paths.
 
-Last verified: **February 20, 2026**.
+Last verified: **May 9, 2026**.
 
 ## Installation / Bootstrap
 
@@ -167,6 +167,39 @@ Checks:
 
 ```bash
 rantaiclaw doctor
+```
+
+### API chat succeeds but no session appears
+
+Checks:
+
+```bash
+rantaiclaw session list
+curl -s http://127.0.0.1:3000/api/v1/sessions
+```
+
+Expected behavior:
+
+- `POST /api/v1/agent/chat` records a completed turn with `source = "api"`.
+- The session contains the user message, assistant response, derived title, and end timestamp.
+
+If chat succeeds but persistence fails, the gateway logs a warning and still returns the completed response. Verify the RantaiClaw data directory is writable and that `sessions.db` is not locked by another long-running process.
+
+### `skills install-deps` download extraction fails
+
+Checks:
+
+```bash
+rantaiclaw skills list
+rantaiclaw skills install-deps <skill>
+which tar
+which unzip
+```
+
+`download` recipes use system `tar` for `tar.gz`/`tgz` archives and system `unzip` for `zip` archives. Extraction is rejected if archive entries use absolute paths or `..` traversal. For a rejected archive, inspect the skill with:
+
+```bash
+rantaiclaw skills inspect <slug>
 ```
 
 ## Channel Issues

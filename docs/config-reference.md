@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 19, 2026**.
+Last verified: **May 9, 2026**.
 
 Config path resolution at startup:
 
@@ -135,6 +135,10 @@ Notes:
 | `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
 | `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
 | `prompt_injection_mode` | `full` | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
+| `entries.<name>.enabled` | `true` | Per-skill enable flag; set `false` to hide a bundled or installed skill |
+| `entries.<name>.env` | `{}` | Per-skill environment variables injected into skill shell execution |
+| `entries.<name>.api_key` | unset | Per-skill API key resolver (`source = "env"` or `source = "literal"`) |
+| `entries.<name>.config` | `{}` | Per-skill config exposed as `RANTAICLAW_SKILL_<NAME>_<KEY>` env vars |
 
 Notes:
 
@@ -145,6 +149,26 @@ Notes:
   - `RANTAICLAW_SKILLS_PROMPT_MODE` accepts `full` or `compact`.
 - Precedence for enable flag: `RANTAICLAW_OPEN_SKILLS_ENABLED` → `skills.open_skills_enabled` in `config.toml` → default `false`.
 - `prompt_injection_mode = "compact"` is recommended on low-context local models to reduce startup prompt size while keeping skill files available on demand.
+- OpenClaw-style bundled-skill block lists map to `[skills.entries.<name>] enabled = false`; RantaiClaw does not add a second `allowBundled` list.
+- Skill manifests can declare `metadata.clawdbot.requires` gates and `metadata.clawdbot.install[]` recipes. `rantaiclaw skills install-deps` runs a matching recipe and revalidates missing binaries.
+- `download` install recipes support raw files, `tar.gz`/`tgz`, and `zip` archives. Archive entries are checked before extraction so absolute paths and `..` traversal are rejected.
+
+Example:
+
+```toml
+[skills.entries.web_search]
+enabled = false
+
+[skills.entries.weather.env]
+WEATHER_UNITS = "metric"
+
+[skills.entries.weather.api_key]
+source = "env"
+value = "WEATHER_API_KEY"
+
+[skills.entries.weather.config]
+region = "us"
+```
 
 ## `[composio]`
 

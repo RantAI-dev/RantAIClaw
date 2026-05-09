@@ -2,7 +2,7 @@
 
 This document maps provider IDs, aliases, and credential environment variables.
 
-Last verified: **February 20, 2026**.
+Last verified: **May 9, 2026**.
 
 ## How to List Providers
 
@@ -21,6 +21,10 @@ Runtime resolution order is:
 For resilient fallback chains (`reliability.fallback_providers`), each fallback
 provider resolves credentials independently. The primary provider's explicit
 credential is not reused for fallback providers.
+
+Compatibility note: config-stored provider keys, including encrypted keys, remain
+above environment variables in credential precedence. Use env vars when no key is
+stored in config, or remove the config key before relying on an env override.
 
 ## Provider Catalog
 

@@ -2,7 +2,7 @@
 
 This runbook is for operators who maintain availability, security posture, and incident response.
 
-Last verified: **February 18, 2026**.
+Last verified: **May 9, 2026**.
 
 ## Scope
 
@@ -60,6 +60,20 @@ rantaiclaw service status
 | Channel connectivity | `rantaiclaw channel doctor` | configured channels healthy |
 | Runtime summary | `rantaiclaw status` | expected provider/model/channels |
 | Daemon heartbeat/state | `~/.rantaiclaw/daemon_state.json` | file updates periodically |
+| Session persistence | `rantaiclaw session list` or `GET /api/v1/sessions` | recent CLI/TUI/API turns are listed |
+
+## Session Persistence Checks
+
+`agent -m`, the TUI, and `POST /api/v1/agent/chat` all write completed turns to
+the shared `sessions.db`. API-created sessions use `source = "api"`.
+
+Fast check:
+
+```bash
+curl -s http://127.0.0.1:3000/api/v1/sessions | jq .
+```
+
+If gateway pairing is required, include `Authorization: Bearer <token>`.
 
 ## Logs and Diagnostics
 

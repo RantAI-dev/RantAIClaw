@@ -477,7 +477,7 @@ mod tests {
                 assert!(picker
                     .entries()
                     .iter()
-                    .any(|e| matches!(e, ListPickerEntry::Item(i) if i.key == "default")));
+                    .any(|e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.key == "default")));
             }
             other => panic!("Expected OpenListPicker, got {other:?}"),
         }

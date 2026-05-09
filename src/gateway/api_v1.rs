@@ -40,7 +40,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/skills/{name}", get(skills_show))
         .route("/api/v1/memory", get(memory_list))
         .route("/api/v1/memory/stats", get(memory_stats))
-        .route("/api/v1/personality", get(personality_get).put(personality_set))
+        .route(
+            "/api/v1/personality",
+            get(personality_get).put(personality_set),
+        )
         .route("/api/v1/channels", get(channels_list))
         .route("/api/v1/providers", get(providers_list))
 }
@@ -238,15 +241,39 @@ async fn agent_chat(
         .unwrap_or_else(|| "unknown".to_string());
 
     let started = std::time::Instant::now();
-    let mut agent =
-        crate::agent::Agent::from_config(&config).map_err(|e| err_500(e))?;
+    let mut agent = crate::agent::Agent::from_config(&config).map_err(|e| err_500(e))?;
     let text = agent.turn(&body.message).await.map_err(|e| err_500(e))?;
+    if let Ok(store) = open_session_store() {
+        if let Err(err) = record_api_chat_session(&store, &model, &body.message, &text) {
+            tracing::warn!(error = %err, "api agent chat session persistence failed");
+        }
+    }
     Ok(Json(ChatResponseBody {
         text,
         model,
         provider,
         duration_ms: started.elapsed().as_millis(),
     }))
+}
+
+fn record_api_chat_session(
+    store: &crate::sessions::SessionStore,
+    model: &str,
+    user_message: &str,
+    assistant_message: &str,
+) -> anyhow::Result<String> {
+    let session = store.new_session(model, "api")?;
+    store.append_message(&crate::sessions::Message::user(&session.id, user_message))?;
+    store.append_message(&crate::sessions::Message::assistant(
+        &session.id,
+        assistant_message,
+    ))?;
+    let title = crate::sessions::derive_session_title(user_message);
+    if !title.is_empty() {
+        store.set_title(&session.id, &title)?;
+    }
+    store.end_session(&session.id)?;
+    Ok(session.id)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -280,7 +307,9 @@ async fn sessions_list(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "sessions": json, "count": json.len() })))
+    Ok(Json(
+        serde_json::json!({ "sessions": json, "count": json.len() }),
+    ))
 }
 
 async fn sessions_get(
@@ -343,7 +372,9 @@ async fn sessions_search(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "results": json, "count": json.len() })))
+    Ok(Json(
+        serde_json::json!({ "results": json, "count": json.len() }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -366,10 +397,10 @@ async fn sessions_set_title(
         1 => matched[0],
         n => return Err(err_400(format!("`{id}` is ambiguous ({n} matches)"))),
     };
-    store
-        .set_title(&session.id, &body.title)
-        .map_err(err_500)?;
-    Ok(Json(serde_json::json!({ "id": session.id, "title": body.title })))
+    store.set_title(&session.id, &body.title).map_err(err_500)?;
+    Ok(Json(
+        serde_json::json!({ "id": session.id, "title": body.title }),
+    ))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -422,7 +453,9 @@ async fn skills_list(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "skills": json, "count": json.len() })))
+    Ok(Json(
+        serde_json::json!({ "skills": json, "count": json.len() }),
+    ))
 }
 
 async fn skills_show(
@@ -490,7 +523,9 @@ async fn memory_list(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "entries": json, "count": json.len() })))
+    Ok(Json(
+        serde_json::json!({ "entries": json, "count": json.len() }),
+    ))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -550,8 +585,8 @@ async fn personality_set(
         .as_ref()
         .map(|e| e.name.clone())
         .unwrap_or_else(|| "RantaiClawAgent".to_string());
-    let mut next = existing
-        .unwrap_or_else(|| crate::persona::PersonaToml::default_for(&name, &timezone));
+    let mut next =
+        existing.unwrap_or_else(|| crate::persona::PersonaToml::default_for(&name, &timezone));
     next.preset = preset;
     crate::persona::write_persona_toml(&profile, &next).map_err(err_500)?;
     crate::persona::render_system_md(&profile, &next).map_err(err_500)?;
@@ -615,5 +650,42 @@ async fn providers_list(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "providers": json, "count": json.len() })))
+    Ok(Json(
+        serde_json::json!({ "providers": json, "count": json.len() }),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_api_chat_session_persists_user_and_assistant_messages() {
+        let store = crate::sessions::SessionStore::in_memory().unwrap();
+
+        let id = record_api_chat_session(
+            &store,
+            "test-model",
+            "Summarize the runtime contract",
+            "Runtime contract summary.",
+        )
+        .unwrap();
+
+        let session = store.get_session(&id).unwrap().unwrap();
+        assert_eq!(session.source, "api");
+        assert_eq!(session.model, "test-model");
+        assert_eq!(session.message_count, 2);
+        assert_eq!(
+            session.title.as_deref(),
+            Some("Summarize the runtime contract")
+        );
+        assert!(session.ended_at.is_some());
+
+        let messages = store.get_messages(&id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "Summarize the runtime contract");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "Runtime contract summary.");
+    }
 }

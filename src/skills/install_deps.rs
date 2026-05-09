@@ -14,7 +14,7 @@
 //! (e.g. `brew` itself isn't installed), that recipe is skipped and the
 //! next preferred kind is tried.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -223,8 +223,7 @@ fn run_go(recipe: &SkillInstallRecipe) -> Result<()> {
     if which::which("go").is_err() {
         if which::which("brew").is_ok() {
             println!("  · `go` not found, bootstrapping via brew first");
-            run_subprocess("brew", &["install", "go"])
-                .context("bootstrap go via brew")?;
+            run_subprocess("brew", &["install", "go"]).context("bootstrap go via brew")?;
         } else {
             bail!("go recipe needs `go` on PATH (or brew to bootstrap it)");
         }
@@ -270,11 +269,7 @@ fn run_download(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
         Some("tar.gz") | Some("tgz") => {
             extract_targz(&bytes, &target_dir, recipe.strip_components.unwrap_or(0))?
         }
-        Some("zip") => {
-            // Skip for v1 — would need the `zip` crate. Most ClawHub
-            // recipes are tar.gz.
-            bail!("zip archives not yet supported by the download recipe runner")
-        }
+        Some("zip") => extract_zip(&bytes, &target_dir, recipe.strip_components.unwrap_or(0))?,
         Some("tar.bz2") => {
             bail!("tar.bz2 archives not yet supported")
         }
@@ -296,16 +291,151 @@ fn run_download(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
     }
 
     println!("  · placed in {}", target_dir.display());
-    println!("  · ⚠ make sure `{}` is on your $PATH", target_dir.display());
+    println!(
+        "  · ⚠ make sure `{}` is on your $PATH",
+        target_dir.display()
+    );
     Ok(())
 }
 
-fn extract_targz(bytes: &[u8], dest: &PathBuf, strip: usize) -> Result<()> {
-    let _ = (bytes, dest, strip);
-    bail!(
-        "tar.gz extraction not yet wired in the v1 runner. \
-         Manual fallback: `curl <url> | tar xz --strip-components=<n> -C <dest>`"
+fn extract_targz(bytes: &[u8], dest: &Path, strip: usize) -> Result<()> {
+    let archive = write_archive_bytes(bytes, dest, "download.tar.gz")?;
+    let list = archive_entries("tar", &["-tzf", archive.to_string_lossy().as_ref()])?;
+    validate_archive_entries(&list)?;
+
+    let strip_arg = format!("--strip-components={strip}");
+    run_subprocess(
+        "tar",
+        &[
+            "-xzf",
+            archive.to_string_lossy().as_ref(),
+            "-C",
+            dest.to_string_lossy().as_ref(),
+            strip_arg.as_str(),
+        ],
     )
+    .context("extract tar.gz download")?;
+    let _ = std::fs::remove_file(archive);
+    Ok(())
+}
+
+fn extract_zip(bytes: &[u8], dest: &Path, strip: usize) -> Result<()> {
+    let archive = write_archive_bytes(bytes, dest, "download.zip")?;
+    let list = archive_entries("unzip", &["-Z1", archive.to_string_lossy().as_ref()])
+        .context("list zip entries (is `unzip` on PATH?)")?;
+    validate_archive_entries(&list)?;
+
+    if strip == 0 {
+        run_subprocess(
+            "unzip",
+            &[
+                "-q",
+                archive.to_string_lossy().as_ref(),
+                "-d",
+                dest.to_string_lossy().as_ref(),
+            ],
+        )
+        .context("extract zip download")?;
+    } else {
+        let staging = dest.join(format!(
+            ".rantaiclaw-extract-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&staging)
+            .with_context(|| format!("create staging dir {}", staging.display()))?;
+        run_subprocess(
+            "unzip",
+            &[
+                "-q",
+                archive.to_string_lossy().as_ref(),
+                "-d",
+                staging.to_string_lossy().as_ref(),
+            ],
+        )
+        .context("extract zip download to staging")?;
+        move_stripped_entries(&staging, dest, strip)?;
+        let _ = std::fs::remove_dir_all(staging);
+    }
+
+    let _ = std::fs::remove_file(archive);
+    Ok(())
+}
+
+fn write_archive_bytes(bytes: &[u8], dest: &Path, name: &str) -> Result<PathBuf> {
+    let archive = dest.join(format!(
+        ".rantaiclaw-{}-{}-{name}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    std::fs::write(&archive, bytes).with_context(|| format!("write {}", archive.display()))?;
+    Ok(archive)
+}
+
+fn archive_entries(cmd: &str, args: &[&str]) -> Result<Vec<String>> {
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .with_context(|| format!("spawn {cmd}"))?;
+    if !output.status.success() {
+        bail!("`{cmd} {}` exited with {}", args.join(" "), output.status);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().map(str::to_string).collect())
+}
+
+fn validate_archive_entries(entries: &[String]) -> Result<()> {
+    for entry in entries {
+        let path = Path::new(entry);
+        for component in path.components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                    bail!("archive entry `{entry}` would extract outside the target dir")
+                }
+                Component::CurDir | Component::Normal(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn move_stripped_entries(from: &Path, to: &Path, strip: usize) -> Result<()> {
+    for entry in std::fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
+        let entry = entry?;
+        move_stripped_entry(&entry.path(), from, to, strip)?;
+    }
+    Ok(())
+}
+
+fn move_stripped_entry(path: &Path, root: &Path, dest: &Path, strip: usize) -> Result<()> {
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+            let entry = entry?;
+            move_stripped_entry(&entry.path(), root, dest, strip)?;
+        }
+        return Ok(());
+    }
+
+    let rel = path
+        .strip_prefix(root)
+        .context("compute extracted relative path")?;
+    let stripped: PathBuf = rel.components().skip(strip).collect();
+    if stripped.as_os_str().is_empty() {
+        return Ok(());
+    }
+    validate_archive_entries(&[stripped.to_string_lossy().to_string()])?;
+    let target = dest.join(stripped);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create target dir {}", parent.display()))?;
+    }
+    std::fs::rename(path, &target)
+        .or_else(|_| {
+            std::fs::copy(path, &target)?;
+            std::fs::remove_file(path)
+        })
+        .with_context(|| format!("move extracted file to {}", target.display()))?;
+    Ok(())
 }
 
 fn run_subprocess(cmd: &str, args: &[&str]) -> Result<()> {
@@ -357,7 +487,11 @@ mod tests {
                 "download" => true,
                 _ => false,
             };
-            assert!(ok, "picked recipe `{}` whose driver isn't available", r.kind);
+            assert!(
+                ok,
+                "picked recipe `{}` whose driver isn't available",
+                r.kind
+            );
         }
     }
 
@@ -371,5 +505,45 @@ mod tests {
         assert!(!r.matches_os());
         r.os = vec![std::env::consts::OS.into()];
         assert!(r.matches_os());
+    }
+
+    #[test]
+    fn archive_entry_validation_rejects_escape_paths() {
+        assert!(validate_archive_entries(&["bin/tool".to_string()]).is_ok());
+        assert!(validate_archive_entries(&["../tool".to_string()]).is_err());
+        assert!(validate_archive_entries(&["/tmp/tool".to_string()]).is_err());
+        assert!(validate_archive_entries(&["bin/../tool".to_string()]).is_err());
+    }
+
+    #[test]
+    fn extract_targz_honors_strip_components() {
+        if which::which("tar").is_err() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src/pkg/bin");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("tool"), "ok").unwrap();
+        let archive = temp.path().join("tool.tar.gz");
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(temp.path().join("src"))
+            .arg("pkg")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let dest = temp.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let bytes = std::fs::read(&archive).unwrap();
+        extract_targz(&bytes, &dest, 1).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("bin/tool")).unwrap(),
+            "ok"
+        );
     }
 }

@@ -142,11 +142,20 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 
 - `rantaiclaw skills list`
 - `rantaiclaw skills install <source>`
+- `rantaiclaw skills install-deps [<slug> | --all]`
+- `rantaiclaw skills inspect <slug>`
+- `rantaiclaw skills update [<slug> | --all]`
 - `rantaiclaw skills remove <name>`
 
-`<source>` accepts git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`) or a local filesystem path.
+`<source>` accepts a ClawHub slug, git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`), or a local filesystem path.
 
-Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injected into the agent system prompt at runtime, so the model can follow skill instructions without manually reading skill files.
+Skill manifests (`SKILL.md`) support YAML frontmatter, `requires` gating, environment injection, and `metadata.clawdbot.install[]` recipes. `install-deps` runs the preferred host recipe (`brew`, `uv`, Node package managers, `go`, or `download`) and validates declared binaries afterward.
+
+In the TUI, `/skills` opens the local skills picker. Press `Ctrl+I` (or Tab in terminals that send Ctrl+I as Tab) on a gated skill row to run its install-deps recipe without leaving the picker.
+
+### API sessions
+
+`POST /api/v1/agent/chat` records completed turns in the same `sessions.db` used by `agent -m`, the TUI, and the `/api/v1/sessions*` endpoints. API-created sessions use `source = "api"` and include the user message, assistant response, derived title, and end timestamp.
 
 ### `migrate`
 
