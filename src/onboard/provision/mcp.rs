@@ -10,7 +10,7 @@
 
 use super::traits::{ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner};
 use crate::config::Config;
-use crate::mcp::curated::{self, CuratedMcpServer, AUTHED, NO_AUTH};
+use crate::mcp::curated::{CuratedMcpServer, AUTHED, NO_AUTH};
 use crate::mcp::setup;
 use crate::profile::Profile;
 use anyhow::Result;

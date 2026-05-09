@@ -15,6 +15,13 @@
 //! cargo test --lib onboard::provision::smoke::telegram
 //! ```
 
+// Each per-provisioner test module does `use super::*;` so it can reach
+// the shared helpers and `ProvisionResponse`/`ProvisionEvent` types. Some
+// mods don't exercise every helper — Rust warns on the unused subset
+// per-mod. Allow at the file level so we don't have to spray
+// `#[allow(unused_imports)]` on 17 test modules.
+#![allow(unused_imports)]
+
 use crate::config::Config;
 use crate::onboard::provision::registry::{available, provisioner_for};
 use crate::onboard::provision::{ProvisionEvent, ProvisionIo, ProvisionResponse};

@@ -10,7 +10,7 @@
 use super::traits::{ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner};
 use crate::config::Config;
 use crate::profile::Profile;
-use crate::skills::bundled::{self, STARTER_PACK};
+use crate::skills::bundled::{self};
 use anyhow::Result;
 use async_trait::async_trait;
 

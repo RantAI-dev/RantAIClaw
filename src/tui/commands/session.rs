@@ -3,7 +3,7 @@ use chrono::{TimeZone, Utc};
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
-use crate::tui::widgets::{ListPicker, ListPickerEntry, ListPickerItem, ListPickerKind};
+use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 
 /// Build picker items from a list of session metas. Skips the current
 /// session so the user doesn't accidentally "resume" it onto itself.

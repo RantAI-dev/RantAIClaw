@@ -1,4 +1,12 @@
 //! Integration tests for WhatsApp Web provisioner.
+//!
+//! The `whatsapp_web` module is feature-gated, so the entire file must
+//! be cfg'd or it breaks `cargo test --tests` for default builds.
+//! Pre-fix the `use` line referenced the module unconditionally and
+//! failed to compile when the feature was absent — `#[ignore]` only
+//! skips execution, not compilation.
+
+#![cfg(feature = "whatsapp-web")]
 
 use futures::StreamExt;
 use rantaiclaw::channels::whatsapp_web::{pair_once, PairEvent, PairOptions};
