@@ -96,11 +96,18 @@ pub struct TuiApp {
     pub clawhub_install_search_version: u64,
     /// Channel for ClawHub search results posted back from spawned tasks.
     /// `None` when the install picker isn't open.
-    pub clawhub_install_results_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<(u64, anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>)>>,
+    pub clawhub_install_results_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<(
+            u64,
+            anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>,
+        )>,
+    >,
     /// Sender side of the results channel above. Cloned per spawned task.
     pub clawhub_install_results_tx: Option<
-        tokio::sync::mpsc::UnboundedSender<(u64, anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>)>,
+        tokio::sync::mpsc::UnboundedSender<(
+            u64,
+            anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>,
+        )>,
     >,
     /// Slug currently being installed from ClawHub, plus the spinner frame
     /// index (advanced each render tick). `None` when no install is in
@@ -116,6 +123,22 @@ pub struct TuiApp {
         Option<tokio::sync::mpsc::UnboundedReceiver<Result<String, String>>>,
     pub clawhub_install_completion_tx:
         Option<tokio::sync::mpsc::UnboundedSender<Result<String, String>>>,
+    /// Skill currently running install-deps from the local `/skills`
+    /// picker, plus spinner frame. Triggered by Ctrl+I/Tab on a skill row.
+    pub skill_deps_install_in_progress: Option<(String, usize)>,
+    pub skill_deps_install_completion_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<
+            Result<crate::skills::install_deps::InstallDepsOutcome, String>,
+        >,
+    >,
+    pub skill_deps_install_completion_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<
+            Result<crate::skills::install_deps::InstallDepsOutcome, String>,
+        >,
+    >,
+    /// Background watcher for profile/workspace skill edits. The watcher
+    /// owns the OS file handle; the TUI drains debounced reload ticks.
+    pub skills_watcher: Option<crate::skills::watcher::SkillsWatcher>,
     /// True while the install picker was opened from inside the first-run
     /// wizard's skills step. On picker close (Esc), we send
     /// `ProvisionResponse::InstalledSkills(installed_slugs)` back to the
@@ -192,6 +215,61 @@ pub fn dispatch_setup_channel_key(key: &str) -> SetupChannelAction {
 }
 
 impl TuiApp {
+    fn refresh_available_skills(&mut self) {
+        self.context.available_skills =
+            crate::skills::load_skills_with_config(&self.config.workspace_dir, &self.config);
+        self.context.available_skills_with_status =
+            crate::skills::load_skills_with_status(&self.config.workspace_dir, &self.config);
+    }
+
+    fn skill_picker_items(&self) -> Vec<crate::tui::widgets::ListPickerItem> {
+        self.context
+            .available_skills_with_status
+            .iter()
+            .map(|(s, reasons)| {
+                let primary = if s.version.is_empty() {
+                    s.name.clone()
+                } else {
+                    format!("{} · v{}", s.name, s.version)
+                };
+                let primary = if reasons.is_empty() {
+                    primary
+                } else {
+                    format!("✗ {primary}")
+                };
+                let mut secondary = s.description.clone();
+                if !reasons.is_empty() {
+                    let reason = reasons.join("; ");
+                    secondary = if secondary.is_empty() {
+                        format!("gated: {reason}")
+                    } else {
+                        format!("{secondary}  · gated: {reason}")
+                    };
+                }
+                if !s.tags.is_empty() {
+                    secondary = format!("{secondary}  ({})", s.tags.join(", "));
+                }
+                let has_missing_bin = s
+                    .requires
+                    .unmet()
+                    .iter()
+                    .any(|reason| reason.starts_with("missing binary"));
+                if has_missing_bin && !s.install_recipes.is_empty() {
+                    secondary = if secondary.is_empty() {
+                        "Ctrl+I install deps".to_string()
+                    } else {
+                        format!("{secondary}  · Ctrl+I install deps")
+                    };
+                }
+                crate::tui::widgets::ListPickerItem {
+                    key: s.name.clone(),
+                    primary,
+                    secondary,
+                }
+            })
+            .collect()
+    }
+
     /// Create a new `TuiApp`, starting or resuming a session based on config.
     ///
     /// `req_tx` and `events_rx` are the TUI-side ends of the bridge to the
@@ -250,6 +328,10 @@ impl TuiApp {
             clawhub_install_in_progress: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -404,15 +486,13 @@ impl TuiApp {
                     let profile = self.profile.clone();
                     let slug_for_task = slug.clone();
                     tokio::spawn(async move {
-                        let send = match crate::skills::clawhub::install_one(
-                            &profile,
-                            &slug_for_task,
-                        )
-                        .await
-                        {
-                            Ok(()) => Ok(slug_for_task),
-                            Err(e) => Err(format!("{e:#}")),
-                        };
+                        let send =
+                            match crate::skills::clawhub::install_one(&profile, &slug_for_task)
+                                .await
+                            {
+                                Ok(()) => Ok(slug_for_task),
+                                Err(e) => Err(format!("{e:#}")),
+                            };
                         let _ = tx.send(send);
                     });
                     return Ok(EventResult::Continue);
@@ -420,9 +500,28 @@ impl TuiApp {
                 self.dispatch_list_picker_selection().await;
                 return Ok(EventResult::Continue);
             }
+            KeyCode::Char('i')
+                if self.list_picker.as_ref().is_some_and(|p| {
+                    p.kind == crate::tui::widgets::ListPickerKind::Skill
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                }) =>
+            {
+                self.spawn_skill_deps_install();
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Tab
+                if self
+                    .list_picker
+                    .as_ref()
+                    .is_some_and(|p| p.kind == crate::tui::widgets::ListPickerKind::Skill) =>
+            {
+                self.spawn_skill_deps_install();
+                return Ok(EventResult::Continue);
+            }
             KeyCode::Esc if self.list_picker.is_some() => {
                 self.list_picker = None;
                 self.close_clawhub_install_picker_state();
+                self.close_skill_deps_install_state();
                 return Ok(EventResult::Continue);
             }
             KeyCode::Backspace if self.list_picker.is_some() => {
@@ -611,7 +710,9 @@ impl TuiApp {
                 }
             }
             // Backspace
-            KeyCode::Backspace if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
+            KeyCode::Backspace
+                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() =>
+            {
                 self.context.input_buffer.pop();
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
@@ -787,21 +888,30 @@ impl TuiApp {
             // navigation/toggle keys to the wizard's own multi-select
             // state. Enter is handled by the wizard Enter arm below.
             KeyCode::Up
-                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+                if self
+                    .first_run_wizard
+                    .as_ref()
+                    .is_some_and(|w| w.is_picker_active()) =>
             {
                 if let Some(w) = self.first_run_wizard.as_mut() {
                     w.picker_move_up();
                 }
             }
             KeyCode::Down
-                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+                if self
+                    .first_run_wizard
+                    .as_ref()
+                    .is_some_and(|w| w.is_picker_active()) =>
             {
                 if let Some(w) = self.first_run_wizard.as_mut() {
                     w.picker_move_down();
                 }
             }
             KeyCode::Char(' ')
-                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+                if self
+                    .first_run_wizard
+                    .as_ref()
+                    .is_some_and(|w| w.is_picker_active()) =>
             {
                 if let Some(w) = self.first_run_wizard.as_mut() {
                     w.picker_toggle();
@@ -1060,6 +1170,7 @@ impl TuiApp {
                 }
             }
         }
+        self.drain_skill_reload_events();
         // ClawHub install picker — async search results stream in via a
         // background task. Drain on each render tick so newly-arrived
         // results land between user actions, not just after the next key.
@@ -1068,6 +1179,7 @@ impl TuiApp {
         // the spinner frame and check whether the spawned install task
         // has produced a result.
         self.tick_clawhub_install();
+        self.tick_skill_deps_install();
         // Wizard auto-advance: when the current provisioner finishes
         // SUCCESSFULLY, close the overlay and open the next provisioner
         // (or advance to Complete if this was the last one). On
@@ -1521,6 +1633,7 @@ impl TuiApp {
         };
         self.list_picker = None;
         self.close_clawhub_install_picker_state();
+        self.close_skill_deps_install_state();
 
         match kind {
             ListPickerKind::Model => {
@@ -1685,8 +1798,7 @@ impl TuiApp {
         if let Some(p) = self.list_picker.as_mut() {
             p.search_pending = false;
         }
-        self.clawhub_install_search_version =
-            self.clawhub_install_search_version.wrapping_add(1);
+        self.clawhub_install_search_version = self.clawhub_install_search_version.wrapping_add(1);
         let version = self.clawhub_install_search_version;
         let q = query.to_string();
         tokio::spawn(async move {
@@ -1697,6 +1809,74 @@ impl TuiApp {
             };
             let _ = tx.send((version, result));
         });
+    }
+
+    fn spawn_skill_deps_install(&mut self) {
+        if self.skill_deps_install_in_progress.is_some() {
+            return;
+        }
+        let Some(skill_name) = self
+            .list_picker
+            .as_ref()
+            .and_then(|p| p.current().map(|item| item.key.clone()))
+        else {
+            return;
+        };
+        let Some(skill) = self
+            .context
+            .available_skills_with_status
+            .iter()
+            .map(|(skill, _)| skill)
+            .chain(self.context.available_skills.iter())
+            .find(|s| s.name.eq_ignore_ascii_case(&skill_name))
+            .cloned()
+        else {
+            if let Some(p) = self.list_picker.as_mut() {
+                p.title = format!("Skills · {skill_name} not found");
+            }
+            return;
+        };
+
+        if skill.install_recipes.is_empty() {
+            if let Some(p) = self.list_picker.as_mut() {
+                p.title = format!("Skills · no install-deps recipe for {}", skill.name);
+            }
+            return;
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+            Result<crate::skills::install_deps::InstallDepsOutcome, String>,
+        >();
+        self.skill_deps_install_completion_rx = Some(rx);
+        self.skill_deps_install_completion_tx = Some(tx.clone());
+        self.skill_deps_install_in_progress = Some((skill.name.clone(), 0));
+
+        tokio::task::spawn_blocking(move || {
+            let result =
+                crate::skills::install_deps::install_deps_for(&skill).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+    }
+
+    fn drain_skill_reload_events(&mut self) {
+        let mut should_reload = false;
+        if let Some(watcher) = self.skills_watcher.as_mut() {
+            while watcher.reload_rx.try_recv().is_ok() {
+                should_reload = true;
+            }
+        }
+        if !should_reload {
+            return;
+        }
+
+        self.refresh_available_skills();
+        let items = self.skill_picker_items();
+        if let Some(picker) = self.list_picker.as_mut() {
+            if picker.kind == crate::tui::widgets::ListPickerKind::Skill {
+                picker.set_items(items);
+                picker.title = "Skills · reloaded".to_string();
+            }
+        }
     }
 
     /// Drain any pending ClawHub search results and apply the latest one
@@ -1812,10 +1992,7 @@ impl TuiApp {
             Some(Ok(installed_slug)) => {
                 // Reload skills so the new one is visible to /skills and
                 // to the next agent turn.
-                self.context.available_skills = crate::skills::load_skills_with_config(
-                    &self.config.workspace_dir,
-                    &self.config,
-                );
+                self.refresh_available_skills();
                 if self.wizard_install_in_progress {
                     self.wizard_installed_slugs.push(installed_slug.clone());
                 }
@@ -1827,23 +2004,7 @@ impl TuiApp {
                 self.clawhub_install_in_progress = None;
                 self.clawhub_install_completion_rx = None;
                 self.clawhub_install_completion_tx = None;
-                let items: Vec<crate::tui::widgets::ListPickerItem> = self
-                    .context
-                    .available_skills
-                    .iter()
-                    .map(|s| {
-                        let primary = if s.version.is_empty() {
-                            s.name.clone()
-                        } else {
-                            format!("{} · v{}", s.name, s.version)
-                        };
-                        crate::tui::widgets::ListPickerItem {
-                            key: s.name.clone(),
-                            primary,
-                            secondary: s.description.clone(),
-                        }
-                    })
-                    .collect();
+                let items = self.skill_picker_items();
                 self.list_picker = Some(crate::tui::widgets::ListPicker::new(
                     crate::tui::widgets::ListPickerKind::Skill,
                     format!("Skills · ✓ Installed {installed_slug}"),
@@ -1861,6 +2022,63 @@ impl TuiApp {
                 self.clawhub_install_in_progress = None;
                 self.clawhub_install_completion_rx = None;
                 self.clawhub_install_completion_tx = None;
+            }
+        }
+    }
+
+    fn tick_skill_deps_install(&mut self) {
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+        let Some((skill, frame)) = self.skill_deps_install_in_progress.as_mut() else {
+            return;
+        };
+
+        let mut completion = None;
+        if let Some(rx) = self.skill_deps_install_completion_rx.as_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                completion = Some(msg);
+            }
+        }
+
+        match completion {
+            None => {
+                *frame = (*frame + 1) % SPINNER.len();
+                let glyph = SPINNER[*frame];
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.title = format!("{glyph}  Installing deps for {skill}…");
+                }
+            }
+            Some(Ok(outcome)) => {
+                self.refresh_available_skills();
+                let items = self.skill_picker_items();
+                if let Some(p) = self.list_picker.as_mut() {
+                    if p.kind == crate::tui::widgets::ListPickerKind::Skill {
+                        p.set_items(items);
+                    }
+                    if outcome.bins_still_missing.is_empty() {
+                        if outcome.bins_installed.is_empty() {
+                            p.title =
+                                format!("Skills · deps already satisfied for {}", outcome.skill);
+                        } else {
+                            p.title = format!(
+                                "Skills · ✓ installed {}",
+                                outcome.bins_installed.join(", ")
+                            );
+                        }
+                    } else {
+                        p.title = format!(
+                            "Skills · still missing {}",
+                            outcome.bins_still_missing.join(", ")
+                        );
+                    }
+                }
+                self.close_skill_deps_install_state();
+            }
+            Some(Err(error_msg)) => {
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.title = format!("Skills · install-deps failed: {error_msg}");
+                }
+                self.close_skill_deps_install_state();
             }
         }
     }
@@ -1888,13 +2106,21 @@ impl TuiApp {
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let _ = tx
-                        .send(crate::onboard::provision::ProvisionResponse::InstalledSkills(
-                            installed,
-                        ))
+                        .send(
+                            crate::onboard::provision::ProvisionResponse::InstalledSkills(
+                                installed,
+                            ),
+                        )
                         .await;
                 });
             }
         }
+    }
+
+    fn close_skill_deps_install_state(&mut self) {
+        self.skill_deps_install_in_progress = None;
+        self.skill_deps_install_completion_rx = None;
+        self.skill_deps_install_completion_tx = None;
     }
 
     fn open_setup_overlay(&mut self, name: String) -> anyhow::Result<()> {
@@ -2035,7 +2261,10 @@ impl TuiApp {
             .collect();
 
         let title = format!("{} setup", cat_label(category));
-        let empty_hint = format!("no {} provisioners available", cat_label(category).to_lowercase());
+        let empty_hint = format!(
+            "no {} provisioners available",
+            cat_label(category).to_lowercase()
+        );
 
         let picker = ListPicker::new(
             ListPickerKind::SetupChannel, // re-used as the generic "category sub-picker" kind
@@ -3448,26 +3677,56 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
 pub(crate) fn count_configured_channels(c: &crate::config::Config) -> usize {
     let mut n = 0;
     let cc = &c.channels_config;
-    if cc.telegram.is_some() { n += 1; }
-    if cc.discord.is_some() { n += 1; }
-    if cc.slack.is_some() { n += 1; }
-    if cc.mattermost.is_some() { n += 1; }
-    if cc.webhook.is_some() { n += 1; }
-    if cc.imessage.is_some() { n += 1; }
-    if cc.signal.is_some() { n += 1; }
-    if cc.whatsapp.is_some() { n += 1; }
-    if cc.linq.is_some() { n += 1; }
-    if cc.nextcloud_talk.is_some() { n += 1; }
-    if cc.email.is_some() { n += 1; }
-    if cc.irc.is_some() { n += 1; }
-    if cc.dingtalk.is_some() { n += 1; }
+    if cc.telegram.is_some() {
+        n += 1;
+    }
+    if cc.discord.is_some() {
+        n += 1;
+    }
+    if cc.slack.is_some() {
+        n += 1;
+    }
+    if cc.mattermost.is_some() {
+        n += 1;
+    }
+    if cc.webhook.is_some() {
+        n += 1;
+    }
+    if cc.imessage.is_some() {
+        n += 1;
+    }
+    if cc.signal.is_some() {
+        n += 1;
+    }
+    if cc.whatsapp.is_some() {
+        n += 1;
+    }
+    if cc.linq.is_some() {
+        n += 1;
+    }
+    if cc.nextcloud_talk.is_some() {
+        n += 1;
+    }
+    if cc.email.is_some() {
+        n += 1;
+    }
+    if cc.irc.is_some() {
+        n += 1;
+    }
+    if cc.dingtalk.is_some() {
+        n += 1;
+    }
     #[cfg(feature = "channel-matrix")]
     {
-        if cc.matrix.is_some() { n += 1; }
+        if cc.matrix.is_some() {
+            n += 1;
+        }
     }
     #[cfg(feature = "channel-lark")]
     {
-        if cc.lark.is_some() { n += 1; }
+        if cc.lark.is_some() {
+            n += 1;
+        }
     }
     n
 }
@@ -3600,8 +3859,16 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // Load skills from the active workspace so /skills can browse them.
     // load_skills_with_config falls back to an empty vec on any error
     // (missing dir, malformed manifest, etc.) — never blocks startup.
-    app.context.available_skills =
-        crate::skills::load_skills_with_config(&app_config.workspace_dir, &app_config);
+    app.refresh_available_skills();
+    let workspace_skills = app_config.workspace_dir.join("skills");
+    match crate::skills::watcher::SkillsWatcher::watch(&profile.skills_dir(), &workspace_skills) {
+        Ok(watcher) => {
+            app.skills_watcher = Some(watcher);
+        }
+        Err(e) => {
+            tracing::warn!("skill watcher disabled: {e:#}");
+        }
+    }
 
     // Auto-start configured channel listeners alongside the TUI. Before
     // v0.6.4 the TUI was a single local-chat surface — Telegram / Discord /
@@ -3925,6 +4192,10 @@ mod tests {
             clawhub_install_in_progress: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4013,6 +4284,10 @@ mod submit_tests {
             clawhub_install_in_progress: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4114,6 +4389,10 @@ mod ctrl_c_tests {
             clawhub_install_in_progress: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4196,6 +4475,10 @@ mod drain_tests {
             clawhub_install_in_progress: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4348,6 +4631,10 @@ mod retry_tests {
             clawhub_install_in_progress: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,

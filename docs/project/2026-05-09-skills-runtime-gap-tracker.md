@@ -15,6 +15,7 @@ a backlog, not a snapshot.
 ## What's shipped (skill system, v0.6.20 → v0.6.29)
 
 ### CLI surface
+
 - ✅ `skills install <slug | url | path>` — bare slug routes to ClawHub
 - ✅ `skills list` — ✓/✗ glyphs, gating reasons, install-deps hint
 - ✅ `skills show <name>` — local detail
@@ -24,6 +25,7 @@ a backlog, not a snapshot.
 - ✅ `skills install-deps [<slug> | --all]` — recipe runner
 
 ### TUI surface
+
 - ✅ `/skills` — interactive picker
 - ✅ `/skill` — same picker as `/skills`
 - ✅ `/skill install`, `/skills install` — both open the ClawHub picker
@@ -34,8 +36,12 @@ a backlog, not a snapshot.
 - ✅ Install picker auto-jumps to `/skills` view on success
 - ✅ "↵ Enter to search ClawHub" CTA when query typed but not searched
 - ✅ Kind-aware placeholder: `Type query, press Enter to search ClawHub…`
+- ✅ `[Install deps]` hotkey in `/skills` picker (`Ctrl+I`/Tab)
+- ✅ Gated skills are visible in `/skills` with reasons and install-deps hints
+- ✅ SKILL.md edits hot-reload in the running TUI
 
 ### Format / parsing
+
 - ✅ SKILL.md YAML frontmatter (name, description, version, author, tags)
 - ✅ `metadata.clawdbot.requires.{bins, env, os}` gating
 - ✅ `metadata.clawdbot.install[]` recipe parsing
@@ -43,6 +49,7 @@ a backlog, not a snapshot.
 - ✅ Both `clawdbot` and `openclaw` namespaces accepted
 
 ### Config & execution
+
 - ✅ `[skills.entries.<name>]` TOML block (OpenClaw shape)
 - ✅ Per-skill `enabled` flag — loader filter
 - ✅ Per-skill `env` injected into shell exec
@@ -51,17 +58,21 @@ a backlog, not a snapshot.
 - ✅ `migrate --from openclaw` ports `openclaw.json` skills.entries → TOML
 
 ### Install recipes (in order they're tried)
+
 - ✅ `brew install <formula>` — Homebrew
 - ✅ `uv tool install <pkg>` — Python tools
 - ✅ `npm install -g <pkg>` (+ pnpm/yarn variants) — Node
 - ✅ `go install <module>` — bootstraps Go via brew if missing
-- ⚠ `download` — URL fetch works, **tar.gz/zip extract stubbed**
+- ✅ `download` — URL fetch plus tar.gz/zip extract (system `tar`/`unzip`, path traversal guarded)
 
 ### Tests
+
 - ✅ 4 unit tests for `compose_skill_env` (env passthrough, literal api_key, SCREAMING_SNAKE config, disabled-skip)
 - ✅ 3 unit tests for `port_skills_entries` (translation, idempotency, missing-source)
 - ✅ 2 unit tests for `install_deps::pick_preferred` + `matches_os_filter`
 - ✅ tmux-based TUI smoke harness (proven works on v0.6.28)
+- ✅ `skills::watcher` unit test for debounced SKILL.md reload events
+- ✅ `dev/ci.sh tui-smoke` gate for the tmux harness
 
 ---
 
@@ -69,11 +80,11 @@ a backlog, not a snapshot.
 
 | ID | Gap | Effort | Priority | Notes |
 |---|---|---|---|---|
-| **SK-01** | `download` recipe tar.gz/zip extract | XS-S | P1 | A handful of ClawHub skills (e.g. ones publishing prebuilt binaries) need this. Wire `flate2` + `tar` crates. Stubbed today with a `bail!` + manual-fallback hint. |
-| **SK-02** | TUI `[Install deps]` button in `/skills` picker | M | P2 | Closes UX parity with OpenClaw's macOS Skills UI. `Ctrl+I` on a gated row → spawn `install_deps_for(skill)` + spinner. Reuse the v0.6.24 install-spinner infrastructure. |
-| **SK-03** | Skill file watcher (auto-reload on SKILL.md change) | M | P2 | Edit a SKILL.md while rantaiclaw is running → no reload. Hot-reload only fires on `skills install <slug>`. Use `notify` crate. |
+| **SK-01** | `download` recipe tar.gz/zip extract | XS-S | P1 | ✅ Shipped 2026-05-09 — uses system `tar`/`unzip` to avoid new runtime deps; archive entries are validated before extract. |
+| **SK-02** | TUI `[Install deps]` button in `/skills` picker | M | P2 | ✅ Shipped 2026-05-09 — `/skills` now renders active and gated rows; `Ctrl+I`/Tab can reach gated install-deps rows, runs `install_deps_for(skill)` in a blocking task, and refreshes loaded skills on completion. |
+| **SK-03** | Skill file watcher (auto-reload on SKILL.md change) | M | P2 | ✅ Shipped 2026-05-09 — TUI watches profile/workspace skills dirs with `notify`, debounces changes, and reloads active + gated skill lists without restart. |
 | **SK-04** | `skills.install.preferBrew` / `nodeManager` config keys | XS | P3 | Recipe selection order is hardcoded today. OpenClaw lets users pin npm vs pnpm vs yarn. Add `[skills.install]` block with `prefer_brew: bool` and `node_manager: "npm"\|"pnpm"\|"yarn"`. |
-| **SK-05** | `skills.allowBundled` block list | XS | P3 | OpenClaw lets users disable specific bundled skills. We have `[skills.entries.<n>] enabled = false` which covers it; document the equivalence rather than add a parallel mechanism. |
+| **SK-05** | `skills.allowBundled` block list | XS | P3 | ✅ Shipped 2026-05-09 — documented `[skills.entries.<n>] enabled = false` as the equivalent; no parallel block list added. |
 | **SK-06** | Multi-source skill location precedence | M | P4 | OpenClaw checks: workspace → project-agent → personal-agent → managed → bundled → extraDirs. We check 3 spots. Real users probably never hit the gap. Defer until someone asks. |
 | **SK-07** | Per-agent skill allowlists for multi-agent setups | L | P4 | Out of scope until multi-agent lands as a top-level concept. |
 | **SK-08** | `migrate codex` — Codex CLI skills import | M | P4 | OpenClaw has it. Niche; defer until a Codex user asks. |
@@ -96,18 +107,20 @@ a backlog, not a snapshot.
 ## Open gaps (beyond skills)
 
 ### Runtime / API
+
 | ID | Gap | Effort | Priority | Notes |
 |---|---|---|---|---|
-| **RT-01** | Verify `/api/v1/agent/chat` writes to sessions.db | S | P1 | I tested `agent -m` writes; never verified the API path. Likely shares the same code, but worth confirming + fixing if not. |
+| **RT-01** | Verify `/api/v1/agent/chat` writes to sessions.db | S | P1 | ✅ Shipped 2026-05-09 — API path now records `source = "api"` sessions with user/assistant messages and title derivation. Persistence failure is logged but does not fail a completed chat turn. |
 | **RT-02** | SSE streaming on `/api/v1/agent/chat` | M | P2 | API blocks 1.5–4s per call today. The agent already supports `turn_streaming` — gateway endpoint just needs to thread events through. Big DX win for API consumers. |
-| **RT-03** | Env var precedence below config-stored encrypted key (B8) | XS | P3 | Documented behavior. Most users expect env to win. Decision: keep as-is, but add a CLAUDE.md note. |
+| **RT-03** | Env var precedence below config-stored encrypted key (B8) | XS | P3 | ✅ Shipped 2026-05-09 — CLAUDE.md and runtime docs now call out the intentional precedence order. |
 
 ### Process / governance
+
 | ID | Gap | Effort | Priority | Notes |
 |---|---|---|---|---|
-| **GV-01** | Doc-pass — runtime-contract refs out of sync | L | P2 | `commands-reference.md`, `providers-reference.md`, `config-reference.md`, etc. don't reflect v0.6.20→v0.6.29 changes (sessions CLI, skills install-deps, persona wiring, env injection, install recipes). CLAUDE.md governance contract requires sync on behavior change. |
-| **GV-02** | `dev/tui-smoke.sh` permanent test harness | XS | P1 | The tmux-based harness from v0.6.28 testing is ad-hoc. Bake into `dev/` so future TUI work is verifiable end-to-end. |
-| **GV-03** | CI hook for `dev/tui-smoke.sh` | S | P3 | After GV-02 lands, gate PRs on it. |
+| **GV-01** | Doc-pass — runtime-contract refs out of sync | L | P2 | ✅ Shipped 2026-05-09 — updated commands, config, providers, runbook, troubleshooting, and bootstrap refs for sessions/API persistence, skills install-deps, env injection, install recipes, and credential precedence. |
+| **GV-02** | `dev/tui-smoke.sh` permanent test harness | XS | P1 | ✅ Shipped 2026-05-09 — launches the TUI in tmux under an isolated temp profile and verifies `/skills` renders. |
+| **GV-03** | CI hook for `dev/tui-smoke.sh` | S | P3 | ✅ Shipped 2026-05-09 — `dev/ci.sh tui-smoke` builds the debug binary and runs the tmux harness, skipping gracefully when host tmux/cargo is unavailable; `all` includes the stage. |
 
 ---
 
@@ -116,20 +129,20 @@ a backlog, not a snapshot.
 Priority cluster, smallest-first within each band:
 
 **P1 (this drop, ~1 day total):**
-1. **GV-02** — bake tmux harness into `dev/tui-smoke.sh` (1h)
-2. **RT-01** — verify API session persistence + fix if needed (½ day)
-3. **SK-01** — wire tar.gz extract for download recipes (1-2h)
+1. ✅ **GV-02** — baked tmux harness into `dev/tui-smoke.sh`
+2. ✅ **RT-01** — verified and fixed API session persistence
+3. ✅ **SK-01** — wired tar.gz/zip extract for download recipes
 
 **P2 (next drop, ~2-3 days):**
-4. **SK-02** — TUI `[Install deps]` button (½ day)
-5. **SK-03** — skill file watcher (½ day)
+4. ✅ **SK-02** — TUI `[Install deps]` hotkey
+5. ✅ **SK-03** — skill file watcher
 6. **RT-02** — SSE streaming API (1 day)
-7. **GV-01** — doc-pass on runtime-contract refs (1 day)
+7. ✅ **GV-01** — doc-pass on runtime-contract refs
 
 **P3+ (defer):**
 8. **SK-04** — `skills.install.*` config keys (1h)
 9. **HE-02** — Phase 2 `skills config` editor (1.5d)
-10. **RT-03** — B8 doc note (XS)
+10. ✅ **RT-03** — B8 doc note
 
 ---
 
@@ -147,6 +160,7 @@ Priority cluster, smallest-first within each band:
 | v0.6.27 | Persona + sessions | B3 persona-to-agent wiring · B4 `agent -m` → sessions.db · env-composition tests |
 | v0.6.28 | Install picker UX | "↵ Enter to search ClawHub" CTA · kind-aware placeholder · `/skill install` mirror |
 | v0.6.29 | Install-deps runner | `metadata.clawdbot.install[]` parser · `skills install-deps` CLI · brew/uv/npm/go/download recipes |
+| v0.6.30 | Skills runtime polish | Gated `/skills` rows · SKILL.md file watcher · tmux TUI smoke in local CI |
 
 ---
 

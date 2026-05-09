@@ -1,6 +1,7 @@
 pub mod bundled;
 pub mod clawhub;
 pub mod install_deps;
+pub mod watcher;
 
 use anyhow::{Context, Result};
 use directories::UserDirs;

@@ -43,8 +43,12 @@ pub struct TuiContext {
     /// the model picker. First entry is the primary/default provider.
     pub available_providers: Vec<String>,
     /// Skills loaded from the workspace at TUI startup. Used by
-    /// `/skills` to populate the skills picker.
+    /// direct slash-skill invocation and agent prompt construction.
     pub available_skills: Vec<crate::skills::Skill>,
+    /// All loaded skills, including gated/disabled rows, paired with
+    /// unmet gating reasons. Used by `/skills` so install-deps can be
+    /// reached from rows that are not active yet.
+    pub available_skills_with_status: Vec<(crate::skills::Skill, Vec<String>)>,
     /// Snapshot of `(command_name, description)` pairs taken at TUI
     /// startup. Used by `/help` to populate the help picker without
     /// reaching back into the command registry from inside handlers.
@@ -112,6 +116,7 @@ impl TuiContext {
             queued_turns: 0,
             available_providers: Vec::new(),
             available_skills: Vec::new(),
+            available_skills_with_status: Vec::new(),
             available_commands: Vec::new(),
             channels_autostart_count: 0,
             channels_summary: Vec::new(),

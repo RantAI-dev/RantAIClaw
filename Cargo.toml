@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rantaiclaw"
-version = "0.6.29-alpha"
+version = "0.6.30-alpha"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "Apache-2.0"
@@ -120,6 +120,9 @@ glob = "0.3"
 
 # Binary discovery (init system detection)
 which = "7.0"
+
+# File watcher for live skill reloads in the TUI
+notify = { version = "8", default-features = false }
 
 # Open the user's default browser for OAuth flows (used by `mcp::oauth`)
 webbrowser = "1.0"

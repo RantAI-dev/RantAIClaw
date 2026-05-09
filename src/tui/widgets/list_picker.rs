@@ -766,9 +766,7 @@ impl ListPicker {
             if self.kind == ListPickerKind::ClawhubInstall && self.search_pending {
                 spans.push(Span::styled(
                     "   ↵ Enter to search ClawHub",
-                    Style::default()
-                        .fg(emerald)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(emerald).add_modifier(Modifier::BOLD),
                 ));
             }
             Line::from(spans)
@@ -910,6 +908,17 @@ impl ListPicker {
                 Span::styled(" install · ", Style::default().fg(muted)),
                 Span::styled("Esc", Style::default().fg(sky)),
                 Span::styled(" close", Style::default().fg(muted)),
+            ])
+        } else if self.kind == ListPickerKind::Skill {
+            Line::from(vec![
+                Span::styled("↑/↓", Style::default().fg(sky)),
+                Span::styled(" navigate · ", Style::default().fg(muted)),
+                Span::styled("Ctrl+I", Style::default().fg(sky)),
+                Span::styled(" install deps · ", Style::default().fg(muted)),
+                Span::styled("Enter", Style::default().fg(sky)),
+                Span::styled(" use · ", Style::default().fg(muted)),
+                Span::styled("Esc", Style::default().fg(sky)),
+                Span::styled(" cancel", Style::default().fg(muted)),
             ])
         } else {
             Line::from(vec![

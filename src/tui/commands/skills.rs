@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
-use crate::tui::widgets::{ListPicker, ListPickerEntry, ListPickerItem, ListPickerKind};
+use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 
 /// Built-in personality presets surfaced in the `/personality` picker.
 /// Each tuple is `(key, summary shown as the muted secondary line)`.
@@ -17,18 +17,55 @@ const PERSONALITY_PRESETS: &[(&str, &str)] = &[
 /// Build picker rows from the loaded skills list. Primary text is the
 /// skill name + version; secondary is the description (truncated by
 /// the renderer if too long).
-fn build_skill_items(skills: &[crate::skills::Skill]) -> Vec<ListPickerItem> {
+fn active_skill_status_from_context(ctx: &TuiContext) -> Vec<(crate::skills::Skill, Vec<String>)> {
+    if ctx.available_skills_with_status.is_empty() {
+        ctx.available_skills
+            .iter()
+            .cloned()
+            .map(|skill| (skill, Vec::new()))
+            .collect()
+    } else {
+        ctx.available_skills_with_status.clone()
+    }
+}
+
+fn build_skill_items(skills: &[(crate::skills::Skill, Vec<String>)]) -> Vec<ListPickerItem> {
     skills
         .iter()
-        .map(|s| {
+        .map(|(s, reasons)| {
             let primary = if s.version.is_empty() {
                 s.name.clone()
             } else {
                 format!("{} · v{}", s.name, s.version)
             };
+            let primary = if reasons.is_empty() {
+                primary
+            } else {
+                format!("✗ {primary}")
+            };
             let mut secondary = s.description.clone();
+            if !reasons.is_empty() {
+                let reason = reasons.join("; ");
+                secondary = if secondary.is_empty() {
+                    format!("gated: {reason}")
+                } else {
+                    format!("{secondary}  · gated: {reason}")
+                };
+            }
             if !s.tags.is_empty() {
                 secondary = format!("{secondary}  ({})", s.tags.join(", "));
+            }
+            let has_missing_bin = s
+                .requires
+                .unmet()
+                .iter()
+                .any(|reason| reason.starts_with("missing binary"));
+            if has_missing_bin && !s.install_recipes.is_empty() {
+                secondary = if secondary.is_empty() {
+                    "Ctrl+I install deps".to_string()
+                } else {
+                    format!("{secondary}  · Ctrl+I install deps")
+                };
             }
             ListPickerItem {
                 key: s.name.clone(),
@@ -69,7 +106,8 @@ impl CommandHandler for SkillsCommand {
             return Ok(CommandResult::OpenClawhubInstallPicker { initial_query });
         }
 
-        let items = build_skill_items(&ctx.available_skills);
+        let status = active_skill_status_from_context(ctx);
+        let items = build_skill_items(&status);
         let picker = ListPicker::new(
             ListPickerKind::Skill,
             "Skills",
@@ -123,7 +161,8 @@ impl CommandHandler for SkillCommand {
             // Pre-v0.6.23 this opened a static InfoPanel which felt out of
             // place next to the picker that `/skills` shows. Tester ask:
             // "make /skill same as /skills (with the same UI)".
-            let items = build_skill_items(&ctx.available_skills);
+            let status = active_skill_status_from_context(ctx);
+            let items = build_skill_items(&status);
             let picker = ListPicker::new(
                 ListPickerKind::Skill,
                 "Skills",
@@ -157,13 +196,12 @@ impl CommandHandler for SkillCommand {
                 if !s.tags.is_empty() {
                     sec = sec.spacer().key_value("Tags", s.tags.join(", "));
                 }
-                panel = panel.section(sec).section(
-                    InfoSection::new("Activate")
-                        .plain(
-                            "Describe what you want and the agent will use this \
+                panel = panel
+                    .section(sec)
+                    .section(InfoSection::new("Activate").plain(
+                        "Describe what you want and the agent will use this \
                              skill — e.g. `summarize today's standup notes`.",
-                        ),
-                );
+                    ));
                 Ok(CommandResult::OpenInfoPanel(panel))
             }
             None => Ok(CommandResult::Message(format!(
@@ -365,7 +403,6 @@ mod tests {
             other => panic!("Expected OpenClawhubInstallPicker, got {other:?}"),
         }
     }
-
 
     #[test]
     fn skill_command_with_no_args_opens_picker() {
