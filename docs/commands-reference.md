@@ -157,6 +157,10 @@ In the TUI, `/skills` opens the local skills picker. Press `Ctrl+I` (or Tab in t
 
 `POST /api/v1/agent/chat` records completed turns in the same `sessions.db` used by `agent -m`, the TUI, and the `/api/v1/sessions*` endpoints. API-created sessions use `source = "api"` and include the user message, assistant response, derived title, and end timestamp.
 
+The same endpoint can stream partial output as Server-Sent Events when called
+with `Accept: text/event-stream` or `?stream=1`; see
+`docs/api-v1-streaming.md` for the event schema.
+
 ### `migrate`
 
 - `rantaiclaw migrate openclaw [--source <path>] [--dry-run]`

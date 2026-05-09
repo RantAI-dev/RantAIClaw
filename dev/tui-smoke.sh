@@ -44,7 +44,7 @@ cat >"$TMP_HOME/.rantaiclaw/profiles/$PROFILE/skills/gog/SKILL.md" <<'EOF'
 name: gog
 description: Gated smoke skill
 version: 0.1.0
-metadata: {"clawdbot":{"requires":{"bins":["definitely-missing-rantaiclaw-gog-smoke"]},"install":[{"id":"download","kind":"download","bins":["definitely-missing-rantaiclaw-gog-smoke"],"label":"Download smoke binary","url":"https://example.invalid/gog","archive":"raw"}]}}
+metadata: {"clawdbot":{"requires":{"bins":["definitely-missing-rantaiclaw-gog-smoke"]},"install":[{"id":"smoke-fail","kind":"smoke-fail","bins":["definitely-missing-rantaiclaw-gog-smoke"],"label":"Fail fast smoke recipe"}]}}
 ---
 # gog
 
@@ -86,8 +86,26 @@ if ! grep -Fiq "gog" "$CAPTURE" \
   exit 1
 fi
 
+tmux send-keys -t "$SESSION" Tab
+sleep 1
+tmux capture-pane -t "$SESSION" -pS -200 >"$CAPTURE"
+
+if ! grep -Fiq "install-deps failed" "$CAPTURE"; then
+  echo "TUI smoke failed: install-deps result title did not persist" >&2
+  echo "--- captured pane ---" >&2
+  cat "$CAPTURE" >&2
+  exit 1
+fi
+
+if grep -Fiq "Skills · reloaded" "$CAPTURE"; then
+  echo "TUI smoke failed: watcher reload clobbered install-deps result title" >&2
+  echo "--- captured pane ---" >&2
+  cat "$CAPTURE" >&2
+  exit 1
+fi
+
 tmux send-keys -t "$SESSION" Escape
 sleep 1
 tmux send-keys -t "$SESSION" C-c
 
-echo "TUI smoke passed: launched TUI, opened /skills, and rendered gated skills"
+echo "TUI smoke passed: launched TUI, rendered gated skills, and preserved install-deps result title"

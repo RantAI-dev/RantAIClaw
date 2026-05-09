@@ -14,9 +14,9 @@ Companion docs (read alongside):
 
 | Tier | Cluster | Effort | Status |
 |---|---|---|---|
-| **T0** | Open the v0.6.30 PR | 5 min | not started |
-| **T1.1** | Watcher reload overwrites install-deps error title (nit) | XS (1h) | not started |
-| **T1.2** | RT-02 — SSE streaming on `/api/v1/agent/chat` | M (1 day) | not started |
+| **T0** | Open the v0.6.30 PR | 5 min | ✅ done — <https://github.com/RantAI-dev/RantAIClaw/pull/53> |
+| **T1.1** | Watcher reload overwrites install-deps error title (nit) | XS (1h) | ✅ done in v0.6.31-alpha |
+| **T1.2** | RT-02 — SSE streaming on `/api/v1/agent/chat` | M (1 day) | ✅ done in v0.6.31-alpha |
 | **T2** | P3 backlog (do **only** when signaled) | varies | parked |
 | **T3** | P4 / permanently-skipped (do **not** start) | n/a | parked |
 
@@ -73,7 +73,7 @@ BODY
 `https://github.com/RantAI-dev/RantAIClaw/pull/new/feat/services-searxng-auto-launch`
 and paste the same body.
 
-**Done when:** PR URL is recorded; CI green or yellow with known-OK reasons documented.
+**Done:** PR opened at <https://github.com/RantAI-dev/RantAIClaw/pull/53>.
 
 ---
 
@@ -234,15 +234,15 @@ let stream = stream.chain(futures::stream::once(async move {
 
 ### v0.6.31 ship checklist
 
-- [ ] T1.1 + T1.2 implemented
-- [ ] `cargo check --target x86_64-unknown-linux-musl` clean
-- [ ] All new unit tests pass via narrow `cargo test --lib <module>`
-- [ ] `bash dev/tui-smoke.sh` passes
-- [ ] tmux manual: install-deps error title persists ≥3s
-- [ ] Live curl: SSE stream emits chunks → done; sync path unchanged
-- [ ] `Cargo.toml` → `0.6.31-alpha`
-- [ ] Tarball + sha256 in `~/rantaiclaw-alpha-build/v0.6.31-alpha-rantaiclaw-x86_64-unknown-linux-musl.tar.gz`
-- [ ] Tracker rows for the watcher nit + RT-02 flipped to ✅
+- [x] T1.1 + T1.2 implemented
+- [x] `cargo check --target x86_64-unknown-linux-musl` clean
+- [x] All new unit tests pass via narrow `cargo test --lib <module>`
+- [x] `bash dev/tui-smoke.sh` passes
+- [x] tmux smoke: install-deps error title persists through watcher reload
+- [x] Live curl: SSE stream emits chunk → done; sync path unchanged
+- [x] `Cargo.toml` → `0.6.31-alpha`
+- [x] Tarball + sha256 in `~/rantaiclaw-alpha-build/v0.6.31-alpha-rantaiclaw-x86_64-unknown-linux-musl.tar.gz`
+- [x] Tracker rows for the watcher nit + RT-02 flipped to ✅
 - [ ] Single commit per the convention in `2026-05-09-next-drops-plan.md` § "Ship sequence"
 - [ ] Push to `origin`; if PR is already open, the new commit lands on it automatically
 

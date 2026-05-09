@@ -73,6 +73,7 @@ a backlog, not a snapshot.
 - ✅ tmux-based TUI smoke harness (proven works on v0.6.28)
 - ✅ `skills::watcher` unit test for debounced SKILL.md reload events
 - ✅ `dev/ci.sh tui-smoke` gate for the tmux harness
+- ✅ API v1 SSE unit tests for streamed chat and sync compatibility
 
 ---
 
@@ -82,7 +83,7 @@ a backlog, not a snapshot.
 |---|---|---|---|---|
 | **SK-01** | `download` recipe tar.gz/zip extract | XS-S | P1 | ✅ Shipped 2026-05-09 — uses system `tar`/`unzip` to avoid new runtime deps; archive entries are validated before extract. |
 | **SK-02** | TUI `[Install deps]` button in `/skills` picker | M | P2 | ✅ Shipped 2026-05-09 — `/skills` now renders active and gated rows; `Ctrl+I`/Tab can reach gated install-deps rows, runs `install_deps_for(skill)` in a blocking task, and refreshes loaded skills on completion. |
-| **SK-03** | Skill file watcher (auto-reload on SKILL.md change) | M | P2 | ✅ Shipped 2026-05-09 — TUI watches profile/workspace skills dirs with `notify`, debounces changes, and reloads active + gated skill lists without restart. |
+| **SK-03** | Skill file watcher (auto-reload on SKILL.md change) | M | P2 | ✅ Shipped 2026-05-09 — TUI watches profile/workspace skills dirs with `notify`, debounces changes, reloads active + gated skill lists without restart, and preserves install-deps result titles during the trailing reload cooldown. |
 | **SK-04** | `skills.install.preferBrew` / `nodeManager` config keys | XS | P3 | Recipe selection order is hardcoded today. OpenClaw lets users pin npm vs pnpm vs yarn. Add `[skills.install]` block with `prefer_brew: bool` and `node_manager: "npm"\|"pnpm"\|"yarn"`. |
 | **SK-05** | `skills.allowBundled` block list | XS | P3 | ✅ Shipped 2026-05-09 — documented `[skills.entries.<n>] enabled = false` as the equivalent; no parallel block list added. |
 | **SK-06** | Multi-source skill location precedence | M | P4 | OpenClaw checks: workspace → project-agent → personal-agent → managed → bundled → extraDirs. We check 3 spots. Real users probably never hit the gap. Defer until someone asks. |
@@ -111,7 +112,7 @@ a backlog, not a snapshot.
 | ID | Gap | Effort | Priority | Notes |
 |---|---|---|---|---|
 | **RT-01** | Verify `/api/v1/agent/chat` writes to sessions.db | S | P1 | ✅ Shipped 2026-05-09 — API path now records `source = "api"` sessions with user/assistant messages and title derivation. Persistence failure is logged but does not fail a completed chat turn. |
-| **RT-02** | SSE streaming on `/api/v1/agent/chat` | M | P2 | API blocks 1.5–4s per call today. The agent already supports `turn_streaming` — gateway endpoint just needs to thread events through. Big DX win for API consumers. |
+| **RT-02** | SSE streaming on `/api/v1/agent/chat` | M | P2 | ✅ Shipped 2026-05-09 — `Accept: text/event-stream` or `?stream=1` streams `chunk`/`usage`/tool/`error`/`done` events, cancels the agent on client disconnect, persists only non-cancelled completions, and keeps the sync JSON path unchanged. |
 | **RT-03** | Env var precedence below config-stored encrypted key (B8) | XS | P3 | ✅ Shipped 2026-05-09 — CLAUDE.md and runtime docs now call out the intentional precedence order. |
 
 ### Process / governance
@@ -136,7 +137,7 @@ Priority cluster, smallest-first within each band:
 **P2 (next drop, ~2-3 days):**
 4. ✅ **SK-02** — TUI `[Install deps]` hotkey
 5. ✅ **SK-03** — skill file watcher
-6. **RT-02** — SSE streaming API (1 day)
+6. ✅ **RT-02** — SSE streaming API
 7. ✅ **GV-01** — doc-pass on runtime-contract refs
 
 **P3+ (defer):**
@@ -161,6 +162,7 @@ Priority cluster, smallest-first within each band:
 | v0.6.28 | Install picker UX | "↵ Enter to search ClawHub" CTA · kind-aware placeholder · `/skill install` mirror |
 | v0.6.29 | Install-deps runner | `metadata.clawdbot.install[]` parser · `skills install-deps` CLI · brew/uv/npm/go/download recipes |
 | v0.6.30 | Skills runtime polish | Gated `/skills` rows · SKILL.md file watcher · tmux TUI smoke in local CI |
+| v0.6.31 | Streaming API | `/api/v1/agent/chat` SSE mode · client-disconnect cancellation · install-deps title cooldown |
 
 ---
 

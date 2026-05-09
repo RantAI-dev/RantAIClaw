@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Stdout, Write};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use crossterm::{
@@ -136,6 +137,7 @@ pub struct TuiApp {
             Result<crate::skills::install_deps::InstallDepsOutcome, String>,
         >,
     >,
+    pub skill_deps_install_finished_at: Option<Instant>,
     /// Background watcher for profile/workspace skill edits. The watcher
     /// owns the OS file handle; the TUI drains debounced reload ticks.
     pub skills_watcher: Option<crate::skills::watcher::SkillsWatcher>,
@@ -331,6 +333,7 @@ impl TuiApp {
             skill_deps_install_in_progress: None,
             skill_deps_install_completion_rx: None,
             skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
             skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
@@ -1871,10 +1874,16 @@ impl TuiApp {
 
         self.refresh_available_skills();
         let items = self.skill_picker_items();
+        let suppress_title = self.skill_deps_install_in_progress.is_some()
+            || self
+                .skill_deps_install_finished_at
+                .is_some_and(|finished| finished.elapsed() < Duration::from_secs(3));
         if let Some(picker) = self.list_picker.as_mut() {
             if picker.kind == crate::tui::widgets::ListPickerKind::Skill {
                 picker.set_items(items);
-                picker.title = "Skills · reloaded".to_string();
+                if !suppress_title {
+                    picker.title = "Skills · reloaded".to_string();
+                }
             }
         }
     }
@@ -2049,6 +2058,7 @@ impl TuiApp {
                 }
             }
             Some(Ok(outcome)) => {
+                self.skill_deps_install_finished_at = Some(Instant::now());
                 self.refresh_available_skills();
                 let items = self.skill_picker_items();
                 if let Some(p) = self.list_picker.as_mut() {
@@ -2075,6 +2085,7 @@ impl TuiApp {
                 self.close_skill_deps_install_state();
             }
             Some(Err(error_msg)) => {
+                self.skill_deps_install_finished_at = Some(Instant::now());
                 if let Some(p) = self.list_picker.as_mut() {
                     p.title = format!("Skills · install-deps failed: {error_msg}");
                 }
@@ -4195,6 +4206,7 @@ mod tests {
             skill_deps_install_in_progress: None,
             skill_deps_install_completion_rx: None,
             skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
             skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
@@ -4287,6 +4299,7 @@ mod submit_tests {
             skill_deps_install_in_progress: None,
             skill_deps_install_completion_rx: None,
             skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
             skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
@@ -4392,6 +4405,7 @@ mod ctrl_c_tests {
             skill_deps_install_in_progress: None,
             skill_deps_install_completion_rx: None,
             skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
             skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
@@ -4478,6 +4492,7 @@ mod drain_tests {
             skill_deps_install_in_progress: None,
             skill_deps_install_completion_rx: None,
             skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
             skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
@@ -4634,6 +4649,7 @@ mod retry_tests {
             skill_deps_install_in_progress: None,
             skill_deps_install_completion_rx: None,
             skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
             skills_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),

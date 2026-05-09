@@ -957,6 +957,8 @@ fn create_provider_with_url_and_options(
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
     match name {
+        #[cfg(test)]
+        "test-sse" => Ok(Box::new(TestSseProvider)),
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
@@ -1169,6 +1171,27 @@ fn create_provider_with_url_and_options(
              Tip: Use \"custom:https://your-api.com\" for OpenAI-compatible endpoints.\n\
              Tip: Use \"anthropic-custom:https://your-api.com\" for Anthropic-compatible endpoints."
         ),
+    }
+}
+
+#[cfg(test)]
+struct TestSseProvider;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Provider for TestSseProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("hello stream".to_string())
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
     }
 }
 

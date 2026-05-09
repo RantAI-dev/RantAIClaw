@@ -10,16 +10,20 @@
 //! test rig can exercise the same backend code paths the TUI hits via slash
 //! commands.
 
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse, Json, Response,
+    },
     routing::{get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use super::AppState;
 
@@ -80,7 +84,7 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, 
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,7 +214,48 @@ struct ChatResponseBody {
     duration_ms: u128,
 }
 
+#[derive(Deserialize, Default)]
+struct ChatQuery {
+    #[serde(default)]
+    stream: Option<String>,
+}
+
 async fn agent_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChatQuery>,
+    Json(body): Json<ChatRequestBody>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    agent_chat_dispatch(State(state), headers, Query(query), Json(body)).await
+}
+
+async fn agent_chat_dispatch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChatQuery>,
+    Json(body): Json<ChatRequestBody>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let wants_stream = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+        || query
+            .stream
+            .as_deref()
+            .is_some_and(|value| matches!(value, "1" | "true" | "yes" | "on"));
+
+    if wants_stream {
+        agent_chat_stream(State(state), headers, Json(body))
+            .await
+            .map(IntoResponse::into_response)
+    } else {
+        agent_chat_sync(State(state), headers, Json(body))
+            .await
+            .map(IntoResponse::into_response)
+    }
+}
+
+async fn agent_chat_sync(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ChatRequestBody>,
@@ -220,16 +265,7 @@ async fn agent_chat(
         return Err(err_400("message must not be empty"));
     }
 
-    let mut config = state.config.lock().clone();
-    if let Some(p) = body.provider {
-        config.default_provider = Some(p);
-    }
-    if let Some(m) = body.model {
-        config.default_model = Some(m);
-    }
-    if let Some(t) = body.temperature {
-        config.default_temperature = t;
-    }
+    let config = chat_config_from_body(&state, &body);
 
     let provider = config
         .default_provider
@@ -254,6 +290,146 @@ async fn agent_chat(
         provider,
         duration_ms: started.elapsed().as_millis(),
     }))
+}
+
+async fn agent_chat_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatRequestBody>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    if body.message.trim().is_empty() {
+        return Err(err_400("message must not be empty"));
+    }
+
+    let config = chat_config_from_body(&state, &body);
+    let model = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let user_message = body.message.clone();
+    let agent_message = body.message.clone();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<crate::agent::AgentEvent>(64);
+    let cancel = CancellationToken::new();
+    let cancel_for_agent = cancel.clone();
+    let cancel_for_stream = cancel.clone();
+
+    tokio::spawn(async move {
+        match crate::agent::Agent::from_config(&config) {
+            Ok(mut agent) => {
+                let _ = agent
+                    .turn_streaming(
+                        &agent_message,
+                        Some(events_tx.clone()),
+                        Some(cancel_for_agent),
+                    )
+                    .await;
+            }
+            Err(err) => {
+                let _ = events_tx
+                    .send(crate::agent::AgentEvent::Error(format!("{err:#}")))
+                    .await;
+                let _ = events_tx
+                    .send(crate::agent::AgentEvent::Done {
+                        final_text: String::new(),
+                        cancelled: false,
+                    })
+                    .await;
+            }
+        }
+    });
+
+    let stream = async_stream::stream! {
+        let _cancel_on_drop = CancelOnDrop(cancel_for_stream);
+        let mut buffered_text = String::new();
+        while let Some(ev) = events_rx.recv().await {
+            let payload = match ev {
+                crate::agent::AgentEvent::Chunk(text) => {
+                    buffered_text.push_str(&text);
+                    serde_json::json!({"type": "chunk", "text": text})
+                }
+                crate::agent::AgentEvent::Usage(usage) => serde_json::json!({
+                    "type": "usage",
+                    "model": usage.model,
+                    "prompt": usage.input_tokens,
+                    "completion": usage.output_tokens,
+                    "total": usage.total_tokens,
+                    "cost_usd": usage.cost_usd,
+                }),
+                crate::agent::AgentEvent::Error(message) => {
+                    serde_json::json!({"type": "error", "message": message})
+                }
+                crate::agent::AgentEvent::Done { final_text, cancelled } => {
+                    let persisted_text = if final_text.is_empty() {
+                        buffered_text.clone()
+                    } else {
+                        final_text.clone()
+                    };
+                    if !cancelled {
+                        if let Ok(store) = open_session_store() {
+                            if let Err(err) = record_api_chat_session(
+                                &store,
+                                &model,
+                                &user_message,
+                                &persisted_text,
+                            ) {
+                                tracing::warn!(
+                                    error = %err,
+                                    "api agent chat stream session persistence failed"
+                                );
+                            }
+                        }
+                    }
+                    serde_json::json!({
+                        "type": "done",
+                        "text": persisted_text,
+                        "cancelled": cancelled,
+                    })
+                }
+                crate::agent::AgentEvent::ToolCallStart { id, name, args } => serde_json::json!({
+                    "type": "tool_call_start",
+                    "id": id,
+                    "name": name,
+                    "args": args,
+                }),
+                crate::agent::AgentEvent::ToolCallEnd { id, ok, output_preview } => serde_json::json!({
+                    "type": "tool_call_end",
+                    "id": id,
+                    "ok": ok,
+                    "output_preview": output_preview,
+                }),
+            };
+            let done = payload.get("type").and_then(|v| v.as_str()) == Some("done");
+            yield Ok::<SseEvent, Infallible>(SseEvent::default().data(payload.to_string()));
+            if done {
+                break;
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn chat_config_from_body(state: &AppState, body: &ChatRequestBody) -> crate::config::Config {
+    let mut config = state.config.lock().clone();
+    if let Some(p) = body.provider.clone() {
+        config.default_provider = Some(p);
+    }
+    if let Some(m) = body.model.clone() {
+        config.default_model = Some(m);
+    }
+    if let Some(t) = body.temperature {
+        config.default_temperature = t;
+    }
+    config
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 fn record_api_chat_session(
@@ -658,6 +834,152 @@ async fn providers_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::{GatewayRateLimiter, IdempotencyStore};
+    use crate::memory::{Memory, MemoryCategory, MemoryEntry};
+    use crate::providers::Provider;
+    use async_trait::async_trait;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct MockProvider;
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+    }
+
+    #[derive(Default)]
+    struct MockMemory;
+
+    #[async_trait]
+    impl Memory for MockMemory {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn test_state() -> AppState {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("test-sse".to_string());
+        config.default_model = Some("test-model".to_string());
+        AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider: Arc::new(MockProvider),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            tools_registry: Arc::new(Vec::new()),
+            webhook_secret_hash: None,
+            pairing: Arc::new(crate::security::pairing::PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
+        }
+    }
+
+    async fn response_text(response: Response<Body>) -> String {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    fn sse_values(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str(line).expect("sse json"))
+            .collect()
+    }
 
     #[test]
     fn record_api_chat_session_persists_user_and_assistant_messages() {
@@ -687,5 +1009,89 @@ mod tests {
         assert_eq!(messages[0].content, "Summarize the runtime contract");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "Runtime contract summary.");
+    }
+
+    #[tokio::test]
+    async fn sse_chat_emits_chunk_then_done() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", temp.path());
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "text/event-stream".parse().unwrap());
+
+        let response = agent_chat_dispatch(
+            State(test_state()),
+            headers,
+            Query(ChatQuery::default()),
+            Json(ChatRequestBody {
+                message: "hello".to_string(),
+                model: None,
+                provider: None,
+                temperature: None,
+            }),
+        )
+        .await
+        .expect("sse response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.starts_with("text/event-stream")),
+            Some(true)
+        );
+
+        let body = response_text(response).await;
+        let events = sse_values(&body);
+        assert!(
+            events.iter().any(|ev| ev["type"] == "chunk"),
+            "missing chunk event in {body:?}"
+        );
+        let done = events
+            .iter()
+            .rfind(|ev| ev["type"] == "done")
+            .expect("done event");
+        assert_eq!(done["text"], "hello stream");
+        assert_eq!(done["cancelled"], false);
+
+        let store = open_session_store().expect("session store");
+        let sessions = store.list_sessions(10).expect("sessions");
+        let meta = sessions.first().expect("persisted session");
+        let session = store
+            .get_session(&meta.id)
+            .expect("get session")
+            .expect("session row");
+        assert_eq!(session.source, "api");
+        assert_eq!(session.model, "test-model");
+        assert_eq!(session.message_count, 2);
+    }
+
+    #[tokio::test]
+    async fn agent_chat_without_stream_accept_returns_sync_json() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", temp.path());
+
+        let response = agent_chat_dispatch(
+            State(test_state()),
+            HeaderMap::new(),
+            Query(ChatQuery::default()),
+            Json(ChatRequestBody {
+                message: "hello".to_string(),
+                model: None,
+                provider: None,
+                temperature: None,
+            }),
+        )
+        .await
+        .expect("sync response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(json["text"], "hello stream");
+        assert_eq!(json["model"], "test-model");
+        assert_eq!(json["provider"], "test-sse");
+        assert!(json["duration_ms"].as_u64().is_some());
     }
 }
