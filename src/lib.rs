@@ -178,6 +178,16 @@ pub(crate) enum SkillCommands {
         /// ClawHub skill slug
         slug: String,
     },
+    /// Install missing binary dependencies for a skill using its declared
+    /// `metadata.clawdbot.install[]` recipes. Picks the preferred recipe
+    /// based on host availability (brew → uv → npm → go → download).
+    InstallDeps {
+        /// Specific skill name to install deps for; omit with --all
+        slug: Option<String>,
+        /// Install deps for every gated skill that has install recipes
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 /// Migration subcommands

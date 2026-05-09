@@ -985,6 +985,18 @@ enum SkillCommands {
         /// ClawHub skill slug.
         slug: String,
     },
+    /// Install missing binary dependencies declared by a skill's
+    /// `metadata.clawdbot.install[]` recipes (brew/npm/uv/go/download).
+    /// Picks the preferred recipe based on what's available on this host.
+    /// Closes the OpenClaw-parity gap where rantaiclaw could detect
+    /// missing bins but couldn't fix them.
+    InstallDeps {
+        /// Skill name. Omit with --all to fix every gated skill that has recipes.
+        slug: Option<String>,
+        /// Run install-deps for every skill whose requires aren't met.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

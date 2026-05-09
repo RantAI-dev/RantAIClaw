@@ -1,5 +1,6 @@
 pub mod bundled;
 pub mod clawhub;
+pub mod install_deps;
 
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -37,6 +38,79 @@ pub struct Skill {
     /// to surface "why" via `skills list` / `skills inspect`.
     #[serde(default)]
     pub requires: SkillRequires,
+    /// Install recipes parsed from `metadata.clawdbot.install[]`. Each
+    /// recipe is one way to fulfil a missing binary requirement
+    /// (`brew install ...`, `npm install -g ...`, etc.). The
+    /// `skills install-deps` runner picks one preferred recipe per skill
+    /// based on host availability. Empty when the skill doesn't ship
+    /// install metadata — user has to install deps themselves.
+    #[serde(default)]
+    pub install_recipes: Vec<SkillInstallRecipe>,
+}
+
+/// One install recipe for a skill's binary dependency. Mirrors OpenClaw's
+/// `metadata.clawdbot.install[]` entries shape.
+///
+/// Five recipe kinds supported:
+/// * `brew`   — `brew install <formula>`. Cross-platform if Homebrew is set up.
+/// * `npm`    — `npm install -g <pkg>` (or pnpm/yarn per `nodeManager`).
+/// * `uv`     — `uv tool install <pkg>` (Python tools).
+/// * `go`     — `go install <module>`. If `go` itself is missing AND
+///              brew is available, the runner bootstraps Go via brew.
+/// * `download` — fetch URL, optionally extract, drop in `targetDir`.
+///
+/// Per ClawHub convention, each recipe MAY have an `os: ["linux"|"darwin"|...]`
+/// filter; runners skip recipes whose `os` doesn't match the current host.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillInstallRecipe {
+    /// Stable identifier (e.g. "brew", "npm-global"). Used for logging.
+    #[serde(default)]
+    pub id: String,
+    /// Recipe kind: brew | npm | uv | go | download.
+    #[serde(default)]
+    pub kind: String,
+    /// Binaries this recipe provides (validates after install).
+    #[serde(default)]
+    pub bins: Vec<String>,
+    /// Human-readable label (e.g. "Install Gemini CLI (brew)").
+    #[serde(default)]
+    pub label: String,
+    /// Platform filter; empty = any.
+    #[serde(default)]
+    pub os: Vec<String>,
+    /// Homebrew formula (kind=brew). Tap-prefixed allowed: `org/tap/formula`.
+    #[serde(default)]
+    pub formula: Option<String>,
+    /// Package name (kind=npm/uv).
+    #[serde(default)]
+    pub pkg: Option<String>,
+    /// Go module path with optional `@version` suffix (kind=go).
+    #[serde(default)]
+    pub module: Option<String>,
+    /// Direct-download URL (kind=download).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Archive type (`tar.gz`, `tar.bz2`, `zip`, or empty/`raw` for no extract).
+    #[serde(default)]
+    pub archive: Option<String>,
+    /// Number of leading directory components to strip on extract.
+    #[serde(default)]
+    pub strip_components: Option<usize>,
+    /// Target directory for download recipes; defaults to
+    /// `~/.rantaiclaw/tools/<skill-slug>/`.
+    #[serde(default)]
+    pub target_dir: Option<String>,
+}
+
+impl SkillInstallRecipe {
+    /// Whether this recipe is eligible on the current host (OS filter).
+    pub fn matches_os(&self) -> bool {
+        if self.os.is_empty() {
+            return true;
+        }
+        let current = std::env::consts::OS;
+        self.os.iter().any(|o| o.eq_ignore_ascii_case(current))
+    }
 }
 
 /// OpenClaw / ClawHub-format declared dependencies for a skill. Mirrors the
@@ -532,6 +606,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         prompts: manifest.prompts,
         location: Some(path.to_path_buf()),
         requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
     })
 }
 
@@ -558,7 +633,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         .map(|s| parse_yaml_list(s))
         .unwrap_or_default();
     let frontmatter_name = frontmatter.get("name").cloned();
-    let requires = parse_skill_requires(&content, &frontmatter);
+    let (requires, install_recipes) = parse_skill_metadata(&content, &frontmatter);
 
     Ok(Skill {
         name: frontmatter_name.unwrap_or(name),
@@ -570,6 +645,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         prompts: vec![content],
         location: Some(path.to_path_buf()),
         requires,
+        install_recipes,
     })
 }
 
@@ -588,7 +664,18 @@ fn parse_skill_requires(
     content: &str,
     frontmatter: &std::collections::HashMap<String, String>,
 ) -> SkillRequires {
+    parse_skill_metadata(content, frontmatter).0
+}
+
+/// Parse both `requires` and `install[]` from SKILL.md frontmatter in
+/// one pass. Returned as a tuple so callers that only need one don't
+/// pay for the other; `parse_skill_requires` is a thin alias.
+fn parse_skill_metadata(
+    content: &str,
+    frontmatter: &std::collections::HashMap<String, String>,
+) -> (SkillRequires, Vec<SkillInstallRecipe>) {
     let mut req = SkillRequires::default();
+    let mut recipes: Vec<SkillInstallRecipe> = Vec::new();
 
     // Shape 1: metadata: {"clawdbot": {...}}
     if let Some(metadata_raw) = frontmatter.get("metadata") {
@@ -612,6 +699,65 @@ fn parse_skill_requires(
                     if let Some(os) = scoped.get("os").and_then(|v| v.as_array()) {
                         req.os.extend(os.iter().filter_map(|v| v.as_str().map(String::from)));
                     }
+                    // install[]: each entry is a recipe object. Common
+                    // fields: id, kind, bins[], label, os[]; per-kind:
+                    // formula | pkg | module | url | archive | …
+                    if let Some(install) = scoped.get("install").and_then(|v| v.as_array()) {
+                        for entry in install {
+                            let mut recipe = SkillInstallRecipe::default();
+                            if let Some(s) = entry.get("id").and_then(|v| v.as_str()) {
+                                recipe.id = s.into();
+                            }
+                            if let Some(s) = entry.get("kind").and_then(|v| v.as_str()) {
+                                recipe.kind = s.into();
+                            }
+                            if let Some(arr) = entry.get("bins").and_then(|v| v.as_array()) {
+                                recipe.bins.extend(
+                                    arr.iter().filter_map(|v| v.as_str().map(String::from)),
+                                );
+                            }
+                            if let Some(s) = entry.get("label").and_then(|v| v.as_str()) {
+                                recipe.label = s.into();
+                            }
+                            if let Some(arr) = entry.get("os").and_then(|v| v.as_array()) {
+                                recipe.os.extend(
+                                    arr.iter().filter_map(|v| v.as_str().map(String::from)),
+                                );
+                            }
+                            recipe.formula = entry
+                                .get("formula")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            recipe.pkg = entry
+                                .get("pkg")
+                                .or_else(|| entry.get("package"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            recipe.module = entry
+                                .get("module")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            recipe.url = entry
+                                .get("url")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            recipe.archive = entry
+                                .get("archive")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            recipe.strip_components =
+                                entry.get("stripComponents").and_then(|v| v.as_u64()).map(
+                                    |n| n as usize,
+                                );
+                            recipe.target_dir = entry
+                                .get("targetDir")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            if !recipe.kind.is_empty() {
+                                recipes.push(recipe);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -634,7 +780,7 @@ fn parse_skill_requires(
         }
     }
 
-    req
+    (req, recipes)
 }
 
 /// Pull `name: FOO_BAR` entries out of a top-level `env:` YAML block.
@@ -769,6 +915,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         prompts: vec![content],
         location: Some(path.to_path_buf()),
         requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
     })
 }
 
@@ -1071,6 +1218,20 @@ pub(crate) fn handle_command(
                             console::style("gated").red(),
                             reasons.join("; ")
                         );
+                        // Show the install-deps hint when the skill ships
+                        // recipes that could fix a missing-binary
+                        // gating. Mirrors OpenClaw's macOS-Skills-UI
+                        // "one-tap install" affordance, just text-based.
+                        let has_missing_bin = reasons
+                            .iter()
+                            .any(|r| r.starts_with("missing binary"));
+                        if has_missing_bin && !skill.install_recipes.is_empty() {
+                            println!(
+                                "    {} run `rantaiclaw skills install-deps {}` to fix",
+                                console::style("→").cyan(),
+                                skill.name
+                            );
+                        }
                     }
                 }
             }
@@ -1367,6 +1528,87 @@ pub(crate) fn handle_command(
             .join()
             .map_err(|_| anyhow::anyhow!("inspect thread panicked"))?
         }
+        crate::SkillCommands::InstallDeps { slug, all } => {
+            let with_status = load_skills_with_status(workspace_dir, config);
+
+            // Build the list of (skill, missing-bins) targets.
+            let targets: Vec<&Skill> = if all {
+                with_status
+                    .iter()
+                    .filter(|(s, _)| !s.requires.bins.is_empty())
+                    .map(|(s, _)| s)
+                    .collect()
+            } else if let Some(s) = slug.as_ref() {
+                let found = with_status
+                    .iter()
+                    .find(|(skill, _)| skill.name.eq_ignore_ascii_case(s))
+                    .map(|(skill, _)| skill);
+                match found {
+                    Some(s) => vec![s],
+                    None => anyhow::bail!("skill `{s}` not found"),
+                }
+            } else {
+                anyhow::bail!("`skills install-deps` needs either a slug or --all");
+            };
+
+            if targets.is_empty() {
+                println!("Nothing to do — no skills declare binary requirements.");
+                return Ok(());
+            }
+
+            let mut had_failure = false;
+            for skill in &targets {
+                if skill.install_recipes.is_empty() {
+                    if !skill.requires.bins.is_empty() {
+                        let missing: Vec<&str> = skill
+                            .requires
+                            .bins
+                            .iter()
+                            .filter(|b| which::which(b).is_err())
+                            .map(|b| b.as_str())
+                            .collect();
+                        if !missing.is_empty() {
+                            println!(
+                                "⊘ {}: missing {} but no install recipes declared — install manually",
+                                skill.name,
+                                missing.join(", ")
+                            );
+                        }
+                    }
+                    continue;
+                }
+                match install_deps::install_deps_for(skill) {
+                    Ok(outcome) if outcome.success() => {
+                        println!(
+                            "  {} {}: installed {}",
+                            console::style("✓").green().bold(),
+                            outcome.skill,
+                            outcome.bins_installed.join(", ")
+                        );
+                    }
+                    Ok(outcome) if outcome.recipe_used.is_none() => {
+                        println!("  · {}: deps already satisfied", outcome.skill);
+                    }
+                    Ok(outcome) => {
+                        had_failure = true;
+                        println!(
+                            "  ✗ {}: recipe ran but {} still missing",
+                            outcome.skill,
+                            outcome.bins_still_missing.join(", ")
+                        );
+                    }
+                    Err(e) => {
+                        had_failure = true;
+                        println!("  ✗ {}: {e}", skill.name);
+                    }
+                }
+            }
+
+            if had_failure {
+                anyhow::bail!("one or more install-deps runs failed");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1481,6 +1723,7 @@ command = "echo hello"
             prompts: vec!["Do the thing.".to_string()],
             location: None,
             requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<available_skills>"));
@@ -1506,6 +1749,7 @@ command = "echo hello"
             prompts: vec!["Do the thing.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
             requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
         }];
         let prompt = skills_to_prompt_with_mode(
             &skills,
@@ -1707,6 +1951,7 @@ description = "Bare minimum"
             prompts: vec![],
             location: None,
             requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
@@ -1727,6 +1972,7 @@ description = "Bare minimum"
             prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
             location: None,
             requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
         }];
 
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));

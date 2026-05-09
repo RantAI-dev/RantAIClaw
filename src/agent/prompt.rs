@@ -396,6 +396,7 @@ mod tests {
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: None,
             requires: Default::default(),
+            install_recipes: Vec::new(),
         }];
 
         let ctx = PromptContext {
@@ -435,6 +436,7 @@ mod tests {
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
             requires: Default::default(),
+            install_recipes: Vec::new(),
         }];
 
         let ctx = PromptContext {
@@ -496,6 +498,7 @@ mod tests {
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
             requires: Default::default(),
+            install_recipes: Vec::new(),
         }];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),

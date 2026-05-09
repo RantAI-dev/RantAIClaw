@@ -410,6 +410,7 @@ mod tests {
             prompts: vec![],
             location: None,
             requires: Default::default(),
+            install_recipes: Vec::new(),
         });
         let result = cmd.execute("summarizer", &mut ctx).unwrap();
         match result {
