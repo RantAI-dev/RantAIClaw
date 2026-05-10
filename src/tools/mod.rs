@@ -45,6 +45,8 @@ pub mod schema;
 pub mod screenshot;
 pub mod shell;
 pub mod skill_tool;
+pub mod skills_install;
+pub mod skills_meta;
 pub mod task_comment;
 pub mod task_complete_subtask;
 pub mod task_create;
@@ -309,6 +311,32 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    // Hermes-parity skill management surface — read-side first
+    // (skills_list, skill_view, skills_search) is unconditional. The
+    // write side (skills_install, skills_install_deps) is also
+    // unconditional but routes through the existing approval manager
+    // by name; users wanting frictionless install add them to
+    // `[security] auto_approve = [...]`. Mirrors the shell tool
+    // approval pattern.
+    tool_arcs.push(Arc::new(skills_meta::SkillsListTool::new(
+        workspace_dir.to_path_buf(),
+        config.clone(),
+    )));
+    tool_arcs.push(Arc::new(skills_meta::SkillViewTool::new(
+        workspace_dir.to_path_buf(),
+        config.clone(),
+    )));
+    tool_arcs.push(Arc::new(skills_meta::SkillsSearchTool::new()));
+    if let Ok(active_profile) = crate::profile::ProfileManager::active() {
+        tool_arcs.push(Arc::new(skills_install::SkillsInstallTool::new(
+            active_profile,
+        )));
+    }
+    tool_arcs.push(Arc::new(skills_install::SkillsInstallDepsTool::new(
+        workspace_dir.to_path_buf(),
+        config.clone(),
+    )));
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
