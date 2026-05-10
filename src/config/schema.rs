@@ -469,6 +469,49 @@ pub struct SkillsConfig {
     /// `enabled`.
     #[serde(default)]
     pub entries: std::collections::HashMap<String, SkillEntryConfig>,
+    /// Install-recipe selection knobs. OpenClaw exposes the equivalents
+    /// at `skills.install.preferBrew` / `nodeManager` — same shape here
+    /// so a user moving from OpenClaw can paste their preferences in
+    /// and have them honoured.
+    #[serde(default, alias = "install")]
+    pub install: SkillsInstallConfig,
+}
+
+/// Recipe-selector overrides for `skills install-deps`. Defaults match the
+/// hardcoded preference order shipped through v0.6.31 (brew first, npm as
+/// the node-manager default), so this block is only needed when a user
+/// wants to deviate.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkillsInstallConfig {
+    /// When true (default), the runner prefers `brew` recipes over
+    /// `uv`/`npm`/`go` when brew is available on the host. Set to
+    /// `false` to demote brew below uv. Has no effect on hosts without
+    /// brew.
+    #[serde(default = "default_true_install")]
+    pub prefer_brew: bool,
+    /// Which node-package-manager recipe wins when multiple are
+    /// declared. Recognised values: `npm` (default), `pnpm`, `yarn`.
+    /// Unknown values fall back to `npm`. The runner still skips a
+    /// preferred recipe whose driver isn't on `$PATH`.
+    #[serde(default = "default_node_manager")]
+    pub node_manager: String,
+}
+
+impl Default for SkillsInstallConfig {
+    fn default() -> Self {
+        Self {
+            prefer_brew: true,
+            node_manager: default_node_manager(),
+        }
+    }
+}
+
+fn default_true_install() -> bool {
+    true
+}
+
+fn default_node_manager() -> String {
+    "npm".to_string()
 }
 
 /// Per-skill configuration entry — OpenClaw `skills.entries.<name>` parity.

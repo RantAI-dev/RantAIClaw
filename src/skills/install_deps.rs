@@ -36,9 +36,59 @@ impl InstallDepsOutcome {
     }
 }
 
-/// Run the preferred install recipe for a skill and validate that the
-/// declared bins now resolve via `which`.
+/// Run the preferred install recipe for a skill, using the default
+/// selector preferences. Convenience wrapper around
+/// [`install_deps_for_with_prefs`] for callers that don't have a config
+/// in hand.
 pub fn install_deps_for(skill: &Skill) -> Result<InstallDepsOutcome> {
+    install_deps_for_with_prefs(skill, &SelectorPrefs::default())
+}
+
+/// User-configurable knobs for [`pick_preferred`]. Mirrors
+/// `[skills.install]` in `config.toml` (`prefer_brew`, `node_manager`).
+/// Defaults match the historical hardcoded order.
+#[derive(Debug, Clone)]
+pub struct SelectorPrefs {
+    /// When true, brew sorts ahead of uv/npm/go (the legacy behaviour).
+    /// Set to false to demote brew to the bottom of the eligible list
+    /// — useful on hosts where brew is installed but the user prefers
+    /// language-native installers (uv for Python, pnpm for Node, …).
+    pub prefer_brew: bool,
+    /// Which node-package-manager kind wins when multiple are declared.
+    /// Recognised: `npm` | `pnpm` | `yarn`. Unknown values fall through
+    /// to `npm`.
+    pub node_manager: String,
+}
+
+impl Default for SelectorPrefs {
+    fn default() -> Self {
+        Self {
+            prefer_brew: true,
+            node_manager: "npm".to_string(),
+        }
+    }
+}
+
+impl SelectorPrefs {
+    /// Build from a `[skills.install]` config block.
+    pub fn from_config(cfg: &crate::config::SkillsInstallConfig) -> Self {
+        Self {
+            prefer_brew: cfg.prefer_brew,
+            node_manager: if cfg.node_manager.is_empty() {
+                "npm".into()
+            } else {
+                cfg.node_manager.clone()
+            },
+        }
+    }
+}
+
+/// Same as [`install_deps_for`] but threads through user-configured
+/// recipe-selector preferences.
+pub fn install_deps_for_with_prefs(
+    skill: &Skill,
+    prefs: &SelectorPrefs,
+) -> Result<InstallDepsOutcome> {
     let missing: Vec<String> = skill
         .requires
         .bins
@@ -75,10 +125,12 @@ pub fn install_deps_for(skill: &Skill) -> Result<InstallDepsOutcome> {
         );
     }
 
-    // Preference order (matches OpenClaw's `skills.install.preferBrew → uv
-    // → node manager → go → download`). For now we hardcode the order;
-    // can later read `skills.install.*` config keys.
-    let preferred: Vec<&SkillInstallRecipe> = pick_preferred(&candidates);
+    // Preference order: brew → uv → <node-manager> → go → download by
+    // default. `prefer_brew = false` demotes brew to the bottom;
+    // `node_manager = "pnpm" | "yarn"` swaps which Node recipe wins
+    // when multiple are declared. Both knobs come from
+    // `[skills.install]` in `config.toml` and mirror OpenClaw.
+    let preferred: Vec<&SkillInstallRecipe> = pick_preferred_with_prefs(&candidates, prefs);
 
     if preferred.is_empty() {
         bail!(
@@ -127,17 +179,46 @@ pub fn install_deps_for(skill: &Skill) -> Result<InstallDepsOutcome> {
     })
 }
 
-/// Pick recipes the host can actually run. A recipe is "available" when
-/// its driver tool (brew, uv, npm, etc.) is on `$PATH`. `download` is
-/// always available because we use `reqwest` + builtin extract logic.
+/// Default-prefs wrapper preserved for tests + external callers that
+/// don't carry a `SelectorPrefs`.
+fn pick_preferred<'a>(candidates: &'a [&'a SkillInstallRecipe]) -> Vec<&'a SkillInstallRecipe> {
+    pick_preferred_with_prefs(candidates, &SelectorPrefs::default())
+}
+
+/// Pick recipes the host can actually run, ordered by user preference.
+/// A recipe is "available" when its driver tool (brew, uv, npm, etc.)
+/// is on `$PATH`. `download` is always available because we use
+/// `reqwest` + system tar/unzip.
 ///
 /// Returns recipes in preference order — caller picks `[0]`.
-fn pick_preferred<'a>(candidates: &'a [&'a SkillInstallRecipe]) -> Vec<&'a SkillInstallRecipe> {
+///
+/// Default ordering: brew → uv → npm → go → download.
+/// `prefer_brew=false` demotes brew to the bottom of the eligible
+/// list (still considered, just not preferred).
+/// `node_manager` selects which Node recipe wins; non-preferred Node
+/// kinds rank below the preferred one.
+fn pick_preferred_with_prefs<'a>(
+    candidates: &'a [&'a SkillInstallRecipe],
+    prefs: &SelectorPrefs,
+) -> Vec<&'a SkillInstallRecipe> {
+    let pref_node = match prefs.node_manager.as_str() {
+        "pnpm" | "yarn" => prefs.node_manager.as_str(),
+        _ => "npm",
+    };
+
     let kind_priority = |kind: &str| -> i32 {
+        let node_pref_score = if kind == pref_node { 2 } else { 5 };
         match kind {
-            "brew" => 0,
+            "brew" => {
+                if prefs.prefer_brew {
+                    0
+                } else {
+                    // Demote to second-to-last; download stays bottom.
+                    8
+                }
+            }
             "uv" => 1,
-            "npm" | "pnpm" | "yarn" | "node" => 2,
+            "npm" | "pnpm" | "yarn" | "node" => node_pref_score,
             "go" => 3,
             "download" => 4,
             _ => 99,
@@ -505,6 +586,103 @@ mod tests {
         assert!(!r.matches_os());
         r.os = vec![std::env::consts::OS.into()];
         assert!(r.matches_os());
+    }
+
+    #[test]
+    fn pick_preferred_with_prefer_brew_false_demotes_brew() {
+        // Build a candidate set where brew, uv, and download all rank.
+        // download is the only kind whose driver is unconditionally
+        // available, so we can compare placement reliably.
+        let brew = r("brew");
+        let uv = r("uv");
+        let download = r("download");
+        let candidates = vec![&brew, &uv, &download];
+
+        let mut prefs = SelectorPrefs::default();
+        prefs.prefer_brew = false;
+
+        let picked = pick_preferred_with_prefs(&candidates, &prefs);
+
+        // download should outrank brew when prefer_brew=false (brew
+        // demoted to priority 8, download stays at 4). brew may be
+        // entirely absent from the picked list when its driver is
+        // missing — which is the dominant case on test hosts.
+        if let Some(brew_pos) = picked.iter().position(|r| r.kind == "brew") {
+            let download_pos = picked
+                .iter()
+                .position(|r| r.kind == "download")
+                .expect("download is always available");
+            assert!(
+                download_pos < brew_pos,
+                "with prefer_brew=false, download should outrank brew (got download={download_pos}, brew={brew_pos})"
+            );
+        }
+    }
+
+    #[test]
+    fn pick_preferred_with_pnpm_node_manager_outranks_npm() {
+        let npm = r("npm");
+        let pnpm = r("pnpm");
+        let yarn = r("yarn");
+        let candidates = vec![&npm, &pnpm, &yarn];
+
+        let mut prefs = SelectorPrefs::default();
+        prefs.node_manager = "pnpm".to_string();
+
+        let picked = pick_preferred_with_prefs(&candidates, &prefs);
+
+        // Among the node-flavoured kinds, pnpm should sort first when
+        // its driver is available. Skip the assertion on hosts that
+        // don't have pnpm at all.
+        if let (Some(p_pos), Some(n_pos)) = (
+            picked.iter().position(|r| r.kind == "pnpm"),
+            picked.iter().position(|r| r.kind == "npm"),
+        ) {
+            assert!(
+                p_pos < n_pos,
+                "node_manager=pnpm should outrank npm (got pnpm={p_pos}, npm={n_pos})"
+            );
+        }
+    }
+
+    #[test]
+    fn pick_preferred_with_unknown_node_manager_falls_back_to_npm() {
+        let npm = r("npm");
+        let pnpm = r("pnpm");
+        let candidates = vec![&npm, &pnpm];
+
+        let mut prefs = SelectorPrefs::default();
+        prefs.node_manager = "fnm".to_string(); // unknown — falls back to npm
+
+        let picked = pick_preferred_with_prefs(&candidates, &prefs);
+        if let (Some(n_pos), Some(p_pos)) = (
+            picked.iter().position(|r| r.kind == "npm"),
+            picked.iter().position(|r| r.kind == "pnpm"),
+        ) {
+            assert!(
+                n_pos < p_pos,
+                "unknown node_manager should fall back to npm preference (got npm={n_pos}, pnpm={p_pos})"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_prefs_from_config_round_trip() {
+        let cfg = crate::config::SkillsInstallConfig {
+            prefer_brew: false,
+            node_manager: "yarn".into(),
+        };
+        let prefs = SelectorPrefs::from_config(&cfg);
+        assert!(!prefs.prefer_brew);
+        assert_eq!(prefs.node_manager, "yarn");
+
+        // Empty node_manager defaults to npm.
+        let cfg_empty = crate::config::SkillsInstallConfig {
+            prefer_brew: true,
+            node_manager: String::new(),
+        };
+        let prefs2 = SelectorPrefs::from_config(&cfg_empty);
+        assert_eq!(prefs2.node_manager, "npm");
     }
 
     #[test]

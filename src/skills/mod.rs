@@ -1578,7 +1578,8 @@ pub(crate) fn handle_command(
                     }
                     continue;
                 }
-                match install_deps::install_deps_for(skill) {
+                let prefs = install_deps::SelectorPrefs::from_config(&config.skills.install);
+                match install_deps::install_deps_for_with_prefs(skill, &prefs) {
                     Ok(outcome) if outcome.success() => {
                         println!(
                             "  {} {}: installed {}",

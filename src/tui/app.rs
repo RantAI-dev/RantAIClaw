@@ -1854,9 +1854,11 @@ impl TuiApp {
         self.skill_deps_install_completion_tx = Some(tx.clone());
         self.skill_deps_install_in_progress = Some((skill.name.clone(), 0));
 
+        let prefs =
+            crate::skills::install_deps::SelectorPrefs::from_config(&self.config.skills.install);
         tokio::task::spawn_blocking(move || {
-            let result =
-                crate::skills::install_deps::install_deps_for(&skill).map_err(|e| format!("{e:#}"));
+            let result = crate::skills::install_deps::install_deps_for_with_prefs(&skill, &prefs)
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
     }
