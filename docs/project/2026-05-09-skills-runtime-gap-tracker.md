@@ -77,6 +77,23 @@ a backlog, not a snapshot.
 
 ---
 
+## ⛔ Maintainer freeze (2026-05-10)
+
+> "as i say before if this new feature forget it. im afraid this will broke the future."
+>
+> — maintainer, after v0.6.32 shipped
+
+**No new features.** P3 / P4 rows below stay parked **regardless of trigger**. If any "trigger condition" surfaces, raise with the maintainer first — do **not** promote autonomously. Scope from here on:
+- ✅ bug fixes in already-shipped code
+- ✅ test additions for already-shipped code
+- ✅ documentation corrections
+- ✅ lint / warning cleanup
+- ❌ anything that adds a CLI flag, config key, route, file, env var, or capability
+
+This freeze applies until the maintainer explicitly lifts it.
+
+---
+
 ## Open gaps (skill system)
 
 | ID | Gap | Effort | Priority | Notes |
