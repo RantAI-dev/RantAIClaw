@@ -333,12 +333,31 @@ impl SetupOverlayState {
 
         // Compute the heights of the optional prompt + choose blocks
         // so the surrounding spacers can collapse cleanly when empty.
+        //
+        // `choose_h` is capped to the space the layout can actually give
+        // it — without the cap, a ClawHub picker with 20+ options would
+        // claim 24+ rows of `Length`, the layout would clamp the chunk
+        // to whatever the terminal allows, but `last_choose_viewport`
+        // (set during render of the inner options area) would still
+        // reflect the requested height. `clamp_choose_scroll_to_cursor`
+        // then never engages, the user presses Down past the bottom row,
+        // and the cursor moves into clipped-but-invisible rows. Bug-hunt
+        // round 2 reported exactly this on "Select ClawHub skills".
+        //
+        // Reserve fixed chrome: brand(2) + top rule(1) + spacer(1) +
+        // spacer-after-interactive(1, conditional) + status-log min(3) +
+        // bottom rule(1) + footer(1) = 9–10 rows. Anything above that
+        // goes to the interactive region.
         let prompt_block_h: u16 = if self.prompt.is_some() { 3 } else { 0 };
-        let choose_h: u16 = self
+        let raw_choose_h: u16 = self
             .choose
             .as_ref()
             .map(|c| (c.options.len() as u16).saturating_add(4)) // section + headline + rule + spacer
             .unwrap_or(0);
+        let fixed_chrome: u16 = 2 + 1 + 1 + 1 + 3 + 1 + 1; // see comment above
+        let max_interactive_h = outer.height.saturating_sub(fixed_chrome);
+        let max_choose_h = max_interactive_h.saturating_sub(prompt_block_h);
+        let choose_h: u16 = raw_choose_h.min(max_choose_h);
         let interactive_h = prompt_block_h.saturating_add(choose_h);
         let interactive_spacer: u16 = if interactive_h > 0 { 1 } else { 0 };
 
