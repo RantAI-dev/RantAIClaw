@@ -1456,6 +1456,25 @@ impl TuiApp {
             body.push_str("[cancelled]");
         }
 
+        // Provider returned no text after the tool loop — most often a
+        // model that emits tool calls then stops without a final natural-
+        // language summary (seen with MiniMax + multi-tool flows like
+        // "help me setup gog skill"). Without this fallback the TUI
+        // committed an empty Assistant: line, leaving the user staring
+        // at a blank reply with no signal that the turn actually ended.
+        // Salvage anything we streamed during the turn; otherwise show
+        // an explicit "[no response]" so the user knows to retry.
+        if !cancelled && body.is_empty() {
+            if let AppState::Streaming { partial, .. } = &self.state {
+                if !partial.is_empty() {
+                    body = partial.clone();
+                }
+            }
+            if body.is_empty() {
+                body = "[no response from model — try /retry or rephrase]".to_string();
+            }
+        }
+
         // Snapshot tool blocks from streaming state before we transition
         // away — they're discarded otherwise.
         let tool_calls_json = if let AppState::Streaming { tool_blocks, .. } = &self.state {
