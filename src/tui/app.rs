@@ -34,6 +34,11 @@ pub struct ToolBlockState {
     pub name: String,
     pub args: serde_json::Value,
     pub result: Option<(bool, String)>, // (ok, preview)
+    /// When this tool call started, for the working-indicator's
+    /// per-tool elapsed timer. Set when we see `ToolCallStart` and
+    /// frozen at `ToolCallEnd` time (still readable; just not the
+    /// "current" tool any more).
+    pub started_at: std::time::Instant,
 }
 
 /// Current application state.
@@ -45,6 +50,9 @@ pub enum AppState {
         partial: String,
         tool_blocks: Vec<ToolBlockState>,
         cancelling: bool,
+        /// When the user's turn started, used by the working
+        /// indicator's elapsed counter when no tool is in flight.
+        turn_started_at: std::time::Instant,
     },
     Quitting,
 }
@@ -1121,6 +1129,7 @@ impl TuiApp {
                     partial: String::new(),
                     tool_blocks: Vec::new(),
                     cancelling: false,
+                    turn_started_at: std::time::Instant::now(),
                 };
                 self.stream_committed_chars = 0;
                 self.stream_header_committed = false;
@@ -1428,6 +1437,7 @@ impl TuiApp {
                         name,
                         args,
                         result: None,
+                        started_at: std::time::Instant::now(),
                     });
                 }
             }
@@ -1550,6 +1560,7 @@ impl TuiApp {
                 partial: String::new(),
                 tool_blocks: Vec::new(),
                 cancelling: false,
+                turn_started_at: std::time::Instant::now(),
             };
             self.stream_committed_chars = 0;
             self.stream_header_committed = false;
@@ -2325,6 +2336,7 @@ impl TuiApp {
                     partial: String::new(),
                     tool_blocks: Vec::new(),
                     cancelling: false,
+                    turn_started_at: std::time::Instant::now(),
                 };
                 self.context.last_error = None;
             }
@@ -2412,7 +2424,7 @@ impl TuiApp {
 
             render_stream_preview_pane(state, *stream_committed_chars, frame, chunks[0]);
             render_input_pane(context, frame, chunks[1]);
-            render_status_pane(context, frame, chunks[2]);
+            render_status_pane(context, state, frame, chunks[2]);
 
             // Modal overlay (e.g. /help) takes over the entire viewport.
             if let Some(content) = overlay.as_ref() {
@@ -2520,6 +2532,7 @@ impl TuiApp {
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
         let TuiApp {
+            state,
             context,
             autocomplete,
             ..
@@ -2543,7 +2556,7 @@ impl TuiApp {
 
             render_input_pane(context, frame, chunks[1]);
             autocomplete.render(frame, chunks[3]);
-            render_status_pane(context, frame, chunks[4]);
+            render_status_pane(context, state, frame, chunks[4]);
         })?;
         Ok(())
     }
@@ -3290,12 +3303,43 @@ fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
     frame.render_widget(input, area);
 }
 
-fn render_status_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
+fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::Frame, area: Rect) {
     let muted = Style::default().fg(Color::Rgb(107, 114, 128));
     let sky = Style::default().fg(Color::Rgb(94, 184, 255));
     let coral = Style::default()
         .fg(Color::Rgb(255, 123, 123))
         .add_modifier(Modifier::BOLD);
+
+    // While the agent is streaming a turn, the status line is more
+    // useful as a "what is happening right now" indicator than as a
+    // model/token meter. We replace the whole line with the
+    // wall-clock-driven working indicator. When the turn finishes,
+    // the line snaps back to the normal token/age view.
+    if let AppState::Streaming {
+        tool_blocks,
+        cancelling,
+        turn_started_at,
+        ..
+    } = state
+    {
+        use crate::tui::widgets::working_indicator::{render as render_indicator, WorkingState};
+        let now = std::time::Instant::now();
+        let indicator_state = if *cancelling {
+            WorkingState::Cancelling
+        } else if let Some(current) = tool_blocks.iter().rev().find(|b| b.result.is_none()) {
+            WorkingState::Tool {
+                name: current.name.as_str(),
+                tool_started: current.started_at,
+            }
+        } else {
+            WorkingState::Thinking {
+                turn_started: *turn_started_at,
+            }
+        };
+        let line = render_indicator(&indicator_state, now);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
 
     let line = if let Some(ref err) = ctx.last_error {
         Line::from(vec![
@@ -4466,6 +4510,7 @@ mod submit_tests {
             partial: String::new(),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
         app.context.input_buffer = "queued".into();
 
@@ -4554,6 +4599,7 @@ mod ctrl_c_tests {
             partial: String::new(),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
 
         let result = app
@@ -4642,6 +4688,7 @@ mod drain_tests {
             partial: String::from("prev "),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
         events_tx
             .send(AgentEvent::Chunk("more".into()))
@@ -4665,6 +4712,7 @@ mod drain_tests {
             partial: String::from("answer"),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
         events_tx
             .send(AgentEvent::Done {
@@ -4689,6 +4737,7 @@ mod drain_tests {
             partial: String::from("partial text from chunks"),
             tool_blocks: vec![],
             cancelling: true,
+            turn_started_at: std::time::Instant::now(),
         };
         // Agent emits Done with empty final_text on cancel — TUI must use local partial.
         events_tx
@@ -4715,6 +4764,7 @@ mod drain_tests {
             partial: String::new(),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
         events_tx
             .send(AgentEvent::ToolCallStart {
@@ -4825,6 +4875,7 @@ mod retry_tests {
             partial: String::new(),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
 
         app.handle_command("retry").await.unwrap();

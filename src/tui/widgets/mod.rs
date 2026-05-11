@@ -4,6 +4,7 @@ pub mod list_picker;
 pub mod model_picker;
 pub mod setup_overlay;
 pub mod spinner;
+pub mod working_indicator;
 
 #[allow(unused_imports)]
 pub use autocomplete::Autocomplete;
