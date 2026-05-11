@@ -1,8 +1,12 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
+
+use crate::security::runtime_overlay;
 
 /// How much autonomy the agent has
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -83,6 +87,7 @@ pub struct SecurityPolicy {
     pub autonomy: AutonomyLevel,
     pub workspace_dir: PathBuf,
     pub workspace_only: bool,
+    /// Boot-time allowlist from config (immutable after load — auditable).
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
     pub max_actions_per_hour: u32,
@@ -90,6 +95,15 @@ pub struct SecurityPolicy {
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub tracker: ActionTracker,
+    /// Runtime allowlist — user-approved basenames added during the
+    /// session. Cloned by handle, so all `SecurityPolicy` clones share
+    /// the same set. Optionally backed by a persisted overlay file
+    /// (`<policy_dir>/runtime_allowlist.toml`).
+    pub runtime_allowlist: Arc<RwLock<HashSet<String>>>,
+    /// Where to persist additions when `add_runtime_command(_, true)` is
+    /// called. `None` means runtime additions stay in-memory only
+    /// (default for ad-hoc/test policies).
+    pub policy_dir: Option<PathBuf>,
 }
 
 impl Default for SecurityPolicy {
@@ -140,6 +154,8 @@ impl Default for SecurityPolicy {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             tracker: ActionTracker::new(),
+            runtime_allowlist: Arc::new(RwLock::new(HashSet::new())),
+            policy_dir: None,
         }
     }
 }
@@ -610,11 +626,12 @@ impl SecurityPolicy {
                 continue;
             }
 
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| allowed == base_cmd)
-            {
+            let on_boot_list = self.allowed_commands.iter().any(|a| a == base_cmd);
+            let on_runtime_list = !on_boot_list && {
+                let set = self.runtime_allowlist.read();
+                set.contains(base_cmd)
+            };
+            if !on_boot_list && !on_runtime_list {
                 return false;
             }
 
@@ -783,11 +800,39 @@ impl SecurityPolicy {
         self.tracker.count() >= self.max_actions_per_hour as usize
     }
 
-    /// Build from config sections
+    /// Build from config sections.
     pub fn from_config(
         autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
     ) -> Self {
+        Self::from_config_with_policy_dir(autonomy_config, workspace_dir, None)
+    }
+
+    /// Build from config sections and bind to a `policy_dir`. If the dir
+    /// contains a `runtime_allowlist.toml`, its basenames are loaded into
+    /// the in-memory runtime set. Subsequent `add_runtime_command(_, true)`
+    /// calls will persist into the same file.
+    pub fn from_config_with_policy_dir(
+        autonomy_config: &crate::config::AutonomyConfig,
+        workspace_dir: &Path,
+        policy_dir: Option<PathBuf>,
+    ) -> Self {
+        let runtime_set: HashSet<String> = match policy_dir.as_deref() {
+            Some(dir) => runtime_overlay::load(dir)
+                .map_err(|e| {
+                    tracing::warn!(
+                        target: "security",
+                        error = %e,
+                        "failed to load runtime allowlist overlay; continuing with empty set"
+                    );
+                    e
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            None => HashSet::new(),
+        };
+
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
@@ -799,7 +844,46 @@ impl SecurityPolicy {
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             tracker: ActionTracker::new(),
+            runtime_allowlist: Arc::new(RwLock::new(runtime_set)),
+            policy_dir,
         }
+    }
+
+    /// Add a basename to the runtime allowlist.
+    ///
+    /// - `persist = false`: in-memory only, lost on restart (session).
+    /// - `persist = true`: also written to `<policy_dir>/runtime_allowlist.toml`
+    ///   so the entry survives restart. Returns `Err` if no `policy_dir`
+    ///   was bound (caller asked for persistence but we have nowhere to
+    ///   write).
+    pub fn add_runtime_command(&self, basename: &str, persist: bool) -> anyhow::Result<()> {
+        let basename = basename.trim();
+        if basename.is_empty() {
+            anyhow::bail!("runtime allowlist: empty basename");
+        }
+        if basename.contains(char::is_whitespace) {
+            anyhow::bail!("runtime allowlist: basename must be a single token");
+        }
+        {
+            let mut set = self.runtime_allowlist.write();
+            set.insert(basename.to_string());
+        }
+        if persist {
+            let dir = self.policy_dir.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("runtime allowlist: persist requested but no policy_dir bound")
+            })?;
+            runtime_overlay::append(dir, basename)?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot of basenames currently in the runtime allowlist
+    /// (in-memory + previously-persisted entries merged at load time).
+    pub fn runtime_allowlist_snapshot(&self) -> Vec<String> {
+        let set = self.runtime_allowlist.read();
+        let mut v: Vec<String> = set.iter().cloned().collect();
+        v.sort();
+        v
     }
 }
 
@@ -1753,5 +1837,95 @@ mod tests {
             !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
             "URL-encoded parent dir traversal must be blocked"
         );
+    }
+
+    // ── runtime allowlist ───────────────────────────────────
+
+    #[test]
+    fn runtime_allowlist_command_passes_is_command_allowed() {
+        let policy = SecurityPolicy {
+            allowed_commands: vec!["ls".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!policy.is_command_allowed("brew --version"));
+        policy.add_runtime_command("brew", false).unwrap();
+        assert!(policy.is_command_allowed("brew --version"));
+    }
+
+    #[test]
+    fn runtime_allowlist_session_only_not_persisted() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = SecurityPolicy {
+            policy_dir: Some(temp.path().to_path_buf()),
+            ..SecurityPolicy::default()
+        };
+        policy.add_runtime_command("brew", false).unwrap();
+        // No file should exist on disk for session-only adds.
+        let path = runtime_overlay::overlay_path(temp.path());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn runtime_allowlist_persist_writes_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = SecurityPolicy {
+            policy_dir: Some(temp.path().to_path_buf()),
+            ..SecurityPolicy::default()
+        };
+        policy.add_runtime_command("brew", true).unwrap();
+
+        let on_disk = runtime_overlay::load(temp.path()).unwrap();
+        assert!(on_disk.contains("brew"));
+    }
+
+    #[test]
+    fn runtime_allowlist_persist_without_policy_dir_errors() {
+        let policy = SecurityPolicy::default();
+        let err = policy.add_runtime_command("brew", true).unwrap_err();
+        assert!(err.to_string().contains("policy_dir"));
+    }
+
+    #[test]
+    fn runtime_allowlist_rejects_multi_token() {
+        let policy = SecurityPolicy::default();
+        assert!(policy.add_runtime_command("brew install", false).is_err());
+        assert!(policy.add_runtime_command("", false).is_err());
+    }
+
+    #[test]
+    fn from_config_with_policy_dir_loads_existing_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        runtime_overlay::append(temp.path(), "brew").unwrap();
+        runtime_overlay::append(temp.path(), "rg").unwrap();
+
+        let cfg = crate::config::AutonomyConfig {
+            allowed_commands: vec!["ls".into()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let workspace = PathBuf::from(".");
+        let policy = SecurityPolicy::from_config_with_policy_dir(
+            &cfg,
+            &workspace,
+            Some(temp.path().to_path_buf()),
+        );
+
+        let snap = policy.runtime_allowlist_snapshot();
+        assert!(snap.contains(&"brew".to_string()));
+        assert!(snap.contains(&"rg".to_string()));
+        // Boot list unchanged.
+        assert_eq!(policy.allowed_commands, vec!["ls".to_string()]);
+        // is_command_allowed sees the runtime entry.
+        assert!(policy.is_command_allowed("brew --version"));
+    }
+
+    #[test]
+    fn runtime_allowlist_shared_across_clones() {
+        let policy_a = SecurityPolicy::default();
+        let policy_b = policy_a.clone();
+        policy_a.add_runtime_command("brew", false).unwrap();
+        // Both handles see the same set (Arc<RwLock>).
+        assert!(policy_b
+            .runtime_allowlist_snapshot()
+            .contains(&"brew".to_string()));
     }
 }

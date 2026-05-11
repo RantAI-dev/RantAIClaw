@@ -29,6 +29,7 @@ pub mod firejail;
 pub mod landlock;
 pub mod pairing;
 pub mod policy;
+pub mod runtime_overlay;
 pub mod secrets;
 pub mod traits;
 
