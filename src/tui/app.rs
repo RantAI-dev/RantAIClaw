@@ -4017,11 +4017,33 @@ async fn run_loop(
         } else if !want_alt && in_alt {
             // Drop the temp fullscreen terminal first so its final flush
             // happens INSIDE alt-screen, then leave alt-screen, then
-            // force the inline terminal to repaint cleanly on top of
-            // the restored screen.
+            // rebuild the inline terminal so its internal viewport-row
+            // tracking is reset.
+            //
+            // Pre-fix this path just called `terminal.clear()` and
+            // assumed the original screen state was restored cleanly by
+            // `LeaveAlternateScreen`. In practice the inline viewport's
+            // row anchor drifted across the swap — the next render drew
+            // the viewport at a new row while the previous frame stayed
+            // pinned in scrollback, producing duplicate input boxes and
+            // status bars after closing `/skills`, `/sessions`, etc.
+            //
+            // Wiping the visible screen with `\x1b[2J\x1b[H` and then
+            // recreating the inline Terminal forces ratatui to claim
+            // fresh viewport rows at the bottom of the now-empty screen.
+            // Scrollback contents above are untouched (no `\x1b[3J`).
             drop(alt.take());
             execute!(io::stdout(), LeaveAlternateScreen)?;
-            terminal.clear()?;
+            let _ = terminal.flush();
+            let mut out = io::stdout();
+            let _ = out.write_all(b"\x1b[2J\x1b[H");
+            let _ = out.flush();
+            *terminal = Terminal::with_options(
+                CrosstermBackend::new(io::stdout()),
+                TerminalOptions {
+                    viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
+                },
+            )?;
         }
 
         // /new and /clear request a full screen+scrollback wipe so
