@@ -232,13 +232,13 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         .filter(|s| {
             if let Some(entry) = config.skills.entries.get(&s.name) {
                 if !entry.enabled {
-                    tracing::info!(skill = %s.name, "skipped: disabled in config.toml");
+                    tracing::debug!(skill = %s.name, "skipped: disabled in config.toml");
                     return false;
                 }
             }
             let unmet = s.requires.unmet();
             if !unmet.is_empty() {
-                tracing::info!(
+                tracing::debug!(
                     skill = %s.name,
                     reasons = %unmet.join("; "),
                     "skipped: unmet requires"

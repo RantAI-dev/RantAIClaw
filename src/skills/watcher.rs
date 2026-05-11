@@ -23,7 +23,32 @@ impl SkillsWatcher {
         let mut watcher =
             notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
-                    let _ = raw_tx.send(event);
+                    // Filter out read-only / metadata events. On Linux,
+                    // notify forwards inotify's `IN_ACCESS` whenever we
+                    // *read* a file in the watched tree — and
+                    // `refresh_available_skills` reads every SKILL.md
+                    // each tick. Treating access events as changes
+                    // creates a feedback loop: refresh → read → access
+                    // event → reload → refresh → … at the watcher's
+                    // debounce cadence (~500ms). The TUI log filled
+                    // with "skipped: unmet requires" forever and the
+                    // agent task got starved.
+                    //
+                    // Only Create/Modify(content)/Remove/Rename count
+                    // as real edits worth a reload. `Other` and
+                    // `Access(_)` are dropped.
+                    use notify::EventKind;
+                    let actionable = matches!(
+                        event.kind,
+                        EventKind::Create(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Modify(notify::event::ModifyKind::Data(_))
+                            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                            | EventKind::Modify(notify::event::ModifyKind::Any)
+                    );
+                    if actionable {
+                        let _ = raw_tx.send(event);
+                    }
                 }
             })?;
 
