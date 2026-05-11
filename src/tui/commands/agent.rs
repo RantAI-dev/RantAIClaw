@@ -75,6 +75,37 @@ impl CommandHandler for UndoCommand {
     }
 }
 
+/// /continue command — extend the current task with a fresh tool-call
+/// budget after the agent hit `max_tool_iterations`. Submits a literal
+/// "continue" message so the conversation history is preserved and
+/// the agent picks up where it left off; the next turn gets its own
+/// full budget (max_tool_iterations is per-turn). Mirrors Cursor's
+/// "Continue" button behavior.
+pub struct ContinueCommand;
+
+impl CommandHandler for ContinueCommand {
+    fn name(&self) -> &str {
+        "continue"
+    }
+
+    fn description(&self) -> &str {
+        "Continue the previous task with a fresh tool-call budget"
+    }
+
+    fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
+        let extra = args.trim();
+        // If the user types `/continue install the missing deps`, pass
+        // that as steering. Plain `/continue` is the common case.
+        let prompt = if extra.is_empty() {
+            "Continue from where you left off. You have a fresh tool-call budget for this turn."
+                .to_string()
+        } else {
+            format!("Continue from where you left off ({extra}). You have a fresh tool-call budget for this turn.")
+        };
+        Ok(CommandResult::Resubmit(prompt))
+    }
+}
+
 /// /stop command — signal intent to cancel ongoing streaming (future integration)
 pub struct StopCommand;
 

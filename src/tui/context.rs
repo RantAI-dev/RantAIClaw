@@ -81,6 +81,11 @@ pub struct TuiContext {
     /// live, and to resolve pending approvals surfaced by the shell
     /// tool.
     pub security: Option<std::sync::Arc<crate::security::SecurityPolicy>>,
+    /// Snapshot of the most recently finished turn's tool calls. Used
+    /// by the `/calls` slash command so the user can see what the
+    /// agent did, especially after a soft-cap hit. Refreshed on every
+    /// `finalize_turn`; empty until at least one turn completes.
+    pub last_turn_tool_calls: Vec<crate::tui::render::PersistedToolCall>,
 }
 
 impl TuiContext {
@@ -131,6 +136,7 @@ impl TuiContext {
             input_history_pos: None,
             input_history_stash: None,
             security: None,
+            last_turn_tool_calls: Vec::new(),
         })
     }
 

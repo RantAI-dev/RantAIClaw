@@ -1446,10 +1446,55 @@ impl TuiApp {
                 ok,
                 output_preview,
             } => {
-                if let AppState::Streaming { tool_blocks, .. } = &mut self.state {
+                // Pull the matching block, finalize its result, and
+                // capture the fields we need for the scrollback line
+                // before letting the borrow drop.
+                let summary = if let AppState::Streaming { tool_blocks, .. } = &mut self.state {
                     if let Some(b) = tool_blocks.iter_mut().find(|b| b.id == id) {
-                        b.result = Some((ok, output_preview));
+                        b.result = Some((ok, output_preview.clone()));
+                        let elapsed = b.started_at.elapsed();
+                        Some((b.name.clone(), b.args.clone(), elapsed))
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+
+                // Inline-flush a 1-line summary to scrollback so the
+                // user sees what the agent did *as it happens*. Format:
+                //   ▸ shell(command="ls -la") → ok (12ms)
+                //   ✗ shell(command="brew --version") → error (3s)
+                if let Some((name, args, elapsed)) = summary {
+                    let marker = if ok { "▸" } else { "✗" };
+                    let args_compact = compact_args_for_log(&args);
+                    let elapsed_label = if elapsed.as_secs() == 0 {
+                        format!("{}ms", elapsed.as_millis())
+                    } else {
+                        format!("{}s", elapsed.as_secs())
+                    };
+                    let status = if ok {
+                        let preview = output_preview.lines().next().unwrap_or("").trim();
+                        if preview.is_empty() {
+                            "ok".to_string()
+                        } else if preview.len() > 60 {
+                            format!("{}…", &preview[..60])
+                        } else {
+                            preview.to_string()
+                        }
+                    } else {
+                        let preview = output_preview.lines().next().unwrap_or("").trim();
+                        if preview.is_empty() {
+                            "error".to_string()
+                        } else if preview.len() > 60 {
+                            format!("error: {}…", &preview[..60])
+                        } else {
+                            format!("error: {preview}")
+                        }
+                    };
+                    let line =
+                        format!("{marker} {name}({args_compact}) → {status} ({elapsed_label})");
+                    self.scrollback_queue.push(("_tool_log".to_string(), line));
                 }
             }
             AgentEvent::Usage(u) => {
@@ -1526,6 +1571,16 @@ impl TuiApp {
         } else {
             None
         };
+        // Preserve a cloned list of the turn's tool calls so `/calls`
+        // can render them after the turn ends. Replaces (not appends
+        // to) the previous turn's list — `/calls` is "what did the
+        // last turn do?", not a cross-turn history.
+        if let AppState::Streaming { tool_blocks, .. } = &self.state {
+            self.context.last_turn_tool_calls = tool_blocks
+                .iter()
+                .map(super::render::PersistedToolCall::from)
+                .collect();
+        }
 
         // Persist and display the assistant reply. A store failure should not
         // crash the loop — surface it as a visible error and keep running.
@@ -2579,6 +2634,15 @@ impl TuiApp {
                 .split('\n')
                 .map(|l| super::render::render_block_line(l, &theme))
                 .collect::<Vec<_>>()
+        } else if role == "_tool_log" {
+            // Inline tool-call summary, indented and muted so it sits
+            // visually between assistant/user lines without competing
+            // for attention. Single-line — already trimmed upstream.
+            let muted = Style::default().fg(ratatui::style::Color::Rgb(107, 114, 128));
+            vec![Line::from(vec![
+                Span::raw("  "),
+                Span::styled(content.to_string(), muted),
+            ])]
         } else {
             super::render::render_message_lines(role, content, &[], &[], &theme)
         };
@@ -3442,6 +3506,48 @@ fn format_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Render tool-call arguments as a compact single-line summary for the
+/// inline scrollback log line. Picks the most informative-looking
+/// scalar field (`command`, `path`, `query`, etc.) and truncates so
+/// the whole line stays readable. Multi-field objects degrade to
+/// `<N args>` rather than smearing across the screen.
+fn compact_args_for_log(args: &serde_json::Value) -> String {
+    const PREFERRED_KEYS: &[&str] = &[
+        "command",
+        "cmd",
+        "path",
+        "file_path",
+        "query",
+        "url",
+        "name",
+        "key",
+        "pattern",
+    ];
+    const MAX_LEN: usize = 50;
+    if let serde_json::Value::Object(map) = args {
+        if map.is_empty() {
+            return String::new();
+        }
+        for k in PREFERRED_KEYS {
+            if let Some(v) = map.get(*k) {
+                if let Some(s) = v.as_str() {
+                    let trimmed = s.trim();
+                    let cropped = if trimmed.len() > MAX_LEN {
+                        format!("{}…", &trimmed[..MAX_LEN])
+                    } else {
+                        trimmed.to_string()
+                    };
+                    return format!("{k}={cropped:?}");
+                }
+            }
+        }
+        // No preferred-key match; fall back to a count-only summary.
+        let n = map.len();
+        return format!("<{n} arg{}>", if n == 1 { "" } else { "s" });
+    }
+    String::new()
 }
 
 /// Render the modal `/help`-style overlay over the chat area. Layout

@@ -1,5 +1,6 @@
 mod agent;
 mod allowlist;
+mod calls;
 mod config;
 mod core;
 mod cron;
@@ -128,6 +129,7 @@ impl CommandRegistry {
         self.register(Box::new(agent::RetryCommand));
         self.register(Box::new(agent::UndoCommand));
         self.register(Box::new(agent::StopCommand));
+        self.register(Box::new(agent::ContinueCommand));
         self.register(Box::new(config::StatusCommand));
         self.register(Box::new(config::DebugCommand));
         self.register(Box::new(config::ConfigCommand));
@@ -147,6 +149,7 @@ impl CommandRegistry {
         self.register(Box::new(allowlist::AllowCommand));
         self.register(Box::new(allowlist::DenyCommand));
         self.register(Box::new(allowlist::AllowlistCommand));
+        self.register(Box::new(calls::CallsCommand));
     }
 
     pub fn register(&mut self, handler: Box<dyn CommandHandler>) {

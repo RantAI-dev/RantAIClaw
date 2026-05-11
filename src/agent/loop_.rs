@@ -1318,6 +1318,14 @@ pub(crate) async fn run_tool_call_loop(
         tools_registry.iter().map(|tool| tool.spec()).collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
+    // Sliding window for loop detection. We keep the last 5 (tool_name,
+    // args_serialised, result_hash) triples. If the *exact* triple
+    // (same tool + same args + same result) appears 3 times in this
+    // window, the model is clearly stuck — break early with a distinct
+    // error so the user knows it wasn't a budget problem.
+    let mut recent_calls: std::collections::VecDeque<(String, String, u64)> =
+        std::collections::VecDeque::with_capacity(5);
+
     for _iteration in 0..max_iterations {
         if cancellation_token
             .as_ref()
@@ -1578,6 +1586,52 @@ pub(crate) async fn run_tool_call_loop(
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
                 call.name, result
             );
+
+            // Loop detection: (name, args_json, hash(result)) triple.
+            // We hash the result so identical large outputs (e.g.
+            // repeated "permission denied") don't bloat memory.
+            let args_str = serde_json::to_string(&call.arguments).unwrap_or_default();
+            let result_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                result.hash(&mut h);
+                h.finish()
+            };
+            let key = (call.name.clone(), args_str, result_hash);
+            let repeats = recent_calls.iter().filter(|k| **k == key).count() + 1;
+            if recent_calls.len() == 5 {
+                recent_calls.pop_front();
+            }
+            recent_calls.push_back(key.clone());
+            if repeats >= 3 {
+                tracing::warn!(
+                    target: "agent_loop",
+                    tool = %key.0,
+                    repeats,
+                    "loop detected — same tool+args+result repeated; breaking early"
+                );
+                let nudge = format!(
+                    "The same tool call (`{}`) returned the same result {} times in a row. \
+                     You're stuck in a loop. Without using any more tools, briefly explain \
+                     what's blocking you and suggest one concrete next step the user can \
+                     take. Do not retry the same call.",
+                    key.0, repeats
+                );
+                return force_final_summary(
+                    provider,
+                    history,
+                    multimodal_config,
+                    provider_name,
+                    model,
+                    temperature,
+                    observer,
+                    cancellation_token.as_ref(),
+                    events.as_ref(),
+                    on_delta.as_ref(),
+                    nudge,
+                )
+                .await;
+            }
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -1598,7 +1652,135 @@ pub(crate) async fn run_tool_call_loop(
         }
     }
 
-    anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+    // Soft cap: instead of bailing with no output (which surfaces as
+    // "[no response from model]" in the TUI), force one final
+    // tools-disabled provider call so the user gets a real summary of
+    // what was attempted. Mentions `/continue` so the user knows how
+    // to extend the budget if more work is needed.
+    let nudge = format!(
+        "You've reached the maximum of {max_iterations} tool calls for this turn. \
+         Without using any more tools, briefly summarize what you found, what's still \
+         unresolved, and suggest a clear next step. If the user wants you to keep \
+         going from here, they can type `/continue` to extend this turn with a fresh \
+         tool-call budget."
+    );
+    force_final_summary(
+        provider,
+        history,
+        multimodal_config,
+        provider_name,
+        model,
+        temperature,
+        observer,
+        cancellation_token.as_ref(),
+        events.as_ref(),
+        on_delta.as_ref(),
+        nudge,
+    )
+    .await
+}
+
+/// Append a tools-disabled nudge to history and make one final provider
+/// call. Used by the iteration soft-cap and the loop detector — both
+/// want to produce a real user-visible summary instead of bailing with
+/// an empty response.
+#[allow(clippy::too_many_arguments)]
+async fn force_final_summary(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    multimodal_config: &crate::config::MultimodalConfig,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    events: Option<&AgentEventSender>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+    nudge: String,
+) -> Result<String> {
+    history.push(ChatMessage::user(nudge));
+
+    let prepared = multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+    observer.record_event(&ObserverEvent::LlmRequest {
+        provider: provider_name.to_string(),
+        model: model.to_string(),
+        messages_count: history.len(),
+    });
+    let llm_started_at = Instant::now();
+
+    // tools: None so the model can't extend the loop further.
+    let resp = match provider
+        .chat(
+            ChatRequest {
+                messages: &prepared.messages,
+                tools: None,
+            },
+            model,
+            temperature,
+        )
+        .await
+    {
+        Ok(resp) => {
+            observer.record_event(&ObserverEvent::LlmResponse {
+                provider: provider_name.to_string(),
+                model: model.to_string(),
+                duration: llm_started_at.elapsed(),
+                success: true,
+                error_message: None,
+            });
+            resp
+        }
+        Err(e) => {
+            observer.record_event(&ObserverEvent::LlmResponse {
+                provider: provider_name.to_string(),
+                model: model.to_string(),
+                duration: llm_started_at.elapsed(),
+                success: false,
+                error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+            });
+            return Err(e);
+        }
+    };
+
+    let text = resp.text_or_empty().to_string();
+    let display_text = if text.is_empty() {
+        "[turn ended without a model response — try `/retry` or `/continue`]".to_string()
+    } else {
+        text.clone()
+    };
+
+    // Relay the summary to the TUI / channel as chunks so it appears
+    // in scrollback like a normal response, rather than landing as one
+    // silent blob after the working indicator finishes.
+    if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(ToolLoopCancelled.into());
+    }
+    let mut chunk = String::new();
+    for word in display_text.split_inclusive(char::is_whitespace) {
+        chunk.push_str(word);
+        if chunk.len() >= STREAM_CHUNK_MIN_CHARS {
+            let piece = std::mem::take(&mut chunk);
+            if let Some(tx) = events {
+                if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
+                    break;
+                }
+            } else if let Some(tx) = on_delta {
+                if tx.send(piece).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    if !chunk.is_empty() {
+        if let Some(tx) = events {
+            let _ = tx.send(AgentEvent::Chunk(chunk)).await;
+        } else if let Some(tx) = on_delta {
+            let _ = tx.send(chunk).await;
+        }
+    }
+
+    history.push(ChatMessage::assistant(text));
+    Ok(display_text)
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1912,11 +2094,7 @@ pub async fn run(
         let session_store = open_cli_session_store();
         let session_id = session_store
             .as_ref()
-            .and_then(|s| {
-                s.new_session(model_name, "cli")
-                    .ok()
-                    .map(|sess| sess.id)
-            });
+            .and_then(|s| s.new_session(model_name, "cli").ok().map(|sess| sess.id));
         if let (Some(store), Some(id)) = (session_store.as_ref(), session_id.as_deref()) {
             let user_msg = crate::sessions::Message::user(id, &msg);
             let _ = store.append_message(&user_msg);
