@@ -74,6 +74,13 @@ pub struct TuiContext {
     /// history (so Down past the newest entry restores what they were
     /// typing). `None` when history navigation is inactive.
     pub input_history_stash: Option<String>,
+    /// Shared security policy handle. `Some` when the TUI was launched
+    /// against a real agent (`Agent::from_config`); `None` for unit
+    /// tests / `test_context()`. Used by `/allow`, `/deny`, and
+    /// `/allowlist` slash commands to mutate the runtime allowlist
+    /// live, and to resolve pending approvals surfaced by the shell
+    /// tool.
+    pub security: Option<std::sync::Arc<crate::security::SecurityPolicy>>,
 }
 
 impl TuiContext {
@@ -123,6 +130,7 @@ impl TuiContext {
             input_history: Vec::new(),
             input_history_pos: None,
             input_history_stash: None,
+            security: None,
         })
     }
 

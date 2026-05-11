@@ -1,4 +1,5 @@
 mod agent;
+mod allowlist;
 mod config;
 mod core;
 mod cron;
@@ -143,6 +144,9 @@ impl CommandRegistry {
         self.register(Box::new(skills::PersonalityCommand));
         self.register(Box::new(skills::InsightsCommand));
         self.register(Box::new(setup::SetupCommand));
+        self.register(Box::new(allowlist::AllowCommand));
+        self.register(Box::new(allowlist::DenyCommand));
+        self.register(Box::new(allowlist::AllowlistCommand));
     }
 
     pub fn register(&mut self, handler: Box<dyn CommandHandler>) {

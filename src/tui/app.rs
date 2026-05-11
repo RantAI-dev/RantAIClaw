@@ -181,6 +181,13 @@ pub struct TuiApp {
     /// instead of the normal chat UI. Provisioner steps use the
     /// existing `setup_overlay` mechanism.
     pub first_run_wizard: Option<super::FirstRunWizard>,
+    /// Broadcast receiver for pending-approval notifications from the
+    /// shared `PendingApprovals` registry on `SecurityPolicy`. Drained
+    /// each frame; new requests surface as system messages instructing
+    /// the user to type `/allow` or `/deny`. `None` until `run_tui`
+    /// subscribes (test contexts skip this).
+    pub pending_approvals_rx:
+        Option<tokio::sync::broadcast::Receiver<crate::security::PendingRequest>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -343,6 +350,7 @@ impl TuiApp {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         })
     }
 
@@ -1137,6 +1145,32 @@ impl TuiApp {
     pub fn drain_events(&mut self) {
         while let Ok(ev) = self.context.events_rx.try_recv() {
             self.handle_agent_event(ev);
+        }
+
+        // Pending-approval requests from the shell tool. Each new
+        // request surfaces as a system message with the exact slash
+        // commands the user can type to resolve it.
+        if let Some(rx) = self.pending_approvals_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(req) => {
+                        let line = format!(
+                            "🔒 Approval needed: `{0}` (full command: `{1}`).\n   Type one of: `/allow {0}` · `/allow {0} --persist` · `/deny {0}` (auto-deny in 5 min)",
+                            req.basename, req.full_command
+                        );
+                        let _ = self.context.append_system_message(&line);
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                        // Missed some; user can /allowlist to see what's still pending.
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        self.pending_approvals_rx = None;
+                        break;
+                    }
+                }
+            }
         }
         if let Some(rx) = &mut self.setup_event_rx {
             // Two-phase drain: first sweep events into a buffer so we can
@@ -3877,6 +3911,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<TurnRequest>(16);
     let (events_tx, events_rx): (AgentEventSender, mpsc::Receiver<AgentEvent>) = mpsc::channel(128);
 
+    let security_handle = agent.security();
     let actor = TuiAgentActor::new(agent, req_rx, events_tx);
     let actor_handle = tokio::spawn(actor.run());
 
@@ -3901,6 +3936,16 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         events_rx,
     )?;
     app.context.available_providers = available_providers;
+    // Subscribe to the pending-approvals broadcast before stashing the
+    // security handle on the context, so that the moment the shell tool
+    // suspends a turn waiting for /allow|/deny, the TUI sees the
+    // notification and surfaces a system message.
+    if let Some(security) = security_handle.as_ref() {
+        if let Some(pending) = security.pending() {
+            app.pending_approvals_rx = Some(pending.subscribe());
+        }
+    }
+    app.context.security = security_handle;
 
     if let Some(topic) = tui_config.setup_provisioner.take() {
         // `rantaiclaw setup` (no topic) and `rantaiclaw setup full` both
@@ -4296,6 +4341,7 @@ mod tests {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         }
     }
 
@@ -4389,6 +4435,7 @@ mod submit_tests {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         }
     }
 
@@ -4495,6 +4542,7 @@ mod ctrl_c_tests {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         }
     }
 
@@ -4582,6 +4630,7 @@ mod drain_tests {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         }
     }
 
@@ -4739,6 +4788,7 @@ mod retry_tests {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         }
     }
 

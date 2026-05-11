@@ -28,6 +28,7 @@ pub mod firejail;
 #[cfg(target_os = "linux")]
 pub mod landlock;
 pub mod pairing;
+pub mod pending;
 pub mod policy;
 pub mod runtime_overlay;
 pub mod secrets;
@@ -39,6 +40,8 @@ pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 pub use detect::create_sandbox;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
+#[allow(unused_imports)]
+pub use pending::{Decision, PendingApprovals, PendingRequest};
 pub use policy::{AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;

@@ -32,6 +32,12 @@ pub struct Agent {
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
+    /// Shared security policy handle. Held on the agent so external
+    /// callers (TUI slash commands, channel reply parsers) can mutate
+    /// the runtime allowlist without re-deriving the policy from
+    /// config. `None` for agents constructed via the bare builder
+    /// (tests, custom embeds); always `Some` after `from_config`.
+    security: Option<Arc<SecurityPolicy>>,
     identity_config: crate::config::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
@@ -210,6 +216,7 @@ impl AgentBuilder {
             workspace_dir: self
                 .workspace_dir
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
+            security: None,
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
@@ -248,10 +255,19 @@ impl Agent {
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn runtime::RuntimeAdapter> =
             Arc::from(runtime::create_runtime(&config.runtime)?);
-        let security = Arc::new(SecurityPolicy::from_config(
+        let policy_dir = crate::profile::ProfileManager::active()
+            .ok()
+            .map(|p| p.policy_dir());
+        let security = Arc::new(SecurityPolicy::from_config_with_policy_dir(
             &config.autonomy,
             &config.workspace_dir,
+            policy_dir,
         ));
+        // Bind the async-approval registry to the policy so the shell
+        // tool can ask the user (via whichever UI is subscribed) when
+        // it hits an allowlist miss in Supervised mode.
+        let pending = Arc::new(crate::security::PendingApprovals::default());
+        security.set_pending(pending);
 
         let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
             &config.memory,
@@ -340,6 +356,18 @@ impl Agent {
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .build()
+            .map(|mut agent| {
+                agent.security = Some(security);
+                agent
+            })
+    }
+
+    /// Shared security policy handle — `Some` when the agent was built
+    /// via [`Agent::from_config`], `None` for bare-builder agents
+    /// (tests/custom embeds). Use this to mutate the runtime allowlist
+    /// or resolve pending approvals from outside the agent loop.
+    pub fn security(&self) -> Option<Arc<SecurityPolicy>> {
+        self.security.clone()
     }
 
     fn trim_history(&mut self) {

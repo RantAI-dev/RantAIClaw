@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::security::pending::PendingApprovals;
 use crate::security::runtime_overlay;
 
 /// How much autonomy the agent has
@@ -104,6 +105,13 @@ pub struct SecurityPolicy {
     /// called. `None` means runtime additions stay in-memory only
     /// (default for ad-hoc/test policies).
     pub policy_dir: Option<PathBuf>,
+    /// Optional async-approval registry. When set, callers that hit an
+    /// allowlist miss can request a runtime decision instead of hard
+    /// failing. Wired at agent boot; cloned freely by tools that share
+    /// the same `Arc<SecurityPolicy>`. `Arc<RwLock<_>>` so it can be
+    /// attached after construction (`Default::default()` leaves it
+    /// `None`).
+    pub pending: Arc<RwLock<Option<Arc<PendingApprovals>>>>,
 }
 
 impl Default for SecurityPolicy {
@@ -156,6 +164,7 @@ impl Default for SecurityPolicy {
             tracker: ActionTracker::new(),
             runtime_allowlist: Arc::new(RwLock::new(HashSet::new())),
             policy_dir: None,
+            pending: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -846,7 +855,19 @@ impl SecurityPolicy {
             tracker: ActionTracker::new(),
             runtime_allowlist: Arc::new(RwLock::new(runtime_set)),
             policy_dir,
+            pending: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Attach (or replace) the async-approval registry. Cheap — only
+    /// writes through the `Arc<RwLock<Option<…>>>` slot.
+    pub fn set_pending(&self, pending: Arc<PendingApprovals>) {
+        *self.pending.write() = Some(pending);
+    }
+
+    /// Current approval registry, if any.
+    pub fn pending(&self) -> Option<Arc<PendingApprovals>> {
+        self.pending.read().clone()
     }
 
     /// Add a basename to the runtime allowlist.
@@ -884,6 +905,54 @@ impl SecurityPolicy {
         let mut v: Vec<String> = set.iter().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Walk the command exactly like `is_command_allowed` and return
+    /// the first basename rejected by the allowlist (boot ∪ runtime).
+    /// Returns `None` when the command would already be accepted or
+    /// when rejection is due to a structural rule (operators, tee,
+    /// dangerous args) rather than an unknown basename.
+    ///
+    /// This is the basename a UI should surface in an approval prompt:
+    /// approving `brew` makes the next attempt at `brew --version`
+    /// succeed.
+    pub fn first_unallowed_basename(&self, command: &str) -> Option<String> {
+        if self.autonomy == AutonomyLevel::ReadOnly || self.autonomy == AutonomyLevel::Full {
+            return None;
+        }
+        // Structural rules: don't surface a basename when the rejection
+        // is about quoting/redirection/etc — those aren't fixable by
+        // approving a name.
+        if command.contains('`')
+            || command.contains("$(")
+            || command.contains("${")
+            || command.contains("<(")
+            || command.contains(">(")
+            || contains_unquoted_char(command, '>')
+            || contains_unquoted_single_ampersand(command)
+        {
+            return None;
+        }
+        for segment in split_unquoted_segments(command) {
+            let cmd_part = skip_env_assignments(&segment);
+            let mut words = cmd_part.split_whitespace();
+            let Some(base_raw) = words.next() else {
+                continue;
+            };
+            let base_cmd = base_raw.rsplit('/').next().unwrap_or("");
+            if base_cmd.is_empty() {
+                continue;
+            }
+            let on_boot = self.allowed_commands.iter().any(|a| a == base_cmd);
+            let on_runtime = !on_boot && {
+                let set = self.runtime_allowlist.read();
+                set.contains(base_cmd)
+            };
+            if !on_boot && !on_runtime {
+                return Some(base_cmd.to_string());
+            }
+        }
+        None
     }
 }
 
