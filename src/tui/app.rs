@@ -1882,7 +1882,44 @@ impl TuiApp {
                 .is_some_and(|finished| finished.elapsed() < Duration::from_secs(3));
         if let Some(picker) = self.list_picker.as_mut() {
             if picker.kind == crate::tui::widgets::ListPickerKind::Skill {
+                // Bail when nothing actually changed. The notify watcher
+                // can fire on innocuous fs noise (editor saves in a
+                // sibling tree, mtime touches, etc.) and rebuilding the
+                // picker would reset cursor + page back to the top —
+                // making it look like the picker auto-scrolls home every
+                // second when the user is paging through their skills.
+                let unchanged = picker.entries().len() == items.len()
+                    && picker
+                        .entries()
+                        .iter()
+                        .zip(items.iter())
+                        .all(|(entry, new)| {
+                            entry.as_item().is_some_and(|cur| {
+                                cur.key == new.key
+                                    && cur.primary == new.primary
+                                    && cur.secondary == new.secondary
+                            })
+                        });
+                if unchanged {
+                    return;
+                }
+                // Items did change — preserve the cursor on the same
+                // skill (by key) so the user doesn't lose their place
+                // mid-scroll when the watcher fires.
+                let preserved_key = picker.current().map(|i| i.key.clone());
                 picker.set_items(items);
+                if let Some(key) = preserved_key {
+                    if let Some(abs_idx) = picker
+                        .entries()
+                        .iter()
+                        .position(|e| e.as_item().is_some_and(|i| i.key == key))
+                    {
+                        let page_size = crate::tui::widgets::list_picker::PAGE_SIZE;
+                        picker.page = abs_idx / page_size;
+                        picker.selected = abs_idx % page_size;
+                        picker.list_state.select(Some(picker.selected));
+                    }
+                }
                 if !suppress_title {
                     picker.title = "Skills · reloaded".to_string();
                 }
