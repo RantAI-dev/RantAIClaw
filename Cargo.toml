@@ -149,7 +149,7 @@ ratatui = { version = "0.29", optional = true, default-features = false, feature
 crossterm = { version = "0.28", optional = true }
 
 # email
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
 mail-parser = "0.11.2"
 async-imap = { version = "0.11",features = ["runtime-tokio"], default-features = false }
 
