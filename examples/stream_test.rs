@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 async fn main() -> anyhow::Result<()> {
     let mut config = rantaiclaw::config::Config::load_or_init().await?;
     config.apply_env_overrides();
-    let agent = Agent::from_config(&config)?;
+    let agent = Agent::from_config(&config).await?;
 
     let (req_tx, req_rx) = mpsc::channel::<TurnRequest>(16);
     let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(128);
