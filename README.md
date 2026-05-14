@@ -158,14 +158,28 @@ Built-in tools with security boundaries:
 | `browser` | Web automation (optional, feature-gated) |
 | `composio` | 150+ app integrations via Composio |
 
-### Autonomy Levels (L1–L4)
+### Autonomy
 
-| Level | Behavior |
+Two layers — the **runtime enum** the approval gate branches on, and the **L1–L4 presets** the setup wizard writes to disk.
+
+**Runtime enum** (`AutonomyLevel` in `src/security/policy.rs`):
+
+| Value | Behavior |
 |-------|----------|
-| **L1** — Supervised | All tool calls require approval |
-| **L2** — Assisted | Low-risk tools auto-approved (file_read, memory, web_search) |
-| **L3** — Autonomous | Most tools auto-approved, dangerous commands blocked |
-| **L4** — Full | All tools auto-approved, agent operates independently |
+| `read_only` | Observe only; no shell, no writes |
+| `supervised` (default) | Boot allowlist + runtime allowlist; unknown shell commands trigger an interactive approval prompt instead of hard-failing |
+| `full` | Bypass the shell allowlist entirely (forbidden paths and `block_high_risk_commands` still apply) |
+
+**Setup wizard presets** (write the right runtime enum + command_allowlist + forbidden_paths bundle):
+
+| Preset | Wizard label | Maps to |
+|---|---|---|
+| **L1** | Manual — prompt for every tool call (safest) | `supervised` + narrow auto_approve |
+| **L2** | Smart — prompt only for writes and system changes (recommended) | `supervised` + curated auto_approve (recommended starting point) |
+| **L3** | Strict — prompt for all exec, allow read-only | `supervised` + deny-by-default + read-only auto_approve |
+| **L4** | Off — autonomous execution, no prompts | `full` autonomy |
+
+In v0.6.5+, Supervised mode adds an **async approval flow**: unknown shell basenames trigger a `/allow` / `/deny` prompt instead of hard-failing. See `docs/security/` and the user-facing site for the full mechanism.
 
 ### Memory System
 Multiple backends for persistent agent memory:
