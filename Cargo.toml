@@ -194,6 +194,19 @@ wa-rs-proto = { version = "0.2", optional = true, default-features = false }
 wa-rs-ureq-http = { version = "0.2", optional = true }
 wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
 
+# Knowledge Base storage backend — sqlite-vec extension for vector search.
+# Activated by --features kb.
+sqlite-vec = { version = "0.1", optional = true }
+
+# KB office support — feature `kb-office`. Pinned now so the feature flag
+# resolves cleanly; actual code that uses these lands in later phases.
+calamine = { version = "0.30", optional = true }
+docx-rs = { version = "0.4", optional = true }
+
+# KB optional LanceDB backend — feature `kb-lancedb`. Pinned now so the
+# feature flag resolves cleanly; backend implementation lands in a later phase.
+lancedb = { version = "0.29", optional = true }
+
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.22", optional = true }
@@ -236,6 +249,12 @@ probe = ["dep:probe-rs"]
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost"]
+# kb = Knowledge Base subsystem (sqlite-vec + PDF extraction)
+kb = ["dep:sqlite-vec", "rag-pdf"]
+# kb-office = Office-document ingestion for the KB (docx/xlsx/pptx)
+kb-office = ["kb", "dep:calamine", "dep:docx-rs"]
+# kb-lancedb = Optional LanceDB backend for the KB store
+kb-lancedb = ["kb", "dep:lancedb"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size
