@@ -17,4 +17,5 @@ pub mod retrieve;
 pub mod store;
 pub mod types;
 
+pub use config::KbConfig;
 pub use error::{KbError, KbResult};
