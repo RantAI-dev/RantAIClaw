@@ -64,8 +64,18 @@ impl TuiAgentActor {
                     Some(TurnRequest::Reload(config)) => {
                         match crate::agent::Agent::from_config(&config).await {
                             Ok(new_agent) => {
+                                let mcp_tools_by_server = new_agent.mcp_tools_by_server();
+                                let mcp_servers_configured: Vec<String> =
+                                    config.mcp_servers.keys().cloned().collect();
                                 self.agent = new_agent;
                                 tracing::info!("agent reloaded with new config");
+                                let _ = self
+                                    .events_tx
+                                    .send(crate::agent::events::AgentEvent::ReloadComplete {
+                                        mcp_servers_configured,
+                                        mcp_tools_by_server,
+                                    })
+                                    .await;
                             }
                             Err(e) => {
                                 tracing::error!("failed to reload agent: {e}");

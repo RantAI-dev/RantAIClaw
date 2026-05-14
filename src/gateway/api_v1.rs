@@ -400,6 +400,13 @@ async fn agent_chat_stream(
                     "ok": ok,
                     "output_preview": output_preview,
                 }),
+                // Gateway endpoint operates on a per-turn agent built
+                // for the request — reload events are a TUI-only
+                // concern. Surface as a benign info line so the SSE
+                // stream stays self-describing.
+                crate::agent::AgentEvent::ReloadComplete { .. } => serde_json::json!({
+                    "type": "reload_complete",
+                }),
             };
             let done = payload.get("type").and_then(|v| v.as_str()) == Some("done");
             yield Ok::<SseEvent, Infallible>(SseEvent::default().data(payload.to_string()));

@@ -149,6 +149,13 @@ pub struct TuiApp {
     /// Background watcher for profile/workspace skill edits. The watcher
     /// owns the OS file handle; the TUI drains debounced reload ticks.
     pub skills_watcher: Option<crate::skills::watcher::SkillsWatcher>,
+    /// Background watcher for the active profile's `config.toml`.
+    /// Direct edits (user adds an `[mcp_servers.foo]` block, swaps the
+    /// provider, changes the model) trigger a debounced reload tick;
+    /// the TUI drains it each frame and runs the same `reload_config`
+    /// pipeline that wizard close uses, so the agent picks up the
+    /// change on the next turn without a restart.
+    pub config_watcher: Option<crate::tui::config_watcher::ConfigWatcher>,
     /// True while the install picker was opened from inside the first-run
     /// wizard's skills step. On picker close (Esc), we send
     /// `ProvisionResponse::InstalledSkills(installed_slugs)` back to the
@@ -350,6 +357,7 @@ impl TuiApp {
             skill_deps_install_completion_tx: None,
             skill_deps_install_finished_at: None,
             skills_watcher: None,
+            config_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -1217,6 +1225,7 @@ impl TuiApp {
             }
         }
         self.drain_skill_reload_events();
+        self.drain_config_reload_events();
         // ClawHub install picker — async search results stream in via a
         // background task. Drain on each render tick so newly-arrived
         // results land between user actions, not just after the next key.
@@ -1513,6 +1522,17 @@ impl TuiApp {
             }
             AgentEvent::Error(msg) => {
                 self.finalize_error(msg);
+            }
+            AgentEvent::ReloadComplete {
+                mcp_servers_configured,
+                mcp_tools_by_server,
+            } => {
+                // Refresh the TUI's cached MCP snapshot so `/mcp`
+                // reflects the post-reload state. The agent already
+                // has the new tools and can use them on the next
+                // turn — this just keeps the UI's view in sync.
+                self.context.mcp_servers_configured = mcp_servers_configured.into_iter().collect();
+                self.context.mcp_tools_by_server = mcp_tools_by_server;
             }
         }
     }
@@ -1982,6 +2002,38 @@ impl TuiApp {
         });
     }
 
+    /// Drain debounced reload ticks from the `config.toml` file
+    /// watcher. Direct user edits to the active profile's config
+    /// (adding `[mcp_servers.foo]`, swapping provider, etc.) trigger
+    /// the same `reload_config` pipeline the wizard close uses. A
+    /// system-message line goes to scrollback so the user knows the
+    /// reload happened.
+    fn drain_config_reload_events(&mut self) {
+        let mut should_reload = false;
+        if let Some(watcher) = self.config_watcher.as_mut() {
+            while watcher.reload_rx.try_recv().is_ok() {
+                should_reload = true;
+            }
+        }
+        if !should_reload {
+            return;
+        }
+        match self.reload_config() {
+            Ok(()) => {
+                let msg =
+                    "⟳ config.toml changed — agent reloaded; next turn uses the new settings.";
+                let _ = self.context.append_system_message(msg);
+                self.scrollback_queue
+                    .push(("system".to_string(), msg.to_string()));
+            }
+            Err(e) => {
+                let msg = format!("⚠ config.toml changed but reload failed: {e}");
+                let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".to_string(), msg));
+            }
+        }
+    }
+
     fn drain_skill_reload_events(&mut self) {
         let mut should_reload = false;
         if let Some(watcher) = self.skills_watcher.as_mut() {
@@ -1993,7 +2045,46 @@ impl TuiApp {
             return;
         }
 
+        // Compare skills before/after refresh so we only push a full
+        // `TurnRequest::Reload` to the agent when the *set of skills*
+        // actually changed. notify can fire on innocuous fs noise
+        // (editor temp files, mtime touches) — rebuilding the agent on
+        // every tick would respawn MCP servers and rerun discovery for
+        // nothing.
+        let prev_keys: std::collections::HashSet<String> = self
+            .context
+            .available_skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
         self.refresh_available_skills();
+        let new_keys: std::collections::HashSet<String> = self
+            .context
+            .available_skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        if prev_keys != new_keys {
+            // Push a full reload to the agent actor so the next turn's
+            // system prompt reflects the new skill list. Uses the
+            // existing `TurnRequest::Reload` path (same as wizard
+            // close) — costs ~one Agent rebuild including MCP
+            // re-discovery, but only on real skill add/remove.
+            let config = self.config.clone();
+            let req_tx = self.context.req_tx.clone();
+            tokio::spawn(async move {
+                let _ = req_tx
+                    .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                    .await;
+            });
+            tracing::info!(
+                target: "tui",
+                added = ?new_keys.difference(&prev_keys).collect::<Vec<_>>(),
+                removed = ?prev_keys.difference(&new_keys).collect::<Vec<_>>(),
+                "skills changed on disk — dispatching agent reload"
+            );
+        }
+
         let items = self.skill_picker_items();
         let suppress_title = self.skill_deps_install_in_progress.is_some()
             || self
@@ -4140,6 +4231,19 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         }
     }
 
+    // Config.toml file watcher — direct edits to the active profile's
+    // config trigger a reload, mirroring the wizard-close path. This
+    // is what makes `[mcp_servers.foo]` added by hand take effect
+    // without restarting rantaiclaw.
+    match crate::tui::config_watcher::ConfigWatcher::watch(&app_config.config_path) {
+        Ok(watcher) => {
+            app.config_watcher = Some(watcher);
+        }
+        Err(e) => {
+            tracing::warn!("config watcher disabled: {e:#}");
+        }
+    }
+
     // Auto-start configured channel listeners alongside the TUI. Before
     // v0.6.4 the TUI was a single local-chat surface — Telegram / Discord /
     // Slack / etc. configured via the wizard would never receive messages
@@ -4489,6 +4593,7 @@ mod tests {
             skill_deps_install_completion_tx: None,
             skill_deps_install_finished_at: None,
             skills_watcher: None,
+            config_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4583,6 +4688,7 @@ mod submit_tests {
             skill_deps_install_completion_tx: None,
             skill_deps_install_finished_at: None,
             skills_watcher: None,
+            config_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4691,6 +4797,7 @@ mod ctrl_c_tests {
             skill_deps_install_completion_tx: None,
             skill_deps_install_finished_at: None,
             skills_watcher: None,
+            config_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4780,6 +4887,7 @@ mod drain_tests {
             skill_deps_install_completion_tx: None,
             skill_deps_install_finished_at: None,
             skills_watcher: None,
+            config_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -4942,6 +5050,7 @@ mod retry_tests {
             skill_deps_install_completion_tx: None,
             skill_deps_install_finished_at: None,
             skills_watcher: None,
+            config_watcher: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
