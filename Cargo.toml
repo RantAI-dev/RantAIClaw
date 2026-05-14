@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rantaiclaw"
-version = "0.6.38-alpha"
+version = "0.6.39-alpha"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "Apache-2.0"
@@ -30,6 +30,13 @@ async-stream = { version = "0.3", default-features = false }
 
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
+# rig-core: unified LLM client library. Used by `src/providers/rig_native.rs`
+# to back Anthropic/OpenAI/Gemini streaming + tool calling instead of our
+# hand-rolled SSE parsers. MIT-licensed; depends on reqwest/rustls/serde
+# which we already pull in. `default = [reqwest, derive, rustls]` per
+# upstream — we disable `derive` to avoid the proc-macro cost since we
+# don't use rig's #[derive(Embed)] macros in our codebase.
+rig-core = { version = "0.37", default-features = false, features = ["reqwest", "rustls"] }
 
 # Matrix client + E2EE decryption
 matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown"] }
@@ -198,6 +205,12 @@ libc = "0.2"
 
 [features]
 default = ["tui"]
+# Re-enables the pre-rig hand-rolled provider implementations for
+# Anthropic/OpenAI/Gemini. Default off — those providers route
+# through `RigProvider` (src/providers/rig_native.rs). Build with
+# --features legacy-providers if rig misbehaves and you need to
+# fall back. Will be removed in v0.7.0 once rig has soaked.
+legacy-providers = []
 tui = ["dep:ratatui", "dep:crossterm"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]

@@ -26,6 +26,7 @@ pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
 pub mod reliable;
+pub mod rig_native;
 pub mod router;
 pub mod traits;
 
@@ -961,7 +962,21 @@ fn create_provider_with_url_and_options(
         "test-sse" => Ok(Box::new(TestSseProvider)),
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
+        // Anthropic / OpenAI native / Gemini route through `RigProvider`
+        // by default — see `src/providers/rig_native.rs`. Build with
+        // `--features legacy-providers` to fall back to the hand-rolled
+        // files (kept in tree through v0.7.0 for safety).
+        #[cfg(not(feature = "legacy-providers"))]
+        "anthropic" => Ok(Box::new(rig_native::RigProvider::for_provider(
+            "anthropic", key,
+        )?)),
+        #[cfg(feature = "legacy-providers")]
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
+        #[cfg(not(feature = "legacy-providers"))]
+        "openai" => Ok(Box::new(rig_native::RigProvider::for_provider_with_url(
+            "openai", key, api_url,
+        )?)),
+        #[cfg(feature = "legacy-providers")]
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
@@ -969,6 +984,11 @@ fn create_provider_with_url_and_options(
             key,
             options.reasoning_enabled,
         ))),
+        #[cfg(not(feature = "legacy-providers"))]
+        "gemini" | "google" | "google-gemini" => Ok(Box::new(
+            rig_native::RigProvider::for_provider("gemini", key)?,
+        )),
+        #[cfg(feature = "legacy-providers")]
         "gemini" | "google" | "google-gemini" => {
             Ok(Box::new(gemini::GeminiProvider::new(key)))
         }
