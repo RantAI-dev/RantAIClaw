@@ -1,4 +1,4 @@
-# RantaiClaw approval policy — preset L1 (Manual / paranoid)
+# RantaiClaw approval policy — preset Manual (paranoid)
 #
 # Source bundle for the three policy files written into
 # `<profile>/policy/` by `crate::approval::policy_writer::write_policy_files`.
@@ -8,14 +8,14 @@
 #   [command_allowlist] → `<profile>/policy/command_allowlist.toml`
 #   [forbidden_paths]   → `<profile>/policy/forbidden_paths.toml`
 #
-# L1 is the most restrictive preset. Every tool call is gated by an
+# Manual is the most restrictive preset. Every tool call is gated by an
 # interactive prompt. The allowlist starts empty — accreted entries
 # accumulate as the user picks `[a]lways` over time. The forbidden-paths
 # list covers system + user-secret directories that no agent should ever
 # touch.
 
 [autonomy]
-preset = "L1"
+preset = "manual"
 mode = "manual"
 description = "Manual — prompt for every tool call. Safest, slowest."
 

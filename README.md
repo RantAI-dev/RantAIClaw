@@ -160,7 +160,7 @@ Built-in tools with security boundaries:
 
 ### Autonomy
 
-Two layers — the **runtime enum** the approval gate branches on, and the **L1–L4 presets** the setup wizard writes to disk.
+Two layers — the **runtime enum** the approval gate branches on, and the **four named presets** the setup wizard writes to disk.
 
 **Runtime enum** (`AutonomyLevel` in `src/security/policy.rs`):
 
@@ -174,10 +174,10 @@ Two layers — the **runtime enum** the approval gate branches on, and the **L1�
 
 | Preset | Wizard label | Maps to |
 |---|---|---|
-| **L1** | Manual — prompt for every tool call (safest) | `supervised` + narrow auto_approve |
-| **L2** | Smart — prompt only for writes and system changes (recommended) | `supervised` + curated auto_approve (recommended starting point) |
-| **L3** | Strict — prompt for all exec, allow read-only | `supervised` + deny-by-default + read-only auto_approve |
-| **L4** | Off — autonomous execution, no prompts | `full` autonomy |
+| **Manual** | prompt for every tool call (safest) | `supervised` + empty allowlist |
+| **Smart** | prompt only for writes and system changes (recommended) | `supervised` + curated read-only allowlist |
+| **Strict** | deny-by-default, allow read-only | `supervised` + strict mode + read-only allowlist |
+| **Off** | autonomous execution, no prompts | `full` autonomy (CI / trusted environments only) |
 
 In v0.6.5+, Supervised mode adds an **async approval flow**: unknown shell basenames trigger a `/allow` / `/deny` prompt instead of hard-failing. See `docs/security/` and the user-facing site for the full mechanism.
 
@@ -414,7 +414,7 @@ RantaiClaw is built on the foundation of [ZeroClaw](https://github.com/zeroclaw-
 - **Multi-agent orchestration** — team communication, cross-employee task delegation and review
 - **ClawHub integration** — skill marketplace discovery and installation
 - **Digital employee platform** — dashboard UI, integration management, deployment automation
-- **Autonomy levels (L1–L4)** — configurable agent independence with tool-level permissions
+- **Autonomy presets (Manual / Smart / Strict / Off)** — configurable agent independence with tool-level permissions
 - **Runtime config persistence** — `config.runtime.toml` overlay preserving base config
 
 ---

@@ -19,7 +19,7 @@ The first thing a user sees. RantaiClaw's setup story is **fullscreen TUI wizard
 | First-run UX | Fullscreen TUI wizard, alt-screen | Shell prompts | TBD |
 | Headless mode | `--non-interactive` (CI-safe) | Partial | TBD |
 | Re-runnable per section | ✅ 6 sections | Partial | TBD |
-| Policy-aware (L1-L4) | ✅ | ❌ | TBD |
+| Policy-aware (Manual / Smart / Strict / Off presets) | ✅ | ❌ | TBD |
 | Diagnostic suite | `doctor` (text/json/brief) | Partial | TBD |
 | Setup time, fresh box → working agent | < 5 min | ~5-15 min | TBD |
 | Migration import (OpenClaw / ZeroClaw) | ✅ `rantaiclaw migrate` | n/a | n/a |

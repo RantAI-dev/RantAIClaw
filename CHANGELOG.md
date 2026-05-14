@@ -5,6 +5,41 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.40-alpha] — 2026-05-14
+
+Approval policy preset rename: drop the `L1` / `L2` / `L3` / `L4`
+prefixes and use the verbal labels directly (`Manual` / `Smart` /
+`Strict` / `Off`). The `L1`–`L4` naming implied a hierarchy that did
+not exist — `L4 — Off` reads counter-intuitive next to `L1 — Manual`,
+and three of the four presets all map to the same runtime
+`supervised` enum value. The new labels carry the meaning instead.
+
+### Changed
+
+- `PolicyPreset` enum variants renamed: `L1Manual` → `Manual`,
+  `L2Smart` → `Smart`, `L3Strict` → `Strict`, `L4Off` → `Off`.
+- On-disk preset identifiers changed: `preset = "L1"` … `"L4"` are now
+  written as `preset = "manual"` … `"off"`.
+- Preset bundle files renamed under `src/approval/presets/`:
+  `policy_l1.toml` → `policy_manual.toml`, `policy_l2.toml` →
+  `policy_smart.toml`, `policy_l3.toml` → `policy_strict.toml`,
+  `policy_l4.toml` → `policy_off.toml`.
+- Setup wizard dropped the `L1 —` / `L2 —` / … prefix; menu now reads
+  `Manual — prompt for every tool call`, etc.
+- `Off` preset (formerly `L4`) warning text updated to use the new
+  label.
+- Pillar docs (`docs/pillars/{1-setup,3-tools-approvals}.md`) and
+  README autonomy section updated to use the verbal preset names.
+
+### Compatibility
+
+- `PolicyPreset::from_str_ci` continues to accept the legacy
+  `L1`/`L2`/`L3`/`L4` ids so existing `<profile>/policy/autonomy.toml`
+  files written by pre-v0.6.40 releases still load without
+  hand-editing.
+- The setup wizard rewrites the file with the new label on next
+  `setup approvals --force`.
+
 ## [0.6.8-alpha] — 2026-05-07
 
 UI consistency cut driven by the v0.6.7 tester recommendation: *"Change

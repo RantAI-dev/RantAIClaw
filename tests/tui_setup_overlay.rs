@@ -60,7 +60,12 @@ fn choose_event_sets_active_choose_state() {
     s.handle_event(ProvisionEvent::Choose {
         id: "tier".into(),
         label: "Pick a tier".into(),
-        options: vec!["L1".into(), "L2".into(), "L3".into(), "L4".into()],
+        options: vec![
+            "Manual".into(),
+            "Smart".into(),
+            "Strict".into(),
+            "Off".into(),
+        ],
         multi: false,
     });
     assert!(s.active_choose().is_some());

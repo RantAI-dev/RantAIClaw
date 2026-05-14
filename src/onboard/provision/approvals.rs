@@ -1,7 +1,8 @@
-//! Approvals provisioner — implements [`TuiProvisioner`] for in-TUI L1-L4 autonomy tier setup.
+//! Approvals provisioner — implements [`TuiProvisioner`] for in-TUI
+//! preset selection (Manual / Smart / Strict / Off).
 //!
 //! Mirrors the legacy flow in [`crate::onboard::section::approvals`]:
-//!   1. Choose preset (L1 Manual / L2 Smart / L3 Strict / L4 Off)
+//!   1. Choose preset (Manual / Smart / Strict / Off)
 //!   2. Write policy files via `crate::approval::policy_writer::write_policy_files`
 //!
 //! Config writes: `<profile>/policy/autonomy.toml`, `command_allowlist.toml`, `forbidden_paths.toml`
@@ -14,7 +15,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 pub const APPROVALS_NAME: &str = "approvals";
-pub const APPROVALS_DESC: &str = "Approval policy preset — L1 manual to L4 off";
+pub const APPROVALS_DESC: &str = "Approval policy preset — Manual / Smart / Strict / Off";
 
 #[derive(Debug, Clone)]
 pub struct ApprovalsProvisioner;
@@ -66,10 +67,10 @@ impl TuiProvisioner for ApprovalsProvisioner {
         .await?;
 
         let options = vec![
-            "L1 — Manual: prompt for every tool call (safest)".to_string(),
-            "L2 — Smart: prompt only for writes and system changes (recommended)".to_string(),
-            "L3 — Strict: prompt for all exec, allow read-only".to_string(),
-            "L4 — Off: autonomous execution, no prompts".to_string(),
+            "Manual — prompt for every tool call (safest)".to_string(),
+            "Smart — prompt only for writes and system changes (recommended)".to_string(),
+            "Strict — deny-by-default, allow read-only".to_string(),
+            "Off — autonomous execution, no prompts".to_string(),
         ];
 
         send(
@@ -87,19 +88,14 @@ impl TuiProvisioner for ApprovalsProvisioner {
         let idx = sel.first().copied().unwrap_or(1);
 
         let preset = match idx {
-            0 => PolicyPreset::L1Manual,
-            1 => PolicyPreset::L2Smart,
-            2 => PolicyPreset::L3Strict,
-            3 => PolicyPreset::L4Off,
-            _ => PolicyPreset::L2Smart,
+            0 => PolicyPreset::Manual,
+            1 => PolicyPreset::Smart,
+            2 => PolicyPreset::Strict,
+            3 => PolicyPreset::Off,
+            _ => PolicyPreset::Smart,
         };
 
-        let label = match preset {
-            PolicyPreset::L1Manual => "L1 — Manual",
-            PolicyPreset::L2Smart => "L2 — Smart",
-            PolicyPreset::L3Strict => "L3 — Strict",
-            PolicyPreset::L4Off => "L4 — Off",
-        };
+        let label = preset.label();
 
         send(
             &events,
