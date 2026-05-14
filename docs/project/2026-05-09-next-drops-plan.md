@@ -17,15 +17,18 @@ needing the chat history.
 These match the v0.6.20 → v0.6.29 ship rhythm. Don't deviate without good reason.
 
 ### Build target
+
 - **Always** build `--target x86_64-unknown-linux-musl --release`. Static musl binary is the canonical artifact; non-musl builds aren't shipped.
 
 ### Validation per change
+
 - `cargo check --target x86_64-unknown-linux-musl` — must be clean (no errors)
 - `cargo test --target x86_64-unknown-linux-musl --lib <module-path>` — narrow run, NOT full suite (full suite is slow and the user's machine is constrained)
 - For TUI changes: `bash dev/tui-smoke.sh` to verify rendering end-to-end via tmux
 - Live test against real MiniMax when the change touches the agent loop. The key is in `.env`; `set -a; source .env; set +a` to load.
 
 ### Ship sequence per drop
+
 1. Bump `Cargo.toml` `version = "0.6.X-alpha"`
 2. `cargo build --release --target x86_64-unknown-linux-musl`
 3. Tarball:
@@ -56,6 +59,7 @@ These match the v0.6.20 → v0.6.29 ship rhythm. Don't deviate without good reas
    ```
 
 ### Anti-patterns to avoid (from prior session feedback)
+
 - **Don't run the full `cargo test` suite** — only run the modules you touched. Full suite freezes the test machine.
 - **Don't auto-add features** — if a "while you're there" temptation surfaces, write it in the gap tracker for a later drop.
 - **Don't skip the tmux smoke** for TUI work — `dev/tui-smoke.sh` exists; use it.
