@@ -277,7 +277,9 @@ async fn agent_chat_sync(
         .unwrap_or_else(|| "unknown".to_string());
 
     let started = std::time::Instant::now();
-    let mut agent = crate::agent::Agent::from_config(&config).map_err(|e| err_500(e))?;
+    let mut agent = crate::agent::Agent::from_config(&config)
+        .await
+        .map_err(|e| err_500(e))?;
     let text = agent.turn(&body.message).await.map_err(|e| err_500(e))?;
     if let Ok(store) = open_session_store() {
         if let Err(err) = record_api_chat_session(&store, &model, &body.message, &text) {
@@ -315,7 +317,7 @@ async fn agent_chat_stream(
     let cancel_for_stream = cancel.clone();
 
     tokio::spawn(async move {
-        match crate::agent::Agent::from_config(&config) {
+        match crate::agent::Agent::from_config(&config).await {
             Ok(mut agent) => {
                 let _ = agent
                     .turn_streaming(

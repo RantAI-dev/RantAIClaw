@@ -86,6 +86,15 @@ pub struct TuiContext {
     /// agent did, especially after a soft-cap hit. Refreshed on every
     /// `finalize_turn`; empty until at least one turn completes.
     pub last_turn_tool_calls: Vec<crate::tui::render::PersistedToolCall>,
+    /// MCP server names from `config.toml` `[mcp_servers.*]`. Used by
+    /// `/mcp` so the user can see which servers were *asked for*,
+    /// independent of whether discovery succeeded.
+    pub mcp_servers_configured: std::collections::HashSet<String>,
+    /// Live MCP tool registry, keyed by server name. Each value is
+    /// the list of fully-qualified tool names the agent actually
+    /// has access to. Empty entries mean the server is configured
+    /// but discovery failed.
+    pub mcp_tools_by_server: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl TuiContext {
@@ -137,6 +146,8 @@ impl TuiContext {
             input_history_stash: None,
             security: None,
             last_turn_tool_calls: Vec::new(),
+            mcp_servers_configured: std::collections::HashSet::new(),
+            mcp_tools_by_server: std::collections::HashMap::new(),
         })
     }
 

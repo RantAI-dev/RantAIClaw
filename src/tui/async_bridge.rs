@@ -62,7 +62,7 @@ impl TuiAgentActor {
                     Some(TurnRequest::Submit(text)) => self.queue.push_back(text),
                     Some(TurnRequest::Cancel) => { /* no-op while idle */ }
                     Some(TurnRequest::Reload(config)) => {
-                        match crate::agent::Agent::from_config(&config) {
+                        match crate::agent::Agent::from_config(&config).await {
                             Ok(new_agent) => {
                                 self.agent = new_agent;
                                 tracing::info!("agent reloaded with new config");
@@ -129,7 +129,7 @@ impl TuiAgentActor {
 
                     // Apply any reload that arrived during the turn.
                     if let Some(config) = self.pending_reload.take() {
-                        match crate::agent::Agent::from_config(&config) {
+                        match crate::agent::Agent::from_config(&config).await {
                             Ok(new_agent) => {
                                 self.agent = new_agent;
                                 tracing::info!("agent reloaded with new config (post-turn)");

@@ -4047,7 +4047,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         }
     }
 
-    let agent = Agent::from_config(&app_config)?;
+    let agent = Agent::from_config(&app_config).await?;
 
     let profile =
         crate::profile::ProfileManager::active().unwrap_or_else(|_| crate::profile::Profile {
@@ -4062,6 +4062,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     let (events_tx, events_rx): (AgentEventSender, mpsc::Receiver<AgentEvent>) = mpsc::channel(128);
 
     let security_handle = agent.security();
+    let mcp_tools_by_server = agent.mcp_tools_by_server();
     let actor = TuiAgentActor::new(agent, req_rx, events_tx);
     let actor_handle = tokio::spawn(actor.run());
 
@@ -4096,6 +4097,11 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         }
     }
     app.context.security = security_handle;
+
+    // Surface MCP server config + discovered tools so `/mcp` can
+    // render a useful diff between "configured" and "actually live".
+    app.context.mcp_servers_configured = app_config.mcp_servers.keys().cloned().collect();
+    app.context.mcp_tools_by_server = mcp_tools_by_server;
 
     if let Some(topic) = tui_config.setup_provisioner.take() {
         // `rantaiclaw setup` (no topic) and `rantaiclaw setup full` both

@@ -1,11 +1,14 @@
 //! MCP server registry — manages lifecycle of multiple stdio-based MCP server processes.
 //! Enforces a maximum of 10 concurrent servers per container.
 
+pub mod client;
 pub mod curated;
+pub mod discover;
 pub mod handle;
 pub mod oauth;
 pub mod setup;
 pub mod supervisor;
+pub mod tool;
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;

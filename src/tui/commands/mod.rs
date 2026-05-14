@@ -4,6 +4,7 @@ mod calls;
 mod config;
 mod core;
 mod cron;
+mod mcp;
 mod memory;
 mod model;
 mod session;
@@ -150,6 +151,7 @@ impl CommandRegistry {
         self.register(Box::new(allowlist::DenyCommand));
         self.register(Box::new(allowlist::AllowlistCommand));
         self.register(Box::new(calls::CallsCommand));
+        self.register(Box::new(mcp::McpCommand));
     }
 
     pub fn register(&mut self, handler: Box<dyn CommandHandler>) {
