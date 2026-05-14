@@ -2804,22 +2804,16 @@ impl TuiApp {
         ctx: &TuiContext,
     ) -> Result<()> {
         let size = terminal.size()?;
-        let lines = render_splash_lines();
+        // Splash already shows `Rantaiclaw v<x>` in the right pane;
+        // append only the session identifier here so the same info
+        // doesn't appear twice in scrollback.
+        let lines = render_splash_lines(ctx);
         let session_short = &ctx.session_id[..8.min(ctx.session_id.len())];
         let mut all_lines = lines;
-        all_lines.push(Line::from(""));
-        all_lines.push(Line::from(vec![
-            Span::styled(
-                format!("Rantaiclaw v{}", env!("CARGO_PKG_VERSION")),
-                Style::default()
-                    .fg(Color::Rgb(94, 184, 255))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  · session {} ", session_short),
-                Style::default().fg(Color::Rgb(107, 114, 128)),
-            ),
-        ]));
+        all_lines.push(Line::from(Span::styled(
+            format!("  · session {} ", session_short),
+            Style::default().fg(Color::Rgb(107, 114, 128)),
+        )));
         all_lines.push(Line::from(""));
         commit_lines_to_scrollback(terminal, all_lines, size.width, size.height)
     }
@@ -2858,7 +2852,7 @@ impl TuiApp {
 
         // Empty-state splash — figlet wordmark + welcome line.
         if self.context.messages.is_empty() && !matches!(self.state, AppState::Streaming { .. }) {
-            for line in render_splash_lines() {
+            for line in render_splash_lines(&self.context) {
                 items.push(ListItem::new(line));
             }
         }
@@ -3227,7 +3221,7 @@ fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Fra
     let mut items: Vec<ListItem> = Vec::with_capacity(ctx.messages.len() + 1);
 
     if ctx.messages.is_empty() && !matches!(state, AppState::Streaming { .. }) {
-        for line in render_splash_lines() {
+        for line in render_splash_lines(ctx) {
             items.push(ListItem::new(line));
         }
     }
@@ -3550,41 +3544,194 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
     frame.render_widget(status, area);
 }
 
-/// Render the splash banner + welcome lines as ratatui `Line`s for the
-/// empty-chat state. Pulls the same assets the CLI splash uses, colored
-/// by the brand gradient.
-fn render_splash_lines() -> Vec<Line<'static>> {
-    let banner = include_str!("../onboard/assets/banner_full.txt");
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let palette = [
-        Color::Rgb(94, 184, 255),  // sky
-        Color::Rgb(94, 184, 255),  // sky
-        Color::Rgb(59, 140, 255),  // blue
-        Color::Rgb(59, 140, 255),  // blue
-        Color::Rgb(40, 70, 140),   // navy bright
-        Color::Rgb(107, 114, 128), // muted
-    ];
-    for (i, line) in banner.lines().enumerate() {
-        let color = palette[i.min(palette.len() - 1)];
-        out.push(Line::from(Span::styled(
-            line.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )));
-    }
-    out.push(Line::from(""));
-    out.push(Line::from(vec![
+/// ASCII hermit-crab mascot. Cream shell on top + orange body + black
+/// eyes — the terminal-friendly cousin of the brand mascot. Kept as a
+/// const so the shape can be eyeballed and tweaked without hunting
+/// through `render_splash_lines`.
+///
+/// Every row is exactly `MASCOT_WIDTH` cells wide. Update both the art
+/// and the constant together.
+const HERMIT_CRAB_ART: &[&str] = &[
+    "         _,--._         ",
+    "      ,-'      `-.      ",
+    "     /  ,-~--~-,  \\     ",
+    "    /  /        \\  \\    ",
+    "   |  | ●      ● |  |   ",
+    "    \\  \\  \\__/  /  /    ",
+    "     '. '.____.' .'     ",
+    "  __   '._____.'   __   ",
+    " /  )__,'       `,__(  \\",
+    "(__/   |  /^\\  |   \\__) ",
+    "       |_/   \\_|        ",
+    "      ^^       ^^       ",
+    "                        ",
+    "      RANTAICLAW        ",
+];
+
+/// Width of the mascot column (in display cells). Keeps the right-pane
+/// alignment stable regardless of how cute we make the art.
+const MASCOT_WIDTH: usize = 24;
+
+/// Hard ceiling on the right-pane width, in chars. Used by `wrap_csv`.
+const MAX_RIGHT_WIDTH: usize = 64;
+
+/// Render the empty-chat splash: hermit-crab mascot on the left and a
+/// hermes-inspired "Available Channels / Skills" panel on the right.
+fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
+    let orange = Color::Rgb(255, 134, 64);
+    let shell = Color::Rgb(245, 230, 200);
+    let muted = Color::Rgb(107, 114, 128);
+    let sky = Color::Rgb(94, 184, 255);
+    let gold = Color::Rgb(234, 179, 8);
+
+    // ── Right-pane content ────────────────────────────────────────────
+    let mut right: Vec<Line<'static>> = Vec::new();
+
+    // Title row: bold sky-blue product name + dim version. Mirrors the
+    // top-right corner of the hermes splash.
+    right.push(Line::from(vec![
         Span::styled(
-            "  Welcome to Rantaiclaw. ",
-            Style::default()
-                .fg(Color::Rgb(94, 184, 255))
-                .add_modifier(Modifier::BOLD),
+            "Rantaiclaw",
+            Style::default().fg(sky).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "Type a message or /help for commands.",
-            Style::default().fg(Color::Rgb(107, 114, 128)),
+            format!("  v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(muted),
         ),
     ]));
+    right.push(Line::from(""));
+
+    // Available Channels — pull configured rows from the TUI context.
+    right.push(Line::from(Span::styled(
+        "Available Channels",
+        Style::default().fg(gold).add_modifier(Modifier::BOLD),
+    )));
+    let channels: Vec<String> = ctx
+        .channels_summary
+        .iter()
+        .filter(|(_, configured)| *configured)
+        .map(|(name, _)| name.clone())
+        .collect();
+    if channels.is_empty() {
+        right.push(Line::from(Span::styled(
+            "  (none configured — run `/setup channels` to enable transports)",
+            Style::default().fg(muted),
+        )));
+    } else {
+        for line in wrap_csv(&channels, MAX_RIGHT_WIDTH) {
+            right.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(sky)),
+            ]));
+        }
+    }
+    right.push(Line::from(""));
+
+    // Available Skills — names from the loaded skill set.
+    right.push(Line::from(Span::styled(
+        "Available Skills",
+        Style::default().fg(gold).add_modifier(Modifier::BOLD),
+    )));
+    let skills: Vec<String> = ctx
+        .available_skills
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    if skills.is_empty() {
+        right.push(Line::from(Span::styled(
+            "  (none installed — run `/setup skills` or `/skill install <name>`)",
+            Style::default().fg(muted),
+        )));
+    } else {
+        for line in wrap_csv(&skills, MAX_RIGHT_WIDTH) {
+            right.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(sky)),
+            ]));
+        }
+    }
+    right.push(Line::from(""));
+
+    // Bottom hint, dim — same wording the old splash used.
+    right.push(Line::from(Span::styled(
+        "Type a message or /help for commands.",
+        Style::default().fg(muted),
+    )));
+
+    // ── Left-pane mascot ──────────────────────────────────────────────
+    //
+    // Tint: top three rows = cream shell, body rows = orange, bottom
+    // three rows (legs + brand stamp) = muted orange / sky for the
+    // wordmark so it reads as part of the brand rather than the crab.
+    let mut left: Vec<Line<'static>> = Vec::with_capacity(HERMIT_CRAB_ART.len());
+    let body_end = HERMIT_CRAB_ART.len().saturating_sub(3);
+    for (i, row) in HERMIT_CRAB_ART.iter().enumerate() {
+        let (color, bold) = if i < 3 {
+            (shell, true)
+        } else if i < body_end {
+            (orange, true)
+        } else if row.contains("RANTAICLAW") {
+            (sky, true)
+        } else {
+            (Color::Rgb(200, 100, 50), true) // darker orange for legs
+        };
+        let style = if bold {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
+        left.push(Line::from(Span::styled(row.to_string(), style)));
+    }
+
+    // ── Stitch the two columns ────────────────────────────────────────
+    let rows = left.len().max(right.len());
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(rows + 2);
     out.push(Line::from(""));
+    for i in 0..rows {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if let Some(line) = left.get(i) {
+            spans.extend(line.spans.iter().cloned());
+            // Pad the left column to MASCOT_WIDTH so the separator stays
+            // vertically aligned even on rows the mascot doesn't fill.
+            let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            if used < MASCOT_WIDTH {
+                spans.push(Span::raw(" ".repeat(MASCOT_WIDTH - used)));
+            }
+        } else {
+            spans.push(Span::raw(" ".repeat(MASCOT_WIDTH)));
+        }
+        spans.push(Span::raw("  "));
+        if let Some(line) = right.get(i) {
+            spans.extend(line.spans.iter().cloned());
+        }
+        out.push(Line::from(spans));
+    }
+    out.push(Line::from(""));
+    out
+}
+
+/// Join `items` with `", "` and word-wrap so no output line exceeds
+/// `width` columns. Returns at least one row even when `items` is empty.
+fn wrap_csv(items: &[String], width: usize) -> Vec<String> {
+    if items.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for (i, item) in items.iter().enumerate() {
+        let token = if i + 1 == items.len() {
+            item.clone()
+        } else {
+            format!("{item}, ")
+        };
+        if !cur.is_empty() && cur.chars().count() + token.chars().count() > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(&token);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
     out
 }
 
