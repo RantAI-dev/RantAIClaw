@@ -54,6 +54,8 @@ pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub(crate) mod identity;
 pub(crate) mod integrations;
+#[cfg(feature = "kb")]
+pub mod kb;
 pub mod mcp;
 pub mod memory;
 pub mod migration;
