@@ -41,6 +41,10 @@ allow = [
     "CDLA-Permissive-2.0",
     "0BSD",
     "BSL-1.0",
+    # CC0-1.0 (Creative Commons Zero) is a public-domain dedication, FSF
+    # Free/Libre, more permissive than MIT (no attribution required).
+    # Used by `notify` 8.x (hot-reload watcher).
+    "CC0-1.0",
 ]
 unused-allowed-license = "allow"
 
