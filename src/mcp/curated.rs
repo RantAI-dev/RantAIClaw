@@ -1,8 +1,24 @@
-//! Curated MCP server registry — the 9 servers offered by the v0.5.0
-//! onboarding wizard's MCP section.
+//! Curated MCP server registry — servers offered by the onboarding
+//! wizard's MCP section.
 //!
 //! Source-of-truth: `docs/superpowers/specs/2026-04-27-onboarding-depth-v2-design.md`,
 //! §"Section 5 — mcp (NEW)" + §"MCP discovery".
+//!
+//! ## Maintenance (2026-05-14 audit)
+//!
+//! Reference MCP servers are published either to npm under
+//! `@modelcontextprotocol/server-*` or to PyPI under `mcp-server-*`
+//! (run via `uvx`). The split is **per server, not per language** —
+//! some Python-only, some TypeScript-only. The split has shifted at
+//! least once; entries here must be checked against
+//! https://github.com/modelcontextprotocol/servers before any
+//! release.
+//!
+//! When an entry's package goes 404 or moves, fix it here; don't
+//! ship a wizard that offers servers users can't install. Removed
+//! entries (Google Calendar, Gmail) had no official MCP server in
+//! the registry as of this audit — the reference servers list ends
+//! at Drive for the Google suite.
 
 #[derive(Debug, Clone, Copy)]
 pub struct CuratedMcpServer {
@@ -57,19 +73,24 @@ impl OAuthProvider {
 }
 
 pub const NO_AUTH: &[CuratedMcpServer] = &[
+    // Web Fetch is a Python reference server. Requires `uv` on PATH
+    // (https://docs.astral.sh/uv/). If uv isn't installed, spawn
+    // fails and `/mcp` shows the server as ✗ failed — clearer than
+    // a misleading npm 404 we used to ship.
     CuratedMcpServer {
         slug: "web-fetch",
         display_name: "Web Fetch",
-        summary: "HTTP GET arbitrary URLs and return text/markdown.",
-        install_command: &["npx", "-y", "@modelcontextprotocol/server-fetch"],
+        summary: "HTTP GET arbitrary URLs and return text/markdown. (Requires `uv` installed; uvx provided.)",
+        install_command: &["uvx", "mcp-server-fetch"],
         auth: AuthMethod::None,
         env_vars: &[],
     },
+    // Time is also Python-only, same uvx requirement.
     CuratedMcpServer {
         slug: "time",
         display_name: "Time",
-        summary: "Current time and timezone conversions.",
-        install_command: &["npx", "-y", "@modelcontextprotocol/server-time"],
+        summary: "Current time and timezone conversions. (Requires `uv` installed; uvx provided.)",
+        install_command: &["uvx", "mcp-server-time"],
         auth: AuthMethod::None,
         env_vars: &[],
     },
@@ -84,11 +105,13 @@ pub const NO_AUTH: &[CuratedMcpServer] = &[
 ];
 
 pub const AUTHED: &[CuratedMcpServer] = &[
+    // Notion's official MCP server moved from `@modelcontextprotocol/server-notion`
+    // (404 as of 2026-05-14) to the Notion-published package.
     CuratedMcpServer {
         slug: "notion",
         display_name: "Notion",
         summary: "Read/search/append Notion pages and databases.",
-        install_command: &["npx", "-y", "@modelcontextprotocol/server-notion"],
+        install_command: &["npx", "-y", "@notionhq/notion-mcp-server"],
         auth: AuthMethod::Token {
             secret_key: "NOTION_API_KEY",
             hint: "Internal integration token — notion.so/profile/integrations",
@@ -128,31 +151,14 @@ pub const AUTHED: &[CuratedMcpServer] = &[
         },
         env_vars: &["GOOGLE_DRIVE_OAUTH_TOKEN"],
     },
-    CuratedMcpServer {
-        slug: "google-calendar",
-        display_name: "Google Calendar",
-        summary: "Read events, create reminders, RSVP.",
-        install_command: &["npx", "-y", "@modelcontextprotocol/server-gcalendar"],
-        auth: AuthMethod::OAuth {
-            provider: OAuthProvider::GoogleCalendar,
-            scopes: &["https://www.googleapis.com/auth/calendar"],
-        },
-        env_vars: &["GOOGLE_CALENDAR_OAUTH_TOKEN"],
-    },
-    CuratedMcpServer {
-        slug: "gmail",
-        display_name: "Gmail",
-        summary: "Read inbox, draft + send messages.",
-        install_command: &["npx", "-y", "@modelcontextprotocol/server-gmail"],
-        auth: AuthMethod::OAuth {
-            provider: OAuthProvider::Gmail,
-            scopes: &[
-                "https://www.googleapis.com/auth/gmail.readonly",
-                "https://www.googleapis.com/auth/gmail.send",
-            ],
-        },
-        env_vars: &["GMAIL_OAUTH_TOKEN"],
-    },
+    // Removed 2026-05-14: Google Calendar + Gmail. The
+    // `@modelcontextprotocol/server-gcalendar` and
+    // `@modelcontextprotocol/server-gmail` packages 404 on npm
+    // and no replacement official server exists in the
+    // modelcontextprotocol/servers registry. `OAuthProvider`
+    // variants for them are kept so existing `oauth.rs` state in
+    // the wild doesn't crash; they'll be re-added once an official
+    // MCP server ships for either.
 ];
 
 pub const fn curated_count() -> usize {
@@ -185,8 +191,42 @@ mod unit {
     fn split_command_extracts_program_and_args() {
         let entry = &NO_AUTH[0];
         let (cmd, args) = entry.split_command();
-        assert_eq!(cmd, "npx");
-        assert_eq!(args, vec!["-y", "@modelcontextprotocol/server-fetch"]);
+        // After 2026-05-14 audit, web-fetch uses the Python
+        // reference server via uvx.
+        assert_eq!(cmd, "uvx");
+        assert_eq!(args, vec!["mcp-server-fetch"]);
+    }
+
+    #[test]
+    fn all_known_npm_packages_are_under_a_real_scope() {
+        // Guards against regressions to the pre-2026-05-14 list
+        // that pointed at npm packages which returned 404. Any
+        // npx entry must live under a known-published scope.
+        for s in NO_AUTH.iter().chain(AUTHED.iter()) {
+            let (cmd, args) = s.split_command();
+            if cmd != "npx" {
+                continue;
+            }
+            // Find the package arg (last token starting with @
+            // or non-flag).
+            let pkg = args
+                .iter()
+                .find(|a| a.starts_with('@') || !a.starts_with('-'))
+                .unwrap_or_else(|| panic!("server {} has no package arg", s.slug));
+            let known_good_prefixes = [
+                "@modelcontextprotocol/server-filesystem",
+                "@modelcontextprotocol/server-slack",
+                "@modelcontextprotocol/server-github",
+                "@modelcontextprotocol/server-gdrive",
+                "@notionhq/notion-mcp-server",
+            ];
+            assert!(
+                known_good_prefixes.iter().any(|p| pkg.starts_with(p)),
+                "server {} uses unknown npm package: {}",
+                s.slug,
+                pkg
+            );
+        }
     }
 
     #[test]
