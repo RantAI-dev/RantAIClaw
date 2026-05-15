@@ -189,7 +189,9 @@ pub async fn probe_channels(config: &crate::config::Config) -> ChannelSummary {
             match probe_whatsapp_web(path) {
                 ProbeWebResult::Ok => ok.push("whatsapp (web)".to_string()),
                 ProbeWebResult::SessionMissing => {
-                    warn.push("whatsapp web: no session — needs QR pairing on next run".to_string())
+                    warn.push(
+                        "whatsapp web: no session — needs QR pairing on next run".to_string(),
+                    );
                 }
                 ProbeWebResult::SessionPathBad(e) => bad.push(format!("whatsapp web session: {e}")),
             }

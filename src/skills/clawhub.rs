@@ -23,7 +23,7 @@ use crate::profile::Profile;
 pub const CLAWHUB_BASE_URL_ENV: &str = "RANTAICLAW_CLAWHUB_BASE_URL";
 const DEFAULT_BASE_URL: &str = "https://clawhub.ai/api/v1";
 const TOP_SKILLS_CACHE_FILE: &str = "top-skills.json";
-const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
+const CACHE_TTL: Duration = Duration::from_hours(24);
 
 /// Subset of the ClawHub skill listing item that the wizard cares about.
 /// Extra fields in the payload are ignored (serde default behaviour).

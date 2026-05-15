@@ -56,7 +56,7 @@ impl TuiProvisioner for AgentsProvisioner {
         )
         .await?;
 
-        let built_in = vec!["researcher", "coder", "planner", "reviewer", "debugger"];
+        let built_in = ["researcher", "coder", "planner", "reviewer", "debugger"];
 
         send(
             &events,

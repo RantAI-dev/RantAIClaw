@@ -200,7 +200,7 @@ impl PendingApprovals {
 impl Default for PendingApprovals {
     /// 5-minute default timeout matches the design doc.
     fn default() -> Self {
-        Self::new(Duration::from_secs(300))
+        Self::new(Duration::from_mins(5))
     }
 }
 

@@ -168,7 +168,7 @@ async fn doctor(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let lib_config = state.config.lock().clone();
-    let profile = crate::profile::ProfileManager::active().map_err(|e| err_500(e.into()))?;
+    let profile = crate::profile::ProfileManager::active().map_err(err_500)?;
     let ctx = crate::doctor::DoctorContext {
         profile,
         config: lib_config,
@@ -279,8 +279,8 @@ async fn agent_chat_sync(
     let started = std::time::Instant::now();
     let mut agent = crate::agent::Agent::from_config(&config)
         .await
-        .map_err(|e| err_500(e))?;
-    let text = agent.turn(&body.message).await.map_err(|e| err_500(e))?;
+        .map_err(err_500)?;
+    let text = agent.turn(&body.message).await.map_err(err_500)?;
     if let Ok(store) = open_session_store() {
         if let Err(err) = record_api_chat_session(&store, &model, &body.message, &text) {
             tracing::warn!(error = %err, "api agent chat session persistence failed");

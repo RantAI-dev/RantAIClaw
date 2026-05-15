@@ -335,7 +335,7 @@ fn run_download(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
 
     println!("  · downloading {url}");
     let bytes = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .build()
         .context("build reqwest client")?
         .get(url)
@@ -347,8 +347,8 @@ fn run_download(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
         .context("download body")?;
 
     match recipe.archive.as_deref() {
-        Some("tar.gz") | Some("tgz") => {
-            extract_targz(&bytes, &target_dir, recipe.strip_components.unwrap_or(0))?
+        Some("tar.gz" | "tgz") => {
+            extract_targz(&bytes, &target_dir, recipe.strip_components.unwrap_or(0))?;
         }
         Some("zip") => extract_zip(&bytes, &target_dir, recipe.strip_components.unwrap_or(0))?,
         Some("tar.bz2") => {

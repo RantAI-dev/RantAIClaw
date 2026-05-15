@@ -108,7 +108,7 @@ impl TuiProvisioner for TunnelProvisioner {
                                 text: "cloudflared found.".into(),
                             },
                         )
-                        .await?
+                        .await?;
                     }
                     Err(e) => {
                         send(
@@ -118,7 +118,7 @@ impl TuiProvisioner for TunnelProvisioner {
                                 text: format!("cloudflared not found: {e}"),
                             },
                         )
-                        .await?
+                        .await?;
                     }
                 }
 
@@ -151,7 +151,7 @@ impl TuiProvisioner for TunnelProvisioner {
                                 text: "tailscale found.".into(),
                             },
                         )
-                        .await?
+                        .await?;
                     }
                     Err(e) => {
                         send(
@@ -161,7 +161,7 @@ impl TuiProvisioner for TunnelProvisioner {
                                 text: format!("tailscale not found: {e}"),
                             },
                         )
-                        .await?
+                        .await?;
                     }
                 }
 
@@ -216,7 +216,7 @@ impl TuiProvisioner for TunnelProvisioner {
                                 text: "ngrok found.".into(),
                             },
                         )
-                        .await?
+                        .await?;
                     }
                     Err(e) => {
                         send(
@@ -226,7 +226,7 @@ impl TuiProvisioner for TunnelProvisioner {
                                 text: format!("ngrok not found: {e}"),
                             },
                         )
-                        .await?
+                        .await?;
                     }
                 }
 
@@ -279,7 +279,7 @@ impl TuiProvisioner for TunnelProvisioner {
         send(
             &events,
             ProvisionEvent::Done {
-                summary: format!("Tunnel provider set."),
+                summary: "Tunnel provider set.".to_string(),
             },
         )
         .await?;

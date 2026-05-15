@@ -86,7 +86,7 @@ fn parse_reply(text: &str) -> Option<ParsedReply> {
     let trailing: Vec<&str> = tokens.collect();
     let persist = match trailing.as_slice() {
         [] => false,
-        ["--persist"] | ["--save"] | ["-p"] | ["persist"] => true,
+        ["--persist" | "--save" | "-p" | "persist"] => true,
         _ => return None,
     };
 

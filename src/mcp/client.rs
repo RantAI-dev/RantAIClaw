@@ -135,7 +135,7 @@ impl McpClient {
             match serde_json::from_value::<McpToolInfo>(entry.clone()) {
                 Ok(info) if !info.name.is_empty() => out.push(info),
                 Ok(_) => {
-                    tracing::warn!(target: "mcp", server = %self.server_name, "tools/list entry missing name")
+                    tracing::warn!(target: "mcp", server = %self.server_name, "tools/list entry missing name");
                 }
                 Err(e) => tracing::warn!(
                     target: "mcp",

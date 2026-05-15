@@ -834,7 +834,7 @@ impl TuiApp {
                     let overlay = self.setup_overlay.as_mut().unwrap();
                     overlay
                         .submit_prompt()
-                        .unwrap_or_else(|| ("".into(), "".into()))
+                        .unwrap_or_else(|| (String::new(), String::new()))
                 };
                 if let Some(tx) = &self.setup_response_tx {
                     let _ = tx
@@ -1617,12 +1617,12 @@ impl TuiApp {
         if self.stream_header_committed {
             let committed = self.stream_committed_chars.min(body.len());
             let tail = body[committed..].to_string();
-            if !tail.is_empty() {
-                self.scrollback_queue
-                    .push(("_continuation".to_string(), tail));
-            } else {
+            if tail.is_empty() {
                 self.scrollback_queue
                     .push(("_continuation".to_string(), String::new()));
+            } else {
+                self.scrollback_queue
+                    .push(("_continuation".to_string(), tail));
             }
         } else {
             self.scrollback_queue
@@ -3401,14 +3401,14 @@ fn render_stream_preview_pane(
         Span::styled(format!("  {spinner} "), sky),
         Span::styled(label.to_string(), muted),
     ];
-    if !snippet.trim().is_empty() {
+    if snippet.trim().is_empty() {
+        spans.push(Span::styled("    Ctrl+C to cancel".to_string(), muted));
+    } else {
         spans.push(Span::styled("    ".to_string(), muted));
         spans.push(Span::styled(
             snippet,
             Style::default().fg(Color::Rgb(180, 200, 220)),
         ));
-    } else {
-        spans.push(Span::styled("    Ctrl+C to cancel".to_string(), muted));
     }
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line);
@@ -4375,7 +4375,7 @@ pub(crate) fn count_configured_channels(c: &crate::config::Config) -> usize {
 /// at TUI startup.
 pub(crate) fn channel_status_summary(c: &crate::config::Config) -> Vec<(&'static str, bool)> {
     let cc = &c.channels_config;
-    let mut rows: Vec<(&'static str, bool)> = vec![
+    let rows: Vec<(&'static str, bool)> = vec![
         ("Telegram", cc.telegram.is_some()),
         ("Discord", cc.discord.is_some()),
         ("Slack", cc.slack.is_some()),

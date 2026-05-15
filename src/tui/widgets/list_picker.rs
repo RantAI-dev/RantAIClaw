@@ -323,7 +323,7 @@ impl ListPicker {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(i, entry)| {
+            .filter(|(_i, entry)| {
                 match entry {
                     ListPickerEntry::CategoryHeader { id, collapsed, .. } => {
                         // Always show headers in filtered results so users can

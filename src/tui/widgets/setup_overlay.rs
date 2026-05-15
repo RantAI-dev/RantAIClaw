@@ -752,8 +752,8 @@ impl SetupOverlayState {
             header_spans.push(Span::styled(
                 format!(
                     "  {}{}",
-                    if !at_top { "↑" } else { " " },
-                    if !at_bot { "↓" } else { " " },
+                    if at_top { " " } else { "↑" },
+                    if at_bot { " " } else { "↓" },
                 ),
                 Style::default().fg(if at_top && at_bot { dim } else { sky }),
             ));
@@ -896,7 +896,7 @@ fn truncate_to_width(s: &str, max_cols: usize) -> String {
     format!("{truncated}…")
 }
 
-fn style_log_line<'a>(l: &'a str, coral: Color, sky: Color, emerald: Color) -> Line<'a> {
+fn style_log_line(l: &str, coral: Color, sky: Color, emerald: Color) -> Line<'_> {
     if let Some(rest) = l.strip_prefix("· ") {
         Line::from(vec![
             Span::styled("· ", Style::default().fg(sky)),
@@ -933,7 +933,7 @@ fn render_horizontal_rule(f: &mut Frame, area: Rect, dim: Color) {
     if w == 0 {
         return;
     }
-    let line: String = std::iter::repeat('─').take(w).collect();
+    let line: String = std::iter::repeat_n('─', w).collect();
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(line, Style::default().fg(dim)))),
         area,

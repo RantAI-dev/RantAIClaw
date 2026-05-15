@@ -15,10 +15,11 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum AutoStartState {
     /// `start_channels` was never dispatched (no channels configured at
     /// TUI launch).
+    #[default]
     NotDispatched,
     /// Dispatched and currently inside `start_channels` — provider build,
     /// listener spawn, dispatch loop entry, etc.
@@ -29,12 +30,6 @@ pub enum AutoStartState {
     /// `start_channels` returned `Err`. Listeners never fully started or
     /// exited unexpectedly. The message is the formatted error chain.
     Failed { message: String, at_unix: u64 },
-}
-
-impl Default for AutoStartState {
-    fn default() -> Self {
-        AutoStartState::NotDispatched
-    }
 }
 
 fn cell() -> &'static Mutex<AutoStartState> {

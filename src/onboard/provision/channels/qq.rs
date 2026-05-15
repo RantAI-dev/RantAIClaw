@@ -115,7 +115,7 @@ impl TuiProvisioner for QqProvisioner {
         )
         .await?;
 
-        let verify_url = format!("https://api.sgroup.qq.com/gateway/bot");
+        let verify_url = "https://api.sgroup.qq.com/gateway/bot".to_string();
         match probe_get(
             &verify_url,
             &[("Authorization", &format!("Bot {}", app_id.trim()))],

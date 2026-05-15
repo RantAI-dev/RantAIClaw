@@ -1105,7 +1105,7 @@ fn render_horizontal_rule(frame: &mut Frame, area: Rect, dim: Color) {
     if w == 0 {
         return;
     }
-    let line: String = std::iter::repeat('─').take(w).collect();
+    let line: String = std::iter::repeat_n('─', w).collect();
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(line, Style::default().fg(dim)))),
         area,

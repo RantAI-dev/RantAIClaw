@@ -44,7 +44,7 @@ impl TuiProvisioner for McpProvisioner {
         MCP_DESC
     }
 
-    async fn run(&self, config: &mut Config, profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
         let ProvisionIo {
             events,
             mut responses,
@@ -64,11 +64,11 @@ impl TuiProvisioner for McpProvisioner {
         // Map global index -> server
         let mut server_by_idx: Vec<(&CuratedMcpServer, bool)> = Vec::new(); // (server, is_authed)
 
-        for s in NO_AUTH.iter() {
+        for s in NO_AUTH {
             all_options.push(format!("{} (no auth)", s.display_name));
             server_by_idx.push((s, false));
         }
-        for s in AUTHED.iter() {
+        for s in AUTHED {
             all_options.push(format!("{} (auth required)", s.display_name));
             server_by_idx.push((s, true));
         }
@@ -180,7 +180,7 @@ impl TuiProvisioner for McpProvisioner {
 
         // Register zero-auth servers
         let mut zero_auth_added = 0;
-        let all_zero_auth_indices: Vec<usize> =
+        let _all_zero_auth_indices: Vec<usize> =
             NO_AUTH.iter().enumerate().map(|(i, _)| i).collect();
 
         for (zero_idx, server) in NO_AUTH.iter().enumerate() {

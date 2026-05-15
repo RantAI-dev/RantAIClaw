@@ -405,10 +405,7 @@ fn port_skills_entries(openclaw_json: &Path, dest_config_toml: &Path) -> Result<
         toml_out.push('\n');
     }
 
-    let mut existing = match fs::read_to_string(dest_config_toml) {
-        Ok(s) => s,
-        Err(_) => String::new(),
-    };
+    let mut existing = fs::read_to_string(dest_config_toml).unwrap_or_default();
     if !existing.is_empty() && !existing.ends_with('\n') {
         existing.push('\n');
     }

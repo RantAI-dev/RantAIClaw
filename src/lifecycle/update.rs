@@ -687,7 +687,7 @@ pub fn rollback(opts: RollbackOpts) -> Result<()> {
     let target = if let Some(path) = &opts.snapshot {
         snapshots
             .into_iter()
-            .find(|s| s.dir == std::path::PathBuf::from(path))
+            .find(|s| s.dir == *path)
             .ok_or_else(|| anyhow!("snapshot {} not found", path))?
     } else {
         snapshots.into_iter().next().ok_or_else(|| {

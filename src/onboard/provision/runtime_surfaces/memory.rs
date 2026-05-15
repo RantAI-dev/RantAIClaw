@@ -84,7 +84,7 @@ impl TuiProvisioner for MemoryProvisioner {
         }
         .to_string();
 
-        let mut memory_cfg = MemoryConfig {
+        let memory_cfg = MemoryConfig {
             backend: backend.clone(),
             auto_save: true,
             hygiene_enabled: true,
@@ -149,9 +149,8 @@ impl TuiProvisioner for MemoryProvisioner {
                 &events,
                 ProvisionEvent::Message {
                     severity: Severity::Info,
-                    text: format!(
-                        "DSN noted (configure in [storage.provider.config] for full integration)"
-                    ),
+                    text: "DSN noted (configure in [storage.provider.config] for full integration)"
+                        .to_string(),
                 },
             )
             .await?;

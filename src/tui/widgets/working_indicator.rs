@@ -65,7 +65,10 @@ pub fn render(state: &WorkingState<'_>, now: Instant) -> Line<'static> {
         WorkingState::Cancelling => {
             // Use a faster-cycling frame source for cancelling so the
             // visual feedback is distinct from normal streaming.
-            let frame = frame_index(now, Instant::now() - Duration::from_secs(0));
+            let frame = frame_index(
+                now,
+                Instant::now().checked_sub(Duration::from_secs(0)).unwrap(),
+            );
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled(SPINNER_FRAMES[frame].to_string(), coral),

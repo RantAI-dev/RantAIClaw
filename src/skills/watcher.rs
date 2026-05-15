@@ -42,9 +42,11 @@ impl SkillsWatcher {
                         event.kind,
                         EventKind::Create(_)
                             | EventKind::Remove(_)
-                            | EventKind::Modify(notify::event::ModifyKind::Data(_))
-                            | EventKind::Modify(notify::event::ModifyKind::Name(_))
-                            | EventKind::Modify(notify::event::ModifyKind::Any)
+                            | EventKind::Modify(
+                                notify::event::ModifyKind::Data(_)
+                                    | notify::event::ModifyKind::Name(_)
+                                    | notify::event::ModifyKind::Any
+                            )
                     );
                     if actionable {
                         let _ = raw_tx.send(event);

@@ -94,8 +94,8 @@ async fn run_provisioner_headless(
                     None => break,
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                let _ = handle.abort();
+            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                let () = handle.abort();
                 break;
             }
         }

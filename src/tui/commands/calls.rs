@@ -60,7 +60,7 @@ impl CommandHandler for CallsCommand {
                 if map.is_empty() {
                     body.push("      args: (none)".into());
                 } else {
-                    for (k, v) in map.iter() {
+                    for (k, v) in map {
                         body.push(format!("      {k}: {}", truncate_value(v)));
                     }
                 }
