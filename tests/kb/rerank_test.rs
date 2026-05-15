@@ -8,7 +8,7 @@
 
 #![allow(clippy::await_holding_lock)]
 
-use rantaiclaw::kb::rerank::{Candidate, CohereReranker, LlmReranker, Reranker};
+use rantaiclaw::kb::rerank::{Candidate, CohereReranker, LlmReranker, Reranker, VllmReranker};
 use rantaiclaw::kb::KbError;
 use serde_json::json;
 use wiremock::matchers::{method, path};
@@ -304,5 +304,95 @@ async fn cohere_rerank_errors_on_4xx() {
             assert!(body.contains("forbidden"), "body = {body}");
         }
         other => panic!("expected KbError::ChatApi(403), got {other:?}"),
+    }
+}
+
+// ---- VllmReranker (task 8.4) ----------------------------------------
+
+/// vLLM mock-response envelope (same shape as Cohere).
+fn vllm_body(results: &[(usize, f32)]) -> serde_json::Value {
+    let items: Vec<_> = results
+        .iter()
+        .map(|(i, s)| json!({ "index": i, "relevance_score": s }))
+        .collect();
+    json!({ "results": items })
+}
+
+#[tokio::test]
+async fn vllm_rerank_short_circuits_when_few_candidates() {
+    // Use a non-routable URL — short-circuit must not touch the network.
+    let r = VllmReranker::new(
+        "http://127.0.0.1:1".into(),
+        "nemotron-test".into(),
+    )
+    .expect("non-empty base_url");
+    let c = cands(2);
+    let out = r.rerank("q", &c, 5).await.expect("short-circuit ok");
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].id, "c0");
+    assert_eq!(out[1].id, "c1");
+    assert!((out[0].score - 5.0).abs() < 1e-6);
+    assert!((out[1].score - 4.0).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn vllm_rerank_parses_cohere_shape_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rerank"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(vllm_body(&[(3, 0.95), (1, 0.42)])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let r = VllmReranker::new(server.uri(), "nemotron-test".into())
+        .expect("non-empty base_url");
+    let c = cands(5);
+    let out = r.rerank("q", &c, 3).await.expect("rerank ok");
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0].id, "c3");
+    assert!((out[0].score - 0.95).abs() < 1e-6);
+    assert_eq!(out[1].id, "c1");
+    assert!((out[1].score - 0.42).abs() < 1e-6);
+    // Filler picks next-in-original-order (c0 before c2/c4) with score 0.
+    assert_eq!(out[2].id, "c0");
+    assert!(out[2].score.abs() < 1e-6);
+}
+
+#[test]
+fn vllm_rerank_errors_on_empty_base_url() {
+    // VllmReranker isn't Debug (holds a reqwest::Client), so use match
+    // instead of expect_err.
+    match VllmReranker::new(String::new(), "nemotron-test".into()) {
+        Ok(_) => panic!("empty base_url must fail at construction"),
+        Err(KbError::Config(msg)) => assert!(msg.contains("base_url"), "msg = {msg}"),
+        Err(other) => panic!("expected KbError::Config, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn vllm_rerank_errors_on_5xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rerank"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream busy"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let r = VllmReranker::new(server.uri(), "nemotron-test".into())
+        .expect("non-empty base_url");
+    let err = r
+        .rerank("q", &cands(5), 3)
+        .await
+        .expect_err("503 must surface as ChatApi");
+    match err {
+        KbError::ChatApi { status, body } => {
+            assert_eq!(status, 503);
+            assert!(body.contains("upstream busy"), "body = {body}");
+        }
+        other => panic!("expected KbError::ChatApi(503), got {other:?}"),
     }
 }
