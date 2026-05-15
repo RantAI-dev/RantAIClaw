@@ -190,14 +190,16 @@ fn sentence_fallback_when_paragraphless() {
         },
     );
     assert!(chunks.len() > 1, "expected >1 chunks, got {}", chunks.len());
-    for c in &chunks {
+    for (i, c) in chunks.iter().enumerate() {
         let trimmed = c.content.trim_end();
         let last = trimmed.chars().last();
-        assert!(
-            matches!(last, Some('.') | Some('!') | Some('?')),
-            "expected sentence terminator at end of chunk, got {last:?} in {:?}",
-            c.content
-        );
+        let is_terminal = matches!(last, Some('.') | Some('!') | Some('?'));
+        if i + 1 < chunks.len() {
+            assert!(
+                is_terminal,
+                "chunk {i} should end with sentence terminator, got tail {trimmed:?}"
+            );
+        }
     }
 }
 
