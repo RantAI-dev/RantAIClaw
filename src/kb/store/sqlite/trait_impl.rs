@@ -69,8 +69,8 @@ impl KbStore for SqliteStore {
         self.search_by_vector_impl(query, limit, filter).await
     }
 
-    async fn bm25_search(&self, _query: &str, _limit: usize) -> KbResult<Vec<Bm25Hit>> {
-        Err(KbError::Other("bm25_search: pending Task 2.6".to_string()))
+    async fn bm25_search(&self, query: &str, limit: usize) -> KbResult<Vec<Bm25Hit>> {
+        self.bm25_search_impl(query, limit).await
     }
 
     async fn count_by_embedding_model(&self) -> KbResult<Vec<(Option<String>, usize)>> {

@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::kb::{KbError, KbResult};
 
+pub mod bm25;
 pub mod chunks;
 pub mod documents;
 pub mod schema;

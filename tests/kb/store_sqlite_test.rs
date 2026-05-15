@@ -162,3 +162,49 @@ async fn dimension_mismatch_errors_loudly() {
         rantaiclaw::kb::KbError::DimensionMismatch { .. }
     ));
 }
+
+#[tokio::test]
+async fn bm25_search_returns_lexical_matches() {
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let doc = sample_doc("doc-bm", "BM Doc");
+    store.create_document(&doc).await.unwrap();
+
+    let chunks = vec![
+        Chunk {
+            content: "the quick brown fox jumps".into(),
+            metadata: ChunkMetadata {
+                document_title: doc.title.clone(),
+                category: "FAQ".into(),
+                subcategory: None,
+                section: None,
+                chunk_index: 0,
+                contextual_prefix: None,
+            },
+        },
+        Chunk {
+            content: "lazy dog sleeps quietly".into(),
+            metadata: ChunkMetadata {
+                document_title: doc.title.clone(),
+                category: "FAQ".into(),
+                subcategory: None,
+                section: None,
+                chunk_index: 1,
+                contextual_prefix: None,
+            },
+        },
+    ];
+    let embeds = vec![ones(4), ones(4)];
+    store
+        .store_chunks(&doc.id, &chunks, &embeds, "test-model")
+        .await
+        .unwrap();
+
+    let hits = store.bm25_search("fox", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].content.contains("fox"));
+    // Score is negated (higher = better) so a matching hit must be > 0.
+    assert!(hits[0].score > 0.0);
+}
