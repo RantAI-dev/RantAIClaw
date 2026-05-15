@@ -3544,20 +3544,83 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
     frame.render_widget(status, area);
 }
 
-// Pixel grid for the hermit-crab mascot. Generated offline from
-// `Untitled design (3).png` via `tools/render_mascot.py`; each cell
-// is `(upper_rgb, upper_transparent, lower_rgb, lower_transparent)`
-// and renders as one '▀' character in the splash with the upper
-// pixel as fg and the lower pixel as bg. Truecolor — terminals
-// without 24-bit colour will down-mix to their palette.
-include!("assets/mascot_pixels.rs");
+/// ASCII hermit-crab mascot, supplied by the project. Rendered with
+/// per-character colour so the silhouette reads as a hermit crab on
+/// any terminal that supports basic ANSI 24-bit (most modern ones) —
+/// terminals without truecolor downmix to their nearest palette, and
+/// the underlying ASCII glyphs (`@ % = + # * - . :`) stay visible
+/// even when colour is dropped entirely.
+const HERMIT_CRAB_ART: &str = include_str!("assets/mascot_ascii.txt");
 
-/// Width of the mascot column (in display cells). Must match the
-/// per-row length of `MASCOT_PIXELS` so the right pane stays aligned.
-const MASCOT_WIDTH: usize = 32;
+/// Width of the mascot column (in display cells). Must be at least as
+/// wide as the longest row of `HERMIT_CRAB_ART` so the right-pane
+/// stays aligned.
+const MASCOT_WIDTH: usize = 95;
 
 /// Hard ceiling on the right-pane width, in chars. Used by `wrap_csv`.
 const MAX_RIGHT_WIDTH: usize = 64;
+
+/// Map a single glyph from `HERMIT_CRAB_ART` to its RGB tint. Returning
+/// `None` means "render this cell as a plain space with no styling" —
+/// the splash uses that for whitespace so the art blends with whatever
+/// background the terminal happens to be using.
+fn mascot_color(ch: char) -> Option<Color> {
+    match ch {
+        // Shell tones — the rounded canopy on the crab's back.
+        '@' => Some(Color::Rgb(215, 195, 160)),
+        '%' => Some(Color::Rgb(245, 230, 200)),
+        // Claw / leg segments — the heavily-rendered orange parts.
+        '=' => Some(Color::Rgb(240, 100, 30)),
+        '+' => Some(Color::Rgb(250, 130, 70)),
+        // Eye / pupil detail — kept very dark so they read as features
+        // rather than noise inside the body.
+        '#' => Some(Color::Rgb(40, 35, 30)),
+        '*' => Some(Color::Rgb(70, 60, 50)),
+        // Body outline and interior shading.
+        '-' => Some(Color::Rgb(180, 110, 60)),
+        '.' => Some(Color::Rgb(235, 215, 180)),
+        ':' => Some(Color::Rgb(220, 195, 165)),
+        _ => None,
+    }
+}
+
+/// Convert one row of `HERMIT_CRAB_ART` into a `Line` of styled spans,
+/// batching contiguous same-colour runs into a single span to keep the
+/// span count manageable for ratatui.
+fn mascot_row(row: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Color> = None;
+    let mut started = false;
+
+    let flush = |spans: &mut Vec<Span<'static>>, buf: &mut String, color: Option<Color>| {
+        if buf.is_empty() {
+            return;
+        }
+        let span = match color {
+            Some(c) => Span::styled(
+                std::mem::take(buf),
+                Style::default().fg(c).add_modifier(Modifier::BOLD),
+            ),
+            None => Span::raw(std::mem::take(buf)),
+        };
+        spans.push(span);
+    };
+
+    for ch in row.chars() {
+        let color = mascot_color(ch);
+        if !started {
+            cur = color;
+            started = true;
+        } else if color != cur {
+            flush(&mut spans, &mut buf, cur);
+            cur = color;
+        }
+        buf.push(ch);
+    }
+    flush(&mut spans, &mut buf, cur);
+    Line::from(spans)
+}
 
 /// Render the empty-chat splash: hermit-crab mascot on the left and a
 /// hermes-inspired "Available Channels / Skills" panel on the right.
@@ -3640,50 +3703,43 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
         Style::default().fg(muted),
     )));
 
-    // ── Left-pane mascot ──────────────────────────────────────────────
+    // ── Left-pane mascot (ASCII, per-character colour) ────────────────
     //
-    // Each row of `MASCOT_PIXELS` is `MASCOT_WIDTH` cells wide. We
-    // render every cell as a `▀` (upper half block) with the upper
-    // pixel as foreground colour and the lower pixel as background,
-    // doubling vertical resolution at no character cost. Transparent
-    // pixels collapse to "no colour" so the splash blends with the
-    // terminal background.
-    let mut left: Vec<Line<'static>> = Vec::with_capacity(MASCOT_PIXELS.len() + 2);
-    for row in MASCOT_PIXELS.iter() {
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(row.len());
-        for &(ur, ug, ub, u_t, lr, lg, lb, l_t) in row.iter() {
-            let mut style = Style::default();
-            if !u_t {
-                style = style.fg(Color::Rgb(ur, ug, ub));
-            }
-            if !l_t {
-                style = style.bg(Color::Rgb(lr, lg, lb));
-            }
-            // When both halves are transparent emit a plain space so
-            // ratatui doesn't bother painting the cell at all — keeps
-            // the splash visually clean on themed terminals.
-            let glyph = if u_t && l_t { " " } else { "▀" };
-            spans.push(Span::styled(glyph.to_string(), style));
-        }
-        left.push(Line::from(spans));
+    // Each non-empty row of `HERMIT_CRAB_ART` becomes a `Line` whose
+    // spans are batched by colour. Whitespace remains uncoloured so
+    // the art blends with the terminal background.
+    let mut left: Vec<Line<'static>> = Vec::new();
+    for row in HERMIT_CRAB_ART.lines() {
+        left.push(mascot_row(row));
     }
-    // Brand wordmark stamp beneath the art — kept in the same sky-blue
-    // as the right-pane title so the two read as one identity.
-    left.push(Line::from(""));
-    let wordmark = "RANTAICLAW";
-    let pad = MASCOT_WIDTH.saturating_sub(wordmark.chars().count()) / 2;
-    left.push(Line::from(vec![
-        Span::raw(" ".repeat(pad)),
-        Span::styled(
-            wordmark.to_string(),
-            Style::default().fg(sky).add_modifier(Modifier::BOLD),
-        ),
-    ]));
+
+    // ── Top section: figlet wordmark ──────────────────────────────────
+    //
+    // The original v0.5.x splash showed the `RANTAICLAW` figlet only;
+    // we keep that on top so the brand reads immediately, then drop
+    // into the mascot + info columns below.
+    let banner = include_str!("../onboard/assets/banner_full.txt");
+    let figlet_palette = [
+        Color::Rgb(94, 184, 255),  // sky
+        Color::Rgb(94, 184, 255),  // sky
+        Color::Rgb(59, 140, 255),  // blue
+        Color::Rgb(59, 140, 255),  // blue
+        Color::Rgb(40, 70, 140),   // navy
+        Color::Rgb(107, 114, 128), // muted
+    ];
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::from(""));
+    for (i, line) in banner.lines().enumerate() {
+        let color = figlet_palette[i.min(figlet_palette.len() - 1)];
+        out.push(Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )));
+    }
+    out.push(Line::from(""));
 
     // ── Stitch the two columns ────────────────────────────────────────
     let rows = left.len().max(right.len());
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(rows + 2);
-    out.push(Line::from(""));
     for i in 0..rows {
         let mut spans: Vec<Span<'static>> = Vec::new();
         if let Some(line) = left.get(i) {
