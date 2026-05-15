@@ -12,7 +12,7 @@ use super::SqliteStore;
 use crate::kb::{Document, DocumentId, KbError, KbResult};
 
 #[allow(clippy::cast_sign_loss)]
-pub(crate) fn map_row(row: &Row<'_>) -> rusqlite::Result<Document> {
+pub(crate) fn map_row(row: &Row<'_>) -> KbResult<Document> {
     let categories_json: String = row.get("categories_json")?;
     let metadata_json: String = row.get("metadata_json")?;
     let created_at: String = row.get("created_at")?;
@@ -35,19 +35,22 @@ pub(crate) fn map_row(row: &Row<'_>) -> rusqlite::Result<Document> {
         created_by: row.get("created_by")?,
         session_id: row.get("session_id")?,
         artifact_type: row.get("artifact_type")?,
-        created_at: parse_ts(&created_at),
-        updated_at: parse_ts(&updated_at),
-        deleted_at: deleted_at.as_deref().map(parse_ts),
+        created_at: parse_ts(&created_at)?,
+        updated_at: parse_ts(&updated_at)?,
+        deleted_at: deleted_at.as_deref().map(parse_ts).transpose()?,
         retention_days: row.get("retention_days")?,
         retrieval_count: row.get("retrieval_count")?,
-        last_retrieved_at: last_retrieved_at.as_deref().map(parse_ts),
+        last_retrieved_at: last_retrieved_at.as_deref().map(parse_ts).transpose()?,
     })
 }
 
-fn parse_ts(s: &str) -> DateTime<Utc> {
+/// Parse an RFC3339 timestamp out of a TEXT column. Fail-fast (CLAUDE.md 3.5):
+/// silently falling back to `Utc::now()` masked storage corruption and made
+/// retention/age computations meaningless.
+fn parse_ts(s: &str) -> KbResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .map_err(|e| KbError::Other(format!("invalid timestamp in DB: {s:?} ({e})")))
 }
 
 impl SqliteStore {
