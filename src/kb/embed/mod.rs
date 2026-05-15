@@ -46,6 +46,11 @@ pub trait EmbeddingProvider: Send + Sync {
 /// CDN whose hostname ends in `openrouter.ai` would misclassify; the operator
 /// in that case should pick a different base URL (TEI typically runs on a
 /// private network, so this collision is unlikely in practice).
+///
+/// **Call once at startup** — each invocation constructs a new
+/// `reqwest::Client` with its own connection pool. Hold the returned
+/// `Arc<dyn EmbeddingProvider>` for the process lifetime; cloning the `Arc`
+/// is cheap and shares the underlying client.
 pub fn make_provider(cfg: &KbConfig) -> KbResult<Arc<dyn EmbeddingProvider>> {
     let cache: SharedEmbedCache = Arc::new(Mutex::new(LruCache::new(
         cfg.query_embed_cache_size,
