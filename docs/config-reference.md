@@ -539,6 +539,78 @@ Notes:
 - Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
 - See [hardware-peripherals-design.md](hardware-peripherals-design.md) for board protocol and firmware notes.
 
+## KB (Knowledge Base)
+
+The KB subsystem is gated behind the `kb` Cargo feature and is **off in the default build**. All KB settings are env-driven (no `[kb]` TOML section today). For the full user guide see [kb.md](kb.md).
+
+### Storage
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `KB_DB_PATH` | platform data dir (`~/.local/share/rantaiclaw/kb.db` on Linux, `~/Library/Application Support/rantaiclaw/kb.db` on macOS) | SQLite database path; `./kb.db` is used as a final fallback when HOME is unavailable |
+
+### Embedding
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `KB_EMBEDDING_MODEL` | `qwen/qwen3-embedding-8b` | Embedding model ID |
+| `KB_EMBEDDING_DIM` | `4096` | Vector dimension; must match the chosen model |
+| `KB_EMBEDDING_BASE_URL` | `https://openrouter.ai/api/v1/embeddings` | Embedding endpoint; point at a TEI sidecar for on-prem use |
+| `KB_EMBEDDING_API_KEY` | unset | Bearer for the embedding endpoint; falls back to `OPENROUTER_API_KEY` when empty |
+| `KB_EMBED_BATCH_SIZE` | `128` | Batch size for embedding requests |
+| `KB_EMBED_CONCURRENCY` | `4` | Concurrent embedding requests in-flight |
+| `KB_QUERY_EMBED_CACHE_SIZE` | `256` | LRU size for cached query embeddings |
+| `KB_QUERY_EMBED_CACHE_TTL_MS` | `300000` | TTL for cached query embeddings (5 minutes) |
+
+### Retrieval
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `KB_DEFAULT_MAX_CHUNKS` | `8` | Default `top_k` when callers don't specify |
+| `KB_HYBRID_BM25_ENABLED` | `true` | Fuse vector + BM25 results via RRF (set to `false` to use pure vector) |
+| `KB_QUERY_EXPANSION_ENABLED` | `false` | LLM-generated paraphrases of the query before retrieval |
+| `KB_QUERY_EXPANSION_MODEL` | `openai/gpt-4.1-nano` | Model used for paraphrase generation |
+| `KB_QUERY_EXPANSION_PARAPHRASES` | `3` | Number of paraphrases per query |
+| `KB_STANDALONE_QUERY_ENABLED` | `false` | Rewrite multi-turn queries to be self-contained before retrieval |
+| `KB_CONTEXTUAL_RETRIEVAL_ENABLED` | `false` | Anthropic-style contextual prefix prepended to each chunk during ingest |
+| `KB_CONTEXTUAL_RETRIEVAL_MODEL` | `openai/gpt-4.1-nano` | Model used for contextual prefix generation |
+
+### Reranker
+
+Opt-in second-stage ranker over the top-`KB_RERANK_INITIAL_K` candidates.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `KB_RERANK_ENABLED` | `false` | Enable the reranker stage |
+| `KB_RERANK_PROVIDER` | unset | Reranker backend: `openrouter` (LLM), `cohere`, `vllm` |
+| `KB_RERANK_MODEL` | `openai/gpt-4.1-nano` | Reranker model ID |
+| `KB_RERANK_INITIAL_K` | `20` | Candidates pulled from first-stage retrieval |
+| `KB_RERANK_FINAL_K` | `5` | Top-k returned after reranking |
+
+### Extraction (PDF + image)
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `KB_EXTRACT_PRIMARY` | `smart` | PDF extraction strategy: `smart` (text-layer first, vision fallback), `unpdf`, `vision`, `mineru` |
+| `KB_EXTRACT_FALLBACK` | `unpdf` | Fallback strategy when the primary fails |
+| `KB_EXTRACT_SMART_FALLBACK` | `openai/gpt-4.1-nano` | Vision model used when smart-router decides a PDF needs OCR |
+| `KB_EXTRACT_VISION_BASE_URL` | `https://openrouter.ai/api/v1/chat/completions` | Vision LLM endpoint |
+| `KB_EXTRACT_VISION_API_KEY` | unset | Bearer for the vision endpoint; falls back to `OPENROUTER_API_KEY` |
+| `KB_EXTRACT_MINERU_BASE_URL` | unset | MinerU sidecar base URL (required when `KB_EXTRACT_PRIMARY=mineru`) |
+
+### Shared
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `KB_OPENROUTER_CHAT_URL` | `https://openrouter.ai/api/v1/chat/completions` | Chat-completions endpoint shared by query expansion, contextual retrieval, and standalone-query rewriting |
+| `OPENROUTER_API_KEY` | unset | Fallback bearer for any KB endpoint whose per-endpoint key is empty |
+
+Notes:
+
+- `KB_RERANK_ENABLED` parses **exactly** the string `"true"` as enabled. All other values (including `"1"`, `"yes"`, `"on"`) are treated as disabled.
+- `KB_HYBRID_BM25_ENABLED` is the inverse: disabled **only** when the value is exactly `"false"`. Any other value (including unset) keeps BM25 on.
+- Parse failures for numeric vars surface a `KbError::Config` at startup with the offending value — fail-fast, no silent fallback to defaults.
+
 ## Security-Relevant Defaults
 
 - deny-by-default channel allowlists (`[]` means deny all)

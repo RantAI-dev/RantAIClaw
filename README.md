@@ -190,6 +190,9 @@ Multiple backends for persistent agent memory:
 
 Memory supports semantic search via embeddings for context-aware recall.
 
+### Knowledge Base
+Embedded SQLite + `sqlite-vec` document store with hybrid (vector + BM25) retrieval, optional reranker, and a smart-router PDF extraction pipeline. Strictly isolated from agent memory. Available behind the `kb` feature flag — see [docs/kb.md](docs/kb.md).
+
 ---
 
 ## Quick Install
