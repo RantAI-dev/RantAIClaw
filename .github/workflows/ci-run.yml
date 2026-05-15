@@ -66,17 +66,26 @@ jobs:
         needs: [changes, lint]
         if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
         runs-on: ubuntu-latest
-        timeout-minutes: 30
+        # 45min: cargo test on the full workspace runs ~6,300 tests over
+        # 32 binaries. Empirically takes 9–12 min when the cache is warm,
+        # but the cold cache + cross-binary recompile in the May-2026
+        # runner image has pushed total Test-step time past 25 min on
+        # back-to-back runs. 45 min leaves headroom for transient
+        # runner-image slowness without masking a true deadlock.
+        timeout-minutes: 45
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@v2
-            - name: Install cargo-nextest
-              run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
-            - name: Run tests (nextest)
-              run: cargo nextest run --locked --workspace
+            - name: Run tests
+              # `cargo nextest` was tried first but the runner consistently
+              # SIGTERM'd or hit the 30-min cap on this codebase. `cargo
+              # test --locked` is the known-good invocation from prior to
+              # the v0.6.40-alpha CI overhaul and is what the v0.6.40-alpha
+              # release was actually verified against.
+              run: cargo test --locked --workspace
 
     features:
         name: Features (${{ matrix.name }})
