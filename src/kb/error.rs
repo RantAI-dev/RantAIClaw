@@ -26,6 +26,13 @@ pub enum KbError {
         index: usize,
     },
 
+    #[error("array length mismatch: {kind} ({left} vs {right})")]
+    LengthMismatch {
+        kind: &'static str,
+        left: usize,
+        right: usize,
+    },
+
     #[error("invalid config: {0}")]
     Config(String),
 

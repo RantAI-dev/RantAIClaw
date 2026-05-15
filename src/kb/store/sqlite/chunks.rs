@@ -34,11 +34,11 @@ impl SqliteStore {
         embedding_model: &str,
     ) -> KbResult<()> {
         if chunks.len() != embeddings.len() {
-            return Err(KbError::Other(format!(
-                "chunk/embedding length mismatch: {} chunks vs {} embeddings",
-                chunks.len(),
-                embeddings.len()
-            )));
+            return Err(KbError::LengthMismatch {
+                kind: "chunks vs embeddings",
+                left: chunks.len(),
+                right: embeddings.len(),
+            });
         }
         // Up-front dimension validation — fail before touching the DB so a
         // partial insert can't leave the FTS/vec tables out of sync.
