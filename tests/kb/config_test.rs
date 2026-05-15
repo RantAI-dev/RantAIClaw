@@ -6,6 +6,22 @@ use std::sync::Mutex;
 // std Mutex keeps the dep surface narrow.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// RAII guard that removes the listed env vars on drop. Ensures cleanup
+/// still runs if an assertion panics between `set_var` and the end of
+/// the test — without this the env var leaks process-wide AND the
+/// `ENV_LOCK` mutex becomes poisoned, breaking every subsequent test.
+struct EnvGuard(Vec<&'static str>);
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for k in &self.0 {
+            // SAFETY: single-threaded access serialized via ENV_LOCK above.
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+}
+
 #[test]
 fn defaults_match_ts_kb() {
     let _guard = ENV_LOCK.lock().unwrap();
@@ -45,6 +61,11 @@ fn defaults_match_ts_kb() {
 #[test]
 fn env_overrides_apply() {
     let _guard = ENV_LOCK.lock().unwrap();
+    let _env = EnvGuard(vec![
+        "KB_EMBEDDING_MODEL",
+        "KB_EMBEDDING_DIM",
+        "KB_HYBRID_BM25_ENABLED",
+    ]);
     unsafe {
         std::env::set_var("KB_EMBEDDING_MODEL", "voyage/voyage-3");
         std::env::set_var("KB_EMBEDDING_DIM", "1024");
@@ -54,22 +75,17 @@ fn env_overrides_apply() {
     assert_eq!(cfg.embedding_model, "voyage/voyage-3");
     assert_eq!(cfg.embedding_dim, 1024);
     assert!(!cfg.hybrid_bm25_enabled);
-    unsafe {
-        std::env::remove_var("KB_EMBEDDING_MODEL");
-        std::env::remove_var("KB_EMBEDDING_DIM");
-        std::env::remove_var("KB_HYBRID_BM25_ENABLED");
-    }
+    // Cleanup runs via EnvGuard::drop, even on assertion panic above.
 }
 
 #[test]
 fn invalid_int_returns_error() {
     let _guard = ENV_LOCK.lock().unwrap();
+    let _env = EnvGuard(vec!["KB_EMBEDDING_DIM"]);
     unsafe {
         std::env::set_var("KB_EMBEDDING_DIM", "not-a-number");
     }
     let result = KbConfig::from_env();
     assert!(result.is_err());
-    unsafe {
-        std::env::remove_var("KB_EMBEDDING_DIM");
-    }
+    // Cleanup runs via EnvGuard::drop.
 }
