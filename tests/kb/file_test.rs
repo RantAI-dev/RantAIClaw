@@ -405,9 +405,8 @@ mod office {
         for body in paragraphs {
             doc = doc.add_paragraph(Paragraph::new().add_run(Run::new().add_text(*body)));
         }
-        let xml = doc.build();
         let mut buf = std::io::Cursor::new(Vec::<u8>::new());
-        docx_rs::zip(&mut buf, xml).expect("zip docx");
+        doc.build().pack(&mut buf).expect("pack docx");
         buf.into_inner()
     }
 
