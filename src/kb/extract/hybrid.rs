@@ -258,21 +258,29 @@ fn normalize_space(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Case-insensitive, whitespace-normalized substring search. Returns the
-/// byte-index into `normalized_haystack` (which is assumed already
-/// normalized) or `None`.
-fn find_normalized(normalized_haystack: &str, needle: &str, from: usize) -> Option<usize> {
+/// Case-insensitive, whitespace-normalized substring search.
+///
+/// Returns a CHAR offset (not a byte offset) into `haystack_lc`, where
+/// `haystack_lc = normalized_haystack.to_lowercase()`. Callers must convert
+/// that char offset back to a byte offset in the ORIGINAL normalized string
+/// via `char_indices()` before slicing — a byte offset from the lowercased
+/// copy is not generally valid in the original, because `to_lowercase()`
+/// can change byte length (e.g. Turkish `İ` -> `i̇`, German `ß` -> `ss`).
+fn find_normalized(haystack_lc: &str, needle: &str, from_chars: usize) -> Option<usize> {
     let norm_needle = normalize_space(needle).to_lowercase();
     if norm_needle.is_empty() {
         return None;
     }
-    let haystack_lc = normalized_haystack.to_lowercase();
-    if from >= haystack_lc.len() {
-        return None;
-    }
-    haystack_lc[from..]
-        .find(&norm_needle)
-        .map(|rel| from + rel)
+    // Translate the caller's char-offset into a byte-offset within haystack_lc.
+    let from_bytes = match haystack_lc.char_indices().nth(from_chars) {
+        Some((b, _)) => b,
+        None if from_chars == haystack_lc.chars().count() => haystack_lc.len(),
+        None => return None,
+    };
+    let rel_bytes = haystack_lc[from_bytes..].find(&norm_needle)?;
+    let abs_bytes = from_bytes + rel_bytes;
+    // Char count up to the match start.
+    Some(haystack_lc[..abs_bytes].chars().count())
 }
 
 fn try_substitute(prose_raw: &str, normalized_text_layer: &str) -> Option<String> {
@@ -282,12 +290,42 @@ fn try_substitute(prose_raw: &str, normalized_text_layer: &str) -> Option<String
     if start_anchor.is_empty() || end_anchor.is_empty() {
         return None;
     }
-    let start_idx = find_normalized(normalized_text_layer, &start_anchor, 0)?;
-    let end_search_from = start_idx + normalize_space(&start_anchor).len();
-    let end_idx = find_normalized(normalized_text_layer, &end_anchor, end_search_from)?;
-    let end_anchor_len = normalize_space(&end_anchor).len();
-    let span_end = (end_idx + end_anchor_len).min(normalized_text_layer.len());
-    let span = &normalized_text_layer[start_idx..span_end];
+
+    let haystack_lc = normalized_text_layer.to_lowercase();
+
+    // All offsets below are CHAR offsets into haystack_lc / normalized_text_layer.
+    // If the lowercased copy has a different char count than the original
+    // (e.g. `ß` -> `ss` adds one char), we can't safely map back, so bail.
+    let original_char_count = normalized_text_layer.chars().count();
+    let lc_char_count = haystack_lc.chars().count();
+    if original_char_count != lc_char_count {
+        return None;
+    }
+
+    let start_chars = find_normalized(&haystack_lc, &start_anchor, 0)?;
+    let start_anchor_lc_chars = normalize_space(&start_anchor)
+        .to_lowercase()
+        .chars()
+        .count();
+    let end_chars = find_normalized(
+        &haystack_lc,
+        &end_anchor,
+        start_chars + start_anchor_lc_chars,
+    )?;
+    let end_anchor_lc_chars = normalize_space(&end_anchor).to_lowercase().chars().count();
+    let span_end_chars = (end_chars + end_anchor_lc_chars).min(original_char_count);
+
+    // Map char offsets back to byte offsets in the ORIGINAL normalized string.
+    // We collect char_indices once; the buffer is bounded by the prose+layer
+    // sizes already kept in memory by the caller, so this is fine.
+    let char_byte_index: Vec<usize> = normalized_text_layer
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(normalized_text_layer.len()))
+        .collect();
+    let start_byte = *char_byte_index.get(start_chars)?;
+    let end_byte = *char_byte_index.get(span_end_chars)?;
+    let span = &normalized_text_layer[start_byte..end_byte];
 
     let ratio = span.len() as f64 / prose.len().max(1) as f64;
     if !(LENGTH_RATIO_MIN..=LENGTH_RATIO_MAX).contains(&ratio) {

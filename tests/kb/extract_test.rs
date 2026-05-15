@@ -615,6 +615,37 @@ fn merge_preserves_tables_verbatim() {
     assert!(merged.contains("Some prose text"));
 }
 
+#[test]
+fn merge_handles_non_ascii_prose_without_panic() {
+    // Regression for a `try_substitute` slicing bug: when `to_lowercase()`
+    // changed byte length (German `ß` -> `ss`, Turkish `İ` -> `i̇`, etc.) or
+    // when multi-byte UTF-8 chars made byte indices land off char boundaries,
+    // the previous code panicked while slicing the original text layer with
+    // an offset computed from its lowercased copy. The merge must now run to
+    // completion on real-world non-ASCII content.
+    let structural = "# Pembayaran Berbasis Saham\n\nPembayaran Berbasis Saham diakui sebagai biaya pada periode berjalan.";
+    let text_layer = "Pembayaran Berbasis Saham diakui sebagai biaya pada periode berjalan.";
+    let merged = merge_structural_with_text_layer(structural, text_layer);
+    assert!(
+        merged.contains("# Pembayaran Berbasis Saham"),
+        "heading must survive: {merged}"
+    );
+    assert!(
+        merged.contains("Pembayaran Berbasis Saham diakui"),
+        "prose must survive: {merged}"
+    );
+
+    // German `ß` -> `ss` exercises the lowercased-bytes-change branch.
+    let structural_de = "Die Straße ist lang und kurvig genug für mehrere Sätze.";
+    let text_layer_de = "Die Straße ist lang und kurvig genug für mehrere Sätze.";
+    let _ = merge_structural_with_text_layer(structural_de, text_layer_de);
+
+    // Mixed multi-byte (Japanese kana + ASCII) must not slice on a UTF-8 boundary.
+    let structural_mb = "概要 — quick brown fox jumps over the lazy dog 終わり.";
+    let text_layer_mb = "概要 — quick brown fox jumps over the lazy dog 終わり.";
+    let _ = merge_structural_with_text_layer(structural_mb, text_layer_mb);
+}
+
 // ----- live integration (skipped unless OPENROUTER_API_KEY set) ----------
 
 #[tokio::test]
