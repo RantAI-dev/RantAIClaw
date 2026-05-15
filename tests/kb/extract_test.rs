@@ -37,9 +37,9 @@ fn ensure_text_pdf() -> PathBuf {
     if path.exists() {
         return path;
     }
-    std::fs::create_dir_all(fixtures_dir()).unwrap();
+    std::fs::create_dir_all(fixtures_dir()).expect("ensure_text_pdf: create fixtures dir");
     let bytes = build_pdf(&["RantaiClawSample Hello World"]);
-    std::fs::write(&path, bytes).unwrap();
+    std::fs::write(&path, bytes).expect("ensure_text_pdf: write sample-text.pdf fixture");
     path
 }
 
@@ -49,11 +49,11 @@ fn ensure_8_page_pdf() -> PathBuf {
     if path.exists() {
         return path;
     }
-    std::fs::create_dir_all(fixtures_dir()).unwrap();
+    std::fs::create_dir_all(fixtures_dir()).expect("ensure_8_page_pdf: create fixtures dir");
     let pages: Vec<String> = (1..=8).map(|i| format!("Page {i}")).collect();
     let refs: Vec<&str> = pages.iter().map(String::as_str).collect();
     let bytes = build_pdf(&refs);
-    std::fs::write(&path, bytes).unwrap();
+    std::fs::write(&path, bytes).expect("ensure_8_page_pdf: write sample-8-page.pdf fixture");
     path
 }
 
@@ -87,7 +87,12 @@ fn build_pdf(pages: &[&str]) -> Vec<u8> {
                 Operation::new("ET", vec![]),
             ],
         };
-        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let content_id = doc.add_object(Stream::new(
+            dictionary! {},
+            content
+                .encode()
+                .expect("build_pdf: encode lopdf page content stream"),
+        ));
         let page_id = doc.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => pages_id,
@@ -113,13 +118,15 @@ fn build_pdf(pages: &[&str]) -> Vec<u8> {
     doc.trailer.set("Root", catalog_id);
     doc.compress();
     let mut buf: Vec<u8> = Vec::new();
-    doc.save_to(&mut buf).unwrap();
+    doc.save_to(&mut buf)
+        .expect("build_pdf: save lopdf Document to in-memory buffer");
     buf
 }
 
 #[allow(dead_code)] // used by task 5.3 splitter test
 fn read_fixture(path: &Path) -> Vec<u8> {
-    std::fs::read(path).unwrap()
+    std::fs::read(path)
+        .unwrap_or_else(|e| panic!("read_fixture: failed to read {}: {e}", path.display()))
 }
 
 // ----- task 5.2: UnpdfExtractor ------------------------------------------
