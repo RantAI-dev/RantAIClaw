@@ -1,3 +1,7 @@
+// matrix-sdk-0.16's async types blow past the default 128-level
+// recursion budget during type-checking under --all-features. Bumping
+// here propagates the limit into monomorphizations we instantiate.
+#![recursion_limit = "512"]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(
     clippy::assigning_clones,

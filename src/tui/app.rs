@@ -4375,7 +4375,8 @@ pub(crate) fn count_configured_channels(c: &crate::config::Config) -> usize {
 /// at TUI startup.
 pub(crate) fn channel_status_summary(c: &crate::config::Config) -> Vec<(&'static str, bool)> {
     let cc = &c.channels_config;
-    let rows: Vec<(&'static str, bool)> = vec![
+    #[allow(unused_mut)]
+    let mut rows: Vec<(&'static str, bool)> = vec![
         ("Telegram", cc.telegram.is_some()),
         ("Discord", cc.discord.is_some()),
         ("Slack", cc.slack.is_some()),
