@@ -19,4 +19,4 @@ pub mod types;
 
 pub use config::KbConfig;
 pub use error::{KbError, KbResult};
-pub use types::{Chunk, ChunkId, Document, DocumentId, SearchResult};
+pub use types::{Chunk, ChunkId, ChunkMetadata, Document, DocumentId, SearchResult};

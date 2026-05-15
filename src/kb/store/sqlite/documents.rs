@@ -1,20 +1,18 @@
-//! Document CRUD + retrieval-stats portion of [`super::SqliteStore`]'s
-//! `KbStore` impl.
+//! Document CRUD + retrieval-stats portion of [`super::SqliteStore`].
 //!
 //! Each method offloads rusqlite calls to a blocking thread so the async
 //! interface stays responsive. Categories + metadata are serialized as JSON
 //! strings to preserve the TS schema shape without introducing relational
 //! join tables for tag-like fields.
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Row};
 
 use super::SqliteStore;
-use crate::kb::store::{Bm25Hit, KbStore, SearchFilter};
-use crate::kb::{Chunk, Document, DocumentId, KbError, KbResult, SearchResult};
+use crate::kb::{Document, DocumentId, KbError, KbResult};
 
-fn map_row(row: &Row<'_>) -> rusqlite::Result<Document> {
+#[allow(clippy::cast_sign_loss)]
+pub(crate) fn map_row(row: &Row<'_>) -> rusqlite::Result<Document> {
     let categories_json: String = row.get("categories_json")?;
     let metadata_json: String = row.get("metadata_json")?;
     let created_at: String = row.get("created_at")?;
@@ -52,9 +50,8 @@ fn parse_ts(s: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
-#[async_trait]
-impl KbStore for SqliteStore {
-    async fn create_document(&self, doc: &Document) -> KbResult<()> {
+impl SqliteStore {
+    pub(crate) async fn create_document_impl(&self, doc: &Document) -> KbResult<()> {
         let conn = self.conn.clone();
         let doc = doc.clone();
         tokio::task::spawn_blocking(move || -> KbResult<()> {
@@ -96,7 +93,7 @@ impl KbStore for SqliteStore {
         .map_err(|e| KbError::Other(format!("join: {e}")))?
     }
 
-    async fn get_document(&self, id: &DocumentId) -> KbResult<Option<Document>> {
+    pub(crate) async fn get_document_impl(&self, id: &DocumentId) -> KbResult<Option<Document>> {
         let conn = self.conn.clone();
         let id = id.0.clone();
         tokio::task::spawn_blocking(move || -> KbResult<Option<Document>> {
@@ -113,7 +110,7 @@ impl KbStore for SqliteStore {
         .map_err(|e| KbError::Other(format!("join: {e}")))?
     }
 
-    async fn update_document(&self, doc: &Document) -> KbResult<()> {
+    pub(crate) async fn update_document_impl(&self, doc: &Document) -> KbResult<()> {
         let conn = self.conn.clone();
         let doc = doc.clone();
         tokio::task::spawn_blocking(move || -> KbResult<()> {
@@ -158,7 +155,7 @@ impl KbStore for SqliteStore {
         .map_err(|e| KbError::Other(format!("join: {e}")))?
     }
 
-    async fn delete_document(&self, id: &DocumentId, soft: bool) -> KbResult<()> {
+    pub(crate) async fn delete_document_impl(&self, id: &DocumentId, soft: bool) -> KbResult<()> {
         let conn = self.conn.clone();
         let id = id.0.clone();
         tokio::task::spawn_blocking(move || -> KbResult<()> {
@@ -180,7 +177,10 @@ impl KbStore for SqliteStore {
         .map_err(|e| KbError::Other(format!("join: {e}")))?
     }
 
-    async fn list_documents(&self, organization_id: Option<&str>) -> KbResult<Vec<Document>> {
+    pub(crate) async fn list_documents_impl(
+        &self,
+        organization_id: Option<&str>,
+    ) -> KbResult<Vec<Document>> {
         let conn = self.conn.clone();
         let org = organization_id.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || -> KbResult<Vec<Document>> {
@@ -213,7 +213,7 @@ impl KbStore for SqliteStore {
         .map_err(|e| KbError::Other(format!("join: {e}")))?
     }
 
-    async fn record_retrieval_hits(&self, ids: &[DocumentId]) -> KbResult<()> {
+    pub(crate) async fn record_retrieval_hits_impl(&self, ids: &[DocumentId]) -> KbResult<()> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -238,56 +238,5 @@ impl KbStore for SqliteStore {
         })
         .await
         .map_err(|e| KbError::Other(format!("join: {e}")))?
-    }
-
-    // --- chunks: stubbed until Task 2.5 lands. Returning explicit "not yet
-    // implemented" surfaces the contract to callers without panicking. ---
-
-    async fn store_chunks(
-        &self,
-        _document_id: &DocumentId,
-        _chunks: &[Chunk],
-        _embeddings: &[Vec<f32>],
-        _embedding_model: &str,
-    ) -> KbResult<()> {
-        Err(KbError::Other("store_chunks: pending Task 2.5".to_string()))
-    }
-
-    async fn delete_chunks_by_document(&self, _document_id: &DocumentId) -> KbResult<()> {
-        Err(KbError::Other(
-            "delete_chunks_by_document: pending Task 2.5".to_string(),
-        ))
-    }
-
-    async fn chunk_count(&self, _document_id: &DocumentId) -> KbResult<usize> {
-        Err(KbError::Other("chunk_count: pending Task 2.5".to_string()))
-    }
-
-    async fn chunk_counts(
-        &self,
-        _ids: &[DocumentId],
-    ) -> KbResult<std::collections::HashMap<DocumentId, usize>> {
-        Err(KbError::Other("chunk_counts: pending Task 2.5".to_string()))
-    }
-
-    async fn search_by_vector(
-        &self,
-        _query: &[f32],
-        _limit: usize,
-        _filter: &SearchFilter,
-    ) -> KbResult<Vec<SearchResult>> {
-        Err(KbError::Other(
-            "search_by_vector: pending Task 2.5".to_string(),
-        ))
-    }
-
-    async fn bm25_search(&self, _query: &str, _limit: usize) -> KbResult<Vec<Bm25Hit>> {
-        Err(KbError::Other("bm25_search: pending Task 2.6".to_string()))
-    }
-
-    async fn count_by_embedding_model(&self) -> KbResult<Vec<(Option<String>, usize)>> {
-        Err(KbError::Other(
-            "count_by_embedding_model: pending Task 2.7".to_string(),
-        ))
     }
 }

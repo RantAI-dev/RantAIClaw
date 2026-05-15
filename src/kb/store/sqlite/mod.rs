@@ -11,8 +11,10 @@ use tokio::sync::Mutex;
 
 use crate::kb::{KbError, KbResult};
 
+pub mod chunks;
 pub mod documents;
 pub mod schema;
+mod trait_impl;
 
 /// SQLite-backed KB store. Uses a single connection guarded by a `Mutex` —
 /// SQLite is internally serialized anyway, and the synchronous rusqlite API

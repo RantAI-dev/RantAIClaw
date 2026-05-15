@@ -7,8 +7,17 @@ use chrono::Utc;
 use tempfile::TempDir;
 
 use rantaiclaw::kb::store::sqlite::SqliteStore;
-use rantaiclaw::kb::store::KbStore;
-use rantaiclaw::kb::{Document, DocumentId};
+use rantaiclaw::kb::store::{KbStore, SearchFilter};
+use rantaiclaw::kb::{Chunk, ChunkMetadata, Document, DocumentId};
+
+fn ones(dim: usize) -> Vec<f32> {
+    vec![1.0; dim]
+}
+fn alt(dim: usize, mag: f32) -> Vec<f32> {
+    let mut v = vec![0.0; dim];
+    v[0] = mag;
+    v
+}
 
 fn sample_doc(id: &str, title: &str) -> Document {
     Document {
@@ -71,4 +80,85 @@ async fn create_get_list_delete_document() {
         .await
         .unwrap();
     assert!(store.get_document(&doc.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn store_chunks_and_vector_search() {
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let doc = sample_doc("doc-vec", "Vec Doc");
+    store.create_document(&doc).await.unwrap();
+
+    let chunks = vec![
+        Chunk {
+            content: "alpha content".into(),
+            metadata: ChunkMetadata {
+                document_title: doc.title.clone(),
+                category: "FAQ".into(),
+                subcategory: None,
+                section: None,
+                chunk_index: 0,
+                contextual_prefix: None,
+            },
+        },
+        Chunk {
+            content: "beta content".into(),
+            metadata: ChunkMetadata {
+                document_title: doc.title.clone(),
+                category: "FAQ".into(),
+                subcategory: None,
+                section: None,
+                chunk_index: 1,
+                contextual_prefix: None,
+            },
+        },
+    ];
+    let embeds = vec![ones(4), alt(4, 2.0)];
+    store
+        .store_chunks(&doc.id, &chunks, &embeds, "test-model")
+        .await
+        .unwrap();
+
+    assert_eq!(store.chunk_count(&doc.id).await.unwrap(), 2);
+
+    let results = store
+        .search_by_vector(&ones(4), 5, &SearchFilter::default())
+        .await
+        .unwrap();
+    assert!(!results.is_empty());
+    // The "alpha" chunk's embedding matches the query, so it should rank first.
+    assert_eq!(results[0].content, "alpha content");
+}
+
+#[tokio::test]
+async fn dimension_mismatch_errors_loudly() {
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let doc = sample_doc("doc-mis", "Mismatch");
+    store.create_document(&doc).await.unwrap();
+
+    let chunks = vec![Chunk {
+        content: "x".into(),
+        metadata: ChunkMetadata {
+            document_title: doc.title.clone(),
+            category: "FAQ".into(),
+            subcategory: None,
+            section: None,
+            chunk_index: 0,
+            contextual_prefix: None,
+        },
+    }];
+    let bad_embed = vec![vec![1.0, 2.0, 3.0]]; // dim=3 vs configured 4
+    let err = store
+        .store_chunks(&doc.id, &chunks, &bad_embed, "test-model")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        rantaiclaw::kb::KbError::DimensionMismatch { .. }
+    ));
 }
