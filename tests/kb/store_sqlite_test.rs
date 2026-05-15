@@ -31,7 +31,7 @@ fn sample_doc(id: &str, title: &str) -> Document {
         file_type: None,
         mime_type: None,
         file_size: None,
-        organization_id: Some("org-1".into()),
+        organization_id: Some("rantaiclaw_org_a".into()),
         created_by: None,
         session_id: None,
         artifact_type: None,
@@ -50,7 +50,7 @@ async fn create_get_list_delete_document() {
     let path = tmp.path().join("kb.db");
     let store = SqliteStore::open(&path, 4).await.unwrap();
 
-    let doc = sample_doc("doc-1", "First Doc");
+    let doc = sample_doc("rantaiclaw_doc_alpha", "First Doc");
     store.create_document(&doc).await.unwrap();
 
     let got = store
@@ -61,7 +61,7 @@ async fn create_get_list_delete_document() {
     assert_eq!(got.title, "First Doc");
     assert_eq!(got.categories, vec!["FAQ"]);
 
-    let list = store.list_documents(Some("org-1")).await.unwrap();
+    let list = store.list_documents(Some("rantaiclaw_org_a")).await.unwrap();
     assert_eq!(list.len(), 1);
 
     store
@@ -76,7 +76,7 @@ async fn create_get_list_delete_document() {
         "soft-deleted docs must not be returned by get_document"
     );
     // …and from `list_documents` as well.
-    let list_after_soft = store.list_documents(Some("org-1")).await.unwrap();
+    let list_after_soft = store.list_documents(Some("rantaiclaw_org_a")).await.unwrap();
     assert_eq!(
         list_after_soft.len(),
         0,
@@ -96,7 +96,7 @@ async fn store_chunks_and_vector_search() {
     let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
         .await
         .unwrap();
-    let doc = sample_doc("doc-vec", "Vec Doc");
+    let doc = sample_doc("rantaiclaw_doc_vec", "Vec Doc");
     store.create_document(&doc).await.unwrap();
 
     let chunks = vec![
@@ -125,7 +125,7 @@ async fn store_chunks_and_vector_search() {
     ];
     let embeds = vec![ones(4), alt(4, 2.0)];
     store
-        .store_chunks(&doc.id, &chunks, &embeds, "test-model")
+        .store_chunks(&doc.id, &chunks, &embeds, "rantaiclaw_test_model_a")
         .await
         .unwrap();
 
@@ -151,7 +151,7 @@ async fn category_filter_uses_array_membership_not_substring() {
     let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
         .await
         .unwrap();
-    let doc = sample_doc("doc-cat", "Category Doc");
+    let doc = sample_doc("rantaiclaw_doc_cat", "Category Doc");
     // `categories = ["FAQ"]` from `sample_doc` — substring "A" appears in "FAQ".
     store.create_document(&doc).await.unwrap();
 
@@ -167,7 +167,7 @@ async fn category_filter_uses_array_membership_not_substring() {
         },
     }];
     store
-        .store_chunks(&doc.id, &chunks, &[ones(4)], "test-model")
+        .store_chunks(&doc.id, &chunks, &[ones(4)], "rantaiclaw_test_model_a")
         .await
         .unwrap();
 
@@ -207,7 +207,7 @@ async fn chunk_count_hides_soft_deleted_doc() {
     let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
         .await
         .unwrap();
-    let doc = sample_doc("doc-soft", "Soft Doc");
+    let doc = sample_doc("rantaiclaw_doc_soft", "Soft Doc");
     store.create_document(&doc).await.unwrap();
 
     let chunks = vec![Chunk {
@@ -222,7 +222,7 @@ async fn chunk_count_hides_soft_deleted_doc() {
         },
     }];
     store
-        .store_chunks(&doc.id, &chunks, &[ones(4)], "test-model")
+        .store_chunks(&doc.id, &chunks, &[ones(4)], "rantaiclaw_test_model_a")
         .await
         .unwrap();
     assert_eq!(store.chunk_count(&doc.id).await.unwrap(), 1);
@@ -246,7 +246,7 @@ async fn dimension_mismatch_errors_loudly() {
     let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
         .await
         .unwrap();
-    let doc = sample_doc("doc-mis", "Mismatch");
+    let doc = sample_doc("rantaiclaw_doc_mismatch", "Mismatch");
     store.create_document(&doc).await.unwrap();
 
     let chunks = vec![Chunk {
@@ -262,7 +262,7 @@ async fn dimension_mismatch_errors_loudly() {
     }];
     let bad_embed = vec![vec![1.0, 2.0, 3.0]]; // dim=3 vs configured 4
     let err = store
-        .store_chunks(&doc.id, &chunks, &bad_embed, "test-model")
+        .store_chunks(&doc.id, &chunks, &bad_embed, "rantaiclaw_test_model_a")
         .await
         .unwrap_err();
     assert!(matches!(
@@ -277,7 +277,7 @@ async fn bm25_search_returns_lexical_matches() {
     let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
         .await
         .unwrap();
-    let doc = sample_doc("doc-bm", "BM Doc");
+    let doc = sample_doc("rantaiclaw_doc_bm25", "BM Doc");
     store.create_document(&doc).await.unwrap();
 
     let chunks = vec![
@@ -306,7 +306,7 @@ async fn bm25_search_returns_lexical_matches() {
     ];
     let embeds = vec![ones(4), ones(4)];
     store
-        .store_chunks(&doc.id, &chunks, &embeds, "test-model")
+        .store_chunks(&doc.id, &chunks, &embeds, "rantaiclaw_test_model_a")
         .await
         .unwrap();
 
@@ -323,7 +323,7 @@ async fn count_by_embedding_model_aggregates() {
     let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
         .await
         .unwrap();
-    let doc = sample_doc("doc-d", "Drift");
+    let doc = sample_doc("rantaiclaw_doc_drift", "Drift");
     store.create_document(&doc).await.unwrap();
 
     let chunks: Vec<_> = (0..3)
@@ -341,11 +341,11 @@ async fn count_by_embedding_model_aggregates() {
         .collect();
     let embeds = vec![ones(4); 3];
     store
-        .store_chunks(&doc.id, &chunks[..2], &embeds[..2], "model-a")
+        .store_chunks(&doc.id, &chunks[..2], &embeds[..2], "rantaiclaw_model_a")
         .await
         .unwrap();
     store
-        .store_chunks(&doc.id, &chunks[2..], &embeds[..1], "model-b")
+        .store_chunks(&doc.id, &chunks[2..], &embeds[..1], "rantaiclaw_model_b")
         .await
         .unwrap();
 
@@ -353,6 +353,6 @@ async fn count_by_embedding_model_aggregates() {
     counts.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
         counts,
-        vec![(Some("model-a".into()), 2), (Some("model-b".into()), 1),]
+        vec![(Some("rantaiclaw_model_a".into()), 2), (Some("rantaiclaw_model_b".into()), 1),]
     );
 }
