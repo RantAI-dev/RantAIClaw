@@ -81,10 +81,19 @@ pub struct ProcessedFile {
 const MARKDOWN_EXTENSIONS: &[&str] = &[".md", ".markdown"];
 const PDF_EXTENSIONS: &[&str] = &[".pdf"];
 const IMAGE_EXTENSIONS: &[&str] = &[".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic"];
-const DOCUMENT_EXTENSIONS: &[&str] = &[
-    ".docx", ".xlsx", ".pptx", ".rtf", ".epub", ".doc", ".xls", ".ppt", ".odt", ".ods", ".gltf",
-    ".glb",
-];
+// Document extensions actually handled by the `kb-office` processor today.
+// Detection must only return Document for these — adding extensions here
+// without a working backend would create a silent-fallback bug where
+// detection says "yes" and processing then errors with UnsupportedFileType
+// (forbidden by CLAUDE.md §3.5 fail-fast contract).
+const DOCUMENT_EXTENSIONS: &[&str] = &[".docx", ".xlsx", ".xls", ".ods"];
+
+/// Office-format extensions that are recognized as document types but not
+/// yet wired to a processor backend. Kept here so future maintainers can
+/// see the deliberate deferral and so user-facing error messages can refer
+/// to a single canonical list. NOT included in [`detect_file_type`].
+pub const DEFERRED_DOCUMENT_EXTENSIONS: &[&str] =
+    &[".pptx", ".rtf", ".epub", ".doc", ".ppt", ".odt", ".gltf", ".glb"];
 const TEXT_EXTENSIONS: &[&str] = &[
     ".csv", ".tsv", ".json", ".jsonl", ".html", ".htm", ".xml", ".yaml", ".yml", ".toml", ".py",
     ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".rb", ".php", ".sh",

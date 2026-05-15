@@ -467,16 +467,39 @@ mod office {
     }
 
     #[tokio::test]
-    async fn process_office_returns_error_for_unsupported_extension() {
+    async fn process_file_rejects_deferred_office_extensions_at_detection() {
+        // `.pptx` (and the other deferred office formats) must be excluded
+        // from `DOCUMENT_EXTENSIONS` so detect_file_type returns None and
+        // process_file errors before reaching the office processor. This
+        // enforces fail-fast: detection saying "yes" while processing
+        // returning UnsupportedFileType is exactly the silent-fallback
+        // shape CLAUDE.md §3.5 forbids.
+        use rantaiclaw::kb::file::DEFERRED_DOCUMENT_EXTENSIONS;
+
+        assert!(
+            !DEFERRED_DOCUMENT_EXTENSIONS.is_empty(),
+            "DEFERRED_DOCUMENT_EXTENSIONS must list the deliberately deferred formats"
+        );
+        assert!(
+            DEFERRED_DOCUMENT_EXTENSIONS.contains(&".pptx"),
+            "`.pptx` must appear in DEFERRED_DOCUMENT_EXTENSIONS so maintainers see the deferral"
+        );
+
+        // Detection-level: deferred extensions must classify as None.
+        assert!(
+            detect_file_type(Path::new("deck.pptx")).is_none(),
+            "detect_file_type must return None for deferred office extensions"
+        );
+
+        // Dispatcher-level: process_file must surface UnsupportedFileType
+        // for deferred extensions via the unknown-extension path.
         let cfg = make_kb_cfg("http://127.0.0.1:1/unused".into());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deck.pptx");
-        // `.pptx` is in DOCUMENT_EXTENSIONS so the dispatcher routes here,
-        // but office.rs returns UnsupportedFileType for pptx specifically.
         std::fs::write(&path, b"not a real pptx").unwrap();
         let err = process_file(&cfg, &path, ProcessingOptions::default())
             .await
-            .expect_err("pptx must surface UnsupportedFileType");
+            .expect_err("deferred office extension must surface UnsupportedFileType");
         assert!(
             matches!(err, KbError::UnsupportedFileType(_)),
             "expected UnsupportedFileType, got: {err}"

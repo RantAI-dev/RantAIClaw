@@ -5,8 +5,12 @@
 //! - `.xlsx` / `.xls` / `.ods` → read every sheet via `calamine`, emit
 //!   `## Sheet: <name>` headers followed by TSV-formatted rows
 //!
-//! Deferred (Phase-7+ work — fail-fast `UnsupportedFileType` for now):
-//!   `.pptx`, `.rtf`, `.epub`, `.doc`, `.ppt`, `.odt`, `.gltf`, `.glb`.
+//! Deferred office formats (`.pptx`, `.rtf`, `.epub`, `.doc`, `.ppt`,
+//! `.odt`, `.gltf`, `.glb`) are intentionally excluded from
+//! [`super::DOCUMENT_EXTENSIONS`] — see [`super::DEFERRED_DOCUMENT_EXTENSIONS`].
+//! Detection skips them entirely so callers get `UnsupportedFileType` at
+//! the dispatcher level rather than this module receiving extensions it
+//! cannot process (CLAUDE.md §3.5 fail-fast contract).
 //!
 //! The TS source funnels these through `@/lib/files/parsers` which wraps
 //! mammoth, xlsx-js, etc. We'll add backends one extension at a time
@@ -22,6 +26,11 @@ use docx_rs::{DocumentChild, ParagraphChild, RunChild};
 use crate::kb::{KbError, KbResult};
 
 /// Entry point — dispatches by lowercased extension.
+///
+/// Invariant: callers must have already filtered through
+/// [`super::detect_file_type`], which restricts the extension to one of
+/// `.docx`, `.xlsx`, `.xls`, `.ods`. Any other extension reaching here is a
+/// programmer error and trips `unreachable!`.
 pub async fn process_office(path: &Path) -> KbResult<String> {
     let ext = path
         .extension()
@@ -37,18 +46,10 @@ pub async fn process_office(path: &Path) -> KbResult<String> {
     match ext.as_str() {
         "docx" => process_docx(&bytes, &display),
         "xlsx" | "xls" | "ods" => process_spreadsheet(&bytes, &ext, &display),
-        // TODO(kb-office-extensions): add backends for these one at a time
-        // (mammoth/pdf-based pptx, rtf via stripped formatting, epub via
-        // zip+xml, gltf via tinygltf). Surfacing UnsupportedFileType keeps
-        // ingest deterministic for now.
-        "pptx" | "rtf" | "epub" | "doc" | "ppt" | "odt" | "gltf" | "glb" => {
-            Err(KbError::UnsupportedFileType(format!(
-                "office extension not yet supported: .{ext} ({display})"
-            )))
-        }
-        _ => Err(KbError::UnsupportedFileType(format!(
-            "unrecognized office extension: .{ext} ({display})"
-        ))),
+        other => unreachable!(
+            "process_office reached with unfiltered extension {other:?} for {display}; \
+             detect_file_type should have rejected it"
+        ),
     }
 }
 
@@ -104,11 +105,10 @@ fn process_spreadsheet(bytes: &[u8], ext: &str, display: &str) -> KbResult<Strin
             let mut wb = calamine::Ods::new(cursor).map_err(|e| spreadsheet_err(ext, display, &e))?;
             render_workbook(&mut wb, &mut output)?;
         }
-        other => {
-            return Err(KbError::UnsupportedFileType(format!(
-                "spreadsheet dispatcher got unexpected ext: {other}"
-            )));
-        }
+        other => unreachable!(
+            "process_spreadsheet reached with non-spreadsheet ext {other:?} for {display}; \
+             process_office should only forward xlsx/xls/ods"
+        ),
     }
     Ok(output)
 }
