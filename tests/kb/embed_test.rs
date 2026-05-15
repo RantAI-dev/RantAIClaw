@@ -10,7 +10,7 @@
 //! `config_test.rs`) into a tokio runtime for parity, which is heavier than
 //! the lint.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -23,10 +23,11 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-// Shared env-mutation lock — mirrors tests/kb/config_test.rs. Tests that
-// mutate `KB_*` / `OPENROUTER_API_KEY` env vars must hold this guard for
-// the duration of their work so they don't race inside the same binary.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+use crate::kb::common::ENV_LOCK;
+
+// Shared env-mutation lock lives in `crate::kb::common::ENV_LOCK` —
+// every test module in this binary serializes against the SAME mutex
+// so cross-module tests don't race on `KB_*` / `OPENROUTER_API_KEY`.
 
 #[allow(dead_code)] // used by TEI tests added in task 3.3
 struct EnvGuard(Vec<&'static str>);

@@ -8,7 +8,7 @@
 //! - 7.5 format_context_for_prompt + standalone query rewriter (wiremock)
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rantaiclaw::kb::embed::EmbeddingProvider;
@@ -19,13 +19,14 @@ use rantaiclaw::kb::{
     Chunk, ChunkId, Document, DocumentId, KbConfig, KbError, KbResult, SearchResult,
 };
 
-// Process-wide env-mutation lock shared across all submodules in this file.
+// Process-wide env-mutation lock lives in `crate::kb::common::ENV_LOCK`
+// so every test module in this binary serializes against the SAME mutex.
 // The query_expansion_tests, contextual_tests, and standalone_tests modules
-// all mutate `OPENROUTER_API_KEY` and `KB_OPENROUTER_CHAT_URL`. A single lock
-// at the file scope ensures their tests serialize against each other — without
-// it, a per-module Mutex only serializes within its own module and tests in
-// different modules race each other on shared env state.
-pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+// all mutate `OPENROUTER_API_KEY` and `KB_OPENROUTER_CHAT_URL` — a per-file
+// or per-module lock would only serialize within its own scope, letting
+// cross-module tests race on shared env state. Re-export under this file's
+// scope so the nested test modules can keep using `super::ENV_LOCK`.
+pub(crate) use crate::kb::common::ENV_LOCK;
 
 // ---- Task 7.1: RRF ---------------------------------------------------
 

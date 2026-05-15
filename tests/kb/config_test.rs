@@ -1,10 +1,12 @@
 use rantaiclaw::kb::KbConfig;
-use std::sync::Mutex;
 
-// Process-wide guard: these tests mutate `KB_*` env vars and would race
-// if run in parallel inside the same test binary. Using a parking-lot-free
-// std Mutex keeps the dep surface narrow.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+use crate::kb::common::ENV_LOCK;
+
+// Process-wide guard lives in `crate::kb::common::ENV_LOCK` so every
+// test module in this binary serializes against the SAME mutex. Per-file
+// statics only serialize within their own module — cross-module tests
+// (config + embed + retrieve) all mutate `KB_*`/`OPENROUTER_API_KEY` and
+// would race without a shared lock.
 
 /// RAII guard that removes the listed env vars on drop. Ensures cleanup
 /// still runs if an assertion panics between `set_var` and the end of
