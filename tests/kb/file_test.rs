@@ -392,6 +392,36 @@ fn scan_directory_returns_empty_for_missing_dir() {
     assert!(file::scan_directory(&missing).is_empty());
 }
 
+#[test]
+fn scan_directory_skips_dotfile_prefixed_entries() {
+    // Workspace dirs commonly contain `.git/`, `.cache/`, `.venv/`. Scanning
+    // them would dump dozens of internal files into the ingest queue and is
+    // never what a user wants. Hidden entries must be skipped silently.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let visible = root.join("visible.md");
+    std::fs::write(&visible, "x").unwrap();
+
+    let git_dir = root.join(".git");
+    std::fs::create_dir(&git_dir).unwrap();
+    std::fs::write(git_dir.join("HEAD.log"), "x").unwrap();
+
+    let cache_dir = root.join(".cache");
+    std::fs::create_dir(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join("junk.txt"), "x").unwrap();
+
+    let hidden_file = root.join(".env");
+    std::fs::write(&hidden_file, "secret=x").unwrap();
+
+    let found = scan_directory(root);
+    assert_eq!(
+        found,
+        vec![visible],
+        "scan must include visible.md only; got {found:?}"
+    );
+}
+
 // ----- task 6.2: office support (feature-gated) --------------------------
 
 #[cfg(feature = "kb-office")]

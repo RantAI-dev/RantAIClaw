@@ -215,6 +215,14 @@ pub async fn process_files(
 /// Recursive directory scan — returns only paths whose extension is in
 /// [`supported_extensions`]. Silently returns an empty vector if `path`
 /// doesn't exist (parity with TS `scanDirectory`).
+///
+/// Hidden entries (file or directory names starting with `.`) are skipped
+/// for *descendants* of the user-provided root. This is a deliberate
+/// divergence from the TS source: the Rust port is wired into agent
+/// workspaces where `.git/`, `.cache/`, `.venv/`, `node_modules/`-adjacent
+/// dotfile dirs are common and would otherwise dump dozens of internal
+/// files into the ingest queue. The user-supplied root itself is not
+/// filtered — passing `scan_directory(Path::new(".kb-docs"))` still works.
 pub fn scan_directory(path: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     scan_into(path, &mut out);
@@ -227,6 +235,17 @@ fn scan_into(path: &Path, out: &mut Vec<PathBuf>) {
         Err(_) => return,
     };
     for entry in entries.flatten() {
+        // Skip dotfile-prefixed entries (.git, .cache, .venv, .idea, etc.).
+        // Applied to descendants only; the caller-supplied root is reached
+        // via the outer scan_directory call which uses `read_dir(path)`
+        // directly without going through this filter.
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with('.'))
+        {
+            continue;
+        }
         let p = entry.path();
         match entry.file_type() {
             Ok(ft) if ft.is_dir() => scan_into(&p, out),
