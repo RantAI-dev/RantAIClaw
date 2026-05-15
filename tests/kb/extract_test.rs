@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use rantaiclaw::kb::extract::pdf_splitter::{get_page_count, split_pdf_by_page_count};
 use rantaiclaw::kb::extract::unpdf::UnpdfExtractor;
 use rantaiclaw::kb::extract::Extractor;
 
@@ -33,7 +34,6 @@ fn ensure_text_pdf() -> PathBuf {
 }
 
 /// Build an 8-page PDF. Each page has a single short string.
-#[allow(dead_code)] // used by task 5.3 splitter test
 fn ensure_8_page_pdf() -> PathBuf {
     let path = fixtures_dir().join("sample-8-page.pdf");
     if path.exists() {
@@ -139,4 +139,47 @@ async fn unpdf_returns_extraction_error_on_garbage_input() {
         msg.contains("extraction failed") || msg.contains("unpdf"),
         "expected extraction-failure message, got: {msg}"
     );
+}
+
+// ----- task 5.3: PDF splitter --------------------------------------------
+
+#[tokio::test]
+async fn pdf_splitter_get_page_count_returns_total() {
+    let path = ensure_8_page_pdf();
+    let bytes = read_fixture(&path);
+    let count = get_page_count(&bytes).await.unwrap();
+    assert_eq!(count, 8);
+}
+
+#[tokio::test]
+async fn pdf_splitter_splits_8_pages_by_3_into_three_segments() {
+    let path = ensure_8_page_pdf();
+    let bytes = read_fixture(&path);
+    let segments = split_pdf_by_page_count(&bytes, 3).await.unwrap();
+    assert_eq!(segments.len(), 3, "expected 3 segments of 3+3+2 pages");
+    // Each segment must be a valid PDF whose page count is what we expect.
+    let expected_pages = [3u32, 3u32, 2u32];
+    for (i, seg) in segments.iter().enumerate() {
+        let pages = get_page_count(seg).await.unwrap_or_else(|e| {
+            panic!("segment {i} is not a valid PDF: {e}");
+        });
+        assert_eq!(
+            pages, expected_pages[i],
+            "segment {i} should have {} pages",
+            expected_pages[i]
+        );
+    }
+}
+
+#[tokio::test]
+async fn pdf_splitter_no_op_when_pages_fit_one_segment() {
+    let path = ensure_8_page_pdf();
+    let bytes = read_fixture(&path);
+    let segments = split_pdf_by_page_count(&bytes, 10).await.unwrap();
+    assert_eq!(
+        segments.len(),
+        1,
+        "splitting by a segment >= total pages must return a single segment"
+    );
+    assert_eq!(segments[0], bytes, "single segment must be the input bytes");
 }
