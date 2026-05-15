@@ -393,6 +393,9 @@ impl SmartChunker {
         let skip = total - size;
         let overlap: String = text.chars().skip(skip).collect();
         if let Some(pos) = overlap.rfind(". ") {
+            // SAFETY: `pos` is the byte offset returned by rfind(". ") and ". " is pure
+            // ASCII (2 bytes), so `pos + 2` is guaranteed to be on a char boundary. The
+            // byte slice is intentional here — using char_indices would be wasted work.
             return overlap[pos + 2..].to_string();
         }
         overlap
