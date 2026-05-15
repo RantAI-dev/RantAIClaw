@@ -4750,9 +4750,17 @@ async fn run_loop(
             // the viewport at the new bottom row, but the previous
             // viewport's rows remain in the terminal buffer above as
             // ghost copies. Drain any coalesced Resize events, then
-            // wipe the screen+scrollback and replay splash + messages
-            // so the terminal looks like a fresh launch at the new
-            // size. While in alt-screen the picker handles its own
+            // wipe the screen+scrollback and replay messages so the
+            // terminal looks like a fresh launch at the new size.
+            //
+            // The splash is NOT replayed: terminals like VS Code's
+            // built-in terminal don't honour the `\x1b[3J` scrollback
+            // clear, so re-committing the splash on every resize
+            // produced visible ghost copies stacking above the current
+            // viewport (see user-reported screenshot, v0.6.40). The
+            // splash is a startup affordance — once seen, the
+            // conversation is the only thing worth re-anchoring on
+            // resize. While in alt-screen the picker handles its own
             // sizing; just trigger a repaint there.
             if matches!(ev, Event::Resize(_, _)) {
                 while event::poll(std::time::Duration::from_millis(0))? {
@@ -4776,7 +4784,6 @@ async fn run_loop(
                             viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
                         },
                     )?;
-                    let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
                     let messages = app.context.messages.clone();
                     for msg in messages {
                         let _ =
