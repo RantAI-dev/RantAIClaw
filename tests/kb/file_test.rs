@@ -392,6 +392,48 @@ fn scan_directory_returns_empty_for_missing_dir() {
     assert!(file::scan_directory(&missing).is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn scan_directory_does_not_follow_symlink_cycles() {
+    // Guard: scan_directory must not loop when a directory contains a
+    // self-referential symlink. Current implementation relies on
+    // entry.file_type() reporting the symlink type itself (not the target),
+    // so is_dir()/is_file() both return false and the symlink is silently
+    // skipped. This test pins that behavior; if a future change starts
+    // following symlinks without cycle detection it will hang here and the
+    // timeout will fail the test rather than letting the suite hang.
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let visible = root.join("visible.md");
+    std::fs::write(&visible, "x").unwrap();
+
+    // self-referential symlink: <root>/loop -> <root>
+    let loop_link = root.join("loop");
+    std::os::unix::fs::symlink(&root, &loop_link).expect("create self-link");
+
+    let (tx, rx) = mpsc::channel();
+    let scan_root = root.clone();
+    let handle = std::thread::spawn(move || {
+        let found = scan_directory(&scan_root);
+        let _ = tx.send(found);
+    });
+
+    let found = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("scan_directory must finish within 5s — symlink cycle detected");
+    handle.join().expect("scan thread must join cleanly");
+
+    assert_eq!(
+        found,
+        vec![visible],
+        "scan must include visible.md only (symlink not followed); got {found:?}"
+    );
+}
+
 #[test]
 fn scan_directory_skips_dotfile_prefixed_entries() {
     // Workspace dirs commonly contain `.git/`, `.cache/`, `.venv/`. Scanning

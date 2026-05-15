@@ -247,6 +247,14 @@ fn scan_into(path: &Path, out: &mut Vec<PathBuf>) {
             continue;
         }
         let p = entry.path();
+        // Symlinks are not followed: `entry.file_type()` reports the symlink
+        // type itself, not the target, so `ft.is_dir()`/`ft.is_file()` both
+        // return false for any symlink and the entry falls through the `_`
+        // arm. This is intentional — it keeps the scan cycle-safe without
+        // needing canonicalized-parent bookkeeping. If symlink-following
+        // becomes a real requirement, switch to `entry.metadata()?.is_dir()`
+        // and add a `HashSet<PathBuf>` of canonicalized ancestors to detect
+        // cycles. YAGNI for now (no current caller asks for it).
         match entry.file_type() {
             Ok(ft) if ft.is_dir() => scan_into(&p, out),
             Ok(ft) if ft.is_file() && is_supported_file(&p) => out.push(p),
