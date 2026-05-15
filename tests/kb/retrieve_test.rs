@@ -491,3 +491,188 @@ async fn format_omits_section_when_none() {
 // Silence unused-import lint when only some Task 7.2 helpers are exercised.
 #[allow(dead_code)]
 fn _force_use(_e: KbError) {}
+
+// ---- Task 7.3: query expansion ---------------------------------------
+//
+// Tests mutate OPENROUTER_API_KEY and KB_OPENROUTER_CHAT_URL — they share
+// the existing ENV_LOCK pattern from config_test.rs / embed_test.rs.
+
+mod query_expansion_tests {
+    use rantaiclaw::kb::retrieve::query_expansion::{
+        _clear_cache_for_tests, expand_query,
+    };
+    use serde_json::json;
+    use std::sync::Mutex;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::test_cfg;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard(Vec<&'static str>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for k in &self.0 {
+                // SAFETY: serialized via ENV_LOCK above.
+                unsafe {
+                    std::env::remove_var(k);
+                }
+            }
+        }
+    }
+
+    fn clear_env() {
+        unsafe {
+            std::env::remove_var("OPENROUTER_API_KEY");
+            std::env::remove_var("KB_OPENROUTER_CHAT_URL");
+        }
+    }
+
+    #[tokio::test]
+    async fn expand_disabled_returns_query_only() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let mut cfg = test_cfg();
+        cfg.query_expansion_enabled = false;
+        let out = expand_query(&cfg, "what is X?").await;
+        assert_eq!(out, vec!["what is X?".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn expand_no_api_key_returns_query_only() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let mut cfg = test_cfg();
+        cfg.query_expansion_enabled = true;
+        let out = expand_query(&cfg, "what is X?").await;
+        assert_eq!(out, vec!["what is X?".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn expand_parses_json_array_response() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": { "content": "[\"p1\", \"p2\", \"p3\"]" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
+        }
+
+        let mut cfg = test_cfg();
+        cfg.query_expansion_enabled = true;
+        let out = expand_query(&cfg, "what is X?").await;
+        assert_eq!(
+            out,
+            vec![
+                "what is X?".to_string(),
+                "p1".to_string(),
+                "p2".to_string(),
+                "p3".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_dedupes_case_insensitive() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let server = MockServer::start().await;
+        // Model returns the original (different case/whitespace) + a dup.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": { "content": "[\"WHAT IS x?\", \"What  is  X?\", \"different phrasing\", \"DIFFERENT PHRASING\"]" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
+        }
+
+        let mut cfg = test_cfg();
+        cfg.query_expansion_enabled = true;
+        let out = expand_query(&cfg, "what is X?").await;
+        // Original retained, both case-only duplicates dropped, second
+        // "DIFFERENT PHRASING" also dropped as case-insensitive dup.
+        assert_eq!(
+            out,
+            vec!["what is X?".to_string(), "different phrasing".to_string()],
+            "case-insensitive dedupe vs original + among paraphrases"
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_failure_returns_query_only() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
+        }
+
+        let mut cfg = test_cfg();
+        cfg.query_expansion_enabled = true;
+        let out = expand_query(&cfg, "what is X?").await;
+        assert_eq!(out, vec!["what is X?".to_string()], "5xx → fallback");
+    }
+
+    #[tokio::test]
+    async fn expand_caches_repeated_query() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let server = MockServer::start().await;
+        // expect(1) — second call must hit cache, not the mock.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": { "content": "[\"alt1\", \"alt2\"]" }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
+        }
+
+        let mut cfg = test_cfg();
+        cfg.query_expansion_enabled = true;
+        let a = expand_query(&cfg, "cache me").await;
+        let b = expand_query(&cfg, "cache me").await;
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 3, "[original, alt1, alt2]");
+        // wiremock auto-asserts .expect(1) on Drop.
+    }
+}
