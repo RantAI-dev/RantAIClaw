@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use rantaiclaw::kb::extract::pdf_splitter::{get_page_count, split_pdf_by_page_count};
 use rantaiclaw::kb::extract::unpdf::UnpdfExtractor;
+use rantaiclaw::kb::extract::vision_llm::VisionLlmExtractor;
 use rantaiclaw::kb::extract::Extractor;
+use rantaiclaw::kb::KbConfig;
 
 // ----- fixture helpers ---------------------------------------------------
 
@@ -182,4 +184,142 @@ async fn pdf_splitter_no_op_when_pages_fit_one_segment() {
         "splitting by a segment >= total pages must return a single segment"
     );
     assert_eq!(segments[0], bytes, "single segment must be the input bytes");
+}
+
+// ----- task 5.4: VisionLlmExtractor (wiremock) ---------------------------
+
+/// Build a [`KbConfig`] with all extractor knobs set for testing. Only the
+/// vision base URL + api key matter for this suite; everything else is a
+/// placeholder so we don't hit real `from_env()` and have to gate env-vars.
+fn vision_cfg(base_url: String) -> KbConfig {
+    KbConfig {
+        extract_primary: "smart".into(),
+        extract_fallback: "unpdf".into(),
+        extract_smart_fallback: "rantaiclaw_test_model_a".into(),
+        embedding_model: "rantaiclaw_test_model_a".into(),
+        embedding_dim: 4,
+        default_max_chunks: 8,
+        rerank_enabled: false,
+        rerank_provider: String::new(),
+        rerank_model: "rantaiclaw_test_model_a".into(),
+        rerank_initial_k: 20,
+        rerank_final_k: 5,
+        hybrid_bm25_enabled: true,
+        contextual_retrieval_enabled: false,
+        contextual_retrieval_model: "rantaiclaw_test_model_a".into(),
+        query_expansion_enabled: false,
+        query_expansion_model: "rantaiclaw_test_model_a".into(),
+        query_expansion_paraphrases: 3,
+        extract_vision_base_url: base_url,
+        extract_vision_api_key: "rantaiclaw_test_key".into(),
+        extract_mineru_base_url: String::new(),
+        embedding_base_url: String::new(),
+        embedding_api_key: String::new(),
+        embed_batch_size: 100,
+        embed_concurrency: 2,
+        query_embed_cache_size: 8,
+        query_embed_cache_ttl_ms: 60_000,
+    }
+}
+
+fn make_pdf(pages: usize) -> Vec<u8> {
+    let strings: Vec<String> = (1..=pages).map(|i| format!("Page {i} body")).collect();
+    let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+    build_pdf(&refs)
+}
+
+#[tokio::test]
+async fn vision_llm_small_pdf_makes_single_call() {
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = json!({
+        "choices": [{ "message": { "content": "# rantaiclaw extracted" }}],
+        "usage": { "prompt_tokens": 11, "completion_tokens": 22, "cost": 0.0004 }
+    });
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cfg = vision_cfg(format!("{}/chat", server.uri()));
+    let ext = VisionLlmExtractor::with_options(cfg, "rantaiclaw/test-model".into(), 100, 5, 2);
+
+    let pdf = make_pdf(3); // 3 pages — below segment_pages=5
+    let result = ext.extract(&pdf).await.unwrap();
+    assert_eq!(result.text, "# rantaiclaw extracted");
+    assert_eq!(result.model, "rantaiclaw/test-model");
+    assert_eq!(result.prompt_tokens, Some(11));
+    assert_eq!(result.completion_tokens, Some(22));
+    assert!((result.cost_usd.unwrap_or(0.0) - 0.0004).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn vision_llm_large_pdf_splits_into_segments_and_sums_usage() {
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // 8 pages with segment_pages=3 => ceil(8/3) = 3 segments => 3 calls.
+    let body = json!({
+        "choices": [{ "message": { "content": "segment text" }}],
+        "usage": { "prompt_tokens": 100, "completion_tokens": 50, "cost": 0.001 }
+    });
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let cfg = vision_cfg(format!("{}/chat", server.uri()));
+    let ext = VisionLlmExtractor::with_options(cfg, "rantaiclaw/test-model".into(), 100, 3, 4);
+    let pdf = make_pdf(8);
+    let result = ext.extract(&pdf).await.unwrap();
+
+    assert_eq!(result.prompt_tokens, Some(300));
+    assert_eq!(result.completion_tokens, Some(150));
+    assert!((result.cost_usd.unwrap_or(0.0) - 0.003).abs() < 1e-9);
+    assert_eq!(
+        result.text,
+        "segment text\n\nsegment text\n\nsegment text",
+        "segments must concatenate with double-newline separators"
+    );
+    // Model field encodes the segment count for observability.
+    assert!(
+        result.model.contains("3 segments"),
+        "model name should annotate segment count, got: {}",
+        result.model
+    );
+}
+
+#[tokio::test]
+async fn vision_llm_4xx_surfaces_extraction_error() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .mount(&server)
+        .await;
+
+    let cfg = vision_cfg(format!("{}/chat", server.uri()));
+    let ext = VisionLlmExtractor::with_options(cfg, "rantaiclaw/test-model".into(), 100, 5, 2);
+    let pdf = make_pdf(2);
+    let err = ext
+        .extract(&pdf)
+        .await
+        .expect_err("4xx must surface KbError::Extraction");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("400"),
+        "error should mention the HTTP status, got: {msg}"
+    );
 }
