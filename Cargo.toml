@@ -129,7 +129,7 @@ glob = "0.3"
 which = "7.0"
 
 # File watcher for live skill reloads in the TUI
-notify = { version = "8", default-features = false }
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 # Open the user's default browser for OAuth flows (used by `mcp::oauth`)
 webbrowser = "1.0"
