@@ -54,15 +54,17 @@ fn long_doc_splits_with_overlap() {
     // edge case the TS reference accepts silently.
     let mut overlap_pairs = 0usize;
     for w in chunks.windows(2) {
-        if w[0].content.len() < 200 || w[1].content.len() < 200 {
+        let a_chars: Vec<char> = w[0].content.chars().collect();
+        let b_chars_count = w[1].content.chars().count();
+        if a_chars.len() < 200 || b_chars_count < 200 {
             continue;
         }
-        let tail_len = w[0].content.len().saturating_sub(50);
-        let tail = &w[0].content[tail_len..];
+        let tail_start = a_chars.len().saturating_sub(50);
+        let tail: String = a_chars[tail_start..].iter().collect();
         assert!(
-            w[1].content.starts_with(tail) || w[1].content.contains(tail),
+            w[1].content.starts_with(&tail) || w[1].content.contains(&tail),
             "expected overlap tail {tail:?} to appear in next chunk; got {:?}",
-            &w[1].content[..w[1].content.len().min(120)]
+            w[1].content.chars().take(120).collect::<String>()
         );
         overlap_pairs += 1;
     }
