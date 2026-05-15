@@ -198,6 +198,15 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 # Activated by --features kb.
 sqlite-vec = { version = "0.1", optional = true }
 
+# Lightweight PDF reader used by the KB extractor pipeline:
+# - `pdf_splitter` carves multi-page docs into N-page segments for the
+#   vision-LLM extractor (which has an output-token budget per call)
+# - test fixtures generate small PDFs deterministically
+# Always compiled (not feature-gated) — the dep is small and is required
+# by the kb extractor module, which itself is `kb`-feature-gated at the
+# crate level via the parent module tree.
+lopdf = "0.34"
+
 # Insertion-order-preserving map backing the KB query embedding LRU cache.
 # `IndexMap` lets us move keys to the back on access without a separate
 # linked-list, which keeps the LRU port from `lru-cache.ts` simple.
