@@ -68,12 +68,20 @@ async fn create_get_list_delete_document() {
         .delete_document(&doc.id, /* soft */ true)
         .await
         .unwrap();
-    let soft = store
-        .get_document(&doc.id)
-        .await
-        .unwrap()
-        .expect("still present after soft delete");
-    assert!(soft.deleted_at.is_some());
+    // Soft-deleted docs must be hidden from `get_document` so callers can't
+    // accidentally surface them (matches the TS reference, which filters
+    // `deletedAt: null` in vector-store.ts).
+    assert!(
+        store.get_document(&doc.id).await.unwrap().is_none(),
+        "soft-deleted docs must not be returned by get_document"
+    );
+    // …and from `list_documents` as well.
+    let list_after_soft = store.list_documents(Some("org-1")).await.unwrap();
+    assert_eq!(
+        list_after_soft.len(),
+        0,
+        "soft-deleted docs must not appear in list_documents"
+    );
 
     store
         .delete_document(&doc.id, /* soft */ false)

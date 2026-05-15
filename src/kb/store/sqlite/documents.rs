@@ -98,7 +98,8 @@ impl SqliteStore {
         let id = id.0.clone();
         tokio::task::spawn_blocking(move || -> KbResult<Option<Document>> {
             let conn = conn.blocking_lock();
-            let mut stmt = conn.prepare("SELECT * FROM document WHERE id = ?1")?;
+            let mut stmt = conn
+                .prepare("SELECT * FROM document WHERE id = ?1 AND deleted_at IS NULL")?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
                 Ok(Some(map_row(row)?))
