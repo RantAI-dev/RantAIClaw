@@ -388,6 +388,16 @@ jobs:
 
             - name: Build and push release Docker image
               uses: docker/build-push-action@v6
+              env:
+                  # Disable the post-step build-record artifact upload —
+                  # it tries to POST a .dockerbuild blob to the Actions
+                  # artifact API which has been returning HTML
+                  # (`<!DOCTYPE ...`) instead of JSON, causing
+                  # `Failed to CreateArtifact: Unexpected token '<'`
+                  # and marking the step as failed even when the
+                  # `docker buildx build --push` succeeded.
+                  DOCKER_BUILD_SUMMARY: false
+                  DOCKER_BUILD_RECORD_UPLOAD: false
               with:
                   context: .
                   push: true

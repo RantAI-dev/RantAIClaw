@@ -48,6 +48,11 @@ jobs:
 
             - name: Build smoke image
               uses: docker/build-push-action@v6
+              env:
+                  # See pub-release.yml: post-step build-record artifact upload
+                  # is broken against the current Actions artifact API.
+                  DOCKER_BUILD_SUMMARY: false
+                  DOCKER_BUILD_RECORD_UPLOAD: false
               with:
                   context: .
                   push: false
@@ -109,6 +114,11 @@ jobs:
 
             - name: Build and push Docker image
               uses: docker/build-push-action@v6
+              env:
+                  # See pub-release.yml: post-step build-record artifact upload
+                  # is broken against the current Actions artifact API.
+                  DOCKER_BUILD_SUMMARY: false
+                  DOCKER_BUILD_RECORD_UPLOAD: false
               with:
                   context: .
                   push: true
