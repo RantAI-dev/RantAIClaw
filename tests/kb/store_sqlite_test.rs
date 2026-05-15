@@ -208,3 +208,43 @@ async fn bm25_search_returns_lexical_matches() {
     // Score is negated (higher = better) so a matching hit must be > 0.
     assert!(hits[0].score > 0.0);
 }
+
+#[tokio::test]
+async fn count_by_embedding_model_aggregates() {
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let doc = sample_doc("doc-d", "Drift");
+    store.create_document(&doc).await.unwrap();
+
+    let chunks: Vec<_> = (0..3)
+        .map(|i| Chunk {
+            content: format!("c{i}"),
+            metadata: ChunkMetadata {
+                document_title: doc.title.clone(),
+                category: "FAQ".into(),
+                subcategory: None,
+                section: None,
+                chunk_index: i,
+                contextual_prefix: None,
+            },
+        })
+        .collect();
+    let embeds = vec![ones(4); 3];
+    store
+        .store_chunks(&doc.id, &chunks[..2], &embeds[..2], "model-a")
+        .await
+        .unwrap();
+    store
+        .store_chunks(&doc.id, &chunks[2..], &embeds[..1], "model-b")
+        .await
+        .unwrap();
+
+    let mut counts = store.count_by_embedding_model().await.unwrap();
+    counts.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        counts,
+        vec![(Some("model-a".into()), 2), (Some("model-b".into()), 1),]
+    );
+}

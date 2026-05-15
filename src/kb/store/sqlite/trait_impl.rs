@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use super::SqliteStore;
 use crate::kb::store::{Bm25Hit, KbStore, SearchFilter};
-use crate::kb::{Chunk, Document, DocumentId, KbError, KbResult, SearchResult};
+use crate::kb::{Chunk, Document, DocumentId, KbResult, SearchResult};
 
 #[async_trait]
 impl KbStore for SqliteStore {
@@ -74,8 +74,6 @@ impl KbStore for SqliteStore {
     }
 
     async fn count_by_embedding_model(&self) -> KbResult<Vec<(Option<String>, usize)>> {
-        Err(KbError::Other(
-            "count_by_embedding_model: pending Task 2.7".to_string(),
-        ))
+        self.count_by_embedding_model_impl().await
     }
 }
