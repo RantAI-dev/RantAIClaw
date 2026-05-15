@@ -105,14 +105,14 @@ pub struct SmartChunker {
 }
 
 impl SmartChunker {
-    pub fn new(options: SmartChunkOptions) -> Self {
+    pub(crate) fn new(options: SmartChunkOptions) -> Self {
         Self { options }
     }
 
     /// Synchronous version of TS `chunk(markdown)`. The TS reference returns
     /// a Promise but does no I/O; the only async behaviour is at the
     /// caller level for batching, so we keep this sync.
-    pub fn chunk(&self, markdown: &str) -> Vec<SmartChunk> {
+    pub(crate) fn chunk(&self, markdown: &str) -> Vec<SmartChunk> {
         let mut chunks: Vec<SmartChunk> = Vec::new();
         let mut chunk_index: usize = 0;
 
