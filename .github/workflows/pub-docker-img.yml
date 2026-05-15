@@ -72,7 +72,13 @@ jobs:
         name: Build and Push Docker Image
         if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
         runs-on: ubuntu-latest
-        timeout-minutes: 45
+        # 90min: cross-compiling rantaiclaw for linux/arm64 via QEMU
+        # emulation on linux/amd64 runners. clap_builder alone took
+        # ~34min on the last cold-cache run before the prior 45-min
+        # timeout cancelled the build. Cache-warm runs typically
+        # finish in 8-12min, but cold-cache misses (e.g. after a
+        # toolchain bump) need the headroom.
+        timeout-minutes: 90
         permissions:
             contents: read
             packages: write
