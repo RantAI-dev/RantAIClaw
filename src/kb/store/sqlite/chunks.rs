@@ -142,8 +142,13 @@ impl SqliteStore {
         let document_id = document_id.0.clone();
         tokio::task::spawn_blocking(move || -> KbResult<usize> {
             let conn = conn.blocking_lock();
+            // Join document to filter soft-deleted parents — chunks for a
+            // soft-deleted doc must be logically invisible (matches the read
+            // path in search_by_vector / get_document).
             let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM chunk WHERE document_id = ?1",
+                "SELECT COUNT(*) FROM chunk c
+                 JOIN document d ON d.id = c.document_id
+                 WHERE c.document_id = ?1 AND d.deleted_at IS NULL",
                 params![document_id],
                 |row| row.get(0),
             )?;
@@ -166,7 +171,14 @@ impl SqliteStore {
         tokio::task::spawn_blocking(move || -> KbResult<HashMap<DocumentId, usize>> {
             let conn = conn.blocking_lock();
             let mut out = HashMap::new();
-            let mut stmt = conn.prepare("SELECT COUNT(*) FROM chunk WHERE document_id = ?1")?;
+            // Same soft-delete guard as chunk_count_impl — missing-doc and
+            // soft-deleted-doc both collapse to 0 so callers can rely on the
+            // logical invariant `chunk_count(doc) == 0 iff doc invisible`.
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(*) FROM chunk c
+                 JOIN document d ON d.id = c.document_id
+                 WHERE c.document_id = ?1 AND d.deleted_at IS NULL",
+            )?;
             for id in &ids {
                 let count: i64 = stmt.query_row(params![id], |row| row.get(0))?;
                 out.insert(DocumentId(id.clone()), count.max(0) as usize);

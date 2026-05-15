@@ -199,6 +199,48 @@ async fn category_filter_uses_array_membership_not_substring() {
 }
 
 #[tokio::test]
+async fn chunk_count_hides_soft_deleted_doc() {
+    // Soft-deleting a document must logically zero out its chunk count so
+    // callers can rely on `chunk_count == 0 iff doc invisible`, even though
+    // the chunk rows physically remain until hard-delete.
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let doc = sample_doc("doc-soft", "Soft Doc");
+    store.create_document(&doc).await.unwrap();
+
+    let chunks = vec![Chunk {
+        content: "alpha".into(),
+        metadata: ChunkMetadata {
+            document_title: doc.title.clone(),
+            category: "FAQ".into(),
+            subcategory: None,
+            section: None,
+            chunk_index: 0,
+            contextual_prefix: None,
+        },
+    }];
+    store
+        .store_chunks(&doc.id, &chunks, &[ones(4)], "test-model")
+        .await
+        .unwrap();
+    assert_eq!(store.chunk_count(&doc.id).await.unwrap(), 1);
+
+    // Soft-delete -> chunk_count must drop to 0 logically.
+    store.delete_document(&doc.id, true).await.unwrap();
+    assert_eq!(
+        store.chunk_count(&doc.id).await.unwrap(),
+        0,
+        "chunk_count must hide chunks belonging to soft-deleted docs"
+    );
+
+    // Same guarantee for the batch variant.
+    let counts = store.chunk_counts(&[doc.id.clone()]).await.unwrap();
+    assert_eq!(counts.get(&doc.id).copied(), Some(0));
+}
+
+#[tokio::test]
 async fn dimension_mismatch_errors_loudly() {
     let tmp = TempDir::new().unwrap();
     let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
