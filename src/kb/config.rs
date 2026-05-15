@@ -44,14 +44,14 @@ impl KbConfig {
                 .unwrap_or_else(|_| "openai/gpt-4.1-nano".into()),
             embedding_model: env::var("KB_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "qwen/qwen3-embedding-8b".into()),
-            embedding_dim: parse_int("KB_EMBEDDING_DIM", 4096)?,
-            default_max_chunks: parse_int("KB_DEFAULT_MAX_CHUNKS", 8)?,
+            embedding_dim: parse_env::<usize>("KB_EMBEDDING_DIM", 4096)?,
+            default_max_chunks: parse_env::<usize>("KB_DEFAULT_MAX_CHUNKS", 8)?,
             rerank_enabled: env::var("KB_RERANK_ENABLED").as_deref() == Ok("true"),
             rerank_provider: env::var("KB_RERANK_PROVIDER").unwrap_or_default(),
             rerank_model: env::var("KB_RERANK_MODEL")
                 .unwrap_or_else(|_| "openai/gpt-4.1-nano".into()),
-            rerank_initial_k: parse_int("KB_RERANK_INITIAL_K", 20)?,
-            rerank_final_k: parse_int("KB_RERANK_FINAL_K", 5)?,
+            rerank_initial_k: parse_env::<usize>("KB_RERANK_INITIAL_K", 20)?,
+            rerank_final_k: parse_env::<usize>("KB_RERANK_FINAL_K", 5)?,
             hybrid_bm25_enabled: env::var("KB_HYBRID_BM25_ENABLED").as_deref() != Ok("false"),
             contextual_retrieval_enabled: env::var("KB_CONTEXTUAL_RETRIEVAL_ENABLED").as_deref()
                 == Ok("true"),
@@ -61,7 +61,7 @@ impl KbConfig {
                 == Ok("true"),
             query_expansion_model: env::var("KB_QUERY_EXPANSION_MODEL")
                 .unwrap_or_else(|_| "openai/gpt-4.1-nano".into()),
-            query_expansion_paraphrases: parse_int("KB_QUERY_EXPANSION_PARAPHRASES", 3)?,
+            query_expansion_paraphrases: parse_env::<usize>("KB_QUERY_EXPANSION_PARAPHRASES", 3)?,
             extract_vision_base_url: env::var("KB_EXTRACT_VISION_BASE_URL")
                 .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".into()),
             extract_vision_api_key: env::var("KB_EXTRACT_VISION_API_KEY").unwrap_or_default(),
@@ -69,11 +69,13 @@ impl KbConfig {
             embedding_base_url: env::var("KB_EMBEDDING_BASE_URL")
                 .unwrap_or_else(|_| "https://openrouter.ai/api/v1/embeddings".into()),
             embedding_api_key: env::var("KB_EMBEDDING_API_KEY").unwrap_or_default(),
-            embed_batch_size: parse_int("KB_EMBED_BATCH_SIZE", 128)?,
-            embed_concurrency: parse_int("KB_EMBED_CONCURRENCY", 4)?,
-            query_embed_cache_size: parse_int("KB_QUERY_EMBED_CACHE_SIZE", 256)?,
-            query_embed_cache_ttl_ms: parse_int("KB_QUERY_EMBED_CACHE_TTL_MS", 5 * 60 * 1000)?
-                as u64,
+            embed_batch_size: parse_env::<usize>("KB_EMBED_BATCH_SIZE", 128)?,
+            embed_concurrency: parse_env::<usize>("KB_EMBED_CONCURRENCY", 4)?,
+            query_embed_cache_size: parse_env::<usize>("KB_QUERY_EMBED_CACHE_SIZE", 256)?,
+            query_embed_cache_ttl_ms: parse_env::<u64>(
+                "KB_QUERY_EMBED_CACHE_TTL_MS",
+                5 * 60 * 1_000,
+            )?,
         })
     }
 
@@ -87,11 +89,23 @@ impl KbConfig {
     }
 }
 
-fn parse_int(key: &str, fallback: usize) -> KbResult<usize> {
+/// Parse an env var as `T` (any `FromStr`), returning `fallback` when the
+/// var is unset or empty. Using a generic over `T` instead of always
+/// returning `usize` avoids a silent truncation on 32-bit targets when a
+/// caller widens to `u64` via `as` (rantaiclaw supports RPi peripherals, so
+/// 32-bit is reachable). Parse failure surfaces as `KbError::Config`.
+fn parse_env<T>(key: &str, fallback: T) -> KbResult<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
     match env::var(key) {
-        Ok(raw) if !raw.is_empty() => raw
-            .parse::<usize>()
-            .map_err(|_| KbError::Config(format!("{key} must be an integer, got {raw:?}"))),
+        Ok(raw) if !raw.is_empty() => raw.parse::<T>().map_err(|e| {
+            KbError::Config(format!(
+                "{key} must be parseable as {}, got {raw:?}: {e}",
+                std::any::type_name::<T>()
+            ))
+        }),
         _ => Ok(fallback),
     }
 }
