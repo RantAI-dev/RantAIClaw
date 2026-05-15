@@ -24,7 +24,12 @@ impl Drop for EnvGuard {
 
 #[test]
 fn defaults_match_ts_kb() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    // Tolerate a poisoned mutex: poisoning means an earlier test panicked
+    // while holding the lock, but the env state is already restored by
+    // each test's `EnvGuard` drop, so the protected state is sound. Without
+    // this, an unrelated assertion failure cascades as a misleading
+    // "poisoned mutex" panic here.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Ensure no KB_* env vars leak into the test.
     for (k, _) in std::env::vars() {
         if k.starts_with("KB_") {
