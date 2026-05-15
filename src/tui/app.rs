@@ -2807,7 +2807,7 @@ impl TuiApp {
         // Splash already shows `Rantaiclaw v<x>` in the right pane;
         // append only the session identifier here so the same info
         // doesn't appear twice in scrollback.
-        let lines = render_splash_lines(ctx);
+        let lines = render_splash_lines(ctx, size.width);
         let session_short = &ctx.session_id[..8.min(ctx.session_id.len())];
         let mut all_lines = lines;
         all_lines.push(Line::from(Span::styled(
@@ -2852,7 +2852,7 @@ impl TuiApp {
 
         // Empty-state splash — figlet wordmark + welcome line.
         if self.context.messages.is_empty() && !matches!(self.state, AppState::Streaming { .. }) {
-            for line in render_splash_lines(&self.context) {
+            for line in render_splash_lines(&self.context, area.width) {
                 items.push(ListItem::new(line));
             }
         }
@@ -3221,7 +3221,7 @@ fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Fra
     let mut items: Vec<ListItem> = Vec::with_capacity(ctx.messages.len() + 1);
 
     if ctx.messages.is_empty() && !matches!(state, AppState::Streaming { .. }) {
-        for line in render_splash_lines(ctx) {
+        for line in render_splash_lines(ctx, area.width) {
             items.push(ListItem::new(line));
         }
     }
@@ -3625,18 +3625,51 @@ fn mascot_row(row: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Render the empty-chat splash: hermit-crab mascot on the left and a
-/// hermes-inspired "Available Channels / Skills" panel on the right.
-fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
+/// Render the empty-chat splash. Adapts at render time to the
+/// terminal width supplied by the caller:
+///
+/// * `width ≥ 80` — full RANTAICLAW figlet at top
+/// * `42 ≤ width < 80` — small figlet
+/// * `width < 42` — plain bold wordmark
+///
+/// * `width ≥ MASCOT_WIDTH + 2 + MIN_RIGHT_WIDTH` — side-by-side
+///   mascot (left) + info (right)
+/// * otherwise — stacked: mascot above info
+///
+/// Right-pane copy wraps to `(width − mascot − sep)` (capped at
+/// `MAX_RIGHT_WIDTH`) so it never bleeds onto the mascot's row.
+/// Because ratatui calls this once per frame with the current
+/// `area.width`, the splash re-flows live as the terminal resizes.
+fn render_splash_lines(ctx: &TuiContext, area_width: u16) -> Vec<Line<'static>> {
     let muted = Color::Rgb(107, 114, 128);
     let sky = Color::Rgb(94, 184, 255);
     let gold = Color::Rgb(234, 179, 8);
 
+    let avail = area_width as usize;
+
+    // Minimum useful width for the right column when sitting beside the
+    // mascot. Below this we stack instead so neither pane is starved.
+    const MIN_RIGHT_WIDTH: usize = 28;
+
+    let side_by_side = avail >= MASCOT_WIDTH + 2 + MIN_RIGHT_WIDTH;
+    // Skip the mascot entirely on terminals too narrow to hold its
+    // canvas — at that point every row would wrap into two visual
+    // rows and the silhouette becomes unreadable. The title figlet
+    // (or fallback wordmark) still conveys brand identity.
+    let show_mascot = avail >= MASCOT_WIDTH;
+    let right_width = if side_by_side {
+        avail
+            .saturating_sub(MASCOT_WIDTH + 2)
+            .min(MAX_RIGHT_WIDTH)
+            .max(MIN_RIGHT_WIDTH)
+    } else {
+        avail.min(MAX_RIGHT_WIDTH).max(20)
+    };
+    let inner_wrap = right_width.saturating_sub(2).max(16);
+
     // ── Right-pane content ────────────────────────────────────────────
     let mut right: Vec<Line<'static>> = Vec::new();
 
-    // Title row: bold sky-blue product name + dim version. Mirrors the
-    // top-right corner of the hermes splash.
     right.push(Line::from(vec![
         Span::styled(
             "Rantaiclaw",
@@ -3649,7 +3682,6 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
     ]));
     right.push(Line::from(""));
 
-    // Available Channels — pull configured rows from the TUI context.
     right.push(Line::from(Span::styled(
         "Available Channels",
         Style::default().fg(gold).add_modifier(Modifier::BOLD),
@@ -3663,7 +3695,7 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
     if channels.is_empty() {
         for line in wrap_text(
             "(none configured — run `/setup channels` to enable transports)",
-            MAX_RIGHT_WIDTH - 2,
+            inner_wrap,
         ) {
             right.push(Line::from(vec![
                 Span::raw("  "),
@@ -3671,7 +3703,7 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
             ]));
         }
     } else {
-        for line in wrap_csv(&channels, MAX_RIGHT_WIDTH) {
+        for line in wrap_csv(&channels, inner_wrap) {
             right.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(line, Style::default().fg(sky)),
@@ -3680,7 +3712,6 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
     }
     right.push(Line::from(""));
 
-    // Available Skills — names from the loaded skill set.
     right.push(Line::from(Span::styled(
         "Available Skills",
         Style::default().fg(gold).add_modifier(Modifier::BOLD),
@@ -3693,7 +3724,7 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
     if skills.is_empty() {
         for line in wrap_text(
             "(none installed — run `/setup skills` or `/skill install <name>`)",
-            MAX_RIGHT_WIDTH - 2,
+            inner_wrap,
         ) {
             right.push(Line::from(vec![
                 Span::raw("  "),
@@ -3701,7 +3732,7 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
             ]));
         }
     } else {
-        for line in wrap_csv(&skills, MAX_RIGHT_WIDTH) {
+        for line in wrap_csv(&skills, inner_wrap) {
             right.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(line, Style::default().fg(sky)),
@@ -3710,31 +3741,20 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
     }
     right.push(Line::from(""));
 
-    // Bottom hint, dim — same wording the old splash used. Wrapped for
-    // very narrow terminals even though the default copy fits in one row.
-    for line in wrap_text("Type a message or /help for commands.", MAX_RIGHT_WIDTH) {
+    for line in wrap_text("Type a message or /help for commands.", right_width) {
         right.push(Line::from(Span::styled(
             line,
             Style::default().fg(muted),
         )));
     }
 
-    // ── Left-pane mascot (ASCII, per-character colour) ────────────────
-    //
-    // Each non-empty row of `HERMIT_CRAB_ART` becomes a `Line` whose
-    // spans are batched by colour. Whitespace remains uncoloured so
-    // the art blends with the terminal background.
+    // ── Left-pane mascot ──────────────────────────────────────────────
     let mut left: Vec<Line<'static>> = Vec::new();
     for row in HERMIT_CRAB_ART.lines() {
         left.push(mascot_row(row));
     }
 
-    // ── Top section: figlet wordmark ──────────────────────────────────
-    //
-    // The original v0.5.x splash showed the `RANTAICLAW` figlet only;
-    // we keep that on top so the brand reads immediately, then drop
-    // into the mascot + info columns below.
-    let banner = include_str!("../onboard/assets/banner_full.txt");
+    // ── Top section: brand wordmark (figlet or plain text) ────────────
     let figlet_palette = [
         Color::Rgb(94, 184, 255),  // sky
         Color::Rgb(94, 184, 255),  // sky
@@ -3743,37 +3763,69 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
         Color::Rgb(40, 70, 140),   // navy
         Color::Rgb(107, 114, 128), // muted
     ];
+    let banner: &'static str = if avail >= 80 {
+        include_str!("../onboard/assets/banner_full.txt")
+    } else if avail >= 42 {
+        include_str!("../onboard/assets/banner_small.txt")
+    } else {
+        ""
+    };
+
     let mut out: Vec<Line<'static>> = Vec::new();
     out.push(Line::from(""));
-    for (i, line) in banner.lines().enumerate() {
-        let color = figlet_palette[i.min(figlet_palette.len() - 1)];
+    if banner.is_empty() {
+        // Fallback wordmark for very narrow terminals.
         out.push(Line::from(Span::styled(
-            line.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            "RANTAICLAW",
+            Style::default()
+                .fg(figlet_palette[0])
+                .add_modifier(Modifier::BOLD),
         )));
+    } else {
+        for (i, line) in banner.lines().enumerate() {
+            let color = figlet_palette[i.min(figlet_palette.len() - 1)];
+            out.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )));
+        }
     }
     out.push(Line::from(""));
 
-    // ── Stitch the two columns ────────────────────────────────────────
-    let rows = left.len().max(right.len());
-    for i in 0..rows {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        if let Some(line) = left.get(i) {
-            spans.extend(line.spans.iter().cloned());
-            // Pad the left column to MASCOT_WIDTH so the separator stays
-            // vertically aligned even on rows the mascot doesn't fill.
-            let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-            if used < MASCOT_WIDTH {
-                spans.push(Span::raw(" ".repeat(MASCOT_WIDTH - used)));
+    // ── Body: side-by-side stitch OR stacked rendering ────────────────
+    if side_by_side {
+        let rows = left.len().max(right.len());
+        for i in 0..rows {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if let Some(line) = left.get(i) {
+                spans.extend(line.spans.iter().cloned());
+                let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+                if used < MASCOT_WIDTH {
+                    spans.push(Span::raw(" ".repeat(MASCOT_WIDTH - used)));
+                }
+            } else {
+                spans.push(Span::raw(" ".repeat(MASCOT_WIDTH)));
             }
-        } else {
-            spans.push(Span::raw(" ".repeat(MASCOT_WIDTH)));
+            spans.push(Span::raw("  "));
+            if let Some(line) = right.get(i) {
+                spans.extend(line.spans.iter().cloned());
+            }
+            out.push(Line::from(spans));
         }
-        spans.push(Span::raw("  "));
-        if let Some(line) = right.get(i) {
-            spans.extend(line.spans.iter().cloned());
+    } else {
+        // Stacked: mascot first (if the canvas fits at all), then a
+        // blank, then the info pane. Below `MASCOT_WIDTH` we drop the
+        // mascot entirely — the figlet/text wordmark on top already
+        // carries the brand and a half-wrapped crab just adds noise.
+        if show_mascot {
+            for line in left {
+                out.push(line);
+            }
+            out.push(Line::from(""));
         }
-        out.push(Line::from(spans));
+        for line in right {
+            out.push(line);
+        }
     }
     out.push(Line::from(""));
     out
