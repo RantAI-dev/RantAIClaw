@@ -17,6 +17,8 @@ mod kb {
     pub mod extract_test;
     pub mod file_test;
     pub mod maintenance_test;
+    pub mod parity_helpers;
+
     pub mod rerank_test;
     pub mod retrieve_test;
     pub mod store_sqlite_test;
