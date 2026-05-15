@@ -265,7 +265,10 @@ impl SmartChunker {
             }
         }
 
-        // Flush remaining block.
+        // NOTE: An unclosed ``` fence at EOF accumulates into `current_block` and is
+        // emitted as raw text (BlockType::Text), not BlockType::Code. This matches
+        // TS smart-chunker.ts behavior — both treat malformed markdown leniently rather
+        // than error. If a future maintainer "fixes" this, also fix the TS source.
         if !current_block.trim().is_empty() {
             blocks.push(current_block.trim().to_string());
         }
