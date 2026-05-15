@@ -676,3 +676,138 @@ mod query_expansion_tests {
         // wiremock auto-asserts .expect(1) on Drop.
     }
 }
+
+// ---- Task 7.4: contextual retrieval ----------------------------------
+
+mod contextual_tests {
+    use rantaiclaw::kb::retrieve::contextual::generate_contextual_prefixes;
+    use serde_json::json;
+    use std::sync::Mutex;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::test_cfg;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard(Vec<&'static str>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for k in &self.0 {
+                unsafe {
+                    std::env::remove_var(k);
+                }
+            }
+        }
+    }
+
+    fn clear_env() {
+        unsafe {
+            std::env::remove_var("OPENROUTER_API_KEY");
+            std::env::remove_var("KB_OPENROUTER_CHAT_URL");
+        }
+    }
+
+    #[tokio::test]
+    async fn contextual_disabled_returns_empty_prefixes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let mut cfg = test_cfg();
+        cfg.contextual_retrieval_enabled = false;
+        let chunks = vec!["a".into(), "b".into(), "c".into()];
+        let out = generate_contextual_prefixes(&cfg, "full doc", &chunks).await;
+        assert_eq!(out, vec!["".to_string(), "".to_string(), "".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn contextual_no_api_key_returns_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let mut cfg = test_cfg();
+        cfg.contextual_retrieval_enabled = true;
+        let chunks = vec!["a".into(), "b".into()];
+        let out = generate_contextual_prefixes(&cfg, "doc", &chunks).await;
+        assert_eq!(out, vec!["".to_string(), "".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn contextual_parses_array_response() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": { "content": "[\"ctx1\", \"ctx2\", \"ctx3\"]" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
+        }
+        let mut cfg = test_cfg();
+        cfg.contextual_retrieval_enabled = true;
+        let chunks = vec!["a".into(), "b".into(), "c".into()];
+        let out = generate_contextual_prefixes(&cfg, "full doc", &chunks).await;
+        assert_eq!(out, vec!["ctx1".to_string(), "ctx2".to_string(), "ctx3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn contextual_length_mismatch_returns_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let server = MockServer::start().await;
+        // Server returns 2 elements when caller asked for 3 — fail-soft to
+        // empty prefixes rather than silently truncate.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": { "content": "[\"only-one\", \"only-two\"]" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
+        }
+        let mut cfg = test_cfg();
+        cfg.contextual_retrieval_enabled = true;
+        let chunks = vec!["a".into(), "b".into(), "c".into()];
+        let out = generate_contextual_prefixes(&cfg, "doc", &chunks).await;
+        assert_eq!(
+            out,
+            vec!["".to_string(), "".to_string(), "".to_string()],
+            "length mismatch → empty prefixes"
+        );
+    }
+
+    #[tokio::test]
+    async fn contextual_failure_returns_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
+        }
+        let mut cfg = test_cfg();
+        cfg.contextual_retrieval_enabled = true;
+        let chunks = vec!["a".into(), "b".into()];
+        let out = generate_contextual_prefixes(&cfg, "doc", &chunks).await;
+        assert_eq!(out, vec!["".to_string(), "".to_string()], "5xx → empty");
+    }
+}
