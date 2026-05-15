@@ -61,7 +61,10 @@ async fn create_get_list_delete_document() {
     assert_eq!(got.title, "First Doc");
     assert_eq!(got.categories, vec!["FAQ"]);
 
-    let list = store.list_documents(Some("rantaiclaw_org_a")).await.unwrap();
+    let list = store
+        .list_documents(Some("rantaiclaw_org_a"))
+        .await
+        .unwrap();
     assert_eq!(list.len(), 1);
 
     store
@@ -76,7 +79,10 @@ async fn create_get_list_delete_document() {
         "soft-deleted docs must not be returned by get_document"
     );
     // …and from `list_documents` as well.
-    let list_after_soft = store.list_documents(Some("rantaiclaw_org_a")).await.unwrap();
+    let list_after_soft = store
+        .list_documents(Some("rantaiclaw_org_a"))
+        .await
+        .unwrap();
     assert_eq!(
         list_after_soft.len(),
         0,
@@ -177,10 +183,7 @@ async fn category_filter_uses_array_membership_not_substring() {
         category: Some("A".into()),
         ..Default::default()
     };
-    let results = store
-        .search_by_vector(&ones(4), 5, &filter)
-        .await
-        .unwrap();
+    let results = store.search_by_vector(&ones(4), 5, &filter).await.unwrap();
     assert!(
         results.is_empty(),
         "category 'A' must not match doc categorized ['FAQ']; got {results:?}"
@@ -195,7 +198,11 @@ async fn category_filter_uses_array_membership_not_substring() {
         .search_by_vector(&ones(4), 5, &filter_exact)
         .await
         .unwrap();
-    assert_eq!(hits.len(), 1, "exact category match must still return the doc");
+    assert_eq!(
+        hits.len(),
+        1,
+        "exact category match must still return the doc"
+    );
 }
 
 #[tokio::test]
@@ -353,6 +360,9 @@ async fn count_by_embedding_model_aggregates() {
     counts.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
         counts,
-        vec![(Some("rantaiclaw_model_a".into()), 2), (Some("rantaiclaw_model_b".into()), 1),]
+        vec![
+            (Some("rantaiclaw_model_a".into()), 2),
+            (Some("rantaiclaw_model_b".into()), 1),
+        ]
     );
 }
