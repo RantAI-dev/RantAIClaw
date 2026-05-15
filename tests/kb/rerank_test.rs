@@ -8,7 +8,7 @@
 
 #![allow(clippy::await_holding_lock)]
 
-use rantaiclaw::kb::rerank::{Candidate, LlmReranker, Reranker};
+use rantaiclaw::kb::rerank::{Candidate, CohereReranker, LlmReranker, Reranker};
 use rantaiclaw::kb::KbError;
 use serde_json::json;
 use wiremock::matchers::{method, path};
@@ -203,5 +203,106 @@ async fn llm_rerank_returns_error_on_4xx() {
             assert!(body.contains("unauthorized"), "body = {body}");
         }
         other => panic!("expected KbError::ChatApi(401), got {other:?}"),
+    }
+}
+
+// ---- CohereReranker (task 8.3) --------------------------------------
+
+/// Cohere mock-response envelope.
+fn cohere_body(results: &[(usize, f32)]) -> serde_json::Value {
+    let items: Vec<_> = results
+        .iter()
+        .map(|(i, s)| json!({ "index": i, "relevance_score": s }))
+        .collect();
+    json!({ "results": items })
+}
+
+#[tokio::test]
+async fn cohere_rerank_short_circuits_when_few_candidates() {
+    // No HTTP, no env — apiKey present is enough to pass the fail-fast.
+    let r = CohereReranker::new(
+        "rerank-v4.0-pro".into(),
+        "test-key".into(),
+        Some("http://127.0.0.1:1/never".into()),
+    );
+    let c = cands(2);
+    let out = r.rerank("q", &c, 5).await.expect("short-circuit ok");
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].id, "c0");
+    assert_eq!(out[1].id, "c1");
+    assert!((out[0].score - 5.0).abs() < 1e-6);
+    assert!((out[1].score - 4.0).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn cohere_rerank_uses_relevance_score() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(cohere_body(&[(2, 0.9), (0, 0.8)])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let r = CohereReranker::new(
+        "rerank-v4.0-pro".into(),
+        "test-key".into(),
+        Some(server.uri()),
+    );
+    let c = cands(5);
+    let out = r.rerank("q", &c, 3).await.expect("rerank ok");
+    assert_eq!(out.len(), 3);
+    // Picked slots use the provider's relevance score directly.
+    assert_eq!(out[0].id, "c2");
+    assert!((out[0].score - 0.9).abs() < 1e-6);
+    assert_eq!(out[1].id, "c0");
+    assert!((out[1].score - 0.8).abs() < 1e-6);
+    // Filler slot picks next-in-original-order (c1, not c3/c4) with score 0.
+    assert_eq!(out[2].id, "c1");
+    assert!(out[2].score.abs() < 1e-6, "filler score must be 0.0");
+}
+
+#[tokio::test]
+async fn cohere_rerank_errors_on_no_api_key() {
+    let r = CohereReranker::new(
+        "rerank-v4.0-pro".into(),
+        String::new(),
+        Some("http://127.0.0.1:1/unused".into()),
+    );
+    let err = r
+        .rerank("q", &cands(5), 3)
+        .await
+        .expect_err("missing key must fail-fast");
+    match err {
+        KbError::Config(msg) => assert!(msg.contains("apiKey"), "msg = {msg}"),
+        other => panic!("expected KbError::Config, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cohere_rerank_errors_on_4xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let r = CohereReranker::new(
+        "rerank-v4.0-pro".into(),
+        "test-key".into(),
+        Some(server.uri()),
+    );
+    let err = r
+        .rerank("q", &cands(5), 3)
+        .await
+        .expect_err("403 must surface as ChatApi");
+    match err {
+        KbError::ChatApi { status, body } => {
+            assert_eq!(status, 403);
+            assert!(body.contains("forbidden"), "body = {body}");
+        }
+        other => panic!("expected KbError::ChatApi(403), got {other:?}"),
     }
 }
