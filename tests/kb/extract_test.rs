@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use rantaiclaw::kb::extract::mineru::MineruExtractor;
 use rantaiclaw::kb::extract::pdf_splitter::{get_page_count, split_pdf_by_page_count};
 use rantaiclaw::kb::extract::unpdf::UnpdfExtractor;
 use rantaiclaw::kb::extract::vision_llm::VisionLlmExtractor;
@@ -296,6 +297,79 @@ async fn vision_llm_large_pdf_splits_into_segments_and_sums_usage() {
         "model name should annotate segment count, got: {}",
         result.model
     );
+}
+
+// ----- task 5.5: MineruExtractor (wiremock) ------------------------------
+
+#[tokio::test]
+async fn mineru_extractor_posts_multipart_and_parses_response() {
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/extract"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({
+                "text": "## RantaiClawSample\n\nbody",
+                "ms": 4321,
+                "pages": 2
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ext = MineruExtractor::new(server.uri()).unwrap();
+    let result = ext.extract(b"%PDF-1.5\nhello").await.unwrap();
+    assert_eq!(result.text, "## RantaiClawSample\n\nbody");
+    assert_eq!(result.elapsed_ms, 4321);
+    assert_eq!(result.pages, Some(2));
+    assert_eq!(result.model, "mineru-2.5-pro");
+}
+
+#[tokio::test]
+async fn mineru_extractor_normalizes_base_url_trailing_extract() {
+    // The TS port accepts `/extract` suffix and trims it. Verify the Rust
+    // port behaves the same: server still receives POST /extract, not
+    // POST /extract/extract.
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/extract"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "text": "ok" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let url_with_suffix = format!("{}/extract/", server.uri());
+    let ext = MineruExtractor::new(url_with_suffix).unwrap();
+    ext.extract(b"%PDF-1.5\n").await.unwrap();
+}
+
+#[tokio::test]
+async fn mineru_extractor_surfaces_sidecar_errors() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/extract"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+
+    let ext = MineruExtractor::new(server.uri()).unwrap();
+    let err = ext
+        .extract(b"%PDF-1.5\n")
+        .await
+        .expect_err("5xx sidecar response must surface as KbError::Extraction");
+    let msg = err.to_string();
+    assert!(msg.contains("500"), "error must include status code: {msg}");
 }
 
 #[tokio::test]
