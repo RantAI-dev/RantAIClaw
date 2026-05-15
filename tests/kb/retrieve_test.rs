@@ -687,6 +687,42 @@ mod query_expansion_tests {
         assert_eq!(a.len(), 3, "[original, alt1, alt2]");
         // wiremock auto-asserts .expect(1) on Drop.
     }
+
+    #[tokio::test]
+    async fn expand_cache_invalidates_on_model_change() {
+        // Cache key includes cfg.query_expansion_model. Changing the model
+        // between two calls of the same query MUST force a second upstream
+        // hit; without the model in the key, the second call would return
+        // stale paraphrases produced by the previous model.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": { "content": "[\"alt-a\", \"alt-b\"]" }
+                }]
+            })))
+            .expect(2) // ← TWO upstream hits, one per distinct model
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+        }
+
+        let mut cfg = test_cfg();
+        cfg.query_expansion_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
+        cfg.query_expansion_model = "model-a".into();
+        let _ = expand_query(&cfg, "same query").await;
+
+        cfg.query_expansion_model = "model-b".into();
+        let _ = expand_query(&cfg, "same query").await;
+        // wiremock auto-asserts .expect(2) on Drop.
+    }
 }
 
 // ---- Task 7.4: contextual retrieval ----------------------------------
@@ -1049,5 +1085,40 @@ mod standalone_tests {
         let out = rewrite_standalone(&cfg, "what?", &history).await.unwrap();
         assert_eq!(out, "what?", "disabled gate → query returned unchanged");
         // wiremock's expect(0) auto-asserts on Drop that the mock was not hit.
+    }
+
+    #[tokio::test]
+    async fn standalone_cache_invalidates_on_model_change() {
+        // Cache key includes cfg.query_expansion_model (the model the
+        // rewriter shares with query_expansion). Changing the model between
+        // two calls of the same (query, history) MUST force a second
+        // upstream hit — otherwise stale rewrites cross model boundaries.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "rewritten output" } }]
+            })))
+            .expect(2) // ← TWO upstream hits, one per distinct model
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+        }
+
+        let mut cfg = test_cfg();
+        cfg.standalone_query_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
+        cfg.query_expansion_model = "model-a".into();
+        let history = vec![("user".to_string(), "earlier turn anchor".to_string())];
+        let _ = rewrite_standalone(&cfg, "follow up?", &history).await.unwrap();
+
+        cfg.query_expansion_model = "model-b".into();
+        let _ = rewrite_standalone(&cfg, "follow up?", &history).await.unwrap();
+        // wiremock auto-asserts .expect(2) on Drop.
     }
 }
