@@ -254,7 +254,7 @@ impl Tool for ShellTool {
 mod tests {
     use super::*;
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
-    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::security::{AutonomyLevel, PendingApprovals, SecurityPolicy};
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {

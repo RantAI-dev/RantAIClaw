@@ -219,22 +219,37 @@ jobs:
               id: rust_paths
               shell: bash
               run: |
-                  # On the May-2026 runner images, neither `cargo` nor
-                  # `rustup` resolve reliably to the toolchain we just
-                  # installed: macOS now has a Homebrew rustup-init shim
-                  # intercepting `cargo`/`rustup`, and Linux has a newer
-                  # pre-installed rustc that wins on cargo's RUSTC
-                  # auto-detection even after `rustup default 1.92.0`.
+                  # On the May-2026 runner images, neither `cargo`,
+                  # `rustup`, nor `rustc` resolve reliably to the
+                  # toolchain we just installed: macOS now has a
+                  # Homebrew rustup-init shim intercepting `cargo`,
+                  # `rustup`, and even `rustc` for steps that don't
+                  # inherit dtolnay's internal PATH; Linux has a newer
+                  # pre-installed cargo that wins after cache restore.
                   #
-                  # `rustc` is the one proxy that has stayed honest on
-                  # every image variant, so use it (with explicit
-                  # `+1.92.0`) to discover the active sysroot, then pin
-                  # CARGO_BIN + RUSTC to absolute paths inside that
-                  # sysroot. Subsequent steps consume these via outputs.
-                  toolchain_root="$(rustc +1.92.0 --print sysroot)"
+                  # Sidestep every PATH-based proxy by probing the
+                  # toolchain directory directly. dtolnay installs the
+                  # toolchain at $HOME/.rustup/toolchains/1.92.0-<host>
+                  # — the host triple suffix varies by runner, so glob
+                  # for whatever 1.92.0-* directory exists.
+                  shopt -s nullglob
+                  candidates=("$HOME/.rustup/toolchains/1.92.0-"*)
+                  if [ ${#candidates[@]} -eq 0 ]; then
+                    echo "::error::No 1.92.0 toolchain found under $HOME/.rustup/toolchains"
+                    ls -la "$HOME/.rustup/toolchains/" || true
+                    exit 1
+                  fi
+                  toolchain_root="${candidates[0]}"
                   echo "toolchain_root=${toolchain_root}"
                   cargo_bin="${toolchain_root}/bin/cargo"
                   rustc_bin="${toolchain_root}/bin/rustc"
+                  # On Windows the binaries have a .exe suffix; bash on
+                  # Git-Bash auto-resolves, but be explicit so
+                  # downstream invocations don't surprise.
+                  if [ "$RUNNER_OS" = "Windows" ]; then
+                    cargo_bin="${cargo_bin}.exe"
+                    rustc_bin="${rustc_bin}.exe"
+                  fi
                   "$cargo_bin" --version
                   "$rustc_bin" --version
                   echo "cargo_bin=${cargo_bin}" >> "$GITHUB_OUTPUT"
