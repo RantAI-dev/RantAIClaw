@@ -215,28 +215,47 @@ jobs:
             # incremental compilation didn't re-emit main.rs with the new
             # CARGO_PKG_VERSION. We only invalidate the rantaiclaw package
             # itself; deps stay cached.
-            - name: Force rantaiclaw recompile (CARGO_PKG_VERSION freshness)
+            - name: Resolve toolchain binaries (1.92.0)
+              id: rust_paths
               shell: bash
               run: |
-                  # Resolve the real cargo via rustup. On macOS GitHub runners,
-                  # both /opt/homebrew/bin/cargo and (since image 20260512.0058)
-                  # ~/.cargo/bin/cargo can resolve to a `rustup-init` shim that
-                  # rejects subcommands like `clean` / `build`. `rustup which`
-                  # returns the active toolchain's cargo binary directly,
-                  # bypassing every PATH-based shim.
-                  CARGO_BIN="$(rustup which cargo)"
+                  # On the May-2026 runner images, neither `cargo` nor
+                  # `rustup` resolve reliably to the toolchain we just
+                  # installed: macOS now has a Homebrew rustup-init shim
+                  # intercepting `cargo`/`rustup`, and Linux has a newer
+                  # pre-installed rustc that wins on cargo's RUSTC
+                  # auto-detection even after `rustup default 1.92.0`.
+                  #
+                  # `rustc` is the one proxy that has stayed honest on
+                  # every image variant, so use it (with explicit
+                  # `+1.92.0`) to discover the active sysroot, then pin
+                  # CARGO_BIN + RUSTC to absolute paths inside that
+                  # sysroot. Subsequent steps consume these via outputs.
+                  toolchain_root="$(rustc +1.92.0 --print sysroot)"
+                  echo "toolchain_root=${toolchain_root}"
+                  cargo_bin="${toolchain_root}/bin/cargo"
+                  rustc_bin="${toolchain_root}/bin/rustc"
+                  "$cargo_bin" --version
+                  "$rustc_bin" --version
+                  echo "cargo_bin=${cargo_bin}" >> "$GITHUB_OUTPUT"
+                  echo "rustc_bin=${rustc_bin}" >> "$GITHUB_OUTPUT"
+
+            - name: Force rantaiclaw recompile (CARGO_PKG_VERSION freshness)
+              shell: bash
+              env:
+                  CARGO_BIN: ${{ steps.rust_paths.outputs.cargo_bin }}
+                  RUSTC: ${{ steps.rust_paths.outputs.rustc_bin }}
+              run: |
                   "$CARGO_BIN" clean --target ${{ matrix.target }} -p rantaiclaw || true
 
             - name: Build release
               shell: bash
               env:
+                  CARGO_BIN: ${{ steps.rust_paths.outputs.cargo_bin }}
+                  RUSTC: ${{ steps.rust_paths.outputs.rustc_bin }}
                   LINKER_ENV: ${{ matrix.linker_env }}
                   LINKER: ${{ matrix.linker }}
               run: |
-                  # See "Force rantaiclaw recompile" above — invoke cargo
-                  # directly via `rustup which` so Homebrew's rustup-init shim
-                  # cannot intercept us on macOS image 20260512.0058+.
-                  CARGO_BIN="$(rustup which cargo)"
                   if [ -n "$LINKER_ENV" ] && [ -n "$LINKER" ]; then
                     echo "Using linker override: $LINKER_ENV=$LINKER"
                     export "$LINKER_ENV=$LINKER"
