@@ -37,3 +37,9 @@ state/
 
 # Agent implementation plans (scratchpad — not product docs)
 docs/superpowers/plans/
+
+# KB extractor PDF test fixtures — generated on demand by
+# tests/kb/extract_test.rs (build_pdf helper) so binary blobs don't
+# enter source control.
+tests/fixtures/sample-text.pdf
+tests/fixtures/sample-8-page.pdf
