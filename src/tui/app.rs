@@ -4750,18 +4750,23 @@ async fn run_loop(
             // the viewport at the new bottom row, but the previous
             // viewport's rows remain in the terminal buffer above as
             // ghost copies. Drain any coalesced Resize events, then
-            // wipe the screen+scrollback and replay messages so the
-            // terminal looks like a fresh launch at the new size.
+            // wipe the screen+scrollback and replay the splash +
+            // message history so the terminal looks like a fresh
+            // launch at the new size.
             //
-            // The splash is NOT replayed: terminals like VS Code's
-            // built-in terminal don't honour the `\x1b[3J` scrollback
-            // clear, so re-committing the splash on every resize
-            // produced visible ghost copies stacking above the current
-            // viewport (see user-reported screenshot, v0.6.40). The
-            // splash is a startup affordance — once seen, the
-            // conversation is the only thing worth re-anchoring on
-            // resize. While in alt-screen the picker handles its own
-            // sizing; just trigger a repaint there.
+            // The clear sequence layers three escapes for portability:
+            //   - `\x1b[3J`  xterm-extension scrollback clear (most
+            //     modern terminals: tmux, alacritty, kitty, wezterm,
+            //     Windows Terminal, iTerm2, gnome-terminal, …).
+            //   - `\x1b[2J`  clear visible region.
+            //   - `\x1bc`    RIS / Full Reset — fallback for terminals
+            //     that ignore `\x1b[3J`, notably the VS Code built-in
+            //     terminal. RIS does reset other state (cursor style,
+            //     character set), but the immediately-following
+            //     `Terminal::with_options` + ratatui rendering
+            //     restores everything we care about.
+            // While in alt-screen the picker handles its own sizing;
+            // just trigger a repaint there.
             if matches!(ev, Event::Resize(_, _)) {
                 while event::poll(std::time::Duration::from_millis(0))? {
                     let next = event::read()?;
@@ -4776,7 +4781,7 @@ async fn run_loop(
                 if alt.is_none() {
                     let _ = terminal.flush();
                     let mut out = io::stdout();
-                    let _ = out.write_all(b"\x1b[3J\x1b[2J\x1b[H");
+                    let _ = out.write_all(b"\x1bc\x1b[3J\x1b[2J\x1b[H");
                     let _ = out.flush();
                     *terminal = Terminal::with_options(
                         CrosstermBackend::new(io::stdout()),
@@ -4784,6 +4789,7 @@ async fn run_loop(
                             viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
                         },
                     )?;
+                    let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
                     let messages = app.context.messages.clone();
                     for msg in messages {
                         let _ =
