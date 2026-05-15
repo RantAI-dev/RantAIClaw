@@ -3555,7 +3555,7 @@ const HERMIT_CRAB_ART: &str = include_str!("assets/mascot_ascii.txt");
 /// Width of the mascot column (in display cells). Must be at least as
 /// wide as the longest row of `HERMIT_CRAB_ART` so the right-pane
 /// stays aligned.
-const MASCOT_WIDTH: usize = 95;
+const MASCOT_WIDTH: usize = 48;
 
 /// Hard ceiling on the right-pane width, in chars. Used by `wrap_csv`.
 const MAX_RIGHT_WIDTH: usize = 64;
@@ -3567,19 +3567,18 @@ const MAX_RIGHT_WIDTH: usize = 64;
 fn mascot_color(ch: char) -> Option<Color> {
     match ch {
         // Shell tones — the rounded canopy on the crab's back.
-        '@' => Some(Color::Rgb(215, 195, 160)),
-        '%' => Some(Color::Rgb(245, 230, 200)),
-        // Claw / leg segments — the heavily-rendered orange parts.
-        '=' => Some(Color::Rgb(240, 100, 30)),
-        '+' => Some(Color::Rgb(250, 130, 70)),
-        // Eye / pupil detail — kept very dark so they read as features
-        // rather than noise inside the body.
-        '#' => Some(Color::Rgb(40, 35, 30)),
-        '*' => Some(Color::Rgb(70, 60, 50)),
-        // Body outline and interior shading.
-        '-' => Some(Color::Rgb(180, 110, 60)),
-        '.' => Some(Color::Rgb(235, 215, 180)),
+        '&' => Some(Color::Rgb(215, 195, 160)),
+        '$' => Some(Color::Rgb(245, 230, 200)),
+        // Claw / leg / body orange — the heavily-rendered warm parts.
+        '+' => Some(Color::Rgb(240, 100, 30)),
+        'X' => Some(Color::Rgb(210, 70, 20)),
+        'x' => Some(Color::Rgb(195, 80, 35)),
+        // Eye / pupil / mouth detail — kept very dark so they read as
+        // features rather than noise inside the body.
+        ';' => Some(Color::Rgb(50, 40, 35)),
+        // Interior shading.
         ':' => Some(Color::Rgb(220, 195, 165)),
+        '.' => Some(Color::Rgb(235, 215, 180)),
         _ => None,
     }
 }
