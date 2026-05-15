@@ -288,13 +288,12 @@ pub fn all_tools_with_runtime(
         // Explicit `web_search.searxng_url` always wins — operators who already
         // run SearXNG on a fixed host/port shouldn't have `auto_launch=true`
         // silently override them. Auto-launch only kicks in when no URL is set.
-        let searxng_url = root_config
-            .web_search
-            .searxng_url
-            .clone()
-            .or_else(|| match root_config.services.searxng.as_ref() {
-                Some(s) if s.auto_launch => Some(format!("http://127.0.0.1:{}", s.port)),
-                _ => None,
+        let searxng_url =
+            root_config.web_search.searxng_url.clone().or_else(|| {
+                match root_config.services.searxng.as_ref() {
+                    Some(s) if s.auto_launch => Some(format!("http://127.0.0.1:{}", s.port)),
+                    _ => None,
+                }
             });
         tool_arcs.push(Arc::new(WebSearchTool::new(
             root_config.web_search.provider.clone(),
@@ -543,10 +542,7 @@ mod tests {
         entry
             .env
             .insert("WEATHER_KEY".into(), "value-from-config".into());
-        config
-            .skills
-            .entries
-            .insert("weather".into(), entry);
+        config.skills.entries.insert("weather".into(), entry);
 
         let env = compose_skill_env(&config);
         assert_eq!(env.get("WEATHER_KEY"), Some(&"value-from-config".into()));

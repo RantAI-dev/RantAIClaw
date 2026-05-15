@@ -197,10 +197,7 @@ impl FirstRunWizard {
                         )
                     {
                         self.phase = WizardPhase::PickChannels;
-                    } else if self
-                        .phase_provisioner_was_channel()
-                        .unwrap_or(false)
-                    {
+                    } else if self.phase_provisioner_was_channel().unwrap_or(false) {
                         self.phase = WizardPhase::PickIntegrations;
                     } else {
                         self.phase = WizardPhase::Complete;
@@ -507,7 +504,10 @@ impl FirstRunWizard {
             };
 
             let arrow = if matches!(state, RailState::Current) {
-                Span::styled(" ▸ ", Style::default().fg(coral).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    " ▸ ",
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::styled("   ", Style::default())
             };
@@ -619,14 +619,8 @@ impl FirstRunWizard {
         // Subhead.
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "Four required steps,",
-                    Style::default().fg(sky),
-                ),
-                Span::styled(
-                    "  two optional pickers,",
-                    Style::default().fg(muted),
-                ),
+                Span::styled("Four required steps,", Style::default().fg(sky)),
+                Span::styled("  two optional pickers,", Style::default().fg(muted)),
                 Span::styled(
                     "  one polished agent.",
                     Style::default().fg(muted).add_modifier(Modifier::ITALIC),
@@ -660,18 +654,12 @@ impl FirstRunWizard {
         // Hint line.
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "Press ",
-                    Style::default().fg(muted),
-                ),
+                Span::styled("Press ", Style::default().fg(muted)),
                 Span::styled(
                     "Enter",
                     Style::default().fg(emerald).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    " to begin · ",
-                    Style::default().fg(muted),
-                ),
+                Span::styled(" to begin · ", Style::default().fg(muted)),
                 Span::styled(
                     "Esc",
                     Style::default().fg(coral).add_modifier(Modifier::BOLD),
@@ -685,14 +673,7 @@ impl FirstRunWizard {
         );
     }
 
-    fn render_loading(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        sky: Color,
-        muted: Color,
-        _dim: Color,
-    ) {
+    fn render_loading(&self, frame: &mut Frame, area: Rect, sky: Color, muted: Color, _dim: Color) {
         // Brief placeholder shown between provisioners while the next
         // overlay is being spawned. The active overlay covers the
         // full screen most of the time; this only flashes briefly.
@@ -844,10 +825,7 @@ impl FirstRunWizard {
                     format!("{} selected", p.selected.len()),
                     Style::default().fg(emerald).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    "  · Enter to confirm",
-                    Style::default().fg(muted),
-                ),
+                Span::styled("  · Enter to confirm", Style::default().fg(muted)),
             ]));
         }
         frame.render_widget(
@@ -961,7 +939,10 @@ impl FirstRunWizard {
             Paragraph::new(vec![
                 row("rantaiclaw", "open the chat TUI"),
                 row("/setup", "interactive picker inside the TUI"),
-                row("rantaiclaw setup <topic>", "reconfigure a single topic from a shell"),
+                row(
+                    "rantaiclaw setup <topic>",
+                    "reconfigure a single topic from a shell",
+                ),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("    ", Style::default()),
@@ -1075,9 +1056,7 @@ impl FirstRunWizard {
         };
         let body = match self.phase {
             WizardPhase::Welcome => "Press Enter to begin.\nEsc to exit.",
-            WizardPhase::RunningProvisioner { .. } => {
-                "Provisioner overlay active. Ctrl+B back."
-            }
+            WizardPhase::RunningProvisioner { .. } => "Provisioner overlay active. Ctrl+B back.",
             WizardPhase::PickChannels => {
                 "↑/↓ Space toggle · Enter confirm · Ctrl+B back · Esc skip"
             }
@@ -1093,7 +1072,10 @@ impl FirstRunWizard {
             .border_style(Style::default().fg(frame_color))
             .title(Line::from(vec![
                 Span::styled(" ", Style::default()),
-                Span::styled(title, Style::default().fg(coral).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    title,
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" ", Style::default()),
             ]));
         let para = Paragraph::new(vec![

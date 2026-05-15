@@ -137,7 +137,11 @@ impl InfoSection {
         self
     }
 
-    pub fn bullet_with<P: Into<String>, S: Into<String>>(mut self, primary: P, secondary: S) -> Self {
+    pub fn bullet_with<P: Into<String>, S: Into<String>>(
+        mut self,
+        primary: P,
+        secondary: S,
+    ) -> Self {
         self.rows.push(InfoRow::Bullet {
             primary: primary.into(),
             secondary: Some(secondary.into()),
@@ -258,10 +262,7 @@ impl InfoPanel {
         ];
         if let Some(ref sub) = self.subtitle {
             title_spans.push(Span::styled(" · ", Style::default().fg(muted)));
-            title_spans.push(Span::styled(
-                sub.clone(),
-                Style::default().fg(muted),
-            ));
+            title_spans.push(Span::styled(sub.clone(), Style::default().fg(muted)));
         }
         title_spans.push(Span::raw("   "));
         title_spans.push(Span::styled("↑/↓", Style::default().fg(sky)));
@@ -273,7 +274,10 @@ impl InfoPanel {
         let footer_spans: Vec<Span<'static>> = if let Some(ref hint) = self.footer_hint {
             vec![
                 Span::raw(" "),
-                Span::styled(hint.clone(), Style::default().fg(muted).add_modifier(Modifier::ITALIC)),
+                Span::styled(
+                    hint.clone(),
+                    Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+                ),
                 Span::raw(" "),
             ]
         } else {
@@ -316,7 +320,11 @@ impl InfoPanel {
                             Span::styled(value.clone(), Style::default()),
                         ]));
                     }
-                    InfoRow::Status { kind, label, detail } => {
+                    InfoRow::Status {
+                        kind,
+                        label,
+                        detail,
+                    } => {
                         let glyph_color = match kind {
                             StatusKind::Ok => emerald,
                             StatusKind::Warn => coral,
@@ -328,7 +336,9 @@ impl InfoPanel {
                             Span::raw("    "),
                             Span::styled(
                                 kind.glyph(),
-                                Style::default().fg(glyph_color).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(glyph_color)
+                                    .add_modifier(Modifier::BOLD),
                             ),
                             Span::raw(" "),
                             Span::styled(label.clone(), Style::default()),
@@ -441,14 +451,12 @@ mod tests {
         let p = InfoPanel::new("Channels")
             .with_subtitle("13 transports")
             .with_footer("Esc close")
-            .section(
-                InfoSection::new("Always available")
-                    .status(StatusKind::Ok, "CLI / TUI"),
-            )
-            .section(
-                InfoSection::new("Configured")
-                    .status_with(StatusKind::Ok, "Telegram", "polling"),
-            );
+            .section(InfoSection::new("Always available").status(StatusKind::Ok, "CLI / TUI"))
+            .section(InfoSection::new("Configured").status_with(
+                StatusKind::Ok,
+                "Telegram",
+                "polling",
+            ));
         assert_eq!(p.sections.len(), 2);
         assert_eq!(p.title, "Channels");
         assert_eq!(p.subtitle.as_deref(), Some("13 transports"));

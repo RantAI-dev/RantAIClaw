@@ -54,6 +54,10 @@ pub fn set(preset: PresetId) -> Result<()> {
     next.preset = preset;
     write_persona_toml(&profile, &next)?;
     super::render_system_md(&profile, &next)?;
-    println!("Persona preset set to {} for profile '{}'.", preset.slug(), profile.name);
+    println!(
+        "Persona preset set to {} for profile '{}'.",
+        preset.slug(),
+        profile.name
+    );
     Ok(())
 }

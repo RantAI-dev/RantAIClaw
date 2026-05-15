@@ -869,12 +869,10 @@ impl SetupOverlayState {
                 ),
                 Span::styled(" ", Style::default()),
             ]));
-        let lines: Vec<Line> = self
-            .log
-            .iter()
-            .map(|l| Line::from(l.as_str()))
-            .collect();
-        let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        let lines: Vec<Line> = self.log.iter().map(|l| Line::from(l.as_str())).collect();
+        let para = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
         f.render_widget(para, area);
         let _ = muted;
     }

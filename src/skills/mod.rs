@@ -607,7 +607,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         prompts: manifest.prompts,
         location: Some(path.to_path_buf()),
         requires: SkillRequires::default(),
-            install_recipes: Vec::new(),
+        install_recipes: Vec::new(),
     })
 }
 
@@ -687,18 +687,17 @@ fn parse_skill_metadata(
                 if let Some(scoped) = json.get(ns) {
                     if let Some(requires) = scoped.get("requires") {
                         if let Some(bins) = requires.get("bins").and_then(|v| v.as_array()) {
-                            req.bins.extend(
-                                bins.iter().filter_map(|v| v.as_str().map(String::from)),
-                            );
+                            req.bins
+                                .extend(bins.iter().filter_map(|v| v.as_str().map(String::from)));
                         }
                         if let Some(env) = requires.get("env").and_then(|v| v.as_array()) {
-                            req.env.extend(
-                                env.iter().filter_map(|v| v.as_str().map(String::from)),
-                            );
+                            req.env
+                                .extend(env.iter().filter_map(|v| v.as_str().map(String::from)));
                         }
                     }
                     if let Some(os) = scoped.get("os").and_then(|v| v.as_array()) {
-                        req.os.extend(os.iter().filter_map(|v| v.as_str().map(String::from)));
+                        req.os
+                            .extend(os.iter().filter_map(|v| v.as_str().map(String::from)));
                     }
                     // install[]: each entry is a recipe object. Common
                     // fields: id, kind, bins[], label, os[]; per-kind:
@@ -738,18 +737,16 @@ fn parse_skill_metadata(
                                 .get("module")
                                 .and_then(|v| v.as_str())
                                 .map(String::from);
-                            recipe.url = entry
-                                .get("url")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
+                            recipe.url =
+                                entry.get("url").and_then(|v| v.as_str()).map(String::from);
                             recipe.archive = entry
                                 .get("archive")
                                 .and_then(|v| v.as_str())
                                 .map(String::from);
-                            recipe.strip_components =
-                                entry.get("stripComponents").and_then(|v| v.as_u64()).map(
-                                    |n| n as usize,
-                                );
+                            recipe.strip_components = entry
+                                .get("stripComponents")
+                                .and_then(|v| v.as_u64())
+                                .map(|n| n as usize);
                             recipe.target_dir = entry
                                 .get("targetDir")
                                 .and_then(|v| v.as_str())
@@ -802,15 +799,14 @@ fn extract_yaml_env_block(body: &str) -> Vec<String> {
     let mut current_name: Option<String> = None;
     let mut current_required = true;
 
-    let flush =
-        |out: &mut Vec<String>, name: &mut Option<String>, required: &mut bool| {
-            if let Some(n) = name.take() {
-                if *required {
-                    out.push(n);
-                }
+    let flush = |out: &mut Vec<String>, name: &mut Option<String>, required: &mut bool| {
+        if let Some(n) = name.take() {
+            if *required {
+                out.push(n);
             }
-            *required = true;
-        };
+        }
+        *required = true;
+    };
 
     for line in body.lines() {
         let indent = line.chars().take_while(|c| *c == ' ').count();
@@ -869,7 +865,9 @@ fn extract_yaml_env_block(body: &str) -> Vec<String> {
 fn parse_yaml_frontmatter(content: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let trimmed = content.trim_start();
-    let Some(rest) = trimmed.strip_prefix("---\n").or_else(|| trimmed.strip_prefix("---\r\n"))
+    let Some(rest) = trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---\r\n"))
     else {
         return out;
     };
@@ -890,7 +888,10 @@ fn parse_yaml_frontmatter(content: &str) -> std::collections::HashMap<String, St
 
 fn parse_yaml_list(raw: &str) -> Vec<String> {
     let s = raw.trim();
-    let inner = s.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(s);
+    let inner = s
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(s);
     inner
         .split(',')
         .map(|p| p.trim().trim_matches('"').trim_matches('\'').to_string())
@@ -916,7 +917,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         prompts: vec![content],
         location: Some(path.to_path_buf()),
         requires: SkillRequires::default(),
-            install_recipes: Vec::new(),
+        install_recipes: Vec::new(),
     })
 }
 
@@ -1223,9 +1224,8 @@ pub(crate) fn handle_command(
                         // recipes that could fix a missing-binary
                         // gating. Mirrors OpenClaw's macOS-Skills-UI
                         // "one-tap install" affordance, just text-based.
-                        let has_missing_bin = reasons
-                            .iter()
-                            .any(|r| r.starts_with("missing binary"));
+                        let has_missing_bin =
+                            reasons.iter().any(|r| r.starts_with("missing binary"));
                         if has_missing_bin && !skill.install_recipes.is_empty() {
                             println!(
                                 "    {} run `rantaiclaw skills install-deps {}` to fix",
@@ -1241,9 +1241,7 @@ pub(crate) fn handle_command(
         }
         crate::SkillCommands::Show { name } => {
             let skills = load_skills_with_config(workspace_dir, config);
-            let found = skills
-                .iter()
-                .find(|s| s.name.eq_ignore_ascii_case(&name));
+            let found = skills.iter().find(|s| s.name.eq_ignore_ascii_case(&name));
             match found {
                 Some(s) => {
                     println!(
@@ -1252,7 +1250,9 @@ pub(crate) fn handle_command(
                         if s.version.is_empty() {
                             String::new()
                         } else {
-                            console::style(format!("· v{}", s.version)).dim().to_string()
+                            console::style(format!("· v{}", s.version))
+                                .dim()
+                                .to_string()
                         }
                     );
                     if !s.description.is_empty() {
@@ -1453,8 +1453,8 @@ pub(crate) fn handle_command(
             Ok(())
         }
         crate::SkillCommands::Update { slug, all } => {
-            let profile = crate::profile::ProfileManager::active()
-                .context("resolve active profile")?;
+            let profile =
+                crate::profile::ProfileManager::active().context("resolve active profile")?;
             let skills = load_skills_with_config(workspace_dir, config);
 
             let targets: Vec<String> = if all {
@@ -1475,8 +1475,7 @@ pub(crate) fn handle_command(
             // inside `#[tokio::main]`, so calling `block_on` here would
             // panic ("Cannot start a runtime from within a runtime").
             let result = std::thread::spawn(move || -> Result<(usize, usize, usize)> {
-                let rt = tokio::runtime::Runtime::new()
-                    .context("build tokio runtime")?;
+                let rt = tokio::runtime::Runtime::new().context("build tokio runtime")?;
                 let (mut updated, mut skipped, mut failed) = (0usize, 0usize, 0usize);
                 for slug in &targets {
                     let dir = profile.skills_dir().join(slug);
@@ -1492,10 +1491,7 @@ pub(crate) fn handle_command(
                     }
                     match rt.block_on(crate::skills::clawhub::install_one(&profile, slug)) {
                         Ok(()) => {
-                            println!(
-                                "  {} {slug}: updated",
-                                console::style("✓").green().bold()
-                            );
+                            println!("  {} {slug}: updated", console::style("✓").green().bold());
                             updated += 1;
                         }
                         Err(e) => {
@@ -1511,9 +1507,7 @@ pub(crate) fn handle_command(
 
             let (updated, skipped, failed) = result;
             println!();
-            println!(
-                "Update summary: {updated} updated, {skipped} skipped, {failed} failed"
-            );
+            println!("Update summary: {updated} updated, {skipped} skipped, {failed} failed");
             if failed > 0 {
                 anyhow::bail!("{failed} skill(s) failed to update");
             }
@@ -1522,8 +1516,7 @@ pub(crate) fn handle_command(
         crate::SkillCommands::Inspect { slug } => {
             // Same pattern as Update — isolated runtime on a fresh thread.
             std::thread::spawn(move || -> Result<()> {
-                let rt = tokio::runtime::Runtime::new()
-                    .context("build tokio runtime")?;
+                let rt = tokio::runtime::Runtime::new().context("build tokio runtime")?;
                 rt.block_on(crate::skills::clawhub::inspect_to_stdout(&slug))
             })
             .join()

@@ -60,16 +60,12 @@ impl Tool for SkillsListTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let with_status =
-            crate::skills::load_skills_with_status(&self.workspace_dir, &self.config);
+        let with_status = crate::skills::load_skills_with_status(&self.workspace_dir, &self.config);
         let mut out = Vec::with_capacity(with_status.len());
         for (skill, reasons) in with_status {
             let active = reasons.is_empty();
             let install_hint = if !active && !skill.install_recipes.is_empty() {
-                Some(format!(
-                    "rantaiclaw skills install-deps {}",
-                    skill.name
-                ))
+                Some(format!("rantaiclaw skills install-deps {}", skill.name))
             } else {
                 None
             };
@@ -142,8 +138,7 @@ impl Tool for SkillViewTool {
         // Use status-aware load so we can surface gated skills too —
         // the user might be asking about one they need to install-deps
         // first.
-        let with_status =
-            crate::skills::load_skills_with_status(&self.workspace_dir, &self.config);
+        let with_status = crate::skills::load_skills_with_status(&self.workspace_dir, &self.config);
         let found = with_status
             .into_iter()
             .find(|(s, _)| s.name.eq_ignore_ascii_case(name));
@@ -170,8 +165,7 @@ impl Tool for SkillViewTool {
                 });
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{}".into()),
+                    output: serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into()),
                     error: None,
                 })
             }
@@ -257,8 +251,7 @@ impl Tool for SkillsSearchTool {
                     .collect();
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string_pretty(&mapped)
-                        .unwrap_or_else(|_| "[]".into()),
+                    output: serde_json::to_string_pretty(&mapped).unwrap_or_else(|_| "[]".into()),
                     error: None,
                 })
             }
@@ -315,7 +308,11 @@ mod tests {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&result.output).unwrap();
         let by_name: std::collections::HashMap<String, &serde_json::Value> = parsed
             .iter()
-            .filter_map(|s| s.get("name").and_then(|n| n.as_str()).map(|n| (n.to_string(), s)))
+            .filter_map(|s| {
+                s.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| (n.to_string(), s))
+            })
             .collect();
         assert_eq!(
             by_name.get("greeter").and_then(|s| s.get("active")),

@@ -142,7 +142,11 @@ pub fn insights() -> Result<()> {
     println!("  Messages:         {total_messages}");
     println!("  Avg msgs/session: {avg:.1}");
     if let Some(latest) = sessions.first() {
-        println!("  Latest session:  {} ({})", &latest.id[..8], fmt_ts(latest.started_at));
+        println!(
+            "  Latest session:  {} ({})",
+            &latest.id[..8],
+            fmt_ts(latest.started_at)
+        );
     }
     Ok(())
 }

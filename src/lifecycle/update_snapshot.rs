@@ -80,8 +80,7 @@ pub fn create(
         let src = rantaiclaw_root.join(name);
         if src.is_file() {
             let dst = dir.join(name);
-            std::fs::copy(&src, &dst)
-                .with_context(|| format!("snapshot {}", name))?;
+            std::fs::copy(&src, &dst).with_context(|| format!("snapshot {}", name))?;
             files.push((*name).to_string());
         }
     }
@@ -120,8 +119,7 @@ pub fn create(
         bak_binary_path: bak_binary_path.map(|p| p.display().to_string()),
     };
 
-    let manifest_toml = toml::to_string_pretty(&manifest)
-        .context("serialize manifest")?;
+    let manifest_toml = toml::to_string_pretty(&manifest).context("serialize manifest")?;
     std::fs::write(dir.join(MANIFEST_FILE), manifest_toml)
         .with_context(|| format!("write {}", MANIFEST_FILE))?;
 
@@ -186,8 +184,7 @@ pub fn restore(snapshot: &Snapshot, rantaiclaw_root: &Path) -> Result<RestoreSum
                 if let Some(parent) = dst.parent() {
                     std::fs::create_dir_all(parent).ok();
                 }
-                std::fs::copy(&src, &dst)
-                    .with_context(|| format!("restore {}", rel))?;
+                std::fs::copy(&src, &dst).with_context(|| format!("restore {}", rel))?;
                 restored.push(rel.clone());
             }
         }
@@ -234,8 +231,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         bail!("not a dir: {}", src.display());
     }
-    std::fs::create_dir_all(dst)
-        .with_context(|| format!("create {}", dst.display()))?;
+    std::fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
     for entry in std::fs::read_dir(src)?.flatten() {
         let path = entry.path();
         let rel = entry.file_name();
@@ -243,9 +239,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         if path.is_dir() {
             copy_dir_recursive(&path, &target)?;
         } else if path.is_file() {
-            std::fs::copy(&path, &target).with_context(|| {
-                format!("copy {} → {}", path.display(), target.display())
-            })?;
+            std::fs::copy(&path, &target)
+                .with_context(|| format!("copy {} → {}", path.display(), target.display()))?;
         }
     }
     Ok(())
@@ -300,16 +295,26 @@ mod tests {
         write(&root.join("config.toml"), "v1");
         write(&root.join("active_profile"), "alpha");
         write(&root.join("profiles/alpha/config.toml"), "alpha-cfg-v1");
-        write(&root.join("profiles/alpha/persona/persona.toml"), "preset = \"default\"");
+        write(
+            &root.join("profiles/alpha/persona/persona.toml"),
+            "preset = \"default\"",
+        );
 
         let snap = create(root, "0.1.0", "0.2.0", "alpha", None).unwrap();
         assert!(snap.dir.is_dir());
         assert!(snap.manifest.files.iter().any(|f| f == "config.toml"));
-        assert!(snap.manifest.files.iter().any(|f| f.starts_with("profiles/alpha/persona")));
+        assert!(snap
+            .manifest
+            .files
+            .iter()
+            .any(|f| f.starts_with("profiles/alpha/persona")));
 
         // Mutate live state.
         write(&root.join("config.toml"), "v2-broken");
-        write(&root.join("profiles/alpha/persona/persona.toml"), "preset = \"corrupted\"");
+        write(
+            &root.join("profiles/alpha/persona/persona.toml"),
+            "preset = \"corrupted\"",
+        );
 
         let snaps = list_all(root).unwrap();
         assert_eq!(snaps.len(), 1);
@@ -319,8 +324,8 @@ mod tests {
 
         let restored = std::fs::read_to_string(root.join("config.toml")).unwrap();
         assert_eq!(restored, "v1");
-        let persona = std::fs::read_to_string(root.join("profiles/alpha/persona/persona.toml"))
-            .unwrap();
+        let persona =
+            std::fs::read_to_string(root.join("profiles/alpha/persona/persona.toml")).unwrap();
         assert_eq!(persona, "preset = \"default\"");
     }
 

@@ -1204,8 +1204,7 @@ async fn main() -> Result<()> {
     // warn/error during render (the v0.6.x "log spam in wizard footer" bug).
     // Override with `RANTAICLAW_LOG_STDERR=1` for piped/CI runs that want
     // human-readable logs on stderr regardless of TTY detection.
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let force_stderr = std::env::var_os("RANTAICLAW_LOG_STDERR").is_some();
     let stdout_is_tty = std::io::stdout().is_terminal();
 
@@ -1232,7 +1231,9 @@ async fn main() -> Result<()> {
         tracing::subscriber::set_global_default(subscriber)
             .expect("setting default subscriber failed");
     } else {
-        let subscriber = fmt::Subscriber::builder().with_env_filter(env_filter).finish();
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .finish();
         tracing::subscriber::set_global_default(subscriber)
             .expect("setting default subscriber failed");
     }
@@ -2422,9 +2423,7 @@ async fn run_provisioner_headless(
                     // automation behaviour. Pre-fix code skipped silently
                     // and let the provisioner block on `recv_selection`
                     // until the 120s timeout.
-                    eprintln!(
-                        "[headless] choose '{label}' ({id}) — defaulting to option 0"
-                    );
+                    eprintln!("[headless] choose '{label}' ({id}) — defaulting to option 0");
                     let _ = response_tx
                         .send(onboard::provision::ProvisionResponse::Selection(vec![0]))
                         .await;

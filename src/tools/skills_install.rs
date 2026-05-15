@@ -162,8 +162,7 @@ impl Tool for SkillsInstallDepsTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'name' parameter"))?;
 
-        let with_status =
-            crate::skills::load_skills_with_status(&self.workspace_dir, &self.config);
+        let with_status = crate::skills::load_skills_with_status(&self.workspace_dir, &self.config);
         let skill = match with_status
             .into_iter()
             .find(|(s, _)| s.name.eq_ignore_ascii_case(name))
@@ -196,9 +195,8 @@ impl Tool for SkillsInstallDepsTool {
 
         // Run the recipe inside spawn_blocking so the brew/npm/curl
         // subprocess doesn't tie up the tokio runtime.
-        let prefs = crate::skills::install_deps::SelectorPrefs::from_config(
-            &self.config.skills.install,
-        );
+        let prefs =
+            crate::skills::install_deps::SelectorPrefs::from_config(&self.config.skills.install);
         let skill_for_task = skill.clone();
         let prefs_for_task = prefs;
         let outcome = tokio::task::spawn_blocking(move || {

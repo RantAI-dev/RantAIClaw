@@ -473,13 +473,7 @@ mod tests {
 
     #[test]
     fn test_searxng_url_empty_string_normalises_to_none() {
-        let tool = WebSearchTool::new(
-            "searxng".to_string(),
-            None,
-            Some("   ".to_string()),
-            5,
-            15,
-        );
+        let tool = WebSearchTool::new("searxng".to_string(), None, Some("   ".to_string()), 5, 15);
         assert_eq!(tool.searxng_url, None);
     }
 }

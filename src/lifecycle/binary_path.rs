@@ -43,8 +43,10 @@ fn classify(path: &Path) -> InstallKind {
     if s.contains("/.cargo/bin/") || s.contains("\\.cargo\\bin\\") {
         return InstallKind::Cargo;
     }
-    if s.contains("/target/debug/") || s.contains("/target/release/")
-        || s.contains("\\target\\debug\\") || s.contains("\\target\\release\\")
+    if s.contains("/target/debug/")
+        || s.contains("/target/release/")
+        || s.contains("\\target\\debug\\")
+        || s.contains("\\target\\release\\")
     {
         return InstallKind::Workspace;
     }

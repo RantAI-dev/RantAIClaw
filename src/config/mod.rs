@@ -12,10 +12,10 @@ pub use schema::{
     ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, ObservabilityConfig,
     PeripheralBoardConfig, PeripheralsConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
     ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
-    SchedulerConfig, SecretsConfig, SecurityConfig, SkillApiKey, SkillEntryConfig,
-    SkillsConfig, SkillsInstallConfig, SkillsPromptInjectionMode,
-    SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
-    TasksConfig, TelegramConfig, TunnelConfig, WebSearchConfig, WebhookConfig,
+    SchedulerConfig, SecretsConfig, SecurityConfig, SkillApiKey, SkillEntryConfig, SkillsConfig,
+    SkillsInstallConfig, SkillsPromptInjectionMode, SlackConfig, StorageConfig,
+    StorageProviderConfig, StorageProviderSection, StreamMode, TasksConfig, TelegramConfig,
+    TunnelConfig, WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]

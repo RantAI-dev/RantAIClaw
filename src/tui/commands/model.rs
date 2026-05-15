@@ -2,9 +2,7 @@ use anyhow::Result;
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
-use crate::tui::widgets::{
-    ListPicker, ListPickerItem, ListPickerKind, ModelEntry,
-};
+use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind, ModelEntry};
 
 /// /model command — display, change, or interactively pick the active model.
 pub struct ModelCommand;

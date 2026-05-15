@@ -392,9 +392,7 @@ fn port_skills_entries(openclaw_json: &Path, dest_config_toml: &Path) -> Result<
                 toml_out.push_str(&format!("[skills.entries.{slug}.config]\n"));
                 for (k, v) in cfg {
                     let rendered = match v {
-                        serde_json::Value::String(s) => {
-                            toml::Value::String(s.clone()).to_string()
-                        }
+                        serde_json::Value::String(s) => toml::Value::String(s.clone()).to_string(),
                         serde_json::Value::Bool(b) => b.to_string(),
                         serde_json::Value::Number(n) => n.to_string(),
                         other => format!("\"{}\"", other.to_string().replace('"', "\\\"")),

@@ -168,7 +168,6 @@ async fn recv_selection(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

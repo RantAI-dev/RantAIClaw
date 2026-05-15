@@ -26,10 +26,7 @@ impl CommandHandler for StatusCommand {
             .section(
                 InfoSection::new("Agent")
                     .key_value("Model", &ctx.model)
-                    .key_value(
-                        "Debug",
-                        if ctx.debug_mode { "on" } else { "off" },
-                    ),
+                    .key_value("Debug", if ctx.debug_mode { "on" } else { "off" }),
             )
             .section(
                 InfoSection::new("Session")
@@ -85,24 +82,20 @@ impl CommandHandler for ConfigCommand {
                 // happens via `/config <key> <value>` and `/setup`.
                 let panel = InfoPanel::new("Config")
                     .with_subtitle("session-level keys")
-                    .with_footer("Esc close · `/config <key> <value>` to set · `/setup` for full wizard")
+                    .with_footer(
+                        "Esc close · `/config <key> <value>` to set · `/setup` for full wizard",
+                    )
                     .section(
                         InfoSection::new("Runtime")
                             .key_value("model", &ctx.model)
-                            .key_value(
-                                "debug",
-                                if ctx.debug_mode { "true" } else { "false" },
-                            ),
+                            .key_value("debug", if ctx.debug_mode { "true" } else { "false" }),
                     )
-                    .section(
-                        InfoSection::new("Persisted")
-                            .plain(
-                                "On-disk config lives at \
+                    .section(InfoSection::new("Persisted").plain(
+                        "On-disk config lives at \
                                  `~/.rantaiclaw/profiles/<active>/config.toml`. \
                                  `/setup` walks the wizard against it; \
                                  `/setup <section>` re-runs one section.",
-                            ),
-                    );
+                    ));
                 Ok(CommandResult::OpenInfoPanel(panel))
             }
             1 => {
@@ -173,7 +166,11 @@ impl CommandHandler for DoctorCommand {
         core = if model_ok {
             core.status_with(StatusKind::Ok, "Model configured", &ctx.model)
         } else {
-            core.status_with(StatusKind::Fail, "Model configured", "no model set — run /setup provider")
+            core.status_with(
+                StatusKind::Fail,
+                "Model configured",
+                "no model set — run /setup provider",
+            )
         };
         core = core.status_with(StatusKind::Ok, "TUI", "running");
 
@@ -183,11 +180,7 @@ impl CommandHandler for DoctorCommand {
         channels = match crate::channels::auto_start_state::snapshot() {
             crate::channels::auto_start_state::AutoStartState::NotDispatched => {
                 if configured_count == 0 {
-                    channels.status_with(
-                        StatusKind::Info,
-                        "Auto-start",
-                        "no channels configured",
-                    )
+                    channels.status_with(StatusKind::Info, "Auto-start", "no channels configured")
                 } else {
                     channels.status_with(
                         StatusKind::Warn,
@@ -199,20 +192,18 @@ impl CommandHandler for DoctorCommand {
             crate::channels::auto_start_state::AutoStartState::Starting { .. } => {
                 channels.status_with(StatusKind::Info, "Auto-start", "starting…")
             }
-            crate::channels::auto_start_state::AutoStartState::Terminated { .. } => {
-                channels.status_with(
+            crate::channels::auto_start_state::AutoStartState::Terminated { .. } => channels
+                .status_with(
                     StatusKind::Warn,
                     "Auto-start",
                     "stopped (dispatch loop exited)",
-                )
-            }
-            crate::channels::auto_start_state::AutoStartState::Failed { .. } => {
-                channels.status_with(
+                ),
+            crate::channels::auto_start_state::AutoStartState::Failed { .. } => channels
+                .status_with(
                     StatusKind::Fail,
                     "Auto-start",
                     "failed — see /channels for the error",
-                )
-            }
+                ),
         };
         for (name, configured) in &ctx.channels_summary {
             if *configured {
@@ -238,14 +229,26 @@ impl CommandHandler for DoctorCommand {
             let profiles = root.join("profiles");
             let mut s = InfoSection::new("Workspace");
             s = s.status_with(
-                if root.exists() { StatusKind::Ok } else { StatusKind::Fail },
+                if root.exists() {
+                    StatusKind::Ok
+                } else {
+                    StatusKind::Fail
+                },
                 "~/.rantaiclaw",
                 if root.exists() { "present" } else { "missing" },
             );
             s = s.status_with(
-                if profiles.exists() { StatusKind::Ok } else { StatusKind::Fail },
+                if profiles.exists() {
+                    StatusKind::Ok
+                } else {
+                    StatusKind::Fail
+                },
                 "profiles/",
-                if profiles.exists() { "present" } else { "missing" },
+                if profiles.exists() {
+                    "present"
+                } else {
+                    "missing"
+                },
             );
             s
         };
@@ -313,37 +316,42 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
             StatusKind::Warn,
             "stopped (dispatch loop exited; restart `rantaiclaw`)".to_string(),
         ),
-        AutoStartState::Failed { message, .. } => {
-            ("Auto-start", StatusKind::Fail, message)
-        }
+        AutoStartState::Failed { message, .. } => ("Auto-start", StatusKind::Fail, message),
     };
 
     let mut panel = InfoPanel::new("Channels")
-        .with_subtitle(format!("{} configured · {} available", configured_count, rows.len()))
+        .with_subtitle(format!(
+            "{} configured · {} available",
+            configured_count,
+            rows.len()
+        ))
         .with_footer("Esc close · `/setup channels` to add or reconfigure")
-        .section(
-            InfoSection::new("Always available")
-                .status_with(StatusKind::Ok, "CLI / TUI", "this terminal"),
-        );
+        .section(InfoSection::new("Always available").status_with(
+            StatusKind::Ok,
+            "CLI / TUI",
+            "this terminal",
+        ));
 
     // Auto-start state row — single-line probe.
-    panel = panel.section(
-        InfoSection::new("Runtime")
-            .status_with(auto_kind, auto_label, auto_detail),
-    );
+    panel =
+        panel.section(InfoSection::new("Runtime").status_with(auto_kind, auto_label, auto_detail));
 
     // Configured channels — detailed per-row state.
     if configured_count > 0 {
         let mut sec = InfoSection::new("Configured");
         let polling_label = match snapshot() {
-            AutoStartState::Starting { since_unix } if now.saturating_sub(since_unix) >= 5 => "polling",
+            AutoStartState::Starting { since_unix } if now.saturating_sub(since_unix) >= 5 => {
+                "polling"
+            }
             AutoStartState::Starting { .. } => "starting…",
             AutoStartState::Terminated { .. } => "stopped",
             AutoStartState::Failed { .. } => "failed",
             AutoStartState::NotDispatched => "configured",
         };
         let kind = match snapshot() {
-            AutoStartState::Starting { since_unix } if now.saturating_sub(since_unix) >= 5 => StatusKind::Ok,
+            AutoStartState::Starting { since_unix } if now.saturating_sub(since_unix) >= 5 => {
+                StatusKind::Ok
+            }
             AutoStartState::Starting { .. } => StatusKind::Info,
             AutoStartState::Terminated { .. } => StatusKind::Warn,
             AutoStartState::Failed { .. } => StatusKind::Fail,
@@ -356,22 +364,16 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
         }
         panel = panel.section(sec);
     } else {
-        panel = panel.section(
-            InfoSection::new("Configured")
-                .plain(
-                    "No external channels configured. \
+        panel = panel.section(InfoSection::new("Configured").plain(
+            "No external channels configured. \
                      Run `/setup channels` to add Telegram, Discord, Slack, etc.",
-                ),
-        );
+        ));
     }
 
     // Not configured — compact comma-separated list (visual breathing
     // room — keep the panel from blowing up to 30 lines).
     if !not_configured.is_empty() {
-        panel = panel.section(
-            InfoSection::new("Not configured")
-                .inline_list(not_configured),
-        );
+        panel = panel.section(InfoSection::new("Not configured").inline_list(not_configured));
     }
 
     // Log pointer — always there because anyone debugging Telegram needs it.

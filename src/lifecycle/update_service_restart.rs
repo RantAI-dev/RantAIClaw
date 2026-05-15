@@ -57,7 +57,10 @@ fn detect_systemd_unit() -> Option<String> {
         // Restart even when failed/inactive — user may want to retry
         // after the binary swap. Only skip when totally unregistered
         // (returns `unknown`).
-        if matches!(s, "active" | "activating" | "reloading" | "failed" | "inactive") {
+        if matches!(
+            s,
+            "active" | "activating" | "reloading" | "failed" | "inactive"
+        ) {
             return Some((*unit).to_string());
         }
     }

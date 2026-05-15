@@ -3742,10 +3742,7 @@ fn render_splash_lines(ctx: &TuiContext, area_width: u16) -> Vec<Line<'static>> 
     right.push(Line::from(""));
 
     for line in wrap_text("Type a message or /help for commands.", right_width) {
-        right.push(Line::from(Span::styled(
-            line,
-            Style::default().fg(muted),
-        )));
+        right.push(Line::from(Span::styled(line, Style::default().fg(muted))));
     }
 
     // ── Left-pane mascot ──────────────────────────────────────────────
