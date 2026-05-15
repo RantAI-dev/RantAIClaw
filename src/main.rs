@@ -83,6 +83,10 @@ mod providers;
 mod runtime;
 mod security;
 mod service;
+mod services;
+mod sessions {
+    pub use rantaiclaw::sessions::*;
+}
 mod skillforge;
 mod skills;
 mod tasks;
@@ -536,6 +540,38 @@ Examples:
         /// Skip confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Take a full-profile tarball backup before swapping the binary.
+        /// Slower than the lightweight pre-update snapshot (which always
+        /// runs); covers sessions.db + skills/* + secrets too. Mirrors
+        /// `hermes update --backup`.
+        #[arg(long)]
+        backup: bool,
+    },
+
+    /// Restore the previous binary + profile state from a pre-update snapshot.
+    #[command(long_about = "\
+Restore from a pre-update snapshot.
+
+Every `rantaiclaw update` writes a lightweight snapshot of config + active
+profile state to ~/.rantaiclaw/.update-snapshots/<timestamp>/ AND keeps the
+previous binary as `rantaiclaw.old` next to the live one. `rollback` undoes
+both: by default it picks the most recent snapshot.
+
+Examples:
+  rantaiclaw rollback                 # restore latest snapshot, prompt first
+  rantaiclaw rollback -y              # skip prompt
+  rantaiclaw rollback --list          # show available snapshots, no restore
+  rantaiclaw rollback --snapshot ~/.rantaiclaw/.update-snapshots/2026-05-09T03-21-00Z")]
+    Rollback {
+        /// Show available snapshots and exit without restoring.
+        #[arg(long)]
+        list: bool,
+        /// Restore from a specific snapshot dir (default: most recent).
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Skip confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Remove rantaiclaw profile data, optionally the binary itself
@@ -588,6 +624,37 @@ Examples:
         /// Target shell
         #[arg(value_enum)]
         shell: CompletionShell,
+    },
+
+    /// Browse, search, or rename past sessions (CLI parity for TUI `/sessions /search /title`).
+    #[command(long_about = "\
+Browse, search, or rename past sessions stored in ~/.local/share/rantaiclaw/sessions.db.
+
+Examples:
+  rantaiclaw session list                       # 50 most recent
+  rantaiclaw session list --limit 200
+  rantaiclaw session get <id-prefix>            # show messages
+  rantaiclaw session search 'docker compose'    # full-text across all sessions
+  rantaiclaw session title <id-prefix> 'Docker debugging'")]
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCommands,
+    },
+
+    /// Show cumulative session/message statistics (CLI parity for TUI `/insights`).
+    Insights,
+
+    /// Show, list, or switch the agent persona preset (CLI parity for TUI `/personality`).
+    #[command(long_about = "\
+Manage the active persona preset.
+
+Examples:
+  rantaiclaw personality show                   # current preset for active profile
+  rantaiclaw personality list                   # all available presets
+  rantaiclaw personality set concise_pro        # switch")]
+    Personality {
+        #[command(subcommand)]
+        cmd: PersonalityCommands,
     },
 
     /// Manage RantaiClaw profiles (multi-profile storage layout, v0.5.0+)
@@ -872,9 +939,57 @@ enum ChannelCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum SessionCommands {
+    /// List recent sessions
+    List {
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Show messages for a session (id prefix accepted)
+    Get {
+        /// Session id or prefix
+        id: String,
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
+    /// Full-text search across all session messages
+    Search {
+        /// Query string
+        query: String,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Set the title of a session (id prefix accepted)
+    Title {
+        /// Session id or prefix
+        id: String,
+        /// New title
+        title: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PersonalityCommands {
+    /// Show the active persona for the current profile
+    Show,
+    /// List available persona presets
+    List,
+    /// Set the persona preset for the current profile
+    Set {
+        #[arg(value_enum)]
+        preset: rantaiclaw::persona::PresetId,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum SkillCommands {
     /// List installed skills
     List,
+    /// Show metadata for a single installed skill (CLI parity for TUI `/skill <name>`)
+    Show {
+        /// Skill name (case-insensitive)
+        name: String,
+    },
     /// Install a skill from a GitHub URL or local path
     Install {
         /// GitHub URL or local path
@@ -884,6 +999,35 @@ enum SkillCommands {
     Remove {
         /// Skill name
         name: String,
+    },
+    /// Re-pull installed ClawHub skill(s) at their latest version.
+    /// With `--all`, updates every installed skill. With a slug, updates
+    /// just that one. Local-path / git skills are skipped (you can `git pull`
+    /// or re-install those manually).
+    Update {
+        /// Specific skill slug to update; omit with `--all` to update every skill.
+        slug: Option<String>,
+        /// Update every installed skill.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show ClawHub metadata + security scan for a skill *before* installing.
+    /// Hits ClawHub's public API; no install side-effect.
+    Inspect {
+        /// ClawHub skill slug.
+        slug: String,
+    },
+    /// Install missing binary dependencies declared by a skill's
+    /// `metadata.clawdbot.install[]` recipes (brew/npm/uv/go/download).
+    /// Picks the preferred recipe based on what's available on this host.
+    /// Closes the OpenClaw-parity gap where rantaiclaw could detect
+    /// missing bins but couldn't fix them.
+    InstallDeps {
+        /// Skill name. Omit with --all to fix every gated skill that has recipes.
+        slug: Option<String>,
+        /// Run install-deps for every skill whose requires aren't met.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -1019,6 +1163,7 @@ async fn main() -> Result<()> {
         to,
         allow_downgrade,
         yes,
+        backup,
     }) = &cli.command
     {
         let channel = match channel.as_str() {
@@ -1033,17 +1178,65 @@ async fn main() -> Result<()> {
             allow_downgrade: *allow_downgrade,
             release_base_url: std::env::var("RANTAICLAW_RELEASE_BASE_URL").ok(),
             yes: *yes,
+            backup: *backup,
         });
     }
+    if let Some(Commands::Rollback {
+        list,
+        snapshot,
+        yes,
+    }) = &cli.command
+    {
+        return rantaiclaw::lifecycle::update::rollback(
+            rantaiclaw::lifecycle::update::RollbackOpts {
+                list: *list,
+                snapshot: snapshot.clone(),
+                yes: *yes,
+            },
+        );
+    }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .finish();
+    // Initialize logging — respects RUST_LOG env var, defaults to INFO.
+    //
+    // When stdout is a TTY, route tracing to a daily file under
+    // `~/.rantaiclaw/logs/`. Otherwise tracing's default-stderr writer bleeds
+    // straight into the TUI's alt-screen frame whenever any subsystem emits a
+    // warn/error during render (the v0.6.x "log spam in wizard footer" bug).
+    // Override with `RANTAICLAW_LOG_STDERR=1` for piped/CI runs that want
+    // human-readable logs on stderr regardless of TTY detection.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let force_stderr = std::env::var_os("RANTAICLAW_LOG_STDERR").is_some();
+    let stdout_is_tty = std::io::stdout().is_terminal();
 
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    let log_file = if stdout_is_tty && !force_stderr {
+        let log_dir = rantaiclaw::profile::paths::rantaiclaw_root().join("logs");
+        std::fs::create_dir_all(&log_dir).ok().and_then(|_| {
+            let date = chrono::Utc::now().format("%Y-%m-%d");
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join(format!("rantaiclaw-{date}.log")))
+                .ok()
+        })
+    } else {
+        None
+    };
+
+    if let Some(file) = log_file {
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
+    } else {
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
+    }
 
     // ── Wave-3 Setup orchestrator ───────────────────────────────────
     //
@@ -1425,6 +1618,25 @@ async fn main() -> Result<()> {
 
         Some(Commands::Skills { skill_command }) => skills::handle_command(skill_command, &config),
 
+        Some(Commands::Session { cmd }) => match cmd {
+            SessionCommands::List { limit } => rantaiclaw::sessions::cli::list(limit),
+            SessionCommands::Get { id, limit } => rantaiclaw::sessions::cli::get(&id, limit),
+            SessionCommands::Search { query, limit } => {
+                rantaiclaw::sessions::cli::search(&query, limit)
+            }
+            SessionCommands::Title { id, title } => {
+                rantaiclaw::sessions::cli::set_title(&id, &title)
+            }
+        },
+
+        Some(Commands::Insights) => rantaiclaw::sessions::cli::insights(),
+
+        Some(Commands::Personality { cmd }) => match cmd {
+            PersonalityCommands::Show => rantaiclaw::persona::cli::show(),
+            PersonalityCommands::List => rantaiclaw::persona::cli::list(),
+            PersonalityCommands::Set { preset } => rantaiclaw::persona::cli::set(preset),
+        },
+
         Some(Commands::Migrate {
             migrate_command,
             from,
@@ -1463,7 +1675,27 @@ async fn main() -> Result<()> {
                 tui_config.resume_session = resume;
 
                 if let Some(msg) = message {
-                    println!("Single message mode not yet implemented: {msg}");
+                    // Single-shot path delegates to the same agent loop the
+                    // `agent -m` subcommand uses — keeps both surfaces
+                    // consistent and avoids spinning up the full TUI for a
+                    // one-shot LLM call.
+                    let model_override = if tui_config.model.is_empty() {
+                        None
+                    } else {
+                        Some(tui_config.model.clone())
+                    };
+                    let response = agent::loop_::run(
+                        config.clone(),
+                        Some(msg),
+                        None,
+                        model_override,
+                        config.default_temperature,
+                        Vec::new(),
+                    )
+                    .await?;
+                    if !response.is_empty() {
+                        println!("{response}");
+                    }
                     return Ok(());
                 }
 
@@ -1508,6 +1740,7 @@ async fn main() -> Result<()> {
         Some(Commands::Profile { .. }) => unreachable!("Profile dispatched earlier"),
         Some(Commands::Uninstall { .. }) => unreachable!("Uninstall dispatched earlier"),
         Some(Commands::Update { .. }) => unreachable!("Update dispatched earlier"),
+        Some(Commands::Rollback { .. }) => unreachable!("Rollback dispatched earlier"),
     }
 }
 
@@ -2120,7 +2353,7 @@ async fn run_provisioner_headless(
     use onboard::provision::{ProvisionEvent, ProvisionIo};
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
-    let (_response_tx, response_rx) = tokio::sync::mpsc::channel(8);
+    let (response_tx, response_rx) = tokio::sync::mpsc::channel(8);
 
     let io = ProvisionIo {
         events: events_tx,
@@ -2169,16 +2402,37 @@ async fn run_provisioner_headless(
                     default,
                     secret,
                 } => {
-                    if secret {
-                        eprintln!("[headless] secret prompt '{label}' ({id}) — using default");
+                    let value = if secret {
+                        eprintln!("[headless] secret prompt '{label}' ({id}) — using empty");
+                        String::new()
                     } else if let Some(def) = default {
                         eprintln!("[headless] prompt '{label}' ({id}) — using default: {def}");
+                        def
                     } else {
-                        eprintln!("[headless] prompt '{label}' ({id}) — no default available");
-                    }
+                        eprintln!("[headless] prompt '{label}' ({id}) — no default; sending empty");
+                        String::new()
+                    };
+                    let _ = response_tx
+                        .send(onboard::provision::ProvisionResponse::Text(value))
+                        .await;
                 }
                 ProvisionEvent::Choose { id, label, .. } => {
-                    eprintln!("[headless] choose '{label}' ({id}) — skipped in headless mode");
+                    // Headless default: pick option 0 (the affirmative
+                    // / first choice). The provisioner authors order options
+                    // with the YES path first, so this gives sensible
+                    // automation behaviour. Pre-fix code skipped silently
+                    // and let the provisioner block on `recv_selection`
+                    // until the 120s timeout.
+                    eprintln!("[headless] choose '{label}' ({id}) — defaulting to option 0");
+                    let _ = response_tx
+                        .send(onboard::provision::ProvisionResponse::Selection(vec![0]))
+                        .await;
+                }
+                ProvisionEvent::OpenSkillInstallPicker { label } => {
+                    eprintln!(
+                        "[headless] install picker '{label}' — skipped in headless mode \
+                         (use the TUI for live ClawHub search/install)"
+                    );
                 }
             }
         }

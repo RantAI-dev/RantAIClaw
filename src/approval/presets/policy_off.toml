@@ -1,18 +1,18 @@
-# RantaiClaw approval policy — preset L4 (Off / no gating)
+# RantaiClaw approval policy — preset Off (no gating)
 #
-# See `policy_l1.toml` for the bundle layout. L4 disables the approval
+# See `policy_manual.toml` for the bundle layout. Off disables the approval
 # gate entirely — every tool call passes through unchallenged.
 #
 # !!! WARNING !!!
 # This preset is intended for *trusted CI environments only*. Agents
-# running under L4 can read, write, and execute anything within OS
-# permissions. Do not enable L4 on a personal machine, in a shared
+# running under Off can read, write, and execute anything within OS
+# permissions. Do not enable Off on a personal machine, in a shared
 # workspace, or against any system that holds secrets you care about.
 # `policy_writer::write_policy_files` prints a stern warning whenever
 # this preset is selected.
 
 [autonomy]
-preset = "L4"
+preset = "off"
 mode = "off"
 description = "Off — no gating. CI / fully-trusted environments only."
 
@@ -25,7 +25,7 @@ timeout_secs = 0
 patterns = []
 
 [forbidden_paths]
-# A minimal floor we keep even under L4: the rantaiclaw secrets dir
+# A minimal floor we keep even under Off: the rantaiclaw secrets dir
 # itself. `mode = "off"` does not bypass forbidden-path checks; that
 # fence is non-negotiable per spec §6.1.
 patterns = [

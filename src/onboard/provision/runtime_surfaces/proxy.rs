@@ -81,7 +81,7 @@ impl TuiProvisioner for ProxyProvisioner {
 
         let mut http_proxy = None;
         let mut https_proxy = None;
-        let mut all_proxy = None;
+        let all_proxy = None;
 
         if enabled {
             send(

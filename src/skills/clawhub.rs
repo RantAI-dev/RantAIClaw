@@ -23,7 +23,7 @@ use crate::profile::Profile;
 pub const CLAWHUB_BASE_URL_ENV: &str = "RANTAICLAW_CLAWHUB_BASE_URL";
 const DEFAULT_BASE_URL: &str = "https://clawhub.ai/api/v1";
 const TOP_SKILLS_CACHE_FILE: &str = "top-skills.json";
-const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
+const CACHE_TTL: Duration = Duration::from_hours(24);
 
 /// Subset of the ClawHub skill listing item that the wizard cares about.
 /// Extra fields in the payload are ignored (serde default behaviour).
@@ -139,6 +139,188 @@ pub async fn list_top(n: usize) -> Result<Vec<ClawHubSkill>> {
     Ok(listing.items.into_iter().take(n).collect())
 }
 
+/// Server-side search across the ClawHub catalogue. Hits
+/// `/api/v1/search?q=<q>&type=skill` which returns results ranked by a
+/// fuzzy-match score (covers display name, slug, summary, tags). Empty
+/// query returns an empty list — callers should fall back to `list_top`
+/// when the user hasn't typed anything yet.
+///
+/// Result entries don't include the `stats` block that listing returns,
+/// so `stars`/`downloads` will be 0 — fine, the picker labels search
+/// results by relevance, not popularity.
+pub async fn search(query: &str) -> Result<Vec<ClawHubSkill>> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let url = format!(
+        "{}/search?q={}&type=skill",
+        base_url(),
+        urlencoding::encode(query)
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("build reqwest client")?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("GET clawhub search")?;
+    if !response.status().is_success() {
+        anyhow::bail!("clawhub search returned status {}", response.status());
+    }
+
+    #[derive(Deserialize)]
+    struct SearchEnvelope {
+        #[serde(default)]
+        results: Vec<SearchResult>,
+    }
+    #[derive(Deserialize)]
+    struct SearchResult {
+        slug: String,
+        #[serde(default, alias = "displayName", alias = "display_name")]
+        display_name: String,
+        #[serde(default)]
+        summary: String,
+    }
+
+    let env: SearchEnvelope = response
+        .json()
+        .await
+        .context("parse clawhub search response")?;
+    Ok(env
+        .results
+        .into_iter()
+        .map(|r| ClawHubSkill {
+            slug: r.slug,
+            display_name: r.display_name,
+            summary: r.summary,
+            stats: ClawHubStats::default(),
+            tags: serde_json::Value::Null,
+        })
+        .collect())
+}
+
+/// Pretty-print a skill's ClawHub metadata + security-scan summary to
+/// stdout. Used by `rantaiclaw skills inspect <slug>` so a user can vet
+/// a skill before installing.
+pub async fn inspect_to_stdout(slug: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build reqwest client")?;
+
+    // Detail
+    let detail_url = format!("{}/skills/{}", base_url(), slug);
+    let detail: serde_json::Value = client
+        .get(&detail_url)
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("clawhub skill `{slug}` not found"))?
+        .json()
+        .await?;
+
+    let skill = detail.get("skill").unwrap_or(&detail);
+    let display = skill
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .unwrap_or(slug);
+    let summary = skill.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+    let stars = skill
+        .get("stats")
+        .and_then(|v| v.get("stars"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let installs = skill
+        .get("stats")
+        .and_then(|v| v.get("installsAllTime"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let latest = detail
+        .get("latestVersion")
+        .and_then(|v| v.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let owner = detail
+        .get("owner")
+        .and_then(|v| v.get("handle"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+
+    println!("{display} ({slug})  ★{stars}  installs:{installs}");
+    println!("  latest:    {latest}");
+    println!("  owner:     {owner}");
+    if !summary.is_empty() {
+        println!("  summary:   {summary}");
+    }
+
+    // Version manifest — files + security scan.
+    let version_url = format!("{}/skills/{}/versions/{}", base_url(), slug, latest);
+    let manifest: serde_json::Value = client
+        .get(&version_url)
+        .send()
+        .await?
+        .error_for_status()
+        .context("fetch version manifest")?
+        .json()
+        .await?;
+
+    let version = manifest.get("version").unwrap_or(&manifest);
+
+    if let Some(files) = version.get("files").and_then(|v| v.as_array()) {
+        println!("  files:     {} file(s)", files.len());
+        for f in files.iter().take(10) {
+            let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let size = f.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("    - {path}  ({size} bytes)");
+        }
+        if files.len() > 10 {
+            println!("    … {} more", files.len() - 10);
+        }
+    }
+
+    if let Some(security) = version.get("security") {
+        let status = security
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let warnings = security
+            .get("hasWarnings")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        println!(
+            "  security:  {status}{}",
+            if warnings { " (with warnings)" } else { "" }
+        );
+        if let Some(scanners) = security.get("scanners") {
+            for (name, body) in scanners.as_object().into_iter().flatten() {
+                let s = body.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                let v = body.get("verdict").and_then(|v| v.as_str()).unwrap_or("");
+                println!(
+                    "    - {name:<6}  {s}{}",
+                    if v.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ({v})")
+                    }
+                );
+            }
+        }
+    } else {
+        println!("  security:  (no scan info available)");
+    }
+
+    if let Some(metadata) = manifest.get("metadata").or_else(|| version.get("metadata")) {
+        if !metadata.is_null() {
+            println!("  metadata:  {}", metadata);
+        }
+    }
+
+    Ok(())
+}
+
 /// Install a batch of ClawHub skills by slug. Errors on individual slugs
 /// are logged but do not abort the batch — the function returns the slugs
 /// that successfully installed.
@@ -175,7 +357,7 @@ struct VersionFile {
 /// Three-step fetch:
 /// 1. `GET /skills/:slug` → resolve the latest version string.
 /// 2. `GET /skills/:slug/versions/:v` → list `version.files[*]` (path + size + sha256).
-/// 3. For each file: `GET /skills/:slug/versions/:v/files/<path>` → write to disk,
+/// 3. For each file: `GET /skills/:slug/file?version=:v&path=<path>` → write to disk,
 ///    verify SHA-256 against the manifest.
 ///
 /// On any failure (network, hash mismatch, path traversal in the manifest)
@@ -258,14 +440,36 @@ async fn install_one_inner(
                 .with_context(|| format!("create {}", parent.display()))?;
         }
 
+        // ClawHub serves file bytes via a singular `/file` endpoint with the
+        // version and path as query parameters. The plural `/versions/:v/files/:path`
+        // shape returns 404 — that was the v0.6.x install regression.
         let file_url = format!(
-            "{}/skills/{}/versions/{}/files/{}",
+            "{}/skills/{}/file?version={}&path={}",
             base_url(),
             slug,
-            version,
+            urlencoding::encode(&version),
             urlencoding::encode(&file.path),
         );
-        let resp = fetch_with_retry(client, &file_url).await?;
+        // SKILL.md is required; auxiliary files (README.md, LICENSE, etc.)
+        // are best-effort. If the upstream manifest references a file that
+        // 404s, treat non-SKILL.md as a warning so the install still
+        // succeeds. This was the v0.6.1-alpha "Clawhub Error Install" bug
+        // — a stale README.md reference broke the entire install.
+        let is_required = file.path.eq_ignore_ascii_case("SKILL.md");
+        let resp = match fetch_with_retry(client, &file_url).await {
+            Ok(r) => r,
+            Err(e) if !is_required => {
+                tracing::warn!(
+                    "clawhub: skipping optional file {} for {}/{}: {}",
+                    file.path,
+                    slug,
+                    version,
+                    e
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let bytes = resp
             .bytes()
             .await
@@ -481,5 +685,16 @@ mod tests {
     fn verify_sha256_is_case_insensitive() {
         let upper = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
         verify_sha256(b"abc", upper).unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_returns_empty_for_blank_query() {
+        // Server-side search with blank query is a guaranteed waste of a
+        // round-trip — the function short-circuits and returns []. This
+        // is also the contract callers rely on to fall back to list_top.
+        let result = search("").await.unwrap();
+        assert!(result.is_empty());
+        let result = search("   ").await.unwrap();
+        assert!(result.is_empty());
     }
 }

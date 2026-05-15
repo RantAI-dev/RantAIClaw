@@ -2,7 +2,7 @@
 
 This page defines the fastest supported path to install and initialize RantaiClaw.
 
-Last verified: **April 26, 2026**.
+Last verified: **May 9, 2026**.
 
 ## Option 0: Homebrew (macOS/Linuxbrew)
 
@@ -149,6 +149,10 @@ RANTAICLAW_API_KEY="sk-..." RANTAICLAW_PROVIDER="openrouter" ./bootstrap.sh --on
 | `RANTAICLAW_API_KEY` | Used when `--api-key` is not provided |
 | `RANTAICLAW_PROVIDER` | Used when `--provider` is not provided |
 | `RANTAICLAW_MODEL` | Used when `--model` is not provided |
+
+Credential precedence after bootstrap matches runtime behavior: keys stored in
+config, including encrypted keys, remain above environment variables. Remove the
+stored config key before relying on an env-only override.
 
 ## Related docs
 

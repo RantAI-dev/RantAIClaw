@@ -43,8 +43,12 @@ pub struct TuiContext {
     /// the model picker. First entry is the primary/default provider.
     pub available_providers: Vec<String>,
     /// Skills loaded from the workspace at TUI startup. Used by
-    /// `/skills` to populate the skills picker.
+    /// direct slash-skill invocation and agent prompt construction.
     pub available_skills: Vec<crate::skills::Skill>,
+    /// All loaded skills, including gated/disabled rows, paired with
+    /// unmet gating reasons. Used by `/skills` so install-deps can be
+    /// reached from rows that are not active yet.
+    pub available_skills_with_status: Vec<(crate::skills::Skill, Vec<String>)>,
     /// Snapshot of `(command_name, description)` pairs taken at TUI
     /// startup. Used by `/help` to populate the help picker without
     /// reaching back into the command registry from inside handlers.
@@ -52,6 +56,15 @@ pub struct TuiContext {
     /// Submitted prompts in chronological order (oldest first). Used
     /// by Up/Down to recall past prompts when the input is empty or
     /// when already in history-navigation mode.
+    /// How many configured channels were dispatched to `start_channels`
+    /// when the TUI launched. Surfaced by `/channels` and `/platforms`
+    /// so the user can see whether their Telegram / Discord / etc. is
+    /// actually being polled by this process. `0` means TUI-only mode.
+    pub channels_autostart_count: usize,
+    /// Snapshot of `(name, configured)` rows at TUI startup. Used by
+    /// `/channels` and `/platforms` to render the table without needing
+    /// live access to the on-disk config. Refreshed by `reload_config`.
+    pub channels_summary: Vec<(String, bool)>,
     pub input_history: Vec<String>,
     /// Current position in history navigation, indexed from the end:
     /// `Some(0)` = most recent submission, `Some(1)` = next-most, etc.
@@ -61,6 +74,27 @@ pub struct TuiContext {
     /// history (so Down past the newest entry restores what they were
     /// typing). `None` when history navigation is inactive.
     pub input_history_stash: Option<String>,
+    /// Shared security policy handle. `Some` when the TUI was launched
+    /// against a real agent (`Agent::from_config`); `None` for unit
+    /// tests / `test_context()`. Used by `/allow`, `/deny`, and
+    /// `/allowlist` slash commands to mutate the runtime allowlist
+    /// live, and to resolve pending approvals surfaced by the shell
+    /// tool.
+    pub security: Option<std::sync::Arc<crate::security::SecurityPolicy>>,
+    /// Snapshot of the most recently finished turn's tool calls. Used
+    /// by the `/calls` slash command so the user can see what the
+    /// agent did, especially after a soft-cap hit. Refreshed on every
+    /// `finalize_turn`; empty until at least one turn completes.
+    pub last_turn_tool_calls: Vec<crate::tui::render::PersistedToolCall>,
+    /// MCP server names from `config.toml` `[mcp_servers.*]`. Used by
+    /// `/mcp` so the user can see which servers were *asked for*,
+    /// independent of whether discovery succeeded.
+    pub mcp_servers_configured: std::collections::HashSet<String>,
+    /// Live MCP tool registry, keyed by server name. Each value is
+    /// the list of fully-qualified tool names the agent actually
+    /// has access to. Empty entries mean the server is configured
+    /// but discovery failed.
+    pub mcp_tools_by_server: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl TuiContext {
@@ -103,10 +137,17 @@ impl TuiContext {
             queued_turns: 0,
             available_providers: Vec::new(),
             available_skills: Vec::new(),
+            available_skills_with_status: Vec::new(),
             available_commands: Vec::new(),
+            channels_autostart_count: 0,
+            channels_summary: Vec::new(),
             input_history: Vec::new(),
             input_history_pos: None,
             input_history_stash: None,
+            security: None,
+            last_turn_tool_calls: Vec::new(),
+            mcp_servers_configured: std::collections::HashSet::new(),
+            mcp_tools_by_server: std::collections::HashMap::new(),
         })
     }
 

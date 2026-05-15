@@ -49,11 +49,11 @@ pub mod daemon;
 pub mod doctor;
 pub mod gateway;
 pub(crate) mod hardware;
-pub mod lifecycle;
 pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub(crate) mod identity;
 pub(crate) mod integrations;
+pub mod lifecycle;
 pub mod mcp;
 pub mod memory;
 pub mod migration;
@@ -68,6 +68,7 @@ pub mod rag;
 pub mod runtime;
 pub mod security;
 pub(crate) mod service;
+pub(crate) mod services;
 pub mod sessions;
 pub mod skills;
 pub(crate) mod tasks;
@@ -149,6 +150,11 @@ Examples:
 pub(crate) enum SkillCommands {
     /// List all installed skills
     List,
+    /// Show metadata for a single installed skill
+    Show {
+        /// Skill name (case-insensitive)
+        name: String,
+    },
     /// Install a new skill from a URL or local path
     Install {
         /// Source URL or local path
@@ -158,6 +164,29 @@ pub(crate) enum SkillCommands {
     Remove {
         /// Skill name to remove
         name: String,
+    },
+    /// Re-pull installed ClawHub skill(s) at their latest version
+    Update {
+        /// Specific skill slug to update; omit with --all
+        slug: Option<String>,
+        /// Update every installed skill
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show ClawHub metadata + security scan for a skill before installing
+    Inspect {
+        /// ClawHub skill slug
+        slug: String,
+    },
+    /// Install missing binary dependencies for a skill using its declared
+    /// `metadata.clawdbot.install[]` recipes. Picks the preferred recipe
+    /// based on host availability (brew → uv → npm → go → download).
+    InstallDeps {
+        /// Specific skill name to install deps for; omit with --all
+        slug: Option<String>,
+        /// Install deps for every gated skill that has install recipes
+        #[arg(long)]
+        all: bool,
     },
 }
 

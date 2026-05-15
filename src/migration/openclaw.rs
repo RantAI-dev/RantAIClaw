@@ -70,6 +70,14 @@ impl DetectedSource {
     pub fn secrets_dir(&self) -> PathBuf {
         self.root.join("secrets")
     }
+
+    /// `<root>/openclaw.json` — OpenClaw's top-level JSON config file.
+    /// Holds `skills.entries.<name>` blocks (per-skill enabled / api_key /
+    /// env / config) plus other runtime settings. ZeroClaw uses the same
+    /// filename. Returns the path even if the file doesn't exist.
+    pub fn openclaw_json(&self) -> PathBuf {
+        self.root.join("openclaw.json")
+    }
 }
 
 /// Summary of what was migrated. Used to print the final user-facing line and
@@ -185,6 +193,18 @@ pub fn migrate_to_profile(
     let skills_migrated = count_skill_dirs(&source.skills_dir())?;
     let secrets_migrated = count_secret_files(&source.secrets_dir())?;
 
+    // Port `skills.entries.<name>` from `openclaw.json` (JSON shape) into
+    // the destination profile's `config.toml` (TOML shape). Best-effort:
+    // missing file or unparseable JSON is logged and skipped, never fails
+    // the whole migration.
+    let dest_config = crate::profile::paths::config_toml(profile_name);
+    if let Err(e) = port_skills_entries(&source.openclaw_json(), &dest_config) {
+        tracing::warn!(
+            error = %e,
+            "skills.entries port failed; user can hand-edit config.toml"
+        );
+    }
+
     Ok(MigrationSummary {
         source_root: source.root.clone(),
         source_variant: source.variant,
@@ -268,6 +288,132 @@ fn count_top_level_blocks(source_toml: &str) -> usize {
         count += 1;
     }
     count
+}
+
+/// Read `<source>/openclaw.json`, extract its `skills.entries` block, and
+/// append a TOML translation onto the destination `config.toml`.
+/// Idempotent: if the destination already has any `[skills.entries.<n>]`
+/// blocks, this is a no-op (we never overwrite user state).
+///
+/// JSON shape (OpenClaw):
+/// ```json
+/// {"skills": {"entries": {
+///     "image-lab": {
+///         "enabled": true,
+///         "apiKey": {"source": "env", "id": "GEMINI_API_KEY"},
+///         "env": {"GEMINI_API_KEY": "..."},
+///         "config": {"endpoint": "https://..."}
+///     }
+/// }}}
+/// ```
+///
+/// TOML shape (rantaiclaw):
+/// ```toml
+/// [skills.entries.image-lab]
+/// enabled = true
+///
+/// [skills.entries.image-lab.api_key]
+/// source = "env"
+/// id = "GEMINI_API_KEY"
+/// ```
+///
+/// Note the JSON uses camelCase (`apiKey`); the TOML uses snake_case
+/// (`api_key`). We translate.
+fn port_skills_entries(openclaw_json: &Path, dest_config_toml: &Path) -> Result<()> {
+    if !openclaw_json.is_file() {
+        return Ok(()); // nothing to port
+    }
+
+    let raw = fs::read_to_string(openclaw_json)
+        .with_context(|| format!("read {}", openclaw_json.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", openclaw_json.display()))?;
+
+    let entries = match json
+        .get("skills")
+        .and_then(|s| s.get("entries"))
+        .and_then(|e| e.as_object())
+    {
+        Some(e) if !e.is_empty() => e,
+        _ => return Ok(()),
+    };
+
+    // Idempotent guard.
+    if let Ok(existing) = fs::read_to_string(dest_config_toml) {
+        if existing.contains("[skills.entries.") {
+            tracing::info!("dest config.toml already has skills.entries; skipping port");
+            return Ok(());
+        }
+    }
+
+    let mut toml_out = String::from(
+        "\n# Migrated from openclaw.json: per-skill enabled / api_key / env / config.\n",
+    );
+    for (slug, entry) in entries {
+        toml_out.push_str(&format!("[skills.entries.{slug}]\n"));
+        let enabled = entry
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        toml_out.push_str(&format!("enabled = {enabled}\n"));
+
+        // env: { K = "V" }
+        if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
+            if !env.is_empty() {
+                toml_out.push('\n');
+                toml_out.push_str(&format!("[skills.entries.{slug}.env]\n"));
+                for (k, v) in env {
+                    if let Some(s) = v.as_str() {
+                        toml_out.push_str(&format!("{k} = {}\n", toml::Value::String(s.into())));
+                    }
+                }
+            }
+        }
+
+        // apiKey → api_key
+        if let Some(api_key) = entry.get("apiKey").or_else(|| entry.get("api_key")) {
+            toml_out.push('\n');
+            toml_out.push_str(&format!("[skills.entries.{slug}.api_key]\n"));
+            if let Some(s) = api_key.get("source").and_then(|v| v.as_str()) {
+                toml_out.push_str(&format!("source = \"{s}\"\n"));
+            }
+            if let Some(s) = api_key.get("id").and_then(|v| v.as_str()) {
+                toml_out.push_str(&format!("id = \"{s}\"\n"));
+            }
+            if let Some(s) = api_key.get("value").and_then(|v| v.as_str()) {
+                toml_out.push_str(&format!("value = \"{s}\"\n"));
+            }
+        }
+
+        // config: free-form
+        if let Some(cfg) = entry.get("config").and_then(|v| v.as_object()) {
+            if !cfg.is_empty() {
+                toml_out.push('\n');
+                toml_out.push_str(&format!("[skills.entries.{slug}.config]\n"));
+                for (k, v) in cfg {
+                    let rendered = match v {
+                        serde_json::Value::String(s) => toml::Value::String(s.clone()).to_string(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        other => format!("\"{}\"", other.to_string().replace('"', "\\\"")),
+                    };
+                    toml_out.push_str(&format!("{k} = {rendered}\n"));
+                }
+            }
+        }
+
+        toml_out.push('\n');
+    }
+
+    let mut existing = fs::read_to_string(dest_config_toml).unwrap_or_default();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        existing.push('\n');
+    }
+    existing.push_str(&toml_out);
+
+    fs::write(dest_config_toml, existing)
+        .with_context(|| format!("write {}", dest_config_toml.display()))?;
+    Ok(())
 }
 
 /// Number of skill directories under `<source>/skills/` (each subdirectory
@@ -433,5 +579,89 @@ mod tests {
             4,
             "must probe ~/.openclaw, ~/.zeroclaw, ~/.config/openclaw, ~/.config/zeroclaw"
         );
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn port_skills_entries_translates_json_to_toml() {
+        let tmp = TempDir::new().unwrap();
+        let json_path = tmp.path().join("openclaw.json");
+        let toml_path = tmp.path().join("config.toml");
+
+        fs::write(
+            &json_path,
+            r#"{
+                "skills": {
+                    "entries": {
+                        "weather": {
+                            "enabled": true,
+                            "config": {"default_city": "Tokyo"}
+                        },
+                        "image-lab": {
+                            "enabled": true,
+                            "apiKey": {"source": "env", "id": "GEMINI_API_KEY"},
+                            "env": {"GEMINI_API_KEY": "test-value"},
+                            "config": {"endpoint": "https://example.com", "size": 2048}
+                        },
+                        "disabled-skill": {
+                            "enabled": false
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        port_skills_entries(&json_path, &toml_path).unwrap();
+        let toml_body = fs::read_to_string(&toml_path).unwrap();
+
+        assert!(toml_body.contains("[skills.entries.weather]"));
+        assert!(toml_body.contains("default_city = \"Tokyo\""));
+        assert!(toml_body.contains("[skills.entries.image-lab]"));
+        assert!(toml_body.contains("[skills.entries.image-lab.api_key]"));
+        assert!(toml_body.contains("source = \"env\""));
+        assert!(toml_body.contains("id = \"GEMINI_API_KEY\""));
+        assert!(toml_body.contains("[skills.entries.image-lab.env]"));
+        assert!(toml_body.contains("GEMINI_API_KEY = \"test-value\""));
+        assert!(toml_body.contains("endpoint = \"https://example.com\""));
+        assert!(toml_body.contains("size = 2048"));
+        assert!(toml_body.contains("[skills.entries.disabled-skill]"));
+        assert!(toml_body.contains("enabled = false"));
+    }
+
+    #[test]
+    fn port_skills_entries_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let json_path = tmp.path().join("openclaw.json");
+        let toml_path = tmp.path().join("config.toml");
+
+        fs::write(
+            &json_path,
+            r#"{"skills":{"entries":{"weather":{"enabled":true}}}}"#,
+        )
+        .unwrap();
+        // First port creates the entry
+        port_skills_entries(&json_path, &toml_path).unwrap();
+        let after_first = fs::read_to_string(&toml_path).unwrap();
+        // Second port must not re-append
+        port_skills_entries(&json_path, &toml_path).unwrap();
+        let after_second = fs::read_to_string(&toml_path).unwrap();
+        assert_eq!(after_first, after_second, "second port should be a no-op");
+    }
+
+    #[test]
+    fn port_skills_entries_skips_when_no_json() {
+        let tmp = TempDir::new().unwrap();
+        let json_path = tmp.path().join("nonexistent.json");
+        let toml_path = tmp.path().join("config.toml");
+        // Just don't panic / fail
+        port_skills_entries(&json_path, &toml_path).unwrap();
+        assert!(!toml_path.exists());
     }
 }

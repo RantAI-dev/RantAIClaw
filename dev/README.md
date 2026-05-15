@@ -121,6 +121,15 @@ To run the incremental strict gate (changed Rust lines only):
 ./dev/ci.sh lint-delta
 ```
 
+To smoke-test the interactive TUI from a real pseudo-terminal:
+
+```bash
+./dev/tui-smoke.sh
+```
+
+The harness runs `target/debug/rantaiclaw` in tmux with an isolated temporary
+profile, opens `/skills`, and fails if the picker content does not render.
+
 ### 3. Run targeted stages
 
 ```bash

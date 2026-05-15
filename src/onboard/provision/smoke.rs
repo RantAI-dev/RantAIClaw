@@ -15,6 +15,13 @@
 //! cargo test --lib onboard::provision::smoke::telegram
 //! ```
 
+// Each per-provisioner test module does `use super::*;` so it can reach
+// the shared helpers and `ProvisionResponse`/`ProvisionEvent` types. Some
+// mods don't exercise every helper — Rust warns on the unused subset
+// per-mod. Allow at the file level so we don't have to spray
+// `#[allow(unused_imports)]` on 17 test modules.
+#![allow(unused_imports)]
+
 use crate::config::Config;
 use crate::onboard::provision::registry::{available, provisioner_for};
 use crate::onboard::provision::{ProvisionEvent, ProvisionIo, ProvisionResponse};
@@ -74,14 +81,21 @@ async fn run_provisioner_headless(
                                 let _ = handle.await;
                                 break;
                             }
+                            ProvisionEvent::OpenSkillInstallPicker { .. } => {
+                                // Headless smoke: no live install picker. Pretend
+                                // the user closed it without installing anything.
+                                let _ = resp_tx
+                                    .send(ProvisionResponse::InstalledSkills(Vec::new()))
+                                    .await;
+                            }
                             ProvisionEvent::Message { .. } | ProvisionEvent::QrCode { .. } => {}
                         }
                     }
                     None => break,
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                let _ = handle.abort();
+            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                let () = handle.abort();
                 break;
             }
         }
@@ -176,10 +190,10 @@ mod provider {
         let events = run_provisioner_headless(
             "provider",
             vec![
-                ProvisionResponse::Selection(vec![0]), // tier
-                ProvisionResponse::Selection(vec![0]), // specific provider
+                ProvisionResponse::Selection(vec![0]),  // tier
+                ProvisionResponse::Selection(vec![0]),  // specific provider
                 ProvisionResponse::Text(String::new()), // api key (empty)
-                ProvisionResponse::Selection(vec![0]), // default model (Choose)
+                ProvisionResponse::Selection(vec![0]),  // default model (Choose)
             ],
         )
         .await

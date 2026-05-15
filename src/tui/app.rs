@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Stdout, Write};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use crossterm::{
@@ -33,6 +34,11 @@ pub struct ToolBlockState {
     pub name: String,
     pub args: serde_json::Value,
     pub result: Option<(bool, String)>, // (ok, preview)
+    /// When this tool call started, for the working-indicator's
+    /// per-tool elapsed timer. Set when we see `ToolCallStart` and
+    /// frozen at `ToolCallEnd` time (still readable; just not the
+    /// "current" tool any more).
+    pub started_at: std::time::Instant,
 }
 
 /// Current application state.
@@ -44,6 +50,9 @@ pub enum AppState {
         partial: String,
         tool_blocks: Vec<ToolBlockState>,
         cancelling: bool,
+        /// When the user's turn started, used by the working
+        /// indicator's elapsed counter when no tool is in flight.
+        turn_started_at: std::time::Instant,
     },
     Quitting,
 }
@@ -85,6 +94,82 @@ pub struct TuiApp {
     /// `ListPicker.kind` tag tells the Enter handler what to do with the
     /// selected key. `None` when no picker is open.
     pub list_picker: Option<super::widgets::ListPicker>,
+    /// Last query we kicked off a ClawHub server-side search for. Used to
+    /// detect when the picker's query has changed since the last fetch so
+    /// we can fire a fresh `clawhub::search` and replace results live.
+    pub clawhub_install_last_query: String,
+    /// Monotonic version counter for ClawHub search tasks. Each task tags
+    /// its result with the version it was spawned for; the receiver only
+    /// applies results matching the current version, so stale completions
+    /// from rapid typing are dropped instead of overwriting newer results.
+    pub clawhub_install_search_version: u64,
+    /// Channel for ClawHub search results posted back from spawned tasks.
+    /// `None` when the install picker isn't open.
+    pub clawhub_install_results_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<(
+            u64,
+            anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>,
+        )>,
+    >,
+    /// Sender side of the results channel above. Cloned per spawned task.
+    pub clawhub_install_results_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<(
+            u64,
+            anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>,
+        )>,
+    >,
+    /// Slug currently being installed from ClawHub, plus the spinner frame
+    /// index (advanced each render tick). `None` when no install is in
+    /// flight. While `Some`, the picker title shows a Braille-spinner
+    /// "Installing …" line that animates per tick.
+    pub clawhub_install_in_progress: Option<(String, usize)>,
+    /// Completion channel for spawned ClawHub install tasks. `Ok(slug)` on
+    /// success, `Err(message)` on failure. The render loop drains this
+    /// each tick — when a result arrives, the install picker swaps to the
+    /// Skill picker (success) or its title flips to an error string
+    /// (failure).
+    pub clawhub_install_completion_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<Result<String, String>>>,
+    pub clawhub_install_completion_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<Result<String, String>>>,
+    /// Skill currently running install-deps from the local `/skills`
+    /// picker, plus spinner frame. Triggered by Ctrl+I/Tab on a skill row.
+    pub skill_deps_install_in_progress: Option<(String, usize)>,
+    pub skill_deps_install_completion_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<
+            Result<crate::skills::install_deps::InstallDepsOutcome, String>,
+        >,
+    >,
+    pub skill_deps_install_completion_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<
+            Result<crate::skills::install_deps::InstallDepsOutcome, String>,
+        >,
+    >,
+    pub skill_deps_install_finished_at: Option<Instant>,
+    /// Background watcher for profile/workspace skill edits. The watcher
+    /// owns the OS file handle; the TUI drains debounced reload ticks.
+    pub skills_watcher: Option<crate::skills::watcher::SkillsWatcher>,
+    /// Background watcher for the active profile's `config.toml`.
+    /// Direct edits (user adds an `[mcp_servers.foo]` block, swaps the
+    /// provider, changes the model) trigger a debounced reload tick;
+    /// the TUI drains it each frame and runs the same `reload_config`
+    /// pipeline that wizard close uses, so the agent picks up the
+    /// change on the next turn without a restart.
+    pub config_watcher: Option<crate::tui::config_watcher::ConfigWatcher>,
+    /// True while the install picker was opened from inside the first-run
+    /// wizard's skills step. On picker close (Esc), we send
+    /// `ProvisionResponse::InstalledSkills(installed_slugs)` back to the
+    /// wizard's response channel so the wizard can advance.
+    pub wizard_install_in_progress: bool,
+    /// Slugs successfully installed during the current install-picker
+    /// session. Reset when the picker opens; consumed when it closes
+    /// during a wizard install step.
+    pub wizard_installed_slugs: Vec<String>,
+    /// Read-only info panel (channels / config / doctor / insights / status
+    /// / usage / skill). Mutually exclusive with `list_picker` and
+    /// `setup_overlay` — the key handler refuses to open one while another
+    /// modal is up. v0.6.8 introduced this surface.
+    pub info_panel: Option<super::widgets::InfoPanel>,
     /// Inline-mode scrollback queue. The event loop drains this list
     /// before each frame and emits each entry into the terminal's native
     /// scrollback above the viewport. Each entry is `(role, content)`.
@@ -111,6 +196,13 @@ pub struct TuiApp {
     /// instead of the normal chat UI. Provisioner steps use the
     /// existing `setup_overlay` mechanism.
     pub first_run_wizard: Option<super::FirstRunWizard>,
+    /// Broadcast receiver for pending-approval notifications from the
+    /// shared `PendingApprovals` registry on `SecurityPolicy`. Drained
+    /// each frame; new requests surface as system messages instructing
+    /// the user to type `/allow` or `/deny`. `None` until `run_tui`
+    /// subscribes (test contexts skip this).
+    pub pending_approvals_rx:
+        Option<tokio::sync::broadcast::Receiver<crate::security::PendingRequest>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -147,6 +239,61 @@ pub fn dispatch_setup_channel_key(key: &str) -> SetupChannelAction {
 }
 
 impl TuiApp {
+    fn refresh_available_skills(&mut self) {
+        self.context.available_skills =
+            crate::skills::load_skills_with_config(&self.config.workspace_dir, &self.config);
+        self.context.available_skills_with_status =
+            crate::skills::load_skills_with_status(&self.config.workspace_dir, &self.config);
+    }
+
+    fn skill_picker_items(&self) -> Vec<crate::tui::widgets::ListPickerItem> {
+        self.context
+            .available_skills_with_status
+            .iter()
+            .map(|(s, reasons)| {
+                let primary = if s.version.is_empty() {
+                    s.name.clone()
+                } else {
+                    format!("{} · v{}", s.name, s.version)
+                };
+                let primary = if reasons.is_empty() {
+                    primary
+                } else {
+                    format!("✗ {primary}")
+                };
+                let mut secondary = s.description.clone();
+                if !reasons.is_empty() {
+                    let reason = reasons.join("; ");
+                    secondary = if secondary.is_empty() {
+                        format!("gated: {reason}")
+                    } else {
+                        format!("{secondary}  · gated: {reason}")
+                    };
+                }
+                if !s.tags.is_empty() {
+                    secondary = format!("{secondary}  ({})", s.tags.join(", "));
+                }
+                let has_missing_bin = s
+                    .requires
+                    .unmet()
+                    .iter()
+                    .any(|reason| reason.starts_with("missing binary"));
+                if has_missing_bin && !s.install_recipes.is_empty() {
+                    secondary = if secondary.is_empty() {
+                        "Ctrl+I install deps".to_string()
+                    } else {
+                        format!("{secondary}  · Ctrl+I install deps")
+                    };
+                }
+                crate::tui::widgets::ListPickerItem {
+                    key: s.name.clone(),
+                    primary,
+                    secondary,
+                }
+            })
+            .collect()
+    }
+
     /// Create a new `TuiApp`, starting or resuming a session based on config.
     ///
     /// `req_tx` and `events_rx` are the TUI-side ends of the bridge to the
@@ -198,11 +345,28 @@ impl TuiApp {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
+            skills_watcher: None,
+            config_watcher: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         })
     }
 
@@ -211,7 +375,9 @@ impl TuiApp {
     fn refresh_autocomplete(&mut self) {
         let buf = &self.context.input_buffer;
         if buf.starts_with('/') && !buf.contains(' ') && !buf.contains('\n') {
-            let suggestions = self.command_registry.autocomplete_with_descriptions(buf);
+            let suggestions = self
+                .command_registry
+                .autocomplete_with_descriptions_and_skills(buf, &self.context.available_skills);
             self.autocomplete.update(suggestions);
         } else {
             self.autocomplete.hide();
@@ -236,6 +402,10 @@ impl TuiApp {
 
     /// Dispatch a key event.
     pub async fn handle_key(&mut self, key: KeyEvent) -> Result<EventResult> {
+        // Drain any pending ClawHub search results before processing the
+        // next key — late-arriving results land in the picker before the
+        // user's next action so they always see the freshest state.
+        self.drain_clawhub_search_results();
         match key.code {
             // Ctrl+D → always quit
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -292,16 +462,105 @@ impl TuiApp {
                 return Ok(EventResult::Continue);
             }
             KeyCode::Enter if self.list_picker.is_some() => {
-                self.dispatch_list_picker_selection();
+                use super::widgets::list_picker::Focus;
+                use super::widgets::ListPickerKind;
+                let (kind, focus, query) = match self.list_picker.as_ref() {
+                    Some(p) => (p.kind, p.focus, p.query.clone()),
+                    None => return Ok(EventResult::Continue),
+                };
+                // ClawhubInstall picker has a two-mode Enter:
+                //   1. Focus::Search → fire a fresh ClawHub search.
+                //      Empty query falls back to top-by-stars listing.
+                //      Picker stays open.
+                //   2. Focus::List → install the highlighted skill. Picker
+                //      stays open afterwards so the user can search again
+                //      and install more without re-running the command.
+                if kind == ListPickerKind::ClawhubInstall {
+                    if focus == Focus::Search {
+                        self.spawn_clawhub_search(&query);
+                        // After firing, move focus to the list so the
+                        // next Enter installs (when results arrive).
+                        if let Some(p) = self.list_picker.as_mut() {
+                            p.focus = Focus::List;
+                        }
+                        return Ok(EventResult::Continue);
+                    }
+                    let slug = match self
+                        .list_picker
+                        .as_ref()
+                        .and_then(|p| p.current().map(|i| i.key.clone()))
+                    {
+                        Some(s) => s,
+                        None => return Ok(EventResult::Continue),
+                    };
+                    if self.clawhub_install_in_progress.is_some() {
+                        // Already installing — ignore the second Enter so
+                        // we don't fire two parallel installs.
+                        return Ok(EventResult::Continue);
+                    }
+                    // Spawn install in a background tokio task and return
+                    // immediately. The render loop's tick handler polls
+                    // `clawhub_install_completion_rx` each frame, advances
+                    // the spinner animation, and swaps the picker when the
+                    // install finishes.  Pre-fix code awaited install
+                    // inline, which froze the entire TUI for the whole
+                    // network round-trip — no spinner, no animation, just
+                    // instant flicker into the next picker.
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
+                    self.clawhub_install_completion_rx = Some(rx);
+                    self.clawhub_install_completion_tx = Some(tx.clone());
+                    self.clawhub_install_in_progress = Some((slug.clone(), 0));
+                    let profile = self.profile.clone();
+                    let slug_for_task = slug.clone();
+                    tokio::spawn(async move {
+                        let send =
+                            match crate::skills::clawhub::install_one(&profile, &slug_for_task)
+                                .await
+                            {
+                                Ok(()) => Ok(slug_for_task),
+                                Err(e) => Err(format!("{e:#}")),
+                            };
+                        let _ = tx.send(send);
+                    });
+                    return Ok(EventResult::Continue);
+                }
+                self.dispatch_list_picker_selection().await;
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Char('i')
+                if self.list_picker.as_ref().is_some_and(|p| {
+                    p.kind == crate::tui::widgets::ListPickerKind::Skill
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                }) =>
+            {
+                self.spawn_skill_deps_install();
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Tab
+                if self
+                    .list_picker
+                    .as_ref()
+                    .is_some_and(|p| p.kind == crate::tui::widgets::ListPickerKind::Skill) =>
+            {
+                self.spawn_skill_deps_install();
                 return Ok(EventResult::Continue);
             }
             KeyCode::Esc if self.list_picker.is_some() => {
                 self.list_picker = None;
+                self.close_clawhub_install_picker_state();
+                self.close_skill_deps_install_state();
                 return Ok(EventResult::Continue);
             }
             KeyCode::Backspace if self.list_picker.is_some() => {
                 if let Some(p) = self.list_picker.as_mut() {
                     p.pop_query_char();
+                    // Mark a search as pending for the ClawHub picker so
+                    // the "↵ Enter to search ClawHub" hint shows up next
+                    // to the typed query — pre-fix users typed and saw
+                    // nothing happen, since search only fires on Enter.
+                    if p.kind == crate::tui::widgets::ListPickerKind::ClawhubInstall {
+                        p.search_pending = !p.query.is_empty();
+                    }
                 }
                 return Ok(EventResult::Continue);
             }
@@ -312,11 +571,49 @@ impl TuiApp {
             {
                 if let Some(p) = self.list_picker.as_mut() {
                     p.push_query_char(c);
+                    if p.kind == crate::tui::widgets::ListPickerKind::ClawhubInstall {
+                        p.search_pending = true;
+                    }
                 }
                 return Ok(EventResult::Continue);
             }
             _ if self.list_picker.is_some() => {
                 // Picker open — swallow everything else.
+                return Ok(EventResult::Continue);
+            }
+            // Info panel active — read-only modal, so the keymap is just
+            // scroll + close. Mirrors the list_picker pattern so the user
+            // doesn't have to learn two modal-key dialects.
+            KeyCode::Up if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.scroll_up();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Down if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.scroll_down();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::PageUp if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.page_up();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::PageDown if self.info_panel.is_some() => {
+                if let Some(p) = self.info_panel.as_mut() {
+                    p.page_down();
+                }
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Esc if self.info_panel.is_some() => {
+                self.info_panel = None;
+                return Ok(EventResult::Continue);
+            }
+            _ if self.info_panel.is_some() => {
+                // Info panel open — swallow everything else (read-only).
                 return Ok(EventResult::Continue);
             }
             // Tab — completes the highlighted command from the dropdown.
@@ -339,6 +636,48 @@ impl TuiApp {
             // (which owns the Terminal); we just raise a flag here.
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.editor_request = true;
+            }
+            // Ctrl+B — back. While the first-run wizard is open, walk the
+            // phase history one step back. If a provisioner is currently
+            // running, first send Cancelled so the task exits cleanly and
+            // tear down the overlay state, then walk history (which skips
+            // RunningProvisioner entries because the task already wrote to
+            // config — rewinding mid-task isn't safe). Tester ask:
+            // "setup should can have back mechanism" (bugs-123).
+            KeyCode::Char('b')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.first_run_wizard.is_some() =>
+            {
+                let was_running_provisioner = self
+                    .first_run_wizard
+                    .as_ref()
+                    .is_some_and(|w| w.is_provisioner_running());
+                if was_running_provisioner {
+                    let was_finished = self
+                        .setup_overlay
+                        .as_ref()
+                        .map(|o| o.finished)
+                        .unwrap_or(false);
+                    if !was_finished {
+                        if let Some(tx) = self.setup_response_tx.take() {
+                            let _ = tx
+                                .send(crate::onboard::provision::ProvisionResponse::Cancelled)
+                                .await;
+                        }
+                    }
+                    self.setup_overlay = None;
+                    self.setup_event_rx = None;
+                    self.setup_response_tx = None;
+                }
+                if let Some(w) = self.first_run_wizard.as_mut() {
+                    if w.back() {
+                        // History pop succeeded — clear any stale picker
+                        // state so the destination phase re-initializes
+                        // cleanly on next render.
+                        w.picker = None;
+                        w.picker_names.clear();
+                    }
+                }
             }
             // Plain Enter — Hermes / Claude Code convention:
             //   * If the autocomplete dropdown is visible and the highlighted
@@ -398,7 +737,9 @@ impl TuiApp {
                 }
             }
             // Backspace
-            KeyCode::Backspace if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
+            KeyCode::Backspace
+                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() =>
+            {
                 self.context.input_buffer.pop();
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
@@ -493,7 +834,7 @@ impl TuiApp {
                     let overlay = self.setup_overlay.as_mut().unwrap();
                     overlay
                         .submit_prompt()
-                        .unwrap_or_else(|| ("".into(), "".into()))
+                        .unwrap_or_else(|| (String::new(), String::new()))
                 };
                 if let Some(tx) = &self.setup_response_tx {
                     let _ = tx
@@ -574,21 +915,30 @@ impl TuiApp {
             // navigation/toggle keys to the wizard's own multi-select
             // state. Enter is handled by the wizard Enter arm below.
             KeyCode::Up
-                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+                if self
+                    .first_run_wizard
+                    .as_ref()
+                    .is_some_and(|w| w.is_picker_active()) =>
             {
                 if let Some(w) = self.first_run_wizard.as_mut() {
                     w.picker_move_up();
                 }
             }
             KeyCode::Down
-                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+                if self
+                    .first_run_wizard
+                    .as_ref()
+                    .is_some_and(|w| w.is_picker_active()) =>
             {
                 if let Some(w) = self.first_run_wizard.as_mut() {
                     w.picker_move_down();
                 }
             }
             KeyCode::Char(' ')
-                if self.first_run_wizard.as_ref().is_some_and(|w| w.is_picker_active()) =>
+                if self
+                    .first_run_wizard
+                    .as_ref()
+                    .is_some_and(|w| w.is_picker_active()) =>
             {
                 if let Some(w) = self.first_run_wizard.as_mut() {
                     w.picker_toggle();
@@ -681,24 +1031,45 @@ impl TuiApp {
                     o.scroll_down();
                 }
             }
+            // PageUp/PageDown/Home/End — when the choose picker is active,
+            // route to picker navigation (jump cursor a page at a time);
+            // otherwise scroll the log panel. Lets the user fly through
+            // long lists like ClawHub's 20-skill picker without one ↓ at
+            // a time. Tester ask: "no good pagination, user can't scroll".
             KeyCode::PageUp if self.setup_overlay.is_some() => {
                 if let Some(o) = self.setup_overlay.as_mut() {
-                    o.scroll_page_up();
+                    if o.active_choose().is_some() {
+                        o.choose_page_up();
+                    } else {
+                        o.scroll_page_up();
+                    }
                 }
             }
             KeyCode::PageDown if self.setup_overlay.is_some() => {
                 if let Some(o) = self.setup_overlay.as_mut() {
-                    o.scroll_page_down();
+                    if o.active_choose().is_some() {
+                        o.choose_page_down();
+                    } else {
+                        o.scroll_page_down();
+                    }
                 }
             }
             KeyCode::Home if self.setup_overlay.is_some() => {
                 if let Some(o) = self.setup_overlay.as_mut() {
-                    o.scroll_home();
+                    if o.active_choose().is_some() {
+                        o.choose_home();
+                    } else {
+                        o.scroll_home();
+                    }
                 }
             }
             KeyCode::End if self.setup_overlay.is_some() => {
                 if let Some(o) = self.setup_overlay.as_mut() {
-                    o.scroll_end();
+                    if o.active_choose().is_some() {
+                        o.choose_end();
+                    } else {
+                        o.scroll_end();
+                    }
                 }
             }
             // Catch-all for any other key while overlay is open — swallow.
@@ -766,6 +1137,7 @@ impl TuiApp {
                     partial: String::new(),
                     tool_blocks: Vec::new(),
                     cancelling: false,
+                    turn_started_at: std::time::Instant::now(),
                 };
                 self.stream_committed_chars = 0;
                 self.stream_header_committed = false;
@@ -791,13 +1163,78 @@ impl TuiApp {
         while let Ok(ev) = self.context.events_rx.try_recv() {
             self.handle_agent_event(ev);
         }
-        if let Some(rx) = &mut self.setup_event_rx {
-            while let Ok(ev) = rx.try_recv() {
-                if let Some(overlay) = &mut self.setup_overlay {
-                    overlay.handle_event(ev);
+
+        // Pending-approval requests from the shell tool. Each new
+        // request surfaces as a system message with the exact slash
+        // commands the user can type to resolve it.
+        if let Some(rx) = self.pending_approvals_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(req) => {
+                        let line = format!(
+                            "🔒 Approval needed: `{0}` (full command: `{1}`).\n   Type one of: `/allow {0}` · `/allow {0} --persist` · `/deny {0}` (auto-deny in 5 min)",
+                            req.basename, req.full_command
+                        );
+                        let _ = self.context.append_system_message(&line);
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                        // Missed some; user can /allowlist to see what's still pending.
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        self.pending_approvals_rx = None;
+                        break;
+                    }
                 }
             }
         }
+        if let Some(rx) = &mut self.setup_event_rx {
+            // Two-phase drain: first sweep events into a buffer so we can
+            // intercept OpenSkillInstallPicker (which the overlay shouldn't
+            // see — it hands off to the install picker, not the choose
+            // render). Other events forward to setup_overlay as before.
+            let mut buffered = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                buffered.push(ev);
+            }
+            for ev in buffered {
+                match ev {
+                    crate::onboard::provision::ProvisionEvent::OpenSkillInstallPicker {
+                        ..
+                    } => {
+                        // Hand off to the live install picker. We track that
+                        // we're in "wizard install" mode so the picker's
+                        // close path knows to send InstalledSkills back to
+                        // the wizard's response channel.
+                        self.wizard_install_in_progress = true;
+                        self.wizard_installed_slugs.clear();
+                        // Fire-and-forget: open_clawhub_install_picker is
+                        // async, but we're inside drain_events (sync). Use
+                        // a tiny future-now: spawn the prep that doesn't
+                        // need awaiting (state init), defer the network
+                        // fetch to drain_clawhub_search_results.
+                        self.open_clawhub_install_picker_sync(None);
+                    }
+                    other => {
+                        if let Some(overlay) = &mut self.setup_overlay {
+                            overlay.handle_event(other);
+                        }
+                    }
+                }
+            }
+        }
+        self.drain_skill_reload_events();
+        self.drain_config_reload_events();
+        // ClawHub install picker — async search results stream in via a
+        // background task. Drain on each render tick so newly-arrived
+        // results land between user actions, not just after the next key.
+        self.drain_clawhub_search_results();
+        // Same idea for install completion + spinner animation: advance
+        // the spinner frame and check whether the spawned install task
+        // has produced a result.
+        self.tick_clawhub_install();
+        self.tick_skill_deps_install();
         // Wizard auto-advance: when the current provisioner finishes
         // SUCCESSFULLY, close the overlay and open the next provisioner
         // (or advance to Complete if this was the last one). On
@@ -874,6 +1311,51 @@ impl TuiApp {
         // loaded — without this, the next config.save() bails with
         // "Config path must have a parent directory".
         config.config_path = path.clone();
+        // Decrypt secrets before pushing to the agent. Without this the
+        // agent receives encrypted blobs in `config.api_key` and friends
+        // and every API call returns 401 "Missing Authentication header"
+        // because the request builder rejects the malformed header. This
+        // mirrors the decrypt pass that `Config::load_or_init` runs at
+        // startup; without it, `/setup provider` saves a fresh key and
+        // the running TUI immediately fails to use it.
+        let rantaiclaw_dir = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let store = crate::security::SecretStore::new(&rantaiclaw_dir, config.secrets.encrypt);
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.api_key,
+            "config.api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.composio.api_key,
+            "config.composio.api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.browser.computer_use.api_key,
+            "config.browser.computer_use.api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.web_search.brave_api_key,
+            "config.web_search.brave_api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.storage.provider.config.db_url,
+            "config.storage.provider.config.db_url",
+        )?;
+        for agent in config.agents.values_mut() {
+            crate::config::schema::decrypt_optional_secret(
+                &store,
+                &mut agent.api_key,
+                "config.agents.*.api_key",
+            )?;
+        }
+        config.apply_env_overrides();
         // Refresh the status-bar model label so the running TUI shows
         // the freshly-saved provider/model. Without this, a wizard run
         // that switches provider (e.g. openrouter → minimax) would
@@ -905,6 +1387,36 @@ impl TuiApp {
             }
         }
         self.context.available_providers = available_providers;
+        // Refresh the channels snapshot so /channels and /platforms reflect
+        // any wizard-driven add/remove since launch.
+        let prev_channels_count = count_configured_channels(&self.config);
+        self.context.channels_summary = channel_status_summary(&config)
+            .into_iter()
+            .map(|(name, configured)| (name.to_string(), configured))
+            .collect();
+        let new_channels_count = count_configured_channels(&config);
+        self.context.channels_autostart_count = new_channels_count;
+        // v0.6.7: surface the restart-needed cue when channels were added
+        // or removed mid-session. Auto-restart is a v0.6.8 deliverable —
+        // the existing `start_channels` task can't be cleanly cancelled
+        // mid-flight without leaking the supervised listener tasks. Tell
+        // the user to restart for now.
+        if new_channels_count != prev_channels_count {
+            let msg = if new_channels_count > prev_channels_count {
+                format!(
+                    "⚠ {} new channel(s) configured. Restart `rantaiclaw` to start polling them. \
+                     `/channels` shows the current state.",
+                    new_channels_count - prev_channels_count
+                )
+            } else {
+                format!(
+                    "⚠ {} channel(s) removed. Restart `rantaiclaw` for the listener(s) to stop.",
+                    prev_channels_count - new_channels_count
+                )
+            };
+            let _ = self.context.append_system_message(&msg);
+            self.scrollback_queue.push(("system".to_string(), msg));
+        }
         self.config = config.clone();
         // Push the new config to the agent actor so the next turn uses
         // the freshly-saved provider/api_key/model. Without this the
@@ -934,6 +1446,7 @@ impl TuiApp {
                         name,
                         args,
                         result: None,
+                        started_at: std::time::Instant::now(),
                     });
                 }
             }
@@ -942,10 +1455,55 @@ impl TuiApp {
                 ok,
                 output_preview,
             } => {
-                if let AppState::Streaming { tool_blocks, .. } = &mut self.state {
+                // Pull the matching block, finalize its result, and
+                // capture the fields we need for the scrollback line
+                // before letting the borrow drop.
+                let summary = if let AppState::Streaming { tool_blocks, .. } = &mut self.state {
                     if let Some(b) = tool_blocks.iter_mut().find(|b| b.id == id) {
-                        b.result = Some((ok, output_preview));
+                        b.result = Some((ok, output_preview.clone()));
+                        let elapsed = b.started_at.elapsed();
+                        Some((b.name.clone(), b.args.clone(), elapsed))
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+
+                // Inline-flush a 1-line summary to scrollback so the
+                // user sees what the agent did *as it happens*. Format:
+                //   ▸ shell(command="ls -la") → ok (12ms)
+                //   ✗ shell(command="brew --version") → error (3s)
+                if let Some((name, args, elapsed)) = summary {
+                    let marker = if ok { "▸" } else { "✗" };
+                    let args_compact = compact_args_for_log(&args);
+                    let elapsed_label = if elapsed.as_secs() == 0 {
+                        format!("{}ms", elapsed.as_millis())
+                    } else {
+                        format!("{}s", elapsed.as_secs())
+                    };
+                    let status = if ok {
+                        let preview = output_preview.lines().next().unwrap_or("").trim();
+                        if preview.is_empty() {
+                            "ok".to_string()
+                        } else if preview.len() > 60 {
+                            format!("{}…", &preview[..60])
+                        } else {
+                            preview.to_string()
+                        }
+                    } else {
+                        let preview = output_preview.lines().next().unwrap_or("").trim();
+                        if preview.is_empty() {
+                            "error".to_string()
+                        } else if preview.len() > 60 {
+                            format!("error: {}…", &preview[..60])
+                        } else {
+                            format!("error: {preview}")
+                        }
+                    };
+                    let line =
+                        format!("{marker} {name}({args_compact}) → {status} ({elapsed_label})");
+                    self.scrollback_queue.push(("_tool_log".to_string(), line));
                 }
             }
             AgentEvent::Usage(u) => {
@@ -964,6 +1522,17 @@ impl TuiApp {
             }
             AgentEvent::Error(msg) => {
                 self.finalize_error(msg);
+            }
+            AgentEvent::ReloadComplete {
+                mcp_servers_configured,
+                mcp_tools_by_server,
+            } => {
+                // Refresh the TUI's cached MCP snapshot so `/mcp`
+                // reflects the post-reload state. The agent already
+                // has the new tools and can use them on the next
+                // turn — this just keeps the UI's view in sync.
+                self.context.mcp_servers_configured = mcp_servers_configured.into_iter().collect();
+                self.context.mcp_tools_by_server = mcp_tools_by_server;
             }
         }
     }
@@ -996,6 +1565,25 @@ impl TuiApp {
             body.push_str("[cancelled]");
         }
 
+        // Provider returned no text after the tool loop — most often a
+        // model that emits tool calls then stops without a final natural-
+        // language summary (seen with MiniMax + multi-tool flows like
+        // "help me setup gog skill"). Without this fallback the TUI
+        // committed an empty Assistant: line, leaving the user staring
+        // at a blank reply with no signal that the turn actually ended.
+        // Salvage anything we streamed during the turn; otherwise show
+        // an explicit "[no response]" so the user knows to retry.
+        if !cancelled && body.is_empty() {
+            if let AppState::Streaming { partial, .. } = &self.state {
+                if !partial.is_empty() {
+                    body = partial.clone();
+                }
+            }
+            if body.is_empty() {
+                body = "[no response from model — try /retry or rephrase]".to_string();
+            }
+        }
+
         // Snapshot tool blocks from streaming state before we transition
         // away — they're discarded otherwise.
         let tool_calls_json = if let AppState::Streaming { tool_blocks, .. } = &self.state {
@@ -1003,6 +1591,16 @@ impl TuiApp {
         } else {
             None
         };
+        // Preserve a cloned list of the turn's tool calls so `/calls`
+        // can render them after the turn ends. Replaces (not appends
+        // to) the previous turn's list — `/calls` is "what did the
+        // last turn do?", not a cross-turn history.
+        if let AppState::Streaming { tool_blocks, .. } = &self.state {
+            self.context.last_turn_tool_calls = tool_blocks
+                .iter()
+                .map(super::render::PersistedToolCall::from)
+                .collect();
+        }
 
         // Persist and display the assistant reply. A store failure should not
         // crash the loop — surface it as a visible error and keep running.
@@ -1019,12 +1617,12 @@ impl TuiApp {
         if self.stream_header_committed {
             let committed = self.stream_committed_chars.min(body.len());
             let tail = body[committed..].to_string();
-            if !tail.is_empty() {
-                self.scrollback_queue
-                    .push(("_continuation".to_string(), tail));
-            } else {
+            if tail.is_empty() {
                 self.scrollback_queue
                     .push(("_continuation".to_string(), String::new()));
+            } else {
+                self.scrollback_queue
+                    .push(("_continuation".to_string(), tail));
             }
         } else {
             self.scrollback_queue
@@ -1037,6 +1635,7 @@ impl TuiApp {
                 partial: String::new(),
                 tool_blocks: Vec::new(),
                 cancelling: false,
+                turn_started_at: std::time::Instant::now(),
             };
             self.stream_committed_chars = 0;
             self.stream_header_committed = false;
@@ -1117,6 +1716,9 @@ impl TuiApp {
             CmdResult::OpenListPicker(picker) => {
                 self.list_picker = Some(picker);
             }
+            CmdResult::OpenInfoPanel(panel) => {
+                self.info_panel = Some(panel);
+            }
             CmdResult::OpenSetupOverlay { provisioner } => {
                 if let Some(name) = provisioner {
                     if let Err(e) = self.open_setup_overlay(name) {
@@ -1129,6 +1731,9 @@ impl TuiApp {
             CmdResult::OpenFirstRunWizard => {
                 self.first_run_wizard = Some(super::FirstRunWizard::new(self.profile.clone()));
             }
+            CmdResult::OpenClawhubInstallPicker { initial_query } => {
+                self.open_clawhub_install_picker(initial_query).await;
+            }
             CmdResult::ClearTerminal(announce) => {
                 // The actual screen+scrollback wipe runs in `run_loop`
                 // (which owns the Terminal). We just raise the flag and
@@ -1140,6 +1745,11 @@ impl TuiApp {
                 let _ = self.context.append_system_message(&announce);
                 self.scrollback_queue.push(("system".to_string(), announce));
             }
+            CmdResult::SetInput(text) => {
+                // Replace input buffer; cursor will land at end on next
+                // render. Used by `/<skill-name>` direct-invoke shortcut.
+                self.context.input_buffer = text;
+            }
         }
         Ok(())
     }
@@ -1148,7 +1758,7 @@ impl TuiApp {
     /// on `ListPickerKind` so each picker type runs its own side effect
     /// (switch model, resume session, set personality…). Always closes
     /// the picker afterward.
-    fn dispatch_list_picker_selection(&mut self) {
+    async fn dispatch_list_picker_selection(&mut self) {
         use super::widgets::ListPickerKind;
 
         let (kind, key) = match self
@@ -1159,10 +1769,13 @@ impl TuiApp {
             Some(v) => v,
             None => {
                 self.list_picker = None;
+                self.close_clawhub_install_picker_state();
                 return;
             }
         };
         self.list_picker = None;
+        self.close_clawhub_install_picker_state();
+        self.close_skill_deps_install_state();
 
         match kind {
             ListPickerKind::Model => {
@@ -1199,6 +1812,14 @@ impl TuiApp {
                 );
                 let _ = self.context.append_system_message(&msg);
                 self.scrollback_queue.push(("system".to_string(), msg));
+                // Replay the loaded messages into the scrollback so the
+                // user can actually see the history. Without this, the
+                // resume just shows "Resumed session ... (N messages)"
+                // and an empty chat — the v0.6.1-alpha bug.
+                for m in &self.context.messages {
+                    self.scrollback_queue
+                        .push((m.role.clone(), m.content.clone()));
+                }
             }
             ListPickerKind::Personality => {
                 let msg = format!(
@@ -1261,7 +1882,505 @@ impl TuiApp {
                     self.scrollback_queue.push(("system".into(), msg));
                 }
             },
+            ListPickerKind::ClawhubInstall => {
+                // ClawhubInstall Enter is handled inline in handle_key
+                // (split between Focus::Search → search and Focus::List
+                // → install) so it never reaches dispatch. This arm is
+                // unreachable; left as a defensive no-op.
+            }
         }
+    }
+
+    /// Open the ClawHub install picker. Empty query → top-by-stars listing.
+    /// Search fires only on Enter while focused on the search bar (per
+    /// tester request — keystroke-fire churned the network too aggressively).
+    async fn open_clawhub_install_picker(&mut self, initial_query: Option<String>) {
+        self.open_clawhub_install_picker_sync(initial_query);
+    }
+
+    /// Sync variant — same as `open_clawhub_install_picker` but callable
+    /// from inside synchronous contexts like `drain_events`. Spawns the
+    /// initial fetch via `tokio::spawn` so we never block the render loop.
+    fn open_clawhub_install_picker_sync(&mut self, initial_query: Option<String>) {
+        use super::widgets::{ListPicker, ListPickerKind};
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.clawhub_install_results_rx = Some(rx);
+        self.clawhub_install_results_tx = Some(tx);
+        self.clawhub_install_last_query = String::new();
+        // Note: don't reset `search_version` — keep monotonic so any
+        // straggling task from a prior picker session can't resurrect
+        // its results into this one.
+
+        let mut picker = ListPicker::new(
+            ListPickerKind::ClawhubInstall,
+            "Install Skill",
+            Vec::new(),
+            None,
+            "Loading top ClawHub skills…",
+        );
+        if let Some(q) = initial_query.as_deref() {
+            picker.query = q.to_string();
+        }
+        let starting_query = picker.query.clone();
+        self.list_picker = Some(picker);
+        self.spawn_clawhub_search(&starting_query);
+    }
+
+    /// Spawn an async ClawHub fetch for the given query. Empty string
+    /// means "give me the top-by-stars listing". Each spawn bumps the
+    /// search version so older inflight tasks' results are dropped on
+    /// arrival (avoids races when the user types quickly).
+    fn spawn_clawhub_search(&mut self, query: &str) {
+        let Some(tx) = self.clawhub_install_results_tx.clone() else {
+            return;
+        };
+        // Clear the "↵ Enter to search ClawHub" hint — a search is
+        // about to fire, so the typed query is no longer pending.
+        if let Some(p) = self.list_picker.as_mut() {
+            p.search_pending = false;
+        }
+        self.clawhub_install_search_version = self.clawhub_install_search_version.wrapping_add(1);
+        let version = self.clawhub_install_search_version;
+        let q = query.to_string();
+        tokio::spawn(async move {
+            let result = if q.trim().is_empty() {
+                crate::skills::clawhub::list_top(50).await
+            } else {
+                crate::skills::clawhub::search(&q).await
+            };
+            let _ = tx.send((version, result));
+        });
+    }
+
+    fn spawn_skill_deps_install(&mut self) {
+        if self.skill_deps_install_in_progress.is_some() {
+            return;
+        }
+        let Some(skill_name) = self
+            .list_picker
+            .as_ref()
+            .and_then(|p| p.current().map(|item| item.key.clone()))
+        else {
+            return;
+        };
+        let Some(skill) = self
+            .context
+            .available_skills_with_status
+            .iter()
+            .map(|(skill, _)| skill)
+            .chain(self.context.available_skills.iter())
+            .find(|s| s.name.eq_ignore_ascii_case(&skill_name))
+            .cloned()
+        else {
+            if let Some(p) = self.list_picker.as_mut() {
+                p.title = format!("Skills · {skill_name} not found");
+            }
+            return;
+        };
+
+        if skill.install_recipes.is_empty() {
+            if let Some(p) = self.list_picker.as_mut() {
+                p.title = format!("Skills · no install-deps recipe for {}", skill.name);
+            }
+            return;
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+            Result<crate::skills::install_deps::InstallDepsOutcome, String>,
+        >();
+        self.skill_deps_install_completion_rx = Some(rx);
+        self.skill_deps_install_completion_tx = Some(tx.clone());
+        self.skill_deps_install_in_progress = Some((skill.name.clone(), 0));
+
+        let prefs =
+            crate::skills::install_deps::SelectorPrefs::from_config(&self.config.skills.install);
+        tokio::task::spawn_blocking(move || {
+            let result = crate::skills::install_deps::install_deps_for_with_prefs(&skill, &prefs)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Drain debounced reload ticks from the `config.toml` file
+    /// watcher. Direct user edits to the active profile's config
+    /// (adding `[mcp_servers.foo]`, swapping provider, etc.) trigger
+    /// the same `reload_config` pipeline the wizard close uses. A
+    /// system-message line goes to scrollback so the user knows the
+    /// reload happened.
+    fn drain_config_reload_events(&mut self) {
+        let mut should_reload = false;
+        if let Some(watcher) = self.config_watcher.as_mut() {
+            while watcher.reload_rx.try_recv().is_ok() {
+                should_reload = true;
+            }
+        }
+        if !should_reload {
+            return;
+        }
+        match self.reload_config() {
+            Ok(()) => {
+                let msg =
+                    "⟳ config.toml changed — agent reloaded; next turn uses the new settings.";
+                let _ = self.context.append_system_message(msg);
+                self.scrollback_queue
+                    .push(("system".to_string(), msg.to_string()));
+            }
+            Err(e) => {
+                let msg = format!("⚠ config.toml changed but reload failed: {e}");
+                let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".to_string(), msg));
+            }
+        }
+    }
+
+    fn drain_skill_reload_events(&mut self) {
+        let mut should_reload = false;
+        if let Some(watcher) = self.skills_watcher.as_mut() {
+            while watcher.reload_rx.try_recv().is_ok() {
+                should_reload = true;
+            }
+        }
+        if !should_reload {
+            return;
+        }
+
+        // Compare skills before/after refresh so we only push a full
+        // `TurnRequest::Reload` to the agent when the *set of skills*
+        // actually changed. notify can fire on innocuous fs noise
+        // (editor temp files, mtime touches) — rebuilding the agent on
+        // every tick would respawn MCP servers and rerun discovery for
+        // nothing.
+        let prev_keys: std::collections::HashSet<String> = self
+            .context
+            .available_skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        self.refresh_available_skills();
+        let new_keys: std::collections::HashSet<String> = self
+            .context
+            .available_skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        if prev_keys != new_keys {
+            // Push a full reload to the agent actor so the next turn's
+            // system prompt reflects the new skill list. Uses the
+            // existing `TurnRequest::Reload` path (same as wizard
+            // close) — costs ~one Agent rebuild including MCP
+            // re-discovery, but only on real skill add/remove.
+            let config = self.config.clone();
+            let req_tx = self.context.req_tx.clone();
+            tokio::spawn(async move {
+                let _ = req_tx
+                    .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                    .await;
+            });
+            tracing::info!(
+                target: "tui",
+                added = ?new_keys.difference(&prev_keys).collect::<Vec<_>>(),
+                removed = ?prev_keys.difference(&new_keys).collect::<Vec<_>>(),
+                "skills changed on disk — dispatching agent reload"
+            );
+        }
+
+        let items = self.skill_picker_items();
+        let suppress_title = self.skill_deps_install_in_progress.is_some()
+            || self
+                .skill_deps_install_finished_at
+                .is_some_and(|finished| finished.elapsed() < Duration::from_secs(3));
+        if let Some(picker) = self.list_picker.as_mut() {
+            if picker.kind == crate::tui::widgets::ListPickerKind::Skill {
+                // Bail when nothing actually changed. The notify watcher
+                // can fire on innocuous fs noise (editor saves in a
+                // sibling tree, mtime touches, etc.) and rebuilding the
+                // picker would reset cursor + page back to the top —
+                // making it look like the picker auto-scrolls home every
+                // second when the user is paging through their skills.
+                let unchanged = picker.entries().len() == items.len()
+                    && picker
+                        .entries()
+                        .iter()
+                        .zip(items.iter())
+                        .all(|(entry, new)| {
+                            entry.as_item().is_some_and(|cur| {
+                                cur.key == new.key
+                                    && cur.primary == new.primary
+                                    && cur.secondary == new.secondary
+                            })
+                        });
+                if unchanged {
+                    return;
+                }
+                // Items did change — preserve the cursor on the same
+                // skill (by key) so the user doesn't lose their place
+                // mid-scroll when the watcher fires.
+                let preserved_key = picker.current().map(|i| i.key.clone());
+                picker.set_items(items);
+                if let Some(key) = preserved_key {
+                    if let Some(abs_idx) = picker
+                        .entries()
+                        .iter()
+                        .position(|e| e.as_item().is_some_and(|i| i.key == key))
+                    {
+                        let page_size = crate::tui::widgets::list_picker::PAGE_SIZE;
+                        picker.page = abs_idx / page_size;
+                        picker.selected = abs_idx % page_size;
+                        picker.list_state.select(Some(picker.selected));
+                    }
+                }
+                if !suppress_title {
+                    picker.title = "Skills · reloaded".to_string();
+                }
+            }
+        }
+    }
+
+    /// Drain any pending ClawHub search results and apply the latest one
+    /// matching the current search version. Called on each event loop
+    /// tick (after a key is processed) so results land before the next
+    /// render. Stale results (older versions) are silently discarded.
+    fn drain_clawhub_search_results(&mut self) {
+        use super::widgets::{ListPickerItem, ListPickerKind};
+
+        let current_version = self.clawhub_install_search_version;
+        let Some(rx) = self.clawhub_install_results_rx.as_mut() else {
+            return;
+        };
+
+        let mut latest: Option<anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>> = None;
+        while let Ok((version, result)) = rx.try_recv() {
+            if version == current_version {
+                latest = Some(result);
+            }
+        }
+
+        let Some(result) = latest else {
+            return;
+        };
+
+        let Some(picker) = self.list_picker.as_mut() else {
+            return;
+        };
+        if picker.kind != ListPickerKind::ClawhubInstall {
+            return;
+        }
+
+        match result {
+            Ok(skills) => {
+                let items: Vec<ListPickerItem> = skills
+                    .into_iter()
+                    .map(|s| {
+                        let name = if s.display_name.is_empty() {
+                            s.slug.clone()
+                        } else {
+                            s.display_name.clone()
+                        };
+                        // Listings include star counts; search results
+                        // don't (server returns score, not stats), so
+                        // omit the (★N) suffix when stars is zero to
+                        // avoid showing a misleading "0 stars" for every
+                        // search hit.
+                        let primary = if s.stats.stars > 0 {
+                            format!("{name}  (★{})", s.stats.stars)
+                        } else {
+                            name
+                        };
+                        let secondary = if s.summary.is_empty() {
+                            String::new()
+                        } else {
+                            let cleaned = s.summary.replace('\n', " ");
+                            let cleaned = cleaned.trim();
+                            if cleaned.chars().count() > 90 {
+                                let head: String = cleaned.chars().take(87).collect();
+                                format!("{head}…")
+                            } else {
+                                cleaned.to_string()
+                            }
+                        };
+                        ListPickerItem {
+                            key: s.slug,
+                            primary,
+                            secondary,
+                        }
+                    })
+                    .collect();
+                picker.set_items(items);
+            }
+            Err(e) => {
+                tracing::warn!("ClawHub search failed: {e}");
+            }
+        }
+    }
+
+    /// Per-frame poll for ClawHub install progress: advances the spinner
+    /// animation (visible as the picker title) and reacts to completion
+    /// when the spawned install task posts its result. Called from
+    /// `drain_events`, which itself runs at the start of each render
+    /// frame, so the spinner advances every poll tick (~100 ms idle,
+    /// ~16 ms while streaming).
+    fn tick_clawhub_install(&mut self) {
+        // Braille-dot spinner. Same set used by `cargo`, so it's visually
+        // familiar and renders cleanly in any monospace font.
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+        let Some((slug, frame)) = self.clawhub_install_in_progress.as_mut() else {
+            return;
+        };
+
+        // Drain completion channel — only the most recent result matters
+        // (only one install can be in flight at a time, but be defensive).
+        let mut completion: Option<Result<String, String>> = None;
+        if let Some(rx) = self.clawhub_install_completion_rx.as_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                completion = Some(msg);
+            }
+        }
+
+        match completion {
+            None => {
+                // Still installing — animate the spinner.
+                *frame = (*frame + 1) % SPINNER.len();
+                let glyph = SPINNER[*frame];
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.title = format!("{glyph}  Installing {slug}…");
+                }
+            }
+            Some(Ok(installed_slug)) => {
+                // Reload skills so the new one is visible to /skills and
+                // to the next agent turn.
+                self.refresh_available_skills();
+                if self.wizard_install_in_progress {
+                    self.wizard_installed_slugs.push(installed_slug.clone());
+                }
+
+                // Swap the ClawhubInstall picker for the standard Skill
+                // picker, preselecting the freshly-installed slug — this
+                // is the "throw us to /skills" UX the tester asked for.
+                self.close_clawhub_install_picker_state();
+                self.clawhub_install_in_progress = None;
+                self.clawhub_install_completion_rx = None;
+                self.clawhub_install_completion_tx = None;
+                let items = self.skill_picker_items();
+                self.list_picker = Some(crate::tui::widgets::ListPicker::new(
+                    crate::tui::widgets::ListPickerKind::Skill,
+                    format!("Skills · ✓ Installed {installed_slug}"),
+                    items,
+                    Some(&installed_slug),
+                    "No skills loaded.",
+                ));
+            }
+            Some(Err(error_msg)) => {
+                // Surface failure in the picker title; keep the overlay
+                // open so the user can pick a different slug or retry.
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.title = format!("✗ Install failed: {error_msg}");
+                }
+                self.clawhub_install_in_progress = None;
+                self.clawhub_install_completion_rx = None;
+                self.clawhub_install_completion_tx = None;
+            }
+        }
+    }
+
+    fn tick_skill_deps_install(&mut self) {
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+        let Some((skill, frame)) = self.skill_deps_install_in_progress.as_mut() else {
+            return;
+        };
+
+        let mut completion = None;
+        if let Some(rx) = self.skill_deps_install_completion_rx.as_mut() {
+            while let Ok(msg) = rx.try_recv() {
+                completion = Some(msg);
+            }
+        }
+
+        match completion {
+            None => {
+                *frame = (*frame + 1) % SPINNER.len();
+                let glyph = SPINNER[*frame];
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.title = format!("{glyph}  Installing deps for {skill}…");
+                }
+            }
+            Some(Ok(outcome)) => {
+                self.skill_deps_install_finished_at = Some(Instant::now());
+                self.refresh_available_skills();
+                let items = self.skill_picker_items();
+                if let Some(p) = self.list_picker.as_mut() {
+                    if p.kind == crate::tui::widgets::ListPickerKind::Skill {
+                        p.set_items(items);
+                    }
+                    if outcome.bins_still_missing.is_empty() {
+                        if outcome.bins_installed.is_empty() {
+                            p.title =
+                                format!("Skills · deps already satisfied for {}", outcome.skill);
+                        } else {
+                            p.title = format!(
+                                "Skills · ✓ installed {}",
+                                outcome.bins_installed.join(", ")
+                            );
+                        }
+                    } else {
+                        p.title = format!(
+                            "Skills · still missing {}",
+                            outcome.bins_still_missing.join(", ")
+                        );
+                    }
+                }
+                self.close_skill_deps_install_state();
+            }
+            Some(Err(error_msg)) => {
+                self.skill_deps_install_finished_at = Some(Instant::now());
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.title = format!("Skills · install-deps failed: {error_msg}");
+                }
+                self.close_skill_deps_install_state();
+            }
+        }
+    }
+
+    /// Tear down ClawHub install picker async state. Called when the
+    /// picker closes (Enter/Esc) so any inflight task's result can't
+    /// resurrect a closed picker.
+    fn close_clawhub_install_picker_state(&mut self) {
+        self.clawhub_install_results_rx = None;
+        self.clawhub_install_results_tx = None;
+        self.clawhub_install_last_query = String::new();
+        // Don't reset version — keep it monotonic so any straggling
+        // task's send to a since-dropped tx is a no-op AND if the user
+        // reopens the picker mid-flight, fresh searches don't collide
+        // with old version numbers.
+
+        // If this picker was opened from inside the first-run wizard's
+        // skills step, the wizard is awaiting an InstalledSkills response.
+        // Send it now (with whatever was installed during the session)
+        // so the wizard can advance to the next provisioner.
+        if self.wizard_install_in_progress {
+            self.wizard_install_in_progress = false;
+            let installed = std::mem::take(&mut self.wizard_installed_slugs);
+            if let Some(tx) = self.setup_response_tx.as_ref() {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(
+                            crate::onboard::provision::ProvisionResponse::InstalledSkills(
+                                installed,
+                            ),
+                        )
+                        .await;
+                });
+            }
+        }
+    }
+
+    fn close_skill_deps_install_state(&mut self) {
+        self.skill_deps_install_in_progress = None;
+        self.skill_deps_install_completion_rx = None;
+        self.skill_deps_install_completion_tx = None;
     }
 
     fn open_setup_overlay(&mut self, name: String) -> anyhow::Result<()> {
@@ -1363,6 +2482,7 @@ impl TuiApp {
                     partial: String::new(),
                     tool_blocks: Vec::new(),
                     cancelling: false,
+                    turn_started_at: std::time::Instant::now(),
                 };
                 self.context.last_error = None;
             }
@@ -1402,7 +2522,10 @@ impl TuiApp {
             .collect();
 
         let title = format!("{} setup", cat_label(category));
-        let empty_hint = format!("no {} provisioners available", cat_label(category).to_lowercase());
+        let empty_hint = format!(
+            "no {} provisioners available",
+            cat_label(category).to_lowercase()
+        );
 
         let picker = ListPicker::new(
             ListPickerKind::SetupChannel, // re-used as the generic "category sub-picker" kind
@@ -1427,6 +2550,7 @@ impl TuiApp {
             autocomplete,
             overlay,
             list_picker,
+            info_panel,
             stream_committed_chars,
             ..
         } = self;
@@ -1446,11 +2570,20 @@ impl TuiApp {
 
             render_stream_preview_pane(state, *stream_committed_chars, frame, chunks[0]);
             render_input_pane(context, frame, chunks[1]);
-            render_status_pane(context, frame, chunks[2]);
+            render_status_pane(context, state, frame, chunks[2]);
 
             // Modal overlay (e.g. /help) takes over the entire viewport.
             if let Some(content) = overlay.as_ref() {
                 render_overlay_pane(content, frame, area);
+            }
+
+            // Setup overlay — full terminal coverage while active. Drawn
+            // BEFORE the list picker so that when the wizard's skills
+            // step opens the install picker, the picker covers the
+            // overlay (ClawhubInstall hand-off path) — otherwise the
+            // user just sees the overlay's "Fetching…" log forever.
+            if let Some(overlay_state) = self.setup_overlay.as_mut() {
+                overlay_state.render(frame, area);
             }
 
             // List picker overlay — covers the entire 6-row viewport.
@@ -1458,9 +2591,11 @@ impl TuiApp {
                 picker.render(frame, area);
             }
 
-            // Setup overlay — full terminal coverage while active.
-            if let Some(overlay_state) = self.setup_overlay.as_mut() {
-                overlay_state.render(frame, area);
+            // Info panel overlay — read-only modal for /channels, /config,
+            // /doctor, /insights, /status, /usage, /skill (no args).
+            // Visually consistent with the list picker; same key dialect.
+            if let Some(panel) = info_panel.as_ref() {
+                panel.render(frame, area);
             }
 
             // First-run wizard — full terminal coverage, renders over everything.
@@ -1514,6 +2649,24 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Fullscreen render for the read-only info panel. Mirrors the
+    /// list-picker fullscreen path so /channels, /config, /doctor, etc.
+    /// occupy the entire viewport while open and don't compete with the
+    /// chat scrollback for screen real estate.
+    pub fn render_fullscreen_info_panel(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        let TuiApp { info_panel, .. } = self;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            if let Some(panel) = info_panel.as_ref() {
+                panel.render(frame, area);
+            }
+        })?;
+        Ok(())
+    }
+
     /// Render path while the slash-command autocomplete dropdown is
     /// visible (alt-screen mode). Layout: input box at top, dropdown
     /// below (taking the bulk of the screen so many commands are
@@ -1525,6 +2678,7 @@ impl TuiApp {
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
         let TuiApp {
+            state,
             context,
             autocomplete,
             ..
@@ -1548,7 +2702,7 @@ impl TuiApp {
 
             render_input_pane(context, frame, chunks[1]);
             autocomplete.render(frame, chunks[3]);
-            render_status_pane(context, frame, chunks[4]);
+            render_status_pane(context, state, frame, chunks[4]);
         })?;
         Ok(())
     }
@@ -1571,6 +2725,15 @@ impl TuiApp {
                 .split('\n')
                 .map(|l| super::render::render_block_line(l, &theme))
                 .collect::<Vec<_>>()
+        } else if role == "_tool_log" {
+            // Inline tool-call summary, indented and muted so it sits
+            // visually between assistant/user lines without competing
+            // for attention. Single-line — already trimmed upstream.
+            let muted = Style::default().fg(ratatui::style::Color::Rgb(107, 114, 128));
+            vec![Line::from(vec![
+                Span::raw("  "),
+                Span::styled(content.to_string(), muted),
+            ])]
         } else {
             super::render::render_message_lines(role, content, &[], &[], &theme)
         };
@@ -1641,22 +2804,16 @@ impl TuiApp {
         ctx: &TuiContext,
     ) -> Result<()> {
         let size = terminal.size()?;
-        let lines = render_splash_lines();
+        // Splash already shows `Rantaiclaw v<x>` in the right pane;
+        // append only the session identifier here so the same info
+        // doesn't appear twice in scrollback.
+        let lines = render_splash_lines(ctx, size.width);
         let session_short = &ctx.session_id[..8.min(ctx.session_id.len())];
         let mut all_lines = lines;
-        all_lines.push(Line::from(""));
-        all_lines.push(Line::from(vec![
-            Span::styled(
-                format!("Rantaiclaw v{}", env!("CARGO_PKG_VERSION")),
-                Style::default()
-                    .fg(Color::Rgb(94, 184, 255))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  · session {} ", session_short),
-                Style::default().fg(Color::Rgb(107, 114, 128)),
-            ),
-        ]));
+        all_lines.push(Line::from(Span::styled(
+            format!("  · session {} ", session_short),
+            Style::default().fg(Color::Rgb(107, 114, 128)),
+        )));
         all_lines.push(Line::from(""));
         commit_lines_to_scrollback(terminal, all_lines, size.width, size.height)
     }
@@ -1695,7 +2852,7 @@ impl TuiApp {
 
         // Empty-state splash — figlet wordmark + welcome line.
         if self.context.messages.is_empty() && !matches!(self.state, AppState::Streaming { .. }) {
-            for line in render_splash_lines() {
+            for line in render_splash_lines(&self.context, area.width) {
                 items.push(ListItem::new(line));
             }
         }
@@ -2064,7 +3221,7 @@ fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Fra
     let mut items: Vec<ListItem> = Vec::with_capacity(ctx.messages.len() + 1);
 
     if ctx.messages.is_empty() && !matches!(state, AppState::Streaming { .. }) {
-        for line in render_splash_lines() {
+        for line in render_splash_lines(ctx, area.width) {
             items.push(ListItem::new(line));
         }
     }
@@ -2244,14 +3401,14 @@ fn render_stream_preview_pane(
         Span::styled(format!("  {spinner} "), sky),
         Span::styled(label.to_string(), muted),
     ];
-    if !snippet.trim().is_empty() {
+    if snippet.trim().is_empty() {
+        spans.push(Span::styled("    Ctrl+C to cancel".to_string(), muted));
+    } else {
         spans.push(Span::styled("    ".to_string(), muted));
         spans.push(Span::styled(
             snippet,
             Style::default().fg(Color::Rgb(180, 200, 220)),
         ));
-    } else {
-        spans.push(Span::styled("    Ctrl+C to cancel".to_string(), muted));
     }
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line);
@@ -2295,12 +3452,43 @@ fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
     frame.render_widget(input, area);
 }
 
-fn render_status_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
+fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::Frame, area: Rect) {
     let muted = Style::default().fg(Color::Rgb(107, 114, 128));
     let sky = Style::default().fg(Color::Rgb(94, 184, 255));
     let coral = Style::default()
         .fg(Color::Rgb(255, 123, 123))
         .add_modifier(Modifier::BOLD);
+
+    // While the agent is streaming a turn, the status line is more
+    // useful as a "what is happening right now" indicator than as a
+    // model/token meter. We replace the whole line with the
+    // wall-clock-driven working indicator. When the turn finishes,
+    // the line snaps back to the normal token/age view.
+    if let AppState::Streaming {
+        tool_blocks,
+        cancelling,
+        turn_started_at,
+        ..
+    } = state
+    {
+        use crate::tui::widgets::working_indicator::{render as render_indicator, WorkingState};
+        let now = std::time::Instant::now();
+        let indicator_state = if *cancelling {
+            WorkingState::Cancelling
+        } else if let Some(current) = tool_blocks.iter().rev().find(|b| b.result.is_none()) {
+            WorkingState::Tool {
+                name: current.name.as_str(),
+                tool_started: current.started_at,
+            }
+        } else {
+            WorkingState::Thinking {
+                turn_started: *turn_started_at,
+            }
+        };
+        let line = render_indicator(&indicator_state, now);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
 
     let line = if let Some(ref err) = ctx.last_error {
         Line::from(vec![
@@ -2356,41 +3544,340 @@ fn render_status_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) 
     frame.render_widget(status, area);
 }
 
-/// Render the splash banner + welcome lines as ratatui `Line`s for the
-/// empty-chat state. Pulls the same assets the CLI splash uses, colored
-/// by the brand gradient.
-fn render_splash_lines() -> Vec<Line<'static>> {
-    let banner = include_str!("../onboard/assets/banner_full.txt");
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let palette = [
-        Color::Rgb(94, 184, 255),  // sky
-        Color::Rgb(94, 184, 255),  // sky
-        Color::Rgb(59, 140, 255),  // blue
-        Color::Rgb(59, 140, 255),  // blue
-        Color::Rgb(40, 70, 140),   // navy bright
-        Color::Rgb(107, 114, 128), // muted
-    ];
-    for (i, line) in banner.lines().enumerate() {
-        let color = palette[i.min(palette.len() - 1)];
-        out.push(Line::from(Span::styled(
-            line.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )));
+/// ASCII hermit-crab mascot, supplied by the project. Rendered with
+/// per-character colour so the silhouette reads as a hermit crab on
+/// any terminal that supports basic ANSI 24-bit (most modern ones) —
+/// terminals without truecolor downmix to their nearest palette, and
+/// the underlying ASCII glyphs (`@ % = + # * - . :`) stay visible
+/// even when colour is dropped entirely.
+const HERMIT_CRAB_ART: &str = include_str!("assets/mascot_ascii.txt");
+
+/// Width of the mascot column (in display cells). Must be at least as
+/// wide as the longest row of `HERMIT_CRAB_ART` so the right-pane
+/// stays aligned.
+const MASCOT_WIDTH: usize = 48;
+
+/// Hard ceiling on the right-pane width, in chars. Used by `wrap_csv`
+/// and `wrap_text`. Kept conservative so the stitched splash row
+/// (mascot + separator + right text) stays well under the width of a
+/// typical 100-col terminal, preventing the right-pane content from
+/// reflowing onto the mascot's row.
+const MAX_RIGHT_WIDTH: usize = 50;
+
+/// Map a single glyph from `HERMIT_CRAB_ART` to its RGB tint. Returning
+/// `None` means "render this cell as a plain space with no styling" —
+/// the splash uses that for whitespace so the art blends with whatever
+/// background the terminal happens to be using.
+fn mascot_color(ch: char) -> Option<Color> {
+    match ch {
+        // Shell tones — the rounded canopy on the crab's back.
+        '&' => Some(Color::Rgb(215, 195, 160)),
+        '$' => Some(Color::Rgb(245, 230, 200)),
+        // Claw / leg / body orange — the heavily-rendered warm parts.
+        '+' => Some(Color::Rgb(240, 100, 30)),
+        'X' => Some(Color::Rgb(210, 70, 20)),
+        'x' => Some(Color::Rgb(195, 80, 35)),
+        // Eye / pupil / mouth detail — kept very dark so they read as
+        // features rather than noise inside the body.
+        ';' => Some(Color::Rgb(50, 40, 35)),
+        // Interior shading.
+        ':' => Some(Color::Rgb(220, 195, 165)),
+        '.' => Some(Color::Rgb(235, 215, 180)),
+        _ => None,
     }
-    out.push(Line::from(""));
-    out.push(Line::from(vec![
+}
+
+/// Convert one row of `HERMIT_CRAB_ART` into a `Line` of styled spans,
+/// batching contiguous same-colour runs into a single span to keep the
+/// span count manageable for ratatui.
+fn mascot_row(row: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Color> = None;
+    let mut started = false;
+
+    let flush = |spans: &mut Vec<Span<'static>>, buf: &mut String, color: Option<Color>| {
+        if buf.is_empty() {
+            return;
+        }
+        let span = match color {
+            Some(c) => Span::styled(
+                std::mem::take(buf),
+                Style::default().fg(c).add_modifier(Modifier::BOLD),
+            ),
+            None => Span::raw(std::mem::take(buf)),
+        };
+        spans.push(span);
+    };
+
+    for ch in row.chars() {
+        let color = mascot_color(ch);
+        if !started {
+            cur = color;
+            started = true;
+        } else if color != cur {
+            flush(&mut spans, &mut buf, cur);
+            cur = color;
+        }
+        buf.push(ch);
+    }
+    flush(&mut spans, &mut buf, cur);
+    Line::from(spans)
+}
+
+/// Render the empty-chat splash. Adapts at render time to the
+/// terminal width supplied by the caller:
+///
+/// * `width ≥ 80` — full RANTAICLAW figlet at top
+/// * `42 ≤ width < 80` — small figlet
+/// * `width < 42` — plain bold wordmark
+///
+/// * `width ≥ MASCOT_WIDTH + 2 + MIN_RIGHT_WIDTH` — side-by-side
+///   mascot (left) + info (right)
+/// * otherwise — stacked: mascot above info
+///
+/// Right-pane copy wraps to `(width − mascot − sep)` (capped at
+/// `MAX_RIGHT_WIDTH`) so it never bleeds onto the mascot's row.
+/// Because ratatui calls this once per frame with the current
+/// `area.width`, the splash re-flows live as the terminal resizes.
+fn render_splash_lines(ctx: &TuiContext, area_width: u16) -> Vec<Line<'static>> {
+    let muted = Color::Rgb(107, 114, 128);
+    let sky = Color::Rgb(94, 184, 255);
+    let gold = Color::Rgb(234, 179, 8);
+
+    let avail = area_width as usize;
+
+    // Minimum useful width for the right column when sitting beside the
+    // mascot. Below this we stack instead so neither pane is starved.
+    const MIN_RIGHT_WIDTH: usize = 28;
+
+    let side_by_side = avail >= MASCOT_WIDTH + 2 + MIN_RIGHT_WIDTH;
+    // Skip the mascot entirely on terminals too narrow to hold its
+    // canvas — at that point every row would wrap into two visual
+    // rows and the silhouette becomes unreadable. The title figlet
+    // (or fallback wordmark) still conveys brand identity.
+    let show_mascot = avail >= MASCOT_WIDTH;
+    let right_width = if side_by_side {
+        avail
+            .saturating_sub(MASCOT_WIDTH + 2)
+            .min(MAX_RIGHT_WIDTH)
+            .max(MIN_RIGHT_WIDTH)
+    } else {
+        avail.min(MAX_RIGHT_WIDTH).max(20)
+    };
+    let inner_wrap = right_width.saturating_sub(2).max(16);
+
+    // ── Right-pane content ────────────────────────────────────────────
+    let mut right: Vec<Line<'static>> = Vec::new();
+
+    right.push(Line::from(vec![
         Span::styled(
-            "  Welcome to Rantaiclaw. ",
-            Style::default()
-                .fg(Color::Rgb(94, 184, 255))
-                .add_modifier(Modifier::BOLD),
+            "Rantaiclaw",
+            Style::default().fg(sky).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "Type a message or /help for commands.",
-            Style::default().fg(Color::Rgb(107, 114, 128)),
+            format!("  v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(muted),
         ),
     ]));
+    right.push(Line::from(""));
+
+    right.push(Line::from(Span::styled(
+        "Available Channels",
+        Style::default().fg(gold).add_modifier(Modifier::BOLD),
+    )));
+    let channels: Vec<String> = ctx
+        .channels_summary
+        .iter()
+        .filter(|(_, configured)| *configured)
+        .map(|(name, _)| name.clone())
+        .collect();
+    if channels.is_empty() {
+        for line in wrap_text(
+            "(none configured — run `/setup channels` to enable transports)",
+            inner_wrap,
+        ) {
+            right.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(muted)),
+            ]));
+        }
+    } else {
+        for line in wrap_csv(&channels, inner_wrap) {
+            right.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(sky)),
+            ]));
+        }
+    }
+    right.push(Line::from(""));
+
+    right.push(Line::from(Span::styled(
+        "Available Skills",
+        Style::default().fg(gold).add_modifier(Modifier::BOLD),
+    )));
+    let skills: Vec<String> = ctx
+        .available_skills
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    if skills.is_empty() {
+        for line in wrap_text(
+            "(none installed — run `/setup skills` or `/skill install <name>`)",
+            inner_wrap,
+        ) {
+            right.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(muted)),
+            ]));
+        }
+    } else {
+        for line in wrap_csv(&skills, inner_wrap) {
+            right.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(sky)),
+            ]));
+        }
+    }
+    right.push(Line::from(""));
+
+    for line in wrap_text("Type a message or /help for commands.", right_width) {
+        right.push(Line::from(Span::styled(line, Style::default().fg(muted))));
+    }
+
+    // ── Left-pane mascot ──────────────────────────────────────────────
+    let mut left: Vec<Line<'static>> = Vec::new();
+    for row in HERMIT_CRAB_ART.lines() {
+        left.push(mascot_row(row));
+    }
+
+    // ── Top section: brand wordmark (figlet or plain text) ────────────
+    let figlet_palette = [
+        Color::Rgb(94, 184, 255),  // sky
+        Color::Rgb(94, 184, 255),  // sky
+        Color::Rgb(59, 140, 255),  // blue
+        Color::Rgb(59, 140, 255),  // blue
+        Color::Rgb(40, 70, 140),   // navy
+        Color::Rgb(107, 114, 128), // muted
+    ];
+    let banner: &'static str = if avail >= 80 {
+        include_str!("../onboard/assets/banner_full.txt")
+    } else if avail >= 42 {
+        include_str!("../onboard/assets/banner_small.txt")
+    } else {
+        ""
+    };
+
+    let mut out: Vec<Line<'static>> = Vec::new();
     out.push(Line::from(""));
+    if banner.is_empty() {
+        // Fallback wordmark for very narrow terminals.
+        out.push(Line::from(Span::styled(
+            "RANTAICLAW",
+            Style::default()
+                .fg(figlet_palette[0])
+                .add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        for (i, line) in banner.lines().enumerate() {
+            let color = figlet_palette[i.min(figlet_palette.len() - 1)];
+            out.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+    out.push(Line::from(""));
+
+    // ── Body: side-by-side stitch OR stacked rendering ────────────────
+    if side_by_side {
+        let rows = left.len().max(right.len());
+        for i in 0..rows {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if let Some(line) = left.get(i) {
+                spans.extend(line.spans.iter().cloned());
+                let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+                if used < MASCOT_WIDTH {
+                    spans.push(Span::raw(" ".repeat(MASCOT_WIDTH - used)));
+                }
+            } else {
+                spans.push(Span::raw(" ".repeat(MASCOT_WIDTH)));
+            }
+            spans.push(Span::raw("  "));
+            if let Some(line) = right.get(i) {
+                spans.extend(line.spans.iter().cloned());
+            }
+            out.push(Line::from(spans));
+        }
+    } else {
+        // Stacked: mascot first (if the canvas fits at all), then a
+        // blank, then the info pane. Below `MASCOT_WIDTH` we drop the
+        // mascot entirely — the figlet/text wordmark on top already
+        // carries the brand and a half-wrapped crab just adds noise.
+        if show_mascot {
+            for line in left {
+                out.push(line);
+            }
+            out.push(Line::from(""));
+        }
+        for line in right {
+            out.push(line);
+        }
+    }
+    out.push(Line::from(""));
+    out
+}
+
+/// Word-wrap `text` at spaces so no output line exceeds `width`
+/// columns. Long tokens that themselves overflow are still emitted on
+/// their own line (truncation would lose information; the caller can
+/// decide whether to clip). Returns at least one row even when `text`
+/// is empty.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Join `items` with `", "` and word-wrap so no output line exceeds
+/// `width` columns. Returns at least one row even when `items` is empty.
+fn wrap_csv(items: &[String], width: usize) -> Vec<String> {
+    if items.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for (i, item) in items.iter().enumerate() {
+        let token = if i + 1 == items.len() {
+            item.clone()
+        } else {
+            format!("{item}, ")
+        };
+        if !cur.is_empty() && cur.chars().count() + token.chars().count() > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(&token);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
     out
 }
 
@@ -2403,6 +3890,48 @@ fn format_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Render tool-call arguments as a compact single-line summary for the
+/// inline scrollback log line. Picks the most informative-looking
+/// scalar field (`command`, `path`, `query`, etc.) and truncates so
+/// the whole line stays readable. Multi-field objects degrade to
+/// `<N args>` rather than smearing across the screen.
+fn compact_args_for_log(args: &serde_json::Value) -> String {
+    const PREFERRED_KEYS: &[&str] = &[
+        "command",
+        "cmd",
+        "path",
+        "file_path",
+        "query",
+        "url",
+        "name",
+        "key",
+        "pattern",
+    ];
+    const MAX_LEN: usize = 50;
+    if let serde_json::Value::Object(map) = args {
+        if map.is_empty() {
+            return String::new();
+        }
+        for k in PREFERRED_KEYS {
+            if let Some(v) = map.get(*k) {
+                if let Some(s) = v.as_str() {
+                    let trimmed = s.trim();
+                    let cropped = if trimmed.len() > MAX_LEN {
+                        format!("{}…", &trimmed[..MAX_LEN])
+                    } else {
+                        trimmed.to_string()
+                    };
+                    return format!("{k}={cropped:?}");
+                }
+            }
+        }
+        // No preferred-key match; fall back to a count-only summary.
+        let n = map.len();
+        return format!("<{n} arg{}>", if n == 1 { "" } else { "s" });
+    }
+    String::new()
 }
 
 /// Render the modal `/help`-style overlay over the chat area. Layout
@@ -2647,7 +4176,7 @@ fn run_external_editor(
     std::fs::write(&tmp_path, &app.context.input_buffer)?;
 
     // Suspend the TUI: flush, leave alt-screen if needed, drop raw mode.
-    let was_fullscreen = app.list_picker.is_some();
+    let was_fullscreen = app.list_picker.is_some() || app.info_panel.is_some();
     if was_fullscreen {
         execute!(io::stdout(), LeaveAlternateScreen)?;
     }
@@ -2777,6 +4306,101 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
 /// On exit we drop the `TuiApp` (which releases `req_tx`), giving the actor
 /// `None` from `req_rx.recv()` so it can finish its current turn and return.
 /// A bounded timeout avoids hanging shutdown if the actor is stuck.
+/// Count how many transport channels have a non-empty configuration in
+/// `config.channels_config`. Used by the TUI auto-start path to decide
+/// whether to spawn `start_channels` and by `/channels` + `/platforms`
+/// to render the active set. The CLI surface is implicit (always on)
+/// and is not counted here.
+pub(crate) fn count_configured_channels(c: &crate::config::Config) -> usize {
+    let mut n = 0;
+    let cc = &c.channels_config;
+    if cc.telegram.is_some() {
+        n += 1;
+    }
+    if cc.discord.is_some() {
+        n += 1;
+    }
+    if cc.slack.is_some() {
+        n += 1;
+    }
+    if cc.mattermost.is_some() {
+        n += 1;
+    }
+    if cc.webhook.is_some() {
+        n += 1;
+    }
+    if cc.imessage.is_some() {
+        n += 1;
+    }
+    if cc.signal.is_some() {
+        n += 1;
+    }
+    if cc.whatsapp.is_some() {
+        n += 1;
+    }
+    if cc.linq.is_some() {
+        n += 1;
+    }
+    if cc.nextcloud_talk.is_some() {
+        n += 1;
+    }
+    if cc.email.is_some() {
+        n += 1;
+    }
+    if cc.irc.is_some() {
+        n += 1;
+    }
+    if cc.dingtalk.is_some() {
+        n += 1;
+    }
+    #[cfg(feature = "channel-matrix")]
+    {
+        if cc.matrix.is_some() {
+            n += 1;
+        }
+    }
+    #[cfg(feature = "channel-lark")]
+    {
+        if cc.lark.is_some() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Per-channel state for the `/channels` and `/platforms` commands.
+/// `(name, configured, transport-hint)`. `configured=true` means the
+/// channel has a config block in `config.toml`; whether it's actually
+/// polling depends on whether `channels_autostart_count > 0` was true
+/// at TUI startup.
+pub(crate) fn channel_status_summary(c: &crate::config::Config) -> Vec<(&'static str, bool)> {
+    let cc = &c.channels_config;
+    let rows: Vec<(&'static str, bool)> = vec![
+        ("Telegram", cc.telegram.is_some()),
+        ("Discord", cc.discord.is_some()),
+        ("Slack", cc.slack.is_some()),
+        ("WhatsApp", cc.whatsapp.is_some()),
+        ("Mattermost", cc.mattermost.is_some()),
+        ("Signal", cc.signal.is_some()),
+        ("Email", cc.email.is_some()),
+        ("IRC", cc.irc.is_some()),
+        ("DingTalk", cc.dingtalk.is_some()),
+        ("Webhook", cc.webhook.is_some()),
+        ("Linq", cc.linq.is_some()),
+        ("Nextcloud Talk", cc.nextcloud_talk.is_some()),
+        ("iMessage", cc.imessage.is_some()),
+    ];
+    #[cfg(feature = "channel-matrix")]
+    {
+        rows.push(("Matrix", cc.matrix.is_some()));
+    }
+    #[cfg(feature = "channel-lark")]
+    {
+        rows.push(("Lark / Feishu", cc.lark.is_some()));
+    }
+    rows
+}
+
 pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("TUI requires an interactive terminal (stdin is not a TTY)");
@@ -2807,7 +4431,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         }
     }
 
-    let agent = Agent::from_config(&app_config)?;
+    let agent = Agent::from_config(&app_config).await?;
 
     let profile =
         crate::profile::ProfileManager::active().unwrap_or_else(|_| crate::profile::Profile {
@@ -2821,6 +4445,8 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<TurnRequest>(16);
     let (events_tx, events_rx): (AgentEventSender, mpsc::Receiver<AgentEvent>) = mpsc::channel(128);
 
+    let security_handle = agent.security();
+    let mcp_tools_by_server = agent.mcp_tools_by_server();
     let actor = TuiAgentActor::new(agent, req_rx, events_tx);
     let actor_handle = tokio::spawn(actor.run());
 
@@ -2845,6 +4471,21 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         events_rx,
     )?;
     app.context.available_providers = available_providers;
+    // Subscribe to the pending-approvals broadcast before stashing the
+    // security handle on the context, so that the moment the shell tool
+    // suspends a turn waiting for /allow|/deny, the TUI sees the
+    // notification and surfaces a system message.
+    if let Some(security) = security_handle.as_ref() {
+        if let Some(pending) = security.pending() {
+            app.pending_approvals_rx = Some(pending.subscribe());
+        }
+    }
+    app.context.security = security_handle;
+
+    // Surface MCP server config + discovered tools so `/mcp` can
+    // render a useful diff between "configured" and "actually live".
+    app.context.mcp_servers_configured = app_config.mcp_servers.keys().cloned().collect();
+    app.context.mcp_tools_by_server = mcp_tools_by_server;
 
     if let Some(topic) = tui_config.setup_provisioner.take() {
         // `rantaiclaw setup` (no topic) and `rantaiclaw setup full` both
@@ -2872,8 +4513,68 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // Load skills from the active workspace so /skills can browse them.
     // load_skills_with_config falls back to an empty vec on any error
     // (missing dir, malformed manifest, etc.) — never blocks startup.
-    app.context.available_skills =
-        crate::skills::load_skills_with_config(&app_config.workspace_dir, &app_config);
+    app.refresh_available_skills();
+    let workspace_skills = app_config.workspace_dir.join("skills");
+    match crate::skills::watcher::SkillsWatcher::watch(&profile.skills_dir(), &workspace_skills) {
+        Ok(watcher) => {
+            app.skills_watcher = Some(watcher);
+        }
+        Err(e) => {
+            tracing::warn!("skill watcher disabled: {e:#}");
+        }
+    }
+
+    // Config.toml file watcher — direct edits to the active profile's
+    // config trigger a reload, mirroring the wizard-close path. This
+    // is what makes `[mcp_servers.foo]` added by hand take effect
+    // without restarting rantaiclaw.
+    match crate::tui::config_watcher::ConfigWatcher::watch(&app_config.config_path) {
+        Ok(watcher) => {
+            app.config_watcher = Some(watcher);
+        }
+        Err(e) => {
+            tracing::warn!("config watcher disabled: {e:#}");
+        }
+    }
+
+    // Auto-start configured channel listeners alongside the TUI. Before
+    // v0.6.4 the TUI was a single local-chat surface — Telegram / Discord /
+    // Slack / etc. configured via the wizard would never receive messages
+    // because nothing was polling them; users had to run a separate
+    // `rantaiclaw daemon`. Tester reports surfaced this as "bot doesn't
+    // reply outside the TUI." Now bare `rantaiclaw` is the canonical
+    // multi-channel runtime: TUI owns the local terminal, channels run as
+    // a background task in the same process.
+    //
+    // Failure-mode discipline: never block the TUI on channel startup.
+    // If start_channels errors (bad token, network, missing creds), the
+    // user can still chat locally; the failure is logged + surfaced via
+    // /channels.
+    let configured_channels = count_configured_channels(&app_config);
+    app.context.channels_summary = channel_status_summary(&app_config)
+        .into_iter()
+        .map(|(name, configured)| (name.to_string(), configured))
+        .collect();
+    if configured_channels > 0 {
+        let cfg_for_channels = app_config.clone();
+        crate::channels::auto_start_state::mark_starting();
+        tokio::spawn(async move {
+            match crate::channels::start_channels(cfg_for_channels).await {
+                Ok(()) => {
+                    crate::channels::auto_start_state::mark_terminated();
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    tracing::warn!(
+                        "auto-start channels failed (TUI continues; channels will not respond until daemon is running separately): {msg}"
+                    );
+                    crate::channels::auto_start_state::mark_failed(msg);
+                }
+            }
+        });
+        app.context.channels_autostart_count = configured_channels;
+    }
+
     let mut terminal = setup_terminal()?;
 
     // Splash banner — committed once to the terminal's scrollback before
@@ -2920,6 +4621,7 @@ async fn run_loop(
         // OR slash-autocomplete dropdown visible. Edge-triggered via
         // option presence so we don't churn buffers on every keystroke.
         let want_alt = app.list_picker.is_some()
+            || app.info_panel.is_some()
             || app.autocomplete.is_visible()
             || app.setup_overlay.is_some()
             || app.first_run_wizard.is_some();
@@ -2932,11 +4634,33 @@ async fn run_loop(
         } else if !want_alt && in_alt {
             // Drop the temp fullscreen terminal first so its final flush
             // happens INSIDE alt-screen, then leave alt-screen, then
-            // force the inline terminal to repaint cleanly on top of
-            // the restored screen.
+            // rebuild the inline terminal so its internal viewport-row
+            // tracking is reset.
+            //
+            // Pre-fix this path just called `terminal.clear()` and
+            // assumed the original screen state was restored cleanly by
+            // `LeaveAlternateScreen`. In practice the inline viewport's
+            // row anchor drifted across the swap — the next render drew
+            // the viewport at a new row while the previous frame stayed
+            // pinned in scrollback, producing duplicate input boxes and
+            // status bars after closing `/skills`, `/sessions`, etc.
+            //
+            // Wiping the visible screen with `\x1b[2J\x1b[H` and then
+            // recreating the inline Terminal forces ratatui to claim
+            // fresh viewport rows at the bottom of the now-empty screen.
+            // Scrollback contents above are untouched (no `\x1b[3J`).
             drop(alt.take());
             execute!(io::stdout(), LeaveAlternateScreen)?;
-            terminal.clear()?;
+            let _ = terminal.flush();
+            let mut out = io::stdout();
+            let _ = out.write_all(b"\x1b[2J\x1b[H");
+            let _ = out.flush();
+            *terminal = Terminal::with_options(
+                CrosstermBackend::new(io::stdout()),
+                TerminalOptions {
+                    viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
+                },
+            )?;
         }
 
         // /new and /clear request a full screen+scrollback wipe so
@@ -2995,6 +4719,8 @@ async fn run_loop(
                 })?;
             } else if app.list_picker.is_some() {
                 app.render_fullscreen_picker(alt_term)?;
+            } else if app.info_panel.is_some() {
+                app.render_fullscreen_info_panel(alt_term)?;
             } else {
                 app.render_fullscreen_autocomplete(alt_term)?;
             }
@@ -3004,9 +4730,13 @@ async fn run_loop(
 
         // Tighten the poll interval during streaming so the live preview
         // updates fast enough to feel like word-by-word streaming. When
-        // idle, poll less aggressively to keep CPU near zero.
+        // idle, poll less aggressively to keep CPU near zero. Also tighten
+        // while a ClawHub install is in flight so the spinner animation
+        // ticks smoothly (~12 fps).
         let poll_ms = if matches!(app.state, AppState::Streaming { .. }) {
             16
+        } else if app.clawhub_install_in_progress.is_some() {
+            80
         } else {
             100
         };
@@ -3017,10 +4747,23 @@ async fn run_loop(
             // the viewport at the new bottom row, but the previous
             // viewport's rows remain in the terminal buffer above as
             // ghost copies. Drain any coalesced Resize events, then
-            // wipe the screen+scrollback and replay splash + messages
-            // so the terminal looks like a fresh launch at the new
-            // size. While in alt-screen the picker handles its own
-            // sizing; just trigger a repaint there.
+            // wipe the screen+scrollback and replay the splash +
+            // message history so the terminal looks like a fresh
+            // launch at the new size.
+            //
+            // The clear sequence layers three escapes for portability:
+            //   - `\x1b[3J`  xterm-extension scrollback clear (most
+            //     modern terminals: tmux, alacritty, kitty, wezterm,
+            //     Windows Terminal, iTerm2, gnome-terminal, …).
+            //   - `\x1b[2J`  clear visible region.
+            //   - `\x1bc`    RIS / Full Reset — fallback for terminals
+            //     that ignore `\x1b[3J`, notably the VS Code built-in
+            //     terminal. RIS does reset other state (cursor style,
+            //     character set), but the immediately-following
+            //     `Terminal::with_options` + ratatui rendering
+            //     restores everything we care about.
+            // While in alt-screen the picker handles its own sizing;
+            // just trigger a repaint there.
             if matches!(ev, Event::Resize(_, _)) {
                 while event::poll(std::time::Duration::from_millis(0))? {
                     let next = event::read()?;
@@ -3035,7 +4778,7 @@ async fn run_loop(
                 if alt.is_none() {
                     let _ = terminal.flush();
                     let mut out = io::stdout();
-                    let _ = out.write_all(b"\x1b[3J\x1b[2J\x1b[H");
+                    let _ = out.write_all(b"\x1bc\x1b[3J\x1b[2J\x1b[H");
                     let _ = out.flush();
                     *terminal = Terminal::with_options(
                         CrosstermBackend::new(io::stdout()),
@@ -3144,11 +4887,28 @@ mod tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
+            skills_watcher: None,
+            config_watcher: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         }
     }
 
@@ -3222,11 +4982,28 @@ mod submit_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
+            skills_watcher: None,
+            config_watcher: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         }
     }
 
@@ -3257,6 +5034,7 @@ mod submit_tests {
             partial: String::new(),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
         app.context.input_buffer = "queued".into();
 
@@ -3313,11 +5091,28 @@ mod ctrl_c_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
+            skills_watcher: None,
+            config_watcher: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         }
     }
 
@@ -3329,6 +5124,7 @@ mod ctrl_c_tests {
             partial: String::new(),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
 
         let result = app
@@ -3385,11 +5181,28 @@ mod drain_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
+            skills_watcher: None,
+            config_watcher: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         }
     }
 
@@ -3401,6 +5214,7 @@ mod drain_tests {
             partial: String::from("prev "),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
         events_tx
             .send(AgentEvent::Chunk("more".into()))
@@ -3424,6 +5238,7 @@ mod drain_tests {
             partial: String::from("answer"),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
         events_tx
             .send(AgentEvent::Done {
@@ -3448,6 +5263,7 @@ mod drain_tests {
             partial: String::from("partial text from chunks"),
             tool_blocks: vec![],
             cancelling: true,
+            turn_started_at: std::time::Instant::now(),
         };
         // Agent emits Done with empty final_text on cancel — TUI must use local partial.
         events_tx
@@ -3474,6 +5290,7 @@ mod drain_tests {
             partial: String::new(),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
         events_tx
             .send(AgentEvent::ToolCallStart {
@@ -3527,11 +5344,28 @@ mod retry_tests {
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
+            skills_watcher: None,
+            config_watcher: None,
+            wizard_install_in_progress: false,
+            wizard_installed_slugs: Vec::new(),
+            info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            pending_approvals_rx: None,
         }
     }
 
@@ -3568,6 +5402,7 @@ mod retry_tests {
             partial: String::new(),
             tool_blocks: vec![],
             cancelling: false,
+            turn_started_at: std::time::Instant::now(),
         };
 
         app.handle_command("retry").await.unwrap();

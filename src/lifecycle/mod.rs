@@ -16,3 +16,5 @@
 pub mod binary_path;
 pub mod uninstall;
 pub mod update;
+pub mod update_service_restart;
+pub mod update_snapshot;

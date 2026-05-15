@@ -38,6 +38,17 @@ pub enum AgentEvent {
 
     /// Non-recoverable error. Followed by `Done { cancelled: false, final_text: "" }`.
     Error(String),
+
+    /// The actor finished rebuilding the agent after a `TurnRequest::Reload`.
+    /// Carries fresh snapshots that the TUI keeps cached (so views like
+    /// `/mcp` reflect the new state without re-probing). Emitted at
+    /// reload-complete time, not per turn.
+    ReloadComplete {
+        /// Names of MCP servers configured after the reload.
+        mcp_servers_configured: Vec<String>,
+        /// Per-server qualified tool names actually discovered.
+        mcp_tools_by_server: std::collections::HashMap<String, Vec<String>>,
+    },
 }
 
 #[derive(Debug, Clone)]

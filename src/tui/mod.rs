@@ -5,6 +5,8 @@ pub mod async_bridge;
 #[cfg(feature = "tui")]
 mod commands;
 #[cfg(feature = "tui")]
+mod config_watcher;
+#[cfg(feature = "tui")]
 mod context;
 #[cfg(feature = "tui")]
 pub mod first_run_wizard;

@@ -156,7 +156,7 @@ impl OpenAiCompatibleProvider {
             }
 
             let builder = Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_mins(2))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
             let builder =
@@ -1475,10 +1475,21 @@ impl Provider for OpenAiCompatibleProvider {
     /// and emits the entire response as one chunk, which defeats the
     /// whole point of streaming for the TUI. This implementation hits
     /// the `chat/completions` endpoint with `stream: true` and forwards
-    /// each `delta.content` token to `text_tx` as it arrives. Tool calls
-    /// in streaming responses are NOT yet handled — when `request.tools`
-    /// is non-empty we fall back to non-streaming `chat()` so tool plumbing
-    /// keeps working.
+    /// each `delta.content` token to `text_tx` as it arrives.
+    ///
+    /// Tool calls in OpenAI-compatible SSE arrive as `delta.tool_calls`
+    /// fragments that this stream parser does NOT reassemble. When the
+    /// caller passes tools we fall back to the non-streaming `chat()`
+    /// path so tool calls round-trip correctly — without the fallback,
+    /// MiniMax (and any other native-tool model) would emit a tool-call
+    /// response with empty `content`, `full_text` would stay empty,
+    /// `tool_calls` would be returned as `vec![]`, and the agent loop
+    /// would terminate with a blank Assistant reply. Reproduced live
+    /// with MiniMax-M2.7 + the skill management tools.
+    ///
+    /// We still emit the final response text as one chunk so the TUI's
+    /// streaming UI gets *something* to render (just no token-by-token
+    /// animation for tool-using turns).
     async fn chat_stream(
         &self,
         request: ProviderChatRequest<'_>,
@@ -1486,6 +1497,17 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         text_tx: tokio::sync::mpsc::Sender<String>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        // Tools present → bypass streaming so tool_calls survive.
+        if request.tools.is_some_and(|t| !t.is_empty()) {
+            let resp = self.chat(request, model, temperature).await?;
+            if let Some(ref text) = resp.text {
+                if !text.is_empty() {
+                    let _ = text_tx.send(text.clone()).await;
+                }
+            }
+            return Ok(resp);
+        }
+
         let credential = self
             .credential
             .as_ref()
@@ -1497,12 +1519,6 @@ impl Provider for OpenAiCompatibleProvider {
             })?
             .clone();
 
-        // Tools are forwarded with `stream: true`. The SSE parser only
-        // extracts text deltas (not tool_call deltas), so if the model
-        // chooses to emit tool calls in streaming mode the rest of the
-        // agent loop falls back to its prompt-guided / native-tool
-        // detection on the assembled `full_text`. This is the same
-        // behaviour as the non-streaming path for prompt-guided tools.
         let tools = Self::convert_tool_specs(request.tools);
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(request.messages)

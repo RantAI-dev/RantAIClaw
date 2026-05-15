@@ -12,7 +12,7 @@ use super::McpRegistry;
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
-const BACKOFF_CAP: Duration = Duration::from_secs(60);
+const BACKOFF_CAP: Duration = Duration::from_mins(1);
 
 fn backoff_delay(consecutive_failures: u32) -> Duration {
     let delay = BACKOFF_BASE * 2u32.saturating_pow(consecutive_failures.saturating_sub(1));

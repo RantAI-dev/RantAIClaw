@@ -5,6 +5,317 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.40-alpha] — 2026-05-14
+
+Approval policy preset rename: drop the `L1` / `L2` / `L3` / `L4`
+prefixes and use the verbal labels directly (`Manual` / `Smart` /
+`Strict` / `Off`). The `L1`–`L4` naming implied a hierarchy that did
+not exist — `L4 — Off` reads counter-intuitive next to `L1 — Manual`,
+and three of the four presets all map to the same runtime
+`supervised` enum value. The new labels carry the meaning instead.
+
+### Changed
+
+- `PolicyPreset` enum variants renamed: `L1Manual` → `Manual`,
+  `L2Smart` → `Smart`, `L3Strict` → `Strict`, `L4Off` → `Off`.
+- On-disk preset identifiers changed: `preset = "L1"` … `"L4"` are now
+  written as `preset = "manual"` … `"off"`.
+- Preset bundle files renamed under `src/approval/presets/`:
+  `policy_l1.toml` → `policy_manual.toml`, `policy_l2.toml` →
+  `policy_smart.toml`, `policy_l3.toml` → `policy_strict.toml`,
+  `policy_l4.toml` → `policy_off.toml`.
+- Setup wizard dropped the `L1 —` / `L2 —` / … prefix; menu now reads
+  `Manual — prompt for every tool call`, etc.
+- `Off` preset (formerly `L4`) warning text updated to use the new
+  label.
+- Pillar docs (`docs/pillars/{1-setup,3-tools-approvals}.md`) and
+  README autonomy section updated to use the verbal preset names.
+
+### Compatibility
+
+- `PolicyPreset::from_str_ci` continues to accept the legacy
+  `L1`/`L2`/`L3`/`L4` ids so existing `<profile>/policy/autonomy.toml`
+  files written by pre-v0.6.40 releases still load without
+  hand-editing.
+- The setup wizard rewrites the file with the new label on next
+  `setup approvals --force`.
+
+## [0.6.8-alpha] — 2026-05-07
+
+UI consistency cut driven by the v0.6.7 tester recommendation: *"Change
+the shitty on chat ui or infos to proper tui comp ui."* Seven info
+commands now open dedicated TUI panels instead of dumping `System:`
+chat blobs. Three picker/wizard polish fixes. One alias dropped.
+
+### Added
+
+- **`InfoPanel` widget** at `src/tui/widgets/info_panel.rs` — bordered
+  modal matching the `list_picker` visual language: sky-bold title,
+  optional subtitle, sectioned typed rows (`KeyValue` / `Status` / `Bullet`
+  / `InlineList` / `Plain` / `Spacer`), scrollable when content overflows,
+  Esc closes, ↑/↓/PgUp/PgDn scroll. Brand colors stay in sync with
+  `list_picker` and `setup_overlay` so the surfaces feel like one app.
+- New `CommandResult::OpenInfoPanel(InfoPanel)` variant; `TuiApp.info_panel`
+  field; render integration in both inline and fullscreen paths;
+  alt-screen toggle picks up the panel.
+
+### Changed
+
+- **`/channels`** — text-blob → InfoPanel. Sections: Always available /
+  Runtime (auto-start state) / Configured (per-channel status with the
+  same icon-vocabulary as `/doctor`) / Not configured (compact comma-
+  list) / Logs.
+- **`/config`** — text-blob → InfoPanel. Sections: Runtime / Persisted
+  with pointer at `~/.rantaiclaw/profiles/<active>/config.toml`.
+- **`/doctor`** — text-blob → InfoPanel + content expansion. Was
+  3 trivial checks (session store, model, TUI); now adds Channels
+  (auto-start state + each configured channel), Skills (count loaded),
+  Workspace (`~/.rantaiclaw/`, `profiles/`).
+- **`/insights`** — text-blob → InfoPanel. Sections: Sessions (total +
+  current age) / Messages (total + current + per-session avg) / Tokens
+  (this session).
+- **`/status`** — text-blob → InfoPanel. Sections: Agent / Session.
+- **`/usage`** — text-blob → InfoPanel. Sections: Tokens / Model
+  (active + context window).
+- **`/skill`** (no args) — text-blob → InfoPanel listing all loaded
+  skills with descriptions; usage hint section. `/skill <name>` opens
+  a per-skill detail panel.
+
+### Polish
+
+- **First-run wizard welcome footer**: "skip any step with Esc" → "Esc
+  to cancel". Esc on Welcome quits the wizard (there's nothing to skip
+  yet); the wording was misleading. Mid-step screens still say "skip"
+  which is correct semantics there.
+- **List picker cross-page navigation**: pressing ↓ at the last item
+  of a page now advances to the first item of the next page (and
+  symmetric for ↑ at the first item of a non-first page). Pre-v0.6.8
+  ↓ wrapped to row 1 of the same page, leaving testers stuck on
+  page 1 of 3 in the ClawHub picker without realizing PgDn was
+  required to advance.
+- **`/personality` picker** now opens on the actual current preset and
+  marks that row with `· current` in the secondary line. Pre-v0.6.8
+  the picker hardcoded `Some("default")` as the preselect, ignoring
+  whatever was actually saved in `<profile>/persona/persona.toml`.
+
+### Removed
+
+- **`/platforms` alias** — was a v0.6.4 alias for `/channels` for
+  muscle memory, but tester feedback flagged the duplicate output as
+  noise. The single canonical command is `/channels`.
+
+### Compatibility
+
+- No on-disk-state changes. No new deps.
+- `CommandResult::OpenInfoPanel(...)` is additive; existing callers
+  using `Message(...)` continue to render as inline chat lines.
+
+## [0.6.7-alpha] — 2026-05-07
+
+Two TUI fixes from v0.6.6-alpha tester feedback. One UX gap deferred
+(ClawHub picker default selection) for v0.6.8.
+
+### Fixed
+
+- **Channel events leak into the local TUI scrollback** — every incoming
+  channel message ("[telegram] from @user: ..."), the "Processing
+  message..." progress line, every reply ("Reply (4208ms): ..."), and
+  delivery failures were `println!`/`eprintln!` to stdout. In TUI mode
+  stdout is the alt-screen, so the channel chatter corrupted the
+  rendering and exposed Telegram conversations the local user wasn't
+  meant to see. v0.6.7 routes all four through `tracing::info!` /
+  `tracing::error!` instead. Channel activity is now visible only in
+  `~/.rantaiclaw/logs/tui-YYYY-MM-DD.log`. Daemon-mode operators who
+  relied on stdout for live message tracing should now `RUST_LOG=info`
+  + tail the log file. (`src/channels/mod.rs` lines ~1324, ~1374,
+  ~1563, ~1589.)
+
+### Added
+
+- **Restart-needed cue when channels are added/removed mid-session** —
+  `reload_config` now compares channel count before vs after and pushes
+  a `⚠` system message into chat scrollback if it changed. Tester report
+  was "Telegram works only after restarting `rantaiclaw`" — true, and
+  the cue makes the requirement visible. Auto-restart of the
+  `start_channels` task is the v0.6.8 follow-up; doing it cleanly needs
+  `start_channels` to accept a cancellation token to avoid orphaning
+  supervised listener tasks.
+
+### Deferred
+
+- ClawHub picker installs 0 skills despite "✓ Installed from ClawHub"
+  banner. Picker likely defaults to nothing-selected; user pressed
+  Enter without picking. Fix is a UX adjustment in `src/onboard/section/skills.rs`
+  — either default-check top-3 skills or warn on empty selection. Will
+  land in v0.6.8.
+
+### Compatibility
+
+- No on-disk-state changes. No new deps.
+
+## [0.6.6-alpha] — 2026-05-07
+
+Diagnostic upgrade for the channel auto-start path. Tester reported v0.6.5
+showed "polling" for Telegram in `/channels` but the bot still didn't
+reply — meaning the dispatch happened but `start_channels` either errored
+mid-build or the listener silently failed. Pre-v0.6.6 had no way for the
+user to see what went wrong; the warn was logged to a file the user
+didn't know to check.
+
+### Added
+
+- `src/channels/auto_start_state.rs` — global Mutex<AutoStartState> with
+  variants `NotDispatched`, `Starting`, `Terminated`, `Failed{message}`.
+  The TUI auto-start callback marks the state through the spawn lifecycle.
+- `/channels` now reads the snapshot and shows one of:
+  - `running` — start_channels is past the build phase and likely in the
+    dispatch loop
+  - `starting…` — within the first 5 seconds of startup
+  - `FAILED — see error below` + the formatted error chain
+  - `stopped (dispatch loop exited)`
+  - `configured · not started in this process`
+- Footer hint at the bottom of `/channels` always points at
+  `~/.rantaiclaw/logs/tui-YYYY-MM-DD.log` for full provenance.
+
+### Fixed
+
+- `/channels` no longer reports `polling` when the spawn task errored.
+  Tester report: "Telegram still not working even though it reports to
+  polling." Status was misleading; this gives an honest answer.
+
+### Compatibility
+
+- No on-disk-state changes. No new deps.
+
+## [0.6.5-alpha] — 2026-05-07
+
+Build-pipeline fix. v0.6.3-alpha and v0.6.4-alpha binaries reported their
+version as `0.6.2-alpha` because Swatinem/rust-cache was restoring a
+target/ from a previous v0.6.2-alpha build, and cargo's incremental
+compilation didn't re-emit `main.rs` with the new `CARGO_PKG_VERSION`
+even though Cargo.toml had been bumped. The binaries were otherwise
+identical functionally — they had all the v0.6.3 + v0.6.4 fixes — but
+the version string was wrong, which testers flagged as confusing.
+
+### Fixed
+
+- **Wrong `--version` output on alpha builds** — `pub-release.yml` now
+  runs `cargo clean -p rantaiclaw --target <target>` between the cache
+  restore step and the build step. This invalidates only the
+  `rantaiclaw` package's incremental-compilation fingerprint while
+  leaving dependency builds cached, so `env!("CARGO_PKG_VERSION")`
+  re-expands fresh against the current `Cargo.toml`. Build-time impact:
+  ~30-60 sec extra on cache-warm runs (the rantaiclaw crate recompiles
+  from scratch instead of incrementally). Negligible on cache-cold
+  runs. (`.github/workflows/pub-release.yml`.)
+
+### Compatibility
+
+- **No source code changes.** This is a CI-only fix. The shipped binary
+  is functionally identical to v0.6.4-alpha; only the `--version` output
+  is corrected. If you trust your v0.6.4-alpha build is doing the right
+  thing functionally (e.g. Telegram replies), it's the same code.
+
+## [0.6.4-alpha] — 2026-05-07
+
+Follow-up to v0.6.3-alpha tester feedback. Fixes the channel deadlock
+(Telegram bot configured but never replied), makes the channel state
+visible, and lands the deferred back button.
+
+### Fixed
+
+- **Telegram / Discord / Slack / etc. don't reply when running bare
+  `rantaiclaw`** — the TUI process was the canonical "all-in-one"
+  runtime in user expectations, but it was only running the local-chat
+  agent actor. Configured channels needed a separate `rantaiclaw daemon`
+  to be polled, which wasn't documented or discoverable. v0.6.4 spawns
+  `start_channels` as a background task alongside the TUI when any
+  channel is configured. Failure-mode discipline: channel-startup
+  errors are logged but don't crash the TUI; the user can still chat
+  locally. (`src/tui/app.rs` `run_tui`.)
+- **`/platforms` always reported "TUI active" only** — was a hardcoded
+  string. Now reflects the actual `channels_config` from
+  `<profile>/config.toml` and indicates whether each channel is
+  configured + whether the TUI is polling it. Refreshes on
+  `reload_config` so post-`/setup` runs see the new state.
+  (`src/tui/commands/config.rs`.)
+
+### Added
+
+- **`/channels` command** — first-class command to list configured +
+  active channels. `/platforms` now aliases to `/channels`.
+- **Back button in the first-run wizard** — `Ctrl+B` walks the phase
+  history one step back. Safe cases (PickChannels ↔ PickIntegrations
+  ↔ Welcome) work fully. RunningProvisioner steps are skipped on
+  rewind (the running task wrote to `config.toml`; surgical rewind
+  isn't safe). For redoing a required section, `Esc` + re-run with
+  `/setup <section>` remains the supported path. (`src/tui/first_run_wizard.rs`
+  `back()`, `src/tui/app.rs` Ctrl+B handler.)
+
+### Compatibility
+
+- No new deps. No on-disk-state changes vs v0.6.3-alpha.
+- Bare `rantaiclaw` now uses more memory + CPU when channels are
+  configured (it spawns the channel listeners). For TUI-only mode
+  with no channels, the auto-start branch is a no-op.
+
+## [0.6.3-alpha] — 2026-05-07
+
+Bug-fix cut driven by Sulthan + Alifia's first round of v0.6.1-alpha
+testing (`bugs-123.pdf`). Five tester-reported bugs fixed; one
+deferred (back-button navigation needs wizard rework).
+
+### Fixed
+
+- **Provider 401 immediately after `/setup provider`** — `reload_config`
+  was reading the encrypted `config.toml` and pushing it straight to
+  the agent actor without running the secret-decrypt pass that
+  `Config::load_or_init` performs at startup. The agent received an
+  encrypted blob in `config.api_key`, the HTTP request builder rejected
+  the malformed Authorization header, and OpenRouter / OpenAI
+  responded "401 Unauthorized: Missing Authentication header". Reload
+  now runs the same `decrypt_optional_secret` pass for `api_key`,
+  `composio.api_key`, `browser.computer_use.api_key`,
+  `web_search.brave_api_key`, `storage.provider.config.db_url`, and
+  every `agents.*.api_key`. (`src/tui/app.rs` `reload_config`)
+- **`/skills` shows "No skills loaded" even after the starter pack
+  installed** — v0.5.0 introduced a per-profile skills dir
+  (`<profile>/skills/`) but the loader still looked at the v0.4.x
+  workspace-level path (`<workspace>/skills/`). The bundled installer
+  + ClawHub both write to the new path; the picker was reading from
+  the old one. Loader now checks both, profile-level wins on conflict,
+  deduped by name. Empty-state hint corrected to point at the actual
+  v0.5.0+ path. (`src/skills/mod.rs` `load_workspace_skills`,
+  `src/tui/commands/skills.rs`)
+- **`/skill` and `/skills` produced identical output** — both opened
+  the same picker. `/skill` (no args) now prints usage + an inline
+  list of loaded skills; `/skills` keeps the interactive picker.
+  `/skill <name>` unchanged. (`src/tui/commands/skills.rs`)
+- **`/resume` shows "Resumed session ... (N messages)" but no
+  history** — messages were loaded into `context.messages` but never
+  pushed into the scrollback display queue. The user saw a fresh-looking
+  TUI even though the agent had the history. Resume now replays each
+  loaded message into `scrollback_queue` so the conversation actually
+  appears. (`src/tui/app.rs` `ListPickerKind::Session` arm)
+- **ClawHub install fails with 404 on auxiliary files** — a stale
+  upstream `README.md` reference in a manifest was breaking the entire
+  install. SKILL.md remains required (a skill without it is rejected
+  per the bundled-format contract); other files (README, LICENSE, etc.)
+  are now best-effort with a `tracing::warn!` on 404. (`src/skills/clawhub.rs`)
+
+### Deferred
+
+- **No back button in the wizard / setup picker** — substantial state-
+  machine work to add reverse navigation across the seven setup steps.
+  Filed as a follow-up; for now testers can `Esc` to cancel and re-run
+  the section.
+
+### Compatibility
+
+- No new deps. No on-disk-state changes vs v0.6.2-alpha.
+- Skills installed under the v0.4.x `<workspace>/skills/` layout still
+  load (back-compat path retained).
+
 ## [0.6.2-alpha] — 2026-05-06
 
 Lifecycle commands — closes the "how do I uninstall?" / "how do I update?"

@@ -35,6 +35,9 @@ pub enum ListPickerKind {
     SetupTopic,
     /// Channel-type picker opened from the Channels category.
     SetupChannel,
+    /// ClawHub install browser — opens via `/install` and `/skills install`.
+    /// Selecting a row installs that skill via `clawhub::install_one`.
+    ClawhubInstall,
 }
 
 /// One row in the picker. `key` is opaque (provider:model, session id,
@@ -153,12 +156,35 @@ pub struct ListPicker {
     /// Category IDs that are currently collapsed. Navigation skips items
     /// in collapsed categories unless a search query is active.
     collapsed_categories: HashSet<String>,
+    /// `true` when the user has typed into the search bar but not yet
+    /// pressed Enter to fire a remote search. Only meaningful for
+    /// `ClawhubInstall` (server-side search) — surfaced as a "Press Enter
+    /// to search ClawHub" banner so users don't think the picker is
+    /// stuck. App sets this on every keystroke and clears it when the
+    /// search task is dispatched.
+    pub search_pending: bool,
 }
 
 impl ListPicker {
     /// Returns the underlying entries (items + category headers).
     pub fn entries(&self) -> &[ListPickerEntry] {
         &self.entries
+    }
+
+    /// Replace the picker's items in-place. Used by live server-side
+    /// search (e.g. ClawHub install picker): the user keeps typing in
+    /// the search bar while results stream in from the network. Resets
+    /// page/selection but preserves the query and focus so the user's
+    /// typing context isn't disturbed.
+    pub fn set_items(&mut self, items: Vec<ListPickerItem>) {
+        self.entries = items.into_iter().map(ListPickerEntry::Item).collect();
+        self.page = 0;
+        self.selected = 0;
+        if self.visible_len() == 0 {
+            self.list_state.select(None);
+        } else {
+            self.list_state.select(Some(0));
+        }
     }
 
     pub fn new(
@@ -197,6 +223,7 @@ impl ListPicker {
             page,
             focus: Focus::Search,
             collapsed_categories: HashSet::new(),
+            search_pending: false,
         }
     }
 
@@ -237,6 +264,7 @@ impl ListPicker {
             page,
             focus: Focus::Search,
             collapsed_categories: HashSet::new(),
+            search_pending: false,
         }
     }
 
@@ -282,14 +310,20 @@ impl ListPicker {
 
     /// Indices into `self.entries` that are currently visible (accounting
     /// for collapsed categories and optional query filter).
+    ///
+    /// `ClawhubInstall` opts out of local filtering: the query buffer is
+    /// only consulted on Enter (which fires a server-side search). Any
+    /// in-flight typing leaves the visible list unchanged so the user
+    /// isn't confused by results narrowing without an explicit search.
     pub fn filtered_indices(&self) -> Vec<usize> {
-        let searching = !self.query.is_empty();
+        let server_search_picker = self.kind == ListPickerKind::ClawhubInstall;
+        let searching = !server_search_picker && !self.query.is_empty();
         let q = self.query.to_lowercase();
 
         self.entries
             .iter()
             .enumerate()
-            .filter(|(i, entry)| {
+            .filter(|(_i, entry)| {
                 match entry {
                     ListPickerEntry::CategoryHeader { id, collapsed, .. } => {
                         // Always show headers in filtered results so users can
@@ -334,6 +368,17 @@ impl ListPicker {
         match self.focus {
             Focus::Search => {}
             Focus::List | Focus::Category => {
+                // v0.6.8: at the first item of a page that's not the
+                // first page, move to the last item of the previous
+                // page (mirror of the cross-page move_down). On page 0
+                // the existing "back to search" behavior is preserved.
+                if self.selected == 0 && self.page > 0 {
+                    self.page -= 1;
+                    let prev_len = self.page_indices().len();
+                    self.selected = prev_len.saturating_sub(1);
+                    self.list_state.select(Some(self.selected));
+                    return;
+                }
                 if self.selected == 0 {
                     self.focus = Focus::Search;
                 } else {
@@ -362,7 +407,25 @@ impl ListPicker {
                 self.list_state.select(Some(self.selected));
             }
             Focus::List | Focus::Category => {
-                self.selected = (self.selected + 1) % len;
+                // v0.6.8: at the last item of the current page, advance
+                // to the next page instead of wrapping to top of same
+                // page. Tester report (bug-hunt round 2): "user should
+                // be able to scroll down" — they pressed ↓ at item 3/3
+                // expecting more items, got page-1 row 1 instead of
+                // page-2 row 1. Cross-page traversal matches every
+                // other list-style TUI dialect.
+                if self.selected + 1 >= len {
+                    if self.page + 1 < self.page_count() {
+                        self.page += 1;
+                        self.selected = 0;
+                    } else {
+                        // Already on last item of last page — keep
+                        // wrap-to-top behavior for cyclic browsing.
+                        self.selected = 0;
+                    }
+                } else {
+                    self.selected += 1;
+                }
                 self.list_state.select(Some(self.selected));
             }
         }
@@ -664,11 +727,21 @@ impl ListPicker {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(search_border_color));
+        // ClawHub picker hits the network on Enter, not on every
+        // keystroke — pre-fix users typed and stared at the picker
+        // wondering why nothing happened. Use a kind-aware placeholder
+        // and a "banner" (rendered just below the search box) when a
+        // pending query is sitting unsubmitted.
+        let placeholder = if self.kind == ListPickerKind::ClawhubInstall {
+            "Type query, press Enter to search ClawHub…"
+        } else {
+            "Search…"
+        };
         let search_line = if self.query.is_empty() {
             let mut spans = vec![
                 Span::styled(" 🔎 ", Style::default().fg(sky)),
                 Span::styled(
-                    "Search…",
+                    placeholder,
                     Style::default().fg(muted).add_modifier(Modifier::ITALIC),
                 ),
             ];
@@ -686,6 +759,15 @@ impl ListPicker {
             ];
             if search_focused {
                 spans.push(Span::styled("▎", Style::default().fg(coral)));
+            }
+            // Inline call-to-action when a search is pending. Renders
+            // immediately to the right of the typed query so it sits at
+            // the natural eye-line after typing.
+            if self.kind == ListPickerKind::ClawhubInstall && self.search_pending {
+                spans.push(Span::styled(
+                    "   ↵ Enter to search ClawHub",
+                    Style::default().fg(emerald).add_modifier(Modifier::BOLD),
+                ));
             }
             Line::from(spans)
         };
@@ -814,19 +896,44 @@ impl ListPicker {
             frame.render_stateful_widget(list, list_area, &mut self.list_state);
         }
 
-        // Footer with hotkey help.
-        let footer = Line::from(vec![
-            Span::styled("↑/↓", Style::default().fg(sky)),
-            Span::styled(" navigate · ", Style::default().fg(muted)),
-            Span::styled("←/→", Style::default().fg(sky)),
-            Span::styled(" collapse · ", Style::default().fg(muted)),
-            Span::styled("type", Style::default().fg(sky)),
-            Span::styled(" to filter · ", Style::default().fg(muted)),
-            Span::styled("Enter", Style::default().fg(sky)),
-            Span::styled(" select · ", Style::default().fg(muted)),
-            Span::styled("Esc", Style::default().fg(sky)),
-            Span::styled(" cancel", Style::default().fg(muted)),
-        ]);
+        // Footer with hotkey help. ClawhubInstall has a two-mode Enter
+        // (search vs install depending on focus) so its hint differs.
+        let footer = if self.kind == ListPickerKind::ClawhubInstall {
+            Line::from(vec![
+                Span::styled("type + Enter", Style::default().fg(sky)),
+                Span::styled(" search · ", Style::default().fg(muted)),
+                Span::styled("↑/↓", Style::default().fg(sky)),
+                Span::styled(" navigate · ", Style::default().fg(muted)),
+                Span::styled("Enter", Style::default().fg(sky)),
+                Span::styled(" install · ", Style::default().fg(muted)),
+                Span::styled("Esc", Style::default().fg(sky)),
+                Span::styled(" close", Style::default().fg(muted)),
+            ])
+        } else if self.kind == ListPickerKind::Skill {
+            Line::from(vec![
+                Span::styled("↑/↓", Style::default().fg(sky)),
+                Span::styled(" navigate · ", Style::default().fg(muted)),
+                Span::styled("Ctrl+I", Style::default().fg(sky)),
+                Span::styled(" install deps · ", Style::default().fg(muted)),
+                Span::styled("Enter", Style::default().fg(sky)),
+                Span::styled(" use · ", Style::default().fg(muted)),
+                Span::styled("Esc", Style::default().fg(sky)),
+                Span::styled(" cancel", Style::default().fg(muted)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("↑/↓", Style::default().fg(sky)),
+                Span::styled(" navigate · ", Style::default().fg(muted)),
+                Span::styled("←/→", Style::default().fg(sky)),
+                Span::styled(" collapse · ", Style::default().fg(muted)),
+                Span::styled("type", Style::default().fg(sky)),
+                Span::styled(" to filter · ", Style::default().fg(muted)),
+                Span::styled("Enter", Style::default().fg(sky)),
+                Span::styled(" select · ", Style::default().fg(muted)),
+                Span::styled("Esc", Style::default().fg(sky)),
+                Span::styled(" cancel", Style::default().fg(muted)),
+            ])
+        };
         frame.render_widget(Paragraph::new(footer), chunks[5]);
     }
 }
@@ -845,6 +952,55 @@ mod tests {
 
     fn picker(items: Vec<ListPickerItem>) -> ListPicker {
         ListPicker::new(ListPickerKind::Model, "Test", items, None, "empty")
+    }
+
+    fn clawhub_picker(items: Vec<ListPickerItem>) -> ListPicker {
+        ListPicker::new(
+            ListPickerKind::ClawhubInstall,
+            "Install",
+            items,
+            None,
+            "empty",
+        )
+    }
+
+    #[test]
+    fn clawhub_picker_does_not_filter_locally_when_typing() {
+        // Tester contract: typing in the ClawhubInstall picker only
+        // updates the query buffer. Visible items must NOT shrink — the
+        // server search fires on Enter, and the picker stays put until
+        // results actually arrive. Local filtering would confuse users.
+        let mut p = clawhub_picker(vec![
+            item("github", "github"),
+            item("obsidian", "obsidian"),
+            item("weather", "weather"),
+        ]);
+        assert_eq!(p.visible_len(), 3);
+        p.push_query_char('g');
+        p.push_query_char('h');
+        // Query updated, but visible count unchanged — no local filter.
+        assert_eq!(p.query, "gh");
+        assert_eq!(p.visible_len(), 3);
+        p.push_query_char('z'); // garbage chars; still no filter
+        assert_eq!(p.visible_len(), 3);
+    }
+
+    #[test]
+    fn non_clawhub_picker_still_filters_locally() {
+        // Sanity: model/session/etc pickers retain local filter
+        // semantics — only ClawhubInstall opts out.
+        let mut p = picker(vec![
+            item("alpha", "alpha"),
+            item("beta", "beta"),
+            item("gamma", "gamma"),
+        ]);
+        assert_eq!(p.visible_len(), 3);
+        p.push_query_char('a');
+        // "alpha" and "gamma" both contain 'a', "beta" does too.
+        assert!(p.visible_len() < 4);
+        p.push_query_char('l');
+        // "al" only matches "alpha".
+        assert_eq!(p.visible_len(), 1);
     }
 
     #[test]

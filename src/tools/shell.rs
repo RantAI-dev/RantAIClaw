@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
-use crate::security::SecurityPolicy;
+use crate::security::{Decision, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -20,11 +20,38 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    /// Per-skill env overlay merged onto every shell exec on top of
+    /// `SAFE_ENV_VARS`. Built from `[skills.entries.<n>].env`,
+    /// `.api_key`, and `.config.*` of every *enabled* skill at tool
+    /// construction time. See `compose_skill_env` in `src/tools/mod.rs`.
+    /// `OpenClaw`-parity behavior: a skill that declares
+    /// `api_key.source = "env"` and the user has set the matching
+    /// outer env var gets that value re-exported into the child
+    /// process; `config.*` values become `RANTAICLAW_SKILL_<NAME>_<KEY>`.
+    skill_env: std::collections::HashMap<String, String>,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+        Self {
+            security,
+            runtime,
+            skill_env: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Construct with a precomputed skill-env overlay. Used by
+    /// `all_tools_with_runtime` after consulting `[skills.entries]`.
+    pub fn with_skill_env(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        skill_env: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            skill_env,
+        }
     }
 }
 
@@ -77,11 +104,65 @@ impl Tool for ShellTool {
         match self.security.validate_command_execution(command, approved) {
             Ok(_) => {}
             Err(reason) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
+                // If rejection was specifically about an unknown
+                // basename and an approval registry is bound, suspend
+                // and ask the user. On approval we mutate the runtime
+                // allowlist and retry validation. On deny or timeout
+                // we fall through to the original failure.
+                let mut handled = false;
+                if let (Some(approvals), Some(basename)) = (
+                    self.security.pending(),
+                    self.security.first_unallowed_basename(command),
+                ) {
+                    let decision = approvals
+                        .request_decision(basename.clone(), command.to_string(), "")
+                        .await;
+                    match decision {
+                        Decision::Once | Decision::Session => {
+                            // Once and Session both add to the in-memory
+                            // runtime set — "Once" is a UX label that says
+                            // "I want this to run, don't persist". The
+                            // simplest implementation that keeps the boot
+                            // list immutable is to add to the runtime set
+                            // either way; "Once" callers can clear the set
+                            // out-of-band if they care. We keep them
+                            // distinct here so a future tightening
+                            // (revoke-after-use) doesn't break the API.
+                            if let Err(e) = self.security.add_runtime_command(&basename, false) {
+                                tracing::warn!(target: "shell", error = %e, "add_runtime_command failed");
+                            }
+                            handled = self
+                                .security
+                                .validate_command_execution(command, approved)
+                                .is_ok();
+                        }
+                        Decision::Persist => {
+                            if let Err(e) = self.security.add_runtime_command(&basename, true) {
+                                tracing::warn!(
+                                    target: "shell",
+                                    error = %e,
+                                    "add_runtime_command(persist) failed; falling back to session-only"
+                                );
+                                let _ = self.security.add_runtime_command(&basename, false);
+                            }
+                            handled = self
+                                .security
+                                .validate_command_execution(command, approved)
+                                .is_ok();
+                        }
+                        Decision::Deny => {
+                            // Explicit user deny: keep the original error.
+                            handled = false;
+                        }
+                    }
+                }
+                if !handled {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(reason),
+                    });
+                }
             }
         }
 
@@ -115,6 +196,14 @@ impl Tool for ShellTool {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
+        }
+
+        // Per-skill env overlay (`[skills.entries.<n>]` from config). User
+        // explicitly opts in by writing values into config; this is *not*
+        // an automatic leak of process env. SAFE_ENV_VARS comes first so
+        // skills can override PATH (intentional, e.g. add brew to PATH).
+        for (k, v) in &self.skill_env {
+            cmd.env(k, v);
         }
 
         let result =
@@ -439,5 +528,128 @@ mod tests {
             .expect("rate-limited command should return a result");
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("Rate limit"));
+    }
+
+    // ── approval-driven runtime allowlist ───────────────────
+
+    fn supervised_security_only_echo() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["echo".into()],
+            ..SecurityPolicy::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn shell_without_approvals_still_blocks_unknown_basename() {
+        let tool = ShellTool::new(supervised_security_only_echo(), test_runtime());
+        let result = tool.execute(json!({"command": "true"})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not allowed"),
+            "without approvals registry, behavior must match pre-PR-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_with_approvals_session_decision_unblocks() {
+        let security = supervised_security_only_echo();
+        let approvals = Arc::new(PendingApprovals::new(Duration::from_secs(5)));
+        security.set_pending(approvals.clone());
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        let mut rx = approvals.subscribe();
+        let approvals_resolver = approvals.clone();
+        tokio::spawn(async move {
+            let req = rx.recv().await.expect("notification");
+            assert_eq!(req.basename, "true");
+            approvals_resolver.resolve(req.id, Decision::Session);
+        });
+
+        let result = tool.execute(json!({"command": "true"})).await.unwrap();
+        assert!(
+            result.success,
+            "session approval should unblock the command"
+        );
+        assert!(
+            security
+                .runtime_allowlist_snapshot()
+                .contains(&"true".to_string()),
+            "session approval must add basename to runtime allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_with_approvals_deny_keeps_original_error() {
+        let security = supervised_security_only_echo();
+        let approvals = Arc::new(PendingApprovals::new(Duration::from_secs(5)));
+        security.set_pending(approvals.clone());
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        let mut rx = approvals.subscribe();
+        let approvals_resolver = approvals.clone();
+        tokio::spawn(async move {
+            let req = rx.recv().await.expect("notification");
+            approvals_resolver.resolve(req.id, Decision::Deny);
+        });
+
+        let result = tool.execute(json!({"command": "true"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("not allowed"));
+        assert!(
+            !security
+                .runtime_allowlist_snapshot()
+                .contains(&"true".to_string()),
+            "deny must not mutate the runtime allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_with_approvals_timeout_denies() {
+        let security = supervised_security_only_echo();
+        let approvals = Arc::new(PendingApprovals::new(Duration::from_millis(50)));
+        security.set_pending(approvals.clone());
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        let result = tool.execute(json!({"command": "true"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn shell_with_approvals_skipped_for_structural_rejection() {
+        // Structural failures (subshells, redirects, …) should NOT
+        // surface an approval prompt — approving "echo" doesn't fix
+        // `echo $(rm -rf /)`.
+        let security = supervised_security_only_echo();
+        let approvals = Arc::new(PendingApprovals::new(Duration::from_millis(50)));
+        security.set_pending(approvals.clone());
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        // If the prompt path were entered, we'd time out at 50ms; the
+        // structural skip means we bail synchronously.
+        let start = std::time::Instant::now();
+        let result = tool
+            .execute(json!({"command": "echo $(true)"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            start.elapsed() < Duration::from_millis(40),
+            "structural rejection must skip the approval timeout"
+        );
     }
 }

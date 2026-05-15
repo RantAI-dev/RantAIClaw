@@ -59,15 +59,13 @@ pub fn run(opts: UninstallOpts) -> Result<()> {
     // 2. Remove profile data.
     for path in &scope.dirs_to_remove {
         if path.exists() {
-            fs::remove_dir_all(path)
-                .with_context(|| format!("remove {}", path.display()))?;
+            fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
             println!("  removed {}", path.display());
         }
     }
     for path in &scope.files_to_remove {
         if path.exists() {
-            fs::remove_file(path)
-                .with_context(|| format!("remove {}", path.display()))?;
+            fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
             println!("  removed {}", path.display());
         }
     }
@@ -243,11 +241,14 @@ fn self_delete_binary(path: &Path) -> Result<()> {
         // it to a sibling with a .delete-on-next-launch suffix and tell the
         // user to delete it manually after they exit.
         let mut sibling = path.to_path_buf();
-        let stem = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let stem = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         sibling.set_file_name(format!("{stem}.delete-on-next-launch"));
-        fs::rename(path, &sibling).with_context(|| {
-            format!("rename binary {} for deferred delete", path.display())
-        })?;
+        fs::rename(path, &sibling)
+            .with_context(|| format!("rename binary {} for deferred delete", path.display()))?;
         println!(
             "  binary moved to {}; delete it manually after this process exits",
             sibling.display()

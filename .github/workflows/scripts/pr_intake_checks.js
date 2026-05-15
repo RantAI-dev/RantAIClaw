@@ -131,7 +131,7 @@ module.exports = async ({ github, context, core }) => {
         "Workflow files changed in this PR:",
         ...workflowFilesChanged.map((name) => `- \`${name}\``),
         "",
-        "Reminder: workflow changes require owner approval via `CI Required Gate`.",
+        "Reminder: workflow files are also linted by `workflow-sanity.yml` (actionlint + tab check).",
       ].join("\n")
     : "";
 

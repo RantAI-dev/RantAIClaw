@@ -14,6 +14,8 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod approval_relay;
+pub mod auto_start_state;
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
@@ -215,6 +217,10 @@ struct ChannelRuntimeContext {
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
+    /// Shared security policy. Carries the runtime allowlist + bound
+    /// `PendingApprovals` registry. Read by the approval-reply parser
+    /// before each inbound message is routed to the agent.
+    security: Arc<crate::security::SecurityPolicy>,
 }
 
 #[derive(Clone)]
@@ -1320,10 +1326,17 @@ async fn process_channel_message(
         return;
     }
 
-    println!(
-        "  💬 [{}] from {}: {}",
-        msg.channel,
-        msg.sender,
+    // Pre-v0.6.7 used `println!` here, which leaks into the TUI's
+    // alt-screen and corrupts rendering when channels are auto-started
+    // alongside `rantaiclaw` (see screenshot in v0.6.6 tester report:
+    // "[telegram] from sulthannauval: can you help me here?" appearing
+    // in the local chat surface). Tracing routes to the log file in TUI
+    // mode and to whatever subscriber daemon mode installs — operator
+    // can `RUST_LOG=info` + tail the log file.
+    tracing::info!(
+        channel = %msg.channel,
+        sender = %msg.sender,
+        "channel message received: {}",
         truncate_with_ellipsis(&msg.content, 80)
     );
 
@@ -1370,7 +1383,7 @@ async fn process_channel_message(
             .await;
     }
 
-    println!("  ⏳ Processing message...");
+    tracing::info!("processing channel message");
     let started_at = Instant::now();
 
     let had_prior_history = ctx
@@ -1559,9 +1572,9 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
-            println!(
-                "  🤖 Reply ({}ms): {}",
-                started_at.elapsed().as_millis(),
+            tracing::info!(
+                ms = started_at.elapsed().as_millis() as u64,
+                "channel reply: {}",
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
@@ -1585,7 +1598,7 @@ async fn process_channel_message(
                     )
                     .await
                 {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                    tracing::error!(channel = %channel.name(), "failed to reply: {e}");
                 }
             }
         }
@@ -1699,6 +1712,27 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        // Intercept approval replies (`/allow X`, `deny X`, `y X`, …)
+        // before the message reaches the agent. The parser is
+        // stateless: it consults only `security.pending()` and
+        // returns an acknowledgement if the text was a recognised
+        // reply, otherwise `None`.
+        if let Some(reply) = approval_relay::try_handle_reply(&msg.content, ctx.security.as_ref()) {
+            if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
+                let ack = traits::SendMessage::new(reply, msg.reply_target.clone())
+                    .in_thread(msg.thread_ts.clone());
+                if let Err(e) = channel.send(&ack).await {
+                    tracing::warn!(
+                        target: "approval_relay",
+                        channel = %msg.channel,
+                        error = %e,
+                        "failed to deliver approval ack"
+                    );
+                }
+            }
+            continue;
+        }
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
@@ -2752,10 +2786,19 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
+    let policy_dir = crate::profile::ProfileManager::active()
+        .ok()
+        .map(|p| p.policy_dir());
+    let security = Arc::new(SecurityPolicy::from_config_with_policy_dir(
         &config.autonomy,
         &config.workspace_dir,
+        policy_dir,
     ));
+    // Bind an async-approval registry to the policy so shell tool
+    // calls in Supervised mode can ask the user via chat reply when
+    // they hit an unknown basename.
+    let pending = Arc::new(crate::security::PendingApprovals::default());
+    security.set_pending(pending);
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
@@ -2879,8 +2922,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if !skills.is_empty() {
-        println!(
-            "  🧩 Skills:   {}",
+        tracing::info!(
+            "Skills loaded: {}",
             skills
                 .iter()
                 .map(|s| s.name.as_str())
@@ -3075,32 +3118,26 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
-        println!("No channels configured. Run `rantaiclaw onboard` to set up channels.");
+        tracing::info!("No channels configured. Run `rantaiclaw onboard` to set up channels.");
         return Ok(());
     }
 
-    println!("🦀 RantaiClaw Channel Server");
-    println!("  🤖 Model:    {model}");
     let effective_backend = memory::effective_memory_backend_name(
         &config.memory.backend,
         Some(&config.storage.provider.config),
     );
-    println!(
-        "  🧠 Memory:   {} (auto-save: {})",
+    tracing::info!(
+        "RantaiClaw Channel Server: model={} memory={} (auto-save={}) channels={}",
+        model,
         effective_backend,
-        if config.memory.auto_save { "on" } else { "off" }
-    );
-    println!(
-        "  📡 Channels: {}",
+        if config.memory.auto_save { "on" } else { "off" },
         channels
             .iter()
             .map(|c| c.name())
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!();
-    println!("  Listening for messages... (Ctrl+C to stop)");
-    println!();
+    tracing::info!("Channel listeners running (Ctrl+C to stop)");
 
     crate::health::mark_component_ok("channels");
 
@@ -3136,7 +3173,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     );
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
-    println!("  🚦 In-flight message limit: {max_in_flight_messages}");
+    tracing::info!("In-flight message limit: {max_in_flight_messages}");
 
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
@@ -3172,6 +3209,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
+        security: Arc::clone(&security),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3348,6 +3386,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -3800,6 +3839,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -3857,6 +3897,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -3914,6 +3955,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -3980,6 +4022,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4067,6 +4110,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4136,6 +4180,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4220,6 +4265,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4289,6 +4335,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4347,6 +4394,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4516,6 +4564,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4594,6 +4643,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4684,6 +4734,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4756,6 +4807,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -4954,6 +5006,8 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
+            requires: Default::default(),
+            install_recipes: Vec::new(),
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
@@ -4989,6 +5043,8 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
+            requires: Default::default(),
+            install_recipes: Vec::new(),
         }];
 
         let prompt = build_system_prompt_with_mode(
@@ -5030,6 +5086,8 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
+            requires: Default::default(),
+            install_recipes: Vec::new(),
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
@@ -5258,6 +5316,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -5341,6 +5400,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -5424,6 +5484,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         });
 
         process_channel_message(

@@ -19,6 +19,14 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
+    // Auto-managed external services (e.g. SearXNG) — opt-in via
+    // [services.<name>] auto_launch = true. Started before gateway/channels so
+    // tools constructed at request time see ready endpoints.
+    let services = crate::services::create_services(&config.services);
+    if !services.is_empty() {
+        crate::services::start_all(&services).await;
+    }
+
     // Write per-profile sentinel so `profile use` knows a daemon is bound.
     // Best-effort — failure to write must not block the daemon.
     let active_profile = std::env::var("RANTAICLAW_PROFILE").unwrap_or_else(|_| "default".into());
@@ -116,6 +124,12 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     }
     for handle in handles {
         let _ = handle.await;
+    }
+
+    // Stop auto-managed services after the supervised components have been aborted,
+    // so in-flight tool calls don't get a torn-down container mid-request.
+    if !services.is_empty() {
+        crate::services::stop_all(&services).await;
     }
 
     // Clear sentinel — best-effort; a stale sentinel from a crash will be

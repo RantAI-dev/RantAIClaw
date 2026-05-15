@@ -44,6 +44,13 @@ pub struct SetupOverlayState {
     /// Last viewport height (frame area) observed at render. Used by
     /// scroll-clamping + page-size calculations.
     last_viewport_height: u16,
+    /// Vertical scroll offset for the choose picker (independent of the
+    /// log panel's `scroll`). Clamped at render time. Auto-adjusted by
+    /// `choose_move_up/down` so the cursor stays in view.
+    choose_scroll: usize,
+    /// Height of the choose options viewport at last render — used by
+    /// `choose_scroll_page_*` for full-page jumps.
+    last_choose_viewport: u16,
     /// True when the provisioner has emitted Done or Failed. Overlay
     /// stays open in this state so the user can read the final
     /// summary; Esc dismisses (handled by the app, not auto-close).
@@ -108,6 +115,11 @@ impl SetupOverlayState {
                     selected: Vec::new(),
                 });
             }
+            ProvisionEvent::OpenSkillInstallPicker { .. } => {
+                // Intercepted upstream by the App's drain_events — should
+                // not reach the overlay. Treat any leak as a no-op so the
+                // overlay doesn't get confused by an unexpected variant.
+            }
             ProvisionEvent::Done { summary } => {
                 self.log.push(format!("✓ {summary}"));
                 self.log.push(String::new());
@@ -142,6 +154,7 @@ impl SetupOverlayState {
                 c.cursor -= 1;
             }
         }
+        self.clamp_choose_scroll_to_cursor();
     }
 
     pub fn choose_move_down(&mut self) {
@@ -149,6 +162,63 @@ impl SetupOverlayState {
             if c.cursor + 1 < c.options.len() {
                 c.cursor += 1;
             }
+        }
+        self.clamp_choose_scroll_to_cursor();
+    }
+
+    /// Page up within the choose picker. Moves cursor by viewport height.
+    pub fn choose_page_up(&mut self) {
+        let step = self.last_choose_viewport.saturating_sub(1).max(1) as usize;
+        if let Some(c) = self.choose.as_mut() {
+            c.cursor = c.cursor.saturating_sub(step);
+        }
+        self.clamp_choose_scroll_to_cursor();
+    }
+
+    /// Page down within the choose picker. Moves cursor by viewport height,
+    /// clamped to the last option.
+    pub fn choose_page_down(&mut self) {
+        let step = self.last_choose_viewport.saturating_sub(1).max(1) as usize;
+        if let Some(c) = self.choose.as_mut() {
+            let last = c.options.len().saturating_sub(1);
+            c.cursor = (c.cursor + step).min(last);
+        }
+        self.clamp_choose_scroll_to_cursor();
+    }
+
+    /// Jump cursor to the first option.
+    pub fn choose_home(&mut self) {
+        if let Some(c) = self.choose.as_mut() {
+            c.cursor = 0;
+        }
+        self.choose_scroll = 0;
+    }
+
+    /// Jump cursor to the last option.
+    pub fn choose_end(&mut self) {
+        if let Some(c) = self.choose.as_mut() {
+            c.cursor = c.options.len().saturating_sub(1);
+        }
+        self.clamp_choose_scroll_to_cursor();
+    }
+
+    /// Adjust `choose_scroll` so the cursor row is visible. Called after
+    /// any cursor movement. With one-row-per-option rendering, this keeps
+    /// the cursor anywhere in the viewport [scroll, scroll + viewport).
+    fn clamp_choose_scroll_to_cursor(&mut self) {
+        let Some(c) = self.choose.as_ref() else {
+            return;
+        };
+        let viewport = self.last_choose_viewport.max(1) as usize;
+        // If cursor is above viewport, scroll up to it.
+        if c.cursor < self.choose_scroll {
+            self.choose_scroll = c.cursor;
+        }
+        // If cursor is at/below viewport bottom, scroll down so cursor is
+        // the last visible row.
+        let bottom = self.choose_scroll + viewport;
+        if c.cursor >= bottom {
+            self.choose_scroll = c.cursor.saturating_sub(viewport.saturating_sub(1));
         }
     }
 
@@ -170,6 +240,8 @@ impl SetupOverlayState {
     pub fn submit_choose(&mut self) -> Option<(String, Vec<usize>)> {
         let c = self.choose.take()?;
         let sel = if c.multi { c.selected } else { vec![c.cursor] };
+        // Reset scroll so the next choose picker starts at the top.
+        self.choose_scroll = 0;
         Some((c.id, sel))
     }
 
@@ -261,12 +333,31 @@ impl SetupOverlayState {
 
         // Compute the heights of the optional prompt + choose blocks
         // so the surrounding spacers can collapse cleanly when empty.
+        //
+        // `choose_h` is capped to the space the layout can actually give
+        // it — without the cap, a ClawHub picker with 20+ options would
+        // claim 24+ rows of `Length`, the layout would clamp the chunk
+        // to whatever the terminal allows, but `last_choose_viewport`
+        // (set during render of the inner options area) would still
+        // reflect the requested height. `clamp_choose_scroll_to_cursor`
+        // then never engages, the user presses Down past the bottom row,
+        // and the cursor moves into clipped-but-invisible rows. Bug-hunt
+        // round 2 reported exactly this on "Select ClawHub skills".
+        //
+        // Reserve fixed chrome: brand(2) + top rule(1) + spacer(1) +
+        // spacer-after-interactive(1, conditional) + status-log min(3) +
+        // bottom rule(1) + footer(1) = 9–10 rows. Anything above that
+        // goes to the interactive region.
         let prompt_block_h: u16 = if self.prompt.is_some() { 3 } else { 0 };
-        let choose_h: u16 = self
+        let raw_choose_h: u16 = self
             .choose
             .as_ref()
             .map(|c| (c.options.len() as u16).saturating_add(4)) // section + headline + rule + spacer
             .unwrap_or(0);
+        let fixed_chrome: u16 = 2 + 1 + 1 + 1 + 3 + 1 + 1; // see comment above
+        let max_interactive_h = outer.height.saturating_sub(fixed_chrome);
+        let max_choose_h = max_interactive_h.saturating_sub(prompt_block_h);
+        let choose_h: u16 = raw_choose_h.min(max_choose_h);
         let interactive_h = prompt_block_h.saturating_add(choose_h);
         let interactive_spacer: u16 = if interactive_h > 0 { 1 } else { 0 };
 
@@ -424,7 +515,7 @@ impl SetupOverlayState {
     }
 
     fn render_choose_block(
-        &self,
+        &mut self,
         f: &mut Frame,
         area: Rect,
         coral: Color,
@@ -449,7 +540,21 @@ impl SetupOverlayState {
             ])
             .split(area);
 
+        // Section label with a right-aligned cursor position indicator
+        // ("4/12 · 2 selected") so the user always knows where they are
+        // in long lists. Without this, ClawHub's 20-skill picker felt
+        // bottomless on first-time setup.
         let kind_label = if c.multi { "MULTI · CHOOSE" } else { "CHOOSE" };
+        let total = c.options.len();
+        let pos_text = if c.multi {
+            format!("{}/{} · {} selected", c.cursor + 1, total, c.selected.len())
+        } else {
+            format!("{}/{}", c.cursor + 1, total)
+        };
+        let label_w = chunks[0].width as usize;
+        let kind_w = kind_label.chars().count() + 3; // glyph + space
+        let pos_w = pos_text.chars().count();
+        let pad = label_w.saturating_sub(kind_w + pos_w);
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("⌗  ", Style::default().fg(coral)),
@@ -459,6 +564,8 @@ impl SetupOverlayState {
                         .fg(coral)
                         .add_modifier(Modifier::BOLD | Modifier::ITALIC),
                 ),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(pos_text, Style::default().fg(muted)),
             ])),
             chunks[0],
         );
@@ -486,9 +593,41 @@ impl SetupOverlayState {
             chunks[2],
         );
 
-        // Options — column-aligned with refined glyphs.
-        let mut option_lines: Vec<Line> = Vec::with_capacity(c.options.len());
-        for (i, opt) in c.options.iter().enumerate() {
+        // Cache the viewport height so cursor-keys can keep the cursor
+        // visible (clamp_choose_scroll_to_cursor reads this).
+        let opts_area = chunks[3];
+        let viewport = opts_area.height as usize;
+        self.last_choose_viewport = opts_area.height;
+
+        // Clamp scroll one more time at render — handles initial render
+        // before any cursor key has been pressed.
+        let total = c.options.len();
+        let max_scroll = total.saturating_sub(viewport.max(1));
+        if self.choose_scroll > max_scroll {
+            self.choose_scroll = max_scroll;
+        }
+        if c.cursor < self.choose_scroll {
+            self.choose_scroll = c.cursor;
+        }
+        let bottom = self.choose_scroll + viewport;
+        if c.cursor >= bottom && viewport > 0 {
+            self.choose_scroll = c.cursor + 1 - viewport;
+        }
+
+        // Reserve fixed-width prefix: ` ▸  ▣  ` = 7 cols. Truncate the
+        // label to the remaining width so each option is exactly one row
+        // — no wrap, predictable alignment, scroll math stays correct.
+        let prefix_cols: usize = 7;
+        let label_width = (opts_area.width as usize).saturating_sub(prefix_cols);
+
+        let visible_count = total.min(viewport);
+        let mut option_lines: Vec<Line> = Vec::with_capacity(visible_count);
+        for offset in 0..visible_count {
+            let i = self.choose_scroll + offset;
+            if i >= total {
+                break;
+            }
+            let opt = &c.options[i];
             let is_cursor = i == c.cursor;
             let is_checked = c.selected.contains(&i);
 
@@ -526,16 +665,17 @@ impl SetupOverlayState {
                 Style::default().fg(muted)
             };
 
+            let label = truncate_to_width(opt, label_width);
+
             option_lines.push(Line::from(vec![
                 Span::styled(format!(" {arrow}  "), arrow_style),
                 Span::styled(format!("{marker}  "), marker_style),
-                Span::styled(opt.clone(), label_style),
+                Span::styled(label, label_style),
             ]));
         }
-        f.render_widget(
-            Paragraph::new(option_lines).wrap(Wrap { trim: false }),
-            chunks[3],
-        );
+        // No wrap — each option is exactly one row. Long labels are
+        // already truncated above, so wrap would only hide bugs.
+        f.render_widget(Paragraph::new(option_lines), opts_area);
     }
 
     fn render_status_log(
@@ -612,8 +752,8 @@ impl SetupOverlayState {
             header_spans.push(Span::styled(
                 format!(
                     "  {}{}",
-                    if !at_top { "↑" } else { " " },
-                    if !at_bot { "↓" } else { " " },
+                    if at_top { " " } else { "↑" },
+                    if at_bot { " " } else { "↓" },
                 ),
                 Style::default().fg(if at_top && at_bot { dim } else { sky }),
             ));
@@ -659,6 +799,8 @@ impl SetupOverlayState {
             let mut v = vec![
                 Span::styled("↑/↓ ", Style::default().fg(sky)),
                 Span::styled("navigate    ", Style::default().fg(muted)),
+                Span::styled("PgUp/PgDn ", Style::default().fg(sky)),
+                Span::styled("page    ", Style::default().fg(muted)),
             ];
             if multi {
                 v.push(Span::styled("Space ", Style::default().fg(sky)));
@@ -727,18 +869,34 @@ impl SetupOverlayState {
                 ),
                 Span::styled(" ", Style::default()),
             ]));
-        let lines: Vec<Line> = self
-            .log
-            .iter()
-            .map(|l| Line::from(l.as_str()))
-            .collect();
-        let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        let lines: Vec<Line> = self.log.iter().map(|l| Line::from(l.as_str())).collect();
+        let para = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
         f.render_widget(para, area);
         let _ = muted;
     }
 }
 
-fn style_log_line<'a>(l: &'a str, coral: Color, sky: Color, emerald: Color) -> Line<'a> {
+/// Truncate `s` to fit within `max_cols` display columns, appending an
+/// ellipsis when shortened. Counts unicode characters (not bytes), but
+/// treats every char as one column — fine for the Latin-heavy skill /
+/// channel labels we render today; revisit if we ever pick up east-Asian
+/// option text.
+fn truncate_to_width(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= max_cols {
+        return s.to_string();
+    }
+    let take = max_cols.saturating_sub(1);
+    let truncated: String = s.chars().take(take).collect();
+    format!("{truncated}…")
+}
+
+fn style_log_line(l: &str, coral: Color, sky: Color, emerald: Color) -> Line<'_> {
     if let Some(rest) = l.strip_prefix("· ") {
         Line::from(vec![
             Span::styled("· ", Style::default().fg(sky)),
@@ -775,7 +933,7 @@ fn render_horizontal_rule(f: &mut Frame, area: Rect, dim: Color) {
     if w == 0 {
         return;
     }
-    let line: String = std::iter::repeat('─').take(w).collect();
+    let line: String = std::iter::repeat_n('─', w).collect();
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(line, Style::default().fg(dim)))),
         area,
@@ -787,5 +945,100 @@ fn render_qr_block(payload: &str) -> String {
     match QrCode::new(payload.as_bytes()) {
         Ok(qr) => qr.render::<unicode::Dense1x2>().build(),
         Err(_) => format!("[QR render failed; raw payload: {payload}]"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onboard::provision::ProvisionEvent;
+
+    fn open_choose(opts: &[&str], multi: bool) -> SetupOverlayState {
+        let mut s = SetupOverlayState::new("test");
+        s.handle_event(ProvisionEvent::Choose {
+            id: "test".into(),
+            label: "Pick one".into(),
+            options: opts.iter().map(|x| (*x).to_string()).collect(),
+            multi,
+        });
+        s
+    }
+
+    #[test]
+    fn truncate_to_width_passes_through_short_strings() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("hi", 2), "hi");
+    }
+
+    #[test]
+    fn truncate_to_width_appends_ellipsis_when_shortened() {
+        assert_eq!(truncate_to_width("abcdefgh", 5), "abcd…");
+    }
+
+    #[test]
+    fn truncate_to_width_handles_zero_width() {
+        assert_eq!(truncate_to_width("anything", 0), "");
+    }
+
+    #[test]
+    fn choose_move_down_advances_cursor() {
+        let mut s = open_choose(&["a", "b", "c"], false);
+        s.choose_move_down();
+        s.choose_move_down();
+        assert_eq!(s.active_choose().unwrap().cursor, 2);
+    }
+
+    #[test]
+    fn choose_move_down_clamps_at_last_option() {
+        let mut s = open_choose(&["a", "b"], false);
+        s.choose_move_down();
+        s.choose_move_down();
+        s.choose_move_down();
+        assert_eq!(s.active_choose().unwrap().cursor, 1);
+    }
+
+    #[test]
+    fn choose_end_jumps_to_last_option() {
+        let mut s = open_choose(&["a", "b", "c", "d", "e"], true);
+        s.choose_end();
+        assert_eq!(s.active_choose().unwrap().cursor, 4);
+    }
+
+    #[test]
+    fn choose_home_jumps_to_first_and_resets_scroll() {
+        let mut s = open_choose(&["a", "b", "c"], false);
+        s.choose_scroll = 5;
+        s.choose_home();
+        assert_eq!(s.active_choose().unwrap().cursor, 0);
+        assert_eq!(s.choose_scroll, 0);
+    }
+
+    #[test]
+    fn choose_page_down_jumps_by_viewport_height() {
+        let mut s = open_choose(&["a", "b", "c", "d", "e", "f", "g"], false);
+        s.last_choose_viewport = 3;
+        s.choose_page_down();
+        // Page down moves cursor by viewport-1 = 2 rows.
+        assert_eq!(s.active_choose().unwrap().cursor, 2);
+    }
+
+    #[test]
+    fn choose_scroll_clamps_when_cursor_moves_below_viewport() {
+        let mut s = open_choose(&["a", "b", "c", "d", "e", "f", "g", "h"], false);
+        s.last_choose_viewport = 3;
+        // Move down 5 times; cursor=5, viewport=3 → scroll should be 3.
+        for _ in 0..5 {
+            s.choose_move_down();
+        }
+        assert_eq!(s.active_choose().unwrap().cursor, 5);
+        assert_eq!(s.choose_scroll, 3);
+    }
+
+    #[test]
+    fn submit_choose_resets_scroll() {
+        let mut s = open_choose(&["a", "b", "c"], false);
+        s.choose_scroll = 2;
+        let _ = s.submit_choose();
+        assert_eq!(s.choose_scroll, 0);
     }
 }

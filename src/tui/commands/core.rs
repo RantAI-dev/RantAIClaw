@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
-use crate::tui::widgets::{ListPicker, ListPickerEntry, ListPickerItem, ListPickerKind};
+use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 
 /// /help command — open an interactive command picker. With no args,
 /// shows every registered command (filterable, paginated). Selecting a
@@ -133,11 +133,11 @@ mod tests {
                 assert!(picker
                     .entries()
                     .iter()
-                    .any(|e| matches!(e, ListPickerEntry::Item(i) if i.key == "quit")));
+                    .any(|e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.key == "quit")));
                 assert!(picker
                     .entries()
                     .iter()
-                    .any(|e| matches!(e, ListPickerEntry::Item(i) if i.primary == "/quit")));
+                    .any(|e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.primary == "/quit")));
             }
             other => panic!("Expected OpenListPicker, got {other:?}"),
         }

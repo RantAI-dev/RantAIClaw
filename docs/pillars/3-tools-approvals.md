@@ -7,7 +7,7 @@ The blast radius surface. Every tool call routes through one approval gate befor
 ## What this pillar covers
 
 - Built-in tools (shell, file, memory, browser, hardware, MCP-bridged)
-- Approval gate (L1 strict → L4 auto presets, per-agent overrides)
+- Approval gate (Manual / Smart / Strict / Off presets, per-agent overrides)
 - Command allowlist + path traversal + injection blocking
 - Rate limiting (default 20 actions/hour)
 - Basic audit log under `<profile>/audit/`
@@ -17,7 +17,7 @@ The blast radius surface. Every tool call routes through one approval gate befor
 | | RantaiClaw | OpenClaw | Hermes-agent |
 |---|---|---|---|
 | Approval gate (single chokepoint) | ✅ | ✅ | TBD |
-| L1-L4 policy presets | ✅ | TBD | TBD |
+| Manual / Smart / Strict / Off policy presets | ✅ | TBD | TBD |
 | Command allowlist (deny-by-default) | ✅ | TBD | TBD |
 | Injection blocking (`$()`, backticks, `&&`, `>`) | ✅ | TBD | TBD |
 | Path traversal protection | ✅ | TBD | TBD |
@@ -28,7 +28,7 @@ The blast radius surface. Every tool call routes through one approval gate befor
 | Surface | Maturity |
 |---|---|
 | Approval gate (single path between LLM and execution) | Stable |
-| L1-L4 presets + per-agent overrides | Stable |
+| Manual / Smart / Strict / Off presets + per-agent overrides | Stable |
 | Command allowlist | Stable |
 | Path-traversal + injection blocking | Stable |
 | Rate limiting | Stable |
@@ -59,7 +59,7 @@ src/security/      ← rate limit + audit
 ## CLI / config
 
 ```bash
-rantaiclaw setup approvals              # pick L1-L4 preset
+rantaiclaw setup approvals              # pick Manual / Smart / Strict / Off preset
 ```
 
 ```toml
@@ -74,4 +74,4 @@ max_actions_per_hour = 20
 
 ## Roadmap
 
-- [v0.6.0 — Product Completeness Beta](https://app.clickup.com/t/86exgu406) — Setup: Approvals validates L1-L4 path coverage; Resilience: Audit log verifies the v0.5.0 basic audit log survives restart + corruption
+- [v0.6.0 — Product Completeness Beta](https://app.clickup.com/t/86exgu406) — Setup: Approvals validates the four preset paths (Manual / Smart / Strict / Off); Resilience: Audit log verifies the v0.5.0 basic audit log survives restart + corruption

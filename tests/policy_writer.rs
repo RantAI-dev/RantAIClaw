@@ -1,7 +1,7 @@
 //! Wave 4A — `policy_writer` integration tests.
 //!
 //! Spec: `docs/superpowers/specs/2026-04-27-onboarding-depth-v2-design.md`,
-//! §6 "Approval runtime" + §"L1-L4 presets".
+//! §6 "Approval runtime" + §"Preset bundles" (Manual / Smart / Strict / Off).
 //!
 //! `write_policy_files(profile, preset, force)` materialises three TOML
 //! files under `<profile>/policy/`:
@@ -63,24 +63,24 @@ fn assert_policy_files_exist(profile: &rantaiclaw::profile::Profile) {
 }
 
 #[test]
-fn l1_writes_three_files_with_manual_mode_and_empty_allowlist() {
+fn manual_writes_three_files_with_manual_mode_and_empty_allowlist() {
     with_home(|| {
         let profile = ProfileManager::ensure_default().unwrap();
-        policy_writer::write_policy_files(&profile, PolicyPreset::L1Manual, false)
-            .expect("L1 write should succeed");
+        policy_writer::write_policy_files(&profile, PolicyPreset::Manual, false)
+            .expect("Manual write should succeed");
 
         assert_policy_files_exist(&profile);
 
         let autonomy = std::fs::read_to_string(profile.policy_dir().join("autonomy.toml")).unwrap();
-        assert!(autonomy.contains("preset = \"L1\""));
+        assert!(autonomy.contains("preset = \"manual\""));
         assert!(autonomy.contains("mode = \"manual\""));
 
         let allowlist =
             std::fs::read_to_string(profile.policy_dir().join("command_allowlist.toml")).unwrap();
-        // L1 ships with no preallowed patterns.
+        // Manual ships with no preallowed patterns.
         assert!(
             allowlist.contains("patterns = []"),
-            "L1 allowlist should be empty, got:\n{}",
+            "Manual allowlist should be empty, got:\n{}",
             allowlist
         );
 
@@ -93,22 +93,22 @@ fn l1_writes_three_files_with_manual_mode_and_empty_allowlist() {
 }
 
 #[test]
-fn l2_seeds_safe_read_only_commands() {
+fn smart_seeds_safe_read_only_commands() {
     with_home(|| {
         let profile = ProfileManager::ensure_default().unwrap();
-        policy_writer::write_policy_files(&profile, PolicyPreset::L2Smart, false)
-            .expect("L2 write should succeed");
+        policy_writer::write_policy_files(&profile, PolicyPreset::Smart, false)
+            .expect("Smart write should succeed");
         assert_policy_files_exist(&profile);
 
         let autonomy = std::fs::read_to_string(profile.policy_dir().join("autonomy.toml")).unwrap();
-        assert!(autonomy.contains("preset = \"L2\""));
+        assert!(autonomy.contains("preset = \"smart\""));
 
         let allowlist =
             std::fs::read_to_string(profile.policy_dir().join("command_allowlist.toml")).unwrap();
         for needle in ["\"ls\"", "\"cat *\"", "\"git status\"", "\"grep *\""] {
             assert!(
                 allowlist.contains(needle),
-                "L2 allowlist should contain {needle}, got:\n{allowlist}"
+                "Smart allowlist should contain {needle}, got:\n{allowlist}"
             );
         }
 
@@ -120,23 +120,23 @@ fn l2_seeds_safe_read_only_commands() {
 }
 
 #[test]
-fn l3_uses_strict_mode_with_safe_write_seeds() {
+fn strict_uses_strict_mode_with_safe_write_seeds() {
     with_home(|| {
         let profile = ProfileManager::ensure_default().unwrap();
-        policy_writer::write_policy_files(&profile, PolicyPreset::L3Strict, false)
-            .expect("L3 write should succeed");
+        policy_writer::write_policy_files(&profile, PolicyPreset::Strict, false)
+            .expect("Strict write should succeed");
         assert_policy_files_exist(&profile);
 
         let autonomy = std::fs::read_to_string(profile.policy_dir().join("autonomy.toml")).unwrap();
-        assert!(autonomy.contains("preset = \"L3\""));
+        assert!(autonomy.contains("preset = \"strict\""));
         assert!(
             autonomy.contains("mode = \"strict\""),
-            "L3 must run in strict mode, got:\n{autonomy}"
+            "Strict must run in strict mode, got:\n{autonomy}"
         );
 
         let allowlist =
             std::fs::read_to_string(profile.policy_dir().join("command_allowlist.toml")).unwrap();
-        // L3 keeps the read-only seeds *and* adds safe-write entries.
+        // Strict keeps the read-only seeds *and* adds safe-write entries.
         assert!(allowlist.contains("\"memory_write *\""));
         assert!(allowlist.contains("\"skill_install *\""));
         assert!(allowlist.contains("\"cron_*\""));
@@ -144,23 +144,23 @@ fn l3_uses_strict_mode_with_safe_write_seeds() {
 }
 
 #[test]
-fn l4_disables_gating_and_keeps_secret_floor() {
+fn off_disables_gating_and_keeps_secret_floor() {
     with_home(|| {
         let profile = ProfileManager::ensure_default().unwrap();
-        policy_writer::write_policy_files(&profile, PolicyPreset::L4Off, false)
-            .expect("L4 write should succeed");
+        policy_writer::write_policy_files(&profile, PolicyPreset::Off, false)
+            .expect("Off write should succeed");
         assert_policy_files_exist(&profile);
 
         let autonomy = std::fs::read_to_string(profile.policy_dir().join("autonomy.toml")).unwrap();
-        assert!(autonomy.contains("preset = \"L4\""));
+        assert!(autonomy.contains("preset = \"off\""));
         assert!(
             autonomy.contains("mode = \"off\""),
-            "L4 must set mode=off, got:\n{autonomy}"
+            "Off must set mode=off, got:\n{autonomy}"
         );
 
         let forbidden =
             std::fs::read_to_string(profile.policy_dir().join("forbidden_paths.toml")).unwrap();
-        // Even L4 keeps the rantaiclaw-secrets fence — non-negotiable.
+        // Even Off keeps the rantaiclaw-secrets fence — non-negotiable.
         assert!(forbidden.contains("~/.rantaiclaw/secrets/**"));
     });
 }
@@ -169,14 +169,14 @@ fn l4_disables_gating_and_keeps_secret_floor() {
 fn write_is_idempotent_without_force() {
     with_home(|| {
         let profile = ProfileManager::ensure_default().unwrap();
-        policy_writer::write_policy_files(&profile, PolicyPreset::L2Smart, false).unwrap();
+        policy_writer::write_policy_files(&profile, PolicyPreset::Smart, false).unwrap();
 
         // Mutate the autonomy file as the user would.
         let path = profile.policy_dir().join("autonomy.toml");
         std::fs::write(&path, "# user-edited\npreset = \"custom\"\n").unwrap();
 
         // Re-run without force — must NOT clobber the user edit.
-        policy_writer::write_policy_files(&profile, PolicyPreset::L1Manual, false).unwrap();
+        policy_writer::write_policy_files(&profile, PolicyPreset::Manual, false).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -190,13 +190,13 @@ fn write_is_idempotent_without_force() {
 fn force_overwrites_existing_files() {
     with_home(|| {
         let profile = ProfileManager::ensure_default().unwrap();
-        policy_writer::write_policy_files(&profile, PolicyPreset::L1Manual, false).unwrap();
+        policy_writer::write_policy_files(&profile, PolicyPreset::Manual, false).unwrap();
 
-        // Force-rewrite with L4. autonomy.toml must now reflect L4.
-        policy_writer::write_policy_files(&profile, PolicyPreset::L4Off, true).unwrap();
+        // Force-rewrite with Off. autonomy.toml must now reflect Off.
+        policy_writer::write_policy_files(&profile, PolicyPreset::Off, true).unwrap();
 
         let autonomy = std::fs::read_to_string(profile.policy_dir().join("autonomy.toml")).unwrap();
-        assert!(autonomy.contains("preset = \"L4\""));
+        assert!(autonomy.contains("preset = \"off\""));
         assert!(autonomy.contains("mode = \"off\""));
     });
 }
@@ -206,14 +206,21 @@ fn preset_str_round_trips() {
     // Quick sanity over the four variants — mostly to catch a future
     // accidental rename without the test breaking compile-time.
     let cases: [(&str, PolicyPreset); 4] = [
-        ("L1", PolicyPreset::L1Manual),
-        ("L2", PolicyPreset::L2Smart),
-        ("L3", PolicyPreset::L3Strict),
-        ("L4", PolicyPreset::L4Off),
+        ("manual", PolicyPreset::Manual),
+        ("smart", PolicyPreset::Smart),
+        ("strict", PolicyPreset::Strict),
+        ("off", PolicyPreset::Off),
     ];
     for (name, expected) in cases {
         assert_eq!(PolicyPreset::from_str_ci(name).unwrap(), expected);
         assert_eq!(expected.id(), name);
     }
+    // Legacy ids still parse for backward compat with old configs.
+    assert_eq!(
+        PolicyPreset::from_str_ci("L1").unwrap(),
+        PolicyPreset::Manual
+    );
+    assert_eq!(PolicyPreset::from_str_ci("L4").unwrap(), PolicyPreset::Off);
     assert!(PolicyPreset::from_str_ci("L99").is_err());
+    assert!(PolicyPreset::from_str_ci("paranoid").is_err());
 }

@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod api_v1;
 pub mod task_handlers;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
@@ -676,6 +677,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment),
         )
         .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
+        .merge(api_v1::router())
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(

@@ -32,6 +32,20 @@ pub struct Agent {
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
+    /// Shared security policy handle. Held on the agent so external
+    /// callers (TUI slash commands, channel reply parsers) can mutate
+    /// the runtime allowlist without re-deriving the policy from
+    /// config. `None` for agents constructed via the bare builder
+    /// (tests, custom embeds); always `Some` after `from_config`.
+    security: Option<Arc<SecurityPolicy>>,
+    /// MCP server health snapshot taken during `from_config`. Used
+    /// by the TUI's `/mcp` slash command to show which servers
+    /// connected vs. failed without re-probing.
+    mcp_health: Vec<crate::mcp::discover::McpServerHealth>,
+    /// Per-server qualified-tool-name list captured from MCP
+    /// discovery. Mirrors `mcp_health` but is keyed by server name
+    /// for `/mcp` rendering.
+    mcp_tools_by_server: std::collections::HashMap<String, Vec<String>>,
     identity_config: crate::config::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
@@ -210,6 +224,9 @@ impl AgentBuilder {
             workspace_dir: self
                 .workspace_dir
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
+            security: None,
+            mcp_health: Vec::new(),
+            mcp_tools_by_server: std::collections::HashMap::new(),
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
@@ -243,15 +260,24 @@ impl Agent {
         self.history.clear();
     }
 
-    pub fn from_config(config: &Config) -> Result<Self> {
+    pub async fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn runtime::RuntimeAdapter> =
             Arc::from(runtime::create_runtime(&config.runtime)?);
-        let security = Arc::new(SecurityPolicy::from_config(
+        let policy_dir = crate::profile::ProfileManager::active()
+            .ok()
+            .map(|p| p.policy_dir());
+        let security = Arc::new(SecurityPolicy::from_config_with_policy_dir(
             &config.autonomy,
             &config.workspace_dir,
+            policy_dir,
         ));
+        // Bind the async-approval registry to the policy so the shell
+        // tool can ask the user (via whichever UI is subscribed) when
+        // it hits an allowlist miss in Supervised mode.
+        let pending = Arc::new(crate::security::PendingApprovals::default());
+        security.set_pending(pending);
 
         let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
             &config.memory,
@@ -272,7 +298,7 @@ impl Agent {
             None
         };
 
-        let tools = tools::all_tools_with_runtime(
+        let mut tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -286,6 +312,39 @@ impl Agent {
             config.api_key.as_deref(),
             config,
         );
+
+        // MCP discovery — spawn each configured server, query
+        // `tools/list`, splice each tool into the registry as an
+        // `McpTool`. Failures are non-fatal (logged); the agent
+        // boots without the broken server's tools, and `/mcp`
+        // surfaces what happened.
+        let mcp_discovery = crate::mcp::discover::discover_mcp_tools(&config.mcp_servers).await;
+        // Build the per-server qualified-tool-name map before the
+        // tools are moved into the registry.
+        let mut mcp_tools_by_server: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for t in &mcp_discovery.tools {
+            // Tool name is `mcp__<server>__<tool>` — split to find server.
+            let name = t.name();
+            if let Some(rest) = name.strip_prefix("mcp__") {
+                if let Some((server, _)) = rest.split_once("__") {
+                    mcp_tools_by_server
+                        .entry(server.to_string())
+                        .or_default()
+                        .push(name.to_string());
+                }
+            }
+        }
+        let mcp_health = mcp_discovery.health.clone();
+        if !mcp_discovery.tools.is_empty() {
+            tracing::info!(
+                target: "agent",
+                count = mcp_discovery.tools.len(),
+                servers = mcp_discovery.health.len(),
+                "appending MCP tools to registry"
+            );
+            tools.extend(mcp_discovery.tools);
+        }
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
@@ -340,6 +399,32 @@ impl Agent {
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .build()
+            .map(|mut agent| {
+                agent.security = Some(security);
+                agent.mcp_health = mcp_health;
+                agent.mcp_tools_by_server = mcp_tools_by_server;
+                agent
+            })
+    }
+
+    /// Shared security policy handle — `Some` when the agent was built
+    /// via [`Agent::from_config`], `None` for bare-builder agents
+    /// (tests/custom embeds). Use this to mutate the runtime allowlist
+    /// or resolve pending approvals from outside the agent loop.
+    pub fn security(&self) -> Option<Arc<SecurityPolicy>> {
+        self.security.clone()
+    }
+
+    /// MCP server health snapshot from boot. Empty for bare-builder
+    /// agents or when no `[mcp_servers.*]` blocks were configured.
+    pub fn mcp_health(&self) -> &[crate::mcp::discover::McpServerHealth] {
+        &self.mcp_health
+    }
+
+    /// Per-server live MCP tool registry (qualified names). Cloned so
+    /// callers can store/own it independently.
+    pub fn mcp_tools_by_server(&self) -> std::collections::HashMap<String, Vec<String>> {
+        self.mcp_tools_by_server.clone()
     }
 
     fn trim_history(&mut self) {
@@ -801,7 +886,7 @@ pub async fn run(
     }
     effective_config.default_temperature = temperature;
 
-    let mut agent = Agent::from_config(&effective_config)?;
+    let mut agent = Agent::from_config(&effective_config).await?;
 
     let provider_name = effective_config
         .default_provider

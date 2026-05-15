@@ -109,6 +109,7 @@ Required:
 - Deny-by-default for access and exposure boundaries.
 - Never log secrets, raw tokens, or sensitive payloads.
 - Keep network/filesystem/shell scope as narrow as possible unless explicitly justified.
+- Credential precedence is intentional: config-stored provider keys, including encrypted keys, remain above env vars. Document exceptions rather than silently changing this order.
 
 ### 3.7 Determinism + Reproducibility
 

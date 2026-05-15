@@ -37,6 +37,19 @@ build_smoke_image() {
   fi
 }
 
+run_tui_smoke() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "⚠ tmux not installed; skipping TUI smoke."
+    return 0
+  fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "⚠ cargo not installed on host; skipping TUI smoke."
+    return 0
+  fi
+  cargo build --bin rantaiclaw
+  RANTAICLAW_BIN="$PWD/target/debug/rantaiclaw" bash dev/tui-smoke.sh
+}
+
 print_help() {
   cat <<'EOF'
 RantaiClaw Local CI in Docker
@@ -54,8 +67,9 @@ Commands:
   audit         Run cargo audit (container only)
   deny          Run cargo deny check (container only)
   security      Run cargo audit + cargo deny (container only)
+  tui-smoke     Run tmux-backed TUI smoke test (host; skips without tmux)
   docker-smoke  Build and verify runtime image (host docker daemon)
-  all           Run lint, test, build, security, docker-smoke
+  all           Run lint, test, build, security, tui-smoke, docker-smoke
   clean         Remove local CI containers and volumes
 EOF
 }
@@ -107,6 +121,10 @@ case "$1" in
     run_in_ci "cargo audit"
     ;;
 
+  tui-smoke)
+    run_tui_smoke
+    ;;
+
   docker-smoke)
     build_smoke_image
     docker run --rm rantaiclaw-local-smoke:latest --version
@@ -118,6 +136,7 @@ case "$1" in
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"
     run_in_ci "cargo audit"
+    run_tui_smoke
     build_smoke_image
     docker run --rm rantaiclaw-local-smoke:latest --version
     ;;

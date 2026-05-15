@@ -1,12 +1,12 @@
-# RantaiClaw approval policy — preset L2 (Smart / safe-by-default)
+# RantaiClaw approval policy — preset Smart (safe-by-default)
 #
-# See `policy_l1.toml` for the bundle layout. L2 is the recommended
+# See `policy_manual.toml` for the bundle layout. Smart is the recommended
 # default for general-assistant use. Read-only and trivially-safe
 # commands are pre-allowed; anything that could mutate state still
 # triggers an interactive prompt.
 
 [autonomy]
-preset = "L2"
+preset = "smart"
 mode = "manual"
 description = "Smart — read-only and trivially-safe commands are pre-allowed; the rest prompt."
 
@@ -73,7 +73,7 @@ patterns = [
 ]
 
 [forbidden_paths]
-# Same defaults as L1: even on a permissive preset, secrets stay sealed.
+# Same defaults as Manual: even on a permissive preset, secrets stay sealed.
 patterns = [
   "/etc/**",
   "/sys/**",

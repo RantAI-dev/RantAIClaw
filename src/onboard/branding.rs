@@ -284,7 +284,7 @@ pub fn render_splash_at_width(inv: &Inventory<'_>, cols: u16) -> String {
     if cols < 60 {
         let mut out = String::new();
         out.push('\n');
-        let _ = writeln!(out, "{}{}▎ {}{}", bold(), fg(0), inv.title, r,);
+        let _ = writeln!(out, "{}{}▎ {}{}", bold(), fg(0), inv.title, r);
         if let Some(sub) = inv.subtitle {
             let _ = writeln!(out, "  {}{}{}", dim(), sub, r);
         }

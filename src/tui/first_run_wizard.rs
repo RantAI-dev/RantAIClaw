@@ -43,6 +43,13 @@ pub struct FirstRunWizard {
     pub picker: Option<ActiveChoose>,
     pub picker_names: Vec<String>,
     pub profile: Profile,
+    /// Phase history for the back button. Each completed phase transition
+    /// pushes the previous phase here; `back()` pops one and restores it.
+    /// v0.6.4 covers the safe cases (PickChannels ↔ PickIntegrations and
+    /// PickChannels → previous required provisioner). RunningProvisioner
+    /// rewind is forward-only for now — the running task can't be
+    /// surgically rewound without leaking partial state.
+    pub history: Vec<WizardPhase>,
 }
 
 const REQUIRED_PROVISIONERS: &[&str] = &["provider", "approvals", "persona", "skills"];
@@ -96,7 +103,60 @@ impl FirstRunWizard {
             picker: None,
             picker_names: Vec::new(),
             profile,
+            history: Vec::new(),
         }
+    }
+
+    /// Go back one step. Returns `true` if the phase changed, `false` if
+    /// already at the earliest restorable point.
+    ///
+    /// When the popped history entry is another `RunningProvisioner`, the
+    /// user wants to redo that section — we re-queue both the prior
+    /// provisioner and (if currently running another one) the current one,
+    /// so the redo replays cleanly and flow continues with what's left.
+    /// Required-provisioner config writes are overwritten by the redo, which
+    /// is exactly the desired effect for "previous page was wrong".
+    ///
+    /// When the popped entry is a Picker, restore it and clear the queue so
+    /// the user's re-selection starts from a clean slate — otherwise stale
+    /// items from the previous picker selection would replay before the new
+    /// ones.
+    pub fn back(&mut self) -> bool {
+        while let Some(prev) = self.history.pop() {
+            match prev {
+                WizardPhase::RunningProvisioner { name: prior } => {
+                    // Capture currently-running provisioner (if any) so it
+                    // resumes after the redo.
+                    let current_running = match &self.phase {
+                        WizardPhase::RunningProvisioner { name } => Some(name.clone()),
+                        _ => None,
+                    };
+                    if let Some(current) = current_running {
+                        self.queue.insert(0, current);
+                    }
+                    self.queue.insert(0, prior);
+                    // Welcome is the only sentinel that lets advance() pop
+                    // from a non-empty queue without falling into the
+                    // "queue empty, pick next phase" branch.
+                    self.phase = WizardPhase::Welcome;
+                    self.advance_to_next_in_queue_or_picker();
+                    return true;
+                }
+                phase => {
+                    if matches!(
+                        phase,
+                        WizardPhase::PickChannels | WizardPhase::PickIntegrations
+                    ) {
+                        // Clear leftover picker-selection queue so the
+                        // user's re-selection isn't shadowed by old picks.
+                        self.queue.clear();
+                    }
+                    self.phase = phase;
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn current_provisioner_name(&self) -> Option<&str> {
@@ -122,6 +182,8 @@ impl FirstRunWizard {
     }
 
     pub fn advance_to_next_in_queue_or_picker(&mut self) {
+        // Record the prior phase for back-navigation before mutating.
+        let prev = self.phase.clone();
         if let Some(next) = self.queue_pop_front() {
             self.phase = WizardPhase::RunningProvisioner { name: next };
         } else {
@@ -135,10 +197,7 @@ impl FirstRunWizard {
                         )
                     {
                         self.phase = WizardPhase::PickChannels;
-                    } else if self
-                        .phase_provisioner_was_channel()
-                        .unwrap_or(false)
-                    {
+                    } else if self.phase_provisioner_was_channel().unwrap_or(false) {
                         self.phase = WizardPhase::PickIntegrations;
                     } else {
                         self.phase = WizardPhase::Complete;
@@ -152,6 +211,9 @@ impl FirstRunWizard {
                 }
                 WizardPhase::Complete => {}
             }
+        }
+        if prev != self.phase {
+            self.history.push(prev);
         }
     }
 
@@ -442,7 +504,10 @@ impl FirstRunWizard {
             };
 
             let arrow = if matches!(state, RailState::Current) {
-                Span::styled(" ▸ ", Style::default().fg(coral).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    " ▸ ",
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::styled("   ", Style::default())
             };
@@ -554,14 +619,8 @@ impl FirstRunWizard {
         // Subhead.
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "Four required steps,",
-                    Style::default().fg(sky),
-                ),
-                Span::styled(
-                    "  two optional pickers,",
-                    Style::default().fg(muted),
-                ),
+                Span::styled("Four required steps,", Style::default().fg(sky)),
+                Span::styled("  two optional pickers,", Style::default().fg(muted)),
                 Span::styled(
                     "  one polished agent.",
                     Style::default().fg(muted).add_modifier(Modifier::ITALIC),
@@ -595,24 +654,18 @@ impl FirstRunWizard {
         // Hint line.
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "Press ",
-                    Style::default().fg(muted),
-                ),
+                Span::styled("Press ", Style::default().fg(muted)),
                 Span::styled(
                     "Enter",
                     Style::default().fg(emerald).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    " to begin · skip any step with ",
-                    Style::default().fg(muted),
-                ),
+                Span::styled(" to begin · ", Style::default().fg(muted)),
                 Span::styled(
                     "Esc",
                     Style::default().fg(coral).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    " · resume later via /setup full",
+                    " to cancel · resume later via /setup full",
                     Style::default().fg(muted).add_modifier(Modifier::ITALIC),
                 ),
             ])),
@@ -620,14 +673,7 @@ impl FirstRunWizard {
         );
     }
 
-    fn render_loading(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        sky: Color,
-        muted: Color,
-        _dim: Color,
-    ) {
+    fn render_loading(&self, frame: &mut Frame, area: Rect, sky: Color, muted: Color, _dim: Color) {
         // Brief placeholder shown between provisioners while the next
         // overlay is being spawned. The active overlay covers the
         // full screen most of the time; this only flashes briefly.
@@ -779,10 +825,7 @@ impl FirstRunWizard {
                     format!("{} selected", p.selected.len()),
                     Style::default().fg(emerald).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    "  · Enter to confirm",
-                    Style::default().fg(muted),
-                ),
+                Span::styled("  · Enter to confirm", Style::default().fg(muted)),
             ]));
         }
         frame.render_widget(
@@ -896,7 +939,10 @@ impl FirstRunWizard {
             Paragraph::new(vec![
                 row("rantaiclaw", "open the chat TUI"),
                 row("/setup", "interactive picker inside the TUI"),
-                row("rantaiclaw setup <topic>", "reconfigure a single topic from a shell"),
+                row(
+                    "rantaiclaw setup <topic>",
+                    "reconfigure a single topic from a shell",
+                ),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("    ", Style::default()),
@@ -944,10 +990,17 @@ impl FirstRunWizard {
                 ),
                 Span::styled("exit", Style::default().fg(muted)),
             ],
-            WizardPhase::RunningProvisioner { .. } => vec![Span::styled(
-                "▣  provisioner overlay active — interact above",
-                Style::default().fg(muted).add_modifier(Modifier::ITALIC),
-            )],
+            WizardPhase::RunningProvisioner { .. } => vec![
+                Span::styled(
+                    "▣  provisioner overlay active — interact above    ",
+                    Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+                ),
+                Span::styled(
+                    "Ctrl+B ",
+                    Style::default().fg(sky).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("back", Style::default().fg(muted)),
+            ],
             WizardPhase::PickChannels | WizardPhase::PickIntegrations => vec![
                 Span::styled("↑/↓ ", Style::default().fg(sky)),
                 Span::styled("navigate    ", Style::default().fg(muted)),
@@ -958,6 +1011,11 @@ impl FirstRunWizard {
                     Style::default().fg(emerald).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("confirm    ", Style::default().fg(muted)),
+                Span::styled(
+                    "Ctrl+B ",
+                    Style::default().fg(sky).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("back    ", Style::default().fg(muted)),
                 Span::styled(
                     "⎋ Esc ",
                     Style::default().fg(coral).add_modifier(Modifier::BOLD),
@@ -998,9 +1056,13 @@ impl FirstRunWizard {
         };
         let body = match self.phase {
             WizardPhase::Welcome => "Press Enter to begin.\nEsc to exit.",
-            WizardPhase::RunningProvisioner { .. } => "Provisioner overlay active.",
-            WizardPhase::PickChannels => "↑/↓ Space toggle · Enter confirm · Esc skip",
-            WizardPhase::PickIntegrations => "↑/↓ Space toggle · Enter confirm · Esc skip",
+            WizardPhase::RunningProvisioner { .. } => "Provisioner overlay active. Ctrl+B back.",
+            WizardPhase::PickChannels => {
+                "↑/↓ Space toggle · Enter confirm · Ctrl+B back · Esc skip"
+            }
+            WizardPhase::PickIntegrations => {
+                "↑/↓ Space toggle · Enter confirm · Ctrl+B back · Esc skip"
+            }
             WizardPhase::Complete => "Configuration saved. Press Enter to close.",
         };
 
@@ -1010,7 +1072,10 @@ impl FirstRunWizard {
             .border_style(Style::default().fg(frame_color))
             .title(Line::from(vec![
                 Span::styled(" ", Style::default()),
-                Span::styled(title, Style::default().fg(coral).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    title,
+                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" ", Style::default()),
             ]));
         let para = Paragraph::new(vec![
@@ -1040,7 +1105,7 @@ fn render_horizontal_rule(frame: &mut Frame, area: Rect, dim: Color) {
     if w == 0 {
         return;
     }
-    let line: String = std::iter::repeat('─').take(w).collect();
+    let line: String = std::iter::repeat_n('─', w).collect();
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(line, Style::default().fg(dim)))),
         area,
@@ -1078,4 +1143,80 @@ pub fn channel_options() -> Vec<(String, String)> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_profile() -> Profile {
+        Profile {
+            name: "test".into(),
+            root: PathBuf::from("/tmp/rantaiclaw-test"),
+        }
+    }
+
+    #[test]
+    fn back_from_welcome_returns_false() {
+        let mut w = FirstRunWizard::new(test_profile());
+        assert!(!w.back(), "no history at Welcome — back must be a no-op");
+    }
+
+    #[test]
+    fn back_from_picker_restores_prior_running_provisioner() {
+        let mut w = FirstRunWizard::new(test_profile());
+        // Simulate Welcome → Running{provider}
+        w.start_provisioners();
+        assert!(matches!(w.phase, WizardPhase::RunningProvisioner { .. }));
+        // Manually advance through required provisioners
+        for _ in 0..REQUIRED_PROVISIONERS.len() {
+            w.advance_to_next_in_queue_or_picker();
+        }
+        // After all required provisioners, we should land at PickChannels
+        assert!(matches!(w.phase, WizardPhase::PickChannels));
+        // Back from picker → previous phase was Running{skills} (last required) →
+        // re-queue it so user redoes it.
+        assert!(w.back());
+        assert!(matches!(w.phase, WizardPhase::RunningProvisioner { .. }));
+    }
+
+    #[test]
+    fn back_from_running_re_queues_prior_running() {
+        let mut w = FirstRunWizard::new(test_profile());
+        w.start_provisioners();
+        // Now in Running{provider}; advance to Running{approvals}.
+        w.advance_to_next_in_queue_or_picker();
+        let in_approvals = matches!(
+            &w.phase,
+            WizardPhase::RunningProvisioner { name } if name == "approvals"
+        );
+        assert!(in_approvals, "expected to be in approvals provisioner");
+        // Back: should re-queue provider (prior) AND approvals (current),
+        // landing back in Running{provider}.
+        assert!(w.back());
+        let in_provider = matches!(
+            &w.phase,
+            WizardPhase::RunningProvisioner { name } if name == "provider"
+        );
+        assert!(in_provider, "back should land us back in provider");
+        // Approvals should be the next queued item so the flow continues.
+        assert_eq!(w.queue.first().map(|s| s.as_str()), Some("approvals"));
+    }
+
+    #[test]
+    fn back_from_picker_clears_stale_queue_items() {
+        let mut w = FirstRunWizard::new(test_profile());
+        // Synthetic state: at PickChannels with a stale queue from a prior pick.
+        w.phase = WizardPhase::PickChannels;
+        w.queue = vec!["telegram".into(), "matrix".into()];
+        w.history.push(WizardPhase::PickChannels);
+        // Pop the picker phase from history → restore + clear queue.
+        assert!(w.back());
+        assert!(matches!(w.phase, WizardPhase::PickChannels));
+        assert!(
+            w.queue.is_empty(),
+            "stale picker selections must be cleared on restore"
+        );
+    }
 }

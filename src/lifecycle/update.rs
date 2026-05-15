@@ -50,6 +50,12 @@ pub struct UpdateOpts {
     /// honored for testing against staging or self-hosted releases.
     pub release_base_url: Option<String>,
     pub yes: bool,
+    /// Opt-in full-profile tarball backup before swap. Mirrors
+    /// Hermes' `update --backup` for "high-value profiles". Adds time
+    /// proportional to profile size (sessions.db + skills/* + secrets);
+    /// the lightweight pre-update state snapshot still runs
+    /// unconditionally regardless of this flag.
+    pub backup: bool,
 }
 
 pub fn run(opts: UpdateOpts) -> Result<()> {
@@ -79,7 +85,12 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
     }
 
     if opts.check {
-        // exit 1 to make `rantaiclaw update --check && deploy` workflows trivial
+        // Hermes-parity: surface release metadata so users can decide
+        // whether to pull. `--check` still exits 1 on "newer
+        // available," 0 on up-to-date — same script-friendly contract.
+        if let Ok(notes) = fetch_release_notes(&target_tag) {
+            print_release_summary(&notes);
+        }
         std::process::exit(1);
     }
 
@@ -88,6 +99,38 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
     if !opts.yes && !confirm() {
         println!("aborted");
         return Ok(());
+    }
+
+    // Pre-swap: lightweight state snapshot. Best-effort — never aborts
+    // the update. Mirrors Hermes' "Pairing-data snapshot" default.
+    let rantaiclaw_root = crate::profile::paths::rantaiclaw_root();
+    let active_profile = crate::profile::ProfileManager::resolve_active_name();
+    let bak_binary = info.path.with_extension("old");
+    let snapshot_summary = match crate::lifecycle::update_snapshot::create(
+        &rantaiclaw_root,
+        &current,
+        &target_version,
+        &active_profile,
+        Some(&bak_binary),
+    ) {
+        Ok(snap) => {
+            println!("✓ state snapshot: {}", snap.dir.display());
+            Some(snap.dir)
+        }
+        Err(e) => {
+            // Don't fail the update; warn so the user knows rollback
+            // won't have a snapshot to restore from.
+            eprintln!("⚠ pre-update snapshot failed: {e:#}");
+            eprintln!("  proceeding without snapshot — rollback will rely on `.old` binary only");
+            None
+        }
+    };
+
+    if opts.backup {
+        match crate::lifecycle::update_snapshot::full_backup_archive(&rantaiclaw_root, &current) {
+            Ok(p) => println!("✓ full backup: {}", p.display()),
+            Err(e) => eprintln!("⚠ --backup tarball failed: {e:#}"),
+        }
     }
 
     let target = platform_target()?;
@@ -126,6 +169,30 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
 
         swap_binary(&info.path, &extracted)?;
         println!("✓ updated to {target_version}");
+
+        // Post-swap: restart managed daemon service so the running
+        // process picks up the new binary instead of staying on the
+        // old in-memory code. Best-effort.
+        match crate::lifecycle::update_service_restart::restart_managed_service() {
+            Ok(true) => println!("✓ daemon service restarted"),
+            Ok(false) => {} // no managed service — nothing to do
+            Err(e) => eprintln!("⚠ daemon restart failed: {e:#}"),
+        }
+
+        // Print rollback hint so users don't have to remember the
+        // command.
+        if snapshot_summary.is_some() {
+            println!(
+                "  rollback: `rantaiclaw rollback` (latest snapshot) \
+                 or `rantaiclaw rollback --list` to inspect"
+            );
+        } else if bak_binary.is_file() {
+            println!(
+                "  rollback: `mv {} {}` then re-run rantaiclaw",
+                bak_binary.display(),
+                info.path.display()
+            );
+        }
         Ok(())
     })();
 
@@ -221,7 +288,10 @@ fn download_to(url: &str, dest: &Path) -> Result<()> {
     let client = Client::builder()
         .user_agent(format!("rantaiclaw-update/{}", current_version()))
         .build()?;
-    let mut resp = client.get(url).send().with_context(|| format!("GET {url}"))?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
     if !resp.status().is_success() {
         bail!("download {url} returned {}", resp.status());
     }
@@ -242,16 +312,14 @@ fn verify_sha256(archive: &Path, sums_file: &Path, archive_name: &str) -> Result
     let expected = read_sha_for_file(sums_file, archive_name)?;
     let actual = compute_sha256(archive)?;
     if !expected.eq_ignore_ascii_case(&actual) {
-        bail!(
-            "SHA256 mismatch for {archive_name}\n  expected: {expected}\n  actual:   {actual}"
-        );
+        bail!("SHA256 mismatch for {archive_name}\n  expected: {expected}\n  actual:   {actual}");
     }
     Ok(())
 }
 
 fn read_sha_for_file(sums_file: &Path, archive_name: &str) -> Result<String> {
-    let content = fs::read_to_string(sums_file)
-        .with_context(|| format!("read {}", sums_file.display()))?;
+    let content =
+        fs::read_to_string(sums_file).with_context(|| format!("read {}", sums_file.display()))?;
     for line in content.lines() {
         // Format: "<hex>  <filename>" (two spaces) or "<hex> *<filename>" or
         // "<hex>  ./<filename>". Be liberal in parsing.
@@ -262,10 +330,7 @@ fn read_sha_for_file(sums_file: &Path, archive_name: &str) -> Result<String> {
         let mut it = line.splitn(2, char::is_whitespace);
         let Some(hash) = it.next() else { continue };
         let Some(rest) = it.next() else { continue };
-        let name = rest
-            .trim()
-            .trim_start_matches('*')
-            .trim_start_matches("./");
+        let name = rest.trim().trim_start_matches('*').trim_start_matches("./");
         if name == archive_name {
             return Ok(hash.to_string());
         }
@@ -320,7 +385,11 @@ fn extract_binary(archive: &Path, work_dir: &Path) -> Result<PathBuf> {
 
     // Find the rantaiclaw binary inside `extract_dir`. The release archives
     // include the binary at the top level.
-    let bin_name = if cfg!(windows) { "rantaiclaw.exe" } else { "rantaiclaw" };
+    let bin_name = if cfg!(windows) {
+        "rantaiclaw.exe"
+    } else {
+        "rantaiclaw"
+    };
     let direct = extract_dir.join(bin_name);
     if direct.exists() {
         return Ok(direct);
@@ -337,7 +406,10 @@ fn extract_binary(archive: &Path, work_dir: &Path) -> Result<PathBuf> {
             }
         }
     }
-    bail!("`{bin_name}` not found in extracted archive at {}", extract_dir.display())
+    bail!(
+        "`{bin_name}` not found in extracted archive at {}",
+        extract_dir.display()
+    )
 }
 
 fn swap_binary(running: &Path, new_bin: &Path) -> Result<()> {
@@ -367,10 +439,13 @@ fn swap_binary(running: &Path, new_bin: &Path) -> Result<()> {
             let _ = fs::rename(&backup, running);
             return Err(e).with_context(|| format!("install new binary at {}", running.display()));
         }
-        // Best-effort cleanup of the backup. Some users may want to keep it
-        // around — we leave it in place; the next successful update or the
-        // uninstall flow will clean it.
-        let _ = fs::remove_file(&backup);
+        // Keep the `.old` backup in place so `rantaiclaw rollback` can
+        // restore it. Pre-v0.6.32 we deleted it on success, which made
+        // the rollback story manual ("you have to know to grab a copy
+        // before updating"). Mirrors Hermes' rollback affordance.
+        // The backup is one binary's worth of disk; the next successful
+        // update overwrites it via the `let _ = fs::remove_file(&backup)`
+        // up-stack, so it doesn't accumulate across multiple updates.
         Ok(())
     }
     #[cfg(windows)]
@@ -501,6 +576,173 @@ fn compare_pre(a: &str, b: &str) -> i32 {
     0
 }
 
+/// GitHub release metadata pulled by `update --check` to surface the
+/// release notes without doing the actual binary download.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReleaseNotes {
+    pub tag_name: String,
+    pub name: String,
+    pub html_url: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub published_at: String,
+}
+
+/// Fetch release metadata for a specific tag. Used by `update --check`.
+/// Errors are non-fatal — `--check` still exits 1 on "newer available"
+/// even when notes can't be loaded (offline mirror, GitHub rate limit,
+/// etc.).
+pub fn fetch_release_notes(tag: &str) -> Result<ReleaseNotes> {
+    let client = Client::builder()
+        .user_agent(format!("rantaiclaw-update/{}", current_version()))
+        .build()?;
+    let url = format!("https://api.github.com/repos/{REPO}/releases/tags/{tag}");
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!(
+            "GitHub releases API returned {} for tag {tag}",
+            resp.status()
+        );
+    }
+    let notes: ReleaseNotes = resp.json().context("parse release JSON")?;
+    Ok(notes)
+}
+
+/// Pretty-print release notes — title, URL, first ~12 lines of body.
+/// `update --check` calls this after the version-delta header.
+pub fn print_release_summary(notes: &ReleaseNotes) {
+    println!();
+    println!(
+        "release: {}",
+        if notes.name.is_empty() {
+            &notes.tag_name
+        } else {
+            &notes.name
+        }
+    );
+    println!("   url:  {}", notes.html_url);
+    if !notes.published_at.is_empty() {
+        println!(" published: {}", notes.published_at);
+    }
+    if !notes.body.is_empty() {
+        println!();
+        let body = notes.body.replace("\r\n", "\n");
+        let mut shown = 0usize;
+        for line in body.lines().take(12) {
+            println!("   {}", line);
+            shown += 1;
+        }
+        if body.lines().count() > shown {
+            println!("   …");
+            println!("   (full notes: {})", notes.html_url);
+        }
+    }
+    println!();
+}
+
+/// `rantaiclaw rollback` entry point. With no args, restores the most
+/// recent snapshot + previous binary. With `--list`, prints available
+/// snapshots and exits without restoring. With `--snapshot <path>`,
+/// restores that specific snapshot.
+pub fn rollback(opts: RollbackOpts) -> Result<()> {
+    let info = BinaryInfo::detect()?;
+    let rantaiclaw_root = crate::profile::paths::rantaiclaw_root();
+    let snapshots = crate::lifecycle::update_snapshot::list_all(&rantaiclaw_root)?;
+
+    if opts.list {
+        if snapshots.is_empty() {
+            println!(
+                "No snapshots found in {}/.update-snapshots/",
+                rantaiclaw_root.display()
+            );
+            return Ok(());
+        }
+        println!("Available snapshots (newest first):");
+        println!();
+        for s in &snapshots {
+            println!(
+                "  {}  {} → {}  (profile: {})",
+                s.manifest.created_at,
+                s.manifest.version_from,
+                s.manifest.version_to,
+                s.manifest.active_profile
+            );
+            println!("    {}", s.dir.display());
+            if let Some(bak) = &s.manifest.bak_binary_path {
+                let exists = std::path::Path::new(bak).is_file();
+                println!(
+                    "    .old binary: {bak} {}",
+                    if exists { "[present]" } else { "[missing]" }
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let target = if let Some(path) = &opts.snapshot {
+        snapshots
+            .into_iter()
+            .find(|s| s.dir == *path)
+            .ok_or_else(|| anyhow!("snapshot {} not found", path))?
+    } else {
+        snapshots.into_iter().next().ok_or_else(|| {
+            anyhow!(
+                "no snapshots in {}/.update-snapshots/ — there's nothing to roll back to",
+                rantaiclaw_root.display()
+            )
+        })?
+    };
+
+    println!(
+        "rolling back to {} ({} → {}) …",
+        target.manifest.created_at, target.manifest.version_to, target.manifest.version_from,
+    );
+
+    if !opts.yes && !confirm() {
+        println!("aborted");
+        return Ok(());
+    }
+
+    let summary = crate::lifecycle::update_snapshot::restore(&target, &rantaiclaw_root)?;
+    if !summary.files_restored.is_empty() {
+        println!("✓ restored {} state file(s)", summary.files_restored.len());
+    }
+    if summary.binary_restored {
+        println!("✓ binary rolled back");
+    } else {
+        println!(
+            "ℹ binary not rolled back (no `.old` available at {})",
+            info.path.with_extension("old").display()
+        );
+    }
+
+    // Try to restart the managed service so the rolled-back binary is
+    // what's running, mirroring the post-update path.
+    match crate::lifecycle::update_service_restart::restart_managed_service() {
+        Ok(true) => println!("✓ daemon service restarted"),
+        Ok(false) => {}
+        Err(e) => eprintln!("⚠ daemon restart failed: {e:#}"),
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RollbackOpts {
+    /// Print available snapshots and exit without restoring.
+    pub list: bool,
+    /// Specific snapshot dir to restore (full path). Defaults to the
+    /// most recent.
+    pub snapshot: Option<String>,
+    /// Skip the confirmation prompt.
+    pub yes: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,14 +776,8 @@ mod tests {
     #[test]
     fn split_pre_basic() {
         assert_eq!(split_pre("0.5.3"), ("0.5.3".into(), String::new()));
-        assert_eq!(
-            split_pre("0.6.1-alpha"),
-            ("0.6.1".into(), "alpha".into())
-        );
-        assert_eq!(
-            split_pre("0.6.1-rc.1"),
-            ("0.6.1".into(), "rc.1".into())
-        );
+        assert_eq!(split_pre("0.6.1-alpha"), ("0.6.1".into(), "alpha".into()));
+        assert_eq!(split_pre("0.6.1-rc.1"), ("0.6.1".into(), "rc.1".into()));
     }
 
     #[test]

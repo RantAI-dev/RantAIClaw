@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
-use crate::tui::widgets::{ListPicker, ListPickerEntry, ListPickerItem, ListPickerKind};
+use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 
 /// Built-in personality presets surfaced in the `/personality` picker.
 /// Each tuple is `(key, summary shown as the muted secondary line)`.
@@ -17,18 +17,55 @@ const PERSONALITY_PRESETS: &[(&str, &str)] = &[
 /// Build picker rows from the loaded skills list. Primary text is the
 /// skill name + version; secondary is the description (truncated by
 /// the renderer if too long).
-fn build_skill_items(skills: &[crate::skills::Skill]) -> Vec<ListPickerItem> {
+fn active_skill_status_from_context(ctx: &TuiContext) -> Vec<(crate::skills::Skill, Vec<String>)> {
+    if ctx.available_skills_with_status.is_empty() {
+        ctx.available_skills
+            .iter()
+            .cloned()
+            .map(|skill| (skill, Vec::new()))
+            .collect()
+    } else {
+        ctx.available_skills_with_status.clone()
+    }
+}
+
+fn build_skill_items(skills: &[(crate::skills::Skill, Vec<String>)]) -> Vec<ListPickerItem> {
     skills
         .iter()
-        .map(|s| {
+        .map(|(s, reasons)| {
             let primary = if s.version.is_empty() {
                 s.name.clone()
             } else {
                 format!("{} · v{}", s.name, s.version)
             };
+            let primary = if reasons.is_empty() {
+                primary
+            } else {
+                format!("✗ {primary}")
+            };
             let mut secondary = s.description.clone();
+            if !reasons.is_empty() {
+                let reason = reasons.join("; ");
+                secondary = if secondary.is_empty() {
+                    format!("gated: {reason}")
+                } else {
+                    format!("{secondary}  · gated: {reason}")
+                };
+            }
             if !s.tags.is_empty() {
                 secondary = format!("{secondary}  ({})", s.tags.join(", "));
+            }
+            let has_missing_bin = s
+                .requires
+                .unmet()
+                .iter()
+                .any(|reason| reason.starts_with("missing binary"));
+            if has_missing_bin && !s.install_recipes.is_empty() {
+                secondary = if secondary.is_empty() {
+                    "Ctrl+I install deps".to_string()
+                } else {
+                    format!("{secondary}  · Ctrl+I install deps")
+                };
             }
             ListPickerItem {
                 key: s.name.clone(),
@@ -53,14 +90,30 @@ impl CommandHandler for SkillsCommand {
         "Browse available skills"
     }
 
-    fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
-        let items = build_skill_items(&ctx.available_skills);
+    fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+        // `/skills install [query]` is an alias for `/install [query]` so
+        // both discoverability paths reach the ClawHub browser. Anything
+        // else (no args, or args that aren't `install*`) opens the local
+        // skills picker as before.
+        let trimmed = args.trim();
+        if let Some(rest) = trimmed.strip_prefix("install") {
+            let query = rest.trim();
+            let initial_query = if query.is_empty() {
+                None
+            } else {
+                Some(query.to_string())
+            };
+            return Ok(CommandResult::OpenClawhubInstallPicker { initial_query });
+        }
+
+        let status = active_skill_status_from_context(ctx);
+        let items = build_skill_items(&status);
         let picker = ListPicker::new(
             ListPickerKind::Skill,
             "Skills",
             items,
             None,
-            "No skills loaded. Drop a SKILL.toml in ~/.rantaiclaw/workspace/skills/<name>/.",
+            "No skills loaded. Drop a SKILL.md in ~/.rantaiclaw/profiles/<profile>/skills/<name>/, or run `/setup skills`.",
         );
         Ok(CommandResult::OpenListPicker(picker))
     }
@@ -84,33 +137,73 @@ impl CommandHandler for SkillCommand {
     }
 
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
-        let name = args.trim();
+        use crate::tui::widgets::{InfoPanel, InfoSection};
+
+        let trimmed = args.trim();
+
+        // `/skill install [query]` mirrors `/skills install [query]` so
+        // typing the singular doesn't fall through to the
+        // "/<skill-name>" lookup. Tester ask: "/skill should mirror
+        // /skills" — same args, same surfaces.
+        if let Some(rest) = trimmed.strip_prefix("install") {
+            let query = rest.trim();
+            let initial_query = if query.is_empty() {
+                None
+            } else {
+                Some(query.to_string())
+            };
+            return Ok(CommandResult::OpenClawhubInstallPicker { initial_query });
+        }
+
+        let name = trimmed;
         if name.is_empty() {
-            // Same as /skills — open the picker.
-            let items = build_skill_items(&ctx.available_skills);
+            // /skill (no args) — open the same interactive picker as `/skills`.
+            // Pre-v0.6.23 this opened a static InfoPanel which felt out of
+            // place next to the picker that `/skills` shows. Tester ask:
+            // "make /skill same as /skills (with the same UI)".
+            let status = active_skill_status_from_context(ctx);
+            let items = build_skill_items(&status);
             let picker = ListPicker::new(
                 ListPickerKind::Skill,
                 "Skills",
                 items,
                 None,
-                "No skills loaded. Drop a SKILL.toml in ~/.rantaiclaw/workspace/skills/<name>/.",
+                "No skills loaded. Drop a SKILL.md in \
+                 ~/.rantaiclaw/profiles/<profile>/skills/<name>/, or run \
+                 `/skills install <slug>` to grab one from ClawHub.",
             );
             return Ok(CommandResult::OpenListPicker(picker));
         }
 
-        // With a name arg, find it in the loaded list and surface a
-        // helpful message. The actual "invoke" lives in the picker
-        // selection handler so both /skill <name> and the picker share
-        // the same activation path.
+        // With a name arg, find it and render its detail in an InfoPanel.
         let found = ctx
             .available_skills
             .iter()
             .find(|s| s.name.eq_ignore_ascii_case(name));
         match found {
-            Some(s) => Ok(CommandResult::Message(format!(
-                "Skill '{}' (v{})\n  {}\nType /skill to open the picker, or just describe what you want and the agent will use this skill.",
-                s.name, s.version, s.description
-            ))),
+            Some(s) => {
+                let mut panel = InfoPanel::new(format!("Skill · {}", s.name))
+                    .with_subtitle(if s.version.is_empty() {
+                        "no version".to_string()
+                    } else {
+                        format!("v{}", s.version)
+                    })
+                    .with_footer("Esc close · `/skills` for full picker");
+                let mut sec = InfoSection::new("Detail");
+                if !s.description.is_empty() {
+                    sec = sec.plain(s.description.clone());
+                }
+                if !s.tags.is_empty() {
+                    sec = sec.spacer().key_value("Tags", s.tags.join(", "));
+                }
+                panel = panel
+                    .section(sec)
+                    .section(InfoSection::new("Activate").plain(
+                        "Describe what you want and the agent will use this \
+                             skill — e.g. `summarize today's standup notes`.",
+                    ));
+                Ok(CommandResult::OpenInfoPanel(panel))
+            }
             None => Ok(CommandResult::Message(format!(
                 "No skill named '{name}'. Run /skills to browse the loaded list."
             ))),
@@ -143,19 +236,53 @@ impl CommandHandler for PersonalityCommand {
             )));
         }
 
+        // v0.6.8: read the active persona from `<profile>/persona/persona.toml`
+        // so the picker (a) opens with the cursor on the current preset and
+        // (b) annotates that row with `· current` so the user can tell at a
+        // glance what's loaded — pre-v0.6.8 the picker hardcoded `Some("default")`
+        // as preselect even when the actual persona was something else.
+        //
+        // Note: `PresetId::slug()` uses snake_case (`concise_pro`,
+        // `friendly_companion`) while the picker keys here use kebab-case
+        // (`friendly-companion`). Match by lowercasing + normalizing `_`
+        // to `-`. The picker also has `concise` and `verbose` keys with
+        // no exact PresetId mapping; those rows just won't get the
+        // `· current` marker, which is acceptable.
+        let active_preset_slug = {
+            let profile = crate::profile::ProfileManager::active().ok();
+            profile.and_then(|p| {
+                crate::persona::read_persona_toml(&p)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.preset.slug().replace('_', "-").to_string())
+            })
+        };
+
         let items: Vec<ListPickerItem> = PERSONALITY_PRESETS
             .iter()
-            .map(|(key, summary)| ListPickerItem {
-                key: (*key).to_string(),
-                primary: (*key).to_string(),
-                secondary: (*summary).to_string(),
+            .map(|(key, summary)| {
+                let is_current = active_preset_slug
+                    .as_deref()
+                    .map(|p| p == *key)
+                    .unwrap_or(false);
+                let secondary = if is_current {
+                    format!("{summary}  · current")
+                } else {
+                    (*summary).to_string()
+                };
+                ListPickerItem {
+                    key: (*key).to_string(),
+                    primary: (*key).to_string(),
+                    secondary,
+                }
             })
             .collect();
+        let preselect = active_preset_slug.as_deref().or(Some("default"));
         let picker = ListPicker::new(
             ListPickerKind::Personality,
             "Personality",
             items,
-            Some("default"),
+            preselect,
             "No personality presets registered.",
         );
         Ok(CommandResult::OpenListPicker(picker))
@@ -179,15 +306,52 @@ impl CommandHandler for InsightsCommand {
     }
 
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+        use crate::tui::widgets::{InfoPanel, InfoSection};
+
         let sessions = ctx.session_store.list_sessions(100)?;
         let total_sessions = sessions.len();
         let total_messages: i64 = sessions.iter().map(|s| s.message_count).sum();
         let current_messages = ctx.messages.len();
+        let avg_per_session = if total_sessions > 0 {
+            (total_messages as f64) / (total_sessions as f64)
+        } else {
+            0.0
+        };
+        let session_age = ctx.started_at.elapsed();
+        let age_label = format_duration(session_age);
 
-        Ok(CommandResult::Message(format!(
-            "Session insights:\n  Total sessions: {}\n  Total messages: {}\n  Current session messages: {}",
-            total_sessions, total_messages, current_messages
-        )))
+        let panel = InfoPanel::new("Insights")
+            .with_subtitle("session + message stats")
+            .with_footer("Esc close · `/usage` for token-level breakdown")
+            .section(
+                InfoSection::new("Sessions")
+                    .key_value("Total", total_sessions.to_string())
+                    .key_value("Current age", age_label),
+            )
+            .section(
+                InfoSection::new("Messages")
+                    .key_value("Total", total_messages.to_string())
+                    .key_value("This session", current_messages.to_string())
+                    .key_value("Per session avg", format!("{:.1}", avg_per_session)),
+            )
+            .section(
+                InfoSection::new("Tokens (this session)")
+                    .key_value("Prompt", ctx.token_usage.prompt_tokens.to_string())
+                    .key_value("Completion", ctx.token_usage.completion_tokens.to_string())
+                    .key_value("Total", ctx.token_usage.total_tokens.to_string()),
+            );
+        Ok(CommandResult::OpenInfoPanel(panel))
+    }
+}
+
+fn format_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
     }
 }
 
@@ -211,6 +375,32 @@ mod tests {
                 assert_eq!(picker.kind, crate::tui::widgets::ListPickerKind::Skill);
             }
             other => panic!("Expected OpenListPicker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skills_command_install_subcommand_routes_to_clawhub_picker() {
+        let cmd = SkillsCommand;
+        let mut ctx = test_context();
+        let result = cmd.execute("install", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenClawhubInstallPicker { initial_query } => {
+                assert!(initial_query.is_none());
+            }
+            other => panic!("Expected OpenClawhubInstallPicker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skills_command_install_with_query_passes_through() {
+        let cmd = SkillsCommand;
+        let mut ctx = test_context();
+        let result = cmd.execute("install github", &mut ctx).unwrap();
+        match result {
+            CommandResult::OpenClawhubInstallPicker { initial_query } => {
+                assert_eq!(initial_query.as_deref(), Some("github"));
+            }
+            other => panic!("Expected OpenClawhubInstallPicker, got {other:?}"),
         }
     }
 
@@ -256,6 +446,8 @@ mod tests {
             tools: vec![],
             prompts: vec![],
             location: None,
+            requires: Default::default(),
+            install_recipes: Vec::new(),
         });
         let result = cmd.execute("summarizer", &mut ctx).unwrap();
         match result {
@@ -285,7 +477,7 @@ mod tests {
                 assert!(picker
                     .entries()
                     .iter()
-                    .any(|e| matches!(e, ListPickerEntry::Item(i) if i.key == "default")));
+                    .any(|e| matches!(e, crate::tui::widgets::ListPickerEntry::Item(i) if i.key == "default")));
             }
             other => panic!("Expected OpenListPicker, got {other:?}"),
         }

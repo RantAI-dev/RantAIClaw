@@ -45,6 +45,8 @@ pub mod schema;
 pub mod screenshot;
 pub mod shell;
 pub mod skill_tool;
+pub mod skills_install;
+pub mod skills_meta;
 pub mod task_comment;
 pub mod task_complete_subtask;
 pub mod task_create;
@@ -212,8 +214,13 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let skill_env = compose_skill_env(root_config);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(ShellTool::with_skill_env(
+            security.clone(),
+            runtime,
+            skill_env,
+        )),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(GlobSearchTool::new(security.clone())),
@@ -274,11 +281,24 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Web search tool (enabled by default for GLM and other models)
+    // Web search tool (enabled by default for GLM and other models).
+    // For provider = "searxng", the endpoint comes from the supervised
+    // service when auto-launch is on, otherwise from web_search.searxng_url.
     if root_config.web_search.enabled {
+        // Explicit `web_search.searxng_url` always wins — operators who already
+        // run SearXNG on a fixed host/port shouldn't have `auto_launch=true`
+        // silently override them. Auto-launch only kicks in when no URL is set.
+        let searxng_url =
+            root_config.web_search.searxng_url.clone().or_else(|| {
+                match root_config.services.searxng.as_ref() {
+                    Some(s) if s.auto_launch => Some(format!("http://127.0.0.1:{}", s.port)),
+                    _ => None,
+                }
+            });
         tool_arcs.push(Arc::new(WebSearchTool::new(
             root_config.web_search.provider.clone(),
             root_config.web_search.brave_api_key.clone(),
+            searxng_url,
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
         )));
@@ -290,6 +310,32 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    // Hermes-parity skill management surface — read-side first
+    // (skills_list, skill_view, skills_search) is unconditional. The
+    // write side (skills_install, skills_install_deps) is also
+    // unconditional but routes through the existing approval manager
+    // by name; users wanting frictionless install add them to
+    // `[security] auto_approve = [...]`. Mirrors the shell tool
+    // approval pattern.
+    tool_arcs.push(Arc::new(skills_meta::SkillsListTool::new(
+        workspace_dir.to_path_buf(),
+        config.clone(),
+    )));
+    tool_arcs.push(Arc::new(skills_meta::SkillViewTool::new(
+        workspace_dir.to_path_buf(),
+        config.clone(),
+    )));
+    tool_arcs.push(Arc::new(skills_meta::SkillsSearchTool::new()));
+    if let Ok(active_profile) = crate::profile::ProfileManager::active() {
+        tool_arcs.push(Arc::new(skills_install::SkillsInstallTool::new(
+            active_profile,
+        )));
+    }
+    tool_arcs.push(Arc::new(skills_install::SkillsInstallDepsTool::new(
+        workspace_dir.to_path_buf(),
+        config.clone(),
+    )));
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
@@ -377,6 +423,103 @@ pub fn all_tools_with_runtime(
     boxed_registry_from_arcs(tool_arcs)
 }
 
+/// Build the per-skill env overlay merged onto every shell exec.
+///
+/// For each enabled skill (`[skills.entries.<name>]`), we surface:
+///
+/// * `env` table — copied verbatim onto the child process. User-controlled
+///   raw values; useful for `OPENROUTER_API_KEY = "..."` style entries.
+/// * `api_key` block — when `source = "env"` we re-export the named env
+///   var from the parent process onto the child (skill scripts often
+///   read e.g. `GEMINI_API_KEY` directly). When `source = "literal"` we
+///   set the env var to the literal `value`. The env-var name is taken
+///   from `id` (or, falling back, the upper-snake-cased skill name +
+///   "_API_KEY").
+/// * `config.*` — exposed as `RANTAICLAW_SKILL_<NAME>_<KEY>` in upper
+///   snake-case so skill scripts can read structured config without
+///   needing a YAML/TOML parser. Mirrors OpenClaw's
+///   `OPENCLAW_SKILL_<NAME>_<KEY>` convention.
+///
+/// Disabled skills (`enabled = false`) contribute nothing — gating
+/// happens at the loader, this is a cheap sanity check.
+fn compose_skill_env(config: &crate::config::Config) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+
+    for (name, entry) in &config.skills.entries {
+        if !entry.enabled {
+            continue;
+        }
+
+        // env: <key> = <value>
+        for (k, v) in &entry.env {
+            out.insert(k.clone(), v.clone());
+        }
+
+        // api_key: env-source re-export, literal-source direct set.
+        if let Some(api_key) = &entry.api_key {
+            let var_name = api_key
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("{}_API_KEY", skill_env_prefix(name)));
+            match api_key.source.as_str() {
+                "env" => {
+                    if let Ok(val) = std::env::var(&var_name) {
+                        if !val.is_empty() {
+                            out.insert(var_name, val);
+                        }
+                    }
+                }
+                "literal" => {
+                    if let Some(val) = api_key.value.clone() {
+                        out.insert(var_name, val);
+                    }
+                }
+                other => {
+                    tracing::warn!(
+                        skill = %name,
+                        source = %other,
+                        "unknown api_key.source; expected `env` or `literal`"
+                    );
+                }
+            }
+        }
+
+        // config.<key> = <value>  →  RANTAICLAW_SKILL_<NAME>_<KEY>
+        let prefix = format!("RANTAICLAW_SKILL_{}", skill_env_prefix(name));
+        for (k, v) in &entry.config {
+            let var_name = format!("{prefix}_{}", upper_snake(k));
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            out.insert(var_name, value);
+        }
+    }
+
+    out
+}
+
+/// Convert a skill slug (`weather`, `image-lab`, `multi-search-engine`)
+/// into the SCREAMING_SNAKE form used in env-var names.
+fn skill_env_prefix(slug: &str) -> String {
+    upper_snake(slug)
+}
+
+fn upper_snake(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +532,78 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn compose_skill_env_passes_through_explicit_env_table() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let mut entry = crate::config::SkillEntryConfig::default();
+        entry
+            .env
+            .insert("WEATHER_KEY".into(), "value-from-config".into());
+        config.skills.entries.insert("weather".into(), entry);
+
+        let env = compose_skill_env(&config);
+        assert_eq!(env.get("WEATHER_KEY"), Some(&"value-from-config".into()));
+    }
+
+    #[test]
+    fn compose_skill_env_resolves_literal_api_key() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let mut entry = crate::config::SkillEntryConfig::default();
+        entry.api_key = Some(crate::config::SkillApiKey {
+            source: "literal".into(),
+            id: Some("MY_API_KEY".into()),
+            value: Some("lit-abc".into()),
+        });
+        config.skills.entries.insert("test-skill".into(), entry);
+
+        let env = compose_skill_env(&config);
+        assert_eq!(env.get("MY_API_KEY"), Some(&"lit-abc".into()));
+    }
+
+    #[test]
+    fn compose_skill_env_emits_screaming_snake_for_config_keys() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let mut entry = crate::config::SkillEntryConfig::default();
+        entry
+            .config
+            .insert("default_city".into(), serde_json::json!("Tokyo"));
+        entry
+            .config
+            .insert("max_results".into(), serde_json::json!(10));
+        config
+            .skills
+            .entries
+            .insert("multi-search-engine".into(), entry);
+
+        let env = compose_skill_env(&config);
+        assert_eq!(
+            env.get("RANTAICLAW_SKILL_MULTI_SEARCH_ENGINE_DEFAULT_CITY"),
+            Some(&"Tokyo".into())
+        );
+        assert_eq!(
+            env.get("RANTAICLAW_SKILL_MULTI_SEARCH_ENGINE_MAX_RESULTS"),
+            Some(&"10".into())
+        );
+    }
+
+    #[test]
+    fn compose_skill_env_skips_disabled_skills() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let mut entry = crate::config::SkillEntryConfig::default();
+        entry.enabled = false;
+        entry
+            .env
+            .insert("DISABLED_KEY".into(), "should-not-appear".into());
+        config.skills.entries.insert("disabled".into(), entry);
+
+        let env = compose_skill_env(&config);
+        assert!(env.get("DISABLED_KEY").is_none());
     }
 
     #[test]

@@ -99,7 +99,7 @@ Maintain these branch protection rules on `main`:
 - Require check `CI Required Gate`.
 - Require pull request reviews before merge.
 - Require CODEOWNERS review for protected paths.
-- For `.github/workflows/**`, require owner approval via `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) and keep branch/ruleset bypass limited to org owners.
+- For `.github/workflows/**`, keep branch/ruleset bypass limited to org owners; `workflow-sanity.yml` (`actionlint` + tab check) is the merge-time gate.
 - Dismiss stale approvals when new commits are pushed.
 - Restrict force-push on protected branches.
 

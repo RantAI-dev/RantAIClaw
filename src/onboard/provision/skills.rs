@@ -10,8 +10,7 @@
 use super::traits::{ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner};
 use crate::config::Config;
 use crate::profile::Profile;
-use crate::skills::bundled::{self, STARTER_PACK};
-use crate::skills::clawhub;
+use crate::skills::bundled::{self};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -114,137 +113,32 @@ impl TuiProvisioner for SkillsProvisioner {
             }
         }
 
-        // Step 2: Browse ClawHub?
+        // Step 2: Point the user to `/skills install`. The provisioner
+        // protocol (Choose / Prompt) is request-response by design — the
+        // wizard sends options, the user picks. ClawHub install is
+        // interactive, network-driven, and stateful in a way that
+        // doesn't fit that mold cleanly. Rather than build a parallel
+        // mini-picker inside the overlay, point the user at the
+        // already-working `/skills install` command, which has live
+        // search, install-and-stay-open, and predictable Enter semantics.
         send(
             &events,
-            ProvisionEvent::Choose {
-                id: "browse_clawhub".into(),
-                label: "Browse ClawHub for more skills?".into(),
-                options: vec!["Yes — browse ClawHub".to_string(), "No — skip".to_string()],
-                multi: false,
+            ProvisionEvent::Message {
+                severity: Severity::Info,
+                text: "Run `/skills install` after setup to browse ClawHub \
+                       (live search, install one or many, Esc to close)."
+                    .into(),
             },
         )
         .await?;
 
-        let browse = {
-            let sel = recv_selection(&mut responses).await?;
-            sel.first().copied() == Some(0)
-        };
-
-        if browse {
-            send(
-                &events,
-                ProvisionEvent::Message {
-                    severity: Severity::Info,
-                    text: "Fetching top ClawHub skills…".into(),
-                },
-            )
-            .await?;
-
-            let top = match clawhub::list_top(20).await {
-                Ok(items) => items,
-                Err(err) => {
-                    send(
-                        &events,
-                        ProvisionEvent::Message {
-                            severity: Severity::Warn,
-                            text: format!("ClawHub fetch failed: {err}; skipping browse step."),
-                        },
-                    )
-                    .await?;
-                    send(
-                        &events,
-                        ProvisionEvent::Done {
-                            summary: format!(
-                                "Skills installed: {} from starter pack",
-                                installed_names.len()
-                            ),
-                        },
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
-
-            if top.is_empty() {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Info,
-                        text: "ClawHub returned no skills.".into(),
-                    },
-                )
-                .await?;
-            } else {
-                let labels: Vec<String> = top
-                    .iter()
-                    .map(|s| {
-                        let name = if s.display_name.is_empty() {
-                            &s.slug
-                        } else {
-                            &s.display_name
-                        };
-                        if s.summary.is_empty() {
-                            format!("{}  ({} stars)", name, s.stats.stars)
-                        } else {
-                            format!("{}  ({} stars) — {}", name, s.stats.stars, s.summary)
-                        }
-                    })
-                    .collect();
-
-                send(
-                    &events,
-                    ProvisionEvent::Choose {
-                        id: "clawhub_picks".into(),
-                        label: "Select ClawHub skills to install (multi-select)".into(),
-                        options: labels,
-                        multi: true,
-                    },
-                )
-                .await?;
-
-                let picks = recv_selection_multi(&mut responses).await?;
-
-                if !picks.is_empty() {
-                    let slugs: Vec<String> = picks
-                        .into_iter()
-                        .filter_map(|i| top.get(i).map(|s| s.slug.clone()))
-                        .collect();
-
-                    match clawhub::install_many(profile, &slugs).await {
-                        Ok(installed) => {
-                            installed_names.extend(installed.clone());
-                            send(
-                                &events,
-                                ProvisionEvent::Message {
-                                    severity: Severity::Success,
-                                    text: format!(
-                                        "Installed from ClawHub: {}",
-                                        installed.join(", ")
-                                    ),
-                                },
-                            )
-                            .await?;
-                        }
-                        Err(err) => {
-                            send(
-                                &events,
-                                ProvisionEvent::Message {
-                                    severity: Severity::Warn,
-                                    text: format!("ClawHub install failed: {err}"),
-                                },
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-        }
-
         send(
             &events,
             ProvisionEvent::Done {
-                summary: format!("Skills installed: {} total", installed_names.len()),
+                summary: format!(
+                    "Skills installed: {} from starter pack — `/skills install` for more",
+                    installed_names.len()
+                ),
             },
         )
         .await?;
@@ -272,12 +166,6 @@ async fn recv_selection(
         Some(_) => anyhow::bail!("unexpected response"),
         None => anyhow::bail!("channel closed"),
     }
-}
-
-async fn recv_selection_multi(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    recv_selection(responses).await
 }
 
 #[cfg(test)]

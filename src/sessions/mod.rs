@@ -1,3 +1,4 @@
+pub mod cli;
 mod migrations;
 mod store;
 mod types;

@@ -460,6 +460,7 @@ mod tests {
             name: "shell".into(),
             args: serde_json::json!({"cmd": "ls"}),
             result: None,
+            started_at: std::time::Instant::now(),
         };
         let lines = render_message_lines("assistant", "Running.", &[], &[block], &theme());
         assert_eq!(lines.len(), 2);
@@ -475,6 +476,7 @@ mod tests {
             name: "shell".into(),
             args: serde_json::json!({"cmd": "ls"}),
             result: Some((true, "ok".into())),
+            started_at: std::time::Instant::now(),
         }];
         let json = serialize_tool_calls(&blocks).expect("non-empty");
         let parsed = parse_persisted_tool_calls(&json);

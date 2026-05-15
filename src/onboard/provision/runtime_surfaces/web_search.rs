@@ -124,6 +124,7 @@ impl TuiProvisioner for WebSearchProvisioner {
             enabled: true,
             provider: provider.clone(),
             brave_api_key: api_key,
+            searxng_url: None,
             max_results,
             timeout_secs: 15,
         };

@@ -1,9 +1,9 @@
 //! Approval policy bootstrap — materialises the three on-disk policy
 //! files (`autonomy.toml`, `command_allowlist.toml`, `forbidden_paths.toml`)
-//! under `<profile>/policy/` from a chosen `PolicyPreset` (L1-L4).
+//! under `<profile>/policy/` from a chosen `PolicyPreset`.
 //!
 //! Spec: `docs/superpowers/specs/2026-04-27-onboarding-depth-v2-design.md`,
-//! §6 "Approval runtime" + §"L1-L4 presets".
+//! §6 "Approval runtime" + §"Preset bundles".
 //!
 //! The four preset bundles ship as `include_str!` resources under
 //! `presets/`. Each bundle is a single TOML document containing the
@@ -14,8 +14,8 @@
 //! on disk so user-edited policy survives re-running the wizard. Pass
 //! `force = true` to overwrite from the preset.
 //!
-//! The L4 ("off") preset prints a stern stderr warning whenever it is
-//! selected — the spec is explicit that L4 is for trusted CI only.
+//! The `Off` preset prints a stern stderr warning whenever it is
+//! selected — the spec is explicit that `Off` is for trusted CI only.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -28,61 +28,77 @@ use crate::profile::Profile;
 
 // ── Preset bundles (compiled into the binary) ───────────────────
 
-const L1_BUNDLE: &str = include_str!("presets/policy_l1.toml");
-const L2_BUNDLE: &str = include_str!("presets/policy_l2.toml");
-const L3_BUNDLE: &str = include_str!("presets/policy_l3.toml");
-const L4_BUNDLE: &str = include_str!("presets/policy_l4.toml");
+const MANUAL_BUNDLE: &str = include_str!("presets/policy_manual.toml");
+const SMART_BUNDLE: &str = include_str!("presets/policy_smart.toml");
+const STRICT_BUNDLE: &str = include_str!("presets/policy_strict.toml");
+const OFF_BUNDLE: &str = include_str!("presets/policy_off.toml");
 
 // ── PolicyPreset enum ───────────────────────────────────────────
 
 /// One of the four canonical approval-policy presets.
 ///
-/// The variants are deliberately spelt out (rather than `enum_iterator`-
-/// style) so callers can pattern-match exhaustively and so the spec's
-/// "L1Manual / L2Smart / L3Strict / L4Off" naming survives as code.
+/// Variants are spelt out so callers can pattern-match exhaustively.
+/// Legacy `L1`/`L2`/`L3`/`L4` ids remain parseable for backward
+/// compatibility with on-disk configs written by earlier releases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyPreset {
-    /// L1 — paranoid manual mode. Empty allowlist, every tool prompts.
-    L1Manual,
-    /// L2 — smart safe-by-default. Read-only commands pre-allowed.
-    L2Smart,
-    /// L3 — deny-by-default strict mode. For unattended agents.
-    L3Strict,
-    /// L4 — gating disabled. Trusted CI environments only.
-    L4Off,
+    /// Manual — paranoid mode. Empty allowlist, every tool prompts.
+    Manual,
+    /// Smart — safe-by-default. Read-only commands pre-allowed.
+    Smart,
+    /// Strict — deny-by-default. For unattended agents.
+    Strict,
+    /// Off — gating disabled. Trusted CI environments only.
+    Off,
 }
 
 impl PolicyPreset {
-    /// Stable identifier (`"L1"` … `"L4"`) used in TOML and CLI flags.
+    /// Stable identifier (`"manual"` … `"off"`) used in TOML and CLI flags.
     pub fn id(self) -> &'static str {
         match self {
-            Self::L1Manual => "L1",
-            Self::L2Smart => "L2",
-            Self::L3Strict => "L3",
-            Self::L4Off => "L4",
+            Self::Manual => "manual",
+            Self::Smart => "smart",
+            Self::Strict => "strict",
+            Self::Off => "off",
         }
     }
 
-    /// Parse a case-insensitive preset id (`"L1"`, `"l3"`, …).
+    /// Parse a case-insensitive preset id. Accepts both new verbal forms
+    /// (`"manual"`, `"smart"`, `"strict"`, `"off"`) and legacy `L1`–`L4`
+    /// ids so configs written by pre-v0.6.40 releases keep working.
     pub fn from_str_ci(s: &str) -> Result<Self> {
-        match s.trim().to_ascii_uppercase().as_str() {
-            "L1" => Ok(Self::L1Manual),
-            "L2" => Ok(Self::L2Smart),
-            "L3" => Ok(Self::L3Strict),
-            "L4" => Ok(Self::L4Off),
+        match s.trim().to_ascii_lowercase().as_str() {
+            "manual" => Ok(Self::Manual),
+            "smart" => Ok(Self::Smart),
+            "strict" => Ok(Self::Strict),
+            "off" => Ok(Self::Off),
+            "l1" => Ok(Self::Manual),
+            "l2" => Ok(Self::Smart),
+            "l3" => Ok(Self::Strict),
+            "l4" => Ok(Self::Off),
             other => Err(anyhow!(
-                "unknown policy preset '{other}' (valid: L1, L2, L3, L4)"
+                "unknown policy preset '{other}' (valid: manual, smart, strict, off)"
             )),
+        }
+    }
+
+    /// Human-facing label for menus / system messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::Smart => "Smart",
+            Self::Strict => "Strict",
+            Self::Off => "Off",
         }
     }
 
     /// Raw bundle TOML for this preset (parsed by `write_policy_files`).
     fn bundle(self) -> &'static str {
         match self {
-            Self::L1Manual => L1_BUNDLE,
-            Self::L2Smart => L2_BUNDLE,
-            Self::L3Strict => L3_BUNDLE,
-            Self::L4Off => L4_BUNDLE,
+            Self::Manual => MANUAL_BUNDLE,
+            Self::Smart => SMART_BUNDLE,
+            Self::Strict => STRICT_BUNDLE,
+            Self::Off => OFF_BUNDLE,
         }
     }
 }
@@ -149,9 +165,9 @@ pub fn write_policy_files(profile: &Profile, preset: PolicyPreset, force: bool) 
         force,
     )?;
 
-    if matches!(preset, PolicyPreset::L4Off) {
+    if matches!(preset, PolicyPreset::Off) {
         eprintln!(
-            "⚠️  approval policy preset L4 selected — gating is OFF.\n   \
+            "⚠️  approval policy preset Off selected — gating is OFF.\n   \
              Every tool call will execute without prompts. Use this only in \
              trusted CI environments. To revert: `rantaiclaw setup approvals --force`."
         );
@@ -250,9 +266,9 @@ fn verify_written_policy(
 
 const AUTONOMY_HEADER: &str = "\
 # Autonomy + approval policy for this profile. Generated from a
-# RantaiClaw L1-L4 preset; safe to hand-edit. Re-running
-# `rantaiclaw setup approvals` without --force will leave this file
-# alone.
+# RantaiClaw preset (Manual / Smart / Strict / Off); safe to hand-edit.
+# Re-running `rantaiclaw setup approvals` without --force will leave
+# this file alone.
 ";
 
 const ALLOWLIST_HEADER: &str = "\
@@ -263,7 +279,7 @@ const ALLOWLIST_HEADER: &str = "\
 
 const FORBIDDEN_HEADER: &str = "\
 # Forbidden paths — never-allow globs checked first by the approval
-# gate. No allowlist entry, /yolo toggle, or L4 setting can override
+# gate. No allowlist entry, /yolo toggle, or `Off` setting can override
 # these paths (spec §6.1).
 ";
 
@@ -338,10 +354,10 @@ mod tests {
     #[test]
     fn all_bundles_parse() {
         for p in [
-            PolicyPreset::L1Manual,
-            PolicyPreset::L2Smart,
-            PolicyPreset::L3Strict,
-            PolicyPreset::L4Off,
+            PolicyPreset::Manual,
+            PolicyPreset::Smart,
+            PolicyPreset::Strict,
+            PolicyPreset::Off,
         ] {
             let parsed: PolicyBundle = toml::from_str(p.bundle())
                 .unwrap_or_else(|e| panic!("preset {} bundle failed to parse: {e}", p.id()));
@@ -357,10 +373,10 @@ mod tests {
     #[test]
     fn id_round_trip() {
         for p in [
-            PolicyPreset::L1Manual,
-            PolicyPreset::L2Smart,
-            PolicyPreset::L3Strict,
-            PolicyPreset::L4Off,
+            PolicyPreset::Manual,
+            PolicyPreset::Smart,
+            PolicyPreset::Strict,
+            PolicyPreset::Off,
         ] {
             assert_eq!(PolicyPreset::from_str_ci(p.id()).unwrap(), p);
         }
@@ -369,31 +385,56 @@ mod tests {
     #[test]
     fn from_str_ci_is_case_insensitive() {
         assert_eq!(
+            PolicyPreset::from_str_ci("Smart").unwrap(),
+            PolicyPreset::Smart
+        );
+        assert_eq!(
+            PolicyPreset::from_str_ci("  OFF ").unwrap(),
+            PolicyPreset::Off
+        );
+    }
+
+    #[test]
+    fn legacy_l1_l4_ids_still_parse() {
+        // Backward compat: configs written by pre-v0.6.40 releases used
+        // `preset = "L1"` … `"L4"`. Reading them must still work so the
+        // user does not have to hand-edit their policy/autonomy.toml.
+        assert_eq!(
+            PolicyPreset::from_str_ci("L1").unwrap(),
+            PolicyPreset::Manual
+        );
+        assert_eq!(
             PolicyPreset::from_str_ci("l2").unwrap(),
-            PolicyPreset::L2Smart
+            PolicyPreset::Smart
+        );
+        assert_eq!(
+            PolicyPreset::from_str_ci("L3").unwrap(),
+            PolicyPreset::Strict
         );
         assert_eq!(
             PolicyPreset::from_str_ci("  L4 ").unwrap(),
-            PolicyPreset::L4Off
+            PolicyPreset::Off
         );
     }
 
     #[test]
     fn from_str_ci_rejects_unknown() {
-        let err = PolicyPreset::from_str_ci("L42").unwrap_err();
+        let err = PolicyPreset::from_str_ci("paranoid").unwrap_err();
         assert!(err.to_string().contains("unknown policy preset"));
+        let err2 = PolicyPreset::from_str_ci("L42").unwrap_err();
+        assert!(err2.to_string().contains("unknown policy preset"));
     }
 
     #[test]
     fn verify_written_policy_passes_for_freshly_written_bundle() {
-        // For each L1-L4 preset, write the files into a tempdir then
-        // re-parse them. Exercises the writer + bundle templates +
-        // verifier together.
+        // For each preset, write the files into a tempdir then re-parse
+        // them. Exercises the writer + bundle templates + verifier
+        // together.
         for p in [
-            PolicyPreset::L1Manual,
-            PolicyPreset::L2Smart,
-            PolicyPreset::L3Strict,
-            PolicyPreset::L4Off,
+            PolicyPreset::Manual,
+            PolicyPreset::Smart,
+            PolicyPreset::Strict,
+            PolicyPreset::Off,
         ] {
             let tmp = tempfile::tempdir().expect("tempdir");
             let bundle: PolicyBundle = toml::from_str(p.bundle()).expect("bundle parses");
@@ -451,7 +492,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             tmp.path().join("autonomy.toml"),
-            "[autonomy]\nlevel = \"l2\"\n[approvals]\nmode = \"manual\"\n",
+            "[autonomy]\npreset = \"smart\"\n[approvals]\nmode = \"manual\"\n",
         )
         .unwrap();
         // A pattern that's a number, not a string — the gate's glob

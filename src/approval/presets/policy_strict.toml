@@ -1,11 +1,11 @@
-# RantaiClaw approval policy — preset L3 (Strict / deny-by-default)
+# RantaiClaw approval policy — preset Strict (deny-by-default)
 #
-# See `policy_l1.toml` for the bundle layout. L3 is for unattended
+# See `policy_manual.toml` for the bundle layout. Strict is for unattended
 # / production agents. Mode is `strict`: anything not explicitly
 # allowed is denied (no interactive prompt fallback).
 
 [autonomy]
-preset = "L3"
+preset = "strict"
 mode = "strict"
 description = "Strict — deny-by-default. Only explicitly allowlisted commands run; no prompts."
 
@@ -18,7 +18,7 @@ timeout_secs = 0
 # install, cron / session housekeeping. Anything beyond this set fails
 # closed under strict mode.
 patterns = [
-  # Read-only (same as L2)
+  # Read-only (same as Smart)
   "ls",
   "ls *",
   "cat *",
@@ -61,7 +61,7 @@ patterns = [
 ]
 
 [forbidden_paths]
-# Strictest set: same as L1 + L2, with read-only system trees added.
+# Strictest set: same as Manual + Smart, with read-only system trees added.
 patterns = [
   "/etc/**",
   "/sys/**",

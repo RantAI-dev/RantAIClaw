@@ -5,7 +5,6 @@ use super::super::traits::{
 };
 use crate::config::schema::SignalConfig;
 use crate::config::Config;
-use crate::onboard::provision::validate::file::assert_path_exists;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;

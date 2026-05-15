@@ -167,6 +167,11 @@ pub struct Config {
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// Auto-managed external services (Docker containers, sidecars).
+    /// Deny-by-default: each service must set `auto_launch = true` explicitly (`[services]`).
+    #[serde(default)]
+    pub services: ServicesConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -440,6 +445,119 @@ pub struct SkillsConfig {
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// Per-skill configuration entries keyed by slug. Mirrors OpenClaw's
+    /// `skills.entries.<name>` JSON shape so the same skill works in
+    /// either runtime with the same config block.
+    ///
+    /// ```toml
+    /// [skills.entries.weather]
+    /// enabled = true
+    ///
+    /// [skills.entries.image-lab]
+    /// enabled = true
+    /// [skills.entries.image-lab.api_key]
+    /// source = "env"
+    /// id = "GEMINI_API_KEY"
+    /// [skills.entries.image-lab.config]
+    /// endpoint = "https://example.com"
+    /// ```
+    ///
+    /// Skills with `enabled = false` are excluded by the loader. Skills
+    /// without an entry are loaded by default (enabled). The `api_key`,
+    /// `env`, and `config` sub-tables are read by skill scripts (or
+    /// surfaced in `skills inspect`) — the loader itself only consults
+    /// `enabled`.
+    #[serde(default)]
+    pub entries: std::collections::HashMap<String, SkillEntryConfig>,
+    /// Install-recipe selection knobs. OpenClaw exposes the equivalents
+    /// at `skills.install.preferBrew` / `nodeManager` — same shape here
+    /// so a user moving from OpenClaw can paste their preferences in
+    /// and have them honoured.
+    #[serde(default, alias = "install")]
+    pub install: SkillsInstallConfig,
+}
+
+/// Recipe-selector overrides for `skills install-deps`. Defaults match the
+/// hardcoded preference order shipped through v0.6.31 (brew first, npm as
+/// the node-manager default), so this block is only needed when a user
+/// wants to deviate.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkillsInstallConfig {
+    /// When true (default), the runner prefers `brew` recipes over
+    /// `uv`/`npm`/`go` when brew is available on the host. Set to
+    /// `false` to demote brew below uv. Has no effect on hosts without
+    /// brew.
+    #[serde(default = "default_true_install")]
+    pub prefer_brew: bool,
+    /// Which node-package-manager recipe wins when multiple are
+    /// declared. Recognised values: `npm` (default), `pnpm`, `yarn`.
+    /// Unknown values fall back to `npm`. The runner still skips a
+    /// preferred recipe whose driver isn't on `$PATH`.
+    #[serde(default = "default_node_manager")]
+    pub node_manager: String,
+}
+
+impl Default for SkillsInstallConfig {
+    fn default() -> Self {
+        Self {
+            prefer_brew: true,
+            node_manager: default_node_manager(),
+        }
+    }
+}
+
+fn default_true_install() -> bool {
+    true
+}
+
+fn default_node_manager() -> String {
+    "npm".to_string()
+}
+
+/// Per-skill configuration entry — OpenClaw `skills.entries.<name>` parity.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkillEntryConfig {
+    /// Whether the skill is loaded into the agent's context. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional API-key wiring. `source = "env"` resolves at run time from
+    /// the named env var; `source = "literal"` uses `value` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SkillApiKey>,
+    /// Extra environment variables to expose to the skill's scripts when
+    /// the agent shells out. Mapped onto the child process at exec time.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub env: std::collections::HashMap<String, String>,
+    /// Free-form per-skill config. Skill-specific schema; rantaiclaw does
+    /// not validate the keys. Stored as JSON values for schema-derive
+    /// compatibility — TOML deserialises seamlessly into these.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub config: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl Default for SkillEntryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            api_key: None,
+            env: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// API-key resolution shape used inside `[skills.entries.<name>.api_key]`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct SkillApiKey {
+    /// `env` (recommended) or `literal`.
+    pub source: String,
+    /// When `source = "env"`, the env var name to read. Ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// When `source = "literal"`, the API key value. **Avoid** — prefer env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -1013,12 +1131,18 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo" (free, no API key), "brave" (requires API key),
+    /// or "searxng" (auto-launched via `[services.searxng]` or pointed at a custom URL).
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// SearXNG endpoint URL — only consulted when `provider = "searxng"` and
+    /// `[services.searxng] auto_launch = false`. When auto-launch is on, the
+    /// supervised container's URL takes precedence over this field.
+    #[serde(default)]
+    pub searxng_url: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
@@ -1045,8 +1169,54 @@ impl Default for WebSearchConfig {
             enabled: false,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            searxng_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+        }
+    }
+}
+
+// ── Auto-managed external services ──────────────────────────────
+
+/// Top-level container for opt-in auto-managed dependencies.
+/// Each service is `Option<...>` and absent by default — the daemon only spawns
+/// services that the user has explicitly opted into with `auto_launch = true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ServicesConfig {
+    /// SearXNG meta-search engine, run as a local Docker container.
+    /// Powers `[web_search] provider = "searxng"` without the user pasting a URL.
+    #[serde(default)]
+    pub searxng: Option<SearxngServiceConfig>,
+}
+
+/// SearXNG service launcher.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SearxngServiceConfig {
+    /// Spawn the container at daemon boot. Defaults to false — must be opted into.
+    #[serde(default)]
+    pub auto_launch: bool,
+    /// Local port on 127.0.0.1 to bind. Default 8888.
+    #[serde(default = "default_searxng_port")]
+    pub port: u16,
+    /// Docker image to run. Default `searxng/searxng:latest`.
+    #[serde(default = "default_searxng_image")]
+    pub image: String,
+}
+
+fn default_searxng_port() -> u16 {
+    8888
+}
+
+fn default_searxng_image() -> String {
+    "searxng/searxng:latest".into()
+}
+
+impl Default for SearxngServiceConfig {
+    fn default() -> Self {
+        Self {
+            auto_launch: false,
+            port: default_searxng_port(),
+            image: default_searxng_image(),
         }
     }
 }
@@ -2923,6 +3093,7 @@ impl Default for Config {
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            services: ServicesConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -3179,7 +3350,7 @@ async fn resolve_runtime_config_dirs(
     ))
 }
 
-fn decrypt_optional_secret(
+pub(crate) fn decrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
     field_name: &str,
@@ -4110,6 +4281,7 @@ default_temperature = 0.7
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            services: ServicesConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -4282,6 +4454,7 @@ tool_dispatcher = "xml"
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_search: WebSearchConfig::default(),
+            services: ServicesConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),

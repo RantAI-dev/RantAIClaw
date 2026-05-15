@@ -22,7 +22,7 @@ use super::curated::OAuthProvider;
 pub const OAUTH_PORT: u16 = 11500;
 
 /// Hard cap on how long we wait for the user to complete the flow.
-pub const OAUTH_TIMEOUT: Duration = Duration::from_secs(300);
+pub const OAUTH_TIMEOUT: Duration = Duration::from_mins(5);
 
 struct ProviderConfig {
     auth_url: &'static str,
