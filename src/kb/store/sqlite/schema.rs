@@ -137,9 +137,12 @@ pub fn migrate(conn: &Connection, embedding_dim: usize) -> KbResult<()> {
 
         -- sqlite-vec virtual table for vectors. The dimension is fixed at table
         -- creation; changing KB_EMBEDDING_DIM requires migration via the
-        -- bulk_re_embed path.
+        -- bulk_re_embed path. `distance_metric=cosine` matches the TS schema
+        -- (vector-store.ts uses SurrealDB MTREE DIST COSINE), so the
+        -- similarity values returned by `search_by_vector` are comparable
+        -- across backends.
         CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
-            embedding float[{dim}]
+            embedding float[{dim}] distance_metric=cosine
         );
 
         -- FTS5 BM25 for lexical search.

@@ -264,9 +264,11 @@ impl SqliteStore {
                         contextual_prefix: r.get("contextual_prefix").ok().flatten(),
                     });
 
-                // sqlite-vec returns L2/cosine distance — lower is closer.
-                // Convert to a [0,1]-ish similarity by `1 - distance` (cosine)
-                // and let downstream filters compare with `min_similarity`.
+                // `chunk_vec` is created with `distance_metric=cosine` (see
+                // schema.rs), so `dist` here is cosine distance in [0, 2].
+                // cosine_similarity = 1 - cosine_distance — this conversion
+                // is only correct because the vec0 column is cosine; if the
+                // distance metric ever changes, revisit this line first.
                 let similarity = 1.0 - dist;
                 if let Some(min) = filter.min_similarity {
                     if similarity < min {
