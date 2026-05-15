@@ -222,6 +222,13 @@ jobs:
                   LINKER_ENV: ${{ matrix.linker_env }}
                   LINKER: ${{ matrix.linker }}
               run: |
+                  # GitHub's macos-15 image ships a Homebrew `cargo` shim
+                  # that actually wraps `rustup-init` and refuses `cargo
+                  # build` invocations. Prepend `$CARGO_HOME/bin` so the
+                  # real rustup-installed toolchain wins on PATH. Linux
+                  # and Windows runners are unaffected — the prepend is
+                  # harmless when the directory already comes first.
+                  export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
                   if [ -n "$LINKER_ENV" ] && [ -n "$LINKER" ]; then
                     echo "Using linker override: $LINKER_ENV=$LINKER"
                     export "$LINKER_ENV=$LINKER"
