@@ -3,12 +3,12 @@
 //! Task 3.1 covers the LRU cache port. Task 3.2 adds OpenRouter provider
 //! tests (wiremock-backed). Task 3.3 appends TEI variant tests.
 //!
-//! `await_holding_lock` is allowed file-wide: `ENV_LOCK` is a std mutex used
-//! to serialize env-var mutation across async tests. Tests run one-at-a-time
-//! per integration binary so the held-across-await pattern is safe here, and
-//! using an async mutex would force every sync test (e.g. `config_test.rs`)
-//! into a tokio runtime for parity, which is heavier than the lint.
-#![allow(clippy::await_holding_lock)]
+//! `await_holding_lock` is allowed only on the specific tests that hold
+//! `ENV_LOCK` (a std mutex serializing env-var mutation) across `.await`.
+//! Tests run one-at-a-time per integration binary so this pattern is safe
+//! here, and using an async mutex would force every sync test (e.g.
+//! `config_test.rs`) into a tokio runtime for parity, which is heavier than
+//! the lint.
 
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -287,6 +287,7 @@ async fn openrouter_embed_many_propagates_dim_mismatch() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn make_provider_uses_openrouter_for_default_url() {
     // Default URL contains `openrouter.ai` → OpenRouter provider. We can't
@@ -335,6 +336,7 @@ async fn openrouter_embed_query_live() {
 
 // ---- TEI sidecar variant (task 3.3) ---------------------------------
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn make_provider_uses_tei_for_non_openrouter_url() {
     // Provider type isn't downcastable through `Arc<dyn Trait>`, so verify
@@ -388,6 +390,7 @@ async fn make_provider_uses_tei_for_non_openrouter_url() {
     }
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn tei_omits_auth_header_when_no_key() {
     // Directly verify the TeiEmbedding behavior without going through the
