@@ -28,7 +28,9 @@ use crate::kb::{KbConfig, KbResult};
 
 const TIMEOUT: Duration = Duration::from_secs(6);
 const CACHE_CAP: usize = 256;
-const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+// 5min matches the TS source's cache TTL. Using `from_mins` keeps clippy
+// (duration_suboptimal_units) happy without an arbitrary `5 * 60` literal.
+const CACHE_TTL: Duration = Duration::from_mins(5);
 
 /// Minimum chars below which we consider the query "likely needs rewriting".
 /// Mirrors the TS source's `< 60` heuristic.

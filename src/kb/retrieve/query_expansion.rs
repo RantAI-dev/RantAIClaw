@@ -15,7 +15,9 @@ use tokio::sync::Mutex;
 use crate::kb::embed::cache::LruCache;
 use crate::kb::KbConfig;
 
-const CACHE_TTL: Duration = Duration::from_secs(60 * 60); // 1h, matches TS source
+// 1h matches the TS source's cache TTL. Using `from_hours` keeps clippy
+// (duration_suboptimal_units) happy without an arbitrary `60 * 60` literal.
+const CACHE_TTL: Duration = Duration::from_hours(1);
 const CACHE_CAP: usize = 1024;
 const TIMEOUT: Duration = Duration::from_secs(8);
 
