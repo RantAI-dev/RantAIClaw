@@ -306,3 +306,8 @@ predicates = "3"
 [[bench]]
 name = "agent_benchmarks"
 harness = false
+
+[[bench]]
+name = "kb_retrieval"
+harness = false
+required-features = ["kb"]
