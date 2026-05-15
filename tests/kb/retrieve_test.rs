@@ -255,6 +255,22 @@ impl KbStore for FakeStore {
     async fn count_by_embedding_model(&self) -> KbResult<Vec<(Option<String>, usize)>> {
         Ok(Vec::new())
     }
+    async fn list_chunks_for_re_embed(
+        &self,
+        _batch_size: usize,
+        _after_id: Option<&str>,
+        _skip_model: Option<&str>,
+    ) -> KbResult<Vec<(ChunkId, String, Option<String>)>> {
+        Ok(Vec::new())
+    }
+    async fn update_chunk_embedding(
+        &self,
+        _chunk_id: &ChunkId,
+        _new_embedding: &[f32],
+        _new_model: &str,
+    ) -> KbResult<()> {
+        Ok(())
+    }
 }
 
 /// Fake EmbeddingProvider — returns a unit-length 4-dim vector per query.

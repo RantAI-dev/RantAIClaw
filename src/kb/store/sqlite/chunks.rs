@@ -189,6 +189,122 @@ impl SqliteStore {
         .map_err(|e| KbError::Other(format!("join: {e}")))?
     }
 
+    /// Paginated walk over chunks for re-embedding (Phase 9.2 / TS
+    /// `bulk-re-embed.ts`). Joins `document` to skip soft-deleted parents.
+    /// When `skip_model` is `Some(m)`, rows tagged with `m` are excluded —
+    /// NULL-tagged rows are always included (treated as "needs re-embed").
+    pub(crate) async fn list_chunks_for_re_embed_impl(
+        &self,
+        batch_size: usize,
+        after_id: Option<&str>,
+        skip_model: Option<&str>,
+    ) -> KbResult<Vec<(ChunkId, String, Option<String>)>> {
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let after_id = after_id.map(str::to_string);
+        let skip_model = skip_model.map(str::to_string);
+        let batch_size_i = batch_size as i64;
+
+        tokio::task::spawn_blocking(
+            move || -> KbResult<Vec<(ChunkId, String, Option<String>)>> {
+                let conn = conn.blocking_lock();
+                // Build SQL with optional predicates inlined as `?` placeholders.
+                // Lexical ordering on TEXT id is deterministic, which is enough
+                // for pagination — the bulk driver never relies on a particular
+                // visit order, only that each chunk is visited exactly once.
+                let mut sql = String::from(
+                    "SELECT c.id, c.content, c.embedding_model
+                     FROM chunk c
+                     JOIN document d ON d.id = c.document_id
+                     WHERE d.deleted_at IS NULL",
+                );
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                if let Some(skip) = &skip_model {
+                    sql.push_str(" AND (c.embedding_model IS NULL OR c.embedding_model != ?)");
+                    params.push(Box::new(skip.clone()));
+                }
+                if let Some(after) = &after_id {
+                    sql.push_str(" AND c.id > ?");
+                    params.push(Box::new(after.clone()));
+                }
+                sql.push_str(" ORDER BY c.id LIMIT ?");
+                params.push(Box::new(batch_size_i));
+
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::ToSql> =
+                    params.iter().map(|b| b.as_ref()).collect();
+                let rows = stmt
+                    .query_map(param_refs.as_slice(), |row| {
+                        let id: String = row.get(0)?;
+                        let content: String = row.get(1)?;
+                        let model: Option<String> = row.get(2)?;
+                        Ok((ChunkId(id), content, model))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            },
+        )
+        .await
+        .map_err(|e| KbError::Other(format!("join: {e}")))?
+    }
+
+    /// Replace an existing chunk's embedding vector and model tag. Validates
+    /// the new vector against [`SqliteStore::embedding_dim`] before touching
+    /// the DB so a bad dim can't half-write `chunk_vec` vs `chunk`. The
+    /// two-statement UPDATE runs inside a single transaction so a crash
+    /// between them can't desync the metadata and vector tables.
+    pub(crate) async fn update_chunk_embedding_impl(
+        &self,
+        chunk_id: &ChunkId,
+        new_embedding: &[f32],
+        new_model: &str,
+    ) -> KbResult<()> {
+        if new_embedding.len() != self.embedding_dim {
+            return Err(KbError::DimensionMismatch {
+                expected: self.embedding_dim,
+                got: new_embedding.len(),
+                index: 0,
+            });
+        }
+        let conn = self.conn.clone();
+        let chunk_id_s = chunk_id.0.clone();
+        let bytes = serialize_float32(new_embedding);
+        let new_model_s = new_model.to_string();
+
+        tokio::task::spawn_blocking(move || -> KbResult<()> {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            // Look up the chunk's rowid — `chunk_vec.rowid` mirrors
+            // `chunk.rowid` (set explicitly at insert time in
+            // `store_chunks_impl`). Missing rowid → NotFound.
+            let rowid: i64 = match tx.query_row(
+                "SELECT rowid FROM chunk WHERE id = ?1",
+                params![chunk_id_s],
+                |row| row.get(0),
+            ) {
+                Ok(r) => r,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err(KbError::NotFound(format!("chunk {chunk_id_s}")));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            tx.execute(
+                "UPDATE chunk_vec SET embedding = ?1 WHERE rowid = ?2",
+                params![bytes, rowid],
+            )?;
+            tx.execute(
+                "UPDATE chunk SET embedding_model = ?1 WHERE id = ?2",
+                params![new_model_s, chunk_id_s],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| KbError::Other(format!("join: {e}")))?
+    }
+
     pub(crate) async fn search_by_vector_impl(
         &self,
         query: &[f32],

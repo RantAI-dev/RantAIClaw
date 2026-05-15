@@ -7,6 +7,8 @@
 //!   other than the currently-configured one.
 //! - `bulk_re_embed` (Task 9.2) — the corrective action when drift > 0.
 
+pub mod bulk_re_embed;
 pub mod drift;
 
+pub use bulk_re_embed::{run_bulk_re_embed, BulkReEmbedOptions, BulkReEmbedReport};
 pub use drift::{check_drift, DriftReport};

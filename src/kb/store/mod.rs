@@ -75,4 +75,27 @@ pub trait KbStore: Send + Sync {
 
     // --- maintenance ---
     async fn count_by_embedding_model(&self) -> KbResult<Vec<(Option<String>, usize)>>;
+
+    /// Paginated walk over chunks for re-embedding. Skips soft-deleted parent
+    /// docs. `after_id` is the last chunk id from the previous page (lexical
+    /// ordering on chunk.id), or `None` for the first page. `skip_model`, if
+    /// `Some(m)`, excludes chunks already tagged with `m` — used by the bulk
+    /// re-embed driver to skip already-current chunks. Returns tuples of
+    /// `(chunk_id, content, current_embedding_model)`.
+    async fn list_chunks_for_re_embed(
+        &self,
+        batch_size: usize,
+        after_id: Option<&str>,
+        skip_model: Option<&str>,
+    ) -> KbResult<Vec<(ChunkId, String, Option<String>)>>;
+
+    /// Update an existing chunk's embedding vector and `embedding_model`
+    /// tag. Validates `new_embedding.len()` against the store's configured
+    /// dim (fails fast with [`crate::kb::KbError::DimensionMismatch`]).
+    async fn update_chunk_embedding(
+        &self,
+        chunk_id: &ChunkId,
+        new_embedding: &[f32],
+        new_model: &str,
+    ) -> KbResult<()>;
 }

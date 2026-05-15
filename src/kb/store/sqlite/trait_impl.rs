@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use super::SqliteStore;
 use crate::kb::store::{Bm25Hit, KbStore, SearchFilter};
-use crate::kb::{Chunk, Document, DocumentId, KbResult, SearchResult};
+use crate::kb::{Chunk, ChunkId, Document, DocumentId, KbResult, SearchResult};
 
 #[async_trait]
 impl KbStore for SqliteStore {
@@ -75,5 +75,25 @@ impl KbStore for SqliteStore {
 
     async fn count_by_embedding_model(&self) -> KbResult<Vec<(Option<String>, usize)>> {
         self.count_by_embedding_model_impl().await
+    }
+
+    async fn list_chunks_for_re_embed(
+        &self,
+        batch_size: usize,
+        after_id: Option<&str>,
+        skip_model: Option<&str>,
+    ) -> KbResult<Vec<(ChunkId, String, Option<String>)>> {
+        self.list_chunks_for_re_embed_impl(batch_size, after_id, skip_model)
+            .await
+    }
+
+    async fn update_chunk_embedding(
+        &self,
+        chunk_id: &ChunkId,
+        new_embedding: &[f32],
+        new_model: &str,
+    ) -> KbResult<()> {
+        self.update_chunk_embedding_impl(chunk_id, new_embedding, new_model)
+            .await
     }
 }

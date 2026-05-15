@@ -5,15 +5,18 @@
 //! re-embed path exercises a multi-statement UPDATE on `chunk` + `chunk_vec`
 //! that's the whole point of the test.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::Utc;
 use tempfile::TempDir;
 
-use rantaiclaw::kb::maintenance::check_drift;
+use rantaiclaw::kb::embed::EmbeddingProvider;
+use rantaiclaw::kb::maintenance::{check_drift, run_bulk_re_embed, BulkReEmbedOptions};
 use rantaiclaw::kb::store::sqlite::SqliteStore;
 use rantaiclaw::kb::store::KbStore;
-use rantaiclaw::kb::{Chunk, ChunkMetadata, Document, DocumentId, KbConfig};
+use rantaiclaw::kb::{Chunk, ChunkMetadata, Document, DocumentId, KbConfig, KbError, KbResult};
 
 const DIM: usize = 4;
 
@@ -208,4 +211,246 @@ async fn drift_report_includes_current_model() {
     assert_eq!(report.current_model, "rantaiclaw_model_xyz");
     assert!(report.in_sync, "empty store has no stale chunks");
     assert!(report.by_model.is_empty());
+}
+
+// ---- Task 9.2: bulk re-embed -----------------------------------------
+
+/// Fake embedder that returns a constant vector per call. The first
+/// component is set to `marker` so the test can assert that the stored
+/// vector was actually replaced (no cheap way to read vec0 bytes back via
+/// the public API, but we use the `embedding_model` tag as a proxy and the
+/// `fail_on_batch` knob to exercise the per-batch error path).
+struct ConstantEmbedder {
+    dim: usize,
+    /// Embed-many call counter. Incremented BEFORE the failure check, so
+    /// `fail_on_call == 1` fails the first call.
+    calls: Arc<AtomicUsize>,
+    /// When `Some(n)`, embed_many returns an error on call number `n`.
+    fail_on_call: Option<usize>,
+}
+
+impl ConstantEmbedder {
+    fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail_on_call: None,
+        }
+    }
+    fn failing(dim: usize, fail_on_call: usize) -> Self {
+        Self {
+            dim,
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail_on_call: Some(fail_on_call),
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for ConstantEmbedder {
+    fn model(&self) -> &str {
+        "rantaiclaw_test_constant_embedder"
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    async fn embed_query(&self, _text: &str) -> KbResult<Vec<f32>> {
+        Ok(vec![1.0; self.dim])
+    }
+    async fn embed_many(&self, texts: &[String]) -> KbResult<Vec<Vec<f32>>> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if Some(n) == self.fail_on_call {
+            return Err(KbError::Other(format!("synthetic failure on call {n}")));
+        }
+        Ok(texts.iter().map(|_| vec![1.0; self.dim]).collect())
+    }
+}
+
+/// Seed `count` chunks tagged with `model_tag`. Each chunk has a unique
+/// `chunk_index` so the resulting `chunk.id` ("<doc>_<index>") is unique.
+async fn seed_chunks(
+    store: &Arc<dyn KbStore>,
+    doc: &Document,
+    starting_index: usize,
+    count: usize,
+    model_tag: &str,
+) {
+    let chunks: Vec<_> = (0..count)
+        .map(|i| sample_chunk(&doc.title, starting_index + i))
+        .collect();
+    let embeds = vec![ones(); count];
+    store
+        .store_chunks(&doc.id, &chunks, &embeds, model_tag)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn bulk_re_embed_skips_already_current_chunks() {
+    let (_tmp, store) = fresh_store().await;
+    let cfg = cfg_with_model("rantaiclaw_model_current");
+
+    let doc = sample_doc("rantaiclaw_doc_skip");
+    store.create_document(&doc).await.unwrap();
+    // 3 chunks already on current model, 3 on an old model.
+    seed_chunks(&store, &doc, 0, 3, &cfg.embedding_model).await;
+    seed_chunks(&store, &doc, 3, 3, "rantaiclaw_model_old").await;
+
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(ConstantEmbedder::new(DIM));
+    let report = run_bulk_re_embed(
+        &cfg,
+        &store,
+        &embedder,
+        BulkReEmbedOptions {
+            batch_size: 10,
+            include_already_current: false,
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.chunks_re_embedded, 3, "only stale chunks re-embedded");
+    assert_eq!(report.total_chunks_examined, 3);
+    assert!(report.errors.is_empty());
+
+    // After the run, drift must be zero — all stale rows now tagged current.
+    let drift = check_drift(&cfg, &store).await.unwrap();
+    assert!(drift.in_sync, "drift must be cleared after a successful run");
+}
+
+#[tokio::test]
+async fn bulk_re_embed_processes_all_when_include_current() {
+    let (_tmp, store) = fresh_store().await;
+    let cfg = cfg_with_model("rantaiclaw_model_current");
+
+    let doc = sample_doc("rantaiclaw_doc_all");
+    store.create_document(&doc).await.unwrap();
+    seed_chunks(&store, &doc, 0, 3, &cfg.embedding_model).await;
+    seed_chunks(&store, &doc, 3, 3, "rantaiclaw_model_old").await;
+
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(ConstantEmbedder::new(DIM));
+    let report = run_bulk_re_embed(
+        &cfg,
+        &store,
+        &embedder,
+        BulkReEmbedOptions {
+            batch_size: 10,
+            include_already_current: true,
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.chunks_re_embedded, 6,
+        "all six chunks processed when include_already_current=true"
+    );
+}
+
+#[tokio::test]
+async fn bulk_re_embed_dry_run_writes_nothing() {
+    let (_tmp, store) = fresh_store().await;
+    let cfg = cfg_with_model("rantaiclaw_model_current");
+
+    let doc = sample_doc("rantaiclaw_doc_dry");
+    store.create_document(&doc).await.unwrap();
+    seed_chunks(&store, &doc, 0, 4, "rantaiclaw_model_old").await;
+
+    let drift_before = check_drift(&cfg, &store).await.unwrap();
+    assert_eq!(drift_before.stale_chunk_count, 4);
+
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(ConstantEmbedder::new(DIM));
+    let report = run_bulk_re_embed(
+        &cfg,
+        &store,
+        &embedder,
+        BulkReEmbedOptions {
+            batch_size: 10,
+            include_already_current: false,
+            dry_run: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.chunks_re_embedded, 4, "report shows would-be writes");
+
+    // DB must be untouched — drift report identical to before.
+    let drift_after = check_drift(&cfg, &store).await.unwrap();
+    assert_eq!(
+        drift_after.stale_chunk_count, 4,
+        "dry_run must NOT modify the DB"
+    );
+    assert!(!drift_after.in_sync);
+}
+
+#[tokio::test]
+async fn bulk_re_embed_continues_after_batch_error() {
+    let (_tmp, store) = fresh_store().await;
+    let cfg = cfg_with_model("rantaiclaw_model_current");
+
+    let doc = sample_doc("rantaiclaw_doc_err");
+    store.create_document(&doc).await.unwrap();
+    // 5 stale chunks; batch_size=2 means at least 3 batches.
+    seed_chunks(&store, &doc, 0, 5, "rantaiclaw_model_old").await;
+
+    // Fail call #2 — first batch succeeds, second batch fails, third batch
+    // succeeds. Net: at least one error recorded, plus partial progress.
+    let embedder = Arc::new(ConstantEmbedder::failing(DIM, 2));
+    let calls_handle = embedder.calls.clone();
+    let embedder_dyn: Arc<dyn EmbeddingProvider> = embedder;
+    let report = run_bulk_re_embed(
+        &cfg,
+        &store,
+        &embedder_dyn,
+        BulkReEmbedOptions {
+            batch_size: 2,
+            include_already_current: false,
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.errors.len(), 1, "exactly one batch failed");
+    assert!(
+        report.chunks_re_embedded >= 2,
+        "at least one successful batch (2 chunks) advanced"
+    );
+    assert!(
+        calls_handle.load(Ordering::SeqCst) >= 3,
+        "embedder kept being called after the failing batch"
+    );
+}
+
+#[tokio::test]
+async fn bulk_re_embed_respects_batch_size() {
+    let (_tmp, store) = fresh_store().await;
+    let cfg = cfg_with_model("rantaiclaw_model_current");
+
+    let doc = sample_doc("rantaiclaw_doc_batches");
+    store.create_document(&doc).await.unwrap();
+    // 25 stale chunks; with batch_size=10 the driver makes 3 pages.
+    seed_chunks(&store, &doc, 0, 25, "rantaiclaw_model_old").await;
+
+    let embedder = Arc::new(ConstantEmbedder::new(DIM));
+    let calls_handle = embedder.calls.clone();
+    let embedder_dyn: Arc<dyn EmbeddingProvider> = embedder;
+    let report = run_bulk_re_embed(
+        &cfg,
+        &store,
+        &embedder_dyn,
+        BulkReEmbedOptions {
+            batch_size: 10,
+            include_already_current: false,
+            dry_run: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.chunks_re_embedded, 25);
+    assert_eq!(
+        calls_handle.load(Ordering::SeqCst),
+        3,
+        "25 chunks at batch_size=10 -> 3 embed_many calls"
+    );
 }
