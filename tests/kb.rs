@@ -8,6 +8,7 @@
 #![cfg(feature = "kb")]
 
 mod kb {
+    pub mod chunk_test;
     pub mod config_test;
     pub mod embed_test;
     pub mod store_sqlite_test;
