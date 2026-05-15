@@ -8,7 +8,7 @@
 //! - 7.5 format_context_for_prompt + standalone query rewriter (wiremock)
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rantaiclaw::kb::embed::EmbeddingProvider;
@@ -18,6 +18,14 @@ use rantaiclaw::kb::store::{Bm25Hit, KbStore, SearchFilter};
 use rantaiclaw::kb::{
     Chunk, ChunkId, Document, DocumentId, KbConfig, KbError, KbResult, SearchResult,
 };
+
+// Process-wide env-mutation lock shared across all submodules in this file.
+// The query_expansion_tests, contextual_tests, and standalone_tests modules
+// all mutate `OPENROUTER_API_KEY` and `KB_OPENROUTER_CHAT_URL`. A single lock
+// at the file scope ensures their tests serialize against each other — without
+// it, a per-module Mutex only serializes within its own module and tests in
+// different modules race each other on shared env state.
+pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 // ---- Task 7.1: RRF ---------------------------------------------------
 
@@ -502,13 +510,10 @@ mod query_expansion_tests {
         _clear_cache_for_tests, expand_query,
     };
     use serde_json::json;
-    use std::sync::Mutex;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::test_cfg;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use super::{test_cfg, ENV_LOCK};
 
     struct EnvGuard(Vec<&'static str>);
     impl Drop for EnvGuard {
@@ -682,13 +687,10 @@ mod query_expansion_tests {
 mod contextual_tests {
     use rantaiclaw::kb::retrieve::contextual::generate_contextual_prefixes;
     use serde_json::json;
-    use std::sync::Mutex;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::test_cfg;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use super::{test_cfg, ENV_LOCK};
 
     struct EnvGuard(Vec<&'static str>);
     impl Drop for EnvGuard {
@@ -809,5 +811,203 @@ mod contextual_tests {
         let chunks = vec!["a".into(), "b".into()];
         let out = generate_contextual_prefixes(&cfg, "doc", &chunks).await;
         assert_eq!(out, vec!["".to_string(), "".to_string()], "5xx → empty");
+    }
+}
+
+// ---- Task 7.5: format + standalone query rewriter -------------------
+
+mod format_tests {
+    use rantaiclaw::kb::retrieve::format::format_context_for_prompt;
+    use rantaiclaw::kb::retrieve::{RetrievalResult, SourceRef};
+
+    #[test]
+    fn format_returns_empty_when_no_context() {
+        let result = RetrievalResult {
+            context: String::new(),
+            sources: Vec::new(),
+            chunks: Vec::new(),
+        };
+        let out = format_context_for_prompt(&result);
+        assert!(out.is_empty(), "empty context → empty output");
+    }
+
+    #[test]
+    fn format_includes_instruction_block_verbatim() {
+        let result = RetrievalResult {
+            context: "[Doc - Section]\nbody here".into(),
+            sources: vec![SourceRef {
+                document_title: "Doc".into(),
+                section: Some("Section".into()),
+                categories: vec!["test".into()],
+            }],
+            chunks: Vec::new(),
+        };
+        let out = format_context_for_prompt(&result);
+        // Spot-check the load-bearing instruction phrases — these are what
+        // the LLM is being told and must not silently drift.
+        assert!(out.contains("## Knowledge Base Context"));
+        assert!(out.contains("The excerpts below are your primary source for this question."));
+        assert!(out.contains("Treat the excerpts as the source of truth for specific facts."));
+        assert!(out.contains("paragraph numbers"));
+        assert!(out.contains("effective dates"));
+        assert!(
+            out.contains("MAY add brief background context"),
+            "framing guidance preserved"
+        );
+        assert!(out.contains("Cite each factual claim inline"));
+        assert!(out.contains("not specified in the available excerpts"));
+        assert!(out.contains("Excerpts:\n[Doc - Section]"));
+        assert!(out.contains("Sources:\n- Doc: Section"));
+    }
+
+    #[test]
+    fn format_lists_sources_with_section() {
+        let result = RetrievalResult {
+            context: "x".into(),
+            sources: vec![
+                SourceRef {
+                    document_title: "Doc A".into(),
+                    section: Some("S1".into()),
+                    categories: Vec::new(),
+                },
+                SourceRef {
+                    document_title: "Doc B".into(),
+                    section: None,
+                    categories: Vec::new(),
+                },
+            ],
+            chunks: Vec::new(),
+        };
+        let out = format_context_for_prompt(&result);
+        assert!(out.contains("- Doc A: S1"), "section appended after colon");
+        assert!(
+            out.contains("- Doc B\n") || out.ends_with("- Doc B"),
+            "no-section entry has no trailing colon"
+        );
+    }
+}
+
+mod standalone_tests {
+    use rantaiclaw::kb::retrieve::standalone_query::{
+        _clear_cache_for_tests, rewrite_standalone,
+    };
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    use super::{test_cfg, ENV_LOCK};
+
+    struct EnvGuard(Vec<&'static str>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for k in &self.0 {
+                unsafe {
+                    std::env::remove_var(k);
+                }
+            }
+        }
+    }
+
+    fn clear_env() {
+        unsafe {
+            std::env::remove_var("OPENROUTER_API_KEY");
+            std::env::remove_var("KB_OPENROUTER_CHAT_URL");
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_returns_original_on_empty_history() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let cfg = test_cfg();
+        let out = rewrite_standalone(&cfg, "what?", &[]).await.unwrap();
+        assert_eq!(out, "what?");
+    }
+
+    #[tokio::test]
+    async fn standalone_rewrites_with_history() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let server = MockServer::start().await;
+
+        // Capture the request body so we can assert the history is embedded.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(move |req: &Request| {
+                let body = String::from_utf8_lossy(&req.body).to_string();
+                *captured_clone.lock().unwrap() = body;
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{
+                        "message": { "content": "exclusions for policy X" }
+                    }]
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
+        }
+
+        let cfg = test_cfg();
+        let history = vec![
+            ("user".to_string(), "tell me about policy X".to_string()),
+            (
+                "assistant".to_string(),
+                "Policy X covers a, b, and c".to_string(),
+            ),
+            ("user".to_string(), "and exclusions?".to_string()),
+        ];
+        let out = rewrite_standalone(&cfg, "tell me more", &history)
+            .await
+            .unwrap();
+        assert_eq!(out, "exclusions for policy X", "model output returned verbatim");
+
+        let captured_body = captured.lock().unwrap().clone();
+        assert!(
+            captured_body.contains("policy X"),
+            "history turns embedded in prompt body, got: {captured_body}"
+        );
+        assert!(
+            captured_body.contains("tell me more"),
+            "latest question embedded in prompt body"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_fails_soft() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
+        }
+
+        let cfg = test_cfg();
+        let history = vec![(
+            "user".to_string(),
+            "earlier turn that anchors disambiguation".to_string(),
+        )];
+        let out = rewrite_standalone(&cfg, "follow up?", &history)
+            .await
+            .unwrap();
+        assert_eq!(
+            out, "follow up?",
+            "5xx → original query returned (fail-soft)"
+        );
     }
 }

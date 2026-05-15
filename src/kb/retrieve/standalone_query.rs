@@ -1,13 +1,195 @@
-//! Standalone query rewriter — stub. Task 7.5 ports `standalone-query.ts`.
+//! Multi-turn query rewriter — port of `src/lib/rag/standalone-query.ts`.
+//!
+//! Takes the latest user query plus an ordered chat history of (role,
+//! content) pairs and rewrites the query into a self-contained search
+//! string. "tell me more about exclusions" becomes "exclusions for policy X"
+//! using context from prior turns.
+//!
+//! Fail-soft contract:
+//! - empty chat_history → returns the query unchanged (nothing to anchor against)
+//! - query length ≥ 60 chars → returns unchanged (already self-contained)
+//! - missing `OPENROUTER_API_KEY` → returns unchanged
+//! - LLM call fails / returns empty → returns unchanged
+//!
+//! Cached for 5min, capacity 256, keyed on `(query, hash(history))` so the
+//! same conversation re-played hits cache but different conversations
+//! producing the same follow-up get different rewrites.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use tokio::sync::Mutex;
+
+use crate::kb::embed::cache::LruCache;
 use crate::kb::{KbConfig, KbResult};
 
-/// Returns the original query. Task 7.5 will replace this with a real
-/// OpenRouter-backed multi-turn query rewriter.
+const OPENROUTER_URL_DEFAULT: &str = "https://openrouter.ai/api/v1/chat/completions";
+const TIMEOUT: Duration = Duration::from_secs(6);
+const CACHE_CAP: usize = 256;
+const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Minimum chars below which we consider the query "likely needs rewriting".
+/// Mirrors the TS source's `< 60` heuristic.
+const SELF_CONTAINED_MIN: usize = 60;
+
+fn openrouter_url() -> String {
+    std::env::var("KB_OPENROUTER_CHAT_URL")
+        .unwrap_or_else(|_| OPENROUTER_URL_DEFAULT.to_string())
+}
+
+fn cache() -> &'static Mutex<LruCache<String, String>> {
+    static CACHE: OnceLock<Mutex<LruCache<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(LruCache::new(CACHE_CAP, Some(CACHE_TTL))))
+}
+
+/// Rewrite `user_query` against `chat_history` into a standalone search query.
+///
+/// `chat_history` is an ordered list of `(role, content)` pairs — most recent
+/// last. The latest user message (the query being rewritten) should NOT be
+/// duplicated in chat_history; pass it once as `user_query` and the prior
+/// turns separately.
+///
+/// Returns `Ok(query)` unchanged on every failure path — the result is always
+/// a usable search string.
 pub async fn rewrite_standalone(
-    _cfg: &KbConfig,
+    cfg: &KbConfig,
     user_query: &str,
-    _chat_history: &[(String, String)],
+    chat_history: &[(String, String)],
 ) -> KbResult<String> {
-    Ok(user_query.to_string())
+    let latest = user_query.trim();
+    if latest.is_empty() {
+        return Ok(String::new());
+    }
+    if chat_history.is_empty() {
+        return Ok(latest.to_string());
+    }
+    // Self-contained heuristic: long messages rarely need disambiguation.
+    if latest.chars().count() >= SELF_CONTAINED_MIN {
+        return Ok(latest.to_string());
+    }
+
+    let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
+        return Ok(latest.to_string());
+    }
+
+    // Take the last 6 turns, truncate each to 400 chars + collapse whitespace.
+    let recent: Vec<&(String, String)> = chat_history
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let history: String = recent
+        .iter()
+        .map(|(role, content)| {
+            let txt: String = content
+                .chars()
+                .take(400)
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{role}: {txt}")
+        })
+        .filter(|line| {
+            // Drop empty-content lines so the model sees only real signal.
+            // "role: " has nothing useful after the colon.
+            line.split(':').nth(1).map_or(false, |after| !after.trim().is_empty())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if history.is_empty() {
+        return Ok(latest.to_string());
+    }
+
+    // Cache key: latest + a hash of the history. Hashing keeps the key short
+    // even for long conversations and avoids storing the full history in the
+    // cache map.
+    let mut hasher = DefaultHasher::new();
+    history.hash(&mut hasher);
+    let key = format!("{latest}::{:016x}", hasher.finish());
+
+    if let Some(hit) = cache().lock().await.get(&key) {
+        return Ok(hit);
+    }
+
+    let prompt = format!(
+        "You rewrite multi-turn chat questions into self-contained search queries for a knowledge base.\n\
+\n\
+Rewrite the user's LATEST question so it can be searched on its own, using context from the conversation. Rules:\n\
+- Preserve the user's intent exactly. Do not add facts the user did not say.\n\
+- Keep the rewrite concise (one sentence, ideally under 25 words).\n\
+- If the latest question is already self-contained, return it unchanged.\n\
+- Output ONLY the rewritten query. No quotes, no prose, no labels.\n\
+\n\
+Conversation:\n\
+{history}\n\
+\n\
+Latest question: {latest}\n\
+\n\
+Rewritten query:"
+    );
+
+    let body = serde_json::json!({
+        "model": cfg.query_expansion_model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "max_tokens": 120,
+        "temperature": 0.1,
+    });
+
+    match fetch_rewrite(&api_key, &body).await {
+        Ok(rewritten) if !rewritten.is_empty() => {
+            cache().lock().await.put(key, rewritten.clone());
+            Ok(rewritten)
+        }
+        Ok(_) => Ok(latest.to_string()),
+        Err(e) => {
+            tracing::warn!(
+                target: "kb::retrieve::standalone_query",
+                error = %e,
+                "rewrite failed; using original query",
+            );
+            Ok(latest.to_string())
+        }
+    }
+}
+
+async fn fetch_rewrite(api_key: &str, body: &serde_json::Value) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(TIMEOUT)
+        .build()
+        .map_err(|e| format!("client build: {e}"))?;
+    let resp = client
+        .post(openrouter_url())
+        .bearer_auth(api_key)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("send: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("standalone-query {}", resp.status().as_u16()));
+    }
+    let data: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    let raw = data
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    // Strip surrounding quotes the model may add.
+    let cleaned = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`').trim();
+    Ok(cleaned.to_string())
+}
+
+#[cfg(any(test, feature = "kb"))]
+pub async fn _clear_cache_for_tests() {
+    let mut guard = cache().lock().await;
+    *guard = LruCache::new(CACHE_CAP, Some(CACHE_TTL));
 }
