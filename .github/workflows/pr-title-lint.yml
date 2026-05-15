@@ -1,0 +1,43 @@
+name: PR Title Lint
+
+on:
+    pull_request_target:
+        types: [opened, reopened, edited, synchronize]
+
+concurrency:
+    group: pr-title-lint-${{ github.event.pull_request.number || github.run_id }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+    pull-requests: write
+
+jobs:
+    title:
+        name: Conventional Commit Title
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - name: Validate PR title
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+              with:
+                  script: |
+                      const pr = context.payload.pull_request;
+                      if (!pr) {
+                          core.setFailed("Missing pull_request context.");
+                          return;
+                      }
+                      const title = (pr.title || "").trim();
+                      // Conventional commits: <type>(optional scope)!: <summary>
+                      // Allowed types match CLAUDE.md and existing changelog conventions.
+                      const pattern = /^(feat|fix|chore|docs|refactor|perf|test|build|ci|style|revert)(\([a-z0-9._/-]+\))?!?: .+/;
+                      if (!pattern.test(title)) {
+                          core.setFailed(
+                              `PR title does not follow Conventional Commits.\n` +
+                              `Got: "${title}"\n` +
+                              `Expected: "<type>(optional-scope): <summary>"\n` +
+                              `Allowed types: feat, fix, chore, docs, refactor, perf, test, build, ci, style, revert`,
+                          );
+                          return;
+                      }
+                      core.info(`PR title OK: ${title}`);

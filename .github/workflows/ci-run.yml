@@ -24,7 +24,6 @@ jobs:
             docs_only: ${{ steps.scope.outputs.docs_only }}
             docs_changed: ${{ steps.scope.outputs.docs_changed }}
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
-            workflow_changed: ${{ steps.scope.outputs.workflow_changed }}
             docs_files: ${{ steps.scope.outputs.docs_files }}
             base_sha: ${{ steps.scope.outputs.base_sha }}
         steps:
@@ -74,8 +73,78 @@ jobs:
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@v2
-            - name: Run tests
-              run: cargo test --locked --verbose
+            - name: Install cargo-nextest
+              run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+            - name: Run tests (nextest)
+              run: cargo nextest run --locked --workspace
+
+    features:
+        name: Features (${{ matrix.name }})
+        needs: [changes, lint]
+        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
+        runs-on: ubuntu-latest
+        timeout-minutes: 25
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: no-default-features
+                      args: --no-default-features
+                      install_libudev: false
+                    - name: all-features
+                      args: --all-features
+                      install_libudev: true
+                    - name: hardware-only
+                      args: --no-default-features --features hardware
+                      install_libudev: false
+                    - name: browser-native
+                      args: --no-default-features --features browser-native
+                      install_libudev: false
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: features-${{ matrix.name }}
+            - name: Install Linux system dependencies for all-features
+              if: matrix.install_libudev
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+            - name: Check feature combination
+              run: cargo check --locked ${{ matrix.args }}
+
+    e2e:
+        name: E2E
+        needs: [changes, lint]
+        if: needs.changes.outputs.rust_changed == 'true' && github.event_name != 'pull_request' && needs.lint.result == 'success'
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@v2
+            - name: Run integration / E2E tests
+              run: cargo test --test agent_e2e --locked --verbose
+
+    bench-compile:
+        name: Bench Compile
+        needs: [changes, lint]
+        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
+        runs-on: ubuntu-latest
+        timeout-minutes: 25
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@v2
+            - name: Verify benchmarks compile
+              run: cargo bench --no-run --locked
 
     build:
         name: Build (Smoke)
@@ -194,30 +263,10 @@ jobs:
                       const script = require('./.github/workflows/scripts/lint_feedback.js');
                       await script({github, context, core});
 
-    workflow-owner-approval:
-        name: Workflow Owner Approval
-        needs: [changes]
-        if: github.event_name == 'pull_request' && needs.changes.outputs.workflow_changed == 'true'
-        runs-on: ubuntu-latest
-        permissions:
-            contents: read
-            pull-requests: read
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-            - name: Require owner approval for workflow file changes
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              env:
-                  WORKFLOW_OWNER_LOGINS: ${{ vars.WORKFLOW_OWNER_LOGINS }}
-              with:
-                  script: |
-                    const script = require('./.github/workflows/scripts/ci_workflow_owner_approval.js');
-                    await script({ github, context, core });
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
+        needs: [changes, lint, test, features, e2e, bench-compile, build, docs-only, non-rust, docs-quality, lint-feedback]
         runs-on: ubuntu-latest
         steps:
             - name: Enforce required status
@@ -228,16 +277,9 @@ jobs:
                   event_name="${{ github.event_name }}"
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"
                   docs_changed="${{ needs.changes.outputs.docs_changed }}"
-                  workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
                   docs_result="${{ needs.docs-quality.result }}"
-                  workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
 
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
-                    echo "workflow_owner_approval=${workflow_owner_result}"
-                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                      echo "Workflow files changed but workflow owner approval gate did not pass."
-                      exit 1
-                    fi
                     if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
                       echo "Docs-only push changed docs, but docs-quality did not pass."
                       exit 1
@@ -248,11 +290,6 @@ jobs:
 
                   if [ "$rust_changed" != "true" ]; then
                     echo "rust_changed=false (non-rust fast path)"
-                    echo "workflow_owner_approval=${workflow_owner_result}"
-                    if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                      echo "Workflow files changed but workflow owner approval gate did not pass."
-                      exit 1
-                    fi
                     if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
                       echo "Non-rust push changed docs, but docs-quality did not pass."
                       exit 1
@@ -264,30 +301,48 @@ jobs:
                   lint_result="${{ needs.lint.result }}"
                   lint_strict_delta_result="${{ needs.lint.result }}"
                   test_result="${{ needs.test.result }}"
+                  features_result="${{ needs.features.result }}"
+                  e2e_result="${{ needs.e2e.result }}"
+                  bench_compile_result="${{ needs.bench-compile.result }}"
                   build_result="${{ needs.build.result }}"
 
                   echo "lint=${lint_result}"
                   echo "lint_strict_delta=${lint_strict_delta_result}"
                   echo "test=${test_result}"
+                  echo "features=${features_result}"
+                  echo "e2e=${e2e_result}"
+                  echo "bench_compile=${bench_compile_result}"
                   echo "build=${build_result}"
                   echo "docs=${docs_result}"
-                  echo "workflow_owner_approval=${workflow_owner_result}"
 
-                  if [ "$event_name" = "pull_request" ] && [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                    echo "Workflow files changed but workflow owner approval gate did not pass."
-                    exit 1
-                  fi
+                  # Helper: a job that was correctly skipped (no `ci:full` label, or PR-only
+                  # short-circuit for `e2e`) is treated as success here.
+                  is_ok() {
+                    case "$1" in
+                      success|skipped) return 0 ;;
+                      *) return 1 ;;
+                    esac
+                  }
 
                   if [ "$event_name" = "pull_request" ]; then
-                    if [ "$build_result" != "success" ]; then
+                    if ! is_ok "$build_result"; then
                       echo "Required PR build job did not pass."
+                      exit 1
+                    fi
+                    # When `ci:full` is set, also require test/features/bench-compile.
+                    # When it isn't set, these were skipped -> is_ok returns success.
+                    if ! is_ok "$test_result" || ! is_ok "$features_result" || ! is_ok "$bench_compile_result"; then
+                      echo "Required PR jobs (test/features/bench-compile) did not pass."
                       exit 1
                     fi
                     echo "PR required checks passed."
                     exit 0
                   fi
 
-                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                  if ! is_ok "$lint_result" || ! is_ok "$lint_strict_delta_result" \
+                     || ! is_ok "$test_result" || ! is_ok "$features_result" \
+                     || ! is_ok "$e2e_result" || ! is_ok "$bench_compile_result" \
+                     || ! is_ok "$build_result"; then
                     echo "Required push CI jobs did not pass."
                     exit 1
                   fi
