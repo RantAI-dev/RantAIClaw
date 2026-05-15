@@ -5,10 +5,12 @@
 //! - Task 4.2: smart structure-aware chunker
 //! - Task 4.3: prepare_chunk_for_embedding metadata prefix
 
+use rantaiclaw::kb::chunk::prepare::prepare_chunk_for_embedding;
 use rantaiclaw::kb::chunk::recursive::{chunk_document, ChunkOptions};
 use rantaiclaw::kb::chunk::smart::{
     chunk_with_smart_chunker, smart_chunk_document, BlockType, SmartChunkOptions,
 };
+use rantaiclaw::kb::{Chunk, ChunkMetadata};
 
 // ============================================================================
 // Task 4.1 — Recursive chunker
@@ -248,4 +250,52 @@ fn default_options_match_ts_smart_chunker() {
     assert!(opts.preserve_code_blocks);
     assert!(opts.respect_heading_boundaries);
     assert!(opts.respect_section_boundaries);
+}
+
+// ============================================================================
+// Task 4.3 — prepare_chunk_for_embedding
+// ============================================================================
+
+#[test]
+fn prepends_metadata_block() {
+    let c = Chunk {
+        content: "the chunk body".into(),
+        metadata: ChunkMetadata {
+            document_title: "T".into(),
+            category: "INS".into(),
+            subcategory: Some("Health".into()),
+            section: Some("Coverage".into()),
+            chunk_index: 0,
+            contextual_prefix: Some("This chunk lists exclusions in section 3.".into()),
+        },
+    };
+    let text = prepare_chunk_for_embedding(&c);
+    assert!(text.starts_with("Category: INS"), "got: {text}");
+    assert!(text.contains("Topic: Health"));
+    assert!(text.contains("Section: Coverage"));
+    assert!(text.contains("Context: This chunk lists exclusions"));
+    assert!(text.ends_with("the chunk body"));
+}
+
+#[test]
+fn omits_missing_metadata_lines() {
+    let c = Chunk {
+        content: "body only".into(),
+        metadata: ChunkMetadata {
+            document_title: "T".into(),
+            category: "INS".into(),
+            subcategory: None,
+            section: None,
+            chunk_index: 0,
+            contextual_prefix: None,
+        },
+    };
+    let text = prepare_chunk_for_embedding(&c);
+    assert!(text.starts_with("Category: INS"));
+    assert!(!text.contains("Topic:"));
+    assert!(!text.contains("Section:"));
+    assert!(!text.contains("Context:"));
+    assert!(text.ends_with("body only"));
+    // "Category: INS\n\nbody only" — blank line between metadata and body.
+    assert_eq!(text, "Category: INS\n\nbody only");
 }
