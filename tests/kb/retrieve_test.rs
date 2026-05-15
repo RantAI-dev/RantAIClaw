@@ -16,7 +16,7 @@ use rantaiclaw::kb::retrieve::rrf::{reciprocal_rank_fusion, RrfOptions};
 use rantaiclaw::kb::retrieve::{RetrieveOptions, Retriever};
 use rantaiclaw::kb::store::{Bm25Hit, KbStore, SearchFilter};
 use rantaiclaw::kb::{
-    Chunk, ChunkId, Document, DocumentId, KbConfig, KbError, KbResult, SearchResult,
+    Chunk, ChunkId, Document, DocumentId, KbConfig, KbResult, SearchResult,
 };
 
 // Process-wide env-mutation lock lives in `crate::kb::common::ENV_LOCK`
@@ -500,10 +500,6 @@ async fn format_omits_section_when_none() {
         "must not include the ' - section' suffix when section is None"
     );
 }
-
-// Silence unused-import lint when only some Task 7.2 helpers are exercised.
-#[allow(dead_code)]
-fn _force_use(_e: KbError) {}
 
 // ---- Task 7.3: query expansion ---------------------------------------
 //
