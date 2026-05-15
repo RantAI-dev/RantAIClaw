@@ -198,6 +198,11 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 # Activated by --features kb.
 sqlite-vec = { version = "0.1", optional = true }
 
+# Insertion-order-preserving map backing the KB query embedding LRU cache.
+# `IndexMap` lets us move keys to the back on access without a separate
+# linked-list, which keeps the LRU port from `lru-cache.ts` simple.
+indexmap = "2"
+
 # KB office support — feature `kb-office`. Pinned now so the feature flag
 # resolves cleanly; actual code that uses these lands in later phases.
 calamine = { version = "0.30", optional = true }
@@ -282,6 +287,8 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs"] }
 insta = { version = "1", features = ["json"] }
 mockito = "1"
+# Mock HTTP server for KB embedding/rerank/extract HTTP clients.
+wiremock = "0.6"
 # Wave 5 — drives the `setup` CLI from integration tests with a temp $HOME.
 assert_cmd = "2"
 predicates = "3"

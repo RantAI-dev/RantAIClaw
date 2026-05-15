@@ -5349,6 +5349,7 @@ dependencies = [
  "hostname",
  "http-body-util",
  "image",
+ "indexmap",
  "insta",
  "landlock",
  "lettre",
@@ -5411,6 +5412,7 @@ dependencies = [
  "webbrowser",
  "webpki-roots 1.0.6",
  "which",
+ "wiremock",
 ]
 
 [[package]]
@@ -8559,6 +8561,29 @@ name = "winsafe"
 version = "0.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
+
+[[package]]
+name = "wiremock"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08db1edfb05d9b3c1542e521aea074442088292f00b5f28e435c714a98f85031"
+dependencies = [
+ "assert-json-diff",
+ "base64",
+ "deadpool",
+ "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
 
 [[package]]
 name = "wit-bindgen"

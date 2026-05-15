@@ -9,5 +9,6 @@
 
 mod kb {
     pub mod config_test;
+    pub mod embed_test;
     pub mod store_sqlite_test;
 }
