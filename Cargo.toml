@@ -202,10 +202,11 @@ sqlite-vec = { version = "0.1", optional = true }
 # - `pdf_splitter` carves multi-page docs into N-page segments for the
 #   vision-LLM extractor (which has an output-token budget per call)
 # - test fixtures generate small PDFs deterministically
-# Always compiled (not feature-gated) — the dep is small and is required
-# by the kb extractor module, which itself is `kb`-feature-gated at the
-# crate level via the parent module tree.
-lopdf = "0.34"
+# Gated behind `kb`: lopdf pulls libz (`zlib-sys`) so keeping it optional
+# saves binary size on non-KB builds. The only consumers
+# (`src/kb/extract/pdf_splitter.rs`, `tests/kb/extract_test.rs`) are
+# already `#[cfg(feature = "kb")]`-gated.
+lopdf = { version = "0.34", optional = true }
 
 # Insertion-order-preserving map backing the KB query embedding LRU cache.
 # `IndexMap` lets us move keys to the back on access without a separate
@@ -260,7 +261,7 @@ rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost"]
 # kb = Knowledge Base subsystem (sqlite-vec + PDF extraction)
-kb = ["dep:sqlite-vec", "rag-pdf"]
+kb = ["dep:sqlite-vec", "dep:lopdf", "rag-pdf"]
 # kb-office = Office-document ingestion for the KB (docx/xlsx/pptx)
 kb-office = ["kb", "dep:calamine", "dep:docx-rs"]
 # Note: a future `kb-lancedb` feature + `lancedb` dep will land together with
