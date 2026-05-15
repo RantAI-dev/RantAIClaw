@@ -20,7 +20,7 @@ type SqliteEntryPoint = unsafe extern "C" fn(
 ) -> c_int;
 
 /// Schema version — bump and add a migration branch when fields change.
-pub const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 1;
 
 /// Register the sqlite-vec extension as an auto-extension once per process.
 ///
@@ -56,7 +56,7 @@ pub(crate) fn load_vec_extension(_conn: &Connection) -> KbResult<()> {
     Ok(())
 }
 
-pub fn migrate(conn: &Connection, embedding_dim: usize) -> KbResult<()> {
+pub(crate) fn migrate(conn: &Connection, embedding_dim: usize) -> KbResult<()> {
     load_vec_extension(conn)?;
 
     conn.execute_batch(&format!(
@@ -180,7 +180,7 @@ pub fn migrate(conn: &Connection, embedding_dim: usize) -> KbResult<()> {
     Ok(())
 }
 
-pub fn current_embedding_dim(conn: &Connection) -> KbResult<Option<usize>> {
+pub(crate) fn current_embedding_dim(conn: &Connection) -> KbResult<Option<usize>> {
     let val: Option<String> = conn
         .query_row(
             "SELECT value FROM kb_meta WHERE key='embedding_dim'",
