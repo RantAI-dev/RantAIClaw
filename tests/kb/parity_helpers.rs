@@ -183,16 +183,20 @@ pub async fn ingest_corpus(
 pub fn fixture_path(name: &str) -> std::path::PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let base = std::path::PathBuf::from(manifest_dir);
-    // Worktree case: <repo>/packages/rantaiclaw/.worktrees/<branch>
-    let worktree_candidate = base.join("../../../tests/fixtures").join(name);
-    if worktree_candidate.exists() {
-        return worktree_candidate;
+    // Probe known layouts in order. The fixtures live in the parent
+    // RantAI-Agents repo at <repo_root>/tests/fixtures/.
+    //
+    // - worktree:   <repo_root>/packages/rantaiclaw/.worktrees/<branch>  (4 levels deep)
+    // - submodule:  <repo_root>/packages/rantaiclaw                       (2 levels deep)
+    // - rantaiclaw-only checkout (no parent repo): tests/fixtures/        (relative)
+    for relative in ["../../../../tests/fixtures", "../../tests/fixtures"] {
+        let candidate = base.join(relative).join(name);
+        if candidate.exists() {
+            return candidate;
+        }
     }
-    // Submodule case: <repo>/packages/rantaiclaw
-    let submodule_candidate = base.join("../../tests/fixtures").join(name);
-    if submodule_candidate.exists() {
-        return submodule_candidate;
-    }
-    // Fallback: relative to current working directory.
+    // Final fallback: relative to current working directory. Returned
+    // even if missing so the caller's `assert!(path.exists())` produces
+    // a useful error message instead of a silent rewrite.
     std::path::PathBuf::from("tests/fixtures").join(name)
 }
