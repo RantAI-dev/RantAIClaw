@@ -6,6 +6,9 @@
 //! - Task 4.3: prepare_chunk_for_embedding metadata prefix
 
 use rantaiclaw::kb::chunk::recursive::{chunk_document, ChunkOptions};
+use rantaiclaw::kb::chunk::smart::{
+    chunk_with_smart_chunker, smart_chunk_document, BlockType, SmartChunkOptions,
+};
 
 // ============================================================================
 // Task 4.1 — Recursive chunker
@@ -118,4 +121,131 @@ fn default_options_match_ts_chunker() {
     assert_eq!(opts.separators[0], "\n## ");
     assert_eq!(opts.separators[1], "\n### ");
     assert_eq!(opts.separators[2], "\n#### ");
+}
+
+// ============================================================================
+// Task 4.2 — Smart chunker
+// ============================================================================
+
+#[test]
+fn preserves_code_blocks() {
+    let md =
+        "## Intro\nSome text.\n\n```rust\nfn main() {\n    println!(\"x\");\n}\n```\n\nMore text.";
+    let chunks = smart_chunk_document(md, "Doc", "GEN", None, SmartChunkOptions::default());
+    let code_chunk = chunks
+        .iter()
+        .find(|c| c.content.contains("fn main"))
+        .expect("must find chunk containing fn main");
+    // The code block must not be split across chunks. Both the opening
+    // fence and the closing fence belong to the same chunk.
+    assert!(
+        code_chunk.content.contains("println!"),
+        "code chunk lost println!: {:?}",
+        code_chunk.content
+    );
+    let fence_count = code_chunk.content.matches("```").count();
+    assert!(
+        fence_count >= 2,
+        "code chunk must contain both fences, found {fence_count}: {:?}",
+        code_chunk.content
+    );
+}
+
+#[test]
+fn respects_heading_boundary() {
+    let md = "## A\nfirst section content\n\n## B\nsecond section content";
+    let chunks = smart_chunk_document(
+        md,
+        "Doc",
+        "GEN",
+        None,
+        SmartChunkOptions {
+            max_chunk_size: 1000,
+            respect_heading_boundaries: true,
+            ..Default::default()
+        },
+    );
+    // Even though both fit in one chunk size-wise, the heading boundary
+    // should split them.
+    assert!(
+        chunks.len() >= 2,
+        "expected at least 2 chunks across heading boundary, got {}",
+        chunks.len()
+    );
+}
+
+#[test]
+fn sentence_fallback_when_paragraphless() {
+    let body = "Sentence one. Sentence two. Sentence three. ".repeat(50);
+    let chunks = smart_chunk_document(
+        &body,
+        "Doc",
+        "GEN",
+        None,
+        SmartChunkOptions {
+            max_chunk_size: 200,
+            ..Default::default()
+        },
+    );
+    assert!(chunks.len() > 1, "expected >1 chunks, got {}", chunks.len());
+    for c in &chunks {
+        let trimmed = c.content.trim_end();
+        let last = trimmed.chars().last();
+        assert!(
+            matches!(last, Some('.') | Some('!') | Some('?')),
+            "expected sentence terminator at end of chunk, got {last:?} in {:?}",
+            c.content
+        );
+    }
+}
+
+#[test]
+fn hierarchy_path_tracks_nested_headings() {
+    // Blank lines separate the headings into individual blocks so the
+    // block splitter can detect each `#`/`##`/`###` distinctly. This
+    // matches standard markdown convention.
+    let md = "# A\n\n## A1\n\n### A1a\n\ncontent body inside the leaf section";
+    let chunks = chunk_with_smart_chunker(md, SmartChunkOptions::default());
+    // Find a non-heading chunk and inspect its hierarchy path.
+    let leaf = chunks
+        .iter()
+        .find(|c| c.metadata.chunk_type != BlockType::Heading)
+        .expect("expected a non-heading chunk");
+    let path = leaf
+        .metadata
+        .hierarchy_path
+        .as_ref()
+        .expect("expected hierarchy_path to be populated");
+    assert_eq!(
+        path,
+        &vec!["A".to_string(), "A1".to_string(), "A1a".to_string()]
+    );
+}
+
+#[test]
+fn table_detected_as_table_chunk() {
+    // Table standalone — no surrounding text — so the chunker doesn't
+    // merge it with a leading heading/paragraph block (which would carry
+    // the final chunk's metadata over to whatever block came last).
+    let md = "| col1 | col2 | col3 |\n| --- | --- | --- |\n| a | b | c |\n| d | e | f |\n";
+    let chunks = chunk_with_smart_chunker(md, SmartChunkOptions::default());
+    let table_chunk = chunks
+        .iter()
+        .find(|c| c.metadata.chunk_type == BlockType::Table)
+        .expect("expected a chunk with BlockType::Table");
+    assert!(
+        table_chunk.text.contains("col1") && table_chunk.text.contains("---"),
+        "table chunk should retain pipe + separator: {:?}",
+        table_chunk.text
+    );
+}
+
+#[test]
+fn default_options_match_ts_smart_chunker() {
+    let opts = SmartChunkOptions::default();
+    assert_eq!(opts.max_chunk_size, 800);
+    assert_eq!(opts.overlap_size, 200);
+    assert!(opts.preserve_code_blocks);
+    assert!(opts.respect_heading_boundaries);
+    assert!(opts.respect_section_boundaries);
 }
