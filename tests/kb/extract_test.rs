@@ -9,12 +9,19 @@
 
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
+
+use rantaiclaw::kb::extract::hybrid::{merge_structural_with_text_layer, HybridExtractor};
 use rantaiclaw::kb::extract::mineru::MineruExtractor;
 use rantaiclaw::kb::extract::pdf_splitter::{get_page_count, split_pdf_by_page_count};
+use rantaiclaw::kb::extract::smart_router::SmartRouterExtractor;
+use rantaiclaw::kb::extract::text_layer_signals::{
+    has_columnar_lines, has_dense_currency, is_unpdf_sufficient, RouterOpts,
+};
 use rantaiclaw::kb::extract::unpdf::UnpdfExtractor;
 use rantaiclaw::kb::extract::vision_llm::VisionLlmExtractor;
-use rantaiclaw::kb::extract::Extractor;
-use rantaiclaw::kb::KbConfig;
+use rantaiclaw::kb::extract::{ExtractionResult, Extractor};
+use rantaiclaw::kb::{KbConfig, KbError, KbResult};
 
 // ----- fixture helpers ---------------------------------------------------
 
@@ -396,4 +403,229 @@ async fn vision_llm_4xx_surfaces_extraction_error() {
         msg.contains("400"),
         "error should mention the HTTP status, got: {msg}"
     );
+}
+
+// ----- task 5.6: text_layer_signals --------------------------------------
+
+#[test]
+fn signals_clean_prose_is_sufficient() {
+    let opts = RouterOpts::default();
+    // 1500 chars of plain prose across an imagined 5-page doc — 300/page.
+    let text = "lorem ipsum dolor sit amet ".repeat(80); // ~2160 chars
+    assert!(is_unpdf_sufficient(&text, 5, &opts));
+}
+
+#[test]
+fn signals_empty_text_triggers_fallback() {
+    let opts = RouterOpts::default();
+    assert!(!is_unpdf_sufficient("", 1, &opts));
+    assert!(!is_unpdf_sufficient("short", 5, &opts));
+}
+
+#[test]
+fn signals_columnar_lines_trigger_fallback() {
+    // 6 columnar lines (>5 = default max_columnar_lines) — should fall back.
+    let line = "Name        Age        Salary        Location";
+    let columnar = std::iter::repeat_n(line, 20).collect::<Vec<_>>().join("\n");
+    let opts = RouterOpts::default();
+    assert!(has_columnar_lines(&columnar, opts.max_columnar_lines));
+    // Padded to enough chars to clear min_chars_per_page; columnar guard
+    // should still reject.
+    let padded = format!("{}\n{}", columnar, "filler text ".repeat(100));
+    assert!(!is_unpdf_sufficient(&padded, 1, &opts));
+}
+
+#[test]
+fn signals_dense_currency_triggers_fallback() {
+    let line = "Revenue $1,234.56 $7,890 $999,999.99 $12 $3,456";
+    let text = std::iter::repeat_n(line, 10).collect::<Vec<_>>().join("\n");
+    let opts = RouterOpts::default();
+    assert!(has_dense_currency(&text, opts.max_currency_matches));
+    assert!(!is_unpdf_sufficient(&text, 1, &opts));
+}
+
+// ----- task 5.7: SmartRouter + Hybrid ------------------------------------
+
+/// A canned-result extractor used to drive SmartRouter/Hybrid behavior
+/// without standing up real PDF parsing.
+struct CannedExtractor {
+    name: String,
+    result: KbResult<ExtractionResult>,
+}
+
+impl CannedExtractor {
+    fn ok(name: &str, text: &str, pages: u32) -> Self {
+        Self {
+            name: name.into(),
+            result: Ok(ExtractionResult {
+                text: text.into(),
+                elapsed_ms: 1,
+                pages: Some(pages),
+                model: name.into(),
+                prompt_tokens: None,
+                completion_tokens: None,
+                cost_usd: None,
+            }),
+        }
+    }
+    fn err(name: &str, msg: &str) -> Self {
+        Self {
+            name: name.into(),
+            result: Err(KbError::Extraction {
+                extractor: name.into(),
+                message: msg.into(),
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl Extractor for CannedExtractor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    async fn extract(&self, _: &[u8]) -> KbResult<ExtractionResult> {
+        match &self.result {
+            Ok(r) => Ok(r.clone()),
+            Err(e) => Err(KbError::Extraction {
+                extractor: self.name.clone(),
+                message: e.to_string(),
+            }),
+        }
+    }
+}
+
+#[tokio::test]
+async fn smart_router_returns_text_layer_when_sufficient() {
+    // ~600 chars over a 1-page doc — passes default min_chars_per_page=300.
+    let text = "lorem ipsum dolor sit amet ".repeat(40);
+    let text_layer = Box::new(CannedExtractor::ok("unpdf", &text, 1));
+    let fallback = Box::new(CannedExtractor::err("vision", "should NOT be called"));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+    let r = router.extract(b"unused").await.unwrap();
+    assert!(r.text.contains("lorem"));
+    assert!(
+        r.model.starts_with("smart("),
+        "model should be wrapped, got: {}",
+        r.model
+    );
+    assert!(
+        !r.model.contains("fallback:"),
+        "fallback must not be invoked, got: {}",
+        r.model
+    );
+}
+
+#[tokio::test]
+async fn smart_router_falls_back_when_text_layer_empty() {
+    let text_layer = Box::new(CannedExtractor::ok("unpdf", "", 1));
+    let fallback = Box::new(CannedExtractor::ok("vision", "structured output", 1));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+    let r = router.extract(b"unused").await.unwrap();
+    assert_eq!(r.text, "structured output");
+    assert!(
+        r.model.contains("fallback:"),
+        "model must mark fallback usage, got: {}",
+        r.model
+    );
+}
+
+#[tokio::test]
+async fn smart_router_falls_back_when_text_layer_errors() {
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "boom"));
+    let fallback = Box::new(CannedExtractor::ok("vision", "structured output", 1));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+    let r = router.extract(b"unused").await.unwrap();
+    assert_eq!(r.text, "structured output");
+}
+
+#[tokio::test]
+async fn smart_router_surfaces_aggregate_error_when_both_fail() {
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "tlfail"));
+    let fallback = Box::new(CannedExtractor::err("vision", "fbfail"));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+    let err = router.extract(b"unused").await.expect_err("must fail");
+    let msg = err.to_string();
+    assert!(msg.contains("tlfail"), "msg must include tl error: {msg}");
+    assert!(msg.contains("fbfail"), "msg must include fb error: {msg}");
+}
+
+#[tokio::test]
+async fn hybrid_merges_both_outputs() {
+    let structural = Box::new(CannedExtractor::ok(
+        "mineru",
+        "# Heading\n\nQuick brown fox jumps over the lazy dog.",
+        2,
+    ));
+    let text_layer = Box::new(CannedExtractor::ok(
+        "unpdf",
+        "Quick brown fox jumps over the lazy dog.",
+        2,
+    ));
+    let hybrid = HybridExtractor::new(structural, text_layer);
+    let r = hybrid.extract(b"unused").await.unwrap();
+    assert!(r.text.contains("# Heading"), "should keep heading");
+    assert!(r.text.contains("Quick brown fox"), "should keep prose");
+    assert!(
+        r.model.starts_with("hybrid("),
+        "model name must annotate hybrid: {}",
+        r.model
+    );
+}
+
+#[tokio::test]
+async fn hybrid_degrades_to_structural_when_text_layer_fails() {
+    let structural = Box::new(CannedExtractor::ok("mineru", "## structural body", 3));
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "boom"));
+    let hybrid = HybridExtractor::new(structural, text_layer);
+    let r = hybrid.extract(b"unused").await.unwrap();
+    assert_eq!(r.text, "## structural body");
+    // The single-source path returns the inner result unchanged, so model
+    // stays "mineru" rather than wrapping.
+    assert_eq!(r.model, "mineru");
+}
+
+#[tokio::test]
+async fn hybrid_degrades_to_text_layer_when_structural_fails() {
+    let structural = Box::new(CannedExtractor::err("mineru", "boom"));
+    let text_layer = Box::new(CannedExtractor::ok("unpdf", "flat prose", 3));
+    let hybrid = HybridExtractor::new(structural, text_layer);
+    let r = hybrid.extract(b"unused").await.unwrap();
+    assert_eq!(r.text, "flat prose");
+    assert_eq!(r.model, "unpdf");
+}
+
+#[tokio::test]
+async fn hybrid_errors_when_both_fail() {
+    let structural = Box::new(CannedExtractor::err("mineru", "sfail"));
+    let text_layer = Box::new(CannedExtractor::err("unpdf", "tfail"));
+    let hybrid = HybridExtractor::new(structural, text_layer);
+    let err = hybrid.extract(b"unused").await.expect_err("must fail");
+    let msg = err.to_string();
+    assert!(msg.contains("sfail"), "msg must include structural err: {msg}");
+    assert!(msg.contains("tfail"), "msg must include text-layer err: {msg}");
+}
+
+#[test]
+fn merge_preserves_tables_verbatim() {
+    let structural = "| a | b |\n|---|---|\n| 1 | 2 |\n\nSome prose text here.";
+    let text_layer = "Some prose text here.";
+    let merged = merge_structural_with_text_layer(structural, text_layer);
+    assert!(merged.contains("| a | b |"));
+    assert!(merged.contains("Some prose text"));
+}
+
+// ----- live integration (skipped unless OPENROUTER_API_KEY set) ----------
+
+#[tokio::test]
+#[ignore = "requires OPENROUTER_API_KEY"]
+async fn vision_llm_extracts_real_pdf() {
+    let api_key = std::env::var("OPENROUTER_API_KEY")
+        .expect("OPENROUTER_API_KEY env var required for live test");
+    let mut cfg = vision_cfg("https://openrouter.ai/api/v1/chat/completions".into());
+    cfg.extract_vision_api_key = api_key;
+    let ext = VisionLlmExtractor::new(cfg, "openai/gpt-4.1-nano".into());
+    let pdf = make_pdf(2);
+    let r = ext.extract(&pdf).await.expect("live extract should succeed");
+    assert!(!r.text.is_empty());
 }
