@@ -117,7 +117,7 @@ impl EmbeddingProvider for OpenRouterEmbedding {
 /// against the batch input size.
 ///
 /// `api_key = None` omits the `Authorization` header (TEI sidecar mode).
-pub(super) async fn embed_via_http(
+pub(in crate::kb::embed) async fn embed_via_http(
     http: &Client,
     url: &str,
     api_key: Option<&str>,
@@ -211,7 +211,7 @@ pub(super) async fn embed_via_http(
 /// Batch dispatcher: chunk inputs, spawn `concurrency` workers that each pull
 /// the next batch index from a shared atomic counter, preserve input order.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn embed_many_via_http(
+pub(in crate::kb::embed) async fn embed_many_via_http(
     http: &Client,
     url: &str,
     api_key: Option<&str>,
