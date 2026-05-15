@@ -317,9 +317,15 @@ fn resolve_allowed_documents(
     let mut allowed: Option<std::collections::HashSet<String>> = None;
 
     if let Some(category) = &filter.category {
+        // Use `json_each` for proper array-element membership. The previous
+        // `LIKE '%' || ?1 || '%'` matched substrings ("A" matched "FAQ") and
+        // expanded SQL wildcards (`_`, `%`) in the user-supplied param —
+        // either of those could silently broaden category access. `json_each`
+        // is the JSON-aware equivalent of `category IN (...)`.
         let mut stmt = conn.prepare(
             "SELECT id FROM document
-             WHERE deleted_at IS NULL AND categories_json LIKE '%' || ?1 || '%'",
+             WHERE deleted_at IS NULL
+               AND EXISTS (SELECT 1 FROM json_each(categories_json) WHERE value = ?1)",
         )?;
         let ids: std::collections::HashSet<String> = stmt
             .query_map(params![category], |row| row.get::<_, String>(0))?

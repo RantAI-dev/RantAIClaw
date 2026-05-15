@@ -141,6 +141,64 @@ async fn store_chunks_and_vector_search() {
 }
 
 #[tokio::test]
+async fn category_filter_uses_array_membership_not_substring() {
+    // Regression: the previous `categories_json LIKE '%X%'` filter matched
+    // any substring of the JSON blob, so a query for category "A" would
+    // match a doc categorized ["FAQ"]. The fix uses `json_each` for true
+    // array-element equality. This test would have failed with the LIKE
+    // implementation.
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let doc = sample_doc("doc-cat", "Category Doc");
+    // `categories = ["FAQ"]` from `sample_doc` — substring "A" appears in "FAQ".
+    store.create_document(&doc).await.unwrap();
+
+    let chunks = vec![Chunk {
+        content: "alpha content".into(),
+        metadata: ChunkMetadata {
+            document_title: doc.title.clone(),
+            category: "FAQ".into(),
+            subcategory: None,
+            section: None,
+            chunk_index: 0,
+            contextual_prefix: None,
+        },
+    }];
+    store
+        .store_chunks(&doc.id, &chunks, &[ones(4)], "test-model")
+        .await
+        .unwrap();
+
+    // Query for the wrong category — must return no hits with json_each.
+    // With the old LIKE substring filter, "A" would have matched "FAQ".
+    let filter = SearchFilter {
+        category: Some("A".into()),
+        ..Default::default()
+    };
+    let results = store
+        .search_by_vector(&ones(4), 5, &filter)
+        .await
+        .unwrap();
+    assert!(
+        results.is_empty(),
+        "category 'A' must not match doc categorized ['FAQ']; got {results:?}"
+    );
+
+    // Sanity: exact match still works.
+    let filter_exact = SearchFilter {
+        category: Some("FAQ".into()),
+        ..Default::default()
+    };
+    let hits = store
+        .search_by_vector(&ones(4), 5, &filter_exact)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "exact category match must still return the doc");
+}
+
+#[tokio::test]
 async fn dimension_mismatch_errors_loudly() {
     let tmp = TempDir::new().unwrap();
     let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
