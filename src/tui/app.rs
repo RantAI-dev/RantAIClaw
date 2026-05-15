@@ -3544,33 +3544,17 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
     frame.render_widget(status, area);
 }
 
-/// ASCII hermit-crab mascot. Cream shell on top + orange body + black
-/// eyes — the terminal-friendly cousin of the brand mascot. Kept as a
-/// const so the shape can be eyeballed and tweaked without hunting
-/// through `render_splash_lines`.
-///
-/// Every row is exactly `MASCOT_WIDTH` cells wide. Update both the art
-/// and the constant together.
-const HERMIT_CRAB_ART: &[&str] = &[
-    "         _,--._         ",
-    "      ,-'      `-.      ",
-    "     /  ,-~--~-,  \\     ",
-    "    /  /        \\  \\    ",
-    "   |  | ●      ● |  |   ",
-    "    \\  \\  \\__/  /  /    ",
-    "     '. '.____.' .'     ",
-    "  __   '._____.'   __   ",
-    " /  )__,'       `,__(  \\",
-    "(__/   |  /^\\  |   \\__) ",
-    "       |_/   \\_|        ",
-    "      ^^       ^^       ",
-    "                        ",
-    "      RANTAICLAW        ",
-];
+// Pixel grid for the hermit-crab mascot. Generated offline from
+// `Untitled design (3).png` via `tools/render_mascot.py`; each cell
+// is `(upper_rgb, upper_transparent, lower_rgb, lower_transparent)`
+// and renders as one '▀' character in the splash with the upper
+// pixel as fg and the lower pixel as bg. Truecolor — terminals
+// without 24-bit colour will down-mix to their palette.
+include!("assets/mascot_pixels.rs");
 
-/// Width of the mascot column (in display cells). Keeps the right-pane
-/// alignment stable regardless of how cute we make the art.
-const MASCOT_WIDTH: usize = 24;
+/// Width of the mascot column (in display cells). Must match the
+/// per-row length of `MASCOT_PIXELS` so the right pane stays aligned.
+const MASCOT_WIDTH: usize = 32;
 
 /// Hard ceiling on the right-pane width, in chars. Used by `wrap_csv`.
 const MAX_RIGHT_WIDTH: usize = 64;
@@ -3578,8 +3562,6 @@ const MAX_RIGHT_WIDTH: usize = 64;
 /// Render the empty-chat splash: hermit-crab mascot on the left and a
 /// hermes-inspired "Available Channels / Skills" panel on the right.
 fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
-    let orange = Color::Rgb(255, 134, 64);
-    let shell = Color::Rgb(245, 230, 200);
     let muted = Color::Rgb(107, 114, 128);
     let sky = Color::Rgb(94, 184, 255);
     let gold = Color::Rgb(234, 179, 8);
@@ -3660,28 +3642,43 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
 
     // ── Left-pane mascot ──────────────────────────────────────────────
     //
-    // Tint: top three rows = cream shell, body rows = orange, bottom
-    // three rows (legs + brand stamp) = muted orange / sky for the
-    // wordmark so it reads as part of the brand rather than the crab.
-    let mut left: Vec<Line<'static>> = Vec::with_capacity(HERMIT_CRAB_ART.len());
-    let body_end = HERMIT_CRAB_ART.len().saturating_sub(3);
-    for (i, row) in HERMIT_CRAB_ART.iter().enumerate() {
-        let (color, bold) = if i < 3 {
-            (shell, true)
-        } else if i < body_end {
-            (orange, true)
-        } else if row.contains("RANTAICLAW") {
-            (sky, true)
-        } else {
-            (Color::Rgb(200, 100, 50), true) // darker orange for legs
-        };
-        let style = if bold {
-            Style::default().fg(color).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(color)
-        };
-        left.push(Line::from(Span::styled(row.to_string(), style)));
+    // Each row of `MASCOT_PIXELS` is `MASCOT_WIDTH` cells wide. We
+    // render every cell as a `▀` (upper half block) with the upper
+    // pixel as foreground colour and the lower pixel as background,
+    // doubling vertical resolution at no character cost. Transparent
+    // pixels collapse to "no colour" so the splash blends with the
+    // terminal background.
+    let mut left: Vec<Line<'static>> = Vec::with_capacity(MASCOT_PIXELS.len() + 2);
+    for row in MASCOT_PIXELS.iter() {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(row.len());
+        for &(ur, ug, ub, u_t, lr, lg, lb, l_t) in row.iter() {
+            let mut style = Style::default();
+            if !u_t {
+                style = style.fg(Color::Rgb(ur, ug, ub));
+            }
+            if !l_t {
+                style = style.bg(Color::Rgb(lr, lg, lb));
+            }
+            // When both halves are transparent emit a plain space so
+            // ratatui doesn't bother painting the cell at all — keeps
+            // the splash visually clean on themed terminals.
+            let glyph = if u_t && l_t { " " } else { "▀" };
+            spans.push(Span::styled(glyph.to_string(), style));
+        }
+        left.push(Line::from(spans));
     }
+    // Brand wordmark stamp beneath the art — kept in the same sky-blue
+    // as the right-pane title so the two read as one identity.
+    left.push(Line::from(""));
+    let wordmark = "RANTAICLAW";
+    let pad = MASCOT_WIDTH.saturating_sub(wordmark.chars().count()) / 2;
+    left.push(Line::from(vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(
+            wordmark.to_string(),
+            Style::default().fg(sky).add_modifier(Modifier::BOLD),
+        ),
+    ]));
 
     // ── Stitch the two columns ────────────────────────────────────────
     let rows = left.len().max(right.len());
