@@ -1,7 +1,14 @@
 //! Tests for the KB embedding layer (`src/kb/embed/`).
 //!
 //! Task 3.1 covers the LRU cache port. Task 3.2 adds OpenRouter provider
-//! tests (wiremock-backed). Task 3.3 will append TEI variant tests.
+//! tests (wiremock-backed). Task 3.3 appends TEI variant tests.
+//!
+//! `await_holding_lock` is allowed file-wide: `ENV_LOCK` is a std mutex used
+//! to serialize env-var mutation across async tests. Tests run one-at-a-time
+//! per integration binary so the held-across-await pattern is safe here, and
+//! using an async mutex would force every sync test (e.g. `config_test.rs`)
+//! into a tokio runtime for parity, which is heavier than the lint.
+#![allow(clippy::await_holding_lock)]
 
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -9,6 +16,7 @@ use std::time::Duration;
 
 use rantaiclaw::kb::embed::cache::LruCache;
 use rantaiclaw::kb::embed::openrouter::OpenRouterEmbedding;
+use rantaiclaw::kb::embed::tei::TeiEmbedding;
 use rantaiclaw::kb::embed::{make_provider, EmbeddingProvider};
 use rantaiclaw::kb::{KbConfig, KbError};
 use serde_json::json;
@@ -323,4 +331,134 @@ async fn openrouter_embed_query_live() {
         .expect("live embed");
     assert_eq!(v.len(), cfg.embedding_dim);
     assert!(v.iter().any(|x| *x != 0.0), "all-zero embedding is suspect");
+}
+
+// ---- TEI sidecar variant (task 3.3) ---------------------------------
+
+#[tokio::test]
+async fn make_provider_uses_tei_for_non_openrouter_url() {
+    // Provider type isn't downcastable through `Arc<dyn Trait>`, so verify
+    // the factory's TEI branch by behavior: build with a non-`openrouter.ai`
+    // base URL pointed at a wiremock that asserts NO `Authorization` header
+    // (which is the TEI-specific behavior when no key is configured).
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let server = MockServer::start().await;
+    let saw_no_auth = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_no_auth_clone = saw_no_auth.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |req: &Request| {
+            let has_auth = req
+                .headers
+                .iter()
+                .any(|(k, _)| k.as_str().eq_ignore_ascii_case("authorization"));
+            saw_no_auth_clone.store(!has_auth, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(make_response(4, 1))
+        })
+        .mount(&server)
+        .await;
+
+    // Wipe env so no auth key leaks through.
+    let snapshot: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("KB_") || k == "OPENROUTER_API_KEY")
+        .collect();
+    for (k, _) in &snapshot {
+        unsafe {
+            std::env::remove_var(k);
+        }
+    }
+    let _env = EnvGuard(vec!["KB_EMBEDDING_BASE_URL", "KB_EMBEDDING_DIM"]);
+    unsafe {
+        std::env::set_var("KB_EMBEDDING_BASE_URL", server.uri());
+        std::env::set_var("KB_EMBEDDING_DIM", "4");
+    }
+
+    let cfg = KbConfig::from_env().expect("env config");
+    let provider = make_provider(&cfg).expect("provider built");
+    let _ = provider.embed_query("x").await.expect("tei mock embed");
+    assert!(
+        saw_no_auth.load(std::sync::atomic::Ordering::SeqCst),
+        "TEI provider must omit Authorization header when no key is set"
+    );
+
+    // Restore.
+    for (k, v) in snapshot {
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
+}
+
+#[tokio::test]
+async fn tei_omits_auth_header_when_no_key() {
+    // Directly verify the TeiEmbedding behavior without going through the
+    // factory. Need to wipe OPENROUTER_API_KEY too — TEI's auth() resolves
+    // via KbConfig::resolve_key which falls back to the env var.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let server = MockServer::start().await;
+    let saw_auth = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_auth_clone = saw_auth.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |req: &Request| {
+            let has_auth = req
+                .headers
+                .iter()
+                .any(|(k, _)| k.as_str().eq_ignore_ascii_case("authorization"));
+            saw_auth_clone.store(has_auth, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(make_response(4, 1))
+        })
+        .mount(&server)
+        .await;
+
+    let snapshot: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k == "OPENROUTER_API_KEY" || k.starts_with("KB_"))
+        .collect();
+    for (k, _) in &snapshot {
+        unsafe {
+            std::env::remove_var(k);
+        }
+    }
+
+    let mut cfg = mock_cfg(server.uri());
+    cfg.embedding_api_key = String::new(); // explicit no-key
+    let provider = TeiEmbedding::new(cfg, make_cache());
+    let _ = provider.embed_query("x").await.expect("tei embed");
+    assert!(
+        !saw_auth.load(std::sync::atomic::Ordering::SeqCst),
+        "TEI must NOT send Authorization header when both keys are empty"
+    );
+
+    for (k, v) in snapshot {
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
+}
+
+#[tokio::test]
+async fn tei_sends_auth_header_when_key_present() {
+    // Defensive: when a key IS configured (per-endpoint), TEI must honor it.
+    // This prevents a future regression where the optional-auth path silently
+    // strips a configured key.
+    let server = MockServer::start().await;
+    let saw_auth = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_auth_clone = saw_auth.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |req: &Request| {
+            let has_auth = req
+                .headers
+                .iter()
+                .any(|(k, _)| k.as_str().eq_ignore_ascii_case("authorization"));
+            saw_auth_clone.store(has_auth, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(make_response(4, 1))
+        })
+        .mount(&server)
+        .await;
+
+    let cfg = mock_cfg(server.uri()); // has embedding_api_key = "test-key"
+    let provider = TeiEmbedding::new(cfg, make_cache());
+    let _ = provider.embed_query("x").await.expect("tei embed");
+    assert!(
+        saw_auth.load(std::sync::atomic::Ordering::SeqCst),
+        "TEI must forward configured api key as Authorization header"
+    );
 }

@@ -1,8 +1,10 @@
 //! KB embedding layer — provider trait, LRU cache, and concrete providers.
 //!
-//! Today only [`openrouter::OpenRouterEmbedding`] is wired through
-//! [`make_provider`]; the TEI sidecar variant lands in task 3.3. The trait
-//! mirrors what the TS RAG pipeline calls (`generateEmbedding` /
+//! Two providers ship today, dispatched by URL substring in [`make_provider`]:
+//! - [`openrouter::OpenRouterEmbedding`] for OpenRouter (cloud).
+//! - [`tei::TeiEmbedding`] for a Text-Embeddings-Inference sidecar (on-prem).
+//!
+//! The trait mirrors what the TS RAG pipeline calls (`generateEmbedding` /
 //! `generateEmbeddings` in `src/lib/rag/embeddings.ts`).
 
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use crate::kb::{KbConfig, KbResult};
 
 pub mod cache;
 pub mod openrouter;
+pub mod tei;
 
 /// Single-query embedding cache, shared across one provider instance.
 pub type SharedEmbedCache = Arc<Mutex<LruCache<String, Vec<f32>>>>;
@@ -37,14 +40,23 @@ pub trait EmbeddingProvider: Send + Sync {
     async fn embed_many(&self, texts: &[String]) -> KbResult<Vec<Vec<f32>>>;
 }
 
-/// Build a provider. Only OpenRouter today (task 3.3 will add TEI dispatch).
+/// Build a provider. Dispatch is URL-based: any base URL containing
+/// `openrouter.ai` routes to [`openrouter::OpenRouterEmbedding`]; everything
+/// else routes to [`tei::TeiEmbedding`]. Self-hosted TEI deployments behind a
+/// CDN whose hostname ends in `openrouter.ai` would misclassify; the operator
+/// in that case should pick a different base URL (TEI typically runs on a
+/// private network, so this collision is unlikely in practice).
 pub fn make_provider(cfg: &KbConfig) -> KbResult<Arc<dyn EmbeddingProvider>> {
     let cache: SharedEmbedCache = Arc::new(Mutex::new(LruCache::new(
         cfg.query_embed_cache_size,
         Some(Duration::from_millis(cfg.query_embed_cache_ttl_ms)),
     )));
-    Ok(Arc::new(openrouter::OpenRouterEmbedding::new(
-        cfg.clone(),
-        cache,
-    )))
+    if cfg.embedding_base_url.contains("openrouter.ai") {
+        Ok(Arc::new(openrouter::OpenRouterEmbedding::new(
+            cfg.clone(),
+            cache,
+        )))
+    } else {
+        Ok(Arc::new(tei::TeiEmbedding::new(cfg.clone(), cache)))
+    }
 }
