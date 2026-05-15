@@ -101,8 +101,12 @@ jobs:
                     fi
 
                     # Guardrail: release tags must resolve to commits already reachable from main.
+                    # Note: the trap swallows rm errors. `git fetch --filter=blob:none`
+                    # occasionally leaves a pack process holding file descriptors in .git/,
+                    # which makes `rm -rf` race and exit non-zero — that has historically
+                    # killed an otherwise-passing prepare step under `set -e`.
                     tmp_repo="$(mktemp -d)"
-                    trap 'rm -rf "$tmp_repo"' EXIT
+                    trap 'rm -rf "$tmp_repo" 2>/dev/null || true' EXIT
                     git -C "$tmp_repo" init -q
                     git -C "$tmp_repo" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
                     git -C "$tmp_repo" fetch --quiet --filter=blob:none origin main "refs/tags/${release_tag}:refs/tags/${release_tag}"
@@ -214,7 +218,14 @@ jobs:
             - name: Force rantaiclaw recompile (CARGO_PKG_VERSION freshness)
               shell: bash
               run: |
-                  cargo clean --target ${{ matrix.target }} -p rantaiclaw || true
+                  # Resolve the real cargo via rustup. On macOS GitHub runners,
+                  # both /opt/homebrew/bin/cargo and (since image 20260512.0058)
+                  # ~/.cargo/bin/cargo can resolve to a `rustup-init` shim that
+                  # rejects subcommands like `clean` / `build`. `rustup which`
+                  # returns the active toolchain's cargo binary directly,
+                  # bypassing every PATH-based shim.
+                  CARGO_BIN="$(rustup which cargo)"
+                  "$CARGO_BIN" clean --target ${{ matrix.target }} -p rantaiclaw || true
 
             - name: Build release
               shell: bash
@@ -222,18 +233,15 @@ jobs:
                   LINKER_ENV: ${{ matrix.linker_env }}
                   LINKER: ${{ matrix.linker }}
               run: |
-                  # GitHub's macos-15 image ships a Homebrew `cargo` shim
-                  # that actually wraps `rustup-init` and refuses `cargo
-                  # build` invocations. Prepend `$CARGO_HOME/bin` so the
-                  # real rustup-installed toolchain wins on PATH. Linux
-                  # and Windows runners are unaffected — the prepend is
-                  # harmless when the directory already comes first.
-                  export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+                  # See "Force rantaiclaw recompile" above — invoke cargo
+                  # directly via `rustup which` so Homebrew's rustup-init shim
+                  # cannot intercept us on macOS image 20260512.0058+.
+                  CARGO_BIN="$(rustup which cargo)"
                   if [ -n "$LINKER_ENV" ] && [ -n "$LINKER" ]; then
                     echo "Using linker override: $LINKER_ENV=$LINKER"
                     export "$LINKER_ENV=$LINKER"
                   fi
-                  cargo build --profile release-fast --locked --target ${{ matrix.target }}
+                  "$CARGO_BIN" build --profile release-fast --locked --target ${{ matrix.target }}
 
             - name: Check binary size (Unix)
               if: runner.os != 'Windows'
