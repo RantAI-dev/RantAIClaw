@@ -55,6 +55,7 @@ fn defaults_match_ts_kb() {
     assert!(!cfg.contextual_retrieval_enabled);
     assert!(!cfg.query_expansion_enabled);
     assert_eq!(cfg.query_expansion_paraphrases, 3);
+    assert!(!cfg.standalone_query_enabled);
     assert_eq!(
         cfg.embedding_base_url,
         "https://openrouter.ai/api/v1/embeddings"

@@ -6,6 +6,7 @@
 //! using context from prior turns.
 //!
 //! Fail-soft contract:
+//! - `cfg.standalone_query_enabled` is false → returns unchanged (TS parity)
 //! - empty chat_history → returns the query unchanged (nothing to anchor against)
 //! - query length ≥ 60 chars → returns unchanged (already self-contained)
 //! - missing `OPENROUTER_API_KEY` → returns unchanged
@@ -63,6 +64,12 @@ pub async fn rewrite_standalone(
         return Ok(String::new());
     }
     if chat_history.is_empty() {
+        return Ok(latest.to_string());
+    }
+    // Opt-in feature gate — TS source guards the LLM call with
+    // `process.env.KB_STANDALONE_QUERY_ENABLED !== "true"`. Without this,
+    // the rewriter ships always-on, which diverges from the TS contract.
+    if !cfg.standalone_query_enabled {
         return Ok(latest.to_string());
     }
     // Self-contained heuristic: long messages rarely need disambiguation.

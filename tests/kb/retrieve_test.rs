@@ -129,6 +129,7 @@ fn test_cfg() -> KbConfig {
         query_expansion_enabled: false,
         query_expansion_model: "rantaiclaw_test_model_a".into(),
         query_expansion_paraphrases: 3,
+        standalone_query_enabled: false,
         extract_vision_base_url: String::new(),
         extract_vision_api_key: String::new(),
         extract_mineru_base_url: String::new(),
@@ -956,7 +957,8 @@ mod standalone_tests {
             std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
 
-        let cfg = test_cfg();
+        let mut cfg = test_cfg();
+        cfg.standalone_query_enabled = true;
         let history = vec![
             ("user".to_string(), "tell me about policy X".to_string()),
             (
@@ -998,7 +1000,8 @@ mod standalone_tests {
             std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
 
-        let cfg = test_cfg();
+        let mut cfg = test_cfg();
+        cfg.standalone_query_enabled = true;
         let history = vec![(
             "user".to_string(),
             "earlier turn that anchors disambiguation".to_string(),
@@ -1010,5 +1013,36 @@ mod standalone_tests {
             out, "follow up?",
             "5xx → original query returned (fail-soft)"
         );
+    }
+
+    #[tokio::test]
+    async fn standalone_disabled_returns_query_only() {
+        // Even with non-empty history AND a valid API key AND a mock server
+        // that would otherwise rewrite the query, the disabled flag must
+        // short-circuit. Mirrors TS `KB_STANDALONE_QUERY_ENABLED !== "true"`.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        _clear_cache_for_tests().await;
+        let server = MockServer::start().await;
+        // expect(0) — the mock must never be hit when the gate is off.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "should not be returned" } }]
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        unsafe {
+            std::env::set_var("OPENROUTER_API_KEY", "test-key");
+            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
+        }
+
+        let cfg = test_cfg(); // standalone_query_enabled = false by default
+        let history = vec![("user".to_string(), "prior turn".to_string())];
+        let out = rewrite_standalone(&cfg, "what?", &history).await.unwrap();
+        assert_eq!(out, "what?", "disabled gate → query returned unchanged");
+        // wiremock's expect(0) auto-asserts on Drop that the mock was not hit.
     }
 }
