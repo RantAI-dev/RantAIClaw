@@ -66,6 +66,13 @@ mod health;
 mod heartbeat;
 mod identity;
 mod integrations;
+// Compile the KB modules as part of the binary crate too — required so
+// `crate::kb::axi::api::router()` returns a router parameterized with the
+// binary's `crate::gateway::AppState` (which is a distinct nominal type
+// from `rantaiclaw::gateway::AppState` even though the source is shared).
+// Gated on the `kb` feature so non-KB builds skip the whole subtree.
+#[cfg(feature = "kb")]
+mod kb;
 mod mcp;
 mod memory;
 mod migration;

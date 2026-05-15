@@ -9,6 +9,7 @@
 
 mod kb {
     pub mod common;
+    pub mod api_test;
     pub mod chunk_test;
     pub mod cli_test;
     pub mod config_test;
