@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::kb::{KbError, KbResult};
 
+pub mod documents;
 pub mod schema;
 
 /// SQLite-backed KB store. Uses a single connection guarded by a `Mutex` —
@@ -39,6 +40,10 @@ impl SqliteStore {
         }
         let open_path = path.clone();
         let conn = tokio::task::spawn_blocking(move || -> KbResult<Connection> {
+            // Register sqlite-vec as a process-wide auto-extension BEFORE
+            // opening the connection — sqlite3_auto_extension only fires for
+            // newly-opened connections. Idempotent across calls via Once.
+            schema::ensure_vec_extension_registered();
             let conn = Connection::open(&open_path)?;
             schema::migrate(&conn, embedding_dim)?;
             Ok(conn)

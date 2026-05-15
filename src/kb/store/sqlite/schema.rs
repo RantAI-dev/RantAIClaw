@@ -30,7 +30,7 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// `sqlite3_auto_extension` before opening connections — see the crate's own
 /// test in `src/lib.rs`. We guard with `std::sync::Once` so re-registration
 /// across `SqliteStore::open` calls is a no-op.
-fn ensure_vec_extension_registered() {
+pub(crate) fn ensure_vec_extension_registered() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // SAFETY: `sqlite3_vec_init` is declared by the sqlite-vec crate as
