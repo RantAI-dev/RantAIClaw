@@ -8,10 +8,11 @@
 #![cfg(feature = "kb")]
 
 mod kb {
-    pub mod common;
+    pub mod agent_integration_test;
     pub mod api_test;
     pub mod chunk_test;
     pub mod cli_test;
+    pub mod common;
     pub mod config_test;
     pub mod embed_test;
     pub mod extract_test;

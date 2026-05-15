@@ -13,11 +13,14 @@
 //! - [`toon`] — the TOON formatter.
 //! - [`cli`] — the `rantaiclaw kb ...` clap subcommand and dispatcher.
 //! - [`api`] — the `/api/v1/kb/*` axum router merged into the gateway.
+//! - [`ambient`] — the AXI ambient-context line for the agent loop.
 
+pub mod ambient;
 pub mod api;
 pub mod cli;
 pub mod toon;
 
+pub use ambient::kb_ambient_context;
 pub use api::router;
 pub use cli::KbCommand;
 pub use toon::{format_toon, serialize_value};

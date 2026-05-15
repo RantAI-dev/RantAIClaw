@@ -2067,6 +2067,16 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
+    // ── AXI principle #7: ambient KB discovery ───────────────────
+    // When the `kb` feature is compiled in AND a KB database is on disk,
+    // teach the agent about the `rantaiclaw kb …` shell capability so
+    // it can shell out via its existing `shell` tool. No `Tool` impl.
+    #[cfg(feature = "kb")]
+    if let Some(line) = crate::kb::axi::kb_ambient_context() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&line);
+    }
+
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = ApprovalManager::from_config(&config.autonomy);
 
@@ -2474,6 +2484,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    }
+
+    // ── AXI principle #7: ambient KB discovery ───────────────────
+    #[cfg(feature = "kb")]
+    if let Some(line) = crate::kb::axi::kb_ambient_context() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&line);
     }
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
