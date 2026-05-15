@@ -3557,8 +3557,12 @@ const HERMIT_CRAB_ART: &str = include_str!("assets/mascot_ascii.txt");
 /// stays aligned.
 const MASCOT_WIDTH: usize = 48;
 
-/// Hard ceiling on the right-pane width, in chars. Used by `wrap_csv`.
-const MAX_RIGHT_WIDTH: usize = 64;
+/// Hard ceiling on the right-pane width, in chars. Used by `wrap_csv`
+/// and `wrap_text`. Kept conservative so the stitched splash row
+/// (mascot + separator + right text) stays well under the width of a
+/// typical 100-col terminal, preventing the right-pane content from
+/// reflowing onto the mascot's row.
+const MAX_RIGHT_WIDTH: usize = 50;
 
 /// Map a single glyph from `HERMIT_CRAB_ART` to its RGB tint. Returning
 /// `None` means "render this cell as a plain space with no styling" —
@@ -3657,10 +3661,15 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
         .map(|(name, _)| name.clone())
         .collect();
     if channels.is_empty() {
-        right.push(Line::from(Span::styled(
-            "  (none configured — run `/setup channels` to enable transports)",
-            Style::default().fg(muted),
-        )));
+        for line in wrap_text(
+            "(none configured — run `/setup channels` to enable transports)",
+            MAX_RIGHT_WIDTH - 2,
+        ) {
+            right.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(muted)),
+            ]));
+        }
     } else {
         for line in wrap_csv(&channels, MAX_RIGHT_WIDTH) {
             right.push(Line::from(vec![
@@ -3682,10 +3691,15 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
         .map(|s| s.name.clone())
         .collect();
     if skills.is_empty() {
-        right.push(Line::from(Span::styled(
-            "  (none installed — run `/setup skills` or `/skill install <name>`)",
-            Style::default().fg(muted),
-        )));
+        for line in wrap_text(
+            "(none installed — run `/setup skills` or `/skill install <name>`)",
+            MAX_RIGHT_WIDTH - 2,
+        ) {
+            right.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(muted)),
+            ]));
+        }
     } else {
         for line in wrap_csv(&skills, MAX_RIGHT_WIDTH) {
             right.push(Line::from(vec![
@@ -3696,11 +3710,14 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
     }
     right.push(Line::from(""));
 
-    // Bottom hint, dim — same wording the old splash used.
-    right.push(Line::from(Span::styled(
-        "Type a message or /help for commands.",
-        Style::default().fg(muted),
-    )));
+    // Bottom hint, dim — same wording the old splash used. Wrapped for
+    // very narrow terminals even though the default copy fits in one row.
+    for line in wrap_text("Type a message or /help for commands.", MAX_RIGHT_WIDTH) {
+        right.push(Line::from(Span::styled(
+            line,
+            Style::default().fg(muted),
+        )));
+    }
 
     // ── Left-pane mascot (ASCII, per-character colour) ────────────────
     //
@@ -3759,6 +3776,34 @@ fn render_splash_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
         out.push(Line::from(spans));
     }
     out.push(Line::from(""));
+    out
+}
+
+/// Word-wrap `text` at spaces so no output line exceeds `width`
+/// columns. Long tokens that themselves overflow are still emitted on
+/// their own line (truncation would lose information; the caller can
+/// decide whether to clip). Returns at least one row even when `text`
+/// is empty.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
     out
 }
 
