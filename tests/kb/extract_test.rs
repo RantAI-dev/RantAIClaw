@@ -235,6 +235,7 @@ fn vision_cfg(base_url: String) -> KbConfig {
         embed_concurrency: 2,
         query_embed_cache_size: 8,
         query_embed_cache_ttl_ms: 60_000,
+        openrouter_chat_url: "http://localhost".into(),
     }
 }
 

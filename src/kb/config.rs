@@ -34,6 +34,12 @@ pub struct KbConfig {
     pub embed_concurrency: usize,
     pub query_embed_cache_size: usize,
     pub query_embed_cache_ttl_ms: u64,
+    /// OpenRouter chat-completions endpoint shared by query_expansion,
+    /// contextual retrieval, and standalone_query rewriter. Reads
+    /// `KB_OPENROUTER_CHAT_URL` from env; tests + on-prem deployments
+    /// override this. Mirrors the same env-override pattern as
+    /// `KB_EMBEDDING_BASE_URL`.
+    pub openrouter_chat_url: String,
 }
 
 impl KbConfig {
@@ -79,6 +85,8 @@ impl KbConfig {
                 "KB_QUERY_EMBED_CACHE_TTL_MS",
                 5 * 60 * 1_000,
             )?,
+            openrouter_chat_url: env::var("KB_OPENROUTER_CHAT_URL")
+                .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".into()),
         })
     }
 

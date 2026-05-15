@@ -64,6 +64,10 @@ fn defaults_match_ts_kb() {
         cfg.extract_vision_base_url,
         "https://openrouter.ai/api/v1/chat/completions"
     );
+    assert_eq!(
+        cfg.openrouter_chat_url,
+        "https://openrouter.ai/api/v1/chat/completions"
+    );
 }
 
 #[test]

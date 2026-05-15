@@ -12,15 +12,9 @@ use std::time::Duration;
 
 use crate::kb::KbConfig;
 
-const OPENROUTER_URL_DEFAULT: &str = "https://openrouter.ai/api/v1/chat/completions";
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 const PROMPT_HEADER: &str = "You are helping index a knowledge base. Given the full document below (cached) and a list of chunks from it, generate a short 1-sentence context for each chunk. The context should describe what the chunk is about *in relation to the full document* — what section it belongs to, what it continues from, or what key entity it describes. This helps downstream retrieval resolve ambiguous chunks.\n\nOutput EXACTLY a JSON array of strings — one string per chunk, same order as input. No prose, no markdown fences.";
-
-fn openrouter_url() -> String {
-    std::env::var("KB_OPENROUTER_CHAT_URL")
-        .unwrap_or_else(|_| OPENROUTER_URL_DEFAULT.to_string())
-}
 
 /// Generate one contextual prefix per chunk.
 ///
@@ -87,7 +81,7 @@ pub async fn generate_contextual_prefixes(
         "temperature": 0,
     });
 
-    match fetch_prefixes(&api_key, &body, chunks.len()).await {
+    match fetch_prefixes(&cfg.openrouter_chat_url, &api_key, &body, chunks.len()).await {
         Ok(prefixes) => prefixes,
         Err(e) => {
             tracing::warn!(
@@ -105,6 +99,7 @@ pub async fn generate_contextual_prefixes(
 /// inside this function: a 5-element response for 3 chunks is treated as a
 /// parse failure, not silently truncated.
 async fn fetch_prefixes(
+    url: &str,
     api_key: &str,
     body: &serde_json::Value,
     expected_len: usize,
@@ -114,7 +109,7 @@ async fn fetch_prefixes(
         .build()
         .map_err(|e| format!("client build: {e}"))?;
     let resp = client
-        .post(openrouter_url())
+        .post(url)
         .bearer_auth(api_key)
         .json(body)
         .send()

@@ -139,6 +139,9 @@ fn test_cfg() -> KbConfig {
         embed_concurrency: 2,
         query_embed_cache_size: 8,
         query_embed_cache_ttl_ms: 60_000,
+        // Default points at the public URL; per-test we overwrite to
+        // `server.uri()` so we don't have to set KB_OPENROUTER_CHAT_URL.
+        openrouter_chat_url: "http://localhost".into(),
     }
 }
 
@@ -529,10 +532,12 @@ mod query_expansion_tests {
         }
     }
 
+    /// Tests still touch `OPENROUTER_API_KEY` (which lives outside `KbConfig`),
+    /// so we keep the env-clearing helper and `ENV_LOCK`. The chat URL is no
+    /// longer env-resolved — it's set directly on `cfg.openrouter_chat_url`.
     fn clear_env() {
         unsafe {
             std::env::remove_var("OPENROUTER_API_KEY");
-            std::env::remove_var("KB_OPENROUTER_CHAT_URL");
         }
     }
 
@@ -574,14 +579,14 @@ mod query_expansion_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
         unsafe {
             std::env::set_var("OPENROUTER_API_KEY", "test-key");
-            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
 
         let mut cfg = test_cfg();
         cfg.query_expansion_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
         let out = expand_query(&cfg, "what is X?").await;
         assert_eq!(
             out,
@@ -610,14 +615,14 @@ mod query_expansion_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
         unsafe {
             std::env::set_var("OPENROUTER_API_KEY", "test-key");
-            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
 
         let mut cfg = test_cfg();
         cfg.query_expansion_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
         let out = expand_query(&cfg, "what is X?").await;
         // Original retained, both case-only duplicates dropped, second
         // "DIFFERENT PHRASING" also dropped as case-insensitive dup.
@@ -639,14 +644,14 @@ mod query_expansion_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
         unsafe {
             std::env::set_var("OPENROUTER_API_KEY", "test-key");
-            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
 
         let mut cfg = test_cfg();
         cfg.query_expansion_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
         let out = expand_query(&cfg, "what is X?").await;
         assert_eq!(out, vec!["what is X?".to_string()], "5xx → fallback");
     }
@@ -668,14 +673,14 @@ mod query_expansion_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
         unsafe {
             std::env::set_var("OPENROUTER_API_KEY", "test-key");
-            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
 
         let mut cfg = test_cfg();
         cfg.query_expansion_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
         let a = expand_query(&cfg, "cache me").await;
         let b = expand_query(&cfg, "cache me").await;
         assert_eq!(a, b);
@@ -705,10 +710,10 @@ mod contextual_tests {
         }
     }
 
+    /// Only `OPENROUTER_API_KEY` is env-resolved now; the chat URL is per-cfg.
     fn clear_env() {
         unsafe {
             std::env::remove_var("OPENROUTER_API_KEY");
-            std::env::remove_var("KB_OPENROUTER_CHAT_URL");
         }
     }
 
@@ -749,13 +754,13 @@ mod contextual_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
         unsafe {
             std::env::set_var("OPENROUTER_API_KEY", "test-key");
-            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
         let mut cfg = test_cfg();
         cfg.contextual_retrieval_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
         let chunks = vec!["a".into(), "b".into(), "c".into()];
         let out = generate_contextual_prefixes(&cfg, "full doc", &chunks).await;
         assert_eq!(out, vec!["ctx1".to_string(), "ctx2".to_string(), "ctx3".to_string()]);
@@ -777,13 +782,13 @@ mod contextual_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
         unsafe {
             std::env::set_var("OPENROUTER_API_KEY", "test-key");
-            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
         let mut cfg = test_cfg();
         cfg.contextual_retrieval_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
         let chunks = vec!["a".into(), "b".into(), "c".into()];
         let out = generate_contextual_prefixes(&cfg, "doc", &chunks).await;
         assert_eq!(
@@ -803,13 +808,13 @@ mod contextual_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
         unsafe {
             std::env::set_var("OPENROUTER_API_KEY", "test-key");
-            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
         let mut cfg = test_cfg();
         cfg.contextual_retrieval_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
         let chunks = vec!["a".into(), "b".into()];
         let out = generate_contextual_prefixes(&cfg, "doc", &chunks).await;
         assert_eq!(out, vec!["".to_string(), "".to_string()], "5xx → empty");
@@ -910,10 +915,10 @@ mod standalone_tests {
         }
     }
 
+    /// Only `OPENROUTER_API_KEY` is env-resolved now; the chat URL is per-cfg.
     fn clear_env() {
         unsafe {
             std::env::remove_var("OPENROUTER_API_KEY");
-            std::env::remove_var("KB_OPENROUTER_CHAT_URL");
         }
     }
 
@@ -951,14 +956,14 @@ mod standalone_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
         unsafe {
             std::env::set_var("OPENROUTER_API_KEY", "test-key");
-            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
 
         let mut cfg = test_cfg();
         cfg.standalone_query_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
         let history = vec![
             ("user".to_string(), "tell me about policy X".to_string()),
             (
@@ -994,14 +999,14 @@ mod standalone_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
         unsafe {
             std::env::set_var("OPENROUTER_API_KEY", "test-key");
-            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
 
         let mut cfg = test_cfg();
         cfg.standalone_query_enabled = true;
+        cfg.openrouter_chat_url = server.uri();
         let history = vec![(
             "user".to_string(),
             "earlier turn that anchors disambiguation".to_string(),
@@ -1033,13 +1038,13 @@ mod standalone_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY", "KB_OPENROUTER_CHAT_URL"]);
+        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
         unsafe {
             std::env::set_var("OPENROUTER_API_KEY", "test-key");
-            std::env::set_var("KB_OPENROUTER_CHAT_URL", server.uri());
         }
 
-        let cfg = test_cfg(); // standalone_query_enabled = false by default
+        let mut cfg = test_cfg(); // standalone_query_enabled = false by default
+        cfg.openrouter_chat_url = server.uri();
         let history = vec![("user".to_string(), "prior turn".to_string())];
         let out = rewrite_standalone(&cfg, "what?", &history).await.unwrap();
         assert_eq!(out, "what?", "disabled gate → query returned unchanged");

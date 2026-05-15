@@ -26,7 +26,6 @@ use tokio::sync::Mutex;
 use crate::kb::embed::cache::LruCache;
 use crate::kb::{KbConfig, KbResult};
 
-const OPENROUTER_URL_DEFAULT: &str = "https://openrouter.ai/api/v1/chat/completions";
 const TIMEOUT: Duration = Duration::from_secs(6);
 const CACHE_CAP: usize = 256;
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -34,11 +33,6 @@ const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// Minimum chars below which we consider the query "likely needs rewriting".
 /// Mirrors the TS source's `< 60` heuristic.
 const SELF_CONTAINED_MIN: usize = 60;
-
-fn openrouter_url() -> String {
-    std::env::var("KB_OPENROUTER_CHAT_URL")
-        .unwrap_or_else(|_| OPENROUTER_URL_DEFAULT.to_string())
-}
 
 fn cache() -> &'static Mutex<LruCache<String, String>> {
     static CACHE: OnceLock<Mutex<LruCache<String, String>>> = OnceLock::new();
@@ -150,7 +144,7 @@ Rewritten query:"
         "temperature": 0.1,
     });
 
-    match fetch_rewrite(&api_key, &body).await {
+    match fetch_rewrite(&cfg.openrouter_chat_url, &api_key, &body).await {
         Ok(rewritten) if !rewritten.is_empty() => {
             cache().lock().await.put(key, rewritten.clone());
             Ok(rewritten)
@@ -167,13 +161,17 @@ Rewritten query:"
     }
 }
 
-async fn fetch_rewrite(api_key: &str, body: &serde_json::Value) -> Result<String, String> {
+async fn fetch_rewrite(
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(TIMEOUT)
         .build()
         .map_err(|e| format!("client build: {e}"))?;
     let resp = client
-        .post(openrouter_url())
+        .post(url)
         .bearer_auth(api_key)
         .json(body)
         .send()

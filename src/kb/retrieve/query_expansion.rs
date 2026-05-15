@@ -15,18 +15,9 @@ use tokio::sync::Mutex;
 use crate::kb::embed::cache::LruCache;
 use crate::kb::KbConfig;
 
-const OPENROUTER_URL_DEFAULT: &str = "https://openrouter.ai/api/v1/chat/completions";
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60); // 1h, matches TS source
 const CACHE_CAP: usize = 1024;
 const TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Resolve the OpenRouter chat-completions endpoint. Defaults to the public
-/// URL; tests + on-prem deployments override via `KB_OPENROUTER_CHAT_URL`.
-/// Mirrors the same env-override pattern as `KB_EMBEDDING_BASE_URL`.
-fn openrouter_url() -> String {
-    std::env::var("KB_OPENROUTER_CHAT_URL")
-        .unwrap_or_else(|_| OPENROUTER_URL_DEFAULT.to_string())
-}
 
 /// Per-process cache. Wrapped in `OnceLock` so initialization is deferred
 /// until the first call — keeps non-KB binaries from paying the allocation.
@@ -76,17 +67,18 @@ pub async fn expand_query(cfg: &KbConfig, query: &str) -> Vec<String> {
         "temperature": 0.3,
     });
 
-    let (paraphrases, success) = match fetch_paraphrases(&api_key, &body).await {
-        Ok(p) => (p, true),
-        Err(e) => {
-            tracing::warn!(
-                target: "kb::retrieve::query_expansion",
-                error = %e,
-                "expansion failed; using original query only",
-            );
-            (Vec::new(), false)
-        }
-    };
+    let (paraphrases, success) =
+        match fetch_paraphrases(&cfg.openrouter_chat_url, &api_key, &body).await {
+            Ok(p) => (p, true),
+            Err(e) => {
+                tracing::warn!(
+                    target: "kb::retrieve::query_expansion",
+                    error = %e,
+                    "expansion failed; using original query only",
+                );
+                (Vec::new(), false)
+            }
+        };
 
     // Dedupe paraphrases against the original. Case- and whitespace-insensitive
     // match (`Foo  bar` collides with `foo bar`) — keep original casing in
@@ -116,6 +108,7 @@ pub async fn expand_query(cfg: &KbConfig, query: &str) -> Vec<String> {
 /// POST to OpenRouter and parse the JSON-array response. Errors propagate so
 /// the caller can decide whether to cache.
 async fn fetch_paraphrases(
+    url: &str,
     api_key: &str,
     body: &serde_json::Value,
 ) -> Result<Vec<String>, String> {
@@ -124,7 +117,7 @@ async fn fetch_paraphrases(
         .build()
         .map_err(|e| format!("client build: {e}"))?;
     let resp = client
-        .post(openrouter_url())
+        .post(url)
         .bearer_auth(api_key)
         .json(body)
         .send()
