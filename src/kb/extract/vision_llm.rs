@@ -110,92 +110,153 @@ impl VisionLlmExtractor {
         filename: &str,
         pages_hint: u32,
     ) -> KbResult<ExtractionResult> {
-        let api_key = KbConfig::resolve_key(&self.cfg.extract_vision_api_key);
-        if api_key.is_empty() {
-            return Err(KbError::Extraction {
-                extractor: self.model.clone(),
-                message: "No API key configured: set KB_EXTRACT_VISION_API_KEY or \
-                          OPENROUTER_API_KEY"
-                    .into(),
-            });
-        }
-
-        let base64 = B64.encode(pdf_bytes);
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "file",
-                            "file": {
-                                "filename": filename,
-                                "file_data": format!("data:application/pdf;base64,{base64}"),
-                            },
-                        },
-                        { "type": "text", "text": EXTRACTION_PROMPT },
-                    ],
-                },
-            ],
-            "max_tokens": self.max_tokens,
-            "temperature": 0,
-        });
-
-        let t0 = Instant::now();
-        let res = self
-            .client
-            .post(&self.cfg.extract_vision_base_url)
-            .bearer_auth(&api_key)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| KbError::Extraction {
-                extractor: self.model.clone(),
-                message: e.to_string(),
-            })?;
-        let took_ms = elapsed_ms(t0);
-
-        let status = res.status();
-        if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
-            let truncated: String = body.chars().take(300).collect();
-            return Err(KbError::Extraction {
-                extractor: self.model.clone(),
-                message: format!(
-                    "VisionLlmExtractor {} {}: {}",
-                    self.model,
-                    status.as_u16(),
-                    truncated
-                ),
-            });
-        }
-
-        let data: ChatResponse = res.json().await.map_err(|e| KbError::Extraction {
-            extractor: self.model.clone(),
-            message: format!("response parse: {e}"),
-        })?;
-
-        let text = data
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message)
-            .and_then(|m| m.content)
-            .unwrap_or_default();
-        let usage = data.usage.unwrap_or_default();
-
-        Ok(ExtractionResult {
-            text,
-            elapsed_ms: took_ms,
-            pages: if pages_hint == 0 { None } else { Some(pages_hint) },
-            model: self.model.clone(),
-            prompt_tokens: usage.prompt_tokens,
-            completion_tokens: usage.completion_tokens,
-            cost_usd: usage.cost,
+        send_single_pdf_call(SendCallArgs {
+            client: &self.client,
+            base_url: &self.cfg.extract_vision_base_url,
+            api_key_override: &self.cfg.extract_vision_api_key,
+            model: &self.model,
+            max_tokens: self.max_tokens,
+            pdf_bytes,
+            filename,
+            pages_hint,
+            error_prefix: None,
         })
+        .await
     }
+}
+
+/// Shared inputs for [`send_single_pdf_call`]. Both the in-line single-call
+/// path on [`VisionLlmExtractor`] and the per-segment [`WorkerCtx::run`] path
+/// route through this helper so the JSON body, auth, response parsing and
+/// `ExtractionResult` assembly live in exactly one place.
+struct SendCallArgs<'a> {
+    client: &'a reqwest::Client,
+    base_url: &'a str,
+    api_key_override: &'a str,
+    model: &'a str,
+    max_tokens: u32,
+    pdf_bytes: &'a [u8],
+    filename: &'a str,
+    pages_hint: u32,
+    /// `Some("[VisionLlmExtractor segment 2/3]")` for segment workers, `None`
+    /// for the single-call path. When `Some`, the prefix is prepended to every
+    /// error message so segment-aware diagnostics survive the refactor.
+    error_prefix: Option<&'a str>,
+}
+
+async fn send_single_pdf_call(args: SendCallArgs<'_>) -> KbResult<ExtractionResult> {
+    // `[prefix] ` if a prefix is set, otherwise empty — keeps error formatting
+    // a single template across both call sites.
+    let prefix = match args.error_prefix {
+        Some(p) => format!("{p} "),
+        None => String::new(),
+    };
+
+    let api_key = KbConfig::resolve_key(args.api_key_override);
+    if api_key.is_empty() {
+        return Err(KbError::Extraction {
+            extractor: args.model.to_string(),
+            message: format!(
+                "{prefix}No API key configured: set KB_EXTRACT_VISION_API_KEY or OPENROUTER_API_KEY"
+            ),
+        });
+    }
+
+    let base64 = B64.encode(args.pdf_bytes);
+    let body = json!({
+        "model": args.model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": args.filename,
+                            "file_data": format!("data:application/pdf;base64,{base64}"),
+                        },
+                    },
+                    { "type": "text", "text": EXTRACTION_PROMPT },
+                ],
+            },
+        ],
+        "max_tokens": args.max_tokens,
+        "temperature": 0,
+    });
+
+    let t0 = Instant::now();
+    let res = args
+        .client
+        .post(args.base_url)
+        .bearer_auth(&api_key)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| KbError::Extraction {
+            extractor: args.model.to_string(),
+            // Single-call path historically surfaced just `{e}`; segment path
+            // surfaced `[VisionLlmExtractor segment N/M] {e}`. Both are
+            // preserved by `prefix`.
+            message: format!("{prefix}{e}"),
+        })?;
+    let took_ms = elapsed_ms(t0);
+
+    let status = res.status();
+    if !status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        let truncated: String = body.chars().take(300).collect();
+        // Single-call: "VisionLlmExtractor {model} {status}: {body}"
+        // Segment:     "[VisionLlmExtractor segment N/M] {model} {status}: {body}"
+        let head = if args.error_prefix.is_some() {
+            String::new()
+        } else {
+            "VisionLlmExtractor ".into()
+        };
+        return Err(KbError::Extraction {
+            extractor: args.model.to_string(),
+            message: format!(
+                "{prefix}{head}{} {}: {}",
+                args.model,
+                status.as_u16(),
+                truncated
+            ),
+        });
+    }
+
+    let data: ChatResponse = res.json().await.map_err(|e| KbError::Extraction {
+        extractor: args.model.to_string(),
+        // Single-call: "response parse: {e}"; segment: "parse: {e}". Match
+        // both faithfully.
+        message: if args.error_prefix.is_some() {
+            format!("{prefix}parse: {e}")
+        } else {
+            format!("response parse: {e}")
+        },
+    })?;
+
+    let text = data
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.message)
+        .and_then(|m| m.content)
+        .unwrap_or_default();
+    let usage = data.usage.unwrap_or_default();
+
+    Ok(ExtractionResult {
+        text,
+        elapsed_ms: took_ms,
+        pages: if args.pages_hint == 0 {
+            None
+        } else {
+            Some(args.pages_hint)
+        },
+        model: args.model.to_string(),
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        cost_usd: usage.cost,
+    })
 }
 
 #[async_trait]
@@ -312,99 +373,19 @@ impl WorkerCtx {
         segment_idx: usize,
         segment_total: usize,
     ) -> KbResult<ExtractionResult> {
-        let api_key = KbConfig::resolve_key(&self.api_key_override);
-        if api_key.is_empty() {
-            return Err(KbError::Extraction {
-                extractor: self.model.clone(),
-                message: "No API key configured: set KB_EXTRACT_VISION_API_KEY or \
-                          OPENROUTER_API_KEY"
-                    .into(),
-            });
-        }
-        let base64 = B64.encode(pdf_bytes);
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "file",
-                            "file": {
-                                "filename": filename,
-                                "file_data": format!("data:application/pdf;base64,{base64}"),
-                            },
-                        },
-                        { "type": "text", "text": EXTRACTION_PROMPT },
-                    ],
-                },
-            ],
-            "max_tokens": self.max_tokens,
-            "temperature": 0,
-        });
-
-        let t0 = Instant::now();
-        let res = self
-            .client
-            .post(&self.base_url)
-            .bearer_auth(&api_key)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| KbError::Extraction {
-                extractor: self.model.clone(),
-                message: format!(
-                    "[VisionLlmExtractor segment {segment_idx}/{segment_total}] {e}"
-                ),
-            })?;
-        let took_ms = elapsed_ms(t0);
-
-        let status = res.status();
-        if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
-            let truncated: String = body.chars().take(300).collect();
-            return Err(KbError::Extraction {
-                extractor: self.model.clone(),
-                message: format!(
-                    "[VisionLlmExtractor segment {}/{}] {} {}: {}",
-                    segment_idx,
-                    segment_total,
-                    self.model,
-                    status.as_u16(),
-                    truncated
-                ),
-            });
-        }
-
-        let data: ChatResponse = res.json().await.map_err(|e| KbError::Extraction {
-            extractor: self.model.clone(),
-            message: format!(
-                "[VisionLlmExtractor segment {segment_idx}/{segment_total}] parse: {e}"
-            ),
-        })?;
-        let text = data
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message)
-            .and_then(|m| m.content)
-            .unwrap_or_default();
-        let usage = data.usage.unwrap_or_default();
-
-        Ok(ExtractionResult {
-            text,
-            elapsed_ms: took_ms,
-            pages: if self.pages_hint == 0 {
-                None
-            } else {
-                Some(self.pages_hint)
-            },
-            model: self.model.clone(),
-            prompt_tokens: usage.prompt_tokens,
-            completion_tokens: usage.completion_tokens,
-            cost_usd: usage.cost,
+        let prefix = format!("[VisionLlmExtractor segment {segment_idx}/{segment_total}]");
+        send_single_pdf_call(SendCallArgs {
+            client: &self.client,
+            base_url: &self.base_url,
+            api_key_override: &self.api_key_override,
+            model: &self.model,
+            max_tokens: self.max_tokens,
+            pdf_bytes,
+            filename,
+            pages_hint: self.pages_hint,
+            error_prefix: Some(&prefix),
         })
+        .await
     }
 }
 
