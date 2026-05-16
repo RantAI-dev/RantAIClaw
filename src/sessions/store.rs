@@ -193,6 +193,41 @@ impl SessionStore {
         Ok(row_id)
     }
 
+    /// Replace every message in a session with a fresh list. Used by
+    /// context compaction (`/compress`) so the on-disk history matches
+    /// the in-memory `[summary, ...recent]` shape after older turns
+    /// have been folded into a summary.
+    ///
+    /// Atomically deletes the existing rows + inserts the new set + sets
+    /// `message_count` to match. `session_id` on each input `Message` is
+    /// rewritten so callers don't have to thread it through.
+    pub fn replace_messages(&mut self, session_id: &str, messages: &[Message]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        for msg in messages {
+            tx.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    session_id,
+                    msg.role,
+                    msg.content,
+                    msg.tool_calls,
+                    msg.timestamp
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE sessions SET message_count = ?1 WHERE id = ?2",
+            params![messages.len() as i64, session_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Retrieve all messages for a session, ordered by timestamp ascending.
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(

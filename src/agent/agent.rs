@@ -436,6 +436,156 @@ impl Agent {
         self.mcp_tools_by_server.clone()
     }
 
+    /// Compact older turns into a structured-markdown summary. Replaces
+    /// the agent's in-memory conversation history with
+    /// `[system_prompt, system(summary_envelope), ...recent]` so the
+    /// next turn picks up cleanly with most of the context budget
+    /// freed.
+    ///
+    /// `keep_last` is the number of *user* turns to preserve verbatim
+    /// at the tail. Saturates to a minimum of 1.
+    ///
+    /// Streams the summary text through `events` as `Chunk` packets
+    /// (so the TUI sees it appear in scrollback like a normal reply),
+    /// then emits `CompactionComplete` with counts.
+    ///
+    /// Returns an `Err` if the history is too short to compact (fewer
+    /// than `keep_last + 1` user messages). The caller's TUI shows
+    /// that error verbatim — it's user-facing, not a panic path.
+    pub async fn compact_streaming(
+        &mut self,
+        keep_last: usize,
+        events: Option<AgentEventSender>,
+    ) -> Result<crate::agent::compaction::CompactionResult> {
+        use crate::agent::compaction::{
+            build_side_request, compute_split_index, stream_summary_as_chunks, summary_envelope,
+            CompactionResult,
+        };
+
+        let keep_last = keep_last.max(1);
+        let original_count = self.history.len();
+
+        let split_idx = compute_split_index(&self.history, keep_last).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Nothing to compact yet — need more than {keep_last} user turn(s) in history."
+            )
+        })?;
+
+        if let Some(tx) = events.as_ref() {
+            let _ = tx
+                .send(AgentEvent::CompactionStart {
+                    original_count,
+                    keep_last,
+                })
+                .await;
+        }
+
+        let to_compact: Vec<ConversationMessage> = self.history[..split_idx].to_vec();
+        let side_messages = build_side_request(&to_compact);
+
+        let observer_started = Instant::now();
+        self.observer.record_event(&ObserverEvent::LlmRequest {
+            provider: "compaction".to_string(),
+            model: self.model_name.clone(),
+            messages_count: side_messages.len(),
+        });
+
+        // Tools-disabled side call. Mirrors `force_final_summary` in
+        // `loop_.rs` — same shape, different prompt.
+        let resp = self
+            .provider
+            .chat(
+                ChatRequest {
+                    messages: &side_messages,
+                    tools: None,
+                },
+                &self.model_name,
+                self.temperature,
+            )
+            .await;
+
+        let resp = match resp {
+            Ok(r) => {
+                self.observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: "compaction".to_string(),
+                    model: self.model_name.clone(),
+                    duration: observer_started.elapsed(),
+                    success: true,
+                    error_message: None,
+                });
+                r
+            }
+            Err(e) => {
+                self.observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: "compaction".to_string(),
+                    model: self.model_name.clone(),
+                    duration: observer_started.elapsed(),
+                    success: false,
+                    error_message: Some(providers::sanitize_api_error(&e.to_string())),
+                });
+                if let Some(tx) = events.as_ref() {
+                    let _ = tx
+                        .send(AgentEvent::Error(format!("compaction failed: {e}")))
+                        .await;
+                }
+                return Err(e);
+            }
+        };
+
+        let summary = resp.text_or_empty().to_string();
+        if summary.trim().is_empty() {
+            if let Some(tx) = events.as_ref() {
+                let _ = tx
+                    .send(AgentEvent::Error(
+                        "compaction failed: provider returned empty summary".into(),
+                    ))
+                    .await;
+            }
+            return Err(anyhow::anyhow!(
+                "Compaction failed: provider returned empty summary."
+            ));
+        }
+
+        // Stream the summary into scrollback so the user sees what
+        // got produced — same UX as a regular streaming response.
+        stream_summary_as_chunks(&summary, events.as_ref()).await;
+
+        // Replace history: keep the original system prompt + insert
+        // the wrapped summary right after it, then re-append the
+        // tail we preserved.
+        let mut kept: Vec<ConversationMessage> = self.history[split_idx..].to_vec();
+        let mut original_system: Vec<ConversationMessage> = self
+            .history
+            .iter()
+            .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
+            .cloned()
+            .collect();
+        self.history.clear();
+        self.history.append(&mut original_system);
+        self.history
+            .push(ConversationMessage::Chat(summary_envelope(&summary)));
+        self.history.append(&mut kept);
+
+        let kept_count = self.history.len();
+
+        if let Some(tx) = events.as_ref() {
+            let _ = tx
+                .send(AgentEvent::CompactionComplete {
+                    summary: summary.clone(),
+                    original_count,
+                    keep_last,
+                    kept_count,
+                })
+                .await;
+        }
+
+        Ok(CompactionResult {
+            summary,
+            original_count,
+            kept_count,
+        })
+    }
+
     fn trim_history(&mut self) {
         let max = self.config.max_history_messages;
         if self.history.len() <= max {

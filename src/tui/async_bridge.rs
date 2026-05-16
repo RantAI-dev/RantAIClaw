@@ -16,6 +16,16 @@ pub enum TurnRequest {
     /// provider/api_key/model so the running session picks up the
     /// new credentials without a `/quit` + relaunch.
     Reload(Box<crate::config::Config>),
+    /// Compact older messages into a summary. Streams the summary
+    /// through the normal event channel (Chunk / Done), then emits
+    /// `AgentEvent::CompactionComplete` so the TUI can replace its
+    /// in-memory + persisted history with `[system, summary, ...recent]`.
+    ///
+    /// `keep_last` is the count of trailing chat turns (user +
+    /// assistant pairs) to preserve verbatim, default `10`.
+    Compact {
+        keep_last: usize,
+    },
 }
 
 pub struct TuiAgentActor {
@@ -82,6 +92,25 @@ impl TuiAgentActor {
                             }
                         }
                     }
+                    Some(TurnRequest::Compact { keep_last }) => {
+                        // Tools-disabled side call to summarize older
+                        // history. The agent emits `CompactionStart` /
+                        // `Chunk*` / `CompactionComplete` itself — we
+                        // just await the future. Errors surface as
+                        // `AgentEvent::Error` (also emitted by the
+                        // agent) so the TUI can render them.
+                        if let Err(e) = self
+                            .agent
+                            .compact_streaming(keep_last, Some(self.events_tx.clone()))
+                            .await
+                        {
+                            tracing::warn!("compaction failed: {e}");
+                            let _ = self
+                                .events_tx
+                                .send(crate::agent::events::AgentEvent::Error(e.to_string()))
+                                .await;
+                        }
+                    }
                     None => return, // channel closed
                 }
             }
@@ -122,6 +151,21 @@ impl TuiAgentActor {
                                             // mid-turn would invalidate
                                             // turn_fut's &mut self.agent borrow.
                                             self.pending_reload = Some(config);
+                                        }
+                                        Some(TurnRequest::Compact { .. }) => {
+                                            // Compaction mutates self.agent.history,
+                                            // which turn_fut borrows mutably right
+                                            // now. Reject with an actionable error
+                                            // so the user can re-fire after the
+                                            // turn finishes.
+                                            let _ = self
+                                                .events_tx
+                                                .send(crate::agent::events::AgentEvent::Error(
+                                                    "Cannot /compress while a turn is running — \
+                                                     wait for the response to finish or /stop first."
+                                                        .into(),
+                                                ))
+                                                .await;
                                         }
                                         None => {
                                             senders_dropped = true;

@@ -1534,6 +1534,91 @@ impl TuiApp {
                 self.context.mcp_servers_configured = mcp_servers_configured.into_iter().collect();
                 self.context.mcp_tools_by_server = mcp_tools_by_server;
             }
+            AgentEvent::CompactionStart {
+                original_count,
+                keep_last,
+            } => {
+                // Mirror the start of a streaming turn so the
+                // working indicator runs and incoming Chunk events
+                // are accumulated into `partial`. We don't queue a
+                // request — the actor already invoked the agent —
+                // so we just flip the state.
+                self.state = AppState::Streaming {
+                    partial: String::new(),
+                    tool_blocks: Vec::new(),
+                    turn_started_at: std::time::Instant::now(),
+                    cancelling: false,
+                };
+                let _ = self.context.append_system_message(&format!(
+                    "Compacting {original_count} message(s), preserving last \
+                     {keep_last} turn(s) verbatim — summary streams below…"
+                ));
+            }
+            AgentEvent::CompactionComplete {
+                summary,
+                original_count,
+                keep_last,
+                kept_count,
+            } => {
+                // Rebuild ctx.messages to match the agent's new
+                // history: prepend a synthetic system entry holding
+                // the summary, then keep the trailing `keep_last`
+                // user turns + their assistant responses + any
+                // tool blocks. Walk backwards counting user roles
+                // to find the slice boundary so tool messages
+                // attached to kept user turns ride along.
+                let mut user_seen = 0usize;
+                let mut slice_from = self.context.messages.len();
+                for (idx, msg) in self.context.messages.iter().enumerate().rev() {
+                    if msg.role == "user" {
+                        user_seen += 1;
+                        if user_seen > keep_last {
+                            slice_from = idx + 1;
+                            break;
+                        }
+                        slice_from = idx;
+                    }
+                }
+                let kept_tail: Vec<crate::sessions::Message> =
+                    self.context.messages.drain(slice_from..).collect();
+
+                // Synthesize a system message for the summary so
+                // it renders as a non-conversational block in the
+                // chat pane.
+                let summary_msg = crate::sessions::Message {
+                    id: 0,
+                    session_id: self.context.session_id.clone(),
+                    role: "system".to_string(),
+                    content: format!(
+                        "[Compacted summary of earlier conversation]\n\n{}",
+                        summary.trim()
+                    ),
+                    tool_calls: None,
+                    timestamp: chrono::Utc::now().timestamp(),
+                };
+
+                self.context.messages.clear();
+                self.context.messages.push(summary_msg);
+                self.context.messages.extend(kept_tail);
+
+                // Persist the new shape so it survives restart.
+                if let Err(e) = self
+                    .context
+                    .session_store
+                    .replace_messages(&self.context.session_id, &self.context.messages)
+                {
+                    tracing::warn!("failed to persist compacted history: {e}");
+                }
+
+                // Returned to ready; the streaming working indicator
+                // stops as soon as state flips.
+                self.state = AppState::Ready;
+
+                let _ = self.context.append_system_message(&format!(
+                    "Compacted {original_count} → {kept_count} message(s). \
+                     Older turns folded into the summary above."
+                ));
+            }
         }
     }
 
@@ -5026,6 +5111,7 @@ mod submit_tests {
             TurnRequest::Submit(text) => assert_eq!(text, "hello"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
+            TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
         }
     }
 
@@ -5050,6 +5136,7 @@ mod submit_tests {
             TurnRequest::Submit(text) => assert_eq!(text, "queued"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
+            TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
         }
     }
 
@@ -5391,6 +5478,7 @@ mod retry_tests {
             TurnRequest::Submit(text) => assert_eq!(text, "previous prompt"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
+            TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
         }
         assert!(app.context.last_error.is_none());
     }

@@ -407,6 +407,28 @@ async fn agent_chat_stream(
                 crate::agent::AgentEvent::ReloadComplete { .. } => serde_json::json!({
                     "type": "reload_complete",
                 }),
+                // Compaction is TUI-only too — per-request gateway
+                // agents have a fresh history each call. Surface as
+                // a benign info line so the SSE stream is exhaustive.
+                crate::agent::AgentEvent::CompactionStart { original_count, keep_last } => {
+                    serde_json::json!({
+                        "type": "compaction_start",
+                        "original_count": original_count,
+                        "keep_last": keep_last,
+                    })
+                }
+                crate::agent::AgentEvent::CompactionComplete {
+                    summary,
+                    original_count,
+                    keep_last,
+                    kept_count,
+                } => serde_json::json!({
+                    "type": "compaction_complete",
+                    "summary": summary,
+                    "original_count": original_count,
+                    "keep_last": keep_last,
+                    "kept_count": kept_count,
+                }),
             };
             let done = payload.get("type").and_then(|v| v.as_str()) == Some("done");
             yield Ok::<SseEvent, Infallible>(SseEvent::default().data(payload.to_string()));

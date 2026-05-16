@@ -481,6 +481,7 @@ mod tests {
             TurnRequest::Submit(s) => assert_eq!(s, "ping"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
+            TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
         }
         events_tx
             .try_send(AgentEvent::Chunk("ok".into()))

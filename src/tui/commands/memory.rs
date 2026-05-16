@@ -291,10 +291,20 @@ impl CommandHandler for ForgetCommand {
     }
 }
 
-/// `/compress` command — placeholder until turn-level context
-/// compression is wired through the agent loop. Reports the snapshot
-/// size so the user still gets actionable feedback.
+/// `/compress` command — fold older turns into a structured-markdown
+/// summary so the agent can continue past its context budget. Dispatches
+/// a `TurnRequest::Compact { keep_last }` to the actor, which streams
+/// the summary back through the normal event channel and emits
+/// `CompactionComplete` so the TUI can swap its in-memory + persisted
+/// history.
+///
+/// Default `keep_last` is 10 user turns. Override with `/compress N`.
+/// Below ~10 messages there's nothing meaningful to compact.
 pub struct CompressCommand;
+
+/// Default trailing-turn count when the user runs bare `/compress`.
+/// Tuned to match Claude Code / Codex CLI's defaults.
+const COMPRESS_DEFAULT_KEEP_LAST: usize = 10;
 
 impl CommandHandler for CompressCommand {
     fn name(&self) -> &str {
@@ -302,23 +312,52 @@ impl CommandHandler for CompressCommand {
     }
 
     fn description(&self) -> &str {
-        "Compress the current context by summarizing older messages"
+        "Summarize older turns into a compact note (preserves the last N turns verbatim)"
     }
 
-    fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
+    fn usage(&self) -> &str {
+        "/compress [N]"
+    }
+
+    fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let count = ctx.messages.len();
-        if count < 10 {
-            return Ok(CommandResult::Message(
-                "Context is small enough, no compression needed.".to_string(),
-            ));
+
+        // Parse optional `keep_last`. Bare `/compress` → default of 10.
+        // Anything that isn't a positive int falls back so a typo
+        // doesn't lose work.
+        let keep_last: usize = match args.trim() {
+            "" => COMPRESS_DEFAULT_KEEP_LAST,
+            other => other
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n >= 1)
+                .unwrap_or(COMPRESS_DEFAULT_KEEP_LAST),
+        };
+
+        if count < keep_last + 2 {
+            return Ok(CommandResult::Message(format!(
+                "Context is too small to compact: {count} message(s) total, \
+                 would preserve {keep_last} turn(s). Nothing meaningful to \
+                 fold yet."
+            )));
         }
-        // The actual summarisation requires a turn-level LLM call.
-        // Tracked separately; the slash command stays informational
-        // for now so users see the message count without a no-op.
+
+        // Dispatch — non-blocking because the actor is on the same
+        // tokio runtime. The agent streams its summary back as Chunk
+        // events and emits `CompactionComplete` when the swap is
+        // ready; the TUI event handler picks both up.
+        if let Err(e) = ctx
+            .req_tx
+            .try_send(crate::tui::async_bridge::TurnRequest::Compact { keep_last })
+        {
+            return Ok(CommandResult::Message(format!(
+                "Failed to dispatch /compress: {e}. Is the agent loop running?"
+            )));
+        }
+
         Ok(CommandResult::Message(format!(
-            "Context: {count} messages in scrollback. Turn-level \
-             summarisation is not yet wired — use /new to start a \
-             fresh session for now."
+            "Compacting older turns (preserving last {keep_last} verbatim). \
+             Summary streams below…"
         )))
     }
 }
@@ -548,8 +587,66 @@ mod tests {
         let (mut ctx, _r, _e) = TuiContext::test_context();
         let res = CompressCommand.execute("", &mut ctx).unwrap();
         match res {
-            CommandResult::Message(msg) => assert!(msg.contains("small enough")),
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.contains("too small to compact") || msg.contains("Nothing meaningful"),
+                    "got:\n{msg}"
+                );
+            }
             _ => panic!("expected Message"),
+        }
+    }
+
+    #[test]
+    fn compress_dispatches_when_history_large_enough() {
+        let (mut ctx, mut req_rx, _e) = TuiContext::test_context();
+        // Seed enough messages so the size guard passes.
+        for i in 0..15 {
+            ctx.messages.push(crate::sessions::Message {
+                id: 0,
+                session_id: ctx.session_id.clone(),
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("msg-{i}"),
+                tool_calls: None,
+                timestamp: 0,
+            });
+        }
+        let res = CompressCommand.execute("", &mut ctx).unwrap();
+        match res {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("Compacting"), "got:\n{msg}");
+            }
+            _ => panic!("expected Message"),
+        }
+        // Verify the actor would receive a TurnRequest::Compact with the
+        // default keep_last.
+        match req_rx.try_recv() {
+            Ok(crate::tui::async_bridge::TurnRequest::Compact { keep_last }) => {
+                assert_eq!(keep_last, COMPRESS_DEFAULT_KEEP_LAST);
+            }
+            other => panic!("expected Compact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compress_custom_keep_last_arg_is_parsed() {
+        let (mut ctx, mut req_rx, _e) = TuiContext::test_context();
+        for i in 0..15 {
+            ctx.messages.push(crate::sessions::Message {
+                id: 0,
+                session_id: ctx.session_id.clone(),
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("msg-{i}"),
+                tool_calls: None,
+                timestamp: 0,
+            });
+        }
+        CompressCommand.execute("4", &mut ctx).unwrap();
+        match req_rx.try_recv() {
+            Ok(crate::tui::async_bridge::TurnRequest::Compact { keep_last }) => {
+                assert_eq!(keep_last, 4);
+            }
+            other => panic!("expected Compact, got {other:?}"),
         }
     }
 }

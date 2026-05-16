@@ -49,6 +49,38 @@ pub enum AgentEvent {
         /// Per-server qualified tool names actually discovered.
         mcp_tools_by_server: std::collections::HashMap<String, Vec<String>>,
     },
+
+    /// Emitted right before the actor begins a compaction so the TUI can
+    /// show a "compacting…" working indicator instead of leaving the
+    /// scrollback silent during the side LLM call.
+    CompactionStart {
+        /// Number of messages currently in the agent's conversation
+        /// history (system prompt included) before compaction.
+        original_count: usize,
+        /// Number of trailing chat turns the compactor will preserve
+        /// verbatim. Anything older is folded into the summary.
+        keep_last: usize,
+    },
+
+    /// Terminal event for a compaction. Followed by no `Done` — compaction
+    /// is not a regular turn. The TUI uses this to swap its in-memory
+    /// message buffer + persist the new history.
+    ///
+    /// The `summary` is the markdown text the model returned; the final
+    /// on-disk history is `[system_prompt, system(summary), ...kept]`.
+    CompactionComplete {
+        /// The freshly-generated summary text (markdown, sectioned).
+        summary: String,
+        /// How many messages were in the history before compaction.
+        original_count: usize,
+        /// How many trailing user-turn entries survived verbatim.
+        /// The TUI uses this to trim its own `ctx.messages` list
+        /// to match the agent's post-compaction shape.
+        keep_last: usize,
+        /// Total `ConversationMessage` entries in the agent's history
+        /// after compaction (system + summary envelope + recent).
+        kept_count: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
