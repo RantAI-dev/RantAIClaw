@@ -146,12 +146,26 @@ land if it broke either of them. The snapshot file lives in
 
 ### Release-side reinforcement
 
-The same maintainer discipline matters for binary integrity, not
-just schema. `pub-release.yml` signs every artifact with cosign
-keyless OIDC (see the `Sign artifacts with cosign (keyless)` step).
-The signing step uses `set -euo pipefail`, so a sign failure aborts
-the job; you can't ship an unsigned release. The matching client-
-side verification was added in v0.6.44.
+The same maintainer discipline matters at release time. Two gates
+sit inside `pub-release.yml` before any binary gets built:
+
+1. **`verify-update-cycle` job** (v0.6.47+) — runs the two schema-
+   drift tests, the migration round-trip, and the per-store
+   migration unit tests. The platform build matrix has
+   `needs: [prepare, verify-update-cycle]`, so a red here means no
+   binary is ever cross-compiled and no release is ever published.
+   The workflow is triggered by the tag itself — there's no way to
+   tag a release that skips this check.
+2. **`Sign artifacts with cosign (keyless)` step** — runs under
+   `set -euo pipefail`. A sign failure aborts the job, so an
+   unsigned release cannot ship. The matching client-side
+   verification was added in v0.6.44.
+
+Together: schema break → tag push → workflow fires →
+`verify-update-cycle` fails → matrix never starts → no release.
+Schema break + bypassed local tests + manually-uploaded artifacts
+is the only path to a broken release, and that path requires the
+maintainer to consciously skip the workflow.
 
 ## Anti-patterns to avoid
 

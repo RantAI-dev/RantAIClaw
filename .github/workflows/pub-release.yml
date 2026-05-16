@@ -132,9 +132,41 @@ jobs:
                     echo "- draft_release: ${draft_release}"
                   } >> "$GITHUB_STEP_SUMMARY"
 
+    # Update-cycle integrity gate. Runs the schema-drift, migration
+    # round-trip, and per-store migration unit tests before any
+    # platform builds start. A red here means the maintainer changed
+    # config.toml or sessions.db schema without bumping
+    # CURRENT_VERSION + adding a migration; we refuse to ship the
+    # binaries in that state because they'd break update for every
+    # user on the prior version. Cannot be bypassed by tagging
+    # without re-running CI — the workflow is triggered by the tag
+    # itself and the matrix `needs` this job.
+    verify-update-cycle:
+        name: Verify update-cycle integrity
+        needs: [prepare]
+        runs-on: ubuntu-22.04
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@v2
+            - name: Schema-drift snapshots + migration round-trip
+              run: |
+                  export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+                  cargo test --locked \
+                    --test schema_drift \
+                    --test config_migration_roundtrip
+            - name: Per-store migration unit tests
+              run: |
+                  export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+                  cargo test --locked --lib \
+                    config::migrations sessions::migrations
+
     build-release:
         name: Build ${{ matrix.target }}
-        needs: [prepare]
+        needs: [prepare, verify-update-cycle]
         runs-on: ${{ matrix.os }}
         timeout-minutes: 40
         strategy:
