@@ -1,0 +1,44 @@
+---
+source: tests/schema_drift.rs
+assertion_line: 64
+description: "sessions.db DDL fingerprint. If this test fails, you changed the SQLite schema. Bump sessions::migrations::CURRENT_VERSION, add a migrate_vN function, write a unit test, then `cargo insta accept` here."
+expression: ddl
+---
+-- index idx_messages_session
+CREATE INDEX idx_messages_session ON messages(session_id, timestamp)
+
+-- index idx_sessions_started
+CREATE INDEX idx_sessions_started ON sessions(started_at DESC)
+
+-- table messages
+CREATE TABLE messages ( id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, tool_calls TEXT, timestamp INTEGER NOT NULL, FOREIGN KEY (session_id) REFERENCES sessions(id) )
+
+-- table messages_fts
+CREATE VIRTUAL TABLE messages_fts USING fts5( content, content=messages, content_rowid=id )
+
+-- table messages_fts_config
+CREATE TABLE 'messages_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID
+
+-- table messages_fts_data
+CREATE TABLE 'messages_fts_data'(id INTEGER PRIMARY KEY, block BLOB)
+
+-- table messages_fts_docsize
+CREATE TABLE 'messages_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)
+
+-- table messages_fts_idx
+CREATE TABLE 'messages_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID
+
+-- table schema_version
+CREATE TABLE schema_version (version INTEGER PRIMARY KEY)
+
+-- table sessions
+CREATE TABLE sessions ( id TEXT PRIMARY KEY, title TEXT, parent_session_id TEXT, model TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, message_count INTEGER DEFAULT 0, token_count INTEGER DEFAULT 0, source TEXT DEFAULT 'tui', FOREIGN KEY (parent_session_id) REFERENCES sessions(id) )
+
+-- trigger messages_ad
+CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content); END
+
+-- trigger messages_ai
+CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content); END
+
+-- trigger messages_au
+CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content); INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content); END

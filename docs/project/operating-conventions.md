@@ -114,6 +114,45 @@ When a future cut needs a new index, table, or DDL change:
   `CURRENT_VERSION` (no silent downgrade). The user has to update
   their binary first.
 
+### Enforcement — the tests that fail loud
+
+Two integration tests sit between schema changes and the release
+button:
+
+1. **`tests/schema_drift.rs`** — snapshot tests over the
+   `Config` JSON Schema and the sessions.db DDL. Any field rename,
+   type change, new field, removed field, or DDL drift fails these
+   tests with a "you changed the schema" message. The maintainer's
+   options are:
+   - Run `cargo insta accept` to refresh the snapshot. Forces the
+     maintainer to *consciously* acknowledge the schema moved — a
+     reviewer can spot the snapshot update in the PR diff and ask
+     "where's the migration?"
+   - Bump `CURRENT_VERSION` in the relevant `migrations.rs` module.
+   - Add the `migrate_vN` + chain arm + unit test.
+2. **`tests/config_migration_roundtrip.rs`** — serialises
+   `Config::default()`, strips `schema_version`, runs `migrate()`,
+   and asserts the post-migration TOML still deserialises into
+   `Config`. If a new required field lacks both `#[serde(default)]`
+   and a `migrate_vN` that fills it in, this test fails with a
+   message naming the offending field. The fix is one of:
+   - Add `#[serde(default)]` to the new field, or
+   - Add a `migrate_vN` that injects a default value, then bump
+     `CURRENT_VERSION`.
+
+Both tests run on every `cargo test`. CI is the backstop: a PR can't
+land if it broke either of them. The snapshot file lives in
+`tests/snapshots/` and shows up in diffs whenever the schema moves.
+
+### Release-side reinforcement
+
+The same maintainer discipline matters for binary integrity, not
+just schema. `pub-release.yml` signs every artifact with cosign
+keyless OIDC (see the `Sign artifacts with cosign (keyless)` step).
+The signing step uses `set -euo pipefail`, so a sign failure aborts
+the job; you can't ship an unsigned release. The matching client-
+side verification was added in v0.6.44.
+
 ## Anti-patterns to avoid
 
 - **Don't run the full `cargo test` suite locally** — only the
