@@ -75,12 +75,11 @@
 - [ci-map.md](ci-map.md)
 - [actions-source-policy.md](actions-source-policy.md)
 
-## 8) Project — snapshots, immutable
+## 8) Project — conventions + archived snapshots
 
 - [project/README.md](project/README.md)
-- [project/codebase-bloat-audit-2026-05-06.md](project/codebase-bloat-audit-2026-05-06.md)
-- [project/docs-cleanup-plan-2026-05-06.md](project/docs-cleanup-plan-2026-05-06.md)
-- [project/archive/superpowers/](project/archive/superpowers/) — superseded design plans/specs (2026-04-16 → 2026-05-04)
+- [project/operating-conventions.md](project/operating-conventions.md) — how alpha cuts ship (build target, validation, ship sequence, anti-patterns)
+- [project/archive/](project/archive/) — superseded plans + snapshot audits (kept for design-rationale history)
 
 ## 9) Forthcoming structure (Phase B will move existing files here)
 

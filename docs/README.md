@@ -78,12 +78,11 @@ These tracks behavior. Every PR that affects a CLI flag or config key updates th
 - [ci-map.md](ci-map.md)
 - [actions-source-policy.md](actions-source-policy.md)
 
-## Project (snapshots, immutable)
+## Project (conventions + archive)
 
 - [project/README.md](project/README.md)
-- [project/codebase-bloat-audit-2026-05-06.md](project/codebase-bloat-audit-2026-05-06.md)
-- [project/docs-cleanup-plan-2026-05-06.md](project/docs-cleanup-plan-2026-05-06.md)
-- [project/archive/superpowers/](project/archive/superpowers/) — superseded planning artifacts (2026-04-16 → 2026-05-04)
+- [project/operating-conventions.md](project/operating-conventions.md) — how alpha cuts ship
+- [project/archive/](project/archive/) — superseded plans + snapshot audits, kept for design-rationale history
 
 ## Documentation governance
 

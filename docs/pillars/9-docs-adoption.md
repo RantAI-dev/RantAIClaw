@@ -1,8 +1,8 @@
 # Pillar 9 — Documentation and Adoption
 
-> **ClickUp:** [Docs cleanup plan 2026-05-06](docs-cleanup-plan-2026-05-06.md) · **Maturity:** Cleanup in progress · **Modules:** `docs/`
+> **Maturity:** Active · **Modules:** `docs/`
 
-The docs are a product surface. They have to convince a new visitor in 30 seconds that RantaiClaw matches OpenClaw + Hermes-agent on completeness while being **lighter** than both — and they have to mirror the ClickUp PM ladder so that what's planned for the current release is the same answer in repo, in docs, and in PM.
+The docs are a product surface. They have to convince a new visitor in 30 seconds that RantaiClaw is **feature-complete and stays lean** alongside OpenClaw and Hermes-agent — and they have to mirror the ClickUp PM ladder so that what's planned for the current release is the same answer in repo, in docs, and in PM.
 
 ## What this pillar covers
 
@@ -57,7 +57,7 @@ docs/
 
 ## Doc governance
 
-- Project snapshots are **date-stamped and immutable** once superseded by a newer date. See `docs/project/codebase-bloat-audit-2026-05-06.md` for the template.
+- Project snapshots are **date-stamped and immutable** once superseded by a newer date. Superseded snapshots live under `docs/project/archive/` for design-rationale history.
 - Runtime-contract references (commands / config / providers / channels) **must track behavior changes** — every code PR that affects a CLI flag or config key updates the corresponding ref doc.
 - Pillar docs link to ClickUp release tasks; when a release ships, the pillar's "Current state by maturity" table is updated to reflect what moved.
 - Plans / specs that have shipped are **archived** under `docs/project/archive/<topic>/`, not deleted — git history alone isn't enough for design rationale.
