@@ -546,6 +546,12 @@ Examples:
         /// `hermes update --backup`.
         #[arg(long)]
         backup: bool,
+        /// Hidden flag. Used by the update orchestrator after a swap
+        /// to verify the freshly-installed binary loads and reports
+        /// the expected version. Prints the version + exits 0. If
+        /// this fails the orchestrator auto-rolls back to `.old`.
+        #[arg(long, hide = true)]
+        verify: bool,
     },
 
     /// Restore the previous binary + profile state from a pre-update snapshot.
@@ -1164,8 +1170,16 @@ async fn main() -> Result<()> {
         allow_downgrade,
         yes,
         backup,
+        verify,
     }) = &cli.command
     {
+        // `--verify` is the hidden flag the post-swap orchestrator
+        // spawns. Has to run before any other init (no config load,
+        // no agent build) so a fault elsewhere can't poison the
+        // first-launch verification and trigger a false rollback.
+        if *verify {
+            return rantaiclaw::lifecycle::update::run_verify();
+        }
         let channel = match channel.as_str() {
             "stable" => rantaiclaw::lifecycle::update::Channel::Stable,
             "prerelease" | "pre" => rantaiclaw::lifecycle::update::Channel::Prerelease,

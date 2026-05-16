@@ -20,6 +20,7 @@
 //! `reqwest`, `sha2`, `hex`, `tempfile`, and shell out to `tar`.
 
 use anyhow::{anyhow, bail, Context, Result};
+use fs2::FileExt;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -30,6 +31,11 @@ use std::path::{Path, PathBuf};
 use crate::lifecycle::binary_path::{require_self_modifiable, BinaryInfo};
 
 const REPO: &str = "RantAI-dev/RantAIClaw";
+
+/// First-launch verification timeout. The freshly-installed binary
+/// must respond to `update verify` and exit 0 within this window or
+/// the swap is rolled back.
+const VERIFY_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
@@ -59,6 +65,13 @@ pub struct UpdateOpts {
 }
 
 pub fn run(opts: UpdateOpts) -> Result<()> {
+    // Single-update guarantee. Two concurrent `rantaiclaw update`
+    // invocations would race on the staged-binary rename and could
+    // leave a corrupt state. flock the lockfile for the duration of
+    // the run; the lock is released automatically when `_lock` drops
+    // or the process exits.
+    let _lock = acquire_update_lock().context("acquire update lock")?;
+
     let info = BinaryInfo::detect()?;
     let current = current_version();
 
@@ -164,11 +177,70 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
         verify_sha256(&archive_path, &sums_path, &archive_name)?;
         println!("✓ SHA256 verified");
 
+        // Cosign signature check on top of the SHA. The pub-release
+        // workflow signs every artifact with cosign keyless OIDC and
+        // attaches `<archive>.bundle`. Verifying the bundle confirms
+        // the release actually came from the project's release
+        // workflow on tags from the project's repo — protects against
+        // a compromised release server that could otherwise swap
+        // archive + SHA256SUMS atomically.
+        //
+        // Graceful degradation: if cosign isn't installed locally,
+        // print a warning and proceed with SHA-only. Users on
+        // air-gapped or minimal hosts shouldn't lose `update`; users
+        // with cosign get the stronger guarantee. Once cosign is in
+        // wider distros (it's already in homebrew, apt, AUR) this
+        // becomes a hard requirement in a future cut.
+        let bundle_url = format!("{base_url}/{archive_name}.bundle");
+        match verify_cosign_signature(&base_url, &archive_path, &archive_name, &work_dir) {
+            Ok(true) => println!("✓ cosign signature verified ({bundle_url})"),
+            Ok(false) => println!(
+                "⚠ skipping cosign verify (signature bundle not found at {bundle_url}). \
+                 SHA-only verification will continue."
+            ),
+            Err(e) => bail!("cosign signature verification failed: {e:#}"),
+        }
+
         let extracted = extract_binary(&archive_path, &work_dir)?;
         println!("✓ extracted {}", extracted.display());
 
         swap_binary(&info.path, &extracted)?;
-        println!("✓ updated to {target_version}");
+
+        // First-launch verification. Spawn the freshly-installed
+        // binary in a short-timeout `update verify` mode. If it
+        // crashes, hangs, or returns the wrong version, restore the
+        // `.old` backup in-place so the user is never left with a
+        // broken install. This is the "auto-rollback on bad swap"
+        // guard — the snapshot rollback path stays available for
+        // post-update issues but doesn't need to be invoked here.
+        match verify_installed_binary(&info.path, &target_version) {
+            Ok(()) => println!("✓ updated to {target_version}"),
+            Err(e) => {
+                eprintln!("⚠ first-launch verification failed: {e:#}");
+                let backup = info.path.with_extension("old");
+                if backup.is_file() {
+                    if let Err(restore_err) = fs::rename(&backup, &info.path) {
+                        bail!(
+                            "first-launch verify failed AND auto-rollback failed: \
+                             {restore_err:#}. Restore manually: `mv {} {}`",
+                            backup.display(),
+                            info.path.display()
+                        );
+                    }
+                    eprintln!("↺ rolled back to {}", current);
+                    bail!("update aborted: new binary failed first-launch verify");
+                } else {
+                    bail!(
+                        "first-launch verify failed and no .old backup exists \
+                         (snapshot at {}). Restore from snapshot or reinstall.",
+                        snapshot_summary
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<missing>".into())
+                    );
+                }
+            }
+        }
 
         // Post-swap: restart managed daemon service so the running
         // process picks up the new binary instead of staying on the
@@ -432,6 +504,19 @@ fn swap_binary(running: &Path, new_bin: &Path) -> Result<()> {
         fs::set_permissions(&new_local, fs::Permissions::from_mode(mode))
             .with_context(|| format!("chmod staged binary {}", new_local.display()))?;
 
+        // fsync the staged binary before rename. Without this, a
+        // crash between the rename and the kernel's deferred
+        // write-back can persist the rename while leaving the file
+        // content empty — the user is left with a 0-byte binary at
+        // `running` that won't even invoke the rollback path.
+        {
+            let staged = fs::File::open(&new_local)
+                .with_context(|| format!("reopen staged binary {}", new_local.display()))?;
+            staged
+                .sync_all()
+                .with_context(|| format!("fsync staged binary {}", new_local.display()))?;
+        }
+
         fs::rename(running, &backup)
             .with_context(|| format!("backup current binary to {}", backup.display()))?;
         if let Err(e) = fs::rename(&new_local, running) {
@@ -439,6 +524,17 @@ fn swap_binary(running: &Path, new_bin: &Path) -> Result<()> {
             let _ = fs::rename(&backup, running);
             return Err(e).with_context(|| format!("install new binary at {}", running.display()));
         }
+
+        // fsync the parent directory so the two rename operations
+        // are durably recorded. Without this, ext4/xfs can leave the
+        // user post-crash with the old binary at `<running>.old` and
+        // nothing at `<running>` at all.
+        if let Some(parent) = running.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+
         // Keep the `.old` backup in place so `rantaiclaw rollback` can
         // restore it. Pre-v0.6.32 we deleted it on success, which made
         // the rollback story manual ("you have to know to grab a copy
@@ -463,6 +559,219 @@ fn swap_binary(running: &Path, new_bin: &Path) -> Result<()> {
         );
         Ok(())
     }
+}
+
+/// Open + flock `<rantaiclaw_root>/.update.lock`. Returns the held
+/// file; dropping it releases the lock automatically. Used by
+/// `update::run` to serialise concurrent updates so two invocations
+/// can't race on the staged-binary rename.
+///
+/// Uses `try_lock_exclusive` so a second invocation gets a clear
+/// "another update is already running" error instead of blocking
+/// forever.
+fn acquire_update_lock() -> Result<fs::File> {
+    let root = crate::profile::paths::rantaiclaw_root();
+    fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
+    let lock_path = root.join(".update.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open update lockfile {}", lock_path.display()))?;
+    lock_file.try_lock_exclusive().map_err(|e| {
+        anyhow!(
+            "another `rantaiclaw update` appears to be running ({}). \
+             If you're sure no other update is in flight, delete {}.",
+            e,
+            lock_path.display()
+        )
+    })?;
+    Ok(lock_file)
+}
+
+/// Spawn the freshly-installed binary in `update verify` mode with
+/// a short timeout, and confirm it (a) starts at all and (b) reports
+/// the expected target version. Returns `Ok(())` only when both
+/// conditions hold; otherwise the caller should auto-rollback to the
+/// `.old` backup.
+fn verify_installed_binary(installed: &Path, expected_version: &str) -> Result<()> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(installed)
+        .args(["update", "--verify"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn {} for first-launch verify", installed.display()))?;
+
+    let deadline = Instant::now() + Duration::from_secs(VERIFY_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|mut s| {
+                        let mut buf = String::new();
+                        let _ = s.read_to_string(&mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|mut s| {
+                        let mut buf = String::new();
+                        let _ = s.read_to_string(&mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
+                if !status.success() {
+                    bail!(
+                        "new binary exited {} (stderr: {})",
+                        status
+                            .code()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        stderr.trim()
+                    );
+                }
+                // `update verify` prints the version it sees as the
+                // first line. Confirm it matches what we just
+                // installed; mismatch means the swap didn't actually
+                // land (e.g. PATH shadow, hardlink redirect).
+                let reported = stdout.lines().next().unwrap_or("").trim();
+                if reported != expected_version {
+                    bail!(
+                        "version mismatch after swap: expected {expected_version}, \
+                         got {reported:?}"
+                    );
+                }
+                return Ok(());
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    bail!(
+                        "new binary did not respond to `update verify` within {}s",
+                        VERIFY_TIMEOUT_SECS
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => bail!("wait on `update verify` child: {e}"),
+        }
+    }
+}
+
+/// Entry point for `rantaiclaw update verify` — a tiny health check
+/// the update orchestrator calls on the freshly-installed binary.
+/// Just prints the compiled-in version and exits 0. Kept deliberately
+/// minimal so a fault in any other subsystem can't cause a false
+/// rollback. If you must add a side effect here, it has to be
+/// strictly read-only.
+pub fn run_verify() -> Result<()> {
+    println!("{}", current_version());
+    Ok(())
+}
+
+/// Cosign keyless-OIDC signature verification on the release archive.
+///
+/// Returns:
+/// * `Ok(true)`  — bundle found and signature verified
+/// * `Ok(false)` — bundle file 404, `cosign` not on PATH, or another
+///                 graceful-degradation condition; SHA-only continues
+/// * `Err(_)`    — bundle found but the verification itself failed
+///                 (signature mismatch, wrong identity, wrong issuer)
+///
+/// The expected signing identity is the project's `pub-release.yml`
+/// workflow on a tag ref. The OIDC issuer is GitHub Actions. Both
+/// are pinned via regex/literal so a signature from any other workflow
+/// or any other repo is rejected.
+fn verify_cosign_signature(
+    base_url: &str,
+    archive_path: &Path,
+    archive_name: &str,
+    work_dir: &Path,
+) -> Result<bool> {
+    use std::process::Command;
+
+    // Bail-friendly local-prereq check. `which cosign` style.
+    let cosign_present = Command::new("cosign")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !cosign_present {
+        eprintln!("⚠ `cosign` not found on PATH — skipping signature verify.");
+        eprintln!("  Install: https://docs.sigstore.dev/system_config/installation/");
+        return Ok(false);
+    }
+
+    let bundle_url = format!("{base_url}/{archive_name}.bundle");
+    let bundle_path = work_dir.join(format!("{archive_name}.bundle"));
+
+    // Try to fetch the bundle. A 404 is the "no bundle for this
+    // release" path — historic releases predating the cosign step
+    // won't have one, and we don't want to break update for them.
+    let client = Client::builder()
+        .user_agent("rantaiclaw-update")
+        .build()
+        .context("build http client")?;
+    let resp = client
+        .get(&bundle_url)
+        .send()
+        .context("fetch cosign bundle")?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        bail!("fetch {bundle_url} returned HTTP {}", resp.status());
+    }
+    let bytes = resp.bytes().context("read cosign bundle body")?;
+    fs::write(&bundle_path, &bytes)
+        .with_context(|| format!("write cosign bundle to {}", bundle_path.display()))?;
+
+    // Pin both the workflow identity and the OIDC issuer. Anything
+    // signed by a different workflow or a non-GitHub-Actions issuer
+    // is rejected. The regex matches any tag-ref on the project's
+    // pub-release workflow.
+    let identity_regex =
+        r"^https://github\.com/RantAI-dev/RantAIClaw/\.github/workflows/pub-release\.yml@.*$";
+    let issuer = "https://token.actions.githubusercontent.com";
+
+    let output = Command::new("cosign")
+        .args([
+            "verify-blob",
+            "--bundle",
+            bundle_path.to_str().unwrap_or_default(),
+            "--certificate-identity-regexp",
+            identity_regex,
+            "--certificate-oidc-issuer",
+            issuer,
+            archive_path.to_str().unwrap_or_default(),
+        ])
+        .output()
+        .context("invoke cosign verify-blob")?;
+
+    if !output.status.success() {
+        bail!(
+            "cosign verify-blob rejected the archive (exit {}): {}",
+            output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(true)
 }
 
 /// Apply a previously staged Windows update before doing anything else.
