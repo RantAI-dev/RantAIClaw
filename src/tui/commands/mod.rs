@@ -4,6 +4,7 @@ mod calls;
 mod config;
 mod core;
 mod cron;
+mod kanban;
 mod mcp;
 mod memory;
 mod model;
@@ -142,6 +143,7 @@ impl CommandRegistry {
         self.register(Box::new(memory::ForgetCommand));
         self.register(Box::new(memory::CompressCommand));
         self.register(Box::new(cron::CronCommand));
+        self.register(Box::new(kanban::KanbanCommand));
         self.register(Box::new(skills::SkillsCommand));
         self.register(Box::new(skills::SkillCommand));
         self.register(Box::new(skills::PersonalityCommand));
