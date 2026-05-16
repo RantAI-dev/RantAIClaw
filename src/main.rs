@@ -66,6 +66,7 @@ mod health;
 mod heartbeat;
 mod identity;
 mod integrations;
+mod kanban;
 mod mcp;
 mod memory;
 mod migration;
@@ -491,6 +492,22 @@ Examples:
     Memory {
         #[command(subcommand)]
         memory_command: MemoryCommands,
+    },
+
+    /// Multi-agent kanban board (Hermes parity).
+    ///
+    /// `rantaiclaw kanban ...` mirrors the `hermes kanban ...` surface 1:1:
+    /// durable SQLite board, multi-board (project) isolation, runs/attempt
+    /// history, notify subscriptions, dispatcher loop. Each verb also works
+    /// as `/kanban <verb>` in the TUI and from gateway channels.
+    Kanban {
+        /// Optional --board override for this invocation; otherwise the
+        /// active board (RANTAICLAW_KANBAN_BOARD or `~/.rantaiclaw/kanban/current`)
+        /// is used.
+        #[arg(long, global = true)]
+        board: Option<String>,
+        #[command(subcommand)]
+        kanban_command: kanban::KanbanCommand,
     },
 
     /// Manage configuration
@@ -1725,6 +1742,15 @@ async fn main() -> Result<()> {
 
         Some(Commands::Memory { memory_command }) => {
             memory::cli::handle_command(memory_command, &config).await
+        }
+
+        Some(Commands::Kanban {
+            board,
+            kanban_command,
+        }) => {
+            let mut stdout = std::io::stdout().lock();
+            kanban::handle_command(&kanban_command, board.as_deref(), &mut stdout)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
         }
 
         Some(Commands::Auth { auth_command }) => handle_auth_command(auth_command, &config).await,
