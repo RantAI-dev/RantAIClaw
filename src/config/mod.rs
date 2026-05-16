@@ -1,3 +1,4 @@
+pub mod migrations;
 pub mod schema;
 
 #[allow(unused_imports)]

@@ -54,6 +54,13 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 /// Resolution order: `RANTAICLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.rantaiclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
+    /// On-disk schema version. Stamped by `config::migrations::migrate`
+    /// at load time and round-tripped on every write so the next
+    /// load can skip migrations that already ran. Absent on configs
+    /// written by pre-v0.6.45 binaries — the migrator treats those
+    /// as version `0` and stamps the current version.
+    #[serde(default = "default_config_schema_version")]
+    pub schema_version: u32,
     /// Workspace directory - computed from home, not serialized
     #[serde(skip)]
     pub workspace_dir: PathBuf,
@@ -3056,6 +3063,13 @@ pub struct QQConfig {
 
 // ── Config impl ──────────────────────────────────────────────────
 
+/// Default for the `schema_version` field on `Config`. Returned when
+/// a config.toml has no such field (pre-v0.6.45 binaries didn't write
+/// it). The migrator stamps the actual version on read.
+pub(crate) fn default_config_schema_version() -> u32 {
+    crate::config::migrations::CURRENT_VERSION
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home =
@@ -3063,6 +3077,7 @@ impl Default for Config {
         let rantaiclaw_dir = home.join(".rantaiclaw");
 
         Self {
+            schema_version: default_config_schema_version(),
             workspace_dir: rantaiclaw_dir.join("workspace"),
             config_path: rantaiclaw_dir.join("config.toml"),
             api_key: None,
@@ -3466,8 +3481,39 @@ impl Config {
             let contents = fs::read_to_string(&config_path)
                 .await
                 .context("Failed to read config file")?;
-            let mut config: Config =
-                toml::from_str(&contents).context("Failed to parse config file")?;
+            // Run versioned config migrations between read and parse.
+            // Old configs (pre-v0.6.45) lack the `schema_version`
+            // field; the migrator treats them as v0 and stamps the
+            // current version. Future renames / re-typings of fields
+            // plug in as `migrate_vN` arms in `config::migrations`.
+            // If anything changed, persist the migrated form to disk
+            // so subsequent loads skip the work.
+            let mut raw: toml::Value =
+                toml::from_str(&contents).context("Failed to parse config file as TOML")?;
+            let migrated = crate::config::migrations::migrate(&mut raw)
+                .context("Failed to migrate config schema")?;
+            if migrated {
+                let serialized =
+                    toml::to_string_pretty(&raw).context("Failed to serialise migrated config")?;
+                if let Err(e) = fs::write(&config_path, serialized).await {
+                    // Non-fatal: we still have the migrated value in
+                    // memory. Warn so the user knows the next load
+                    // will redo the work.
+                    tracing::warn!(
+                        "config migrated in memory but write-back to {} failed: {e:#}",
+                        config_path.display()
+                    );
+                } else {
+                    tracing::info!(
+                        "config schema migrated to v{} ({})",
+                        crate::config::migrations::CURRENT_VERSION,
+                        config_path.display()
+                    );
+                }
+            }
+            let mut config: Config = raw
+                .try_into()
+                .context("Failed to deserialise (post-migration) config")?;
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
@@ -4205,6 +4251,7 @@ default_temperature = 0.7
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            schema_version: crate::config::migrations::CURRENT_VERSION,
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
@@ -4424,6 +4471,7 @@ tool_dispatcher = "xml"
 
         let config_path = dir.join("config.toml");
         let config = Config {
+            schema_version: crate::config::migrations::CURRENT_VERSION,
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),

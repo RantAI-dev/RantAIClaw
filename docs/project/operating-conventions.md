@@ -61,6 +61,59 @@ feat(<scope>): <one-line summary> — bump v0.6.N-alpha
 `ci(...)`, `test(...)`. The PR-title-lint workflow enforces the
 prefix.
 
+## Adding a schema migration
+
+`config.toml` and `sessions.db` are versioned. A field rename or
+type change across releases would otherwise leave users on the
+previous binary with an unparseable config or a broken DB. The
+migration framework keeps that from ever happening.
+
+### Config (`config.toml`)
+
+Source: `src/config/migrations.rs`. Runs on every `Config::load_or_init`
+between the raw-TOML read and the `Config` deserialise.
+
+When a future cut needs to rename or re-type a field:
+
+1. Bump `CURRENT_VERSION` in `src/config/migrations.rs` from `N` to
+   `N+1`.
+2. Add `migrate_vN_plus_1(raw: &mut toml::Value) -> Result<()>` next
+   to the existing migration stubs. Keep the transformation narrow —
+   one schema change per `migrate_vN`.
+3. Append `if from < N+1 { migrate_vN_plus_1(raw)?; }` to the chain
+   inside `migrate()`.
+4. Add a unit test that feeds a fixture written by an old binary
+   through `migrate()` and asserts the post-shape.
+
+### Sessions DB (SQLite)
+
+Source: `src/sessions/migrations.rs`. Runs on every
+`SessionStore::open` after the connection is opened.
+
+When a future cut needs a new index, table, or DDL change:
+
+1. Bump `CURRENT_VERSION` from `N` to `N+1`.
+2. Add `migrate_vN_plus_1(conn: &Connection) -> Result<()>` that
+   issues the DDL via `execute_batch`. End by calling
+   `set_schema_version(conn, N+1)`.
+3. Append `if version < N+1 { migrate_vN_plus_1(conn)?; }` to the
+   chain inside `run_migrations()`.
+4. Add a unit test that opens an in-memory connection through the
+   prior version, runs the new migration, and asserts the new
+   schema is present.
+
+### Both frameworks
+
+- Each migration is **idempotent**: running it twice has no extra
+  effect. Tests assert this.
+- Each migration is **append-only**: never re-edit a shipped
+  `migrate_vN` — the next user's `config.toml` already encodes that
+  it ran. If a migration is wrong, write a `migrate_vN_plus_1` that
+  corrects it.
+- A binary refuses to load state newer than its own
+  `CURRENT_VERSION` (no silent downgrade). The user has to update
+  their binary first.
+
 ## Anti-patterns to avoid
 
 - **Don't run the full `cargo test` suite locally** — only the
