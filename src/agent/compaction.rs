@@ -164,6 +164,19 @@ pub(crate) fn build_side_request(to_compact: &[ConversationMessage]) -> Vec<Chat
     out
 }
 
+/// Same as [`build_side_request`] but for callers that already hold a
+/// flat `Vec<ChatMessage>` (the CLI agent loop in `loop_.rs`). The
+/// original system prompt is dropped — the compaction system prompt
+/// takes its place — so the model gets exactly one system message
+/// telling it how to summarise.
+pub(crate) fn build_chat_side_request(to_compact: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut out = Vec::with_capacity(to_compact.len() + 2);
+    out.push(ChatMessage::system(COMPACTION_SYSTEM_PROMPT.to_string()));
+    out.extend(to_compact.iter().filter(|m| m.role != "system").cloned());
+    out.push(ChatMessage::user(COMPACTION_USER_PROMPT.to_string()));
+    out
+}
+
 /// Wrap a freshly-generated summary in a single system message that
 /// gets injected back into the history right after the agent's own
 /// system prompt. Marker text on the boundaries so a future
@@ -309,6 +322,27 @@ mod tests {
         assert_eq!(req.first().unwrap().role, "system");
         assert_eq!(req.last().unwrap().role, "user");
         assert!(req.last().unwrap().content.contains("compacted"));
+    }
+
+    #[test]
+    fn build_chat_side_request_drops_original_system_and_wraps_with_compaction_prompts() {
+        let history = vec![
+            ChatMessage::system("you are an agent — ignore me"),
+            ChatMessage::user("first turn"),
+            ChatMessage::assistant("first reply"),
+        ];
+        let req = build_chat_side_request(&history);
+        // System prompt first, closing user prompt last, the original
+        // system message filtered out — same contract as the
+        // ConversationMessage-flavoured helper.
+        assert_eq!(req.first().unwrap().role, "system");
+        assert!(req.first().unwrap().content.contains("summarizing"));
+        assert_eq!(req.last().unwrap().role, "user");
+        assert!(req.last().unwrap().content.contains("compacted"));
+        // Should be: compaction-system + 2 history + closing-user = 4.
+        assert_eq!(req.len(), 4);
+        // Original system message must not appear.
+        assert!(!req.iter().any(|m| m.content.contains("ignore me")));
     }
 
     #[test]

@@ -174,7 +174,10 @@ fn apply_compaction_summary(
     compact_end: usize,
     summary: &str,
 ) {
-    let summary_msg = ChatMessage::assistant(format!("[Compaction summary]\n{}", summary.trim()));
+    // Same envelope shape as `Agent::compact_streaming` so a future
+    // `/uncompact` (or human reader) can find the seam regardless of
+    // which code path produced the summary.
+    let summary_msg = crate::agent::compaction::summary_envelope(summary);
     history.splice(start..compact_end, std::iter::once(summary_msg));
 }
 
@@ -204,22 +207,27 @@ async fn auto_compact_history(
 
     let compact_end = start + compact_count;
     let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
-    let transcript = build_compaction_transcript(&to_compact);
 
-    let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
+    // Same structured 5-section prompt the `/compress` slash command
+    // uses. Sharing the prompt means a user who compacts manually and
+    // a user whose history hit the auto threshold both get summaries
+    // in the same shape — easier to reason about, easier to test.
+    let request_messages = crate::agent::compaction::build_chat_side_request(&to_compact);
+    let request = crate::providers::ChatRequest {
+        messages: &request_messages,
+        tools: None,
+    };
 
-    let summarizer_user = format!(
-        "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{}",
-        transcript
-    );
-
-    let summary_raw = provider
-        .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
-        .await
-        .unwrap_or_else(|_| {
-            // Fallback to deterministic local truncation when summarization fails.
+    let summary_raw = match provider.chat(request, model, 0.2).await {
+        Ok(resp) => resp.text_or_empty().to_string(),
+        Err(_) => {
+            // Fallback to deterministic local truncation when the
+            // summarizer call fails for any reason — better a short
+            // truncated tail than aborting the whole turn.
+            let transcript = build_compaction_transcript(&to_compact);
             truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
-        });
+        }
+    };
 
     let summary = truncate_with_ellipsis(&summary_raw, COMPACTION_MAX_SUMMARY_CHARS);
     apply_compaction_summary(history, start, compact_end, &summary);
