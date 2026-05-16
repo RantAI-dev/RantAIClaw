@@ -4447,6 +4447,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     let (events_tx, events_rx): (AgentEventSender, mpsc::Receiver<AgentEvent>) = mpsc::channel(128);
 
     let security_handle = agent.security();
+    let memory_handle = agent.memory_handle();
     let mcp_tools_by_server = agent.mcp_tools_by_server();
     let actor = TuiAgentActor::new(agent, req_rx, events_tx);
     let actor_handle = tokio::spawn(actor.run());
@@ -4482,6 +4483,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         }
     }
     app.context.security = security_handle;
+    app.context.memory = Some(memory_handle);
 
     // Surface MCP server config + discovered tools so `/mcp` can
     // render a useful diff between "configured" and "actually live".

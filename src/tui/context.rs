@@ -81,6 +81,12 @@ pub struct TuiContext {
     /// live, and to resolve pending approvals surfaced by the shell
     /// tool.
     pub security: Option<std::sync::Arc<crate::security::SecurityPolicy>>,
+    /// Shared memory backend handle. `Some` when the TUI was launched
+    /// against a real agent (`Agent::from_config`); `None` for unit
+    /// tests / `test_context()`. Used by `/memory` and `/forget`
+    /// slash commands to drive the user-facing memory surface
+    /// without going through a turn round-trip.
+    pub memory: Option<std::sync::Arc<dyn crate::memory::Memory>>,
     /// Snapshot of the most recently finished turn's tool calls. Used
     /// by the `/calls` slash command so the user can see what the
     /// agent did, especially after a soft-cap hit. Refreshed on every
@@ -145,6 +151,7 @@ impl TuiContext {
             input_history_pos: None,
             input_history_stash: None,
             security: None,
+            memory: None,
             last_turn_tool_calls: Vec::new(),
             mcp_servers_configured: std::collections::HashSet::new(),
             mcp_tools_by_server: std::collections::HashMap::new(),

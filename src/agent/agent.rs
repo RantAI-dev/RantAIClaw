@@ -415,6 +415,15 @@ impl Agent {
         self.security.clone()
     }
 
+    /// Shared memory backend handle. Always populated — the agent
+    /// always has a memory store (defaulting to the `None` no-op
+    /// backend if none was configured). Use this to drive the user-
+    /// facing `/memory`, `/forget`, etc. slash commands from outside
+    /// the agent loop.
+    pub fn memory_handle(&self) -> Arc<dyn Memory> {
+        self.memory.clone()
+    }
+
     /// MCP server health snapshot from boot. Empty for bare-builder
     /// agents or when no `[mcp_servers.*]` blocks were configured.
     pub fn mcp_health(&self) -> &[crate::mcp::discover::McpServerHealth] {
