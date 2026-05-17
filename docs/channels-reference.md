@@ -219,7 +219,7 @@ ignore_stories = true
 RantaiClaw supports two WhatsApp backends:
 
 - **Cloud API mode** (`phone_number_id` + `access_token` + `verify_token`) — stable, uses the official Meta Cloud API.
-- **WhatsApp Web mode** (`session_path`, requires build flag `--features whatsapp-web`) — **experimental, see security warning below**.
+- **WhatsApp Web mode** (`session_path`) — always available in the default build (since v0.6.49-alpha). **Experimental, see security warning below.**
 
 Cloud API mode:
 
@@ -242,7 +242,7 @@ pair_code = ""                     # optional custom pair code
 allowed_numbers = ["*"]
 ```
 
-> **Security warning — WhatsApp Web mode (`--features whatsapp-web`)**
+> **Security warning — WhatsApp Web mode**
 >
 > WhatsApp Web mode uses the `wa-rs` library, which reverse-engineers the
 > WhatsApp Web protocol. This approach carries risks that do not apply to the
@@ -260,8 +260,9 @@ allowed_numbers = ["*"]
 
 Notes:
 
-- Build with `cargo build --features whatsapp-web` (or equivalent run command).
-  The feature is disabled by default. Prefer Cloud API mode in production.
+- Always compiled into the default `rantaiclaw` binary since v0.6.49-alpha.
+  Prefer Cloud API mode in production — the WhatsApp Web protocol is
+  unofficial and can break on any WhatsApp update.
 - Keep `session_path` on persistent storage to avoid relinking after restart.
 - Reply routing uses the originating chat JID, so direct and group replies work correctly.
 

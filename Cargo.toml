@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rantaiclaw"
-version = "0.6.48-alpha"
+version = "0.6.49-alpha"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "Apache-2.0"
@@ -204,7 +204,7 @@ landlock = { version = "0.4" }
 libc = "0.2"
 
 [features]
-default = ["tui"]
+default = ["tui", "whatsapp-web"]
 # Re-enables the pre-rig hand-rolled provider implementations for
 # Anthropic/OpenAI/Gemini. Default off — those providers route
 # through `RigProvider` (src/providers/rig_native.rs). Build with

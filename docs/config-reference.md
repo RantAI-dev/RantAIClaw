@@ -460,7 +460,7 @@ WhatsApp Web mode (native client):
 
 Notes:
 
-- WhatsApp Web requires build flag `whatsapp-web`.
+- WhatsApp Web is compiled into the default binary since v0.6.49-alpha (no build flag required).
 - If both Cloud and Web fields are present, Cloud mode wins for backward compatibility.
 
 ### `[channels_config.nextcloud_talk]`
