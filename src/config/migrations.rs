@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -78,8 +78,20 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; placeholder for symmetry)
     }
 
-    // Future migrations (v2, v3, …) inserted here in order.
-    // if from < 2 { migrate_v2(raw)?; }
+    // v1 → v2: the default for `[agent].max_tool_iterations` changed
+    // from 10 to 25. Configs that have an EXPLICIT 10 keep their
+    // explicit value (treated as a user choice, not the old default).
+    // Configs that lack the field gain it on first write through the
+    // serde default — which is now 25 — without us touching anything
+    // here. No structural migration needed; this arm exists only to
+    // burn a version slot so the schema_drift fingerprint can be
+    // accepted with intent.
+    if from < 2 {
+        // (no transformation; default-only change)
+    }
+
+    // Future migrations (v3, v4, …) inserted here in order.
+    // if from < 3 { migrate_v3(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -111,14 +123,35 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v1_config_is_noop() {
-        let mut v = parse("schema_version = 1\n[other]\nfoo = \"bar\"\n");
+    fn fresh_current_version_config_is_noop() {
+        let mut v = parse(&format!(
+            "schema_version = {CURRENT_VERSION}\n[other]\nfoo = \"bar\"\n"
+        ));
         let migrated = migrate(&mut v).unwrap();
         assert!(
             !migrated,
             "current-version config should not be transformed"
         );
-        assert_eq!(version_of(&v), Some(1));
+        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+    }
+
+    #[test]
+    fn v1_to_v2_preserves_explicit_max_tool_iterations() {
+        // A user who had set max_tool_iterations = 10 explicitly in
+        // their v1 config keeps that exact value through the v2 bump.
+        // The default change (10 → 25) doesn't override their choice.
+        let mut v = parse(
+            "schema_version = 1\n[agent]\nmax_tool_iterations = 10\n",
+        );
+        let migrated = migrate(&mut v).unwrap();
+        assert!(migrated, "v1 → v2 bump should be reported as transformed");
+        assert_eq!(version_of(&v), Some(2));
+        let agent = v.get("agent").unwrap().as_table().unwrap();
+        assert_eq!(
+            agent.get("max_tool_iterations").unwrap().as_integer(),
+            Some(10),
+            "explicit 10 must survive v1 → v2 (user choice, not default)"
+        );
     }
 
     #[test]

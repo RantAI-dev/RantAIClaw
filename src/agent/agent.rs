@@ -247,6 +247,34 @@ fn empty_usage(model: &str) -> TokenUsage {
     TokenUsage::new(model.to_string(), 0, 0, 0.0, 0.0)
 }
 
+/// Read `<policy_dir>/command_allowlist.toml` into a flat Vec of glob
+/// patterns. Used by `build_system_prompt` to surface the pre-approved
+/// command list to the model so it knows what will pass without
+/// prompting. Returns `Err` only on TOML parse failure; missing file
+/// → `Ok(empty)` so a fresh profile (no policy provisioned yet) gets
+/// the generic safety section instead of a hard error.
+fn read_command_allowlist(policy_dir: &std::path::Path) -> Result<Vec<String>> {
+    let path = policy_dir.join("command_allowlist.toml");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let table: toml::value::Table = toml::from_str(&raw)?;
+    let patterns = table
+        .get("command_allowlist")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("patterns"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(patterns)
+}
+
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
@@ -312,6 +340,28 @@ impl Agent {
             config.api_key.as_deref(),
             config,
         );
+
+        // Strict preset filter: when the active policy is Strict, drop
+        // the `shell` tool from the registry so the model can't even
+        // attempt a call (CC plan-mode analog). The model is also told
+        // about this via SafetySection, so the prompt + tool list agree.
+        // Manual / Smart / Off keep shell; the gate handles per-call
+        // approval there.
+        if matches!(
+            crate::profile::ProfileManager::active().ok().and_then(|p| {
+                crate::approval::policy_writer::read_active_preset(&p.policy_dir())
+            }),
+            Some(crate::approval::policy_writer::PolicyPreset::Strict)
+        ) {
+            let before = tools.len();
+            tools.retain(|t| t.name() != "shell");
+            if tools.len() < before {
+                tracing::info!(
+                    target: "agent",
+                    "Strict preset active — `shell` tool removed from registry"
+                );
+            }
+        }
 
         // MCP discovery — spawn each configured server, query
         // `tools/list`, splice each tool into the registry as an
@@ -615,6 +665,23 @@ impl Agent {
 
     fn build_system_prompt(&self) -> Result<String> {
         let instructions = self.tool_dispatcher.prompt_instructions(&self.tools);
+
+        // Resolve the active preset + its on-disk command_allowlist so
+        // the SafetySection can render preset-specific guidance + the
+        // exact pre-approved patterns. Both come from the active
+        // profile's policy dir. Failure to read either is non-fatal —
+        // we fall back to None / empty and the safety section renders
+        // its generic floor.
+        let (autonomy_preset, allowed_commands) = match crate::profile::ProfileManager::active() {
+            Ok(profile) => {
+                let dir = profile.policy_dir();
+                let preset = crate::approval::policy_writer::read_active_preset(&dir);
+                let allowlist = read_command_allowlist(&dir).unwrap_or_default();
+                (preset, allowlist)
+            }
+            Err(_) => (None, Vec::new()),
+        };
+
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             model_name: &self.model_name,
@@ -623,15 +690,48 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
+            autonomy_preset,
+            allowed_commands: &allowed_commands,
         };
         self.prompt_builder.build(&ctx)
     }
 
-    async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
+    async fn execute_tool_call(
+        &self,
+        call: &ParsedToolCall,
+        cancel: Option<&CancellationToken>,
+    ) -> ToolExecutionResult {
         let start = Instant::now();
 
         let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            match tool.execute(call.arguments.clone()).await {
+            let tool_future = tool.execute(call.arguments.clone());
+            // Race the tool against the cancellation token so a Ctrl+C
+            // mid-execution drops the future (and, for the shell tool
+            // with `kill_on_drop(true)`, terminates the child process).
+            // Without this race, an in-flight `pip install` ran to
+            // completion before cancel could take effect — that's what
+            // the user saw as "cancel not instant".
+            let outcome = if let Some(token) = cancel {
+                tokio::select! {
+                    () = token.cancelled() => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: false,
+                        });
+                        return ToolExecutionResult {
+                            name: call.name.clone(),
+                            output: "[cancelled]".to_string(),
+                            success: false,
+                            tool_call_id: call.tool_call_id.clone(),
+                        };
+                    }
+                    result = tool_future => result,
+                }
+            } else {
+                tool_future.await
+            };
+            match outcome {
                 Ok(r) => {
                     self.observer.record_event(&ObserverEvent::ToolCall {
                         tool: call.name.clone(),
@@ -665,18 +765,22 @@ impl Agent {
         }
     }
 
-    async fn execute_tools(&self, calls: &[ParsedToolCall]) -> Vec<ToolExecutionResult> {
+    async fn execute_tools(
+        &self,
+        calls: &[ParsedToolCall],
+        cancel: Option<&CancellationToken>,
+    ) -> Vec<ToolExecutionResult> {
         if !self.config.parallel_tools {
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
-                results.push(self.execute_tool_call(call).await);
+                results.push(self.execute_tool_call(call, cancel).await);
             }
             return results;
         }
 
         let futs: Vec<_> = calls
             .iter()
-            .map(|call| self.execute_tool_call(call))
+            .map(|call| self.execute_tool_call(call, cancel))
             .collect();
         futures_util::future::join_all(futs).await
     }
@@ -933,10 +1037,65 @@ impl Agent {
             self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
+        // Hit the iteration cap. Instead of bailing with an opaque
+        // anyhow error (which surfaces in the TUI as "[no response
+        // from model]"), do ONE final non-tool LLM round asking the
+        // model to summarize what it gathered. The user gets the value
+        // of the work that already ran rather than a blank turn.
+        let cap_prompt = format!(
+            "You hit the tool-call iteration cap ({} calls). Summarize \
+             what you found from the calls above and answer the user's \
+             original question with whatever data you have. Do NOT call \
+             any more tools — just respond in plain text.",
             self.config.max_tool_iterations
-        )
+        );
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::system(cap_prompt)));
+        let final_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        let final_request = ChatRequest {
+            messages: &final_messages,
+            tools: None, // disable tools so the model can't keep looping
+        };
+        let final_response = match self
+            .provider
+            .chat(final_request, &effective_model, self.temperature)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Even the summary call failed — fall back to the
+                // original bail behaviour so the user at least knows
+                // something went wrong.
+                anyhow::bail!(
+                    "Agent exceeded maximum tool iterations ({}) and the cap-summary fallback also failed: {e}",
+                    self.config.max_tool_iterations
+                );
+            }
+        };
+        let summary_text = final_response.text.unwrap_or_default();
+        let body = if summary_text.is_empty() {
+            format!(
+                "I hit the tool-call iteration cap ({}) before I could \
+                 finalise. Raise `agent.max_tool_iterations` in your \
+                 config.toml or rephrase the request to fewer steps.",
+                self.config.max_tool_iterations
+            )
+        } else {
+            summary_text
+        };
+        if let Some(tx) = events {
+            let _ = tx.send(AgentEvent::Chunk(body.clone())).await;
+        }
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(
+                body.clone(),
+            )));
+        self.trim_history();
+        Ok(TurnResult {
+            text: body,
+            usage: empty_usage(&effective_model),
+            cancelled: false,
+        })
     }
 
     /// Execute tool calls while emitting `ToolCallStart`/`ToolCallEnd` events
@@ -954,7 +1113,7 @@ impl Agent {
             if cancel.is_some_and(CancellationToken::is_cancelled) {
                 return Err(true);
             }
-            return Ok(self.execute_tools(calls).await);
+            return Ok(self.execute_tools(calls, cancel).await);
         }
 
         // Events path: emit Start/End per call. Run sequentially so event
@@ -976,7 +1135,21 @@ impl Agent {
                 })
                 .await;
 
-            let result = self.execute_tool_call(call).await;
+            let result = self.execute_tool_call(call, cancel).await;
+            // execute_tool_call returns "[cancelled]" with success=false
+            // when the token fires mid-execution. Propagate that as the
+            // turn-level cancel signal so the loop exits immediately
+            // instead of looping back to another LLM call.
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                let _ = tx
+                    .send(AgentEvent::ToolCallEnd {
+                        id,
+                        ok: false,
+                        output_preview: "[cancelled]".into(),
+                    })
+                    .await;
+                return Err(true);
+            }
 
             let _ = tx
                 .send(AgentEvent::ToolCallEnd {

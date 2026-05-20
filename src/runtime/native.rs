@@ -39,8 +39,27 @@ impl RuntimeAdapter for NativeRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        let mut process = tokio::process::Command::new("sh");
+        // Use the absolute POSIX path so spawn doesn't depend on PATH
+        // being intact in the rantaiclaw process env. The shell tool
+        // does `env_clear()` then re-adds a `SAFE_ENV_VARS` allowlist
+        // (which includes PATH from the parent); if the parent process
+        // somehow lost PATH, `Command::new("sh")` would fail with
+        // "No such file or directory" at spawn time — the v0.6.50 user
+        // report. `/bin/sh` is POSIX-mandated and present on Linux,
+        // macOS, BSD, and every container image we support.
+        const SH_PATH: &str = if cfg!(target_os = "windows") {
+            "sh"
+        } else {
+            "/bin/sh"
+        };
+        let mut process = tokio::process::Command::new(SH_PATH);
         process.arg("-c").arg(command).current_dir(workspace_dir);
+        // Kill the child if the parent future is dropped — covers the
+        // Ctrl+C path in the TUI where `execute_tool_call` is cancelled
+        // mid-run. Without this, a long-running shell (e.g. `pip
+        // install`) keeps executing after the agent has moved on,
+        // wasting cycles and racing with the next turn.
+        process.kill_on_drop(true);
         Ok(process)
     }
 }
@@ -78,6 +97,41 @@ mod tests {
     fn native_storage_path_contains_rantaiclaw() {
         let path = NativeRuntime::new().storage_path();
         assert!(path.to_string_lossy().contains("rantaiclaw"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kill_on_drop_terminates_child_when_future_dropped() {
+        // Proves the fix for the v0.6.49 "cancel not instant" bug:
+        // dropping the future returned by Command::output() must actually
+        // kill the running child process. Spawn `sleep 30`, drop after
+        // 100ms, and confirm the future resolves in <1s instead of
+        // waiting the full 30s.
+        let runtime = NativeRuntime::new();
+        let mut cmd = runtime
+            .build_shell_command("sleep 30", std::env::temp_dir().as_path())
+            .expect("build command");
+        let start = std::time::Instant::now();
+        // Race the 30s shell against a 100ms sleep. tokio::select! drops
+        // the loser branch's future, so when the 100ms timer wins we drop
+        // the in-flight `sleep 30`. With kill_on_drop(true) the child
+        // gets SIGKILL'd and the drop returns immediately; without it,
+        // the future would block waiting for the 30s child to exit.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                _ = cmd.output() => unreachable!("30s sleep can't finish in 100ms"),
+            }
+        })
+        .await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_ok(),
+            "kill_on_drop didn't take effect — select drop blocked for >3s"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "select drop took {elapsed:?}, expected sub-second (kill_on_drop should make it instant)"
+        );
     }
 
     #[test]

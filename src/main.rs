@@ -209,6 +209,39 @@ Examples:
         non_interactive: bool,
     },
 
+    /// Show or switch the approval-policy preset for the active profile.
+    ///
+    /// Without `<preset>`, prints the currently-active preset plus the
+    /// four options. With `<preset>`, force-writes
+    /// `<profile>/policy/{autonomy,command_allowlist,forbidden_paths}.toml`
+    /// from the bundled preset. Hand-edits to those three files are
+    /// clobbered; `runtime_allowlist.toml` (from `/allow X --persist`)
+    /// is preserved.
+    ///
+    /// `full` is accepted as an alias for `off` — same destination, just
+    /// matches the autonomy-level vocabulary some users reach for.
+    ///
+    /// Examples:
+    ///   rantaiclaw autonomy           # print current + options
+    ///   rantaiclaw autonomy smart     # switch to the default preset
+    ///   rantaiclaw autonomy full      # alias for off (no prompts)
+    #[command(long_about = "\
+Show or switch the approval-policy preset for the active profile.
+
+Without <preset>, prints the currently-active preset plus the four options.
+With <preset>, force-writes the three policy files from the bundled preset.
+Hand-edits to those files are clobbered; runtime_allowlist.toml is preserved.
+
+Examples:
+  rantaiclaw autonomy           # print current + options
+  rantaiclaw autonomy smart     # switch to the default preset
+  rantaiclaw autonomy full      # alias for off (no prompts)")]
+    Autonomy {
+        /// One of: `manual`, `smart`, `strict`, `off`, `full` (alias for `off`).
+        /// Omit to print the active preset and the four options.
+        preset: Option<String>,
+    },
+
     /// Start the AI agent loop
     #[command(long_about = "\
 Start the AI agent loop.
@@ -1398,13 +1431,75 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Autonomy: profile-level concern, but we ALSO need to write the
+    // matching `[autonomy].level` into config.toml so the live
+    // `SecurityPolicy` actually honours the preset. Without that step
+    // the preset switch was cosmetic (v0.6.49 bug).
+    if let Some(Commands::Autonomy { preset }) = &cli.command {
+        use approval::policy_writer::{self, PolicyPreset};
+        let profile = profile::ProfileManager::active()?;
+        match preset.as_deref().map(str::trim) {
+            None | Some("") => {
+                let current = policy_writer::read_active_preset(&profile.policy_dir());
+                match current {
+                    Some(p) => println!(
+                        "Current autonomy preset: {} ({}, level={:?})",
+                        p.label(),
+                        p.id(),
+                        p.autonomy_level()
+                    ),
+                    None => println!(
+                        "No approval policy provisioned yet — run `rantaiclaw setup approvals`."
+                    ),
+                }
+                println!("\nAvailable presets:");
+                for p in PolicyPreset::ALL {
+                    let marker = if current == Some(p) { "›" } else { " " };
+                    println!(
+                        "  {marker} {:<8} ({})  level={:?}",
+                        p.label(),
+                        p.id(),
+                        p.autonomy_level()
+                    );
+                }
+                println!("\nSwitch with: rantaiclaw autonomy <preset>");
+                println!("Inside the TUI: Shift+Tab to cycle, /autonomy to pick.");
+            }
+            Some(arg) => {
+                let target = PolicyPreset::from_str_ci(arg)?;
+                if let Some(warning) = policy_writer::write_policy_files(&profile, target, true)? {
+                    eprintln!("{warning}");
+                }
+                // Load + mutate + save config.toml so the runtime gate
+                // actually reflects the preset. `load_or_init` is async
+                // because of the secret store; we're already in an
+                // async main, so just await it.
+                let mut config = Config::load_or_init().await?;
+                policy_writer::apply_preset_to_config(&mut config, target);
+                config.save().await?;
+                println!(
+                    "✓ Autonomy preset set to {} ({}, level={:?}).",
+                    target.label(),
+                    target.id(),
+                    target.autonomy_level()
+                );
+            }
+        }
+        return Ok(());
+    }
+
     // All other commands need config loaded first
     let mut config = Config::load_or_init().await?;
     config.apply_env_overrides();
 
     match cli.command {
         None
-        | Some(Commands::Onboard { .. } | Commands::Setup { .. } | Commands::Completions { .. }) => {
+        | Some(
+            Commands::Onboard { .. }
+            | Commands::Setup { .. }
+            | Commands::Autonomy { .. }
+            | Commands::Completions { .. },
+        ) => {
             unreachable!()
         }
 

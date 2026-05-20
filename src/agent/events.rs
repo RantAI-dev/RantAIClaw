@@ -48,6 +48,13 @@ pub enum AgentEvent {
         mcp_servers_configured: Vec<String>,
         /// Per-server qualified tool names actually discovered.
         mcp_tools_by_server: std::collections::HashMap<String, Vec<String>>,
+        /// New `SecurityPolicy` handle from the rebuilt agent. The TUI
+        /// must replace its old handle here and re-subscribe to the
+        /// `PendingApprovals` broadcast — the previous registry
+        /// belonged to the old agent and is no longer being written to
+        /// by the new shell tool. Without this, the inline Y/N prompt
+        /// silently misses every approval after the first reload.
+        security: Option<std::sync::Arc<crate::security::SecurityPolicy>>,
     },
 
     /// Emitted right before the actor begins a compaction so the TUI can

@@ -272,7 +272,7 @@ mod tests {
     #[tokio::test]
     async fn try_handle_reply_resolves_pending() {
         let security = supervised_only_echo();
-        let pending = Arc::new(PendingApprovals::new(Duration::from_secs(10)));
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
         security.set_pending(pending.clone());
 
         // Producer side: shell tool would call this.
@@ -298,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn try_handle_reply_deny_keeps_allowlist_clean() {
         let security = supervised_only_echo();
-        let pending = Arc::new(PendingApprovals::new(Duration::from_secs(10)));
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
         security.set_pending(pending.clone());
 
         let pending2 = pending.clone();

@@ -77,6 +77,7 @@ impl TuiAgentActor {
                                 let mcp_tools_by_server = new_agent.mcp_tools_by_server();
                                 let mcp_servers_configured: Vec<String> =
                                     config.mcp_servers.keys().cloned().collect();
+                                let security = new_agent.security();
                                 self.agent = new_agent;
                                 tracing::info!("agent reloaded with new config");
                                 let _ = self
@@ -84,6 +85,7 @@ impl TuiAgentActor {
                                     .send(crate::agent::events::AgentEvent::ReloadComplete {
                                         mcp_servers_configured,
                                         mcp_tools_by_server,
+                                        security,
                                     })
                                     .await;
                             }
@@ -185,8 +187,23 @@ impl TuiAgentActor {
                     if let Some(config) = self.pending_reload.take() {
                         match crate::agent::Agent::from_config(&config).await {
                             Ok(new_agent) => {
+                                let mcp_tools_by_server = new_agent.mcp_tools_by_server();
+                                let mcp_servers_configured: Vec<String> =
+                                    config.mcp_servers.keys().cloned().collect();
+                                let security = new_agent.security();
                                 self.agent = new_agent;
                                 tracing::info!("agent reloaded with new config (post-turn)");
+                                // Same ReloadComplete shape as the idle
+                                // path so the TUI re-subscribes to the
+                                // fresh PendingApprovals registry.
+                                let _ = self
+                                    .events_tx
+                                    .send(crate::agent::events::AgentEvent::ReloadComplete {
+                                        mcp_servers_configured,
+                                        mcp_tools_by_server,
+                                        security,
+                                    })
+                                    .await;
                             }
                             Err(e) => {
                                 tracing::error!("failed to reload agent post-turn: {e}");

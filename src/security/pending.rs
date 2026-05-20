@@ -97,13 +97,17 @@ struct Inner {
     /// New-request notifications. Listeners that miss a beat just see
     /// the snapshot next time they wake up.
     notify_tx: broadcast::Sender<PendingRequest>,
-    /// How long to wait before auto-denying.
-    timeout: Duration,
+    /// Optional auto-deny timeout. `None` waits forever — matches CC's
+    /// pause semantics for the TUI surface. Tests + channels that
+    /// genuinely want a deadline pass `Some(Duration::…)` via
+    /// `PendingApprovals::new`.
+    timeout: Option<Duration>,
 }
 
 impl PendingApprovals {
-    /// Create a registry with the given decision timeout.
-    pub fn new(timeout: Duration) -> Self {
+    /// Create a registry with the given decision timeout. `None` waits
+    /// indefinitely for an explicit decision.
+    pub fn new(timeout: Option<Duration>) -> Self {
         let (notify_tx, _) = broadcast::channel(32);
         Self {
             inner: Arc::new(Inner {
@@ -129,8 +133,10 @@ impl PendingApprovals {
         v
     }
 
-    /// Block until the user decides on this basename, or the configured
-    /// timeout elapses (in which case we auto-deny).
+    /// Block until the user decides on this basename. When `timeout`
+    /// is `Some`, auto-denies after the deadline; when `None`, waits
+    /// indefinitely (CC-style — the prompt sits until the user acts
+    /// or the process shuts down).
     pub async fn request_decision(
         &self,
         basename: impl Into<String>,
@@ -148,17 +154,25 @@ impl PendingApprovals {
         // Ignore send error: no live subscribers is fine.
         let _ = self.inner.notify_tx.send(request);
 
-        let timeout = self.inner.timeout;
-        let result = tokio::time::timeout(timeout, rx).await;
+        let decision = match self.inner.timeout {
+            Some(d) => match tokio::time::timeout(d, rx).await {
+                Ok(Ok(decision)) => decision,
+                // Timed out or sender dropped — deny is the safe
+                // default. Cleanup happens below regardless.
+                _ => Decision::Deny,
+            },
+            None => match rx.await {
+                Ok(decision) => decision,
+                // Oneshot sender dropped (registry shut down) — deny.
+                Err(_) => Decision::Deny,
+            },
+        };
+
         // Always clean up before returning.
         self.inner.waiting.lock().remove(&id);
         self.inner.snapshot.lock().remove(&id);
 
-        match result {
-            Ok(Ok(decision)) => decision,
-            // oneshot dropped or timed out → deny.
-            _ => Decision::Deny,
-        }
+        decision
     }
 
     /// Resolve a pending request. Returns `true` if a sender was
@@ -198,9 +212,16 @@ impl PendingApprovals {
 }
 
 impl Default for PendingApprovals {
-    /// 5-minute default timeout matches the design doc.
+    /// No timeout by default — the prompt waits indefinitely for an
+    /// explicit user decision. Matches Claude Code's pause semantics:
+    /// the agent doesn't make progress until the user acts. The 60s
+    /// auto-deny that lived here through v0.6.50 caused the LLM to
+    /// re-enter the loop with a "denied" error and explore alternative
+    /// commands, defeating the "deny cancels turn" UX. Non-TUI surfaces
+    /// (Telegram, webhook) that genuinely need a deadline construct
+    /// the registry explicitly with `PendingApprovals::new(Some(d))`.
     fn default() -> Self {
-        Self::new(Duration::from_mins(5))
+        Self::new(None)
     }
 }
 
@@ -210,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_returns_decision() {
-        let registry = PendingApprovals::new(Duration::from_secs(10));
+        let registry = PendingApprovals::new(Some(Duration::from_secs(10)));
         let registry2 = registry.clone();
 
         let task = tokio::spawn(async move {
@@ -235,7 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_yields_deny() {
-        let registry = PendingApprovals::new(Duration::from_millis(50));
+        let registry = PendingApprovals::new(Some(Duration::from_millis(50)));
         let decision = registry
             .request_decision("brew", "brew --version", "tui")
             .await;
@@ -244,8 +265,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_timeout_waits_for_explicit_decision() {
+        // CC-style: prompt waits indefinitely until the user acts.
+        // We simulate by resolving after 50ms — without my fix the
+        // request would auto-deny at 60s and this test would hang for
+        // 60s (or, with the prior default of 5 min, much longer).
+        let registry = PendingApprovals::new(None);
+        let r = registry.clone();
+        let task =
+            tokio::spawn(async move { r.request_decision("brew", "brew --version", "tui").await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(registry
+            .resolve_by_basename("brew", Decision::Session)
+            .is_some());
+        assert_eq!(task.await.unwrap(), Decision::Session);
+    }
+
+    #[tokio::test]
+    async fn default_registry_has_no_timeout() {
+        // Sanity: PendingApprovals::default() is the TUI-facing
+        // constructor; it must not auto-deny.
+        let registry = PendingApprovals::default();
+        let r = registry.clone();
+        let task =
+            tokio::spawn(async move { r.request_decision("brew", "brew --version", "tui").await });
+        // Wait past where the OLD 60s default would have fired. If
+        // somebody ever flips the default back, this test would hang
+        // for 60s+ then auto-deny — failing the assert below.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            registry.list().len(),
+            1,
+            "default registry must not have auto-denied"
+        );
+        registry.resolve_by_basename("brew", Decision::Session);
+        assert_eq!(task.await.unwrap(), Decision::Session);
+    }
+
+    #[tokio::test]
     async fn resolve_by_basename_unique_match() {
-        let registry = PendingApprovals::new(Duration::from_secs(10));
+        let registry = PendingApprovals::new(Some(Duration::from_secs(10)));
         let r = registry.clone();
         let task =
             tokio::spawn(async move { r.request_decision("rg", "rg foo", "telegram").await });
@@ -259,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_by_basename_ambiguous_is_none() {
-        let registry = PendingApprovals::new(Duration::from_secs(10));
+        let registry = PendingApprovals::new(Some(Duration::from_secs(10)));
         let r1 = registry.clone();
         let r2 = registry.clone();
         let _t1 =
@@ -274,7 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_receives_new_requests() {
-        let registry = PendingApprovals::new(Duration::from_secs(10));
+        let registry = PendingApprovals::new(Some(Duration::from_secs(10)));
         let mut rx = registry.subscribe();
         let r = registry.clone();
         let _t =
@@ -289,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_unknown_id_returns_false() {
-        let registry = PendingApprovals::new(Duration::from_secs(10));
+        let registry = PendingApprovals::new(Some(Duration::from_secs(10)));
         assert!(!registry.resolve(Uuid::new_v4(), Decision::Once));
     }
 }

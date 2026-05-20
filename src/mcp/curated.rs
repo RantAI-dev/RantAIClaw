@@ -94,14 +94,16 @@ pub const NO_AUTH: &[CuratedMcpServer] = &[
         auth: AuthMethod::None,
         env_vars: &[],
     },
-    CuratedMcpServer {
-        slug: "filesystem",
-        display_name: "Filesystem",
-        summary: "Sandboxed read/write inside the active workspace.",
-        install_command: &["npx", "-y", "@modelcontextprotocol/server-filesystem"],
-        auth: AuthMethod::None,
-        env_vars: &[],
-    },
+    // `filesystem` was here until v0.6.51. Removed because it duplicates
+    // capabilities the built-in `shell` / `file_read` / `file_write`
+    // tools already provide (gated by `SecurityPolicy.workspace_only`
+    // + `forbidden_paths`), at the cost of ~80MB of node + npx fetch
+    // and 2 wasted iterations per filesystem op while the model
+    // probed both layers. MCP is reserved for integrations rantaiclaw
+    // can't natively implement (GitHub, Slack, Notion, etc.). Users
+    // who want it back can wire it manually with explicit allowed-
+    // dirs args: `[mcp_servers.filesystem] command = "npx" args = ["-y",
+    // "@modelcontextprotocol/server-filesystem", "/path/to/dir"]`.
 ];
 
 pub const AUTHED: &[CuratedMcpServer] = &[

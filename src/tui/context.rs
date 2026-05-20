@@ -87,6 +87,13 @@ pub struct TuiContext {
     /// slash commands to drive the user-facing memory surface
     /// without going through a turn round-trip.
     pub memory: Option<std::sync::Arc<dyn crate::memory::Memory>>,
+    /// Currently-active approval preset for this profile (`Manual` /
+    /// `Smart` / `Strict` / `Off`). Snapshotted at TUI startup and
+    /// refreshed whenever Shift+Tab / `/autonomy` writes a new preset.
+    /// `None` means the policy dir hasn't been provisioned yet (pre-
+    /// onboarding) or the `[autonomy].preset` field couldn't be read —
+    /// the status bar hides the segment in either case.
+    pub autonomy_preset: Option<crate::approval::policy_writer::PolicyPreset>,
     /// Snapshot of the most recently finished turn's tool calls. Used
     /// by the `/calls` slash command so the user can see what the
     /// agent did, especially after a soft-cap hit. Refreshed on every
@@ -152,6 +159,7 @@ impl TuiContext {
             input_history_stash: None,
             security: None,
             memory: None,
+            autonomy_preset: None,
             last_turn_tool_calls: Vec::new(),
             mcp_servers_configured: std::collections::HashSet::new(),
             mcp_tools_by_server: std::collections::HashMap::new(),

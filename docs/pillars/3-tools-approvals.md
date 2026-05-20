@@ -8,9 +8,22 @@ The blast radius surface. Every tool call routes through one approval gate befor
 
 - Built-in tools (shell, file, memory, browser, hardware, MCP-bridged)
 - Approval gate (Manual / Smart / Strict / Off presets, per-agent overrides)
+- v0.6.50 Smart/Strict UX overhaul (inline Y/A/N prompt, plan-mode Strict, cascading approvals)
 - Command allowlist + path traversal + injection blocking
 - Rate limiting (default 20 actions/hour)
 - Basic audit log under `<profile>/audit/`
+
+## v0.6.50 approval UX (Claude Code parity)
+
+When the agent attempts a shell command not on the active preset's allowlist:
+
+1. **Boxed inline prompt** replaces the input row — amber border, command preview, action chips (`[Y]` yes once · `[A]` always (persist) · `[N]` no · `[Esc]` deny). Single keypress resolves.
+2. **No auto-deny timeout** — the prompt sits indefinitely until you act. Matches CC's pause semantics; the LLM is genuinely frozen while waiting.
+3. **Deny cancels the entire turn**, not just the tool call. Stops the LLM from trying alternative commands behind your back.
+4. **Cascading approvals** walk `&&` chains — approving `cd` then re-prompts for the next blocking basename (e.g. `python3`), capped at 6 prompts per call.
+5. **Strict preset = plan mode.** The `shell` tool is dropped from the model's tool list entirely. The agent describes commands instead of attempting them. CC plan-mode analog.
+6. **Preset switching is live.** `Shift+Tab` cycles in the TUI; the runtime rebuilds the `SecurityPolicy` on each switch and the TUI re-subscribes to the fresh `PendingApprovals` broadcast (no more silent dropped approvals after a switch).
+7. **The bundle is now the source of truth.** `<policy_dir>/command_allowlist.toml` patterns are bridged into `config.autonomy.allowed_commands` at preset-apply time; the runtime gate reads the bridged list (previously the bundle was write-only).
 
 ## Vs OpenClaw / Hermes-agent
 
@@ -59,8 +72,16 @@ src/security/      ← rate limit + audit
 ## CLI / config
 
 ```bash
-rantaiclaw setup approvals              # pick Manual / Smart / Strict / Off preset
+rantaiclaw setup approvals              # pick Manual / Smart / Strict / Off preset (wizard)
+rantaiclaw autonomy                     # print active preset + 4 options
+rantaiclaw autonomy <preset>            # switch (manual | smart | strict | off | full)
 ```
+
+Inside the TUI:
+- `Shift+Tab` — cycle Manual → Smart → Strict → Off → Manual
+- `/autonomy` — interactive picker; `/autonomy <preset>` for direct switch
+- `[Y]` / `[A]` / `[N]` / `[Esc]` — resolve the inline approval prompt
+- `/allow <basename> [--persist]` — fallback for non-TUI channels (Telegram, webhook)
 
 ```toml
 [autonomy]

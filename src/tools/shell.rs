@@ -101,40 +101,56 @@ impl Tool for ShellTool {
             });
         }
 
-        match self.security.validate_command_execution(command, approved) {
-            Ok(_) => {}
-            Err(reason) => {
-                // If rejection was specifically about an unknown
-                // basename and an approval registry is bound, suspend
-                // and ask the user. On approval we mutate the runtime
-                // allowlist and retry validation. On deny or timeout
-                // we fall through to the original failure.
-                let mut handled = false;
-                if let (Some(approvals), Some(basename)) = (
-                    self.security.pending(),
-                    self.security.first_unallowed_basename(command),
-                ) {
+        // Cascading approval loop: a single shell command may chain
+        // multiple basenames via `&&` (e.g. `cd … && python3 …`). The
+        // gate rejects on the FIRST unallowed basename; approving it
+        // doesn't help if the next segment is also blocked. Walk the
+        // chain, prompting for each new blocker, until either the
+        // command validates or the user denies. Cap at 6 prompts per
+        // call so an adversarial command can't spin forever.
+        const MAX_CASCADING_APPROVALS: usize = 6;
+        let mut last_reason: Option<String> = None;
+        let mut iters = 0;
+        loop {
+            match self.security.validate_command_execution(command, approved) {
+                Ok(_) => break,
+                Err(reason) => {
+                    iters += 1;
+                    if iters > MAX_CASCADING_APPROVALS {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Cascading approval limit reached ({MAX_CASCADING_APPROVALS}) — last error: {reason}"
+                            )),
+                        });
+                    }
+                    let (Some(approvals), Some(basename)) = (
+                        self.security.pending(),
+                        self.security.first_unallowed_basename(command),
+                    ) else {
+                        // Hard block (high-risk, redirect, subshell
+                        // expansion, etc.) — no basename to approve;
+                        // return the error and let the LLM/UI decide
+                        // what to do. The TUI's per-turn block counter
+                        // surfaces a "switch to /autonomy off" toast
+                        // when these pile up.
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(reason),
+                        });
+                    };
                     let decision = approvals
                         .request_decision(basename.clone(), command.to_string(), "")
                         .await;
                     match decision {
                         Decision::Once | Decision::Session => {
-                            // Once and Session both add to the in-memory
-                            // runtime set — "Once" is a UX label that says
-                            // "I want this to run, don't persist". The
-                            // simplest implementation that keeps the boot
-                            // list immutable is to add to the runtime set
-                            // either way; "Once" callers can clear the set
-                            // out-of-band if they care. We keep them
-                            // distinct here so a future tightening
-                            // (revoke-after-use) doesn't break the API.
                             if let Err(e) = self.security.add_runtime_command(&basename, false) {
                                 tracing::warn!(target: "shell", error = %e, "add_runtime_command failed");
                             }
-                            handled = self
-                                .security
-                                .validate_command_execution(command, approved)
-                                .is_ok();
+                            last_reason = Some(reason);
+                            continue;
                         }
                         Decision::Persist => {
                             if let Err(e) = self.security.add_runtime_command(&basename, true) {
@@ -145,23 +161,23 @@ impl Tool for ShellTool {
                                 );
                                 let _ = self.security.add_runtime_command(&basename, false);
                             }
-                            handled = self
-                                .security
-                                .validate_command_execution(command, approved)
-                                .is_ok();
+                            last_reason = Some(reason);
+                            continue;
                         }
                         Decision::Deny => {
-                            // Explicit user deny: keep the original error.
-                            handled = false;
+                            // Explicit user deny: keep the LAST error
+                            // (the one that triggered this prompt) so
+                            // the message accurately names the blocker
+                            // the user just rejected — not the very
+                            // first one from before any approvals.
+                            let final_reason = last_reason.unwrap_or(reason);
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(final_reason),
+                            });
                         }
                     }
-                }
-                if !handled {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(reason),
-                    });
                 }
             }
         }
@@ -172,6 +188,24 @@ impl Tool for ShellTool {
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
+        }
+
+        // Defensive: re-create the workspace directory if it vanished
+        // (e.g. user deleted it between Config::load_or_init and now).
+        // Without this, `current_dir(workspace_dir)` makes Command::spawn
+        // return a confusing "No such file or directory" with 0ms
+        // elapsed — same shape as a missing `sh` binary.
+        if !self.security.workspace_dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(&self.security.workspace_dir) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Workspace directory {} did not exist and could not be re-created: {e}",
+                        self.security.workspace_dir.display()
+                    )),
+                });
+            }
         }
 
         // Execute with timeout to prevent hanging commands.
@@ -234,11 +268,33 @@ impl Tool for ShellTool {
                     },
                 })
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to execute command: {e}")),
-            }),
+            Ok(Err(e)) => {
+                // ENOENT here usually means either `sh` isn't on PATH
+                // (env_clear stripped it and SAFE_ENV_VARS didn't pick it
+                // back up — unusual) or the workspace_dir we chdir'd
+                // into doesn't exist on disk. Pre-flight checks below
+                // give the user a clearer hint than the raw io::Error.
+                let mut hint = format!("Failed to execute command: {e}");
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    if !self.security.workspace_dir.exists() {
+                        hint = format!(
+                            "Shell spawn failed because workspace directory does not exist: {}\n\
+                             Re-create with: mkdir -p {}",
+                            self.security.workspace_dir.display(),
+                            self.security.workspace_dir.display(),
+                        );
+                    } else if std::env::var_os("PATH").is_none() {
+                        hint = "Shell spawn failed: PATH is empty in the rantaiclaw \
+                                 process environment. Set PATH before launching."
+                            .to_string();
+                    }
+                }
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(hint),
+                })
+            }
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -559,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn shell_with_approvals_session_decision_unblocks() {
         let security = supervised_security_only_echo();
-        let approvals = Arc::new(PendingApprovals::new(Duration::from_secs(5)));
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
         security.set_pending(approvals.clone());
         let tool = ShellTool::new(security.clone(), test_runtime());
 
@@ -587,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn shell_with_approvals_deny_keeps_original_error() {
         let security = supervised_security_only_echo();
-        let approvals = Arc::new(PendingApprovals::new(Duration::from_secs(5)));
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
         security.set_pending(approvals.clone());
         let tool = ShellTool::new(security.clone(), test_runtime());
 
@@ -616,7 +672,7 @@ mod tests {
     #[tokio::test]
     async fn shell_with_approvals_timeout_denies() {
         let security = supervised_security_only_echo();
-        let approvals = Arc::new(PendingApprovals::new(Duration::from_millis(50)));
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_millis(50))));
         security.set_pending(approvals.clone());
         let tool = ShellTool::new(security.clone(), test_runtime());
 
@@ -635,7 +691,7 @@ mod tests {
         // surface an approval prompt — approving "echo" doesn't fix
         // `echo $(rm -rf /)`.
         let security = supervised_security_only_echo();
-        let approvals = Arc::new(PendingApprovals::new(Duration::from_millis(50)));
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_millis(50))));
         security.set_pending(approvals.clone());
         let tool = ShellTool::new(security.clone(), test_runtime());
 

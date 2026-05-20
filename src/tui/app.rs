@@ -203,6 +203,20 @@ pub struct TuiApp {
     /// subscribes (test contexts skip this).
     pub pending_approvals_rx:
         Option<tokio::sync::broadcast::Receiver<crate::security::PendingRequest>>,
+    /// Number of `Command not allowed by security policy` results seen
+    /// in the current turn. Reset on every `finalize_turn` /
+    /// `finalize_error`. Used to surface a one-shot "switch to
+    /// /autonomy off" toast when a skill bootstrap repeatedly hits
+    /// the Smart gate.
+    pub shell_blocks_this_turn: u32,
+    /// Whether the autonomy-hint toast has already fired this turn so
+    /// we don't spam the user with the same suggestion on every block.
+    pub autonomy_hint_shown_this_turn: bool,
+    /// Most-recent unresolved pending approval. When `Some`, the input
+    /// box surfaces a single-key Y/N/A prompt and absorbs Y/N/A/Esc so
+    /// the user doesn't have to type `/allow X`. Resolves via
+    /// `security.pending().resolve_by_basename(...)` and clears here.
+    pub pending_approval: Option<crate::security::PendingRequest>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -367,6 +381,9 @@ impl TuiApp {
             clear_terminal_request: false,
             first_run_wizard: None,
             pending_approvals_rx: None,
+            shell_blocks_this_turn: 0,
+            autonomy_hint_shown_this_turn: false,
+            pending_approval: None,
         })
     }
 
@@ -382,6 +399,173 @@ impl TuiApp {
         } else {
             self.autocomplete.hide();
         }
+    }
+
+    /// Advance the approval-policy preset for the active profile by one
+    /// step (`Manual → Smart → Strict → Off → Manual`) and persist it
+    /// to `<policy_dir>/{autonomy,command_allowlist,forbidden_paths}.toml`.
+    ///
+    /// Wired to `KeyCode::BackTab` (Shift+Tab) and shared with the
+    /// `/autonomy` slash command (which calls into the same write path).
+    /// The on-disk write goes through `policy_writer::write_policy_files`
+    /// with `force=true` — that's the same call `rantaiclaw setup
+    /// approvals --force` makes, so any hand-edits to
+    /// `command_allowlist.toml` / `forbidden_paths.toml` are clobbered.
+    /// `runtime_allowlist.toml` (the user's `/allow X --persist`
+    /// accretions) lives in a separate file and is preserved.
+    fn cycle_autonomy_preset(&mut self) {
+        use crate::approval::policy_writer::{self, PolicyPreset};
+        let dir = self.profile.policy_dir();
+        let current = policy_writer::read_active_preset(&dir).unwrap_or(PolicyPreset::Smart);
+        let next = current.next();
+        let warning = match policy_writer::write_policy_files(&self.profile, next, true) {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = self
+                    .context
+                    .append_system_message(&format!("✗ Failed to switch autonomy mode: {e}"));
+                return;
+            }
+        };
+        // Propagate to config.toml + live agent. Without this step the
+        // preset file changes but `SecurityPolicy.autonomy` keeps its
+        // launch-time value (v0.6.49 bug — Off didn't actually disable
+        // the gate). `apply_preset_to_config_and_reload` saves
+        // config.toml synchronously via block_in_place and asks the
+        // actor to rebuild the agent with the new policy.
+        if let Err(e) = self.apply_preset_to_config_and_reload(next) {
+            let _ = self
+                .context
+                .append_system_message(&format!("⚠ Preset written, but live reload failed: {e}"));
+        }
+        self.context.autonomy_preset = Some(next);
+        let _ = self.context.append_system_message(&format!(
+            "⚙ Autonomy mode → {} ({}). Shift+Tab to cycle · /autonomy to pick.",
+            next.label(),
+            preset_blurb(next),
+        ));
+        if let Some(w) = warning {
+            let _ = self.context.append_system_message(w);
+        }
+    }
+
+    /// Apply `preset` to `self.config.autonomy.level`, save config.toml,
+    /// and send the rebuilt config to the agent actor so the next turn
+    /// uses the new `SecurityPolicy`. Returns the underlying error if
+    /// saving or reloading fails — caller surfaces it as a system
+    /// message but does not bail the TUI.
+    fn apply_preset_to_config_and_reload(
+        &mut self,
+        preset: crate::approval::policy_writer::PolicyPreset,
+    ) -> Result<()> {
+        crate::approval::policy_writer::apply_preset_to_config(&mut self.config, preset);
+        // Save is async (encrypts secrets); drive it on the current
+        // tokio runtime via block_in_place. Same pattern `/memory` uses.
+        let config_for_save = self.config.clone();
+        let saved = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(config_for_save.save())
+        });
+        saved?;
+        // Hand the new config to the agent actor — mirrors what
+        // `reload_config` does after a wizard run, but without the
+        // wholesale re-read since we already have the live struct.
+        let req_tx = self.context.req_tx.clone();
+        let config = self.config.clone();
+        tokio::spawn(async move {
+            let _ = req_tx
+                .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                .await;
+        });
+        Ok(())
+    }
+
+    /// Resolve the current pending approval inline via Y/N/A keystroke.
+    /// `Session` allows the basename for this session only; `Persist`
+    /// writes it to runtime_allowlist.toml; `Deny` rejects the call
+    /// **and cancels the entire turn** so the LLM doesn't loop on
+    /// alternative commands after the user has said no. Clears
+    /// `self.pending_approval` regardless of outcome so the prompt
+    /// overlay disappears.
+    ///
+    /// The "deny cancels everything" semantics (vs CC's "deny returns
+    /// to LLM") came from tester feedback: under the per-call-deny
+    /// model the LLM kept trying alternative invocations (`curl -s` →
+    /// blocked → `curl --head` → blocked → …) and burned a turn
+    /// before giving up. One decision, one outcome.
+    fn resolve_pending_approval(&mut self, decision: crate::security::Decision) {
+        let req = match self.pending_approval.take() {
+            Some(r) => r,
+            None => return,
+        };
+        let basename = req.basename.clone();
+        let Some(security) = self.context.security.as_ref() else {
+            let _ = self
+                .context
+                .append_system_message("Security policy not available — cannot resolve approval.");
+            return;
+        };
+        let Some(pending) = security.pending() else {
+            let _ = self
+                .context
+                .append_system_message("Pending-approval registry not attached — cannot resolve.");
+            return;
+        };
+        // Persist / Session decisions also add the basename to the
+        // runtime allowlist so the same command doesn't prompt twice
+        // in this session. Mirrors what /allow does.
+        let persist_flag = matches!(decision, crate::security::Decision::Persist);
+        if matches!(
+            decision,
+            crate::security::Decision::Session | crate::security::Decision::Persist
+        ) {
+            if let Err(e) = security.add_runtime_command(&basename, persist_flag) {
+                tracing::warn!(
+                    target: "tui",
+                    error = %e,
+                    basename = %basename,
+                    "inline approval add_runtime_command failed"
+                );
+            }
+        }
+        let resolved = pending.resolve_by_basename(&basename, decision).is_some();
+
+        // Deny → cancel the entire turn. Without this, the shell tool
+        // returns the error to the LLM which typically reacts by
+        // trying alternative commands (each hitting the gate again).
+        // The user already said no; respect that as a "stop, don't
+        // explore alternatives" signal. Sent as a non-blocking
+        // try_send so resolve never stalls if the actor channel is
+        // back-pressured.
+        if matches!(decision, crate::security::Decision::Deny) {
+            // Mark the streaming state as cancelling so the status bar
+            // reflects the in-flight cancel immediately. The actor
+            // will catch TurnRequest::Cancel and fire the token; the
+            // outer agent loop already produces a clean Done event.
+            if let AppState::Streaming { cancelling, .. } = &mut self.state {
+                *cancelling = true;
+            }
+            let req_tx = self.context.req_tx.clone();
+            tokio::spawn(async move {
+                let _ = req_tx.send(crate::tui::TurnRequest::Cancel).await;
+            });
+        }
+
+        let msg = match decision {
+            crate::security::Decision::Session if resolved => {
+                format!("✓ Approved `{basename}` for this session.")
+            }
+            crate::security::Decision::Persist if resolved => {
+                format!("✓ Approved `{basename}` and persisted to allowlist.")
+            }
+            crate::security::Decision::Deny => {
+                format!("✗ Denied `{basename}` — turn cancelled.")
+            }
+            _ => {
+                format!("⚠ `{basename}` was no longer pending (timed out or already resolved).")
+            }
+        };
+        let _ = self.context.append_system_message(&msg);
+        self.scrollback_queue.push(("system".into(), msg));
     }
 
     /// Replace the input buffer with the highlighted command name.
@@ -406,6 +590,33 @@ impl TuiApp {
         // next key — late-arriving results land in the picker before the
         // user's next action so they always see the freshest state.
         self.drain_clawhub_search_results();
+
+        // Inline pending-approval prompt: when an approval is open and
+        // the user hits Y/N/A/Esc, resolve it without going through
+        // `/allow` slash commands. Modifiers must be empty so we don't
+        // clash with Ctrl-Y (none today, future-proofing) or
+        // accidentally fire when the user types "yes" into the buffer.
+        // This arm runs BEFORE the Ctrl+D/Ctrl+C globals so the prompt
+        // wins for these specific keys; quit shortcuts still work for
+        // everything else.
+        if self.pending_approval.is_some() && key.modifiers.is_empty() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.resolve_pending_approval(crate::security::Decision::Session);
+                    return Ok(EventResult::Continue);
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.resolve_pending_approval(crate::security::Decision::Persist);
+                    return Ok(EventResult::Continue);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.resolve_pending_approval(crate::security::Decision::Deny);
+                    return Ok(EventResult::Continue);
+                }
+                _ => {} // fall through to normal key handling
+            }
+        }
+
         match key.code {
             // Ctrl+D → always quit
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -621,6 +832,14 @@ impl TuiApp {
             // slash command (the autocomplete is visible only then).
             KeyCode::Tab if self.autocomplete.is_visible() => {
                 self.complete_selected_command();
+            }
+            // Shift+Tab — Claude-Code-style cycle through approval-policy
+            // presets (Manual → Smart → Strict → Off → …). Only fires
+            // when no modal is up; all picker/overlay/wizard arms above
+            // already returned early before we got here.
+            KeyCode::BackTab => {
+                self.cycle_autonomy_preset();
+                return Ok(EventResult::Continue);
             }
             // Ctrl+Enter → submit (Kitty-protocol terminals).
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1171,11 +1390,26 @@ impl TuiApp {
             loop {
                 match rx.try_recv() {
                     Ok(req) => {
+                        // Short audit-trail line for scrollback — the
+                        // real prompt UI is the boxed widget that takes
+                        // over the input row. The full command was
+                        // already echoed in the assistant's tool block
+                        // line, so this is just the gate fingerprint.
                         let line = format!(
-                            "🔒 Approval needed: `{0}` (full command: `{1}`).\n   Type one of: `/allow {0}` · `/allow {0} --persist` · `/deny {0}` (auto-deny in 5 min)",
-                            req.basename, req.full_command
+                            "🔒 awaiting decision on `{}` (press Y/A/N or Esc)",
+                            req.basename
                         );
                         let _ = self.context.append_system_message(&line);
+                        self.scrollback_queue.push(("system".into(), line));
+                        // Stash the latest pending request so the key
+                        // handler can resolve it inline via single
+                        // keystroke without the user typing /allow X.
+                        // Replacing an earlier unresolved request is
+                        // fine — the inner registry tracks all of them
+                        // by id, and the user only sees the newest in
+                        // the prompt. Older ones still auto-deny on
+                        // timeout.
+                        self.pending_approval = Some(req);
                     }
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
@@ -1311,6 +1545,14 @@ impl TuiApp {
         // loaded — without this, the next config.save() bails with
         // "Config path must have a parent directory".
         config.config_path = path.clone();
+        // `workspace_dir` is also `#[serde(skip)]`. Forgetting to
+        // restore it after a reload sets `SecurityPolicy.workspace_dir`
+        // to an empty path, which makes `tokio::process::Command::
+        // current_dir("")` fail with "No such file or directory" at
+        // spawn time — that's the "shell broken after config reload"
+        // bug. Re-derive it from the active profile so the rebuilt
+        // agent runs shell tools in the right cwd.
+        config.workspace_dir = self.profile.workspace_dir();
         // Decrypt secrets before pushing to the agent. Without this the
         // agent receives encrypted blobs in `config.api_key` and friends
         // and every API call returns 401 "Missing Authentication header"
@@ -1505,6 +1747,31 @@ impl TuiApp {
                         format!("{marker} {name}({args_compact}) → {status} ({elapsed_label})");
                     self.scrollback_queue.push(("_tool_log".to_string(), line));
                 }
+
+                // UX nudge: if the agent is repeatedly hitting the
+                // security gate on Smart/Manual/Strict, the user is
+                // almost certainly trying a skill that needs broader
+                // shell access. Surface a one-shot hint pointing at
+                // `/autonomy off`. Threshold of 3 blocks per turn so
+                // a single mistyped command doesn't trigger the toast.
+                if !ok && output_preview.contains("Command not allowed by security policy") {
+                    self.shell_blocks_this_turn = self.shell_blocks_this_turn.saturating_add(1);
+                    if self.shell_blocks_this_turn == 3 && !self.autonomy_hint_shown_this_turn {
+                        self.autonomy_hint_shown_this_turn = true;
+                        let preset = self
+                            .context
+                            .autonomy_preset
+                            .map(|p| p.label())
+                            .unwrap_or("Smart");
+                        let hint = format!(
+                            "⚠ Multiple shell commands blocked by {preset} preset. \
+                             If this is a trusted skill bootstrap, run /autonomy off \
+                             (then /autonomy smart when done) for unrestricted access."
+                        );
+                        let _ = self.context.append_system_message(&hint);
+                        self.scrollback_queue.push(("system".into(), hint));
+                    }
+                }
             }
             AgentEvent::Usage(u) => {
                 // Map the agent's cost::TokenUsage onto the TUI's tally shape.
@@ -1526,6 +1793,7 @@ impl TuiApp {
             AgentEvent::ReloadComplete {
                 mcp_servers_configured,
                 mcp_tools_by_server,
+                security,
             } => {
                 // Refresh the TUI's cached MCP snapshot so `/mcp`
                 // reflects the post-reload state. The agent already
@@ -1533,6 +1801,26 @@ impl TuiApp {
                 // turn — this just keeps the UI's view in sync.
                 self.context.mcp_servers_configured = mcp_servers_configured.into_iter().collect();
                 self.context.mcp_tools_by_server = mcp_tools_by_server;
+                // Re-subscribe to the new SecurityPolicy's pending-
+                // approval broadcast. The old subscriber was bound to
+                // the previous registry, which the new shell tool
+                // doesn't write to — without this, every approval
+                // after the first /autonomy switch was silently
+                // missed and the inline Y/N prompt never appeared.
+                if let Some(new_security) = security {
+                    if let Some(pending) = new_security.pending() {
+                        self.pending_approvals_rx = Some(pending.subscribe());
+                    }
+                    self.context.security = Some(new_security);
+                    // Drop any stale prompt left over from the
+                    // previous registry — it's no longer resolvable.
+                    self.pending_approval = None;
+                }
+                // Snapshot the freshly-active preset so the status bar
+                // colour and inline command-allowlist hint match the
+                // newly-loaded policy.
+                self.context.autonomy_preset =
+                    crate::approval::policy_writer::read_active_preset(&self.profile.policy_dir());
             }
             AgentEvent::CompactionStart {
                 original_count,
@@ -1633,6 +1921,10 @@ impl TuiApp {
     /// If more turns are queued, transitions back to a fresh `Streaming`
     /// state; otherwise returns to `Ready`.
     fn finalize_turn(&mut self, final_text: String, cancelled: bool) {
+        // Reset per-turn UX counters before any state transitions so
+        // the next turn starts with a clean slate.
+        self.shell_blocks_this_turn = 0;
+        self.autonomy_hint_shown_this_turn = false;
         let mut body = if cancelled && final_text.is_empty() {
             if let AppState::Streaming { partial, .. } = &self.state {
                 partial.clone()
@@ -1738,6 +2030,10 @@ impl TuiApp {
     /// short, actionable line so the chat doesn't get a wall of stack
     /// trace. Unknown errors fall through verbatim.
     fn finalize_error(&mut self, msg: String) {
+        // Reset per-turn UX counters here too, since errors are
+        // alternative turn-end states.
+        self.shell_blocks_this_turn = 0;
+        self.autonomy_hint_shown_this_turn = false;
         let provider_hint = self
             .config
             .default_provider
@@ -1972,6 +2268,44 @@ impl TuiApp {
                 // (split between Focus::Search → search and Focus::List
                 // → install) so it never reaches dispatch. This arm is
                 // unreachable; left as a defensive no-op.
+            }
+            ListPickerKind::Autonomy => {
+                use crate::approval::policy_writer::{self, PolicyPreset};
+                let target = match PolicyPreset::from_str_ci(&key) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let msg = format!("Unknown autonomy preset key '{key}': {e}");
+                        let _ = self.context.append_system_message(&msg);
+                        self.scrollback_queue.push(("system".into(), msg));
+                        return;
+                    }
+                };
+                let warning = match policy_writer::write_policy_files(&self.profile, target, true) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        let msg = format!("Failed to switch autonomy mode: {e}");
+                        let _ = self.context.append_system_message(&msg);
+                        self.scrollback_queue.push(("system".into(), msg));
+                        return;
+                    }
+                };
+                if let Err(e) = self.apply_preset_to_config_and_reload(target) {
+                    let msg = format!("⚠ Preset written, but live reload failed: {e}");
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".into(), msg));
+                }
+                self.context.autonomy_preset = Some(target);
+                let msg = format!(
+                    "⚙ Autonomy mode → {} ({}). Shift+Tab to cycle · /autonomy to pick.",
+                    target.label(),
+                    preset_blurb(target),
+                );
+                let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".into(), msg));
+                if let Some(w) = warning {
+                    let _ = self.context.append_system_message(w);
+                    self.scrollback_queue.push(("system".into(), w.to_string()));
+                }
             }
         }
     }
@@ -2640,22 +2974,34 @@ impl TuiApp {
             ..
         } = self;
 
+        let pending_approval_snapshot = self.pending_approval.clone();
         terminal.draw(|frame| {
             let area = frame.area();
 
-            // Original tight 6-row layout: preview + input + status.
+            // Tight 5-row layout: input + status. The pre-v0.6.50 layout
+            // also reserved a stream-preview row above the input box that
+            // duplicated the cancelling/thinking/streaming indicator
+            // already shown in the status bar. Two indicators ticking at
+            // once were noisy + confusing per tester feedback, so the
+            // upper pane was removed and the status bar is now the
+            // canonical streaming surface.
+            let _ = stream_committed_chars; // kept on App for future re-introduction
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(STREAM_PREVIEW_LINES),
-                    Constraint::Length(4),
-                    Constraint::Length(1),
-                ])
+                .constraints([Constraint::Length(4), Constraint::Length(1)])
                 .split(area);
 
-            render_stream_preview_pane(state, *stream_committed_chars, frame, chunks[0]);
-            render_input_pane(context, frame, chunks[1]);
-            render_status_pane(context, state, frame, chunks[2]);
+            // When an approval is pending, the top row swaps from the
+            // input box to the styled approval prompt — same height so
+            // the status bar stays put. The key handler absorbs Y/A/N/
+            // Esc while the prompt is up; everything else falls through
+            // (so Ctrl+C still cancels, /quit still works, etc.).
+            if let Some(ref req) = pending_approval_snapshot {
+                render_approval_pane(req, frame, chunks[0]);
+            } else {
+                render_input_pane(context, frame, chunks[0]);
+            }
+            render_status_pane(context, state, frame, chunks[1]);
 
             // Modal overlay (e.g. /help) takes over the entire viewport.
             if let Some(content) = overlay.as_ref() {
@@ -3080,7 +3426,7 @@ impl TuiApp {
             let age_secs = self.context.started_at.elapsed().as_secs();
             let age_label = format_duration_short(age_secs);
 
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(" $ ", sky),
                 Span::styled(
                     self.context.model.clone(),
@@ -3105,11 +3451,53 @@ impl TuiApp {
                 Span::styled(format!("{} msgs", self.context.messages.len()), muted),
                 Span::styled("  │  ", muted),
                 Span::styled(age_label, muted),
-            ])
+            ];
+            append_autonomy_segment(&mut spans, self.context.autonomy_preset, muted);
+            Line::from(spans)
         };
 
         let status = Paragraph::new(line);
         frame.render_widget(status, area);
+    }
+}
+
+/// Append a `· <preset>` segment to the status bar when an active
+/// preset is known. Colour-coded so the user can tell at a glance which
+/// tier they're in: Off in coral (autonomy hot), Strict in muted-amber,
+/// Manual in sky, Smart in mint (default-feel). When `preset` is `None`
+/// (pre-onboarding, unreadable file), the segment is omitted entirely.
+pub(crate) fn append_autonomy_segment(
+    spans: &mut Vec<Span<'_>>,
+    preset: Option<crate::approval::policy_writer::PolicyPreset>,
+    muted: Style,
+) {
+    use crate::approval::policy_writer::PolicyPreset;
+    let Some(p) = preset else {
+        return;
+    };
+    let colour = match p {
+        PolicyPreset::Off => Color::Rgb(255, 123, 123),
+        PolicyPreset::Strict => Color::Rgb(241, 196, 15),
+        PolicyPreset::Manual => Color::Rgb(94, 184, 255),
+        PolicyPreset::Smart => Color::Rgb(126, 226, 179),
+    };
+    spans.push(Span::styled("  │  ", muted));
+    spans.push(Span::styled(
+        p.label().to_string(),
+        Style::default().fg(colour).add_modifier(Modifier::BOLD),
+    ));
+}
+
+/// One-line description for each approval preset, used by the Shift+Tab
+/// confirmation toast and the `/autonomy` help text. Shorter than the
+/// preset bundle's `description` field so it reads cleanly inline.
+pub(crate) fn preset_blurb(preset: crate::approval::policy_writer::PolicyPreset) -> &'static str {
+    use crate::approval::policy_writer::PolicyPreset;
+    match preset {
+        PolicyPreset::Manual => "every tool call prompts",
+        PolicyPreset::Smart => "read-only auto, writes prompt",
+        PolicyPreset::Strict => "deny by default, no prompts",
+        PolicyPreset::Off => "no prompts — trusted env only",
     }
 }
 
@@ -3433,6 +3821,11 @@ fn commit_lines_to_scrollback(
 /// shows the still-uncommitted tail of the assistant's reply as it
 /// arrives. Empty when not streaming. The first row also shows a Braille
 /// spinner so the user has motion to look at while bytes accumulate.
+// Removed from the render pipeline in v0.6.50 — the status bar's
+// WorkingState indicator covers the same ground. Kept around so it
+// can be re-wired by flipping `STREAM_PREVIEW_LINES` back to `1` and
+// adding the constraint + call to the layout in `render()`.
+#[allow(dead_code)]
 fn render_stream_preview_pane(
     state: &AppState,
     committed_chars: usize,
@@ -3498,6 +3891,106 @@ fn render_stream_preview_pane(
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
+}
+
+/// Render the boxed approval prompt that replaces the input row while
+/// a `PendingRequest` is open. Designed to match Claude Code's prompt
+/// style: amber border (caution), basename in bold, full command in a
+/// muted block with newlines preserved, action chips with the hotkey
+/// letter highlighted.
+///
+/// Layout (4 rows total, same height as the input box it replaces):
+///
+/// ```text
+/// ╭ 🔒 Approval needed · cd ────────────────────────────╮
+/// │ cd /home/.../skills/stocks && .venv/bin/python …   │
+/// │                                                     │
+/// │ [Y] yes once   [A] always   [N] no   [Esc] deny    │
+/// ╰─────────────────────────────────────────────────────╯
+/// ```
+fn render_approval_pane(
+    req: &crate::security::PendingRequest,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+) {
+    let amber = Color::Rgb(241, 196, 15);
+    let muted = Color::Rgb(150, 150, 150);
+    let key_bg = Color::Rgb(241, 196, 15);
+    let key_fg = Color::Rgb(20, 20, 20);
+
+    // Compress the command preview to a single line — multi-line
+    // heredocs (e.g. the stocks skill's `python3 - <<'PY' ... PY`)
+    // blow out the 4-row pane and bury the action chips. The full
+    // command was already shown in the system-message scrollback line
+    // when the request landed, so this preview is just enough context
+    // for the user to decide.
+    let one_line = req.full_command.replace('\n', " ⏎ ");
+    let preview = if one_line.chars().count() > 200 {
+        let head: String = one_line.chars().take(197).collect();
+        format!("{head}…")
+    } else {
+        one_line
+    };
+
+    fn chip(
+        key: &str,
+        label: &str,
+        key_bg: Color,
+        key_fg: Color,
+        muted: Color,
+    ) -> Vec<Span<'static>> {
+        vec![
+            Span::styled(
+                format!(" {key} "),
+                Style::default()
+                    .bg(key_bg)
+                    .fg(key_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {label}   "), Style::default().fg(muted)),
+        ]
+    }
+
+    let mut chip_spans: Vec<Span<'static>> = Vec::new();
+    chip_spans.extend(chip("Y", "yes once", key_bg, key_fg, muted));
+    chip_spans.extend(chip("A", "always (persist)", key_bg, key_fg, muted));
+    chip_spans.extend(chip("N", "no", key_bg, key_fg, muted));
+    chip_spans.extend(chip("Esc", "deny", key_bg, key_fg, muted));
+
+    let body = vec![
+        Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(preview, Style::default().fg(Color::Rgb(220, 220, 220))),
+        ]),
+        Line::from(chip_spans),
+    ];
+
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "🔒 Approval needed",
+            Style::default().fg(amber).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(muted)),
+        Span::styled(
+            req.basename.clone(),
+            Style::default()
+                .fg(Color::Rgb(255, 255, 255))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ]);
+
+    let para = Paragraph::new(body)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(amber)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
 }
 
 fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
@@ -3597,7 +4090,7 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
         let age_secs = ctx.started_at.elapsed().as_secs();
         let age_label = format_duration_short(age_secs);
 
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(" $ ", sky),
             Span::styled(
                 ctx.model.clone(),
@@ -3622,7 +4115,9 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
             Span::styled(format!("{} msgs", ctx.messages.len()), muted),
             Span::styled("  │  ", muted),
             Span::styled(age_label, muted),
-        ])
+        ];
+        append_autonomy_segment(&mut spans, ctx.autonomy_preset, muted);
+        Line::from(spans)
     };
 
     let status = Paragraph::new(line);
@@ -4186,17 +4681,15 @@ fn format_duration_short(secs: u64) -> String {
 /// Lines reserved at the bottom of the terminal for the live inline
 /// viewport (status bar + input box + spinner room). Everything else flows
 /// into the terminal's native scrollback.
-/// Inline viewport height. Reverted to a tight 6-row layout because
-/// any static "leave room for the dropdown below input" approach
-/// in ratatui's inline mode leaves visible blank rows in scrollback.
-/// Dropdown renders ABOVE the input within these 6 rows.
-pub const INLINE_VIEWPORT_LINES: u16 = 6;
-/// Rows reserved at the top of the inline viewport for the live streaming
-/// preview (the still-uncommitted tail of the assistant's reply). Always
-/// present so the viewport size doesn't need to resize between idle and
-/// streaming states. Just one row — the spinner and current in-progress
-/// snippet share it. Completed lines flow up into permanent scrollback.
-pub const STREAM_PREVIEW_LINES: u16 = 1;
+/// Inline viewport height. Tight 5-row layout: 4 rows of input box +
+/// 1 row of status bar. v0.6.50 dropped the stream-preview row that
+/// used to duplicate the status bar's spinner/label.
+pub const INLINE_VIEWPORT_LINES: u16 = 5;
+/// Retained constant (= 0) so old call sites that used it as an offset
+/// keep type-checking. The stream-preview pane was removed in v0.6.50;
+/// re-introducing it means flipping this to `1` and adding the
+/// `Constraint::Length(STREAM_PREVIEW_LINES)` back to the layout.
+pub const STREAM_PREVIEW_LINES: u16 = 0;
 
 /// Set up the terminal in **inline mode** — no alternate screen takeover.
 ///
@@ -4569,11 +5062,36 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     }
     app.context.security = security_handle;
     app.context.memory = Some(memory_handle);
+    app.context.autonomy_preset =
+        crate::approval::policy_writer::read_active_preset(&profile.policy_dir());
 
     // Surface MCP server config + discovered tools so `/mcp` can
     // render a useful diff between "configured" and "actually live".
     app.context.mcp_servers_configured = app_config.mcp_servers.keys().cloned().collect();
     app.context.mcp_tools_by_server = mcp_tools_by_server;
+
+    // v0.6.51 deprecation: the curated `filesystem` MCP was dropped
+    // because it duplicates the built-in shell / file_read / file_write
+    // tools at the cost of ~80MB of node + 2 wasted iterations per fs
+    // op. We don't auto-remove the user's config entry (their data),
+    // just surface a one-shot warning so they know they can clean it
+    // up. Detection is loose — anything with `filesystem` in the slug
+    // and an npx `@modelcontextprotocol/server-filesystem` command.
+    if let Some((slug, entry)) = app_config.mcp_servers.iter().find(|(s, e)| {
+        s.contains("filesystem")
+            && e.command == "npx"
+            && e.args
+                .iter()
+                .any(|a| a.contains("@modelcontextprotocol/server-filesystem"))
+    }) {
+        let _ = app.context.append_system_message(&format!(
+            "⚠ MCP server `{slug}` (`@modelcontextprotocol/server-filesystem`) is deprecated \
+             in rantaiclaw. The built-in `shell`/`file_read`/`file_write` tools cover the same \
+             surface without the npx overhead. Remove the `[mcp_servers.{slug}]` block from \
+             config.toml to free up ~80MB of node + reduce wasted tool iterations."
+        ));
+        let _ = entry; // suppress unused warning when args check skipped
+    }
 
     if let Some(topic) = tui_config.setup_provisioner.take() {
         // `rantaiclaw setup` (no topic) and `rantaiclaw setup full` both
@@ -4997,6 +5515,9 @@ mod tests {
             clear_terminal_request: false,
             first_run_wizard: None,
             pending_approvals_rx: None,
+            shell_blocks_this_turn: 0,
+            autonomy_hint_shown_this_turn: false,
+            pending_approval: None,
         }
     }
 
@@ -5092,6 +5613,9 @@ mod submit_tests {
             clear_terminal_request: false,
             first_run_wizard: None,
             pending_approvals_rx: None,
+            shell_blocks_this_turn: 0,
+            autonomy_hint_shown_this_turn: false,
+            pending_approval: None,
         }
     }
 
@@ -5203,6 +5727,9 @@ mod ctrl_c_tests {
             clear_terminal_request: false,
             first_run_wizard: None,
             pending_approvals_rx: None,
+            shell_blocks_this_turn: 0,
+            autonomy_hint_shown_this_turn: false,
+            pending_approval: None,
         }
     }
 
@@ -5293,6 +5820,9 @@ mod drain_tests {
             clear_terminal_request: false,
             first_run_wizard: None,
             pending_approvals_rx: None,
+            shell_blocks_this_turn: 0,
+            autonomy_hint_shown_this_turn: false,
+            pending_approval: None,
         }
     }
 
@@ -5456,6 +5986,9 @@ mod retry_tests {
             clear_terminal_request: false,
             first_run_wizard: None,
             pending_approvals_rx: None,
+            shell_blocks_this_turn: 0,
+            autonomy_hint_shown_this_turn: false,
+            pending_approval: None,
         }
     }
 

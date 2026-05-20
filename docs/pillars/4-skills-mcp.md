@@ -8,7 +8,7 @@ Composable, reusable agent capabilities. Skills are markdown bundles with tool w
 
 - 5-skill bundled starter pack (web-search, scheduler-reminders, summarizer, research-assistant, meeting-notes)
 - ClawHub multi-select skill picker (sorted by stars, SHA-256 verified install)
-- 9 MCP servers curated picker — 3 zero-auth + 6 authenticated, with inline auth
+- 8 MCP servers curated picker — 2 zero-auth + 6 authenticated, with inline auth (filesystem dropped in v0.6.51 — see below)
 - Spawn-and-validate at setup time (zero-auth servers)
 - SkillForge — skill authoring helper
 
@@ -56,6 +56,24 @@ src/skillforge/    ← Authoring helper
 Skills are data, not code — no trait. Adding a skill means writing `SKILL.md` + tool descriptors and dropping it in the skills dir, or installing from ClawHub.
 
 For programmatic tool surfaces, see Pillar 3 — `Tool` trait.
+
+## Why no `filesystem` MCP server in the curated list
+
+Removed in v0.6.51. RantaiClaw ships built-in `shell`, `file_read`, and `file_write` tools gated by `SecurityPolicy.workspace_only` + `forbidden_paths`. The MCP `@modelcontextprotocol/server-filesystem` package duplicated those capabilities at the cost of:
+
+- ~80MB of node + npx fetch on first agent boot
+- 2 wasted tool iterations per filesystem op (the model probes both layers)
+- A second allowed-dirs sandbox to keep in sync with the rantaiclaw workspace
+
+MCP is reserved for integrations rantaiclaw can't natively implement — GitHub, Slack, Notion, Linear, etc. Users who still want the filesystem MCP can wire it manually with explicit allowed-dirs args:
+
+```toml
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace", "/path/to/skills"]
+```
+
+The TUI surfaces a one-shot deprecation toast at boot when it detects an existing `filesystem` MCP entry, pointing users at this section.
 
 ## CLI / config
 

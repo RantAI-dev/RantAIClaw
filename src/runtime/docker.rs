@@ -133,6 +133,12 @@ impl RuntimeAdapter for DockerRuntime {
             .arg("-c")
             .arg(command);
 
+        // Kill the `docker run …` child if the future is dropped — the
+        // `--rm` flag then cleans up the container. Without this, a
+        // Ctrl+C mid-run leaves the docker CLI process waiting on the
+        // container and the container itself keeps executing.
+        process.kill_on_drop(true);
+
         Ok(process)
     }
 }

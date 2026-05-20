@@ -18,6 +18,33 @@ timeout_secs = 60
 # Read-only seeds + safe inspections. Globs follow the
 # `<command> <args>` shape used by ApprovalGate::check.
 patterns = [
+  # Shell builtins / lookups — no side effects, no execution.
+  # Without these, every `cd … && python …` chain failed at the cd
+  # step even though cd in `sh -c` is ephemeral (each tool call is
+  # a fresh subshell so the chdir doesn't persist). v0.6.50.
+  "cd",
+  "cd *",
+  "pushd",
+  "pushd *",
+  "popd",
+  "echo",
+  "echo *",
+  "printf",
+  "printf *",
+  "true",
+  "false",
+  "which",
+  "which *",
+  "command",
+  "command *",
+  "type",
+  "type *",
+  "test",
+  "test *",
+  "[",
+  "[ *",
+  "exit",
+
   # File / directory inspection
   "ls",
   "ls *",

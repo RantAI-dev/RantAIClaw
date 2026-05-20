@@ -6,7 +6,7 @@
 //! §"Section 5 — mcp (NEW)" + §"MCP discovery".
 //!
 //! Flow:
-//! 1. Yes/no: install zero-auth servers (web-fetch, time, filesystem).
+//! 1. Yes/no: install zero-auth servers (web-fetch, time).
 //! 2. `MultiSelect` over the curated authed list.
 //! 3. Per-pick credential collection — masked input or OAuth.
 //! 4. Spawn-and-validate (5 s `initialize` ack); skip + warn on failure.
@@ -43,7 +43,7 @@ pub async fn run_interactive(profile: &Profile, config: &mut Config) -> Result<(
 
     // 1. Zero-auth bundle.
     let install_zero_auth = Confirm::with_theme(&theme)
-        .with_prompt("Install zero-auth MCP servers? (web-fetch, time, filesystem)")
+        .with_prompt("Install zero-auth MCP servers? (web-fetch, time)")
         .default(true)
         .interact()
         .context("read zero-auth confirmation")?;

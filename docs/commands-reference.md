@@ -30,6 +30,22 @@ Last verified: **February 20, 2026**.
 
 ## Command Groups
 
+### `autonomy`
+
+- `rantaiclaw autonomy` — print the currently-active preset + the four options
+- `rantaiclaw autonomy <preset>` — switch to `manual`, `smart`, `strict`, `off`, or `full` (alias for `off`)
+
+Profile-level operation. Writes `<profile>/policy/{autonomy,command_allowlist,forbidden_paths}.toml` from the bundled preset AND mirrors `[autonomy].level` + `[autonomy].allowed_commands` into `config.toml` so the runtime gate actually consumes the change. `runtime_allowlist.toml` (from `/allow X --persist`) is preserved across preset switches.
+
+| Preset | Behaviour |
+|---|---|
+| `manual` | Every shell call prompts. Read-only file/memory tools not gated. |
+| `smart` | Read-only and safe shell builtins pre-allowed (`ls`, `cd`, `echo`, `git status`, `which`, etc.). Writes prompt with an inline `[Y/A/N/Esc]` widget. |
+| `strict` | `shell` tool removed from the model's registry entirely. Agent describes commands the user can run, doesn't execute. CC plan-mode analog. |
+| `off` / `full` | No gating. Forbidden paths still enforced. CI / trusted-env only. |
+
+Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker · `/autonomy <preset>` skips the picker.
+
 ### `setup`
 
 - `rantaiclaw setup`
