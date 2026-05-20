@@ -106,7 +106,16 @@ impl TuiProvisioner for ApprovalsProvisioner {
         )
         .await?;
 
-        policy_writer::write_policy_files(profile, preset, false)?;
+        if let Some(warning) = policy_writer::write_policy_files(profile, preset, false)? {
+            send(
+                &events,
+                ProvisionEvent::Message {
+                    severity: Severity::Warn,
+                    text: warning.to_string(),
+                },
+            )
+            .await?;
+        }
 
         send(
             &events,

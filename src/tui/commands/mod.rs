@@ -1,5 +1,6 @@
 mod agent;
 mod allowlist;
+mod autonomy;
 mod calls;
 mod config;
 mod core;
@@ -150,6 +151,7 @@ impl CommandRegistry {
         self.register(Box::new(allowlist::AllowCommand));
         self.register(Box::new(allowlist::DenyCommand));
         self.register(Box::new(allowlist::AllowlistCommand));
+        self.register(Box::new(autonomy::AutonomyCommand));
         self.register(Box::new(calls::CallsCommand));
         self.register(Box::new(mcp::McpCommand));
     }

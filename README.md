@@ -179,7 +179,14 @@ Two layers — the **runtime enum** the approval gate branches on, and the **fou
 | **Strict** | deny-by-default, allow read-only | `supervised` + strict mode + read-only allowlist |
 | **Off** | autonomous execution, no prompts | `full` autonomy (CI / trusted environments only) |
 
-In v0.6.5+, Supervised mode adds an **async approval flow**: unknown shell basenames trigger a `/allow` / `/deny` prompt instead of hard-failing. See `docs/security/` and the user-facing site for the full mechanism.
+**v0.6.50+ approval UX** (Claude Code-style):
+
+- **Inline single-key prompt.** When the agent attempts a command not on the allowlist, a boxed widget replaces the input row: `[Y] yes once` · `[A] always (persist)` · `[N] no` · `[Esc] deny`. No `/allow X` slash command required (it still works as a fallback for non-TUI channels).
+- **Indefinite wait.** The prompt sits until you act — no auto-deny clock. Matches CC's pause semantics so the LLM doesn't time out and try alternatives behind your back.
+- **Deny cancels the whole turn.** Saying no doesn't just reject the call — it cancels the entire LLM turn. One decision, one outcome; no loop on alternative commands.
+- **Cascading approvals.** Commands like `cd … && python3 …` prompt for each blocking basename in the chain, capped at 6 per call.
+- **Strict preset = plan mode.** Under Strict the `shell` tool is **unregistered** from the model's tool list. The agent describes what commands the user could run, but doesn't try to execute them. CC plan-mode analog.
+- **Switch fast.** `Shift+Tab` cycles presets in the TUI; `/autonomy` opens the picker; `rantaiclaw autonomy <preset>` flips from the shell.
 
 ### Memory System
 Multiple backends for persistent agent memory:

@@ -38,6 +38,10 @@ pub enum ListPickerKind {
     /// ClawHub install browser — opens via `/install` and `/skills install`.
     /// Selecting a row installs that skill via `clawhub::install_one`.
     ClawhubInstall,
+    /// Approval-policy preset picker opened via `/autonomy` (no arg).
+    /// Selecting a row force-writes the policy files for that preset —
+    /// same write path as Shift+Tab and `rantaiclaw autonomy <preset>`.
+    Autonomy,
 }
 
 /// One row in the picker. `key` is opaque (provider:model, session id,

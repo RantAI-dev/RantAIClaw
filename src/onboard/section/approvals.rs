@@ -49,7 +49,9 @@ impl SetupSection for ApprovalsSection {
             eprintln!("{}", self.headless_hint());
             PolicyPreset::Smart
         };
-        policy_writer::write_policy_files(ctx.profile, preset, false)?;
+        if let Some(warning) = policy_writer::write_policy_files(ctx.profile, preset, false)? {
+            eprintln!("{warning}");
+        }
         Ok(())
     }
 

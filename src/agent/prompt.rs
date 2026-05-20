@@ -17,6 +17,18 @@ pub struct PromptContext<'a> {
     pub skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
+    /// Currently-active approval preset (Manual / Smart / Strict / Off).
+    /// `None` when no policy is provisioned yet (pre-onboarding) — the
+    /// safety section then falls back to its old generic text. Threading
+    /// this lets SafetySection render preset-specific guidance so the
+    /// model knows upfront what will pass vs prompt vs block, instead
+    /// of discovering the gate by hitting it.
+    pub autonomy_preset: Option<crate::approval::policy_writer::PolicyPreset>,
+    /// Boot-time snapshot of `<policy_dir>/command_allowlist.toml` glob
+    /// patterns. Surfaced verbatim in Smart mode so the model has a
+    /// machine-readable list of pre-approved shell commands; in Strict
+    /// mode the list is short by design; in Manual/Off it's omitted.
+    pub allowed_commands: &'a [String],
 }
 
 pub trait PromptSection: Send + Sync {
@@ -185,8 +197,81 @@ impl PromptSection for SafetySection {
         "safety"
     }
 
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- When in doubt, ask before acting externally.".into())
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        use crate::approval::policy_writer::PolicyPreset;
+
+        let mut out = String::from("## Safety + Approval Policy\n\n");
+        out.push_str(
+            "- Do not exfiltrate private data.\n\
+             - Do not run destructive commands without asking.\n\
+             - Do not bypass oversight or approval mechanisms.\n\
+             - Prefer `trash` over `rm`.\n\
+             - When in doubt, ask before acting externally.\n\n",
+        );
+
+        match ctx.autonomy_preset {
+            Some(PolicyPreset::Strict) => {
+                // Plan-mode analog: shell is unavailable to the model in
+                // this preset (filtered out at registration). Tell the
+                // model so it doesn't waste tokens describing shell
+                // sequences — it should plan with read-only tools only.
+                out.push_str(
+                    "**Active approval policy: Strict (read-only).**\n\n\
+                     - The `shell` tool is **NOT registered** in this session — \
+                     do not attempt to call it; it is not in your tool list.\n\
+                     - You may read files (`file_read`), search memory \
+                     (`memory_*`), inspect the workspace, and reason.\n\
+                     - For any task that would normally require running a \
+                     command, describe what you would do — list the exact \
+                     commands a user would run — but do not call shell. \
+                     The user reviews and runs them manually.\n\
+                     - To leave Strict mode the user types `/autonomy smart` \
+                     or `/autonomy off`. Don't suggest it unless they ask.\n",
+                );
+            }
+            Some(PolicyPreset::Smart) => {
+                out.push_str(
+                    "**Active approval policy: Smart.**\n\n\
+                     - Read-only and trivially-safe commands are pre-allowed \
+                     (see allowlist below) and run without prompting.\n\
+                     - Any command **not** matching the allowlist will pause \
+                     for a single-key user prompt (Y/N/A); plan for that \
+                     latency — bundle related ops when reasonable.\n\
+                     - Forbidden paths (secrets, ssh, gnupg, aws, etc.) \
+                     are blocked unconditionally regardless of approval.\n",
+                );
+                if !ctx.allowed_commands.is_empty() {
+                    out.push_str("\n**Pre-approved shell commands (glob patterns):**\n");
+                    for pat in ctx.allowed_commands {
+                        let _ = writeln!(out, "- `{pat}`");
+                    }
+                }
+            }
+            Some(PolicyPreset::Manual) => {
+                out.push_str(
+                    "**Active approval policy: Manual (paranoid).**\n\n\
+                     - **Every** shell tool call requires explicit user \
+                     approval — even `ls`. Batch related ops into single \
+                     compound commands (`a && b && c`) to minimise the \
+                     number of prompts the user has to clear.\n\
+                     - Read-only file/memory tools are not gated.\n",
+                );
+            }
+            Some(PolicyPreset::Off) => {
+                out.push_str(
+                    "**Active approval policy: Off (CI / trusted-env only).**\n\n\
+                     - Shell commands execute without prompts. Be deliberate — \
+                     this preset is meant for unattended automation.\n\
+                     - Forbidden-path checks still apply (secrets dirs).\n",
+                );
+            }
+            None => {
+                // No policy provisioned yet (fresh install pre-onboarding).
+                // Don't lie about a mode — just keep the safety floor.
+            }
+        }
+
+        Ok(out)
     }
 }
 
@@ -342,6 +427,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
+            autonomy_preset: None,
+            allowed_commands: &[],
         };
 
         let section = IdentitySection;
@@ -370,6 +457,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            autonomy_preset: None,
+            allowed_commands: &[],
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -407,6 +496,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            autonomy_preset: None,
+            allowed_commands: &[],
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -447,6 +538,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
+            autonomy_preset: None,
+            allowed_commands: &[],
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -468,6 +561,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            autonomy_preset: None,
+            allowed_commands: &[],
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -508,6 +603,8 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            autonomy_preset: None,
+            allowed_commands: &[],
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();

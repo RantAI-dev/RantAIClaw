@@ -66,12 +66,16 @@ impl PolicyPreset {
     /// Parse a case-insensitive preset id. Accepts both new verbal forms
     /// (`"manual"`, `"smart"`, `"strict"`, `"off"`) and legacy `L1`–`L4`
     /// ids so configs written by pre-v0.6.40 releases keep working.
+    ///
+    /// Also accepts `"full"` as an alias for `Off` so users who reach
+    /// for the autonomy-level vocabulary (`AutonomyLevel::Full`) land on
+    /// the preset that disables gating.
     pub fn from_str_ci(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "manual" => Ok(Self::Manual),
             "smart" => Ok(Self::Smart),
             "strict" => Ok(Self::Strict),
-            "off" => Ok(Self::Off),
+            "off" | "full" => Ok(Self::Off),
             "l1" => Ok(Self::Manual),
             "l2" => Ok(Self::Smart),
             "l3" => Ok(Self::Strict),
@@ -79,6 +83,44 @@ impl PolicyPreset {
             other => Err(anyhow!(
                 "unknown policy preset '{other}' (valid: manual, smart, strict, off)"
             )),
+        }
+    }
+
+    /// Cycle order for the Shift+Tab keybinding and `rantaiclaw autonomy`
+    /// CLI: Manual → Smart → Strict → Off → Manual. Picked so a casual
+    /// tap walks from paranoid → default → CI → autonomous and back.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Manual => Self::Smart,
+            Self::Smart => Self::Strict,
+            Self::Strict => Self::Off,
+            Self::Off => Self::Manual,
+        }
+    }
+
+    /// All four presets in cycle order. Used by `/autonomy` to render the
+    /// picker list when no argument is supplied.
+    pub const ALL: [Self; 4] = [Self::Manual, Self::Smart, Self::Strict, Self::Off];
+
+    /// Map preset to the runtime [`crate::security::AutonomyLevel`].
+    ///
+    /// `Off` short-circuits to `Full` so `SecurityPolicy::is_command_allowed`
+    /// skips every approval check. The other three presets all run under
+    /// `Supervised` — they differ in their `command_allowlist.toml` /
+    /// `forbidden_paths.toml` contents (which the shell tool reads),
+    /// not in their autonomy level.
+    ///
+    /// This is the bridge between the preset bundle (a human-facing
+    /// configuration knob) and the `Config.autonomy.level` field that
+    /// `SecurityPolicy::from_config` actually consumes. Without this
+    /// mapping the preset switcher updates `<policy_dir>/autonomy.toml`
+    /// but the live gate keeps using whatever `config.toml` shipped
+    /// with — the v0.6.49 bug.
+    pub fn autonomy_level(self) -> crate::security::AutonomyLevel {
+        use crate::security::AutonomyLevel;
+        match self {
+            Self::Manual | Self::Smart | Self::Strict => AutonomyLevel::Supervised,
+            Self::Off => AutonomyLevel::Full,
         }
     }
 
@@ -101,6 +143,62 @@ impl PolicyPreset {
             Self::Off => OFF_BUNDLE,
         }
     }
+}
+
+/// Apply `preset` to the in-memory `Config`. Updates two fields:
+///
+/// 1. `config.autonomy.level` — drives `SecurityPolicy.autonomy`
+///    (Manual/Smart/Strict → Supervised, Off → Full).
+/// 2. `config.autonomy.allowed_commands` — basenames extracted from
+///    the preset bundle's `[command_allowlist].patterns`. This bridges
+///    the bundle (a write-only TOML file before v0.6.51) into the
+///    list the runtime gate actually consults. Without this step, the
+///    `cd`/`echo`/`which`/etc. patterns I added to the Smart bundle
+///    were dead weight — the gate kept using the hardcoded default
+///    (`git`, `npm`, `cargo`, `ls`, …) and prompted for everything else.
+///
+/// Caller is responsible for persisting the change (`config.save().await`)
+/// and, in the TUI, triggering `reload_config` so the running agent
+/// rebuilds its `SecurityPolicy` with the new lists.
+pub fn apply_preset_to_config(config: &mut crate::config::Config, preset: PolicyPreset) {
+    config.autonomy.level = preset.autonomy_level();
+    if let Ok(bundle) = toml::from_str::<PolicyBundle>(preset.bundle()) {
+        let mut basenames: Vec<String> = bundle
+            .command_allowlist
+            .patterns
+            .iter()
+            .filter_map(|pat| {
+                // The bundle uses `<command> <args>` glob patterns
+                // (e.g. `"git status"`, `"curl --head *"`). Strip the
+                // arg suffix — the runtime gate matches on basename
+                // only, not the glob — and any absolute-path prefix.
+                let first = pat.split_whitespace().next()?;
+                let base = first.rsplit('/').next()?;
+                if base.is_empty() {
+                    None
+                } else {
+                    Some(base.to_string())
+                }
+            })
+            .collect();
+        basenames.sort();
+        basenames.dedup();
+        config.autonomy.allowed_commands = basenames;
+    }
+}
+
+/// Read the currently-active preset from `<policy_dir>/autonomy.toml`.
+///
+/// Returns `None` if the file is missing, unparseable, or the
+/// `[autonomy].preset` field is absent — all of which mean "the policy
+/// dir hasn't been provisioned yet" (the user is pre-onboarding) rather
+/// than an error worth surfacing. Callers should treat `None` as
+/// "Smart-equivalent unknown" for display purposes.
+pub fn read_active_preset(policy_dir: &Path) -> Option<PolicyPreset> {
+    let raw = fs::read_to_string(policy_dir.join("autonomy.toml")).ok()?;
+    let table: toml::value::Table = toml::from_str(&raw).ok()?;
+    let preset_str = table.get("autonomy")?.as_table()?.get("preset")?.as_str()?;
+    PolicyPreset::from_str_ci(preset_str).ok()
 }
 
 // ── Bundle deserialisation ──────────────────────────────────────
@@ -127,7 +225,20 @@ struct SectionPatterns {
 
 // ── Public API ──────────────────────────────────────────────────
 
+/// Stern warning string surfaced when the `Off` preset is selected.
+/// Kept as a `const` so every caller (CLI eprintln, TUI system message,
+/// setup wizard overlay) emits identical wording without having to
+/// duplicate the text. Returned from [`write_policy_files`] as
+/// `Some(_)` only when the freshly-written preset is `Off`.
+pub const OFF_WARNING: &str = "⚠️  approval policy preset Off selected — gating is OFF. \
+Every tool call will execute without prompts. Use this only in trusted CI \
+environments. To revert: `rantaiclaw setup approvals --force`.";
+
 /// Write the three policy files for `preset` into `profile.policy_dir()`.
+///
+/// Returns `Some(OFF_WARNING)` when the `Off` preset is written so the
+/// caller can route the stern warning to the right surface (stderr for
+/// CLI, system message for TUI). All other presets return `None`.
 ///
 /// * `force = false` (the default for a fresh wizard run) — any file that
 ///   already exists is left untouched. Idempotent.
@@ -138,7 +249,11 @@ struct SectionPatterns {
 ///   * `autonomy.toml`          — `[autonomy]` + `[approvals]` from bundle
 ///   * `command_allowlist.toml` — patterns array
 ///   * `forbidden_paths.toml`   — patterns array
-pub fn write_policy_files(profile: &Profile, preset: PolicyPreset, force: bool) -> Result<()> {
+pub fn write_policy_files(
+    profile: &Profile,
+    preset: PolicyPreset,
+    force: bool,
+) -> Result<Option<&'static str>> {
     let dir = profile.policy_dir();
     fs::create_dir_all(&dir).with_context(|| format!("create policy dir {}", dir.display()))?;
 
@@ -165,13 +280,11 @@ pub fn write_policy_files(profile: &Profile, preset: PolicyPreset, force: bool) 
         force,
     )?;
 
-    if matches!(preset, PolicyPreset::Off) {
-        eprintln!(
-            "⚠️  approval policy preset Off selected — gating is OFF.\n   \
-             Every tool call will execute without prompts. Use this only in \
-             trusted CI environments. To revert: `rantaiclaw setup approvals --force`."
-        );
-    }
+    let warning = if matches!(preset, PolicyPreset::Off) {
+        Some(OFF_WARNING)
+    } else {
+        None
+    };
 
     // Round-trip self-check: parse what we just wrote. Catches schema drift
     // between the bundled preset and the writer (e.g. someone adds a new
@@ -191,7 +304,7 @@ pub fn write_policy_files(profile: &Profile, preset: PolicyPreset, force: bool) 
         },
     )?;
 
-    Ok(())
+    Ok(warning)
 }
 
 /// Re-read each of `autonomy.toml`, `command_allowlist.toml`,
@@ -415,6 +528,124 @@ mod tests {
             PolicyPreset::from_str_ci("  L4 ").unwrap(),
             PolicyPreset::Off
         );
+    }
+
+    #[test]
+    fn full_alias_maps_to_off() {
+        // `rantaiclaw autonomy full` is the natural way for users who
+        // think in AutonomyLevel terms to say "no prompts". Map it to Off.
+        assert_eq!(
+            PolicyPreset::from_str_ci("full").unwrap(),
+            PolicyPreset::Off
+        );
+        assert_eq!(
+            PolicyPreset::from_str_ci("FULL").unwrap(),
+            PolicyPreset::Off
+        );
+    }
+
+    #[test]
+    fn next_cycles_in_canonical_order() {
+        assert_eq!(PolicyPreset::Manual.next(), PolicyPreset::Smart);
+        assert_eq!(PolicyPreset::Smart.next(), PolicyPreset::Strict);
+        assert_eq!(PolicyPreset::Strict.next(), PolicyPreset::Off);
+        assert_eq!(PolicyPreset::Off.next(), PolicyPreset::Manual);
+    }
+
+    #[test]
+    fn off_preset_maps_to_full_autonomy() {
+        use crate::security::AutonomyLevel;
+        // The whole point of Off: short-circuit the gate. If this
+        // mapping drifts from Full, `is_command_allowed` will still
+        // run its checks and Off becomes cosmetic again (v0.6.49 bug).
+        assert_eq!(PolicyPreset::Off.autonomy_level(), AutonomyLevel::Full);
+    }
+
+    #[test]
+    fn non_off_presets_map_to_supervised() {
+        use crate::security::AutonomyLevel;
+        // Manual / Smart / Strict all need the gate to actually run —
+        // they differ only in their command_allowlist contents.
+        assert_eq!(
+            PolicyPreset::Manual.autonomy_level(),
+            AutonomyLevel::Supervised
+        );
+        assert_eq!(
+            PolicyPreset::Smart.autonomy_level(),
+            AutonomyLevel::Supervised
+        );
+        assert_eq!(
+            PolicyPreset::Strict.autonomy_level(),
+            AutonomyLevel::Supervised
+        );
+    }
+
+    #[test]
+    fn apply_preset_to_config_updates_level() {
+        use crate::config::Config;
+        use crate::security::AutonomyLevel;
+        let mut config = Config::default();
+        // Default is Supervised — confirm the helper changes it.
+        assert_eq!(config.autonomy.level, AutonomyLevel::Supervised);
+        apply_preset_to_config(&mut config, PolicyPreset::Off);
+        assert_eq!(config.autonomy.level, AutonomyLevel::Full);
+        apply_preset_to_config(&mut config, PolicyPreset::Smart);
+        assert_eq!(config.autonomy.level, AutonomyLevel::Supervised);
+    }
+
+    #[test]
+    fn apply_preset_smart_populates_allowed_commands_from_bundle() {
+        use crate::config::Config;
+        let mut config = Config::default();
+        apply_preset_to_config(&mut config, PolicyPreset::Smart);
+        // The Smart bundle declares `cd`, `which`, `ls`, `git status`,
+        // `curl --head *`, etc. — basenames should land in the runtime
+        // allowlist. Without this bridge, the `which`/`cd`/`echo`
+        // patterns I added to the bundle were never read by the gate.
+        let allow = &config.autonomy.allowed_commands;
+        for expected in ["cd", "which", "echo", "ls", "git", "curl", "pwd"] {
+            assert!(
+                allow.iter().any(|c| c == expected),
+                "Smart preset should populate `{expected}` in allowed_commands, got: {allow:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_preset_manual_has_minimal_allowlist() {
+        use crate::config::Config;
+        let mut config = Config::default();
+        apply_preset_to_config(&mut config, PolicyPreset::Manual);
+        // Manual preset's bundle declares an empty allowlist; the
+        // bridge should leave the runtime allowed_commands empty
+        // (rather than carrying over the pre-bridge hardcoded
+        // defaults). Every shell call then prompts — paranoid by design.
+        assert!(
+            config.autonomy.allowed_commands.is_empty(),
+            "Manual preset must produce an empty allowlist, got: {:?}",
+            config.autonomy.allowed_commands
+        );
+    }
+
+    #[test]
+    fn read_active_preset_returns_none_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_active_preset(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn read_active_preset_round_trips_each_preset() {
+        for p in PolicyPreset::ALL {
+            let tmp = tempfile::tempdir().unwrap();
+            let bundle: PolicyBundle = toml::from_str(p.bundle()).unwrap();
+            write_autonomy(tmp.path(), &bundle, p, true).unwrap();
+            assert_eq!(
+                read_active_preset(tmp.path()),
+                Some(p),
+                "preset {} should read back from its own bundle",
+                p.id()
+            );
+        }
     }
 
     #[test]

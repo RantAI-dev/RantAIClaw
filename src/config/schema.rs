@@ -395,7 +395,13 @@ pub struct AgentConfig {
 }
 
 fn default_agent_max_tool_iterations() -> usize {
-    10
+    // Bumped from 10 to 25 in v0.6.50. Multi-step skills (stocks setup
+    // + fetch, research-assistant, github sequences) routinely need
+    // ~15 tool calls before producing a final answer; the 10-call cap
+    // surfaced as "Agent exceeded maximum tool iterations" mid-skill
+    // with an empty "[no response from model]" body. Cap is still
+    // bounded — runaway loops bail at 25 instead of being unlimited.
+    25
 }
 
 fn default_agent_max_history_messages() -> usize {
