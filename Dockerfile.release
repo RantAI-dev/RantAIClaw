@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1.7
+#
+# Release-image build for `pub-release.yml`. Uses the prebuilt,
+# cosign-signed binaries from the matrix-build artifacts instead of
+# recompiling Rust under QEMU. Drops multi-arch publish time from
+# 90+ min (which hit the GitHub Actions job timeout in v0.6.50)
+# to ~1-2 min total.
+#
+# Expects `artifacts/` in the build context, populated by
+# `actions/download-artifact@v4` upstream in the workflow:
+#
+#   artifacts/rantaiclaw-x86_64-unknown-linux-gnu/rantaiclaw-*.tar.gz
+#   artifacts/rantaiclaw-aarch64-unknown-linux-gnu/rantaiclaw-*.tar.gz
+#
+# The extractor and runtime-data stages are pinned to $BUILDPLATFORM so
+# they run natively on the GitHub runner even when the final image is
+# being built for linux/arm64 — only the distroless `release` stage
+# carries arch-specific bytes, and that's just a `COPY` of the binary
+# the extractor already untarred for the right TARGETARCH.
+
+# ── Stage 1: extract the prebuilt binary for $TARGETARCH ────────────
+FROM --platform=$BUILDPLATFORM debian:trixie-slim AS extractor
+ARG TARGETARCH
+WORKDIR /work
+COPY artifacts/ /work/artifacts/
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64)  target="x86_64-unknown-linux-gnu" ;; \
+      arm64)  target="aarch64-unknown-linux-gnu" ;; \
+      *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    tarball="/work/artifacts/rantaiclaw-${target}/rantaiclaw-${target}.tar.gz"; \
+    test -f "$tarball" || { echo "Missing artifact: $tarball" >&2; ls -R /work/artifacts >&2; exit 1; }; \
+    tar xzf "$tarball" -C /usr/local/bin/; \
+    chmod +x /usr/local/bin/rantaiclaw; \
+    file /usr/local/bin/rantaiclaw || true
+
+# ── Stage 2: build the runtime data dir + default config ────────────
+# Pinned to $BUILDPLATFORM because nothing arch-specific happens here —
+# only file creation. Same QEMU-bypass trick as the extractor.
+FROM --platform=$BUILDPLATFORM debian:trixie-slim AS runtime-data
+RUN mkdir -p /rantaiclaw-data/.rantaiclaw /rantaiclaw-data/workspace && \
+    cat > /rantaiclaw-data/.rantaiclaw/config.toml <<EOF && \
+    chown -R 65534:65534 /rantaiclaw-data
+workspace_dir = "/rantaiclaw-data/workspace"
+config_path = "/rantaiclaw-data/.rantaiclaw/config.toml"
+api_key = ""
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4-20250514"
+default_temperature = 0.7
+
+[gateway]
+port = 3000
+host = "[::]"
+allow_public_bind = true
+EOF
+
+# ── Stage 3: distroless production image (matches Dockerfile@release) ─
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
+COPY --from=extractor /usr/local/bin/rantaiclaw /usr/local/bin/rantaiclaw
+COPY --from=runtime-data /rantaiclaw-data /rantaiclaw-data
+
+ENV RANTAICLAW_WORKSPACE=/rantaiclaw-data/workspace
+ENV HOME=/rantaiclaw-data
+ENV PROVIDER="openrouter"
+ENV RANTAICLAW_GATEWAY_PORT=3000
+
+WORKDIR /rantaiclaw-data
+USER 65534:65534
+EXPOSE 3000
+ENTRYPOINT ["rantaiclaw"]
+CMD ["gateway"]

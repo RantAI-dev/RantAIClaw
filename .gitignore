@@ -37,3 +37,9 @@ state/
 
 # Agent implementation plans (scratchpad — not product docs)
 docs/superpowers/plans/
+
+# Local product experiments live as separate repos and are not pushed here.
+product/
+
+# CI-only build context (downloaded by pub-release.yml; not source)
+artifacts/
