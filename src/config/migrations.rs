@@ -140,9 +140,7 @@ mod tests {
         // A user who had set max_tool_iterations = 10 explicitly in
         // their v1 config keeps that exact value through the v2 bump.
         // The default change (10 → 25) doesn't override their choice.
-        let mut v = parse(
-            "schema_version = 1\n[agent]\nmax_tool_iterations = 10\n",
-        );
+        let mut v = parse("schema_version = 1\n[agent]\nmax_tool_iterations = 10\n");
         let migrated = migrate(&mut v).unwrap();
         assert!(migrated, "v1 → v2 bump should be reported as transformed");
         assert_eq!(version_of(&v), Some(2));

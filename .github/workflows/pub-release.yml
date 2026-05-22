@@ -464,6 +464,22 @@ jobs:
                   tags="${image}:${RELEASE_TAG},${sha_tag}"
                   echo "tags=${tags}" >> "$GITHUB_OUTPUT"
 
+            # Render the install template with the actual release tag
+            # substituted in. action-gh-release will append GitHub's
+            # auto-generated changelog *after* this body, so install
+            # instructions sit at the top of the release page.
+            - name: Render install body
+              id: install_body
+              shell: bash
+              env:
+                  RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+              run: |
+                  set -euo pipefail
+                  template=.github/release-notes-install.md
+                  out="${RUNNER_TEMP}/release-body.md"
+                  sed "s|__VERSION__|${RELEASE_TAG}|g" "$template" > "$out"
+                  echo "path=$out" >> "$GITHUB_OUTPUT"
+
             # Create the GitHub Release FIRST, before Docker. v0.6.50
             # learned the hard way that the multi-arch QEMU build often
             # exceeds the 90-min job timeout — when the runner gets
@@ -478,6 +494,7 @@ jobs:
                   tag_name: ${{ needs.prepare.outputs.release_tag }}
                   target_commitish: ${{ github.sha }}
                   draft: ${{ needs.prepare.outputs.draft_release == 'true' }}
+                  body_path: ${{ steps.install_body.outputs.path }}
                   generate_release_notes: true
                   files: |
                       artifacts/**/*

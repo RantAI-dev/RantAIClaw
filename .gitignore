@@ -43,3 +43,6 @@ product/
 
 # CI-only build context (downloaded by pub-release.yml; not source)
 artifacts/
+
+# Locally cloned RantAIClaw-Site (separate repo, never committed here)
+/site/

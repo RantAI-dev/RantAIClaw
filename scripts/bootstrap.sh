@@ -50,8 +50,9 @@ Common options:
   --from-source              Build from source instead of downloading a binary
   --no-verify-checksum       Skip SHA256 verification (offline / mirror only)
   --docker                   Build & run inside a container
-  --onboard                  Run onboarding after install
-  --interactive-onboard      Run interactive onboarding (implies --onboard)
+  --skip-setup               Don't run \`rantaiclaw setup --force\` at the end (default: run it)
+  --onboard                  Run legacy \`onboard\` flow instead of \`setup --force\`
+  --interactive-onboard      Run interactive legacy onboarding (implies --onboard)
   --api-key <key>            API key for non-interactive onboarding
   --provider <id>            Provider for non-interactive onboarding (default: openrouter)
   --model <id>               Model for non-interactive onboarding (optional)
@@ -94,6 +95,7 @@ Environment:
   RANTAICLAW_INSTALL_DIR       Override install directory (default: pick a dir already in PATH)
   RANTAICLAW_AUTO_MODIFY_PATH  Set to "1" to auto-amend shell rc with PATH export (no prompt)
   RANTAICLAW_NO_MODIFY_PATH    Set to "1" to never modify the shell rc
+  RANTAICLAW_SKIP_SETUP        Set to "1" to skip the auto-run of \`rantaiclaw setup --force\`
   RANTAICLAW_API_KEY           Used when --api-key is not provided
   RANTAICLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   RANTAICLAW_MODEL             Used when --model is not provided
@@ -316,6 +318,9 @@ install_prebuilt_binary() {
     [[ -n "$version_line" ]] && info "Version: $version_line"
   fi
   print_path_hint "$install_dir"
+  # Stash the install dir so the end-of-script reminder can reference it
+  # (this runs at top level after install_prebuilt_binary returns).
+  RANTAICLAW_FINAL_INSTALL_DIR="$install_dir"
 
   return 0
 }
@@ -355,16 +360,62 @@ resolve_install_dir() {
   printf '%s' "$HOME/.local/bin"
 }
 
-# Pick the user's interactive shell rc. Falls back to ~/.bashrc.
-# Returns the unexpanded form (e.g. "~/.bashrc") for display, plus the
-# expanded path for filesystem operations, separated by a tab.
+# Pick the user's interactive shell rc.
+#
+# Returns three tab-separated fields: shell_name, display path (with ~), and
+# the expanded absolute path for filesystem operations.
+#
+# Coverage:
+#   - bash      -> ~/.bashrc (Linux), ~/.bash_profile if it already exists on macOS
+#   - zsh       -> ~/.zshrc (covers macOS Catalina+ default)
+#   - fish      -> ~/.config/fish/config.fish
+#   - ksh/mksh  -> ~/.kshrc
+#   - tcsh/csh  -> ~/.tcshrc or ~/.cshrc
+#   - dash/ash  -> ~/.profile (no per-shell rc; .profile is the POSIX fallback)
+#   - unknown   -> ~/.profile (safer than .bashrc when shell is non-bash)
 detect_shell_rc() {
-  local shell_name display expanded
+  local shell_name display expanded uname_kernel
   shell_name="$(basename "${SHELL:-/bin/bash}")"
+  uname_kernel="$(uname -s 2>/dev/null || echo '')"
   case "$shell_name" in
-    zsh)  display='~/.zshrc';                    expanded="$HOME/.zshrc" ;;
-    fish) display='~/.config/fish/config.fish';  expanded="$HOME/.config/fish/config.fish" ;;
-    *)    display='~/.bashrc';                   expanded="$HOME/.bashrc" ;;
+    zsh)
+      display='~/.zshrc';                    expanded="$HOME/.zshrc"
+      ;;
+    fish)
+      display='~/.config/fish/config.fish';  expanded="$HOME/.config/fish/config.fish"
+      ;;
+    ksh|mksh|ksh93)
+      display='~/.kshrc';                    expanded="$HOME/.kshrc"
+      ;;
+    tcsh)
+      display='~/.tcshrc';                   expanded="$HOME/.tcshrc"
+      ;;
+    csh)
+      display='~/.cshrc';                    expanded="$HOME/.cshrc"
+      ;;
+    dash|ash|sh)
+      display='~/.profile';                  expanded="$HOME/.profile"
+      ;;
+    bash)
+      # macOS launches bash as a login shell, which reads ~/.bash_profile
+      # (or ~/.profile) instead of ~/.bashrc. Prefer the file that's already
+      # there to avoid silently creating an inert rc.
+      if [[ "$uname_kernel" == "Darwin" ]]; then
+        if [[ -f "$HOME/.bash_profile" ]]; then
+          display='~/.bash_profile';         expanded="$HOME/.bash_profile"
+        elif [[ -f "$HOME/.profile" ]]; then
+          display='~/.profile';              expanded="$HOME/.profile"
+        else
+          display='~/.bash_profile';         expanded="$HOME/.bash_profile"
+        fi
+      else
+        display='~/.bashrc';                 expanded="$HOME/.bashrc"
+      fi
+      ;;
+    *)
+      # Unknown shell — ~/.profile is read by most POSIX login shells.
+      display='~/.profile';                  expanded="$HOME/.profile"
+      ;;
   esac
   printf '%s\t%s\t%s' "$shell_name" "$display" "$expanded"
 }
@@ -891,6 +942,14 @@ FORCE_SOURCE_BUILD=false
 VERIFY_CHECKSUM="${VERIFY_CHECKSUM:-true}"
 RUN_ONBOARD=false
 INTERACTIVE_ONBOARD=false
+# As of v0.6.52-alpha, `rantaiclaw setup --force` runs by default at the end
+# of a successful install (the "full" setup wizard: provider, approvals,
+# channels, persona, skills, MCP). Skip with --skip-setup or
+# RANTAICLAW_SKIP_SETUP=1, or use the legacy --onboard flow.
+RUN_SETUP_DEFAULT=true
+if [[ "${RANTAICLAW_SKIP_SETUP:-0}" == "1" ]]; then
+  RUN_SETUP_DEFAULT=false
+fi
 SKIP_BUILD=false
 SKIP_INSTALL=false
 PREBUILT_INSTALLED=false
@@ -943,12 +1002,21 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --onboard)
+      # Legacy: switches the post-install step from `setup --force` (default)
+      # to the older `onboard` flow. Useful for CI pipelines pinned to the
+      # old API. Suppresses the default `setup --force` run.
       RUN_ONBOARD=true
+      RUN_SETUP_DEFAULT=false
       shift
       ;;
     --interactive-onboard)
       RUN_ONBOARD=true
       INTERACTIVE_ONBOARD=true
+      RUN_SETUP_DEFAULT=false
+      shift
+      ;;
+    --skip-setup)
+      RUN_SETUP_DEFAULT=false
       shift
       ;;
     --api-key)
@@ -1256,6 +1324,36 @@ MSG
   fi
 fi
 
+# Default end-of-install: always run `rantaiclaw setup --force` (the "full"
+# wizard). Suppressed by --skip-setup, RANTAICLAW_SKIP_SETUP=1, or the legacy
+# --onboard flag. We try the interactive wizard whenever a TTY is available
+# (either stdin is a TTY, or /dev/tty is readable for `curl | bash` cases).
+# When neither is true, we print a bold reminder instead of crashing.
+if [[ "$RUN_SETUP_DEFAULT" == true ]]; then
+  if [[ -z "$RANTAICLAW_BIN" ]]; then
+    warn "Skipping default setup: rantaiclaw binary not on PATH yet."
+    warn "Open a new terminal and run: rantaiclaw setup --force"
+  elif [[ -t 0 || -r /dev/tty ]]; then
+    next_step "Running guided setup (rantaiclaw setup --force)"
+    info "Pass --skip-setup or set RANTAICLAW_SKIP_SETUP=1 to disable this."
+    if [[ -t 0 ]]; then
+      "$RANTAICLAW_BIN" setup --force || {
+        warn "Setup exited non-zero. Re-run anytime with: rantaiclaw setup --force"
+      }
+    else
+      # curl|bash case: stdin is piped, but /dev/tty is reachable. Reattach
+      # the wizard to the controlling terminal so its prompts work.
+      "$RANTAICLAW_BIN" setup --force </dev/tty || {
+        warn "Setup exited non-zero. Re-run anytime with: rantaiclaw setup --force"
+      }
+    fi
+  else
+    warn "No TTY available (headless / non-interactive shell)."
+    warn "Skipping interactive setup. When you're at a terminal, run:"
+    warn "    rantaiclaw setup --force"
+  fi
+fi
+
 # Show success banner only when real install work was performed.
 # Pure --skip-build --skip-install runs (no prebuilt either) get a plain notice.
 if [[ "$SKIP_BUILD" == "true" && "$SKIP_INSTALL" == "true" && "$PREBUILT_INSTALLED" == "false" ]]; then
@@ -1266,9 +1364,50 @@ else
     "rantaiclaw agent      — run the autonomous agent loop"
     "rantaiclaw status     — verify installation"
   )
-  if [[ "$RUN_ONBOARD" == false ]]; then
+  # Only suggest `setup` as a next step if we did NOT just run it (or the
+  # legacy `onboard` flow). When we ran setup successfully there's nothing
+  # left to configure; surfacing the same command again is noise.
+  if [[ "$RUN_ONBOARD" == false && "$RUN_SETUP_DEFAULT" == false ]]; then
     next_steps+=("rantaiclaw setup     — guided wizard (provider, approvals, channels, persona, skills, MCP)")
     next_steps+=("rantaiclaw doctor    — verify the install once configured")
+  elif [[ "$RUN_SETUP_DEFAULT" == true ]]; then
+    next_steps+=("rantaiclaw doctor    — verify the install at any time")
   fi
   print_success_banner "${next_steps[@]}"
+
+  # Bold, unmissable PATH reminder — printed AFTER the success banner so it's
+  # the very last thing the user sees. Fires only when the install dir was
+  # resolved AND is still not on PATH for this shell session (i.e. the user
+  # will hit "command not found" until they source their rc or open a new
+  # terminal).
+  reminder_dir="${RANTAICLAW_FINAL_INSTALL_DIR:-}"
+  if [[ -n "$reminder_dir" && ":$PATH:" != *":$reminder_dir:"* ]]; then
+    rc_info_final="$(detect_shell_rc)"
+    IFS=$'\t' read -r shell_name_final display_rc_final rc_file_final <<<"$rc_info_final"
+    if [[ "$shell_name_final" == "fish" ]]; then
+      reload_cmd="exec fish      # or: source $display_rc_final"
+      copy_paste_line="fish_add_path $reminder_dir   # persists across sessions"
+    elif [[ "$shell_name_final" == "tcsh" || "$shell_name_final" == "csh" ]]; then
+      reload_cmd="source $display_rc_final"
+      copy_paste_line="echo 'set path = ( $reminder_dir \$path )' >> $display_rc_final"
+    else
+      reload_cmd="source $display_rc_final"
+      copy_paste_line="echo 'export PATH=\"$reminder_dir:\$PATH\"' >> $display_rc_final"
+    fi
+
+    print_action_required "rantaiclaw not yet on PATH" \
+      "Run this NOW so the \`rantaiclaw\` command works in this terminal:" \
+      "" \
+      "    $reload_cmd" \
+      "" \
+      "If you skipped the auto-amend, also add the export to $display_rc_final:" \
+      "" \
+      "    $copy_paste_line" \
+      "" \
+      "Then verify:" \
+      "" \
+      "    rantaiclaw --version" \
+      "" \
+      "(Detected shell: $shell_name_final. Opening a NEW terminal also works.)"
+  fi
 fi

@@ -439,21 +439,28 @@ async fn turn_handles_multi_step_tool_chain() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 4. Max-iteration bailout
+// 4. Max-iteration soft-cap (force a final summary instead of erroring)
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn turn_bails_out_at_max_iterations() {
-    // Create more tool calls than max_tool_iterations allows.
+async fn turn_soft_caps_at_max_iterations_with_summary() {
+    // Set up `max_iters` tool-call responses, then one final text response
+    // that the soft-cap path will consume when force_final_summary runs.
+    // Behavior contract (since the soft-cap refactor): at max_iterations,
+    // the agent does NOT return Err — it makes one tools-disabled provider
+    // call so the user gets a real summary, then returns Ok with that text.
     let max_iters = 3;
     let mut responses = Vec::new();
-    for i in 0..max_iters + 5 {
+    for i in 0..max_iters {
         responses.push(tool_response(vec![ToolCall {
             id: format!("tc{i}"),
             name: "echo".into(),
             arguments: r#"{"message": "loop"}"#.into(),
         }]));
     }
+    responses.push(text_response(
+        "Hit the iteration cap. Tried `echo` three times. Type /continue to extend the budget.",
+    ));
 
     let provider = Box::new(ScriptedProvider::new(responses));
 
@@ -464,12 +471,13 @@ async fn turn_bails_out_at_max_iterations() {
 
     let mut agent = build_agent_with_config(provider, vec![Box::new(EchoTool)], config);
 
-    let result = agent.turn("infinite loop").await;
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    let response = agent
+        .turn("loop forever")
+        .await
+        .expect("soft-cap path returns Ok with a final summary, not Err");
     assert!(
-        err.contains("maximum tool iterations"),
-        "Expected max iterations error, got: {err}"
+        !response.is_empty(),
+        "expected a non-empty final summary at the iteration cap"
     );
 }
 
