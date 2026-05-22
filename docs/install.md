@@ -144,7 +144,72 @@ install -m 0755 rantaiclaw ~/.local/bin/    # or /usr/local/bin with sudo
 rantaiclaw --version
 ```
 
-For Windows: extract the `.zip`, move `rantaiclaw.exe` somewhere on `%PATH%`, run `rantaiclaw.exe --version`.
+For Windows: extract the `.zip`, move `rantaiclaw.exe` somewhere on `%PATH%`, run `rantaiclaw.exe --version`. See [Windows install](#windows-install) below for the full step-by-step.
+
+---
+
+## Windows install
+
+Native Windows is the **recommended** path for Windows users. WSL2 is an alternative if you already live in a Linux environment or need bash-only tooling.
+
+### Option 1 — Native Windows (recommended)
+
+1. **Download the binary.** From the [latest release](https://github.com/RantAI-dev/RantAIClaw/releases/latest), grab `rantaiclaw-x86_64-pc-windows-msvc.zip`.
+2. **Extract.** Right-click → *Extract All*, or in PowerShell:
+   ```powershell
+   Expand-Archive rantaiclaw-x86_64-pc-windows-msvc.zip -DestinationPath $HOME\rantaiclaw
+   ```
+3. **Add to PATH.** Move `rantaiclaw.exe` to a folder on your `%PATH%` (for example `C:\Users\<you>\bin\`). To add a new folder to PATH: *System Properties → Environment Variables → Path → Edit → New*.
+4. **Verify** in a new PowerShell window:
+   ```powershell
+   rantaiclaw.exe --version
+   rantaiclaw.exe setup
+   rantaiclaw.exe chat
+   ```
+
+**Optional — verify the signature first** (requires [cosign](https://github.com/sigstore/cosign)):
+
+```powershell
+$VERSION = "v0.6.51-alpha"   # or the latest tag
+$TARGET  = "x86_64-pc-windows-msvc"
+curl.exe -fsSL -O "https://github.com/RantAI-dev/RantAIClaw/releases/download/$VERSION/rantaiclaw-$TARGET.zip"
+curl.exe -fsSL -O "https://github.com/RantAI-dev/RantAIClaw/releases/download/$VERSION/rantaiclaw-$TARGET.zip.bundle"
+cosign verify-blob `
+  --bundle "rantaiclaw-$TARGET.zip.bundle" `
+  --certificate-identity-regexp "https://github.com/RantAI-dev/RantAIClaw/.github/workflows/pub-release.yml@.*" `
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" `
+  "rantaiclaw-$TARGET.zip"
+```
+
+### Option 2 — WSL2 (alternative)
+
+If you already use WSL2, or prefer a Linux toolchain on Windows:
+
+```powershell
+wsl --install
+```
+
+Restart, then inside the WSL Ubuntu shell run the standard one-liner:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
+rantaiclaw --version
+```
+
+The binary lives inside the WSL filesystem; run it from the WSL shell. Native Windows shells (PowerShell, cmd) won't see it unless you explicitly invoke `wsl rantaiclaw`.
+
+### Option 3 — Build from source (native MSVC)
+
+Requires Rust 1.92+ (`rustup-init.exe`) and the *Desktop development with C++* workload from Visual Studio Build Tools.
+
+```powershell
+git clone https://github.com/RantAI-dev/RantAIClaw.git
+cd RantAIClaw
+cargo build --release
+.\target\release\rantaiclaw.exe --version
+```
+
+`bootstrap.sh` is bash-only, so the source path on native Windows is plain `cargo build`. For most users WSL2 or the prebuilt binary is smoother.
 
 ---
 
