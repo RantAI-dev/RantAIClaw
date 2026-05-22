@@ -1646,13 +1646,17 @@ impl TuiApp {
         if new_channels_count != prev_channels_count {
             let msg = if new_channels_count > prev_channels_count {
                 format!(
-                    "⚠ {} new channel(s) configured. Restart `rantaiclaw` to start polling them. \
-                     `/channels` shows the current state.",
+                    "⚠ {} new channel(s) configured. To start polling them now \
+                     without closing this TUI, open another terminal and run \
+                     `rantaiclaw channels run` (add `&` or wrap with `nohup` to \
+                     background it). `/channels` shows the current state.",
                     new_channels_count - prev_channels_count
                 )
             } else {
                 format!(
-                    "⚠ {} channel(s) removed. Restart `rantaiclaw` for the listener(s) to stop.",
+                    "⚠ {} channel(s) removed. The listener(s) keep running until \
+                     you stop the background `rantaiclaw channels run` process \
+                     (Ctrl-C in its terminal, or `kill <pid>`).",
                     prev_channels_count - new_channels_count
                 )
             };
@@ -2424,9 +2428,16 @@ impl TuiApp {
     /// Drain debounced reload ticks from the `config.toml` file
     /// watcher. Direct user edits to the active profile's config
     /// (adding `[mcp_servers.foo]`, swapping provider, etc.) trigger
-    /// the same `reload_config` pipeline the wizard close uses. A
-    /// system-message line goes to scrollback so the user knows the
-    /// reload happened.
+    /// the same `reload_config` pipeline the wizard close uses.
+    ///
+    /// As of v0.6.53-alpha the *success* path is silent in the TUI:
+    /// every wizard-driven flow nudges config.toml multiple times in
+    /// succession, and surfacing each one as a System line spammed the
+    /// chat history (`config.toml changed — agent reloaded` repeated
+    /// 3-5× per /setup run). The reload still happens; the log line
+    /// goes to `tracing::info!` so it's recoverable in debug logs.
+    /// Failures still surface in the TUI — those are real user-actionable
+    /// signals.
     fn drain_config_reload_events(&mut self) {
         let mut should_reload = false;
         if let Some(watcher) = self.config_watcher.as_mut() {
@@ -2439,11 +2450,9 @@ impl TuiApp {
         }
         match self.reload_config() {
             Ok(()) => {
-                let msg =
-                    "⟳ config.toml changed — agent reloaded; next turn uses the new settings.";
-                let _ = self.context.append_system_message(msg);
-                self.scrollback_queue
-                    .push(("system".to_string(), msg.to_string()));
+                tracing::info!(
+                    "config.toml changed — agent reloaded; next turn uses the new settings"
+                );
             }
             Err(e) => {
                 let msg = format!("⚠ config.toml changed but reload failed: {e}");
