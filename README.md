@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/install.md"><strong>Install</strong></a> ·
+  <a href="#install"><strong>Install</strong></a> ·
   <a href="https://clawhub.ai">ClawHub Skills</a> ·
   <a href="docs/config-reference.md">Config</a> ·
   <a href="docs/channels-reference.md">Channels</a> ·
@@ -24,6 +24,54 @@
   <a href="docs/troubleshooting.md">Troubleshooting</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
+
+<p align="center">
+  <video src="https://github.com/RantAI-dev/RantAIClaw/raw/main/assets/tui.mp4" autoplay loop muted playsinline width="800">
+    Your browser does not support inline video.
+    <a href="https://github.com/RantAI-dev/RantAIClaw/raw/main/assets/tui.mp4">Download the TUI demo (MP4, ~770 KB)</a>.
+  </video>
+</p>
+
+---
+
+## Install
+
+```bash
+# Linux + macOS — auto-detects platform, downloads, verifies SHA256, installs
+curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
+```
+
+**Windows (native, recommended):** download `rantaiclaw-x86_64-pc-windows-msvc.zip` from the [latest release](https://github.com/RantAI-dev/RantAIClaw/releases/latest), extract it, and add `rantaiclaw.exe` to your `PATH` — then run `rantaiclaw.exe --version` in a new PowerShell window. **Alternative (WSL2):** install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the Linux one-liner above from inside the Ubuntu shell.
+
+| Method | Command |
+|---|---|
+| Docker | `docker pull ghcr.io/rantai-dev/rantaiclaw:latest` |
+| Cargo | `cargo install --git https://github.com/RantAI-dev/RantAIClaw --locked` |
+| From source | `git clone https://github.com/RantAI-dev/RantAIClaw.git && cd RantAIClaw && ./bootstrap.sh --from-source` |
+| Manual | [Pick a release archive](https://github.com/RantAI-dev/RantAIClaw/releases/latest), verify against `SHA256SUMS`, extract, move into `PATH` |
+| Homebrew *(planned)* | `brew install rantaiclaw` |
+
+> **Step-by-step per-platform tutorial** (macOS Gatekeeper, Linux distro notes, Windows PowerShell, Raspberry Pi, Docker compose, cosign verify) is published with every release — see the latest [release notes](https://github.com/RantAI-dev/RantAIClaw/releases/latest). Long-form reference: [`docs/install.md`](docs/install.md) · [Troubleshooting](docs/troubleshooting.md).
+
+### First run
+
+```bash
+rantaiclaw --version
+rantaiclaw setup     # guided wizard: provider, approvals, channels, persona, skills, MCP
+rantaiclaw doctor    # validate the install
+rantaiclaw chat      # launch the TUI and start chatting
+```
+
+### Update / Rollback / Uninstall
+
+```bash
+rantaiclaw update             # self-replace from the latest release
+rantaiclaw rollback           # restore the pre-update binary snapshot
+
+# Full uninstall
+rm -f ~/.cargo/bin/rantaiclaw ~/.local/bin/rantaiclaw
+rm -rf ~/.rantaiclaw          # config + workspace (back up first if needed)
+```
 
 ---
 
@@ -199,32 +247,6 @@ Memory supports semantic search via embeddings for context-aware recall.
 
 ---
 
-## Quick Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
-```
-
-Works on Linux (x86_64, aarch64, armv7) and macOS (Intel, Apple Silicon). The installer auto-detects your platform, downloads the latest pre-built binary, verifies its SHA256 checksum, and installs it — no Rust toolchain, no compiler, no git clone.
-
-> **Windows:** native Windows is not yet supported by the installer. Run via [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install), or download the `x86_64-pc-windows-msvc.zip` manually from the [latest release](https://github.com/RantAI-dev/RantAIClaw/releases/latest).
->
-> **PATH:** binary lands in `~/.cargo/bin` (or `~/.local/bin`). If `rantaiclaw --version` says "command not found", the installer prints the exact `export PATH=...` line for your shell.
-
-After installation:
-
-```bash
-rantaiclaw --version
-rantaiclaw setup                   # guided wizard — provider, approvals, channels, persona, skills, MCP
-rantaiclaw doctor                  # verify the install and surface any gaps
-rantaiclaw chat                    # start chatting!
-```
-
-> The legacy `rantaiclaw onboard` command still works as an alias for
-> `rantaiclaw setup` through v0.5.0; new recipes should prefer `setup`.
-
----
-
 ## Getting Started
 
 ```bash
@@ -241,36 +263,6 @@ rantaiclaw --help              # All commands
 ```
 
 📖 **[Full install reference →](docs/install.md)** · **[Troubleshooting →](docs/troubleshooting.md)** · **[Releases →](https://github.com/RantAI-dev/RantAIClaw/releases)**
-
----
-
-## Other install options
-
-| Method | Command |
-|--------|---------|
-| **One-liner** (recommended) | `curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh \| bash` |
-| **Manual download** | [Pick a release archive](https://github.com/RantAI-dev/RantAIClaw/releases/latest), verify against `SHA256SUMS`, extract, move into `PATH`. |
-| **Build from source** | `git clone https://github.com/RantAI-dev/RantAIClaw.git && cd RantAIClaw && ./bootstrap.sh --from-source` |
-| **Cargo** | `cargo install --git https://github.com/RantAI-dev/RantAIClaw --locked` |
-| **Docker** | `docker pull ghcr.io/rantai-dev/rantaiclaw:latest` |
-| **Bootstrap-managed Docker** | `./bootstrap.sh --docker --interactive-onboard` |
-| **Homebrew** *(when published)* | `brew install rantaiclaw` |
-
-Step-by-step recipes for each (with checksum + cosign verification, feature flags, container persistence): see **[docs/install.md](docs/install.md)**.
-
-### Updating
-
-```bash
-# Re-run the installer — always pulls the latest release
-curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
-```
-
-### Uninstalling
-
-```bash
-rm -f ~/.cargo/bin/rantaiclaw ~/.local/bin/rantaiclaw
-rm -rf ~/.rantaiclaw            # config + workspace (back up first if needed)
-```
 
 ---
 
