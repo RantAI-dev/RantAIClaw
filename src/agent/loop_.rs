@@ -3458,7 +3458,7 @@ Done."#;
         apply_compaction_summary(&mut history, 1, 3, "- user prefers concise replies");
 
         assert_eq!(history.len(), 4);
-        assert!(history[1].content.contains("Compaction summary"));
+        assert!(history[1].content.contains("Compacted summary"));
         assert!(history[2].content.contains("recent 1"));
         assert!(history[3].content.contains("recent 2"));
     }
