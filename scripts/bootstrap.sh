@@ -316,6 +316,9 @@ install_prebuilt_binary() {
     [[ -n "$version_line" ]] && info "Version: $version_line"
   fi
   print_path_hint "$install_dir"
+  # Stash the install dir so the end-of-script reminder can reference it
+  # (this runs at top level after install_prebuilt_binary returns).
+  RANTAICLAW_FINAL_INSTALL_DIR="$install_dir"
 
   return 0
 }
@@ -355,16 +358,62 @@ resolve_install_dir() {
   printf '%s' "$HOME/.local/bin"
 }
 
-# Pick the user's interactive shell rc. Falls back to ~/.bashrc.
-# Returns the unexpanded form (e.g. "~/.bashrc") for display, plus the
-# expanded path for filesystem operations, separated by a tab.
+# Pick the user's interactive shell rc.
+#
+# Returns three tab-separated fields: shell_name, display path (with ~), and
+# the expanded absolute path for filesystem operations.
+#
+# Coverage:
+#   - bash      -> ~/.bashrc (Linux), ~/.bash_profile if it already exists on macOS
+#   - zsh       -> ~/.zshrc (covers macOS Catalina+ default)
+#   - fish      -> ~/.config/fish/config.fish
+#   - ksh/mksh  -> ~/.kshrc
+#   - tcsh/csh  -> ~/.tcshrc or ~/.cshrc
+#   - dash/ash  -> ~/.profile (no per-shell rc; .profile is the POSIX fallback)
+#   - unknown   -> ~/.profile (safer than .bashrc when shell is non-bash)
 detect_shell_rc() {
-  local shell_name display expanded
+  local shell_name display expanded uname_kernel
   shell_name="$(basename "${SHELL:-/bin/bash}")"
+  uname_kernel="$(uname -s 2>/dev/null || echo '')"
   case "$shell_name" in
-    zsh)  display='~/.zshrc';                    expanded="$HOME/.zshrc" ;;
-    fish) display='~/.config/fish/config.fish';  expanded="$HOME/.config/fish/config.fish" ;;
-    *)    display='~/.bashrc';                   expanded="$HOME/.bashrc" ;;
+    zsh)
+      display='~/.zshrc';                    expanded="$HOME/.zshrc"
+      ;;
+    fish)
+      display='~/.config/fish/config.fish';  expanded="$HOME/.config/fish/config.fish"
+      ;;
+    ksh|mksh|ksh93)
+      display='~/.kshrc';                    expanded="$HOME/.kshrc"
+      ;;
+    tcsh)
+      display='~/.tcshrc';                   expanded="$HOME/.tcshrc"
+      ;;
+    csh)
+      display='~/.cshrc';                    expanded="$HOME/.cshrc"
+      ;;
+    dash|ash|sh)
+      display='~/.profile';                  expanded="$HOME/.profile"
+      ;;
+    bash)
+      # macOS launches bash as a login shell, which reads ~/.bash_profile
+      # (or ~/.profile) instead of ~/.bashrc. Prefer the file that's already
+      # there to avoid silently creating an inert rc.
+      if [[ "$uname_kernel" == "Darwin" ]]; then
+        if [[ -f "$HOME/.bash_profile" ]]; then
+          display='~/.bash_profile';         expanded="$HOME/.bash_profile"
+        elif [[ -f "$HOME/.profile" ]]; then
+          display='~/.profile';              expanded="$HOME/.profile"
+        else
+          display='~/.bash_profile';         expanded="$HOME/.bash_profile"
+        fi
+      else
+        display='~/.bashrc';                 expanded="$HOME/.bashrc"
+      fi
+      ;;
+    *)
+      # Unknown shell — ~/.profile is read by most POSIX login shells.
+      display='~/.profile';                  expanded="$HOME/.profile"
+      ;;
   esac
   printf '%s\t%s\t%s' "$shell_name" "$display" "$expanded"
 }
@@ -1271,4 +1320,40 @@ else
     next_steps+=("rantaiclaw doctor    — verify the install once configured")
   fi
   print_success_banner "${next_steps[@]}"
+
+  # Bold, unmissable PATH reminder — printed AFTER the success banner so it's
+  # the very last thing the user sees. Fires only when the install dir was
+  # resolved AND is still not on PATH for this shell session (i.e. the user
+  # will hit "command not found" until they source their rc or open a new
+  # terminal).
+  reminder_dir="${RANTAICLAW_FINAL_INSTALL_DIR:-}"
+  if [[ -n "$reminder_dir" && ":$PATH:" != *":$reminder_dir:"* ]]; then
+    rc_info_final="$(detect_shell_rc)"
+    IFS=$'\t' read -r shell_name_final display_rc_final rc_file_final <<<"$rc_info_final"
+    if [[ "$shell_name_final" == "fish" ]]; then
+      reload_cmd="exec fish      # or: source $display_rc_final"
+      copy_paste_line="fish_add_path $reminder_dir   # persists across sessions"
+    elif [[ "$shell_name_final" == "tcsh" || "$shell_name_final" == "csh" ]]; then
+      reload_cmd="source $display_rc_final"
+      copy_paste_line="echo 'set path = ( $reminder_dir \$path )' >> $display_rc_final"
+    else
+      reload_cmd="source $display_rc_final"
+      copy_paste_line="echo 'export PATH=\"$reminder_dir:\$PATH\"' >> $display_rc_final"
+    fi
+
+    print_action_required "rantaiclaw not yet on PATH" \
+      "Run this NOW so the \`rantaiclaw\` command works in this terminal:" \
+      "" \
+      "    $reload_cmd" \
+      "" \
+      "If you skipped the auto-amend, also add the export to $display_rc_final:" \
+      "" \
+      "    $copy_paste_line" \
+      "" \
+      "Then verify:" \
+      "" \
+      "    rantaiclaw --version" \
+      "" \
+      "(Detected shell: $shell_name_final. Opening a NEW terminal also works.)"
+  fi
 fi

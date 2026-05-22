@@ -118,6 +118,27 @@ step() {
   printf '\n%s%s[%s]%s %s\n' "$__UI_BOLD" "$__UI_CYAN" "$progress" "$__UI_RESET" "$*"
 }
 
+# print_action_required "TITLE" [line ...]
+# Bold yellow attention box used for unmissable post-install reminders
+# (e.g. "PATH not yet active — run `source ~/.bashrc`"). Each extra
+# argument becomes one indented line inside the box.
+print_action_required() {
+  local title="$1"
+  shift
+  printf '\n'
+  printf '%s%s┌%s┐%s\n' "$__UI_YELLOW" "$__UI_BOLD" "$__UI_BANNER_INNER" "$__UI_RESET"
+  printf '%s%s│  ⚠ ACTION REQUIRED: %-35s│%s\n' \
+    "$__UI_YELLOW" "$__UI_BOLD" "$title" "$__UI_RESET"
+  printf '%s%s└%s┘%s\n' "$__UI_YELLOW" "$__UI_BOLD" "$__UI_BANNER_INNER" "$__UI_RESET"
+  if [[ "$#" -gt 0 ]]; then
+    printf '\n'
+    for line in "$@"; do
+      printf '  %s\n' "$line"
+    done
+  fi
+  printf '\n'
+}
+
 # Braille spinner. Backgrounded subshell + carriage-return overwrite.
 # Falls back to a plain info line when stdout is not a TTY (capture-safe).
 __UI_SPINNER_PID=""

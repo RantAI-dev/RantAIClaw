@@ -41,7 +41,13 @@
 curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
 ```
 
-**Windows (native, recommended):** download `rantaiclaw-x86_64-pc-windows-msvc.zip` from the [latest release](https://github.com/RantAI-dev/RantAIClaw/releases/latest), extract it, and add `rantaiclaw.exe` to your `PATH` — then run `rantaiclaw.exe --version` in a new PowerShell window. **Alternative (WSL2):** install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the Linux one-liner above from inside the Ubuntu shell.
+**Windows (native, recommended)** — run in PowerShell:
+
+```powershell
+iwr https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install.ps1 -UseBasicParsing | iex
+```
+
+Detects your arch, downloads the prebuilt `x86_64-pc-windows-msvc` binary, verifies its SHA-256 against `SHA256SUMS`, installs to `%LOCALAPPDATA%\Programs\rantaiclaw`, and amends your *user* `PATH`. Open a new terminal afterwards (existing windows cache the old PATH). **Alternative (WSL2):** install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the Linux one-liner above from inside the Ubuntu shell.
 
 | Method | Command |
 |---|---|

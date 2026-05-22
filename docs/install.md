@@ -96,6 +96,52 @@ less bootstrap.sh
 bash bootstrap.sh
 ```
 
+### What the installer does to your `PATH`
+
+The installer picks an install directory that's *already* on `$PATH` whenever possible (priority: `RANTAICLAW_INSTALL_DIR` → `~/.cargo/bin` → `~/.local/bin` → `/usr/local/bin` → `~/.cargo/bin` → `~/.local/bin`). When the chosen directory isn't on `$PATH` yet, it offers to amend your **shell rc file** so it's picked up next time you open a shell.
+
+Shell-rc files written by the installer, by shell:
+
+| Shell | Detected from `$SHELL` | rc file amended |
+|---|---|---|
+| **bash** (Linux: Debian/Ubuntu, Arch, Fedora, openSUSE, Alpine, …) | `bash` | `~/.bashrc` |
+| **bash** (macOS — login shell) | `bash` on `Darwin` | `~/.bash_profile` (or `~/.profile` if already present) |
+| **zsh** (macOS Catalina+ default; common on Linux) | `zsh` | `~/.zshrc` |
+| **fish** | `fish` | `~/.config/fish/config.fish` (uses `fish_add_path`) |
+| **ksh / mksh** | `ksh`, `mksh`, `ksh93` | `~/.kshrc` |
+| **tcsh / csh** | `tcsh`, `csh` | `~/.tcshrc` or `~/.cshrc` |
+| **dash / ash / sh** | `dash`, `ash`, `sh` | `~/.profile` |
+| Anything else | unrecognized | `~/.profile` (POSIX fallback) |
+
+After the install finishes, if the binary isn't usable in the **current** shell, a bold **⚠ ACTION REQUIRED** box is printed with the exact `source` command to run. The two most common cases:
+
+```bash
+# bash on Linux
+source ~/.bashrc
+
+# zsh (Linux or macOS)
+source ~/.zshrc
+
+# fish
+exec fish        # or: source ~/.config/fish/config.fish
+```
+
+Opening a new terminal also works.
+
+#### Controlling the PATH amendment
+
+| Variable | Effect |
+|---|---|
+| `RANTAICLAW_AUTO_MODIFY_PATH=1` | Skip the prompt, always amend the rc (good for automation) |
+| `RANTAICLAW_NO_MODIFY_PATH=1` | Skip the prompt, never amend the rc (prints the `export` line instead) |
+
+If you piped `curl | bash` (no TTY for prompts), the installer behaves as if `RANTAICLAW_NO_MODIFY_PATH=1` and just prints the export line — review it, then add it yourself:
+
+```bash
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
+source ~/.bashrc
+```
+
 ---
 
 ## Option B: Manual download
@@ -152,25 +198,147 @@ For Windows: extract the `.zip`, move `rantaiclaw.exe` somewhere on `%PATH%`, ru
 
 Native Windows is the **recommended** path for Windows users. WSL2 is an alternative if you already live in a Linux environment or need bash-only tooling.
 
-### Option 1 — Native Windows (recommended)
+### Option 0 — Native Windows one-liner (easiest)
 
-1. **Download the binary.** From the [latest release](https://github.com/RantAI-dev/RantAIClaw/releases/latest), grab `rantaiclaw-x86_64-pc-windows-msvc.zip`.
-2. **Extract.** Right-click → *Extract All*, or in PowerShell:
-   ```powershell
-   Expand-Archive rantaiclaw-x86_64-pc-windows-msvc.zip -DestinationPath $HOME\rantaiclaw
-   ```
-3. **Add to PATH.** Move `rantaiclaw.exe` to a folder on your `%PATH%` (for example `C:\Users\<you>\bin\`). To add a new folder to PATH: *System Properties → Environment Variables → Path → Edit → New*.
-4. **Verify** in a new PowerShell window:
-   ```powershell
-   rantaiclaw.exe --version
-   rantaiclaw.exe setup
-   rantaiclaw.exe chat
-   ```
-
-**Optional — verify the signature first** (requires [cosign](https://github.com/sigstore/cosign)):
+Open PowerShell and run:
 
 ```powershell
-$VERSION = "v0.6.51-alpha"   # or the latest tag
+iwr https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install.ps1 -UseBasicParsing | iex
+```
+
+What the script does (parity with `scripts/bootstrap.sh`):
+
+1. Detects your architecture (only `x86_64-pc-windows-msvc` is published today; ARM64 / x86 fail with a clear message).
+2. Downloads `rantaiclaw-x86_64-pc-windows-msvc.zip` + `SHA256SUMS` from the [latest release](https://github.com/RantAI-dev/RantAIClaw/releases/latest).
+3. Verifies the SHA-256 against `SHA256SUMS` (refuses to install on mismatch).
+4. Extracts `rantaiclaw.exe` to `%LOCALAPPDATA%\Programs\rantaiclaw\` — the same convention VS Code, Slack, and Discord use, no admin needed.
+5. Amends your **User** `PATH` via the registry (not `setx` — which truncates at 1024 chars) and broadcasts `WM_SETTINGCHANGE` so Explorer-spawned shells pick it up without a logoff.
+6. Prints a bold **ACTION REQUIRED** reminder to open a new terminal (because cmd.exe / VS Code / Git Bash tabs cache the old `PATH`).
+
+**Options** (env vars and flags mirror `bootstrap.sh`):
+
+```powershell
+# Download once, run with flags
+iwr https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install.ps1 -OutFile install.ps1
+.\install.ps1 -InstallDir "$HOME\bin" -Onboard -Interactive
+.\install.ps1 -NoModifyPath               # never touch PATH
+.\install.ps1 -ForceModifyPath            # always amend PATH (no prompt)
+.\install.ps1 -NoVerifyChecksum           # skip SHA256 (offline/mirror only)
+.\install.ps1 -Version v0.6.52-alpha      # pin to a specific release
+```
+
+| Env var | Equivalent |
+|---|---|
+| `RANTAICLAW_INSTALL_DIR` | `-InstallDir` |
+| `RANTAICLAW_RELEASE_BASE_URL` | `-ReleaseBaseUrl` |
+| `RANTAICLAW_AUTO_MODIFY_PATH=1` | `-ForceModifyPath` |
+| `RANTAICLAW_NO_MODIFY_PATH=1` | `-NoModifyPath` |
+| `VERIFY_CHECKSUM=false` | `-NoVerifyChecksum` |
+
+**Reviewing the script before running it** (recommended for shell pipes on managed machines):
+
+```powershell
+iwr https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install.ps1 -OutFile install.ps1
+notepad install.ps1
+.\install.ps1
+```
+
+**Execution policy.** If PowerShell blocks the script with *"running scripts is disabled on this system"*, either pipe via `iex` (which doesn't trigger the policy — it evaluates an in-memory string) or unblock for the current shell only:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\install.ps1
+```
+
+If you'd rather do everything by hand, continue with **Option 1** below.
+
+---
+
+### Option 1 — Native Windows manual install
+
+#### Step 1 — Download the binary
+
+From the [latest release](https://github.com/RantAI-dev/RantAIClaw/releases/latest), grab `rantaiclaw-x86_64-pc-windows-msvc.zip`.
+
+Or in PowerShell:
+
+```powershell
+$VERSION = "latest"   # or a specific tag like "v0.6.52-alpha"
+$TARGET  = "x86_64-pc-windows-msvc"
+curl.exe -fsSL -O "https://github.com/RantAI-dev/RantAIClaw/releases/$VERSION/download/rantaiclaw-$TARGET.zip"
+```
+
+#### Step 2 — Extract
+
+```powershell
+Expand-Archive "rantaiclaw-x86_64-pc-windows-msvc.zip" -DestinationPath "$HOME\rantaiclaw"
+```
+
+That gives you `C:\Users\<you>\rantaiclaw\rantaiclaw.exe`.
+
+#### Step 3 — Add it to your `PATH` (the part everyone gets stuck on)
+
+Pick **one** of the three methods below. **Method A is the easiest** — one PowerShell command, no GUI.
+
+##### Method A — Automatic (PowerShell, one command)
+
+Permanently appends `$HOME\rantaiclaw` to your *user* `PATH` via `setx`:
+
+```powershell
+setx PATH "$HOME\rantaiclaw;$env:Path"
+```
+
+After this command:
+
+- **Close this PowerShell window and open a new one** — `setx` only updates the registry; existing terminals keep their old `PATH`.
+- `rantaiclaw.exe --version` should work in the new window.
+
+> If `setx` complains the value is too long (>1024 chars), use Method B or C instead — they edit `PATH` in place rather than reassigning it.
+
+##### Method B — GUI (most reliable on managed/corporate machines)
+
+1. Press <kbd>Win</kbd>, type **"Environment Variables"**, and click **"Edit the system environment variables"**.
+2. In the *System Properties* window, click **"Environment Variables..."** (bottom right).
+3. Under the **"User variables for &lt;you&gt;"** list (top half), select **`Path`** and click **"Edit..."**.
+4. Click **"New"** and paste `C:\Users\<your-user>\rantaiclaw` (replace `<your-user>`).
+5. Click **OK** → **OK** → **OK** to close all three dialogs.
+6. **Open a new PowerShell / Terminal window** — existing windows won't see the change.
+7. Verify: `rantaiclaw.exe --version`.
+
+> Avoid touching the **System variables** `Path` (bottom half) unless you actually want a system-wide install — that requires admin rights and affects every user.
+
+##### Method C — Drop it into a folder that's already on PATH
+
+If you'd rather not edit `PATH` at all, move the binary into a folder that's already there. Run `$env:Path -split ';'` in PowerShell to list them. Common writable choices:
+
+- `C:\Users\<you>\AppData\Local\Microsoft\WindowsApps` — always on PATH for your user, no admin needed.
+- `C:\Windows\System32` — system-wide but requires admin and is heavyweight.
+
+```powershell
+Move-Item "$HOME\rantaiclaw\rantaiclaw.exe" "$HOME\AppData\Local\Microsoft\WindowsApps\rantaiclaw.exe"
+```
+
+`rantaiclaw.exe --version` works immediately, even in the same window.
+
+#### Step 4 — Verify
+
+In a **new** PowerShell window:
+
+```powershell
+rantaiclaw.exe --version       # rantaiclaw 0.6.x
+rantaiclaw.exe setup           # guided wizard
+rantaiclaw.exe doctor          # validate install
+rantaiclaw.exe chat            # start chatting
+```
+
+If `rantaiclaw.exe` is "not recognized as the name of a cmdlet…", your `PATH` edit didn't apply — see [Windows PATH troubleshooting](#windows-path-troubleshooting) below.
+
+#### Optional — verify the cosign signature first
+
+Requires [cosign](https://github.com/sigstore/cosign):
+
+```powershell
+$VERSION = "v0.6.52-alpha"   # or the latest tag
 $TARGET  = "x86_64-pc-windows-msvc"
 curl.exe -fsSL -O "https://github.com/RantAI-dev/RantAIClaw/releases/download/$VERSION/rantaiclaw-$TARGET.zip"
 curl.exe -fsSL -O "https://github.com/RantAI-dev/RantAIClaw/releases/download/$VERSION/rantaiclaw-$TARGET.zip.bundle"
@@ -181,7 +349,17 @@ cosign verify-blob `
   "rantaiclaw-$TARGET.zip"
 ```
 
-### Option 2 — WSL2 (alternative)
+#### Windows PATH troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `'rantaiclaw' is not recognized…` in the **same** PowerShell window where you ran `setx` | `setx` only affects *new* sessions | Close the window, open a new one |
+| Works in PowerShell, missing in cmd.exe / Git Bash / VS Code terminal | Each tool may cache its own `PATH` snapshot | Restart the tool (close & reopen) |
+| `Execution of scripts is disabled…` | PowerShell execution policy is `Restricted` | The binary itself is unaffected; this only matters if you launch a `.ps1` script |
+| Works for you but not for another user on the same PC | You added to *User* PATH, they need *System* PATH | Repeat Method B in the System variables half (requires admin) |
+| `setx` complains "value too long" | The combined PATH exceeds 1024 chars | Use Method B or C instead |
+
+### Option 2 — WSL2
 
 If you already use WSL2, or prefer a Linux toolchain on Windows:
 
