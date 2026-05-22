@@ -32,6 +32,12 @@ param(
     [switch]$NoVerifyChecksum,
     [switch]$NoModifyPath,
     [switch]$ForceModifyPath,
+    # As of v0.6.52-alpha the installer ALWAYS runs `rantaiclaw setup --force`
+    # at the end (the "full" wizard: provider, approvals, channels, persona,
+    # skills, MCP). Use -SkipSetup or $env:RANTAICLAW_SKIP_SETUP=1 to disable.
+    [switch]$SkipSetup,
+    # Legacy: switches the post-install step from `setup --force` to the
+    # older `onboard` flow.
     [switch]$Onboard,
     [switch]$Interactive,
     [string]$ApiKey,
@@ -58,6 +64,7 @@ if (-not $Model            -and $env:RANTAICLAW_MODEL)              { $Model    
 if (-not $NoModifyPath     -and $env:RANTAICLAW_NO_MODIFY_PATH    -eq '1') { $NoModifyPath     = $true }
 if (-not $ForceModifyPath  -and $env:RANTAICLAW_AUTO_MODIFY_PATH  -eq '1') { $ForceModifyPath  = $true }
 if (-not $NoVerifyChecksum -and $env:VERIFY_CHECKSUM -eq 'false')          { $NoVerifyChecksum = $true }
+if (-not $SkipSetup        -and $env:RANTAICLAW_SKIP_SETUP        -eq '1') { $SkipSetup        = $true }
 
 if (-not $ReleaseBaseUrl) {
     $ReleaseBaseUrl = if ($Version -eq 'latest') {
@@ -301,7 +308,11 @@ try {
         }
     }
 
-    # --- Optional onboarding ---
+    # --- Post-install configuration ---
+    # Default: `rantaiclaw setup --force` (the "full" wizard) unless the user
+    # passed -SkipSetup / $env:RANTAICLAW_SKIP_SETUP=1, or opted into the
+    # legacy `onboard` path via -Onboard.
+    $ranPostInstall = $false
     if ($Onboard) {
         $onboardArgs = @('onboard')
         if ($Interactive) {
@@ -313,6 +324,28 @@ try {
         }
         Write-Info "Running: rantaiclaw.exe $($onboardArgs -join ' ')"
         & $finalExe @onboardArgs
+        $ranPostInstall = $true
+    } elseif (-not $SkipSetup) {
+        # Always run the full setup wizard at install end. When piped via
+        # `iwr | iex`, stdin is redirected but the wizard expects interactive
+        # input — Windows doesn't have a clean /dev/tty fallback, so when
+        # input is redirected we print a clear reminder instead of crashing.
+        if ([Console]::IsInputRedirected) {
+            Write-Warn 'No interactive console (piped install).'
+            Write-Warn 'Run the full setup wizard manually in a new PowerShell window:'
+            Write-Warn ''
+            Write-Warn '    rantaiclaw.exe setup --force'
+        } else {
+            Write-Info 'Running guided setup (rantaiclaw setup --force)'
+            Write-Info 'Pass -SkipSetup or $env:RANTAICLAW_SKIP_SETUP=1 to disable this.'
+            try {
+                & $finalExe setup --force
+                $ranPostInstall = $true
+            } catch {
+                Write-Warn "Setup exited non-zero: $($_.Exception.Message)"
+                Write-Warn 'Re-run anytime with: rantaiclaw.exe setup --force'
+            }
+        }
     }
 
     # --- Success banner ---
@@ -321,9 +354,11 @@ try {
         'rantaiclaw agent      — run the autonomous agent loop'
         'rantaiclaw status     — verify installation'
     )
-    if (-not $Onboard) {
-        $nextSteps += 'rantaiclaw setup     — guided wizard (provider, approvals, channels, persona, skills, MCP)'
-        $nextSteps += 'rantaiclaw doctor    — verify the install once configured'
+    if (-not $ranPostInstall) {
+        $nextSteps += 'rantaiclaw setup --force   — guided wizard (provider, approvals, channels, persona, skills, MCP)'
+        $nextSteps += 'rantaiclaw doctor          — verify the install once configured'
+    } else {
+        $nextSteps += 'rantaiclaw doctor          — verify the install at any time'
     }
     Write-SuccessBanner -NextSteps $nextSteps
 

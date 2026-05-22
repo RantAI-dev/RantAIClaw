@@ -17,11 +17,12 @@ This downloads the latest pre-built binary for your platform, verifies its
 SHA256 checksum, and installs it to `~/.cargo/bin` (or `~/.local/bin` if
 cargo isn't present). No Rust toolchain, no compiler, no git clone needed.
 
+**As of v0.6.52-alpha the installer automatically runs `rantaiclaw setup --force` at the end** — the full guided wizard (provider, approvals, channels, persona, skills, MCP). You don't need to invoke it yourself. Opt out with `--skip-setup` or `RANTAICLAW_SKIP_SETUP=1` if you're just unpacking the binary for later configuration.
+
 After install:
 
 ```bash
 rantaiclaw --version
-rantaiclaw onboard --interactive
 rantaiclaw chat
 ```
 
@@ -52,6 +53,7 @@ Unsupported platform? Use [Build from source](#option-c-build-from-source).
 4. Verifies its SHA256 against the published `SHA256SUMS`.
 5. Extracts the binary and installs it to `~/.cargo/bin` or `~/.local/bin`.
 6. Tells you exactly how to add the install dir to PATH if needed.
+7. **Runs `rantaiclaw setup --force` automatically** (full guided wizard). Reattaches `/dev/tty` when invoked via `curl | bash` so prompts still work; falls back to a bold "run setup manually" reminder on truly headless systems.
 
 ### Standard install
 
@@ -59,11 +61,34 @@ Unsupported platform? Use [Build from source](#option-c-build-from-source).
 curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
 ```
 
-### With onboarding right after install
+### Skip the auto-setup wizard
+
+The installer runs `rantaiclaw setup --force` by default. To install only — no wizard — use `--skip-setup` or the env-var equivalent:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash -s -- --skip-setup
+# or
+curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | RANTAICLAW_SKIP_SETUP=1 bash
+```
+
+You can re-run the wizard any time:
+
+```bash
+rantaiclaw setup --force        # re-walk every section
+rantaiclaw setup                # only sections not yet configured
+rantaiclaw setup provider       # one section
+```
+
+### Legacy: --onboard (pre-v0.6.52 flow)
+
+The older `onboard` command is still supported when you need quick non-interactive provisioning with an API key:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash -s -- --interactive-onboard
+RANTAICLAW_API_KEY="sk-..." curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash -s -- --onboard
 ```
+
+`--onboard` suppresses the default `setup --force` (mutually exclusive).
 
 ### Custom install directory
 
@@ -214,13 +239,16 @@ What the script does (parity with `scripts/bootstrap.sh`):
 4. Extracts `rantaiclaw.exe` to `%LOCALAPPDATA%\Programs\rantaiclaw\` — the same convention VS Code, Slack, and Discord use, no admin needed.
 5. Amends your **User** `PATH` via the registry (not `setx` — which truncates at 1024 chars) and broadcasts `WM_SETTINGCHANGE` so Explorer-spawned shells pick it up without a logoff.
 6. Prints a bold **ACTION REQUIRED** reminder to open a new terminal (because cmd.exe / VS Code / Git Bash tabs cache the old `PATH`).
+7. **Runs `rantaiclaw.exe setup --force` automatically** (full guided wizard — provider, approvals, channels, persona, skills, MCP). Skipped only when stdin is redirected (piped via `iwr | iex` directly) or when you pass `-SkipSetup`; in those cases a clear "run setup manually" reminder is printed instead.
 
 **Options** (env vars and flags mirror `bootstrap.sh`):
 
 ```powershell
 # Download once, run with flags
 iwr https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install.ps1 -OutFile install.ps1
-.\install.ps1 -InstallDir "$HOME\bin" -Onboard -Interactive
+.\install.ps1 -InstallDir "$HOME\bin"     # custom install location
+.\install.ps1 -SkipSetup                  # don't auto-run `setup --force`
+.\install.ps1 -Onboard -Interactive       # legacy `onboard` flow instead of setup
 .\install.ps1 -NoModifyPath               # never touch PATH
 .\install.ps1 -ForceModifyPath            # always amend PATH (no prompt)
 .\install.ps1 -NoVerifyChecksum           # skip SHA256 (offline/mirror only)
@@ -233,6 +261,7 @@ iwr https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install
 | `RANTAICLAW_RELEASE_BASE_URL` | `-ReleaseBaseUrl` |
 | `RANTAICLAW_AUTO_MODIFY_PATH=1` | `-ForceModifyPath` |
 | `RANTAICLAW_NO_MODIFY_PATH=1` | `-NoModifyPath` |
+| `RANTAICLAW_SKIP_SETUP=1` | `-SkipSetup` |
 | `VERIFY_CHECKSUM=false` | `-NoVerifyChecksum` |
 
 **Reviewing the script before running it** (recommended for shell pipes on managed machines):
@@ -505,11 +534,12 @@ Common:
   --from-source            Build from source instead of downloading a binary
   --no-verify-checksum     Skip SHA256 verification (offline / mirror only)
   --docker                 Build & run inside a container
-  --onboard                Run onboarding after install
-  --interactive-onboard    Run interactive onboarding (implies --onboard)
-  --api-key <key>          API key for non-interactive onboarding
-  --provider <id>          Provider for onboarding (default: openrouter)
-  --model <id>             Model for onboarding
+  --skip-setup             Don't run `rantaiclaw setup --force` (default: run it)
+  --onboard                Use legacy `onboard` flow instead of `setup --force`
+  --interactive-onboard    Run interactive legacy onboarding (implies --onboard)
+  --api-key <key>          API key for non-interactive legacy onboarding
+  --provider <id>          Provider for legacy onboarding (default: openrouter)
+  --model <id>             Model for legacy onboarding
 
 System bootstrap (only with --from-source):
   --install-system-deps    Install build deps (Linux/macOS)
@@ -533,7 +563,8 @@ Advanced / build-tuning:
 | `RANTAICLAW_FALLBACK_IMAGE` | `ghcr.io/rantai-dev/rantaiclaw:latest` | Docker fallback image |
 | `RANTAICLAW_INSTALL_DIR` | `~/.cargo/bin` (else `~/.local/bin`) | Where the binary lands |
 | `VERIFY_CHECKSUM` | `true` | Set to `false` to skip SHA256 verification |
-| `RANTAICLAW_API_KEY` | — | Used when `--api-key` not provided |
+| `RANTAICLAW_SKIP_SETUP` | unset | Set to `1` to skip the default `rantaiclaw setup --force` run |
+| `RANTAICLAW_API_KEY` | — | Used when `--api-key` not provided (legacy `--onboard` flow) |
 | `RANTAICLAW_PROVIDER` | `openrouter` | Used when `--provider` not provided |
 | `RANTAICLAW_MODEL` | — | Used when `--model` not provided |
 | `RANTAICLAW_CONTAINER_CLI` | `docker` (auto-fallback `podman`) | Container CLI for `--docker` |

@@ -37,7 +37,8 @@
 ## Install
 
 ```bash
-# Linux + macOS — auto-detects platform, downloads, verifies SHA256, installs
+# Linux + macOS — auto-detects platform, downloads, verifies SHA256,
+# installs, and runs `rantaiclaw setup --force` (full guided wizard).
 curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash
 ```
 
@@ -47,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/
 iwr https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install.ps1 -UseBasicParsing | iex
 ```
 
-Detects your arch, downloads the prebuilt `x86_64-pc-windows-msvc` binary, verifies its SHA-256 against `SHA256SUMS`, installs to `%LOCALAPPDATA%\Programs\rantaiclaw`, and amends your *user* `PATH`. Open a new terminal afterwards (existing windows cache the old PATH). **Alternative (WSL2):** install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the Linux one-liner above from inside the Ubuntu shell.
+Both installers detect your arch, download the matching prebuilt binary, verify SHA-256, amend `PATH`, and end by launching the **full guided setup wizard** (`rantaiclaw setup --force` — provider, approvals, channels, persona, skills, MCP). Pass `--skip-setup` / `-SkipSetup` (or set `RANTAICLAW_SKIP_SETUP=1`) to install only. **Windows alternative (WSL2):** install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the Linux one-liner above from inside the Ubuntu shell.
 
 | Method | Command |
 |---|---|
@@ -61,11 +62,14 @@ Detects your arch, downloads the prebuilt `x86_64-pc-windows-msvc` binary, verif
 
 ### First run
 
+The installer already ran `rantaiclaw setup --force` for you. To re-run, validate, or jump into the TUI:
+
 ```bash
 rantaiclaw --version
-rantaiclaw setup     # guided wizard: provider, approvals, channels, persona, skills, MCP
-rantaiclaw doctor    # validate the install
-rantaiclaw chat      # launch the TUI and start chatting
+rantaiclaw setup         # re-walk any unconfigured sections
+rantaiclaw setup --force # re-walk every section from scratch
+rantaiclaw doctor        # validate the install
+rantaiclaw chat          # launch the TUI and start chatting
 ```
 
 ### Update / Rollback / Uninstall
