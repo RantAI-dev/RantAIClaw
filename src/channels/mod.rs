@@ -2220,6 +2220,9 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         crate::ChannelCommands::Start => {
             anyhow::bail!("Start must be handled in main.rs (requires async runtime)")
         }
+        crate::ChannelCommands::Run => {
+            anyhow::bail!("Run must be handled in main.rs (requires async runtime)")
+        }
         crate::ChannelCommands::Doctor => {
             anyhow::bail!("Doctor must be handled in main.rs (requires async runtime)")
         }

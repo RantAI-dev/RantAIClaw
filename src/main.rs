@@ -392,19 +392,29 @@ Examples:
     Providers,
 
     /// Manage channels (telegram, discord, slack)
-    #[command(long_about = "\
+    #[command(
+        alias = "channels",
+        long_about = "\
 Manage communication channels.
 
 Add, remove, list, and health-check channels that connect RantaiClaw \
 to messaging platforms. Supported channel types: telegram, discord, \
 slack, whatsapp, matrix, imessage, email.
 
+The `run` subcommand is the recommended way to keep channels polling \
+in the background after closing the TUI — wrap it with `nohup`, \
+`systemd-run --user`, or `tmux` for a true detached process.
+
 Examples:
   rantaiclaw channel list
   rantaiclaw channel doctor
   rantaiclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
   rantaiclaw channel remove my-bot
-  rantaiclaw channel bind-telegram rantaiclaw_user")]
+  rantaiclaw channel bind-telegram rantaiclaw_user
+  rantaiclaw channels run                              # foreground (Ctrl-C to stop)
+  nohup rantaiclaw channels run > rantaiclaw-channels.log 2>&1 &
+  systemd-run --user --unit=rantaiclaw-channels rantaiclaw channels run"
+    )]
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
@@ -954,8 +964,15 @@ enum DoctorFormat {
 enum ChannelCommands {
     /// List configured channels
     List,
-    /// Start all configured channels (Telegram, Discord, Slack)
+    /// Start all configured channels (Telegram, Discord, Slack) — foreground
     Start,
+    /// Run all configured channels in the foreground until Ctrl-C.
+    ///
+    /// Alias of `start` with a louder, friendlier startup banner so users
+    /// arriving from the TUI's "configure channels" flow see clear stop
+    /// instructions. Background it from your shell: `nohup rantaiclaw
+    /// channels run > out.log 2>&1 &` or via systemd-run / tmux / screen.
+    Run,
     /// Run health checks for configured channels
     Doctor,
     /// Add a new channel
@@ -1717,6 +1734,24 @@ async fn main() -> Result<()> {
 
         Some(Commands::Channel { channel_command }) => match channel_command {
             ChannelCommands::Start => channels::start_channels(config).await,
+            ChannelCommands::Run => {
+                // Friendly banner so users arriving from the TUI's wizard
+                // know exactly what they ran and how to stop it. The actual
+                // supervisor is the same `start_channels` path the daemon
+                // and `channel start` use — this just wraps it with UX.
+                println!("🛰️  rantaiclaw channels run");
+                println!(
+                    "   Starting all configured channels (supervised with exponential backoff)."
+                );
+                println!(
+                    "   Press Ctrl-C to stop, or send SIGTERM to PID {}.",
+                    std::process::id()
+                );
+                println!("   Tip: to keep polling after closing this terminal:");
+                println!("        nohup rantaiclaw channels run > rantaiclaw-channels.log 2>&1 &");
+                println!("        (or `systemd-run --user --unit=rantaiclaw-channels rantaiclaw channels run`)");
+                channels::start_channels(config).await
+            }
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
             other => channels::handle_command(other, &config).await,
         },

@@ -107,6 +107,11 @@ pub(crate) enum ChannelCommands {
     List,
     /// Start all configured channels (handled in main.rs for async)
     Start,
+    /// Run all configured channels in the foreground until Ctrl-C
+    /// (handled in main.rs for async). v0.6.53+ alias of `start` with
+    /// a friendlier banner and explicit backgrounding tips for users
+    /// arriving from the TUI's channel wizard.
+    Run,
     /// Run health checks for configured channels (handled in main.rs for async)
     Doctor,
     /// Add a new channel configuration

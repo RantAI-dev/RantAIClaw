@@ -273,27 +273,42 @@ impl TuiProvisioner for ProviderProvisioner {
             )
             .await?;
 
-            let prompt_label = if provider_name == "gemini" {
+            let prompt_label: String = if provider_name == "gemini" {
                 "Gemini API key (Enter to skip if using CLI auth)".into()
             } else {
                 "API key".into()
             };
 
-            send(
-                &events,
-                ProvisionEvent::Prompt {
-                    id: "api_key".into(),
-                    label: prompt_label,
-                    default: None,
-                    secret: true,
-                },
-            )
-            .await?;
+            // Retry loop. As of v0.6.53-alpha, hitting 401/403 no longer
+            // silently advances to the next step — the user gets a
+            // three-way choice (Re-enter / Continue anyway / Abort).
+            // Default is "re-enter", because the most common cause is a
+            // typo or copy-paste truncation.
+            //
+            // The loop also handles transient validation network errors
+            // separately: those go straight through with a warning (we
+            // don't want to block setup just because the validation
+            // endpoint is temporarily unreachable).
+            loop {
+                send(
+                    &events,
+                    ProvisionEvent::Prompt {
+                        id: "api_key".into(),
+                        label: prompt_label.clone(),
+                        default: None,
+                        secret: true,
+                    },
+                )
+                .await?;
 
-            api_key = recv_text(&mut responses).await?;
+                api_key = recv_text(&mut responses).await?;
 
-            // Validate against /v1/models if key provided
-            if !api_key.trim().is_empty() {
+                if api_key.trim().is_empty() {
+                    // Empty key: don't validate, just move on. Some flows
+                    // (gemini with CLI auth, dev mode) expect this.
+                    break;
+                }
+
                 send(
                     &events,
                     ProvisionEvent::Message {
@@ -331,17 +346,43 @@ impl TuiProvisioner for ProviderProvisioner {
                             &events,
                             ProvisionEvent::Message {
                                 severity: Severity::Warn,
-                                text: "API key appears invalid (401/403). You can still continue."
-                                    .into(),
+                                text: format!(
+                                    "API key rejected ({}). Re-enter the key, continue with it anyway, or abort setup.",
+                                    result.status
+                                ),
                             },
                         )
                         .await?;
+                        send(
+                            &events,
+                            ProvisionEvent::Choose {
+                                id: "api_key_retry".into(),
+                                label: "What would you like to do?".into(),
+                                options: vec![
+                                    "Re-enter the API key".into(),
+                                    "Continue anyway (proceed with this key)".into(),
+                                    "Abort setup".into(),
+                                ],
+                                multi: false,
+                            },
+                        )
+                        .await?;
+                        let choice = recv_selection(&mut responses).await?;
+                        match choice.first().copied() {
+                            Some(0) => continue, // re-prompt for the key
+                            Some(1) => break,    // keep the rejected key
+                            Some(2) | None => {
+                                anyhow::bail!("setup aborted by user after invalid API key");
+                            }
+                            Some(_) => continue, // unknown index — safest is to re-prompt
+                        }
                     }
                     Err(e) => {
                         send(&events, ProvisionEvent::Message {
                             severity: Severity::Warn,
                             text: format!("Could not validate key (network error): {e}. Continuing anyway…"),
                         }).await?;
+                        break;
                     }
                     Ok(_) => {
                         send(
@@ -352,6 +393,7 @@ impl TuiProvisioner for ProviderProvisioner {
                             },
                         )
                         .await?;
+                        break;
                     }
                 }
             }
