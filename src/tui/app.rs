@@ -89,6 +89,19 @@ pub struct TuiApp {
     /// Sender for responses (prompt answers) back to the provisioner.
     pub setup_response_tx:
         Option<tokio::sync::mpsc::Sender<crate::onboard::provision::ProvisionResponse>>,
+    /// Receiver for the post-save `Config` from the active provisioner's
+    /// spawn task. Drained in the render tick; on receive we swap
+    /// `self.config` to the saved value so the *next* provisioner clone
+    /// sees the prior provisioner's writes.
+    ///
+    /// Without this, the first-run wizard had a race: provisioner N's
+    /// spawn task emitted `Done` (via the provisioner) BEFORE its async
+    /// `config.save().await` completed; provisioner N+1's overlay then
+    /// cloned a stale `self.config` and saved its mutated clone back
+    /// over N's writes. Net effect: only the last provisioner's writes
+    /// landed on disk, wiping everything else (provider, api_key, ...).
+    /// Fix shipped in v0.6.56.
+    pub setup_save_complete_rx: Option<tokio::sync::oneshot::Receiver<crate::config::Config>>,
     /// Active interactive list picker — Up/Down/Enter/Esc overlay used
     /// by `/model`, `/sessions`, `/resume`, `/personality`, etc. The
     /// `ListPicker.kind` tag tells the Enter handler what to do with the
@@ -356,6 +369,7 @@ impl TuiApp {
             overlay: None,
             setup_overlay: None,
             setup_event_rx: None,
+            setup_save_complete_rx: None,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
@@ -886,6 +900,7 @@ impl TuiApp {
                     }
                     self.setup_overlay = None;
                     self.setup_event_rx = None;
+                    self.setup_save_complete_rx = None;
                     self.setup_response_tx = None;
                 }
                 if let Some(w) = self.first_run_wizard.as_mut() {
@@ -1011,6 +1026,7 @@ impl TuiApp {
                     self.first_run_wizard = None;
                     self.setup_overlay = None;
                     self.setup_event_rx = None;
+                    self.setup_save_complete_rx = None;
                     self.setup_response_tx = None;
                     if let Err(e) = self.reload_config() {
                         tracing::warn!("failed to reload config after wizard cancel: {}", e);
@@ -1035,6 +1051,7 @@ impl TuiApp {
                 }
                 self.setup_overlay = None;
                 self.setup_event_rx = None;
+                self.setup_save_complete_rx = None;
                 self.setup_response_tx = None;
                 // Reload config so freshly-written sections take effect.
                 if let Err(e) = self.reload_config() {
@@ -1470,10 +1487,39 @@ impl TuiApp {
         self.tick_clawhub_install();
         self.tick_skill_deps_install();
         // Wizard auto-advance: when the current provisioner finishes
-        // SUCCESSFULLY, close the overlay and open the next provisioner
-        // (or advance to Complete if this was the last one). On
-        // failure, keep the overlay open so the user reads the error
-        // and decides what to do (Esc aborts the wizard).
+        // SUCCESSFULLY AND its config.save() has completed, close the
+        // overlay and open the next provisioner (or advance to Complete
+        // if this was the last one). On failure, keep the overlay open
+        // so the user reads the error and decides what to do (Esc
+        // aborts the wizard).
+        //
+        // The save-completion gate (v0.6.56) closes a race where the
+        // provisioner emitted `Done` via the events channel BEFORE its
+        // async `config.save().await` finished — the wizard would
+        // advance, clone a stale `self.config`, run the next
+        // provisioner, and that next save would trample the previous
+        // one. Net effect: only the last provisioner's writes landed
+        // on disk; provider/api_key/etc were wiped. We now poll the
+        // setup_save_complete_rx oneshot and only advance when the
+        // saved Config has been received (and swapped into self.config)
+        // so the next clone sees the latest writes.
+        let saved_config = match self.setup_save_complete_rx.as_mut() {
+            Some(rx) => match rx.try_recv() {
+                Ok(cfg) => Some(Some(cfg)), // Some(Some) = save succeeded, here's the config
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some(None), // Some(None) = save failed / spawn aborted
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None, // still pending
+            },
+            None => None,
+        };
+        if let Some(Some(cfg)) = &saved_config {
+            // Save succeeded — swap in the new config NOW so the next
+            // provisioner's clone sees this provisioner's writes.
+            self.config = cfg.clone();
+        }
+        if saved_config.is_some() {
+            // Either Ok or Err — the oneshot is consumed; drop the rx.
+            self.setup_save_complete_rx = None;
+        }
         let need_advance = self
             .first_run_wizard
             .as_ref()
@@ -1481,11 +1527,18 @@ impl TuiApp {
             && {
                 let o = self.setup_overlay.as_ref();
                 o.is_some_and(|s| s.finished) && o.is_some_and(|s| s.failure_reason.is_none())
-            };
+            }
+            // Gate: only advance once the save has completed (Some(Some))
+            // OR if the spawn already errored out (Some(None) — handled
+            // via overlay.failure_reason elsewhere, but defensively we
+            // refuse to advance on a closed save channel since it means
+            // nothing was persisted).
+            && matches!(saved_config, Some(Some(_)));
         if need_advance {
             // Clean success → close overlay, advance wizard, react.
             self.setup_overlay = None;
             self.setup_event_rx = None;
+            self.setup_save_complete_rx = None;
             self.setup_response_tx = None;
             if let Some(wizard) = self.first_run_wizard.as_mut() {
                 wizard.advance_to_next_in_queue_or_picker();
@@ -2819,6 +2872,12 @@ impl TuiApp {
 
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(32);
         let (response_tx, response_rx) = tokio::sync::mpsc::channel(8);
+        // Oneshot the spawn task uses to send the post-save Config back
+        // to the main loop. The race fix: see `setup_save_complete_rx`
+        // field doc — we MUST swap `self.config` to the saved value
+        // BEFORE the wizard opens the next provisioner overlay,
+        // otherwise N+1 clones a stale self.config and saves over N.
+        let (save_tx, save_rx) = tokio::sync::oneshot::channel::<crate::config::Config>();
 
         let mut config = self.config.clone();
         let profile = self.profile.clone();
@@ -2829,6 +2888,7 @@ impl TuiApp {
         self.setup_overlay = Some(overlay_state);
         self.setup_event_rx = Some(events_rx);
         self.setup_response_tx = Some(response_tx);
+        self.setup_save_complete_rx = Some(save_rx);
 
         let events_tx = events_tx;
         tokio::spawn(async move {
@@ -2856,19 +2916,32 @@ impl TuiApp {
                     if config.config_path.parent().is_none() {
                         config.config_path = profile.config_toml();
                     }
-                    if let Err(e) = config.save().await {
-                        tracing::error!(
-                            provisioner = prov_name,
-                            "failed to save config after provisioner: {e}"
-                        );
-                        // Best-effort surface to the overlay log so the
-                        // user sees the failure instead of a phantom
-                        // success.
-                        let _ = save_failure_tx
-                            .send(crate::onboard::provision::ProvisionEvent::Failed {
-                                error: format!("Config save failed: {e}"),
-                            })
-                            .await;
+                    match config.save().await {
+                        Ok(()) => {
+                            // Hand the just-saved Config back to the main
+                            // loop. The render-tick drain swaps it into
+                            // self.config and only then does the wizard
+                            // advance to the next provisioner. Closes the
+                            // race where the next overlay would clone a
+                            // stale self.config and overwrite this save.
+                            let _ = save_tx.send(config);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                provisioner = prov_name,
+                                "failed to save config after provisioner: {e}"
+                            );
+                            // Best-effort surface to the overlay log so
+                            // the user sees the failure instead of a
+                            // phantom success. save_tx is dropped here →
+                            // receiver gets `Closed`, which the gate
+                            // treats as "save failed, don't advance".
+                            let _ = save_failure_tx
+                                .send(crate::onboard::provision::ProvisionEvent::Failed {
+                                    error: format!("Config save failed: {e}"),
+                                })
+                                .await;
+                        }
                     }
                 }
                 Err(e) => {
@@ -2883,6 +2956,7 @@ impl TuiApp {
                             error: format!("Provisioner error: {e}"),
                         })
                         .await;
+                    // save_tx drops → receiver gets `Closed`.
                 }
             }
         });
@@ -5499,6 +5573,7 @@ mod tests {
             overlay: None,
             setup_overlay: None,
             setup_event_rx: None,
+            setup_save_complete_rx: None,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
@@ -5597,6 +5672,7 @@ mod submit_tests {
             overlay: None,
             setup_overlay: None,
             setup_event_rx: None,
+            setup_save_complete_rx: None,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
@@ -5711,6 +5787,7 @@ mod ctrl_c_tests {
             overlay: None,
             setup_overlay: None,
             setup_event_rx: None,
+            setup_save_complete_rx: None,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
@@ -5804,6 +5881,7 @@ mod drain_tests {
             overlay: None,
             setup_overlay: None,
             setup_event_rx: None,
+            setup_save_complete_rx: None,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
@@ -5970,6 +6048,7 @@ mod retry_tests {
             overlay: None,
             setup_overlay: None,
             setup_event_rx: None,
+            setup_save_complete_rx: None,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
