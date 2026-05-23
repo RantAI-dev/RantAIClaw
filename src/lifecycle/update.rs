@@ -109,6 +109,15 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
 
     require_self_modifiable(&info, "update")?;
 
+    // Pre-flight: the swap path writes `<binary>.new`, `<binary>.old`, and
+    // renames into the install directory. If we can't write there, the
+    // download is wasted bandwidth — bail early with a clear "re-run with
+    // sudo" hint that tells the user exactly which dir is the problem.
+    //
+    // Common case: bootstrap.sh installed to /usr/local/bin (writable only
+    // to root) but the user runs `rantaiclaw update` as themselves.
+    require_install_dir_writable(&info.path)?;
+
     if !opts.yes && !confirm() {
         println!("aborted");
         return Ok(());
@@ -192,13 +201,19 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
         // wider distros (it's already in homebrew, apt, AUR) this
         // becomes a hard requirement in a future cut.
         let bundle_url = format!("{base_url}/{archive_name}.bundle");
-        match verify_cosign_signature(&base_url, &archive_path, &archive_name, &work_dir) {
-            Ok(true) => println!("✓ cosign signature verified ({bundle_url})"),
-            Ok(false) => println!(
-                "⚠ skipping cosign verify (signature bundle not found at {bundle_url}). \
+        match verify_cosign_signature(&base_url, &archive_path, &archive_name, &work_dir)? {
+            CosignOutcome::Verified => println!("✓ cosign signature verified ({bundle_url})"),
+            CosignOutcome::CosignNotInstalled => {
+                // Already printed the "cosign not found on PATH" warning
+                // from inside the helper. Don't double-warn with a
+                // "bundle not found" message that misrepresents the
+                // actual cause (the bundle IS published; we just can't
+                // verify it without cosign).
+            }
+            CosignOutcome::BundleMissing => println!(
+                "⚠ no cosign bundle published at {bundle_url} (pre-v0.6.44 release?). \
                  SHA-only verification will continue."
             ),
-            Err(e) => bail!("cosign signature verification failed: {e:#}"),
         }
 
         let extracted = extract_binary(&archive_path, &work_dir)?;
@@ -274,6 +289,78 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
 
 /// Allocate a unique temp dir under `std::env::temp_dir()` without pulling
 /// in the `tempfile` crate (which is dev-deps-only in this workspace).
+/// Pre-flight: confirm the install directory is writable by the current
+/// process before we burn bandwidth downloading the release archive.
+///
+/// We need write access to the install directory (not just the binary
+/// file itself) because the swap path writes `<binary>.new`, `<binary>.old`,
+/// and renames into the parent dir. A binary that's 0755 root:root in
+/// /usr/local/bin gives the user *read* access to the binary but no write
+/// access to the parent — exactly the case bootstrap.sh creates when
+/// users install with `sudo` once and then update without it.
+///
+/// Probe by attempting `O_CREAT | O_EXCL` on a uniquely-named dotfile in
+/// the parent directory. This is the same semantics the real swap will
+/// use (creating `<binary>.new`). On PermissionDenied, bail with a
+/// sudo-aware message that names the directory and shows the exact
+/// re-run command.
+fn require_install_dir_writable(running: &Path) -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let parent = running.parent().ok_or_else(|| {
+        anyhow!(
+            "install-dir writability check failed: binary path {} has no parent",
+            running.display()
+        )
+    })?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = parent.join(format!(
+        ".rantaiclaw-update-probe-{}-{:x}",
+        std::process::id(),
+        nanos
+    ));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            // Best-effort cleanup; if remove fails we don't care, the
+            // probe file is harmless and likely already unlinked by
+            // someone else (extremely unlikely race).
+            let _ = fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let parent_display = parent.display();
+            let argv0 = std::env::args()
+                .next()
+                .unwrap_or_else(|| "rantaiclaw".to_string());
+            bail!(
+                "install directory not writable: {parent_display}\n\
+                 \n\
+                 The current user can't write `{parent_display}/rantaiclaw.new` — \
+                 the `update` swap needs write access to the install dir, not just \
+                 the binary file.\n\
+                 \n\
+                 Re-run with sudo (preserving env so your config/profile is found):\n\
+                 \n    sudo -E {argv0} update\n\
+                 \n\
+                 Or reinstall to a user-owned dir like ~/.local/bin and re-run \
+                 without sudo:\n\
+                 \n    RANTAICLAW_INSTALL_DIR=$HOME/.local/bin curl -fsSL \\\n      \
+                 https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash"
+            )
+        }
+        Err(e) => bail!(
+            "install-dir writability check failed for {}: {e}",
+            parent.display()
+        ),
+    }
+}
+
 fn make_work_dir() -> Result<PathBuf> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -692,12 +779,22 @@ pub fn run_verify() -> Result<()> {
 /// workflow on a tag ref. The OIDC issuer is GitHub Actions. Both
 /// are pinned via regex/literal so a signature from any other workflow
 /// or any other repo is rejected.
+/// Tri-state outcome from `verify_cosign_signature` so the caller can
+/// emit the right user-facing message. Distinguishes "no cosign on this
+/// host" (user-fixable: install cosign) from "no bundle published for
+/// this release" (release-side: historic pre-cosign tag).
+enum CosignOutcome {
+    Verified,
+    CosignNotInstalled,
+    BundleMissing,
+}
+
 fn verify_cosign_signature(
     base_url: &str,
     archive_path: &Path,
     archive_name: &str,
     work_dir: &Path,
-) -> Result<bool> {
+) -> Result<CosignOutcome> {
     use std::process::Command;
 
     // Bail-friendly local-prereq check. `which cosign` style.
@@ -711,7 +808,7 @@ fn verify_cosign_signature(
     if !cosign_present {
         eprintln!("⚠ `cosign` not found on PATH — skipping signature verify.");
         eprintln!("  Install: https://docs.sigstore.dev/system_config/installation/");
-        return Ok(false);
+        return Ok(CosignOutcome::CosignNotInstalled);
     }
 
     let bundle_url = format!("{base_url}/{archive_name}.bundle");
@@ -729,7 +826,7 @@ fn verify_cosign_signature(
         .send()
         .context("fetch cosign bundle")?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(false);
+        return Ok(CosignOutcome::BundleMissing);
     }
     if !resp.status().is_success() {
         bail!("fetch {bundle_url} returned HTTP {}", resp.status());
@@ -771,7 +868,7 @@ fn verify_cosign_signature(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(true)
+    Ok(CosignOutcome::Verified)
 }
 
 /// Apply a previously staged Windows update before doing anything else.
