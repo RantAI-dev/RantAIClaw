@@ -118,6 +118,14 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
     // to root) but the user runs `rantaiclaw update` as themselves.
     require_install_dir_writable(&info.path)?;
 
+    // Pre-flight: confirm there's enough free space across the three dirs
+    // the update will touch (work dir for download+extract, snapshot dir,
+    // install dir for `.new`/`.old` staging). Without this, we'd download
+    // the archive only to die at the staged-binary write with `No space
+    // left on device` — exactly the failure mode v0.6.54 surfaced on a
+    // 2.5 GB Ubuntu VM where every megabyte counts.
+    require_disk_space_for_update(&info.path)?;
+
     if !opts.yes && !confirm() {
         println!("aborted");
         return Ok(());
@@ -359,6 +367,86 @@ fn require_install_dir_writable(running: &Path) -> Result<()> {
             parent.display()
         ),
     }
+}
+
+/// Headroom needed by an update, in bytes. Sized generously to cover:
+///   - downloaded archive (~25 MB compressed across platforms today)
+///   - extracted binary (~50-80 MB)
+///   - staged `.new` file (same size as extracted)
+///   - retained `.old` backup (same size as extracted)
+///   - state snapshot (kilobytes; included in the margin)
+///   - cargo-style build artifacts? no — `update` is binary-only
+///
+/// 200 MB gives ~3-4× the worst-case real consumption so users with
+/// slightly larger future binaries don't immediately hit the wall.
+const UPDATE_MIN_FREE_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Pre-flight: confirm there's at least `UPDATE_MIN_FREE_BYTES` available
+/// on each filesystem the update will write to.
+///
+/// Checks the three relevant locations:
+///   - **Work dir** — `$TMPDIR` / `/tmp` (download + extract)
+///   - **Snapshot dir** — `<rantaiclaw_root>/.update-snapshots/`
+///   - **Install dir** — parent of the running binary (`.new` + `.old`)
+///
+/// These often map to different filesystems (e.g. `/tmp` is sometimes
+/// a tmpfs, `/usr/local/bin` is the root partition, `$HOME` may be a
+/// separate volume), so we check each independently. The tightest one
+/// is reported so the user knows where to free space.
+fn require_disk_space_for_update(running: &Path) -> Result<()> {
+    let install_parent = running.parent().ok_or_else(|| {
+        anyhow!(
+            "disk-space check failed: binary path {} has no parent",
+            running.display()
+        )
+    })?;
+    let work_root = std::env::temp_dir();
+    let snapshot_root = crate::profile::paths::rantaiclaw_root();
+    // Ensure the snapshot dir exists for the statvfs call (a missing
+    // path on Linux makes statvfs walk up; on macOS it can error out).
+    let _ = fs::create_dir_all(&snapshot_root);
+
+    let locations: [(&str, &Path); 3] = [
+        ("work dir (download/extract)", work_root.as_path()),
+        ("snapshot dir", snapshot_root.as_path()),
+        ("install dir", install_parent),
+    ];
+
+    let mut tightest: Option<(&str, &Path, u64)> = None;
+    for (label, path) in &locations {
+        let available = match fs2::available_space(path) {
+            Ok(b) => b,
+            Err(_) => continue, // best-effort: skip unprobeable paths
+        };
+        if available < UPDATE_MIN_FREE_BYTES
+            && tightest.map_or(true, |(_, _, prev)| available < prev)
+        {
+            tightest = Some((label, path, available));
+        }
+    }
+
+    if let Some((label, path, available)) = tightest {
+        let need_mb = UPDATE_MIN_FREE_BYTES / (1024 * 1024);
+        let avail_mb = available / (1024 * 1024);
+        bail!(
+            "not enough free disk space for update.\n\
+             \n\
+             {label} ({}) has {avail_mb} MB free; the update needs ~{need_mb} MB \
+             (archive + extracted binary + .new staging + .old backup + snapshot).\n\
+             \n\
+             Free space, then retry:\n\
+             \n    df -h\n\
+             \n  Common space-savers:\n\
+             \n    rm -rf {snapshot_root}/.update-snapshots\n\
+             \n    rm -rf /tmp/rantaiclaw-update-*\n\
+             \n    sudo apt-get clean   # or your package manager's equivalent\n\
+             \n  Or skip `update` entirely and re-bootstrap:\n\
+             \n    curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/bootstrap.sh | bash",
+            path.display(),
+            snapshot_root = snapshot_root.display(),
+        );
+    }
+    Ok(())
 }
 
 fn make_work_dir() -> Result<PathBuf> {
