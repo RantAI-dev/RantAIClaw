@@ -47,20 +47,28 @@ pub fn restart_managed_service() -> Result<bool> {
 fn detect_systemd_unit() -> Option<String> {
     let candidates = ["rantaiclaw.service"];
     for unit in candidates {
-        let out = Command::new("systemctl")
-            .args(["--user", "is-active", unit])
+        // Probe with `systemctl --user cat` rather than `is-active`.
+        //
+        // Pre-fix: we read `is-active` stdout and treated `inactive`
+        // as "unit exists, restart it" — but `is-active` ALSO prints
+        // `inactive` (with non-zero exit) for units that are NOT
+        // installed at all. That made every fresh CLI/TUI install
+        // emit a red `Failed to restart rantaiclaw.service: Unit
+        // rantaiclaw.service not found.` line right after a perfectly
+        // successful `rantaiclaw update`, scaring users.
+        //
+        // `cat` succeeds (exit 0) only when systemd can locate the
+        // unit file; if the unit was never installed (the default
+        // for everyone running CLI/TUI without `rantaiclaw daemon`
+        // managed by systemd), we get a clean None and the caller's
+        // `Ok(false)` branch silently no-ops. Installed-but-stopped
+        // units still get restarted because `cat` returns the unit
+        // body regardless of runtime state.
+        let cat = Command::new("systemctl")
+            .args(["--user", "cat", "--no-pager", unit])
             .output()
             .ok()?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let s = stdout.trim();
-        // is-active prints `active`, `inactive`, `failed`, etc.
-        // Restart even when failed/inactive — user may want to retry
-        // after the binary swap. Only skip when totally unregistered
-        // (returns `unknown`).
-        if matches!(
-            s,
-            "active" | "activating" | "reloading" | "failed" | "inactive"
-        ) {
+        if cat.status.success() {
             return Some((*unit).to_string());
         }
     }
