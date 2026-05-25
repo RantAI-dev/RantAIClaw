@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -586,6 +586,7 @@ impl TuiApp {
     fn complete_selected_command(&mut self) {
         if let Some(name) = self.autocomplete.selected() {
             self.context.input_buffer = format!("{name} ");
+            self.context.cursor_to_end();
             self.autocomplete.hide();
         }
     }
@@ -593,6 +594,14 @@ impl TuiApp {
     /// Process a single terminal event, returning whether to continue or quit.
     pub async fn handle_event(&mut self, event: Event) -> Result<EventResult> {
         if let Event::Key(key) = event {
+            // Windows + terminals that enable the kitty keyboard protocol
+            // emit BOTH Press and Release for every keystroke. Without
+            // this guard each char is pushed twice into the input buffer.
+            // Linux ttys without the protocol only emit Press, so the
+            // filter is a no-op there.
+            if key.kind != KeyEventKind::Press {
+                return Ok(EventResult::Continue);
+            }
             return self.handle_key(key).await;
         }
         Ok(EventResult::Continue)
@@ -862,7 +871,7 @@ impl TuiApp {
             }
             // Ctrl+J → newline (alt for terminals that don't pass Shift+Enter).
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.context.input_buffer.push('\n');
+                self.context.insert_char_at_cursor('\n');
             }
             // Ctrl+G → suspend the TUI and open the current input
             // buffer in $EDITOR. The actual swap happens in `run_loop`
@@ -970,19 +979,61 @@ impl TuiApp {
                     }
                 }
             }
-            // Backspace
+            // Backspace — delete the char immediately before the cursor.
             KeyCode::Backspace
                 if self.setup_overlay.is_none() && self.first_run_wizard.is_none() =>
             {
-                self.context.input_buffer.pop();
+                self.context.backspace_at_cursor();
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
             }
-            // Regular character input
-            KeyCode::Char(c) if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
-                self.context.input_buffer.push(c);
+            // Delete — remove the char at the cursor (cursor stays put).
+            KeyCode::Delete
+                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() =>
+            {
+                self.context.delete_at_cursor();
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
+            }
+            // Regular character input — insert at the cursor.
+            KeyCode::Char(c) if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
+                self.context.insert_char_at_cursor(c);
+                self.context.exit_history_navigation();
+                self.refresh_autocomplete();
+            }
+            // Left/Right move the cursor inside the input buffer when no
+            // overlay/picker has claimed them. Overlay tab navigation
+            // arms below already gated on overlay presence, so they run
+            // first and these arms only fire when nothing else needs the
+            // arrow keys.
+            KeyCode::Left
+                if self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none()
+                    && self.list_picker.is_none()
+                    && self.info_panel.is_none()
+                    && self.overlay.is_none() =>
+            {
+                self.context.cursor_left();
+            }
+            KeyCode::Right
+                if self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none()
+                    && self.list_picker.is_none()
+                    && self.info_panel.is_none()
+                    && self.overlay.is_none() =>
+            {
+                self.context.cursor_right();
+            }
+            // Home / End jump to the buffer extremes.
+            KeyCode::Home
+                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() =>
+            {
+                self.context.cursor_home();
+            }
+            KeyCode::End
+                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() =>
+            {
+                self.context.cursor_end();
             }
             // Up/Down navigate the dropdown when visible; otherwise scroll
             // the chat history.
@@ -998,12 +1049,14 @@ impl TuiApp {
             KeyCode::Up if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 if let Some(text) = self.context.history_recall_older() {
                     self.context.input_buffer = text;
+                    self.context.cursor_to_end();
                     self.refresh_autocomplete();
                 }
             }
             KeyCode::Down if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 if let Some(text) = self.context.history_recall_newer() {
                     self.context.input_buffer = text;
+                    self.context.cursor_to_end();
                     self.refresh_autocomplete();
                 }
             }
@@ -1327,6 +1380,7 @@ impl TuiApp {
     /// `queued_turns` is incremented so the status bar reflects backlog.
     pub async fn submit_input(&mut self) -> Result<()> {
         let raw = std::mem::take(&mut self.context.input_buffer);
+        self.context.cursor_pos = 0;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Ok(());
@@ -2184,9 +2238,10 @@ impl TuiApp {
                 self.scrollback_queue.push(("system".to_string(), announce));
             }
             CmdResult::SetInput(text) => {
-                // Replace input buffer; cursor will land at end on next
-                // render. Used by `/<skill-name>` direct-invoke shortcut.
+                // Replace input buffer; cursor lands at end. Used by
+                // `/<skill-name>` direct-invoke shortcut.
                 self.context.input_buffer = text;
+                self.context.cursor_to_end();
             }
         }
         Ok(())
@@ -2270,6 +2325,7 @@ impl TuiApp {
                 // Pre-fill an invocation prompt into the input buffer.
                 // The user can edit, append context, and Enter to send.
                 self.context.input_buffer = format!("Use the {key} skill: ");
+                self.context.cursor_to_end();
                 self.refresh_autocomplete();
             }
             ListPickerKind::Help => {
@@ -2277,6 +2333,7 @@ impl TuiApp {
                 // user can add args and submit (or just press Enter for
                 // no-arg commands like /usage or /status).
                 self.context.input_buffer = format!("/{key} ");
+                self.context.cursor_to_end();
                 self.refresh_autocomplete();
             }
             ListPickerKind::SetupTopic => match dispatch_setup_topic_key(&key) {
@@ -4111,6 +4168,45 @@ fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(input, area);
+
+    // Position the terminal cursor at the insertion point so the user
+    // can see where they are typing and so Left/Right/Home/End feedback
+    // is visible. ratatui hides the cursor unless `set_cursor_position`
+    // is called on every frame — without it the input box looks frozen
+    // even though the buffer is actually updating, which was reported
+    // as "characters don't appear until I press Enter".
+    //
+    // Char-cell wrap model: assume each char (including the leading
+    // "▎ " prefix) consumes one terminal cell. This is exact for ASCII
+    // and slightly off for full-width / combining glyphs, but the
+    // common case (latin prose + slash commands) lands the cursor on
+    // the right cell. Long inputs that wrap inside the 2-row inner area
+    // still get a roughly-correct cursor row.
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+    let inner_w = area.width.saturating_sub(2).max(1);
+    let inner_h = area.height.saturating_sub(2).max(1);
+    let prefix_cells: u16 = 2; // "▎ "
+    let mut col: u16 = prefix_cells.min(inner_w.saturating_sub(1));
+    let mut row: u16 = 0;
+    for ch in ctx.input_buffer.chars().take(ctx.cursor_pos) {
+        if ch == '\n' {
+            col = 0;
+            row = row.saturating_add(1);
+        } else {
+            col = col.saturating_add(1);
+            if col >= inner_w {
+                col = 0;
+                row = row.saturating_add(1);
+            }
+        }
+    }
+    // Clamp to inner area so we never point the terminal at a row
+    // outside the input box (would draw the caret on top of the
+    // status bar).
+    let row = row.min(inner_h.saturating_sub(1));
+    let col = col.min(inner_w.saturating_sub(1));
+    frame.set_cursor_position((inner_x + col, inner_y + row));
 }
 
 fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::Frame, area: Rect) {
@@ -4875,6 +4971,7 @@ fn run_external_editor(
                 buf.pop();
             }
             app.context.input_buffer = buf;
+            app.context.cursor_to_end();
             app.context.exit_history_navigation();
             Ok(())
         }

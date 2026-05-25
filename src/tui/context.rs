@@ -20,6 +20,13 @@ pub struct TuiContext {
     pub messages: Vec<Message>,
     pub model: String,
     pub input_buffer: String,
+    /// Cursor position inside `input_buffer`, measured in characters (not
+    /// bytes). Always `<= input_buffer.chars().count()`. Drives the
+    /// terminal cursor placement in `render_input_pane` and the insert /
+    /// delete points for `KeyCode::Char`, `Backspace`, `Delete`, `Left`,
+    /// `Right`, `Home`, `End`. Must be reset (usually to the end of the
+    /// new buffer) whenever `input_buffer` is replaced wholesale.
+    pub cursor_pos: usize,
     pub scroll_offset: usize,
     pub token_usage: TokenUsage,
     /// Total context window of the active model, in tokens. Used by the
@@ -139,6 +146,7 @@ impl TuiContext {
             messages,
             model: model.to_string(),
             input_buffer: String::new(),
+            cursor_pos: 0,
             scroll_offset: 0,
             token_usage: TokenUsage::default(),
             context_window: None,
@@ -235,6 +243,82 @@ impl TuiContext {
     pub fn exit_history_navigation(&mut self) {
         self.input_history_pos = None;
         self.input_history_stash = None;
+    }
+
+    /// Character count of the input buffer. Used as the upper bound for
+    /// `cursor_pos` and as the "End" target.
+    pub fn input_char_count(&self) -> usize {
+        self.input_buffer.chars().count()
+    }
+
+    /// Convert a `cursor_pos` char index into the matching byte index
+    /// inside `input_buffer`. Returns `input_buffer.len()` when the
+    /// cursor sits at end-of-buffer.
+    fn cursor_byte_index(&self) -> usize {
+        self.input_buffer
+            .char_indices()
+            .nth(self.cursor_pos)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input_buffer.len())
+    }
+
+    /// Place the cursor at end-of-buffer. Call this any time
+    /// `input_buffer` is replaced wholesale (history recall, slash
+    /// completion, external editor return, list-picker prefill).
+    pub fn cursor_to_end(&mut self) {
+        self.cursor_pos = self.input_char_count();
+    }
+
+    /// Insert a single char at the cursor and advance past it.
+    pub fn insert_char_at_cursor(&mut self, c: char) {
+        let byte_idx = self.cursor_byte_index();
+        self.input_buffer.insert(byte_idx, c);
+        self.cursor_pos += 1;
+    }
+
+    /// Delete the char immediately before the cursor (Backspace).
+    /// No-op when the cursor is already at the start.
+    pub fn backspace_at_cursor(&mut self) {
+        if self.cursor_pos == 0 {
+            return;
+        }
+        self.cursor_pos -= 1;
+        let byte_idx = self.cursor_byte_index();
+        self.input_buffer.remove(byte_idx);
+    }
+
+    /// Delete the char at the cursor (Delete key). No-op when the cursor
+    /// is at end-of-buffer.
+    pub fn delete_at_cursor(&mut self) {
+        if self.cursor_pos >= self.input_char_count() {
+            return;
+        }
+        let byte_idx = self.cursor_byte_index();
+        self.input_buffer.remove(byte_idx);
+    }
+
+    /// Move the cursor one char left, saturating at 0.
+    pub fn cursor_left(&mut self) {
+        self.cursor_pos = self.cursor_pos.saturating_sub(1);
+    }
+
+    /// Move the cursor one char right, clamped at end-of-buffer.
+    pub fn cursor_right(&mut self) {
+        let max = self.input_char_count();
+        if self.cursor_pos < max {
+            self.cursor_pos += 1;
+        }
+    }
+
+    /// Jump the cursor to the beginning of the buffer (Home).
+    pub fn cursor_home(&mut self) {
+        self.cursor_pos = 0;
+    }
+
+    /// Jump the cursor to the end of the buffer (End). Alias for
+    /// `cursor_to_end` named for keyboard symmetry with `cursor_home`.
+    pub fn cursor_end(&mut self) {
+        self.cursor_to_end();
     }
 
     /// Build a `TuiContext` suitable for unit tests, returning the peer ends
