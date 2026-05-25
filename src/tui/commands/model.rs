@@ -24,6 +24,11 @@ impl CommandHandler for ModelCommand {
         let model = args.trim();
         if !model.is_empty() {
             ctx.model = model.to_string();
+            // The previous `last_error` (e.g. "model unavailable")
+            // may have been caused by the model we are leaving. Clear
+            // it on explicit user-driven model change; the next failed
+            // turn will set a fresh error if the new model also fails.
+            ctx.last_error = None;
             return Ok(CommandResult::Message(format!("Model set to: {model}")));
         }
 

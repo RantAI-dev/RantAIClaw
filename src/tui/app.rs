@@ -1781,6 +1781,14 @@ impl TuiApp {
                 .send(crate::tui::TurnRequest::Reload(Box::new(config)))
                 .await;
         });
+        // Config reload means the on-disk state changed (wizard saved,
+        // /setup overlay closed, external editor wrote the file). Any
+        // `last_error` from a previous turn — typically "missing API
+        // key" / "model unavailable" — may now be resolved. Clear it
+        // optimistically; the next failed turn will set a fresh error
+        // through `finalize_error`, so we never leave the user staring
+        // at a stale warning that doesn't match the current config.
+        self.context.last_error = None;
         Ok(())
     }
 
@@ -2092,12 +2100,16 @@ impl TuiApp {
 
         // Persist and display the assistant reply. A store failure should not
         // crash the loop — surface it as a visible error and keep running.
-        if let Err(e) = self
+        let persist_ok = match self
             .context
             .append_assistant_message_with_tools(&body, tool_calls_json)
         {
-            self.context.last_error = Some(format!("failed to persist reply: {e}"));
-        }
+            Ok(()) => true,
+            Err(e) => {
+                self.context.last_error = Some(format!("failed to persist reply: {e}"));
+                false
+            }
+        };
         // Commit assistant message to scrollback (inline mode).
         // If we've already been streaming this turn line-by-line into
         // scrollback, only emit the trailing partial-line tail (if any)
@@ -2129,6 +2141,18 @@ impl TuiApp {
             self.stream_header_committed = false;
         } else {
             self.state = AppState::Ready;
+        }
+
+        // A clean turn means the underlying system path that produced
+        // the previous `last_error` is verifiably healthy now (the
+        // provider responded, the model accepted the request, persist
+        // succeeded). Cancelled turns and the persist-failure branch
+        // above are NOT clean — they leave `last_error` alone (or, for
+        // persist failure, leave the freshly-set error in place) so
+        // the user keeps seeing the original cause until a turn
+        // actually completes end-to-end.
+        if !cancelled && persist_ok {
+            self.context.last_error = None;
         }
     }
 
@@ -2273,6 +2297,10 @@ impl TuiApp {
         match kind {
             ListPickerKind::Model => {
                 self.context.model = key.clone();
+                // See `commands/model.rs::execute` for the rationale —
+                // an explicit model switch supersedes any model-related
+                // last_error from the previous selection.
+                self.context.last_error = None;
                 let msg = format!("Model set to: {key}");
                 let _ = self.context.append_system_message(&msg);
                 self.scrollback_queue.push(("system".to_string(), msg));
