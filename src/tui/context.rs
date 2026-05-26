@@ -276,6 +276,20 @@ impl TuiContext {
         self.cursor_pos += 1;
     }
 
+    /// Insert a chunk of text at the cursor and advance past it. Used by
+    /// the bracketed-paste handler so multi-line pastes land as a single
+    /// buffer mutation rather than a stream of per-char inserts (which
+    /// would also have to split on the embedded `\n` becoming an
+    /// `Enter` event and auto-submitting the prompt).
+    pub fn paste_at_cursor(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let byte_idx = self.cursor_byte_index();
+        self.input_buffer.insert_str(byte_idx, text);
+        self.cursor_pos += text.chars().count();
+    }
+
     /// Delete the char immediately before the cursor (Backspace).
     /// No-op when the cursor is already at the start.
     pub fn backspace_at_cursor(&mut self) {

@@ -3,7 +3,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -593,18 +596,36 @@ impl TuiApp {
 
     /// Process a single terminal event, returning whether to continue or quit.
     pub async fn handle_event(&mut self, event: Event) -> Result<EventResult> {
-        if let Event::Key(key) = event {
-            // Windows + terminals that enable the kitty keyboard protocol
-            // emit BOTH Press and Release for every keystroke. Without
-            // this guard each char is pushed twice into the input buffer.
-            // Linux ttys without the protocol only emit Press, so the
-            // filter is a no-op there.
-            if key.kind != KeyEventKind::Press {
-                return Ok(EventResult::Continue);
+        match event {
+            Event::Key(key) => {
+                // Windows + terminals that enable the kitty keyboard protocol
+                // emit BOTH Press and Release for every keystroke. Without
+                // this guard each char is pushed twice into the input buffer.
+                // Linux ttys without the protocol only emit Press, so the
+                // filter is a no-op there.
+                if key.kind != KeyEventKind::Press {
+                    return Ok(EventResult::Continue);
+                }
+                self.handle_key(key).await
             }
-            return self.handle_key(key).await;
+            // Bracketed-paste payload: insert verbatim at the cursor.
+            // Modals (setup overlay, wizard, picker) absorb their own
+            // text via dedicated handlers; pasting into them is rare
+            // enough that we keep the input-buffer path simple and
+            // route paste to the chat composer regardless. The pasted
+            // text may contain literal newlines — those are preserved
+            // in the buffer (multi-line prompt) instead of triggering
+            // submit, which is the whole point of bracketed paste.
+            Event::Paste(text) => {
+                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() {
+                    self.context.paste_at_cursor(&text);
+                    self.context.exit_history_navigation();
+                    self.refresh_autocomplete();
+                }
+                Ok(EventResult::Continue)
+            }
+            _ => Ok(EventResult::Continue),
         }
-        Ok(EventResult::Continue)
     }
 
     /// Dispatch a key event.
@@ -4913,6 +4934,13 @@ pub const STREAM_PREVIEW_LINES: u16 = 0;
 /// terminal's own scrollback, not a ratatui List widget that fights it.
 pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
+    // Opt into bracketed paste so multi-line pastes arrive as a single
+    // `Event::Paste(text)` rather than a stream of `KeyCode::Char` + `\n` =
+    // `KeyCode::Enter` events. Without this the first newline in a paste
+    // auto-submits the prompt and the rest of the buffer becomes the
+    // next turn(s). Terminals that don't understand the escape ignore
+    // it and fall back to per-key delivery — same behavior as before.
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::with_options(
         backend,
@@ -5074,6 +5102,9 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
     // prompt doesn't print on top of our last frame.
     terminal.clear()?;
     let _ = terminal.show_cursor();
+    // Pair with the EnableBracketedPaste in setup_terminal so the user's
+    // shell after we exit doesn't inherit the bracketed-paste mode.
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     disable_raw_mode()?;
     let _ = io::stdout().flush();
     println!();
