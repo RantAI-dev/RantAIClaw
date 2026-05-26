@@ -878,10 +878,13 @@ impl TuiApp {
                 self.complete_selected_command();
             }
             // Shift+Tab — Claude-Code-style cycle through approval-policy
-            // presets (Manual → Smart → Strict → Off → …). Only fires
-            // when no modal is up; all picker/overlay/wizard arms above
-            // already returned early before we got here.
-            KeyCode::BackTab => {
+            // presets (Manual → Smart → Strict → Off → …). Gated on no
+            // modal active: list_picker / info_panel return early above,
+            // but setup_overlay and first_run_wizard own the screen at
+            // their own arms further down. Cycling autonomy from inside
+            // the setup wizard is a silent state change that the user
+            // didn't ask for.
+            KeyCode::BackTab if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 self.cycle_autonomy_preset();
                 return Ok(EventResult::Continue);
             }
@@ -897,7 +900,14 @@ impl TuiApp {
             // Ctrl+G → suspend the TUI and open the current input
             // buffer in $EDITOR. The actual swap happens in `run_loop`
             // (which owns the Terminal); we just raise a flag here.
-            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Gated on no modal active — the external editor expects to
+            // edit the chat composer's input_buffer, not whatever the
+            // setup wizard or first-run wizard is collecting.
+            KeyCode::Char('g')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none() =>
+            {
                 self.editor_request = true;
             }
             // Ctrl+B — back. While the first-run wizard is open, walk the
