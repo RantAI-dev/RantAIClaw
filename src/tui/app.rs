@@ -1126,6 +1126,22 @@ impl TuiApp {
                     tracing::warn!("failed to reload config after setup: {}", e);
                 }
             }
+            // Esc — cancel the in-flight streaming turn. Mirrors Ctrl+C's
+            // streaming branch but only acts during Streaming, never as a
+            // quit (Ctrl+C still handles quit). This arm sits AFTER every
+            // modal-specific Esc handler above so closing a picker /
+            // overlay / wizard always wins over cancel; Esc only reaches
+            // here when no modal is up and the agent is actively running.
+            // Matches the working indicator's `esc to interrupt` hint.
+            KeyCode::Esc if matches!(self.state, AppState::Streaming { .. }) => {
+                if let AppState::Streaming { cancelling, .. } = &mut self.state {
+                    *cancelling = true;
+                }
+                if let Err(e) = self.context.req_tx.send(TurnRequest::Cancel).await {
+                    self.context.last_error = Some(format!("cancel failed: {e}"));
+                }
+                return Ok(EventResult::Continue);
+            }
             // Enter — submit the active prompt response.
             KeyCode::Enter
                 if self.setup_overlay.is_some()
