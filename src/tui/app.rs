@@ -3,7 +3,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -593,18 +596,36 @@ impl TuiApp {
 
     /// Process a single terminal event, returning whether to continue or quit.
     pub async fn handle_event(&mut self, event: Event) -> Result<EventResult> {
-        if let Event::Key(key) = event {
-            // Windows + terminals that enable the kitty keyboard protocol
-            // emit BOTH Press and Release for every keystroke. Without
-            // this guard each char is pushed twice into the input buffer.
-            // Linux ttys without the protocol only emit Press, so the
-            // filter is a no-op there.
-            if key.kind != KeyEventKind::Press {
-                return Ok(EventResult::Continue);
+        match event {
+            Event::Key(key) => {
+                // Windows + terminals that enable the kitty keyboard protocol
+                // emit BOTH Press and Release for every keystroke. Without
+                // this guard each char is pushed twice into the input buffer.
+                // Linux ttys without the protocol only emit Press, so the
+                // filter is a no-op there.
+                if key.kind != KeyEventKind::Press {
+                    return Ok(EventResult::Continue);
+                }
+                self.handle_key(key).await
             }
-            return self.handle_key(key).await;
+            // Bracketed-paste payload: insert verbatim at the cursor.
+            // Modals (setup overlay, wizard, picker) absorb their own
+            // text via dedicated handlers; pasting into them is rare
+            // enough that we keep the input-buffer path simple and
+            // route paste to the chat composer regardless. The pasted
+            // text may contain literal newlines — those are preserved
+            // in the buffer (multi-line prompt) instead of triggering
+            // submit, which is the whole point of bracketed paste.
+            Event::Paste(text) => {
+                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() {
+                    self.context.paste_at_cursor(&text);
+                    self.context.exit_history_navigation();
+                    self.refresh_autocomplete();
+                }
+                Ok(EventResult::Continue)
+            }
+            _ => Ok(EventResult::Continue),
         }
-        Ok(EventResult::Continue)
     }
 
     /// Dispatch a key event.
@@ -857,10 +878,13 @@ impl TuiApp {
                 self.complete_selected_command();
             }
             // Shift+Tab — Claude-Code-style cycle through approval-policy
-            // presets (Manual → Smart → Strict → Off → …). Only fires
-            // when no modal is up; all picker/overlay/wizard arms above
-            // already returned early before we got here.
-            KeyCode::BackTab => {
+            // presets (Manual → Smart → Strict → Off → …). Gated on no
+            // modal active: list_picker / info_panel return early above,
+            // but setup_overlay and first_run_wizard own the screen at
+            // their own arms further down. Cycling autonomy from inside
+            // the setup wizard is a silent state change that the user
+            // didn't ask for.
+            KeyCode::BackTab if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 self.cycle_autonomy_preset();
                 return Ok(EventResult::Continue);
             }
@@ -876,7 +900,14 @@ impl TuiApp {
             // Ctrl+G → suspend the TUI and open the current input
             // buffer in $EDITOR. The actual swap happens in `run_loop`
             // (which owns the Terminal); we just raise a flag here.
-            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Gated on no modal active — the external editor expects to
+            // edit the chat composer's input_buffer, not whatever the
+            // setup wizard or first-run wizard is collecting.
+            KeyCode::Char('g')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none() =>
+            {
                 self.editor_request = true;
             }
             // Ctrl+B — back. While the first-run wizard is open, walk the
@@ -1104,6 +1135,22 @@ impl TuiApp {
                 if let Err(e) = self.reload_config() {
                     tracing::warn!("failed to reload config after setup: {}", e);
                 }
+            }
+            // Esc — cancel the in-flight streaming turn. Mirrors Ctrl+C's
+            // streaming branch but only acts during Streaming, never as a
+            // quit (Ctrl+C still handles quit). This arm sits AFTER every
+            // modal-specific Esc handler above so closing a picker /
+            // overlay / wizard always wins over cancel; Esc only reaches
+            // here when no modal is up and the agent is actively running.
+            // Matches the working indicator's `esc to interrupt` hint.
+            KeyCode::Esc if matches!(self.state, AppState::Streaming { .. }) => {
+                if let AppState::Streaming { cancelling, .. } = &mut self.state {
+                    *cancelling = true;
+                }
+                if let Err(e) = self.context.req_tx.send(TurnRequest::Cancel).await {
+                    self.context.last_error = Some(format!("cancel failed: {e}"));
+                }
+                return Ok(EventResult::Continue);
             }
             // Enter — submit the active prompt response.
             KeyCode::Enter
@@ -4273,7 +4320,18 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
                 turn_started: *turn_started_at,
             }
         };
-        let line = render_indicator(&indicator_state, now);
+        let mut line = render_indicator(&indicator_state, now);
+        // Append "+ N queued" so the user can see follow-up submissions
+        // are stacked behind the active turn. Without this, the only
+        // signal that a queued submit landed is the input buffer
+        // clearing — easy to miss, easy to double-submit.
+        if ctx.queued_turns > 0 {
+            line.spans.push(Span::styled("  ·  ", muted));
+            line.spans.push(Span::styled(
+                format!("+{} queued", ctx.queued_turns),
+                Style::default().fg(Color::Rgb(241, 196, 15)),
+            ));
+        }
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
@@ -4286,17 +4344,6 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
     } else {
         let used = ctx.token_usage.total_tokens;
         let used_label = format_tokens(used);
-        let window = ctx.context_window.unwrap_or(0);
-        let window_label = if window > 0 {
-            format!("/{}", format_tokens(window))
-        } else {
-            String::new()
-        };
-        let pct = if window > 0 {
-            ((used as f64 / window as f64) * 100.0).round() as u32
-        } else {
-            0
-        };
         let age_secs = ctx.started_at.elapsed().as_secs();
         let age_label = format_duration_short(age_secs);
 
@@ -4309,18 +4356,7 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  │  ", muted),
-            Span::styled(
-                format!("{used_label}{window_label}"),
-                Style::default().fg(Color::Rgb(126, 226, 179)),
-            ),
-            Span::styled(
-                if window > 0 {
-                    format!("  {pct}%")
-                } else {
-                    String::new()
-                },
-                muted,
-            ),
+            Span::styled(used_label, Style::default().fg(Color::Rgb(126, 226, 179))),
             Span::styled("  │  ", muted),
             Span::styled(format!("{} msgs", ctx.messages.len()), muted),
             Span::styled("  │  ", muted),
@@ -4913,6 +4949,13 @@ pub const STREAM_PREVIEW_LINES: u16 = 0;
 /// terminal's own scrollback, not a ratatui List widget that fights it.
 pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
+    // Opt into bracketed paste so multi-line pastes arrive as a single
+    // `Event::Paste(text)` rather than a stream of `KeyCode::Char` + `\n` =
+    // `KeyCode::Enter` events. Without this the first newline in a paste
+    // auto-submits the prompt and the rest of the buffer becomes the
+    // next turn(s). Terminals that don't understand the escape ignore
+    // it and fall back to per-key delivery — same behavior as before.
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::with_options(
         backend,
@@ -5074,6 +5117,9 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
     // prompt doesn't print on top of our last frame.
     terminal.clear()?;
     let _ = terminal.show_cursor();
+    // Pair with the EnableBracketedPaste in setup_terminal so the user's
+    // shell after we exit doesn't inherit the bracketed-paste mode.
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     disable_raw_mode()?;
     let _ = io::stdout().flush();
     println!();
