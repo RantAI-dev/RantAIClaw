@@ -988,9 +988,7 @@ impl TuiApp {
                 self.refresh_autocomplete();
             }
             // Delete — remove the char at the cursor (cursor stays put).
-            KeyCode::Delete
-                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() =>
-            {
+            KeyCode::Delete if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 self.context.delete_at_cursor();
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
@@ -1025,14 +1023,10 @@ impl TuiApp {
                 self.context.cursor_right();
             }
             // Home / End jump to the buffer extremes.
-            KeyCode::Home
-                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() =>
-            {
+            KeyCode::Home if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 self.context.cursor_home();
             }
-            KeyCode::End
-                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() =>
-            {
+            KeyCode::End if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
                 self.context.cursor_end();
             }
             // Up/Down navigate the dropdown when visible; otherwise scroll
@@ -2275,6 +2269,15 @@ impl TuiApp {
     /// on `ListPickerKind` so each picker type runs its own side effect
     /// (switch model, resume session, set personality…). Always closes
     /// the picker afterward.
+    //
+    // `async` is retained for parity with the sibling dispatch_resubmit
+    // helper that does await on `req_tx.send(...)`; this one happens to
+    // dispatch only sync arms today but is called via `.await` at the
+    // single call site and may grow await points later. Suppress the
+    // delta clippy gate so cosmetic edits inside this fn (e.g. the
+    // `last_error = None` clear added with the error-lifecycle fix)
+    // don't tip a long-standing baseline warning into a blocking error.
+    #[allow(clippy::unused_async)]
     async fn dispatch_list_picker_selection(&mut self) {
         use super::widgets::ListPickerKind;
 
