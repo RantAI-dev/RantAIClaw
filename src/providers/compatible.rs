@@ -562,11 +562,74 @@ struct StreamDelta {
     /// Reasoning/thinking models may stream output via `reasoning_content`.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Tool-call fragments. OpenAI-compatible SSE emits these
+    /// progressively: the first fragment for a given `index` carries
+    /// `id` and `function.name`; subsequent fragments carry only
+    /// `function.arguments` chunks that must be concatenated.
+    /// Multiple parallel tool calls are distinguished by `index`.
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+/// Per-fragment tool-call delta as emitted by OpenAI-compatible SSE.
+/// See [`StreamDelta::tool_calls`] for the accumulation contract.
+#[derive(Debug, Deserialize, Clone)]
+struct StreamToolCallDelta {
+    /// 0-based position in the assistant message's tool_calls array.
+    /// Used to identify which call a fragment belongs to when multiple
+    /// parallel calls are being streamed. Missing on some providers
+    /// that only stream one call at a time → treat as 0.
+    #[serde(default)]
+    index: Option<u32>,
+    /// Tool call id (e.g. `call_abc123`). Sent once per `index` in the
+    /// first fragment; subsequent fragments for that index omit it.
+    #[serde(default)]
+    id: Option<String>,
+    /// Function name + arguments fragments. `function.name` is sent
+    /// once per index; `function.arguments` streams as concatenated
+    /// JSON-string fragments. Mirror of the non-streaming
+    /// `tool_calls[].function` shape.
+    #[serde(default)]
+    function: Option<StreamToolCallFunction>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct StreamToolCallFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// In-progress assembly state for a single tool call streamed across
+/// multiple SSE fragments. The chat-stream loop maintains a
+/// `BTreeMap<u32, ToolCallAccumulator>` keyed by `index`; at end of
+/// stream each entry is materialised into a `ProviderToolCall`.
+#[derive(Default, Debug)]
+struct ToolCallAccumulator {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
 }
 
 /// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
 /// Handles the `data: {...}` format and `[DONE]` sentinel.
+///
+/// Text-only convenience wrapper around [`parse_sse_line_full`] — kept
+/// for the legacy non-tool streaming callsite that only needs
+/// `delta.content`. New callsites that need tool_call streaming should
+/// use `parse_sse_line_full` instead.
 fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
+    Ok(parse_sse_line_full(line)?.and_then(|p| p.text))
+}
+
+/// Full SSE-line parse: returns text deltas, tool-call deltas, and the
+/// optional `finish_reason` from a single SSE `data:` line. Returns
+/// `None` for empty/comment/`[DONE]` lines.
+///
+/// Designed for the chat-stream loop in `chat_stream`, which must
+/// reassemble multi-fragment tool_calls in addition to forwarding text.
+fn parse_sse_line_full(line: &str) -> StreamResult<Option<ParsedSseLine>> {
     let line = line.trim();
 
     // Skip empty lines and comments
@@ -586,21 +649,67 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
         // Parse JSON delta
         let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
 
-        // Extract content from delta
         if let Some(choice) = chunk.choices.first() {
-            if let Some(content) = &choice.delta.content {
-                if !content.is_empty() {
-                    return Ok(Some(content.clone()));
-                }
-            }
-            // Fallback to reasoning_content for thinking models
-            if let Some(reasoning) = &choice.delta.reasoning_content {
-                return Ok(Some(reasoning.clone()));
-            }
+            // Prefer delta.content; fall back to reasoning_content for
+            // thinking models that stream chain-of-thought separately.
+            // An empty `content` ALSO falls back to reasoning_content —
+            // some providers emit `{"content":"","reasoning_content":"…"}`
+            // during thinking phases.
+            let text = match (&choice.delta.content, &choice.delta.reasoning_content) {
+                (Some(c), _) if !c.is_empty() => Some(c.clone()),
+                (_, Some(r)) => Some(r.clone()),
+                _ => None,
+            };
+
+            return Ok(Some(ParsedSseLine {
+                text,
+                tool_calls: choice.delta.tool_calls.clone(),
+                finish_reason: choice.finish_reason.clone(),
+            }));
         }
     }
 
     Ok(None)
+}
+
+/// Output of [`parse_sse_line_full`]. All fields are independently
+/// optional so a single SSE chunk can carry text, tool-call fragments,
+/// finish_reason, any combination, or none.
+struct ParsedSseLine {
+    text: Option<String>,
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+    #[allow(dead_code)] // Reserved for future use (e.g., emit "[tool_use stop]" cues to TUI).
+    finish_reason: Option<String>,
+}
+
+/// Materialise an in-progress tool-call accumulator into the public
+/// `ProviderToolCall` shape returned by `chat_stream`.
+///
+/// Empty arguments are normalised to `"{}"` so downstream JSON parsers
+/// (the agent loop's `serde_json::from_str` of `arguments`) don't
+/// choke on a literal empty string when a tool was called with no
+/// parameters. Missing `id` defaults to empty — providers that route
+/// tool_call_id back to us in the next turn will fail loudly if they
+/// actually need it, but most don't, and we'd rather surface a real
+/// error than silently drop the call.
+fn drain_tool_accumulator(
+    acc: std::collections::BTreeMap<u32, ToolCallAccumulator>,
+) -> Vec<ProviderToolCall> {
+    acc.into_values()
+        .filter_map(|a| {
+            let name = a.name?;
+            let arguments = if a.arguments.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                a.arguments
+            };
+            Some(ProviderToolCall {
+                id: a.id.unwrap_or_default(),
+                name,
+                arguments,
+            })
+        })
+        .collect()
 }
 
 /// Convert SSE byte stream to text chunks.
@@ -1477,19 +1586,16 @@ impl Provider for OpenAiCompatibleProvider {
     /// the `chat/completions` endpoint with `stream: true` and forwards
     /// each `delta.content` token to `text_tx` as it arrives.
     ///
-    /// Tool calls in OpenAI-compatible SSE arrive as `delta.tool_calls`
-    /// fragments that this stream parser does NOT reassemble. When the
-    /// caller passes tools we fall back to the non-streaming `chat()`
-    /// path so tool calls round-trip correctly — without the fallback,
-    /// MiniMax (and any other native-tool model) would emit a tool-call
-    /// response with empty `content`, `full_text` would stay empty,
-    /// `tool_calls` would be returned as `vec![]`, and the agent loop
-    /// would terminate with a blank Assistant reply. Reproduced live
-    /// with MiniMax-M2.7 + the skill management tools.
-    ///
-    /// We still emit the final response text as one chunk so the TUI's
-    /// streaming UI gets *something* to render (just no token-by-token
-    /// animation for tool-using turns).
+    /// **v0.6.58: tool-call streaming.** Pre-v0.6.58 we bailed to the
+    /// non-streaming `chat()` whenever tools were present because this
+    /// loop didn't reassemble `delta.tool_calls[]` fragments — MiniMax
+    /// (and every other native-tool OpenAI-compatible model) emitted
+    /// tool-call responses with empty `content` and we'd return an
+    /// empty assistant reply. We now accumulate per-index `id`,
+    /// `function.name`, and concatenated `function.arguments`
+    /// fragments into a `BTreeMap<u32, ToolCallAccumulator>`; at end
+    /// of stream we materialise the map into `Vec<ProviderToolCall>`
+    /// so tool calls round-trip correctly AND text deltas stream live.
     async fn chat_stream(
         &self,
         request: ProviderChatRequest<'_>,
@@ -1497,17 +1603,6 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         text_tx: tokio::sync::mpsc::Sender<String>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        // Tools present → bypass streaming so tool_calls survive.
-        if request.tools.is_some_and(|t| !t.is_empty()) {
-            let resp = self.chat(request, model, temperature).await?;
-            if let Some(ref text) = resp.text {
-                if !text.is_empty() {
-                    let _ = text_tx.send(text.clone()).await;
-                }
-            }
-            return Ok(resp);
-        }
-
         let credential = self
             .credential
             .as_ref()
@@ -1555,6 +1650,11 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let mut full_text = String::new();
+        // BTreeMap keyed by `index` so the final tool_calls Vec is in
+        // the order the model emitted them, regardless of fragment
+        // interleaving across SSE chunks.
+        let mut tool_acc: std::collections::BTreeMap<u32, ToolCallAccumulator> =
+            std::collections::BTreeMap::new();
         let mut bytes_stream = response.bytes_stream();
         let mut buffer = String::new();
         // Some servers (MiniMax in particular) "stream" by emitting one
@@ -1571,9 +1671,36 @@ impl Provider for OpenAiCompatibleProvider {
             while let Some(pos) = buffer.find('\n') {
                 let line: String = buffer.drain(..=pos).collect();
                 let trimmed = line.trim_end_matches(['\r', '\n']);
-                let delta = match parse_sse_line(trimmed) {
-                    Ok(Some(d)) => d,
+                let parsed = match parse_sse_line_full(trimmed) {
+                    Ok(Some(p)) => p,
                     _ => continue,
+                };
+
+                // Tool-call fragments: accumulate per-index. The first
+                // fragment for an index carries id+name; subsequent
+                // fragments carry only `function.arguments` chunks
+                // that must be concatenated in arrival order.
+                if let Some(deltas) = parsed.tool_calls {
+                    for d in deltas {
+                        let idx = d.index.unwrap_or(0);
+                        let entry = tool_acc.entry(idx).or_default();
+                        if let Some(id) = d.id {
+                            entry.id = Some(id);
+                        }
+                        if let Some(func) = d.function {
+                            if let Some(name) = func.name {
+                                entry.name = Some(name);
+                            }
+                            if let Some(args) = func.arguments {
+                                entry.arguments.push_str(&args);
+                            }
+                        }
+                    }
+                }
+
+                // Text deltas: filter <think> tags, pace, forward to TUI.
+                let Some(delta) = parsed.text else {
+                    continue;
                 };
                 let visible = filter_think_tags(&delta, &mut in_think, &mut think_partial);
                 if visible.is_empty() {
@@ -1590,7 +1717,7 @@ impl Provider for OpenAiCompatibleProvider {
                             } else {
                                 Some(full_text)
                             },
-                            tool_calls: vec![],
+                            tool_calls: drain_tool_accumulator(tool_acc),
                         });
                     }
                     if visible.len() > 16 {
@@ -1606,7 +1733,7 @@ impl Provider for OpenAiCompatibleProvider {
             } else {
                 Some(full_text)
             },
-            tool_calls: vec![],
+            tool_calls: drain_tool_accumulator(tool_acc),
         })
     }
 
@@ -2650,5 +2777,144 @@ mod tests {
         let line = "data: [DONE]";
         let result = parse_sse_line(line).unwrap();
         assert_eq!(result, None);
+    }
+
+    // ── v0.6.58: tool-call streaming ────────────────────────────────────
+    //
+    // The accumulator's contract is the hard part — fragments arrive
+    // out-of-order, `id`/`name` come once per index, and `arguments`
+    // streams as raw JSON-string chunks that MUST concatenate in
+    // arrival order. These tests pin the exact behaviour the
+    // chat_stream loop depends on.
+
+    #[test]
+    fn parse_sse_line_full_extracts_text_only() {
+        let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
+        let parsed = parse_sse_line_full(line).unwrap().unwrap();
+        assert_eq!(parsed.text.as_deref(), Some("hello"));
+        assert!(parsed.tool_calls.is_none());
+    }
+
+    #[test]
+    fn parse_sse_line_full_extracts_tool_call_first_fragment() {
+        // First fragment for a given index always carries id + name;
+        // arguments may start as empty string or a partial JSON prefix.
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#;
+        let parsed = parse_sse_line_full(line).unwrap().unwrap();
+        assert!(parsed.text.is_none() || parsed.text.as_deref() == Some(""));
+        let deltas = parsed.tool_calls.unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].index, Some(0));
+        assert_eq!(deltas[0].id.as_deref(), Some("call_abc"));
+        let func = deltas[0].function.as_ref().unwrap();
+        assert_eq!(func.name.as_deref(), Some("read_file"));
+        assert_eq!(func.arguments.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn parse_sse_line_full_extracts_tool_call_argument_fragment() {
+        // Continuation fragment: only `function.arguments` set.
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"src/"}}]}}]}"#;
+        let parsed = parse_sse_line_full(line).unwrap().unwrap();
+        let deltas = parsed.tool_calls.unwrap();
+        assert_eq!(deltas[0].index, Some(0));
+        assert!(deltas[0].id.is_none());
+        let func = deltas[0].function.as_ref().unwrap();
+        assert!(func.name.is_none());
+        assert_eq!(func.arguments.as_deref(), Some("{\"path\":\"src/"));
+    }
+
+    #[test]
+    fn drain_tool_accumulator_reassembles_multi_fragment_call() {
+        use std::collections::BTreeMap;
+        // Simulate three fragments for index=0: id+name+empty-args,
+        // then two argument chunks. End state must be one ProviderToolCall
+        // with the full concatenated JSON.
+        let mut acc: BTreeMap<u32, ToolCallAccumulator> = BTreeMap::new();
+        let entry = acc.entry(0).or_default();
+        entry.id = Some("call_abc".to_string());
+        entry.name = Some("read_file".to_string());
+        entry.arguments.push_str("");
+        entry.arguments.push_str("{\"path\":\"src/");
+        entry.arguments.push_str("main.rs\"}");
+
+        let out = drain_tool_accumulator(acc);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "call_abc");
+        assert_eq!(out[0].name, "read_file");
+        assert_eq!(out[0].arguments, r#"{"path":"src/main.rs"}"#);
+    }
+
+    #[test]
+    fn drain_tool_accumulator_preserves_index_order() {
+        use std::collections::BTreeMap;
+        // Parallel tool calls: index 1 fragment arrives before index 0.
+        // Final Vec must be index-ordered (0, then 1) because the
+        // agent loop uses position to round-trip tool_call_id.
+        let mut acc: BTreeMap<u32, ToolCallAccumulator> = BTreeMap::new();
+        let e1 = acc.entry(1).or_default();
+        e1.id = Some("call_second".to_string());
+        e1.name = Some("write_file".to_string());
+        e1.arguments.push_str("{}");
+        let e0 = acc.entry(0).or_default();
+        e0.id = Some("call_first".to_string());
+        e0.name = Some("read_file".to_string());
+        e0.arguments.push_str("{}");
+
+        let out = drain_tool_accumulator(acc);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "call_first");
+        assert_eq!(out[1].id, "call_second");
+    }
+
+    #[test]
+    fn drain_tool_accumulator_normalises_empty_arguments_to_object() {
+        use std::collections::BTreeMap;
+        // Some providers emit zero-arg tool calls with literal "" for
+        // arguments. The agent loop's `serde_json::from_str` would
+        // bail; normalise to "{}" so a nullary call still parses.
+        let mut acc: BTreeMap<u32, ToolCallAccumulator> = BTreeMap::new();
+        let entry = acc.entry(0).or_default();
+        entry.id = Some("call_x".to_string());
+        entry.name = Some("ping".to_string());
+
+        let out = drain_tool_accumulator(acc);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].arguments, "{}");
+    }
+
+    #[test]
+    fn drain_tool_accumulator_skips_entries_missing_name() {
+        use std::collections::BTreeMap;
+        // Defensive: if a stream got truncated before the function.name
+        // chunk arrived, the entry is unusable — drop it rather than
+        // ship a tool call with empty name (which the agent dispatcher
+        // would fail to resolve anyway, producing a worse UX).
+        let mut acc: BTreeMap<u32, ToolCallAccumulator> = BTreeMap::new();
+        let entry = acc.entry(0).or_default();
+        entry.id = Some("call_truncated".to_string());
+        entry.arguments.push_str("{\"path\":\"...");
+
+        let out = drain_tool_accumulator(acc);
+        assert!(
+            out.is_empty(),
+            "truncated calls without a name should be dropped"
+        );
+    }
+
+    #[test]
+    fn parse_sse_line_full_handles_mixed_text_and_tool_call_in_same_chunk() {
+        // Per OpenAI spec, a delta CAN carry both content and
+        // tool_calls in a single chunk (rare but allowed). Verify
+        // both fields are populated independently.
+        let line = r#"data: {"choices":[{"delta":{"content":"calling tool","tool_calls":[{"index":0,"function":{"arguments":"\"end\""}}]}}]}"#;
+        let parsed = parse_sse_line_full(line).unwrap().unwrap();
+        assert_eq!(parsed.text.as_deref(), Some("calling tool"));
+        let deltas = parsed.tool_calls.unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(
+            deltas[0].function.as_ref().unwrap().arguments.as_deref(),
+            Some("\"end\"")
+        );
     }
 }
