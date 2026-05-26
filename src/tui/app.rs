@@ -4294,7 +4294,18 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
                 turn_started: *turn_started_at,
             }
         };
-        let line = render_indicator(&indicator_state, now);
+        let mut line = render_indicator(&indicator_state, now);
+        // Append "+ N queued" so the user can see follow-up submissions
+        // are stacked behind the active turn. Without this, the only
+        // signal that a queued submit landed is the input buffer
+        // clearing — easy to miss, easy to double-submit.
+        if ctx.queued_turns > 0 {
+            line.spans.push(Span::styled("  ·  ", muted));
+            line.spans.push(Span::styled(
+                format!("+{} queued", ctx.queued_turns),
+                Style::default().fg(Color::Rgb(241, 196, 15)),
+            ));
+        }
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
