@@ -34,6 +34,16 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod kanban_block;
+pub mod kanban_comment;
+pub mod kanban_common;
+pub mod kanban_complete;
+pub mod kanban_create;
+pub mod kanban_heartbeat;
+pub mod kanban_link;
+pub mod kanban_list;
+pub mod kanban_show;
+pub mod kanban_unblock;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -81,6 +91,15 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use kanban_block::KanbanBlockTool;
+pub use kanban_comment::KanbanCommentTool;
+pub use kanban_complete::KanbanCompleteTool;
+pub use kanban_create::KanbanCreateTool;
+pub use kanban_heartbeat::KanbanHeartbeatTool;
+pub use kanban_link::KanbanLinkTool;
+pub use kanban_list::KanbanListTool;
+pub use kanban_show::KanbanShowTool;
+pub use kanban_unblock::KanbanUnblockTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -389,6 +408,21 @@ pub fn all_tools_with_runtime(
         )));
         tool_arcs.push(Arc::new(TaskReadCommentsTool::new(config.clone())));
     }
+
+    // Kanban tool surface — parity with Hermes kanban_*. The tools are
+    // always present in the registry but each one short-circuits on
+    // execute() unless the worker / orchestrator env vars are set, so a
+    // regular `rantaiclaw chat` session sees structured "unavailable"
+    // errors instead of acting on the board.
+    tool_arcs.push(Arc::new(KanbanShowTool));
+    tool_arcs.push(Arc::new(KanbanListTool));
+    tool_arcs.push(Arc::new(KanbanCompleteTool));
+    tool_arcs.push(Arc::new(KanbanBlockTool));
+    tool_arcs.push(Arc::new(KanbanHeartbeatTool));
+    tool_arcs.push(Arc::new(KanbanCommentTool::default()));
+    tool_arcs.push(Arc::new(KanbanCreateTool));
+    tool_arcs.push(Arc::new(KanbanLinkTool));
+    tool_arcs.push(Arc::new(KanbanUnblockTool));
 
     // Add delegation tool when agents are configured
     if !agents.is_empty() {

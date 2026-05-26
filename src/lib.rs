@@ -57,6 +57,7 @@ pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub(crate) mod identity;
 pub(crate) mod integrations;
+pub mod kanban;
 pub mod lifecycle;
 pub mod mcp;
 pub mod memory;
