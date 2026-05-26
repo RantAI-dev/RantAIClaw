@@ -4318,17 +4318,6 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
     } else {
         let used = ctx.token_usage.total_tokens;
         let used_label = format_tokens(used);
-        let window = ctx.context_window.unwrap_or(0);
-        let window_label = if window > 0 {
-            format!("/{}", format_tokens(window))
-        } else {
-            String::new()
-        };
-        let pct = if window > 0 {
-            ((used as f64 / window as f64) * 100.0).round() as u32
-        } else {
-            0
-        };
         let age_secs = ctx.started_at.elapsed().as_secs();
         let age_label = format_duration_short(age_secs);
 
@@ -4341,18 +4330,7 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  │  ", muted),
-            Span::styled(
-                format!("{used_label}{window_label}"),
-                Style::default().fg(Color::Rgb(126, 226, 179)),
-            ),
-            Span::styled(
-                if window > 0 {
-                    format!("  {pct}%")
-                } else {
-                    String::new()
-                },
-                muted,
-            ),
+            Span::styled(used_label, Style::default().fg(Color::Rgb(126, 226, 179))),
             Span::styled("  │  ", muted),
             Span::styled(format!("{} msgs", ctx.messages.len()), muted),
             Span::styled("  │  ", muted),
