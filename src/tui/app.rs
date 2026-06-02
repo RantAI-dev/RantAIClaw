@@ -4370,18 +4370,19 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
     frame.render_widget(status, area);
 }
 
-/// ASCII hermit-crab mascot, supplied by the project. Rendered with
-/// per-character colour so the silhouette reads as a hermit crab on
-/// any terminal that supports basic ANSI 24-bit (most modern ones) —
-/// terminals without truecolor downmix to their nearest palette, and
-/// the underlying ASCII glyphs (`@ % = + # * - . :`) stay visible
-/// even when colour is dropped entirely.
-const HERMIT_CRAB_ART: &str = include_str!("assets/mascot_ascii.txt");
+/// Rantai logo mascot, drawn as Unicode block + ASCII hash glyphs that
+/// `mascot_color()` colours per-region: head silhouette in deep navy
+/// (`█`), two accent squares in light blue (`#`). On terminals with
+/// truecolour support the splash matches the brand palette; terminals
+/// that lack it downmix to the nearest 256-colour cell, and the
+/// underlying glyphs still convey the silhouette even when colour is
+/// dropped entirely (cat the asset to see the raw shape).
+const MASCOT_ART: &str = include_str!("assets/mascot_ascii.txt");
 
 /// Width of the mascot column (in display cells). Must be at least as
-/// wide as the longest row of `HERMIT_CRAB_ART` so the right-pane
+/// wide as the longest row of `MASCOT_ART` so the right-pane
 /// stays aligned.
-const MASCOT_WIDTH: usize = 48;
+const MASCOT_WIDTH: usize = 39;
 
 /// Hard ceiling on the right-pane width, in chars. Used by `wrap_csv`
 /// and `wrap_text`. Kept conservative so the stitched splash row
@@ -4390,30 +4391,31 @@ const MASCOT_WIDTH: usize = 48;
 /// reflowing onto the mascot's row.
 const MAX_RIGHT_WIDTH: usize = 50;
 
-/// Map a single glyph from `HERMIT_CRAB_ART` to its RGB tint. Returning
+/// Map a single glyph from the mascot ASCII art to its RGB tint. Returning
 /// `None` means "render this cell as a plain space with no styling" —
 /// the splash uses that for whitespace so the art blends with whatever
 /// background the terminal happens to be using.
+///
+/// Two glyph groups carry the Rantai logo: `@`/`$` are the diagonal
+/// slashes in sky blue (centre), and `;`/`+` are the two bracket frames
+/// in navy. The pair reuses the RANTAICLAW figlet gradient endpoints so
+/// logo and wordmark share one palette. All four are plain ASCII so
+/// terminals without truecolour downmix the colour but the silhouette
+/// stays intact.
 fn mascot_color(ch: char) -> Option<Color> {
     match ch {
-        // Shell tones — the rounded canopy on the crab's back.
-        '&' => Some(Color::Rgb(215, 195, 160)),
-        '$' => Some(Color::Rgb(245, 230, 200)),
-        // Claw / leg / body orange — the heavily-rendered warm parts.
-        '+' => Some(Color::Rgb(240, 100, 30)),
-        'X' => Some(Color::Rgb(210, 70, 20)),
-        'x' => Some(Color::Rgb(195, 80, 35)),
-        // Eye / pupil / mouth detail — kept very dark so they read as
-        // features rather than noise inside the body.
-        ';' => Some(Color::Rgb(50, 40, 35)),
-        // Interior shading.
-        ':' => Some(Color::Rgb(220, 195, 165)),
-        '.' => Some(Color::Rgb(235, 215, 180)),
+        // Diagonal slashes (centre) — sky, the top of the RANTAICLAW
+        // figlet gradient so the logo and wordmark share one palette.
+        '@' | '$' => Some(Color::Rgb(94, 184, 255)),
+        // Bracket frames — a lifted navy (royal blue), brighter than the
+        // figlet's darkest navy but still clearly deeper than the sky
+        // slashes so the two regions stay distinct.
+        ';' | '+' => Some(Color::Rgb(60, 110, 200)),
         _ => None,
     }
 }
 
-/// Convert one row of `HERMIT_CRAB_ART` into a `Line` of styled spans,
+/// Convert one row of `MASCOT_ART` into a `Line` of styled spans,
 /// batching contiguous same-colour runs into a single span to keep the
 /// span count manageable for ratatui.
 fn mascot_row(row: &str) -> Line<'static> {
@@ -4573,7 +4575,7 @@ fn render_splash_lines(ctx: &TuiContext, area_width: u16) -> Vec<Line<'static>> 
 
     // ── Left-pane mascot ──────────────────────────────────────────────
     let mut left: Vec<Line<'static>> = Vec::new();
-    for row in HERMIT_CRAB_ART.lines() {
+    for row in MASCOT_ART.lines() {
         left.push(mascot_row(row));
     }
 
