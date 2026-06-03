@@ -22,6 +22,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -32,6 +33,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use crate::gateway::AppState;
 use crate::kb::chunk::{smart_chunk_document, SmartChunkOptions};
@@ -51,6 +53,12 @@ use crate::kb::{Document, DocumentId, KbConfig, KbError};
 /// caller free buffer pool space. Operators who need more can fork.
 const KB_UPLOAD_MAX_BYTES: usize = 32 * 1024 * 1024;
 
+/// Per-request timeout for the KB routes. Document ingest embeds every chunk
+/// via the (possibly remote) embedding provider, so it needs far longer than
+/// the gateway-wide `REQUEST_TIMEOUT_SECS` (120 s). 600 s covers a large
+/// multi-MB document; genuinely huge corpora should move to async ingest.
+const KB_REQUEST_TIMEOUT_SECS: u64 = 600;
+
 /// Build the `/api/v1/kb/*` router. Merged into the main gateway router by
 /// `gateway::run_gateway` so it shares state and timeout layers.
 ///
@@ -69,6 +77,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/kb/re-embed", post(re_embed))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(KB_UPLOAD_MAX_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(KB_REQUEST_TIMEOUT_SECS),
+        ))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -462,11 +474,49 @@ async fn search(
     }))
 }
 
+/// Metadata-only view of a [`Document`] for the list endpoint — omits the
+/// denormalized full `content` (and raw `metadata`), which can be megabytes
+/// per document. Fetch full content via `GET /api/v1/kb/documents/{id}`.
+#[derive(Debug, Serialize)]
+struct DocumentSummary {
+    id: DocumentId,
+    title: String,
+    categories: Vec<String>,
+    subcategory: Option<String>,
+    file_type: Option<String>,
+    mime_type: Option<String>,
+    file_size: Option<u64>,
+    session_id: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    retrieval_count: i64,
+    last_retrieved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<Document> for DocumentSummary {
+    fn from(d: Document) -> Self {
+        Self {
+            id: d.id,
+            title: d.title,
+            categories: d.categories,
+            subcategory: d.subcategory,
+            file_type: d.file_type,
+            mime_type: d.mime_type,
+            file_size: d.file_size,
+            session_id: d.session_id,
+            created_at: d.created_at,
+            updated_at: d.updated_at,
+            retrieval_count: d.retrieval_count,
+            last_retrieved_at: d.last_retrieved_at,
+        }
+    }
+}
+
 async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<ListQuery>,
-) -> Result<Json<Vec<Document>>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Json<Vec<DocumentSummary>>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let ctx = ensure_kb_ctx().await?;
     let docs = ctx
@@ -474,7 +524,7 @@ async fn list(
         .list_documents(q.organization.as_deref())
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(docs))
+    Ok(Json(docs.into_iter().map(DocumentSummary::from).collect()))
 }
 
 async fn get_doc(
