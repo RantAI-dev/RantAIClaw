@@ -30,6 +30,24 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from("tests/fixtures")
 }
 
+/// Write `bytes` to `path` atomically: serialize into a unique temp sibling,
+/// then rename into place. Rename is atomic on the same filesystem, so a
+/// concurrent reader never observes a half-written file. Without this, two
+/// `#[tokio::test]` cases that both call an `ensure_*` helper for the same
+/// fixture race: the first creates the path then streams bytes into it, and
+/// the second sees `path.exists() == true` and reads the partial file,
+/// failing with "Invalid file header".
+fn write_fixture_atomic(path: &Path, bytes: &[u8]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{unique}", std::process::id()));
+    std::fs::write(&tmp, bytes)
+        .unwrap_or_else(|e| panic!("write_fixture_atomic: write {}: {e}", tmp.display()));
+    std::fs::rename(&tmp, path)
+        .unwrap_or_else(|e| panic!("write_fixture_atomic: rename into {}: {e}", path.display()));
+}
+
 /// Build a tiny PDF whose page 1 contains `text`. Cached on disk so repeated
 /// test runs don't regenerate it.
 fn ensure_text_pdf() -> PathBuf {
@@ -39,7 +57,7 @@ fn ensure_text_pdf() -> PathBuf {
     }
     std::fs::create_dir_all(fixtures_dir()).expect("ensure_text_pdf: create fixtures dir");
     let bytes = build_pdf(&["RantaiClawSample Hello World"]);
-    std::fs::write(&path, bytes).expect("ensure_text_pdf: write sample-text.pdf fixture");
+    write_fixture_atomic(&path, &bytes);
     path
 }
 
@@ -53,7 +71,7 @@ fn ensure_8_page_pdf() -> PathBuf {
     let pages: Vec<String> = (1..=8).map(|i| format!("Page {i}")).collect();
     let refs: Vec<&str> = pages.iter().map(String::as_str).collect();
     let bytes = build_pdf(&refs);
-    std::fs::write(&path, bytes).expect("ensure_8_page_pdf: write sample-8-page.pdf fixture");
+    write_fixture_atomic(&path, &bytes);
     path
 }
 
@@ -303,8 +321,7 @@ async fn vision_llm_large_pdf_splits_into_segments_and_sums_usage() {
     assert_eq!(result.completion_tokens, Some(150));
     assert!((result.cost_usd.unwrap_or(0.0) - 0.003).abs() < 1e-9);
     assert_eq!(
-        result.text,
-        "segment text\n\nsegment text\n\nsegment text",
+        result.text, "segment text\n\nsegment text\n\nsegment text",
         "segments must concatenate with double-newline separators"
     );
     // Model field encodes the segment count for observability.
@@ -326,13 +343,11 @@ async fn mineru_extractor_posts_multipart_and_parses_response() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/extract"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "text": "## RantaiClawSample\n\nbody",
-                "ms": 4321,
-                "pages": 2
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "text": "## RantaiClawSample\n\nbody",
+            "ms": 4321,
+            "pages": 2
+        })))
         .expect(1)
         .mount(&server)
         .await;
@@ -611,8 +626,14 @@ async fn hybrid_errors_when_both_fail() {
     let hybrid = HybridExtractor::new(structural, text_layer);
     let err = hybrid.extract(b"unused").await.expect_err("must fail");
     let msg = err.to_string();
-    assert!(msg.contains("sfail"), "msg must include structural err: {msg}");
-    assert!(msg.contains("tfail"), "msg must include text-layer err: {msg}");
+    assert!(
+        msg.contains("sfail"),
+        "msg must include structural err: {msg}"
+    );
+    assert!(
+        msg.contains("tfail"),
+        "msg must include text-layer err: {msg}"
+    );
 }
 
 #[test]
@@ -666,6 +687,9 @@ async fn vision_llm_extracts_real_pdf() {
     cfg.extract_vision_api_key = api_key;
     let ext = VisionLlmExtractor::new(cfg, "openai/gpt-4.1-nano".into());
     let pdf = make_pdf(2);
-    let r = ext.extract(&pdf).await.expect("live extract should succeed");
+    let r = ext
+        .extract(&pdf)
+        .await
+        .expect("live extract should succeed");
     assert!(!r.text.is_empty());
 }
