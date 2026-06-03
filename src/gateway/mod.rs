@@ -677,21 +677,23 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment),
         )
         .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
-        .merge(api_v1::router());
+        .merge(api_v1::router())
+        // The 64 KiB body cap applies to webhook + api_v1 routes (small JSON
+        // bodies). It is deliberately NOT applied to the KB router below, which
+        // sets its own larger upload limit (KB_UPLOAD_MAX_BYTES). Applying this
+        // outer cap to the whole app would override that and reject document
+        // uploads with 413.
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE));
 
     // KB HTTP surface (Phase 11) — only mounted when the `kb` feature is on.
-    // Adds its own larger body limit (the gateway-wide 64 KiB cap is too
-    // small for document uploads).
+    // Keeps its own larger upload body limit (set on the router itself).
     #[cfg(feature = "kb")]
     let app = app.merge(crate::kb::axi::api::router());
 
-    let app = app
-        .with_state(state)
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        ));
+    let app = app.with_state(state).layer(TimeoutLayer::with_status_code(
+        StatusCode::REQUEST_TIMEOUT,
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+    ));
 
     // Run the server
     axum::serve(
