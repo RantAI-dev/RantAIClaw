@@ -107,12 +107,10 @@ pub async fn process_image(
     });
 
     let client = reqwest::Client::new();
-    let description = post_with_retry(&client, &cfg.extract_vision_base_url, &api_key, &body).await?;
+    let description =
+        post_with_retry(&client, &cfg.extract_vision_base_url, &api_key, &body).await?;
 
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("image");
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
     Ok(format!("[Image: {filename}]\n\n{description}"))
 }
 

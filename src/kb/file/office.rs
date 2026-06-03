@@ -94,15 +94,18 @@ fn process_spreadsheet(bytes: &[u8], ext: &str, display: &str) -> KbResult<Strin
     // small match instead of a trait-object dance.
     match ext {
         "xlsx" => {
-            let mut wb = calamine::Xlsx::new(cursor).map_err(|e| spreadsheet_err(ext, display, &e))?;
+            let mut wb =
+                calamine::Xlsx::new(cursor).map_err(|e| spreadsheet_err(ext, display, &e))?;
             render_workbook(&mut wb, &mut output)?;
         }
         "xls" => {
-            let mut wb = calamine::Xls::new(cursor).map_err(|e| spreadsheet_err(ext, display, &e))?;
+            let mut wb =
+                calamine::Xls::new(cursor).map_err(|e| spreadsheet_err(ext, display, &e))?;
             render_workbook(&mut wb, &mut output)?;
         }
         "ods" => {
-            let mut wb = calamine::Ods::new(cursor).map_err(|e| spreadsheet_err(ext, display, &e))?;
+            let mut wb =
+                calamine::Ods::new(cursor).map_err(|e| spreadsheet_err(ext, display, &e))?;
             render_workbook(&mut wb, &mut output)?;
         }
         other => unreachable!(
@@ -139,11 +142,7 @@ where
         // through the KbResult signature.
         writeln!(out, "## Sheet: {name}").expect("write to String never fails");
         for row in range.rows() {
-            let line = row
-                .iter()
-                .map(format_cell)
-                .collect::<Vec<_>>()
-                .join("\t");
+            let line = row.iter().map(format_cell).collect::<Vec<_>>().join("\t");
             writeln!(out, "{line}").expect("write to String never fails");
         }
         out.push('\n');
@@ -154,12 +153,11 @@ where
 fn format_cell(cell: &Data) -> String {
     match cell {
         Data::Empty => String::new(),
-        Data::String(s) => s.clone(),
+        Data::String(s) | Data::DateTimeIso(s) | Data::DurationIso(s) => s.clone(),
         Data::Float(f) => f.to_string(),
         Data::Int(i) => i.to_string(),
         Data::Bool(b) => b.to_string(),
         Data::DateTime(dt) => dt.to_string(),
-        Data::DateTimeIso(s) | Data::DurationIso(s) => s.clone(),
         Data::Error(e) => format!("#ERR({e:?})"),
     }
 }

@@ -21,6 +21,4 @@ pub mod cli;
 pub mod toon;
 
 pub use ambient::kb_ambient_context;
-pub use api::router;
-pub use cli::KbCommand;
-pub use toon::{format_toon, serialize_value};
+pub use toon::format_toon;

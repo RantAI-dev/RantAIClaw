@@ -153,9 +153,7 @@ pub async fn run_bulk_re_embed(
         // of corruption that needs operator attention, not a silent skip.
         let mut written: usize = 0;
         for (id, emb) in ids.iter().zip(embeddings.iter()) {
-            store
-                .update_chunk_embedding(id, emb, &target_model)
-                .await?;
+            store.update_chunk_embedding(id, emb, &target_model).await?;
             written += 1;
         }
         report.chunks_re_embedded += written;

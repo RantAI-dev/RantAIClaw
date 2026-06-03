@@ -310,13 +310,19 @@ async fn bulk_re_embed_skips_already_current_chunks() {
     .await
     .unwrap();
 
-    assert_eq!(report.chunks_re_embedded, 3, "only stale chunks re-embedded");
+    assert_eq!(
+        report.chunks_re_embedded, 3,
+        "only stale chunks re-embedded"
+    );
     assert_eq!(report.total_chunks_examined, 3);
     assert!(report.errors.is_empty());
 
     // After the run, drift must be zero — all stale rows now tagged current.
     let drift = check_drift(&cfg, &store).await.unwrap();
-    assert!(drift.in_sync, "drift must be cleared after a successful run");
+    assert!(
+        drift.in_sync,
+        "drift must be cleared after a successful run"
+    );
 }
 
 #[tokio::test]

@@ -25,7 +25,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Utc;
-use rantaiclaw::kb::chunk::{prepare_chunk_for_embedding, smart_chunk_document, SmartChunkOptions};
+use rantaiclaw::kb::chunk::prepare::prepare_chunk_for_embedding;
+use rantaiclaw::kb::chunk::{smart_chunk_document, SmartChunkOptions};
 use rantaiclaw::kb::embed::EmbeddingProvider;
 use rantaiclaw::kb::store::KbStore;
 use rantaiclaw::kb::{Document, DocumentId};

@@ -131,8 +131,8 @@ async fn fetch_prefixes(
     if end < start {
         return Err("malformed array bounds".into());
     }
-    let parsed: Vec<serde_json::Value> = serde_json::from_str(&raw[start..=end])
-        .map_err(|e| format!("parse: {e}"))?;
+    let parsed: Vec<serde_json::Value> =
+        serde_json::from_str(&raw[start..=end]).map_err(|e| format!("parse: {e}"))?;
     if parsed.len() != expected_len {
         return Err(format!(
             "length mismatch: got {} prefixes, expected {expected_len}",

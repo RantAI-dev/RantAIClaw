@@ -28,9 +28,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
-use rantaiclaw::kb::chunk::{
-    prepare_chunk_for_embedding, smart_chunk_document, SmartChunkOptions,
-};
+use rantaiclaw::kb::chunk::prepare::prepare_chunk_for_embedding;
+use rantaiclaw::kb::chunk::{smart_chunk_document, SmartChunkOptions};
 use rantaiclaw::kb::embed::EmbeddingProvider;
 use rantaiclaw::kb::retrieve::{RetrieveOptions, Retriever};
 use rantaiclaw::kb::store::sqlite::SqliteStore;
@@ -156,7 +155,10 @@ async fn setup() -> (Retriever, TempDir) {
         // corpus shape.
         let body = format!(
             "{title}\n\n{}",
-            (0..20).map(|j| format!("Content paragraph {j} of {title}.")).collect::<Vec<_>>().join("\n\n"),
+            (0..20)
+                .map(|j| format!("Content paragraph {j} of {title}."))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
         );
         let doc = Document {
             id: DocumentId(format!("bench-doc-{i:04}")),
@@ -213,24 +215,20 @@ fn bench_retrieve(c: &mut Criterion) {
     group.sample_size(50);
 
     for (idx, query) in QUERIES.iter().enumerate() {
-        group.bench_with_input(
-            BenchmarkId::new("retrieve_top8", idx),
-            query,
-            |b, &q| {
-                b.to_async(&rt).iter(|| async {
-                    retriever
-                        .retrieve(
-                            q,
-                            RetrieveOptions {
-                                max_chunks: Some(8),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .expect("retrieve")
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("retrieve_top8", idx), query, |b, &q| {
+            b.to_async(&rt).iter(|| async {
+                retriever
+                    .retrieve(
+                        q,
+                        RetrieveOptions {
+                            max_chunks: Some(8),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("retrieve")
+            });
+        });
     }
 
     group.finish();

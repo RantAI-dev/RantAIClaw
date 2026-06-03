@@ -30,9 +30,7 @@ use rantaiclaw::kb::store::KbStore;
 use rantaiclaw::kb::KbConfig;
 use tempfile::TempDir;
 
-use super::parity_helpers::{
-    build_corpus_from_fixtures, fixture_path, ingest_corpus,
-};
+use super::parity_helpers::{build_corpus_from_fixtures, fixture_path, ingest_corpus};
 
 const RECALL_THRESHOLD: f64 = 0.85;
 const TOP_K: usize = 8;
@@ -76,8 +74,8 @@ async fn rag_golden_parity() {
     );
 
     eprintln!("building corpus from fixtures...");
-    let corpus = build_corpus_from_fixtures(&seed_path, &golden_path)
-        .expect("build_corpus_from_fixtures");
+    let corpus =
+        build_corpus_from_fixtures(&seed_path, &golden_path).expect("build_corpus_from_fixtures");
     eprintln!("synthesized {} unique documents", corpus.len());
 
     eprintln!("ingesting corpus (this calls OpenRouter)...");

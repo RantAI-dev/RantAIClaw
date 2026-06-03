@@ -11,11 +11,8 @@ pub mod query_expansion;
 pub mod rrf;
 pub mod standalone_query;
 
-pub use contextual::generate_contextual_prefixes;
-pub use format::format_context_for_prompt;
 pub use query_expansion::expand_query;
-pub use rrf::{reciprocal_rank_fusion, RrfOptions, RrfResult};
-pub use standalone_query::rewrite_standalone;
+pub use rrf::{reciprocal_rank_fusion, RrfOptions};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,11 +91,7 @@ impl Retriever {
 
     /// End-to-end retrieval. Returns an empty [`RetrievalResult`] when no
     /// chunk crosses the similarity threshold — never throws on empty input.
-    pub async fn retrieve(
-        &self,
-        query: &str,
-        opts: RetrieveOptions,
-    ) -> KbResult<RetrievalResult> {
+    pub async fn retrieve(&self, query: &str, opts: RetrieveOptions) -> KbResult<RetrievalResult> {
         let min_similarity = opts.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY);
         let max_chunks = opts.max_chunks.unwrap_or(self.cfg.default_max_chunks);
 
@@ -193,8 +186,7 @@ impl Retriever {
         // Coverage analytics: fire-and-forget. tokio::spawn detaches the
         // store call so retrieve() returns even if the store hangs or panics.
         // Mirrors the TS source's `void import(...).then(...).catch(()=>{})`.
-        let doc_ids: Vec<DocumentId> =
-            chunks.iter().map(|c| c.document_id.clone()).collect();
+        let doc_ids: Vec<DocumentId> = chunks.iter().map(|c| c.document_id.clone()).collect();
         let store = self.store.clone();
         tokio::spawn(async move {
             // Errors deliberately swallowed — analytics must never affect the
@@ -225,7 +217,11 @@ impl Retriever {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut sources: Vec<SourceRef> = Vec::new();
         for chunk in &chunks {
-            let key = format!("{}-{}", chunk.document_title, chunk.section.as_deref().unwrap_or(""));
+            let key = format!(
+                "{}-{}",
+                chunk.document_title,
+                chunk.section.as_deref().unwrap_or("")
+            );
             if seen.insert(key) {
                 sources.push(SourceRef {
                     document_title: chunk.document_title.clone(),
@@ -275,7 +271,10 @@ impl Retriever {
         let embeddings = self.embedder.embed_many(queries).await?;
         let mut union: HashMap<ChunkId, SearchResult> = HashMap::new();
         for emb in &embeddings {
-            let results = self.store.search_by_vector(emb, fetch_limit, filter).await?;
+            let results = self
+                .store
+                .search_by_vector(emb, fetch_limit, filter)
+                .await?;
             for r in results {
                 if r.similarity < min_similarity {
                     continue;

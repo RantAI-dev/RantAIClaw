@@ -19,10 +19,7 @@ pub struct RrfOptions {
 
 impl Default for RrfOptions {
     fn default() -> Self {
-        Self {
-            k: 60,
-            limit: None,
-        }
+        Self { k: 60, limit: None }
     }
 }
 

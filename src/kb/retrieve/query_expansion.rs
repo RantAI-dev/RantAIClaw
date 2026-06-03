@@ -90,7 +90,12 @@ pub async fn expand_query(cfg: &KbConfig, query: &str) -> Vec<String> {
     // Dedupe paraphrases against the original. Case- and whitespace-insensitive
     // match (`Foo  bar` collides with `foo bar`) — keep original casing in
     // output, matching the TS source.
-    let norm = |s: &str| s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    let norm = |s: &str| {
+        s.to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     seen.insert(norm(q));
     let mut cleaned = vec![q.to_string()];
@@ -133,8 +138,7 @@ async fn fetch_paraphrases(
     if !resp.status().is_success() {
         return Err(format!("expansion {}", resp.status().as_u16()));
     }
-    let data: serde_json::Value =
-        resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    let data: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
     let raw = data
         .get("choices")
         .and_then(|c| c.get(0))

@@ -64,10 +64,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/kb/search", post(search))
         .route("/api/v1/kb/documents", post(ingest).get(list))
-        .route(
-            "/api/v1/kb/documents/{id}",
-            get(get_doc).delete(delete_doc),
-        )
+        .route("/api/v1/kb/documents/{id}", get(get_doc).delete(delete_doc))
         .route("/api/v1/kb/drift", get(drift))
         .route("/api/v1/kb/re-embed", post(re_embed))
         .layer(DefaultBodyLimit::disable())
@@ -112,10 +109,7 @@ async fn ensure_kb_ctx() -> Result<Arc<KbContext>, ApiError> {
         if cached.path == path {
             return match &cached.ctx {
                 Ok(ctx) => Ok(Arc::clone(ctx)),
-                Err(msg) => Err(ApiError::service_unavailable(
-                    "kb_unavailable",
-                    msg.clone(),
-                )),
+                Err(msg) => Err(ApiError::service_unavailable("kb_unavailable", msg.clone())),
             };
         }
     }
@@ -124,10 +118,7 @@ async fn ensure_kb_ctx() -> Result<Arc<KbContext>, ApiError> {
     // gateway, which clears the static.
     let outcome = build_ctx(&path).await;
     let snapshot = outcome.clone();
-    *guard = Some(CachedCtx {
-        path,
-        ctx: outcome,
-    });
+    *guard = Some(CachedCtx { path, ctx: outcome });
     match snapshot {
         Ok(ctx) => Ok(ctx),
         Err(msg) => Err(ApiError::service_unavailable("kb_unavailable", msg)),
@@ -691,7 +682,11 @@ async fn ingest(
     }
 
     let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-    let embeddings = ctx.embedder.embed_many(&texts).await.map_err(ApiError::from)?;
+    let embeddings = ctx
+        .embedder
+        .embed_many(&texts)
+        .await
+        .map_err(ApiError::from)?;
 
     let doc_id = DocumentId(uuid::Uuid::new_v4().to_string());
     let now = chrono::Utc::now();
@@ -838,7 +833,11 @@ mod tests {
                 StatusCode::NOT_FOUND,
                 "not_found",
             ),
-            (KbError::Config("x".into()), StatusCode::BAD_REQUEST, "bad_request"),
+            (
+                KbError::Config("x".into()),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
             (
                 KbError::UnsupportedFileType("x".into()),
                 StatusCode::BAD_REQUEST,

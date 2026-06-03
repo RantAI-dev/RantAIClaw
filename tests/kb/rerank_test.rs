@@ -114,9 +114,7 @@ async fn llm_rerank_handles_malformed_response() {
     let server = MockServer::start().await;
     // No JSON array in the content at all — picked list ends up empty.
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(chat_body("sorry, can't comply")),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_body("sorry, can't comply")))
         .mount(&server)
         .await;
 
@@ -238,9 +236,7 @@ async fn cohere_rerank_short_circuits_when_few_candidates() {
 async fn cohere_rerank_uses_relevance_score() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(cohere_body(&[(2, 0.9), (0, 0.8)])),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(cohere_body(&[(2, 0.9), (0, 0.8)])))
         .expect(1)
         .mount(&server)
         .await;
@@ -321,11 +317,8 @@ fn vllm_body(results: &[(usize, f32)]) -> serde_json::Value {
 #[tokio::test]
 async fn vllm_rerank_short_circuits_when_few_candidates() {
     // Use a non-routable URL — short-circuit must not touch the network.
-    let r = VllmReranker::new(
-        "http://127.0.0.1:1".into(),
-        "nemotron-test".into(),
-    )
-    .expect("non-empty base_url");
+    let r = VllmReranker::new("http://127.0.0.1:1".into(), "nemotron-test".into())
+        .expect("non-empty base_url");
     let c = cands(2);
     let out = r.rerank("q", &c, 5).await.expect("short-circuit ok");
     assert_eq!(out.len(), 2);
@@ -340,15 +333,12 @@ async fn vllm_rerank_parses_cohere_shape_response() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/rerank"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(vllm_body(&[(3, 0.95), (1, 0.42)])),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(vllm_body(&[(3, 0.95), (1, 0.42)])))
         .expect(1)
         .mount(&server)
         .await;
 
-    let r = VllmReranker::new(server.uri(), "nemotron-test".into())
-        .expect("non-empty base_url");
+    let r = VllmReranker::new(server.uri(), "nemotron-test".into()).expect("non-empty base_url");
     let c = cands(5);
     let out = r.rerank("q", &c, 3).await.expect("rerank ok");
     assert_eq!(out.len(), 3);
@@ -382,8 +372,7 @@ async fn vllm_rerank_errors_on_5xx() {
         .mount(&server)
         .await;
 
-    let r = VllmReranker::new(server.uri(), "nemotron-test".into())
-        .expect("non-empty base_url");
+    let r = VllmReranker::new(server.uri(), "nemotron-test".into()).expect("non-empty base_url");
     let err = r
         .rerank("q", &cands(5), 3)
         .await

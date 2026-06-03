@@ -6,6 +6,13 @@
 //! - 7.3 Query expansion (wiremock)
 //! - 7.4 Contextual retrieval (wiremock)
 //! - 7.5 format_context_for_prompt + standalone query rewriter (wiremock)
+//!
+//! Tests that mutate `OPENROUTER_API_KEY` serialize on `ENV_LOCK` from
+//! `tests/kb/common.rs` and intentionally hold the guard across `.await`
+//! to keep env mutation single-threaded — see the rationale in
+//! `embed_test.rs` / `rerank_test.rs`.
+
+#![allow(clippy::await_holding_lock)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,9 +22,7 @@ use rantaiclaw::kb::embed::EmbeddingProvider;
 use rantaiclaw::kb::retrieve::rrf::{reciprocal_rank_fusion, RrfOptions};
 use rantaiclaw::kb::retrieve::{RetrieveOptions, Retriever};
 use rantaiclaw::kb::store::{Bm25Hit, KbStore, SearchFilter};
-use rantaiclaw::kb::{
-    Chunk, ChunkId, Document, DocumentId, KbConfig, KbResult, SearchResult,
-};
+use rantaiclaw::kb::{Chunk, ChunkId, Document, DocumentId, KbConfig, KbResult, SearchResult};
 
 // Process-wide env-mutation lock lives in `crate::kb::common::ENV_LOCK`
 // so every test module in this binary serializes against the SAME mutex.
@@ -36,10 +41,7 @@ fn rrf_basic_two_lists() {
     let b: Vec<(String, ())> = vec![("y".into(), ()), ("x".into(), ()), ("w".into(), ())];
     let merged = reciprocal_rank_fusion(
         &[a.as_slice(), b.as_slice()],
-        RrfOptions {
-            k: 60,
-            limit: None,
-        },
+        RrfOptions { k: 60, limit: None },
     );
     assert_eq!(merged.len(), 4, "all four unique ids preserved");
     let ids: Vec<&str> = merged.iter().map(|r| r.id.as_str()).collect();
@@ -307,11 +309,10 @@ impl EmbeddingProvider for FakeEmbedder {
     }
 }
 
-fn make_retriever(
-    cfg: KbConfig,
-    store: Arc<FakeStore>,
-) -> (Retriever, Arc<FakeStore>) {
-    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbedder { dim: cfg.embedding_dim });
+fn make_retriever(cfg: KbConfig, store: Arc<FakeStore>) -> (Retriever, Arc<FakeStore>) {
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbedder {
+        dim: cfg.embedding_dim,
+    });
     let r = Retriever::new(cfg, store.clone() as Arc<dyn KbStore>, embedder);
     (r, store)
 }
@@ -457,9 +458,7 @@ async fn record_retrieval_hits_fired_fire_and_forget() {
     let store = Arc::new(store);
     let (retriever, _) = make_retriever(test_cfg(), store.clone());
 
-    let result = retriever
-        .retrieve("test", RetrieveOptions::default())
-        .await;
+    let result = retriever.retrieve("test", RetrieveOptions::default()).await;
     assert!(
         result.is_ok(),
         "retrieve must return Ok even when record_retrieval_hits panics: {:?}",
@@ -523,9 +522,7 @@ async fn format_omits_section_when_none() {
 // the existing ENV_LOCK pattern from config_test.rs / embed_test.rs.
 
 mod query_expansion_tests {
-    use rantaiclaw::kb::retrieve::query_expansion::{
-        _clear_cache_for_tests, expand_query,
-    };
+    use rantaiclaw::kb::retrieve::query_expansion::{_clear_cache_for_tests, expand_query};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -811,7 +808,10 @@ mod contextual_tests {
         cfg.openrouter_chat_url = server.uri();
         let chunks = vec!["a".into(), "b".into(), "c".into()];
         let out = generate_contextual_prefixes(&cfg, "full doc", &chunks).await;
-        assert_eq!(out, vec!["ctx1".to_string(), "ctx2".to_string(), "ctx3".to_string()]);
+        assert_eq!(
+            out,
+            vec!["ctx1".to_string(), "ctx2".to_string(), "ctx3".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -943,9 +943,7 @@ mod format_tests {
 }
 
 mod standalone_tests {
-    use rantaiclaw::kb::retrieve::standalone_query::{
-        _clear_cache_for_tests, rewrite_standalone,
-    };
+    use rantaiclaw::kb::retrieve::standalone_query::{_clear_cache_for_tests, rewrite_standalone};
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -1023,7 +1021,10 @@ mod standalone_tests {
         let out = rewrite_standalone(&cfg, "tell me more", &history)
             .await
             .unwrap();
-        assert_eq!(out, "exclusions for policy X", "model output returned verbatim");
+        assert_eq!(
+            out, "exclusions for policy X",
+            "model output returned verbatim"
+        );
 
         let captured_body = captured.lock().unwrap().clone();
         assert!(
@@ -1127,10 +1128,14 @@ mod standalone_tests {
         cfg.openrouter_chat_url = server.uri();
         cfg.query_expansion_model = "model-a".into();
         let history = vec![("user".to_string(), "earlier turn anchor".to_string())];
-        let _ = rewrite_standalone(&cfg, "follow up?", &history).await.unwrap();
+        let _ = rewrite_standalone(&cfg, "follow up?", &history)
+            .await
+            .unwrap();
 
         cfg.query_expansion_model = "model-b".into();
-        let _ = rewrite_standalone(&cfg, "follow up?", &history).await.unwrap();
+        let _ = rewrite_standalone(&cfg, "follow up?", &history)
+            .await
+            .unwrap();
         // wiremock auto-asserts .expect(2) on Drop.
     }
 }

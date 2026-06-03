@@ -92,8 +92,9 @@ const DOCUMENT_EXTENSIONS: &[&str] = &[".docx", ".xlsx", ".xls", ".ods"];
 /// yet wired to a processor backend. Kept here so future maintainers can
 /// see the deliberate deferral and so user-facing error messages can refer
 /// to a single canonical list. NOT included in [`detect_file_type`].
-pub const DEFERRED_DOCUMENT_EXTENSIONS: &[&str] =
-    &[".pptx", ".rtf", ".epub", ".doc", ".ppt", ".odt", ".gltf", ".glb"];
+pub const DEFERRED_DOCUMENT_EXTENSIONS: &[&str] = &[
+    ".pptx", ".rtf", ".epub", ".doc", ".ppt", ".odt", ".gltf", ".glb",
+];
 const TEXT_EXTENSIONS: &[&str] = &[
     ".csv", ".tsv", ".json", ".jsonl", ".html", ".htm", ".xml", ".yaml", ".yml", ".toml", ".py",
     ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".rb", ".php", ".sh",

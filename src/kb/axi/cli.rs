@@ -147,7 +147,9 @@ impl KbCommand {
                 groups,
                 json,
             } => cmd_ingest(&cfg, store, path, title, categories, groups, json).await,
-            Self::List { organization, json } => cmd_list(store, organization.as_deref(), json).await,
+            Self::List { organization, json } => {
+                cmd_list(store, organization.as_deref(), json).await
+            }
             Self::Get { id, json } => cmd_get(store, id, json).await,
             Self::Delete { id, hard } => cmd_delete(store, id, hard).await,
             Self::Drift { json } => cmd_drift(&cfg, store, json).await,
@@ -251,7 +253,10 @@ async fn cmd_ingest(
     if chunks.is_empty() {
         // Fail-soft but explicit: the file was processable but produced no
         // chunks. Surface as operational error so the agent can decide.
-        print_error_toon("empty_chunks", &format!("no chunks produced from {}", path.display()));
+        print_error_toon(
+            "empty_chunks",
+            &format!("no chunks produced from {}", path.display()),
+        );
         return Ok(1);
     }
 
@@ -608,4 +613,3 @@ fn re_embed_to_json(r: &BulkReEmbedReport, elapsed_ms: u64) -> String {
     });
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
 }
-

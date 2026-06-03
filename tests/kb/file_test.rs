@@ -384,7 +384,10 @@ fn scan_directory_finds_supported_files_recursively() {
     found.sort();
     let mut expected = vec![md.clone(), pdf.clone()];
     expected.sort();
-    assert_eq!(found, expected, "scan must return md + pdf, not unsupported");
+    assert_eq!(
+        found, expected,
+        "scan must return md + pdf, not unsupported"
+    );
 }
 
 #[test]

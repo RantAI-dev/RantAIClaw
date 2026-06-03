@@ -131,11 +131,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
 
         // HTML table: <table...> ... </table>, optionally wrapped in a <div>
         let div_table_ahead = trimmed.starts_with("<div")
-            && lines
-                .iter()
-                .skip(i)
-                .take(3)
-                .any(|l| l.contains("<table"));
+            && lines.iter().skip(i).take(3).any(|l| l.contains("<table"));
         if trimmed.starts_with("<table") || div_table_ahead {
             flush_prose(&mut prose, &mut blocks);
             let mut buf: Vec<&str> = Vec::new();
@@ -156,10 +152,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
         }
 
         // Markdown pipe table
-        if trimmed.starts_with('|')
-            && i + 1 < lines.len()
-            && lines[i + 1].trim().starts_with('|')
-        {
+        if trimmed.starts_with('|') && i + 1 < lines.len() && lines[i + 1].trim().starts_with('|') {
             flush_prose(&mut prose, &mut blocks);
             let mut buf: Vec<&str> = Vec::new();
             while i < lines.len() && lines[i].trim().starts_with('|') {
@@ -357,10 +350,9 @@ pub fn merge_structural_with_text_layer(structural: &str, text_layer: &str) -> S
                 let sub = try_substitute(&raw, &normalized);
                 out.push(sub.unwrap_or(raw));
             }
-            Block::Heading(raw)
-            | Block::Table(raw)
-            | Block::Code(raw)
-            | Block::Latex(raw) => out.push(raw),
+            Block::Heading(raw) | Block::Table(raw) | Block::Code(raw) | Block::Latex(raw) => {
+                out.push(raw);
+            }
         }
     }
     out.join("\n")

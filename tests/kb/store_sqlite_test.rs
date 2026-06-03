@@ -243,7 +243,10 @@ async fn chunk_count_hides_soft_deleted_doc() {
     );
 
     // Same guarantee for the batch variant.
-    let counts = store.chunk_counts(&[doc.id.clone()]).await.unwrap();
+    let counts = store
+        .chunk_counts(std::slice::from_ref(&doc.id))
+        .await
+        .unwrap();
     assert_eq!(counts.get(&doc.id).copied(), Some(0));
 }
 

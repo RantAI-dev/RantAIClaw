@@ -102,7 +102,9 @@ pub async fn rewrite_standalone(
         .filter(|line| {
             // Drop empty-content lines so the model sees only real signal.
             // "role: " has nothing useful after the colon.
-            line.split(':').nth(1).map_or(false, |after| !after.trim().is_empty())
+            line.split(':')
+                .nth(1)
+                .map_or(false, |after| !after.trim().is_empty())
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -197,7 +199,10 @@ async fn fetch_rewrite(
         .and_then(|c| c.as_str())
         .unwrap_or("");
     // Strip surrounding quotes the model may add.
-    let cleaned = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == '`').trim();
+    let cleaned = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .trim();
     Ok(cleaned.to_string())
 }
 

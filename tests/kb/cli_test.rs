@@ -325,7 +325,10 @@ async fn kb_drift_in_sync_when_no_chunks() {
     let _store = SqliteStore::open(&db, 4).await.unwrap();
 
     let (code, stdout, stderr) = run_kb(&db, &["drift"]);
-    assert_eq!(code, 0, "drift on empty store must succeed; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "drift on empty store must succeed; stderr={stderr}"
+    );
     assert!(
         stdout.starts_with("drift[1]{"),
         "expected drift TOON header, got: {stdout}"
@@ -404,6 +407,9 @@ async fn kb_ingest_then_search_returns_toon() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&search.stdout);
-    assert!(stdout.starts_with("chunks["), "expected chunks TOON: {stdout}");
+    assert!(
+        stdout.starts_with("chunks["),
+        "expected chunks TOON: {stdout}"
+    );
     assert!(stdout.contains("Health Insurance"));
 }

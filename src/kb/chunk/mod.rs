@@ -11,9 +11,4 @@ pub mod prepare;
 pub mod recursive;
 pub mod smart;
 
-pub use prepare::prepare_chunk_for_embedding;
-pub use recursive::{chunk_document, chunk_documents, ChunkOptions};
-pub use smart::{
-    chunk_with_smart_chunker, smart_chunk_document, smart_chunk_documents, BlockType,
-    ChunkingStrategy, SmartChunk, SmartChunkMetadata, SmartChunkOptions,
-};
+pub use smart::{smart_chunk_document, SmartChunkOptions};

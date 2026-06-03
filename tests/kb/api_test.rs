@@ -14,6 +14,12 @@
 //! network here — re-embed with `dry_run=true` exercises the SQL path
 //! without hitting the embedder when the store has no chunks. Search/ingest
 //! against a real embedder live in `cli_test.rs` behind `#[ignore]`.
+//!
+//! Tests serialize on `super::common::ENV_LOCK` and intentionally hold the
+//! guard across `.await` to keep `KB_DB_PATH`/env mutation single-threaded
+//! — see the rationale in `embed_test.rs` / `rerank_test.rs`.
+
+#![allow(clippy::await_holding_lock)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -37,7 +43,6 @@ use rantaiclaw::memory::{Memory, MemoryCategory, MemoryEntry};
 use rantaiclaw::observability::NoopObserver;
 use rantaiclaw::providers::Provider;
 use rantaiclaw::security::pairing::PairingGuard;
-
 
 // ────────────────────────────────────────────────────────────────────────────
 // Mocks — minimal Provider + Memory impls so we can construct AppState.
@@ -192,9 +197,7 @@ where
     seed_docs(store).await;
 
     let state = build_state(require_pairing, tokens);
-    let app: Router = Router::new()
-        .merge(api::router())
-        .with_state(state);
+    let app: Router = Router::new().merge(api::router()).with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
