@@ -66,6 +66,13 @@ mod health;
 mod heartbeat;
 mod identity;
 mod integrations;
+// Compile the KB modules as part of the binary crate too — required so
+// `crate::kb::axi::api::router()` returns a router parameterized with the
+// binary's `crate::gateway::AppState` (which is a distinct nominal type
+// from `rantaiclaw::gateway::AppState` even though the source is shared).
+// Gated on the `kb` feature so non-KB builds skip the whole subtree.
+#[cfg(feature = "kb")]
+mod kb;
 mod mcp;
 mod memory;
 mod migration;
@@ -724,6 +731,23 @@ Examples:
     Profile {
         #[command(subcommand)]
         cmd: profile::commands::ProfileCommand,
+    },
+
+    /// Knowledge Base axi-cli surface (search, ingest, list, drift, re-embed).
+    ///
+    /// Token-efficient TOON output by default; pass `--json` for full JSON.
+    /// All operations target the KB database resolved from `KB_DB_PATH` (env)
+    /// or the platform's data dir (`~/.local/share/rantaiclaw/kb.db` on Linux).
+    ///
+    /// Examples:
+    ///   rantaiclaw kb list
+    ///   rantaiclaw kb search "what is the coverage?" --top 3
+    ///   rantaiclaw kb ingest ./policy.md --category finance
+    ///   rantaiclaw kb drift
+    #[cfg(feature = "kb")]
+    Kb {
+        #[command(subcommand)]
+        cmd: rantaiclaw::kb::axi::cli::KbCommand,
     },
 }
 
@@ -1877,6 +1901,21 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+
+        // KB axi-cli — feature-gated. Exit codes flow through `process::exit`
+        // because the agent caller relies on `0` vs `1` (per axi.md §6). Any
+        // internal `KbError` is rendered as a TOON error block to stdout, NOT
+        // stderr — AXI principle 6 says agents grep one stream.
+        #[cfg(feature = "kb")]
+        Some(Commands::Kb { cmd }) => {
+            match cmd.run().await {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    println!("error[1]{{code,message}}:\n  internal,{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
 
         // Already short-circuited above before Config::load_or_init; these
         // arms exist solely to make the match exhaustive without touching

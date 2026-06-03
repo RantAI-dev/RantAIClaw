@@ -27,6 +27,7 @@ Last verified: **February 20, 2026**.
 | `completions` | Generate shell completion scripts to stdout |
 | `hardware` | Discover and introspect USB hardware |
 | `peripheral` | Configure and flash peripherals |
+| `kb` | Knowledge Base CRUD + maintenance (gated by `--features kb`) |
 
 ## Command Groups
 
@@ -210,6 +211,80 @@ with `Accept: text/event-stream` or `?stream=1`; see
 - `rantaiclaw peripheral flash [--port <serial_port>]`
 - `rantaiclaw peripheral setup-uno-q [--host <ip_or_host>]`
 - `rantaiclaw peripheral flash-nucleo`
+
+### `kb` (Knowledge Base)
+
+Gated by `--features kb`. Off in the default build. See [kb.md](kb.md) for the full KB chapter (architecture, sidecars, HTTP API).
+
+The `kb` subcommands follow the axi-cli contract: idempotent, never interactive, TOON output by default, `--json` toggles JSON. Exit code `0` is success, `1` is an operational failure (the binary prints a TOON `error[1]{code,message}:` block to stdout).
+
+#### `kb search <query>`
+
+Hybrid retrieval over the knowledge base.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--top <n>` | Max chunks to return | `5` |
+| `--group <id>` | Filter by knowledge-base group ID (repeatable) | _none_ |
+| `--category <c>` | Filter by category | _none_ |
+| `--json` | Emit JSON instead of TOON | `false` |
+
+#### `kb ingest <path>`
+
+Extract, chunk, embed, and store a file.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--title <t>` | Override document title | file stem |
+| `--category <c>` | Add to categories (repeatable) | _none_ |
+| `--group <id>` | Add to knowledge-base groups (repeatable) | _none_ |
+| `--json` | Emit JSON instead of TOON | `false` |
+
+Supported file types depend on feature flags — see [kb.md](kb.md#ingest-a-document).
+
+#### `kb list`
+
+List documents.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--organization <id>` | Filter by organization ID | _none_ |
+| `--json` | Emit JSON instead of TOON | `false` |
+
+#### `kb get <id>`
+
+Show one document. Exits `1` with a TOON `error[not_found]` block when the ID is absent.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--json` | Emit JSON instead of TOON | `false` |
+
+#### `kb delete <id>`
+
+Soft-delete by default (sets `deleted_at`, hides from search). `--hard` permanently removes the document and its chunks.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--hard` | Permanently remove rows | `false` |
+
+#### `kb drift`
+
+Report which chunks were embedded with a non-current model.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--json` | Emit JSON instead of TOON | `false` |
+
+#### `kb re-embed`
+
+Re-embed chunks using the currently-configured embedding model.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--include-current` | Re-embed even chunks already on the current model | `false` |
+| `--dry-run` | Report what would happen without writing | `false` |
+| `--batch-size <n>` | Batch size for re-embed work | `100` |
+| `--json` | Emit JSON instead of TOON | `false` |
 
 ## Validation Tip
 

@@ -157,7 +157,7 @@ pub struct GatewayRateLimiter {
 }
 
 impl GatewayRateLimiter {
-    fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
+    pub fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
@@ -182,7 +182,7 @@ pub struct IdempotencyStore {
 }
 
 impl IdempotencyStore {
-    fn new(ttl: Duration, max_keys: usize) -> Self {
+    pub fn new(ttl: Duration, max_keys: usize) -> Self {
         Self {
             ttl,
             max_keys: max_keys.max(1),
@@ -677,7 +677,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment),
         )
         .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
-        .merge(api_v1::router())
+        .merge(api_v1::router());
+
+    // KB HTTP surface (Phase 11) — only mounted when the `kb` feature is on.
+    // Adds its own larger body limit (the gateway-wide 64 KiB cap is too
+    // small for document uploads).
+    #[cfg(feature = "kb")]
+    let app = app.merge(crate::kb::axi::api::router());
+
+    let app = app
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
