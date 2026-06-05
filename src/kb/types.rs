@@ -69,6 +69,33 @@ pub struct DocumentGroup {
     pub organization_id: Option<String>,
 }
 
+/// A knowledge-base group as persisted in `knowledge_base_group`. Distinct from
+/// [`DocumentGroup`] because it carries the lifecycle timestamps the CRUD API
+/// surfaces and omits `organization_id` (org scoping is a higher-layer concern
+/// today; the column exists but is not exposed through the group HTTP API).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KbGroup {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub color: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// List-view projection of a [`KbGroup`] with a denormalized membership count
+/// (`COUNT(*)` over `document_group`). Kept separate from [`KbGroup`] so the
+/// list endpoint stays cheap and callers can't confuse a summary for the full
+/// record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KbGroupSummary {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub color: Option<String>,
+    pub document_count: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Category {
     pub id: String,

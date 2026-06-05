@@ -11,7 +11,9 @@
 
 use async_trait::async_trait;
 
-use crate::kb::{Chunk, ChunkId, Document, DocumentId, KbResult, SearchResult};
+use crate::kb::{
+    Chunk, ChunkId, Document, DocumentId, KbGroup, KbGroupSummary, KbResult, SearchResult,
+};
 
 pub mod sqlite;
 
@@ -46,6 +48,40 @@ pub trait KbStore: Send + Sync {
     async fn delete_document(&self, id: &DocumentId, soft: bool) -> KbResult<()>;
     async fn list_documents(&self, organization_id: Option<&str>) -> KbResult<Vec<Document>>;
     async fn record_retrieval_hits(&self, ids: &[DocumentId]) -> KbResult<()>;
+
+    // --- groups ---
+    /// Create a new KB group. Generates the id + timestamps server-side.
+    async fn create_group(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        color: Option<&str>,
+    ) -> KbResult<KbGroup>;
+    /// List all groups with a denormalized `document_count` from
+    /// `document_group`. Ordered newest-first to match `list_documents`.
+    async fn list_groups(&self) -> KbResult<Vec<KbGroupSummary>>;
+    /// Fetch a single group by id, or `None` when absent.
+    async fn get_group(&self, id: &str) -> KbResult<Option<KbGroup>>;
+    /// Update only the provided fields (a `None` leaves the column untouched).
+    /// Always bumps `updated_at`. Returns `NotFound` when the group is absent.
+    async fn update_group(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        color: Option<&str>,
+    ) -> KbResult<()>;
+    /// Delete a group and its `document_group` membership rows. Returns
+    /// `true` when a row was removed, `false` when the id did not exist.
+    async fn delete_group(&self, id: &str) -> KbResult<bool>;
+    /// Attach a document to a group. Idempotent (`INSERT OR IGNORE`).
+    async fn add_document_to_group(&self, document_id: &str, group_id: &str) -> KbResult<()>;
+    /// Detach a document from a group. Returns `true` when a membership row
+    /// was removed.
+    async fn remove_document_from_group(&self, document_id: &str, group_id: &str)
+        -> KbResult<bool>;
+    /// List the (non-soft-deleted) documents belonging to a group.
+    async fn list_group_documents(&self, group_id: &str) -> KbResult<Vec<Document>>;
 
     // --- chunks ---
     async fn store_chunks(

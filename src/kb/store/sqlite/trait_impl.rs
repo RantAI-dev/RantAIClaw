@@ -9,7 +9,9 @@ use async_trait::async_trait;
 
 use super::SqliteStore;
 use crate::kb::store::{Bm25Hit, KbStore, SearchFilter};
-use crate::kb::{Chunk, ChunkId, Document, DocumentId, KbResult, SearchResult};
+use crate::kb::{
+    Chunk, ChunkId, Document, DocumentId, KbGroup, KbGroupSummary, KbResult, SearchResult,
+};
 
 #[async_trait]
 impl KbStore for SqliteStore {
@@ -35,6 +37,54 @@ impl KbStore for SqliteStore {
 
     async fn record_retrieval_hits(&self, ids: &[DocumentId]) -> KbResult<()> {
         self.record_retrieval_hits_impl(ids).await
+    }
+
+    async fn create_group(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        color: Option<&str>,
+    ) -> KbResult<KbGroup> {
+        self.create_group_impl(name, description, color).await
+    }
+
+    async fn list_groups(&self) -> KbResult<Vec<KbGroupSummary>> {
+        self.list_groups_impl().await
+    }
+
+    async fn get_group(&self, id: &str) -> KbResult<Option<KbGroup>> {
+        self.get_group_impl(id).await
+    }
+
+    async fn update_group(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        color: Option<&str>,
+    ) -> KbResult<()> {
+        self.update_group_impl(id, name, description, color).await
+    }
+
+    async fn delete_group(&self, id: &str) -> KbResult<bool> {
+        self.delete_group_impl(id).await
+    }
+
+    async fn add_document_to_group(&self, document_id: &str, group_id: &str) -> KbResult<()> {
+        self.add_document_to_group_impl(document_id, group_id).await
+    }
+
+    async fn remove_document_from_group(
+        &self,
+        document_id: &str,
+        group_id: &str,
+    ) -> KbResult<bool> {
+        self.remove_document_from_group_impl(document_id, group_id)
+            .await
+    }
+
+    async fn list_group_documents(&self, group_id: &str) -> KbResult<Vec<Document>> {
+        self.list_group_documents_impl(group_id).await
     }
 
     async fn store_chunks(

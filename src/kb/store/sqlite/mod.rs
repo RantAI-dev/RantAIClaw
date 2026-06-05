@@ -15,6 +15,7 @@ pub mod bm25;
 pub mod chunks;
 pub mod documents;
 pub mod drift;
+pub mod groups;
 pub mod schema;
 mod trait_impl;
 

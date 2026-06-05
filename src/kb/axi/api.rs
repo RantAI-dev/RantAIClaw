@@ -46,7 +46,7 @@ use crate::kb::rerank::{self, Reranker};
 use crate::kb::retrieve::{RetrieveOptions, Retriever, SourceRef};
 use crate::kb::store::sqlite::SqliteStore;
 use crate::kb::store::KbStore;
-use crate::kb::{Document, DocumentId, KbConfig, KbError};
+use crate::kb::{Document, DocumentId, KbConfig, KbError, KbGroup, KbGroupSummary};
 
 /// Upload size cap for the KB ingest route. 32 MiB covers a typical
 /// scientific PDF / large markdown bundle without giving an unauthenticated
@@ -73,6 +73,19 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/kb/search", post(search))
         .route("/api/v1/kb/documents", post(ingest).get(list))
         .route("/api/v1/kb/documents/{id}", get(get_doc).delete(delete_doc))
+        .route("/api/v1/kb/groups", get(list_groups).post(create_group))
+        .route(
+            "/api/v1/kb/groups/{id}",
+            get(get_group).put(update_group).delete(delete_group),
+        )
+        .route(
+            "/api/v1/kb/groups/{id}/documents",
+            get(list_group_documents).post(add_group_document),
+        )
+        .route(
+            "/api/v1/kb/groups/{id}/documents/{doc_id}",
+            axum::routing::delete(remove_group_document),
+        )
         .route("/api/v1/kb/drift", get(drift))
         .route("/api/v1/kb/re-embed", post(re_embed))
         .layer(DefaultBodyLimit::disable())
@@ -601,6 +614,178 @@ async fn re_embed(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// KB groups — CRUD + document membership.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CreateGroupRequest {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateGroupRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteGroupResponse {
+    id: String,
+    deleted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddGroupDocumentRequest {
+    document_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OkResponse {
+    ok: bool,
+}
+
+async fn list_groups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<KbGroupSummary>>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let ctx = ensure_kb_ctx().await?;
+    let groups = ctx.store.list_groups().await.map_err(ApiError::from)?;
+    Ok(Json(groups))
+}
+
+async fn create_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateGroupRequest>,
+) -> Result<Json<KbGroup>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    if body.name.trim().is_empty() {
+        return Err(ApiError::bad_request("name must not be empty".into()).into());
+    }
+    let ctx = ensure_kb_ctx().await?;
+    let group = ctx
+        .store
+        .create_group(
+            body.name.trim(),
+            body.description.as_deref(),
+            body.color.as_deref(),
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(group))
+}
+
+async fn get_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<KbGroup>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let ctx = ensure_kb_ctx().await?;
+    match ctx.store.get_group(&id).await.map_err(ApiError::from)? {
+        Some(g) => Ok(Json(g)),
+        None => Err(ApiError::not_found(format!("group {id} not found")).into()),
+    }
+}
+
+async fn update_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateGroupRequest>,
+) -> Result<Json<KbGroup>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    if let Some(n) = body.name.as_deref() {
+        if n.trim().is_empty() {
+            return Err(ApiError::bad_request("name must not be empty".into()).into());
+        }
+    }
+    let ctx = ensure_kb_ctx().await?;
+    ctx.store
+        .update_group(
+            &id,
+            body.name.as_deref().map(str::trim),
+            body.description.as_deref(),
+            body.color.as_deref(),
+        )
+        .await
+        .map_err(ApiError::from)?;
+    // Return the freshly-updated record so callers see canonical state.
+    match ctx.store.get_group(&id).await.map_err(ApiError::from)? {
+        Some(g) => Ok(Json(g)),
+        None => Err(ApiError::not_found(format!("group {id} not found")).into()),
+    }
+}
+
+async fn delete_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<DeleteGroupResponse>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let ctx = ensure_kb_ctx().await?;
+    let deleted = ctx.store.delete_group(&id).await.map_err(ApiError::from)?;
+    Ok(Json(DeleteGroupResponse { id, deleted }))
+}
+
+async fn list_group_documents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<DocumentSummary>>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let ctx = ensure_kb_ctx().await?;
+    let docs = ctx
+        .store
+        .list_group_documents(&id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(docs.into_iter().map(DocumentSummary::from).collect()))
+}
+
+async fn add_group_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<AddGroupDocumentRequest>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    if body.document_id.trim().is_empty() {
+        return Err(ApiError::bad_request("document_id must not be empty".into()).into());
+    }
+    let ctx = ensure_kb_ctx().await?;
+    ctx.store
+        .add_document_to_group(body.document_id.trim(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+async fn remove_group_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, doc_id)): Path<(String, String)>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let ctx = ensure_kb_ctx().await?;
+    let ok = ctx
+        .store
+        .remove_document_from_group(&doc_id, &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(OkResponse { ok }))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Ingest — multipart upload.
 //
 // Form fields (all optional except `file`):
@@ -777,6 +962,16 @@ async fn ingest(
         .store_chunks(&doc_id, &chunks, &embeddings, ctx.embedder.model())
         .await
         .map_err(ApiError::from)?;
+
+    // Attach the document to any groups named in the `groups` form field
+    // (single id or comma-separated, already split into `groups`). Idempotent
+    // per-group via INSERT OR IGNORE in the store.
+    for group_id in &groups {
+        ctx.store
+            .add_document_to_group(&doc_id.0, group_id)
+            .await
+            .map_err(ApiError::from)?;
+    }
 
     // u128 → u64 ms: see comments on the CLI side; the cast is safe in any
     // realistic ingest duration.
