@@ -97,6 +97,8 @@ mod sessions {
 mod skillforge;
 mod skills;
 mod tasks;
+#[cfg(feature = "remote-install")]
+mod remote;
 mod tools;
 mod tunnel;
 mod util;
