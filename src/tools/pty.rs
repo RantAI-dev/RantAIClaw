@@ -5,7 +5,7 @@
 //! drive it with `tmux send-keys` / `capture-pane`. No terminal emulator needed.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -36,7 +36,11 @@ fn remember_target(session: &str, target: Target) {
 }
 
 fn lookup_target(session: &str) -> Option<Target> {
-    targets().lock().expect("tmux target lock").get(session).cloned()
+    targets()
+        .lock()
+        .expect("tmux target lock")
+        .get(session)
+        .cloned()
 }
 
 fn forget_target(session: &str) {
@@ -60,7 +64,12 @@ fn new_session_argv(session: &str, cols: u32, rows: u32, command: &str) -> Vec<S
 }
 
 fn capture_argv(session: &str) -> Vec<String> {
-    vec!["capture-pane".into(), "-t".into(), session.into(), "-p".into()]
+    vec![
+        "capture-pane".into(),
+        "-t".into(),
+        session.into(),
+        "-p".into(),
+    ]
 }
 
 fn kill_argv(session: &str) -> Vec<String> {
@@ -72,7 +81,11 @@ fn send_argvs(session: &str, batches: &[Vec<String>]) -> Vec<Vec<String>> {
     batches
         .iter()
         .map(|b| {
-            let mut v = vec!["send-keys".to_string(), "-t".to_string(), session.to_string()];
+            let mut v = vec![
+                "send-keys".to_string(),
+                "-t".to_string(),
+                session.to_string(),
+            ];
             v.extend(b.iter().cloned());
             v
         })
@@ -128,8 +141,6 @@ pub struct PtyTool {
     security: Arc<SecurityPolicy>,
 }
 
-use std::sync::Arc;
-
 impl PtyTool {
     #[must_use]
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
@@ -166,10 +177,18 @@ impl PtyTool {
             Some("local") | None => Target::Local,
             Some(id) => Target::Ssh(id.to_string()),
         };
-        let cols = u32::try_from(args.get("cols").and_then(serde_json::Value::as_u64).unwrap_or(200))
-            .unwrap_or(200);
-        let rows = u32::try_from(args.get("rows").and_then(serde_json::Value::as_u64).unwrap_or(50))
-            .unwrap_or(50);
+        let cols = u32::try_from(
+            args.get("cols")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(200),
+        )
+        .unwrap_or(200);
+        let rows = u32::try_from(
+            args.get("rows")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(50),
+        )
+        .unwrap_or(50);
         // best-effort: kill any stale session of the same name first
         let _ = run_tmux(&target, &kill_argv(sess), 15).await;
         match run_tmux(&target, &new_session_argv(sess, cols, rows, command), 30).await {
@@ -219,7 +238,10 @@ impl PtyTool {
             Some(Err(e)) => return fail(format!("invalid `until` regex: {e}")),
             None => None,
         };
-        let stable = args.get("stable").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let stable = args
+            .get("stable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let timeout_ms = args
             .get("timeout_ms")
             .and_then(serde_json::Value::as_u64)
@@ -341,7 +363,14 @@ mod tests {
         assert_eq!(
             new_session_argv("nqr", 200, 50, "sudo /tmp/nqr-installer install"),
             vec![
-                "new-session", "-d", "-s", "nqr", "-x", "200", "-y", "50",
+                "new-session",
+                "-d",
+                "-s",
+                "nqr",
+                "-x",
+                "200",
+                "-y",
+                "50",
                 "sudo /tmp/nqr-installer install"
             ]
         );

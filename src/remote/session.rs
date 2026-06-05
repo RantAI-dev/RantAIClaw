@@ -71,7 +71,14 @@ pub async fn connect(host: &str, port: u16, user: &str, auth: Auth) -> Result<St
     }
 
     let id = session_id(user, host, port);
-    registry::insert(id.clone(), Arc::new(SshConn { id: id.clone(), handle })).await;
+    registry::insert(
+        id.clone(),
+        Arc::new(SshConn {
+            id: id.clone(),
+            handle,
+        }),
+    )
+    .await;
     Ok(id)
 }
 
@@ -211,7 +218,10 @@ impl Handler for ClientHandler {
         &mut self,
         server_public_key: &key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(tofu_accept(&self.endpoint, &server_public_key.fingerprint()))
+        Ok(tofu_accept(
+            &self.endpoint,
+            &server_public_key.fingerprint(),
+        ))
     }
 }
 
@@ -250,6 +260,9 @@ mod tests {
     #[test]
     fn session_id_format() {
         assert_eq!(session_id("root", "10.0.0.5", 22), "root@10.0.0.5:22");
-        assert_eq!(session_id("ubuntu", "host.local", 2222), "ubuntu@host.local:2222");
+        assert_eq!(
+            session_id("ubuntu", "host.local", 2222),
+            "ubuntu@host.local:2222"
+        );
     }
 }

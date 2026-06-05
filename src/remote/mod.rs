@@ -5,10 +5,6 @@
 //!
 //! Gated behind the `remote-install` cargo feature.
 
-// Items are consumed incrementally by the `ssh`/`pty` tools across tasks; the
-// allow is removed once both tools wire everything up.
-#![allow(dead_code)]
-
 pub mod keys;
 pub mod registry;
 pub mod session;

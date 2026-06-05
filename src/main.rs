@@ -94,11 +94,11 @@ mod services;
 mod sessions {
     pub use rantaiclaw::sessions::*;
 }
+#[cfg(feature = "remote-install")]
+mod remote;
 mod skillforge;
 mod skills;
 mod tasks;
-#[cfg(feature = "remote-install")]
-mod remote;
 mod tools;
 mod tunnel;
 mod util;

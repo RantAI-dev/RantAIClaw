@@ -100,8 +100,12 @@ impl SshTool {
         let Some(user) = str_field(args, "user") else {
             return fail("connect requires `user`");
         };
-        let port = u16::try_from(args.get("port").and_then(serde_json::Value::as_u64).unwrap_or(22))
-            .unwrap_or(22);
+        let port = u16::try_from(
+            args.get("port")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(22),
+        )
+        .unwrap_or(22);
         let auth = match parse_auth(args) {
             Ok(a) => a,
             Err(e) => return fail(e),
@@ -265,7 +269,10 @@ mod tests {
     #[tokio::test]
     async fn readonly_blocks() {
         let t = tool(AutonomyLevel::ReadOnly);
-        let r = t.execute(json!({"action": "exec", "session": "x", "command": "id"})).await.unwrap();
+        let r = t
+            .execute(json!({"action": "exec", "session": "x", "command": "id"}))
+            .await
+            .unwrap();
         assert!(!r.success);
         assert!(r.error.unwrap().contains("read-only"));
     }

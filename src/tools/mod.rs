@@ -39,18 +39,18 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod pdf_read;
 pub mod proxy_config;
+#[cfg(feature = "remote-install")]
+pub mod pty;
 pub mod pushover;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
-#[cfg(feature = "remote-install")]
-pub mod pty;
-#[cfg(feature = "remote-install")]
-pub mod ssh;
 pub mod skill_tool;
 pub mod skills_install;
 pub mod skills_meta;
+#[cfg(feature = "remote-install")]
+pub mod ssh;
 pub mod task_comment;
 pub mod task_complete_subtask;
 pub mod task_create;
@@ -90,17 +90,17 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use pdf_read::PdfReadTool;
 pub use proxy_config::ProxyConfigTool;
+#[cfg(feature = "remote-install")]
+pub use pty::PtyTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
-#[cfg(feature = "remote-install")]
-pub use pty::PtyTool;
+pub use skill_tool::skill_tools_from_skills;
 #[cfg(feature = "remote-install")]
 pub use ssh::SshTool;
-pub use skill_tool::skill_tools_from_skills;
 pub use task_comment::TaskCommentTool;
 pub use task_complete_subtask::TaskCompleteSubtaskTool;
 pub use task_create::TaskCreateTool;

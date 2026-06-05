@@ -30,10 +30,3 @@ pub async fn get(id: &str) -> Option<Arc<SshConn>> {
 pub async fn remove(id: &str) -> bool {
     sessions().lock().await.remove(id).is_some()
 }
-
-/// List currently-registered session ids (for diagnostics).
-pub async fn ids() -> Vec<String> {
-    let mut v: Vec<String> = sessions().lock().await.keys().cloned().collect();
-    v.sort();
-    v
-}
