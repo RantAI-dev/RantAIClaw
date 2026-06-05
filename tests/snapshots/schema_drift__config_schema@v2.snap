@@ -1,6 +1,5 @@
 ---
 source: tests/schema_drift.rs
-assertion_line: 42
 description: "Config JSON Schema fingerprint. If this test fails, you changed the on-disk config.toml surface. Bump config::migrations::CURRENT_VERSION, add a migrate_vN function, write a unit test, then `cargo insta accept` here."
 expression: pretty
 ---
@@ -61,7 +60,10 @@ expression: pretty
           "head",
           "tail"
         ],
-        "always_ask": [],
+        "always_ask": [
+          "ssh",
+          "pty"
+        ],
         "auto_approve": [
           "file_read",
           "memory_recall"
@@ -564,7 +566,10 @@ expression: pretty
         "always_ask": {
           "description": "Tools that always require interactive approval, even after \"Always\".",
           "type": "array",
-          "default": [],
+          "default": [
+            "ssh",
+            "pty"
+          ],
           "items": {
             "type": "string"
           }
