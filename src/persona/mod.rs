@@ -115,6 +115,12 @@ pub struct PersonaToml {
     pub role: String,
     pub tone: String,
     pub avoid: Option<String>,
+    /// KB group ids whose documents are always retrieved for this persona,
+    /// regardless of per-query group selection. `#[serde(default)]` keeps
+    /// older `persona.toml` files (written before this field existed)
+    /// parseable.
+    #[serde(default)]
+    pub always_on_kbs: Vec<String>,
 }
 
 impl PersonaToml {
@@ -129,6 +135,7 @@ impl PersonaToml {
             role: "general productivity and helpful assistance".to_string(),
             tone: "neutral".to_string(),
             avoid: None,
+            always_on_kbs: Vec::new(),
         }
     }
 

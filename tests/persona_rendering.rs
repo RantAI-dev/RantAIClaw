@@ -210,6 +210,7 @@ fn write_persona_toml_round_trips() {
         role: "engineering work".into(),
         tone: "formal".into(),
         avoid: Some("speculative claims".into()),
+        always_on_kbs: Vec::new(),
     };
     write_persona_toml(&profile, &persona).unwrap();
 

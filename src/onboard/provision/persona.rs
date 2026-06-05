@@ -198,6 +198,7 @@ impl TuiProvisioner for PersonaProvisioner {
             role,
             tone,
             avoid,
+            always_on_kbs: Vec::new(),
         };
 
         persona::write_persona_toml(profile, &persona_record)?;

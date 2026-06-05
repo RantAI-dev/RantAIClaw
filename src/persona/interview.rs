@@ -33,6 +33,7 @@ pub fn run_interactive(default_name: &str, default_timezone: &str) -> Result<Per
         role,
         tone,
         avoid,
+        always_on_kbs: Vec::new(),
     })
 }
 
