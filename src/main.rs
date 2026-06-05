@@ -95,6 +95,8 @@ mod webui;
 mod sessions {
     pub use rantaiclaw::sessions::*;
 }
+#[cfg(feature = "remote-install")]
+mod remote;
 mod skillforge;
 mod skills;
 mod tasks;

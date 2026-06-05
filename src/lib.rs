@@ -71,6 +71,8 @@ pub mod persona;
 pub mod profile;
 pub mod providers;
 pub mod rag;
+#[cfg(feature = "remote-install")]
+pub mod remote;
 pub mod runtime;
 pub mod security;
 pub(crate) mod service;

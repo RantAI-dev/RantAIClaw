@@ -169,6 +169,9 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
+russh = { version = "0.45", optional = true }
+russh-keys = { version = "0.45", optional = true }
+russh-sftp = { version = "2.0", optional = true }
 
 # USB device enumeration (hardware discovery) — only on platforms nusb supports
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
@@ -228,7 +231,7 @@ landlock = { version = "0.4" }
 libc = "0.2"
 
 [features]
-default = ["tui", "whatsapp-web"]
+default = ["tui", "whatsapp-web", "remote-install"]
 # Re-enables the pre-rig hand-rolled provider implementations for
 # Anthropic/OpenAI/Gemini. Default off — those providers route
 # through `RigProvider` (src/providers/rig_native.rs). Build with
@@ -264,6 +267,8 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 kb = ["dep:sqlite-vec", "dep:lopdf", "rag-pdf"]
 # kb-office = Office-document ingestion for the KB (docx/xlsx/pptx)
 kb-office = ["kb", "dep:calamine", "dep:docx-rs"]
+# remote-install = ssh transport (russh) + tmux pty driver for piloting remote installers
+remote-install = ["dep:russh", "dep:russh-keys", "dep:russh-sftp"]
 # Note: a future `kb-lancedb` feature + `lancedb` dep will land together with
 # the actual HNSW backend implementation. No stub feature is kept here on
 # purpose: an in-tree feature flag with no consumer is itself a YAGNI
