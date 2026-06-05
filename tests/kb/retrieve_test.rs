@@ -22,7 +22,9 @@ use rantaiclaw::kb::embed::EmbeddingProvider;
 use rantaiclaw::kb::retrieve::rrf::{reciprocal_rank_fusion, RrfOptions};
 use rantaiclaw::kb::retrieve::{RetrieveOptions, Retriever};
 use rantaiclaw::kb::store::{Bm25Hit, KbStore, SearchFilter};
-use rantaiclaw::kb::{Chunk, ChunkId, Document, DocumentId, KbConfig, KbResult, SearchResult};
+use rantaiclaw::kb::{
+    Chunk, ChunkId, Document, DocumentId, KbConfig, KbGroup, KbGroupSummary, KbResult, SearchResult,
+};
 
 // Process-wide env-mutation lock lives in `crate::kb::common::ENV_LOCK`
 // so every test module in this binary serializes against the SAME mutex.
@@ -207,6 +209,45 @@ impl KbStore for FakeStore {
             panic!("intentional panic in fake store: tests assert fire-and-forget isolation");
         }
         Ok(())
+    }
+    async fn create_group(
+        &self,
+        _name: &str,
+        _description: Option<&str>,
+        _color: Option<&str>,
+    ) -> KbResult<KbGroup> {
+        unimplemented!("FakeStore does not exercise group CRUD")
+    }
+    async fn list_groups(&self) -> KbResult<Vec<KbGroupSummary>> {
+        Ok(Vec::new())
+    }
+    async fn get_group(&self, _id: &str) -> KbResult<Option<KbGroup>> {
+        Ok(None)
+    }
+    async fn update_group(
+        &self,
+        _id: &str,
+        _name: Option<&str>,
+        _description: Option<&str>,
+        _color: Option<&str>,
+    ) -> KbResult<()> {
+        Ok(())
+    }
+    async fn delete_group(&self, _id: &str) -> KbResult<bool> {
+        Ok(false)
+    }
+    async fn add_document_to_group(&self, _document_id: &str, _group_id: &str) -> KbResult<()> {
+        Ok(())
+    }
+    async fn remove_document_from_group(
+        &self,
+        _document_id: &str,
+        _group_id: &str,
+    ) -> KbResult<bool> {
+        Ok(false)
+    }
+    async fn list_group_documents(&self, _group_id: &str) -> KbResult<Vec<Document>> {
+        Ok(Vec::new())
     }
     async fn store_chunks(
         &self,

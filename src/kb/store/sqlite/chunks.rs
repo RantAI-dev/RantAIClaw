@@ -429,6 +429,11 @@ impl SqliteStore {
 /// Resolve the set of document IDs allowed by `filter`. `None` means "no
 /// restriction" — when category and group_ids and document_ids are all empty,
 /// we skip the pre-filter entirely.
+///
+/// The category / group / document-id filters are **unioned** (a document is in
+/// scope if it matches ANY of them), so a chat can search its conversation
+/// attachments (`category`) together with one or more selected knowledge bases
+/// (`group_ids`) in a single call.
 fn resolve_allowed_documents(
     conn: &rusqlite::Connection,
     filter: &SearchFilter,
@@ -461,7 +466,7 @@ fn resolve_allowed_documents(
             .query_map(params![category], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?;
         allowed = Some(match allowed {
-            Some(prev) => prev.intersection(&ids).cloned().collect(),
+            Some(prev) => prev.union(&ids).cloned().collect(),
             None => ids,
         });
     }
@@ -483,7 +488,7 @@ fn resolve_allowed_documents(
             .query_map(params.as_slice(), |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?;
         allowed = Some(match allowed {
-            Some(prev) => prev.intersection(&ids).cloned().collect(),
+            Some(prev) => prev.union(&ids).cloned().collect(),
             None => ids,
         });
     }
@@ -491,7 +496,7 @@ fn resolve_allowed_documents(
     if let Some(doc_ids) = &filter.document_ids {
         let ids: std::collections::HashSet<String> = doc_ids.iter().map(|d| d.0.clone()).collect();
         allowed = Some(match allowed {
-            Some(prev) => prev.intersection(&ids).cloned().collect(),
+            Some(prev) => prev.union(&ids).cloned().collect(),
             None => ids,
         });
     }

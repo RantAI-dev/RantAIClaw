@@ -163,7 +163,7 @@ impl SqliteStore {
         let conn = self.conn.clone();
         let id = id.0.clone();
         tokio::task::spawn_blocking(move || -> KbResult<()> {
-            let conn = conn.blocking_lock();
+            let mut conn = conn.blocking_lock();
             if soft {
                 conn.execute(
                     "UPDATE document
@@ -173,7 +173,28 @@ impl SqliteStore {
                     params![id],
                 )?;
             } else {
-                conn.execute("DELETE FROM document WHERE id = ?1", params![id])?;
+                // Hard delete: drop the document AND its chunks + vectors
+                // atomically. `chunk_vec` (vec0) has no foreign key, so neither a
+                // cascade nor `DELETE FROM document` reaches it — delete it
+                // explicitly by the chunk rowids, or it orphans and a later
+                // ingest collides on rowid reuse
+                // (`UNIQUE constraint failed on chunk_vec primary key`).
+                let tx = conn.transaction()?;
+                {
+                    let mut stmt = tx.prepare("SELECT rowid FROM chunk WHERE document_id = ?1")?;
+                    let rowids: Vec<i64> = stmt
+                        .query_map(params![id], |row| row.get(0))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    drop(stmt);
+                    let mut del_vec = tx.prepare("DELETE FROM chunk_vec WHERE rowid = ?1")?;
+                    for rid in &rowids {
+                        del_vec.execute(params![rid])?;
+                    }
+                    drop(del_vec);
+                    tx.execute("DELETE FROM chunk WHERE document_id = ?1", params![id])?;
+                    tx.execute("DELETE FROM document WHERE id = ?1", params![id])?;
+                }
+                tx.commit()?;
             }
             Ok(())
         })
