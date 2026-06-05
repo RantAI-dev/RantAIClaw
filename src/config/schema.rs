@@ -1988,7 +1988,9 @@ fn default_auto_approve() -> Vec<String> {
 }
 
 fn default_always_ask() -> Vec<String> {
-    vec![]
+    // High-blast-radius remote-install tools always prompt, even after a
+    // session "Always" (no effect when the remote-install feature is off).
+    vec!["ssh".to_string(), "pty".to_string()]
 }
 
 impl Default for AutonomyConfig {

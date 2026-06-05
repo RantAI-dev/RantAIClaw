@@ -44,6 +44,10 @@ jobs:
             - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
               with:
                   token: ${{ secrets.GITHUB_TOKEN }}
+                  # russh SSH stack (opt-in remote-install tools); mirrors deny.toml.
+                  # rsa Marvin sidechannel + russh/russh-cryptovec allocation advisories,
+                  # no upstream fix for the 2026 set — revisit on a russh bump.
+                  ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0153,RUSTSEC-2026-0154,RUSTSEC-2026-0159
 
     deny:
         name: License & Supply Chain

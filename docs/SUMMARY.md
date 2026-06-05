@@ -32,6 +32,9 @@
 - [providers-reference.md](providers-reference.md)
 - [channels-reference.md](channels-reference.md)
 - [custom-providers.md](custom-providers.md)
+- [kb.md](kb.md) — Knowledge Base (feature-gated)
+- [kb-bench.md](kb-bench.md) — KB retrieval latency baseline
+- [kb-tuning.md](kb-tuning.md) — KB retrieval quality knobs
 
 ## 4) Operations & deployment
 

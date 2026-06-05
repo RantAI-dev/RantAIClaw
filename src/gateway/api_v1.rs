@@ -37,7 +37,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/agent/chat", post(agent_chat))
         .route("/api/v1/sessions", get(sessions_list))
         .route("/api/v1/sessions/search", post(sessions_search))
-        .route("/api/v1/sessions/{id}", get(sessions_get))
+        .route(
+            "/api/v1/sessions/{id}",
+            get(sessions_get).delete(sessions_delete),
+        )
         .route("/api/v1/sessions/{id}/title", put(sessions_set_title))
         .route("/api/v1/insights", get(insights))
         .route("/api/v1/skills", get(skills_list))
@@ -204,6 +207,9 @@ struct ChatRequestBody {
     provider: Option<String>,
     #[serde(default)]
     temperature: Option<f64>,
+    /// Continue this session (multi-turn). Empty/absent starts a new one.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -212,6 +218,8 @@ struct ChatResponseBody {
     model: String,
     provider: String,
     duration_ms: u128,
+    /// The session this turn was persisted to — pass it back to continue.
+    session_id: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -281,9 +289,17 @@ async fn agent_chat_sync(
         .await
         .map_err(err_500)?;
     let text = agent.turn(&body.message).await.map_err(err_500)?;
+    let mut session_id = body.session_id.clone().unwrap_or_default();
     if let Ok(store) = open_session_store() {
-        if let Err(err) = record_api_chat_session(&store, &model, &body.message, &text) {
-            tracing::warn!(error = %err, "api agent chat session persistence failed");
+        match record_api_chat_session(
+            &store,
+            &model,
+            body.session_id.as_deref(),
+            &body.message,
+            &text,
+        ) {
+            Ok(id) => session_id = id,
+            Err(err) => tracing::warn!(error = %err, "api agent chat session persistence failed"),
         }
     }
     Ok(Json(ChatResponseBody {
@@ -291,6 +307,7 @@ async fn agent_chat_sync(
         model,
         provider,
         duration_ms: started.elapsed().as_millis(),
+        session_id,
     }))
 }
 
@@ -311,6 +328,7 @@ async fn agent_chat_stream(
         .unwrap_or_else(|| "unknown".to_string());
     let user_message = body.message.clone();
     let agent_message = body.message.clone();
+    let req_session_id = body.session_id.clone();
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<crate::agent::AgentEvent>(64);
     let cancel = CancellationToken::new();
     let cancel_for_agent = cancel.clone();
@@ -367,18 +385,21 @@ async fn agent_chat_stream(
                     } else {
                         final_text.clone()
                     };
+                    let mut session_id = req_session_id.clone().unwrap_or_default();
                     if !cancelled {
                         if let Ok(store) = open_session_store() {
-                            if let Err(err) = record_api_chat_session(
+                            match record_api_chat_session(
                                 &store,
                                 &model,
+                                req_session_id.as_deref(),
                                 &user_message,
                                 &persisted_text,
                             ) {
-                                tracing::warn!(
+                                Ok(id) => session_id = id,
+                                Err(err) => tracing::warn!(
                                     error = %err,
                                     "api agent chat stream session persistence failed"
-                                );
+                                ),
                             }
                         }
                     }
@@ -386,6 +407,7 @@ async fn agent_chat_stream(
                         "type": "done",
                         "text": persisted_text,
                         "cancelled": cancelled,
+                        "session_id": session_id,
                     })
                 }
                 crate::agent::AgentEvent::ToolCallStart { id, name, args } => serde_json::json!({
@@ -466,21 +488,31 @@ impl Drop for CancelOnDrop {
 fn record_api_chat_session(
     store: &crate::sessions::SessionStore,
     model: &str,
+    session_id: Option<&str>,
     user_message: &str,
     assistant_message: &str,
 ) -> anyhow::Result<String> {
-    let session = store.new_session(model, "api")?;
-    store.append_message(&crate::sessions::Message::user(&session.id, user_message))?;
-    store.append_message(&crate::sessions::Message::assistant(
-        &session.id,
-        assistant_message,
-    ))?;
-    let title = crate::sessions::derive_session_title(user_message);
-    if !title.is_empty() {
-        store.set_title(&session.id, &title)?;
+    // Continue the supplied session when it exists so a multi-turn conversation
+    // lands in ONE session instead of a fresh session per turn. An absent or
+    // unknown id starts a new session.
+    let (id, is_new) = match session_id {
+        Some(sid) if !sid.is_empty() && store.get_session(sid)?.is_some() => {
+            (sid.to_string(), false)
+        }
+        _ => (store.new_session(model, "api")?.id, true),
+    };
+    store.append_message(&crate::sessions::Message::user(&id, user_message))?;
+    store.append_message(&crate::sessions::Message::assistant(&id, assistant_message))?;
+    // Title only the first turn — derived from the user's own text (decorations
+    // are appended after it, so the first line stays the real question).
+    if is_new {
+        let title = crate::sessions::derive_session_title(user_message);
+        if !title.is_empty() {
+            store.set_title(&id, &title)?;
+        }
     }
-    store.end_session(&session.id)?;
-    Ok(session.id)
+    store.end_session(&id)?;
+    Ok(id)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -607,6 +639,26 @@ async fn sessions_set_title(
     store.set_title(&session.id, &body.title).map_err(err_500)?;
     Ok(Json(
         serde_json::json!({ "id": session.id, "title": body.title }),
+    ))
+}
+
+async fn sessions_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let mut store = open_session_store().map_err(err_500)?;
+    let sessions = store.list_sessions(500).map_err(err_500)?;
+    let matched: Vec<_> = sessions.iter().filter(|s| s.id.starts_with(&id)).collect();
+    let session_id = match matched.len() {
+        0 => return Err(err_404(format!("no session matches `{id}`"))),
+        1 => matched[0].id.clone(),
+        n => return Err(err_400(format!("`{id}` is ambiguous ({n} matches)"))),
+    };
+    let deleted = store.delete_session(&session_id).map_err(err_500)?;
+    Ok(Json(
+        serde_json::json!({ "deleted": deleted, "id": session_id }),
     ))
 }
 
@@ -754,6 +806,7 @@ async fn personality_get(
             "role": p.role,
             "tone": p.tone,
             "avoid": p.avoid,
+            "always_on_kbs": p.always_on_kbs,
         }))),
         None => Ok(Json(serde_json::json!({
             "profile": profile.name,
@@ -765,7 +818,12 @@ async fn personality_get(
 
 #[derive(Deserialize)]
 struct PersonalityBody {
-    preset: String,
+    /// Optional: when absent, the current preset is kept (and a Default persona
+    /// is created if none exists). Lets callers update only `always_on_kbs`.
+    #[serde(default)]
+    preset: Option<String>,
+    #[serde(default)]
+    always_on_kbs: Option<Vec<String>>,
 }
 
 async fn personality_set(
@@ -774,14 +832,6 @@ async fn personality_set(
     Json(body): Json<PersonalityBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let preset = match body.preset.as_str() {
-        "default" => crate::persona::PresetId::Default,
-        "concise_pro" => crate::persona::PresetId::ConcisePro,
-        "friendly_companion" => crate::persona::PresetId::FriendlyCompanion,
-        "research_analyst" => crate::persona::PresetId::ResearchAnalyst,
-        "executive_assistant" => crate::persona::PresetId::ExecutiveAssistant,
-        other => return Err(err_400(format!("unknown preset `{other}`"))),
-    };
     let profile = crate::profile::ProfileManager::active().map_err(err_500)?;
     let existing = crate::persona::read_persona_toml(&profile).map_err(err_500)?;
     let timezone = existing
@@ -794,10 +844,28 @@ async fn personality_set(
         .unwrap_or_else(|| "RantaiClawAgent".to_string());
     let mut next =
         existing.unwrap_or_else(|| crate::persona::PersonaToml::default_for(&name, &timezone));
-    next.preset = preset;
+    // Update the preset only when supplied; otherwise keep the current one.
+    if let Some(ref preset) = body.preset {
+        next.preset = match preset.as_str() {
+            "default" => crate::persona::PresetId::Default,
+            "concise_pro" => crate::persona::PresetId::ConcisePro,
+            "friendly_companion" => crate::persona::PresetId::FriendlyCompanion,
+            "research_analyst" => crate::persona::PresetId::ResearchAnalyst,
+            "executive_assistant" => crate::persona::PresetId::ExecutiveAssistant,
+            other => return Err(err_400(format!("unknown preset `{other}`"))),
+        };
+    }
+    // Only overwrite always_on_kbs when the caller supplied it, so a
+    // preset-only update preserves the existing KB selection.
+    if let Some(kbs) = body.always_on_kbs {
+        next.always_on_kbs = kbs;
+    }
     crate::persona::write_persona_toml(&profile, &next).map_err(err_500)?;
     crate::persona::render_system_md(&profile, &next).map_err(err_500)?;
-    Ok(Json(serde_json::json!({ "preset": preset.slug() })))
+    Ok(Json(serde_json::json!({
+        "preset": next.preset.slug(),
+        "always_on_kbs": next.always_on_kbs,
+    })))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1019,6 +1087,7 @@ mod tests {
         let id = record_api_chat_session(
             &store,
             "test-model",
+            None,
             "Summarize the runtime contract",
             "Runtime contract summary.",
         )
@@ -1042,6 +1111,35 @@ mod tests {
         assert_eq!(messages[1].content, "Runtime contract summary.");
     }
 
+    #[test]
+    fn record_api_chat_session_continues_existing_session() {
+        let store = crate::sessions::SessionStore::in_memory().unwrap();
+
+        let first =
+            record_api_chat_session(&store, "test-model", None, "turn one", "reply one").unwrap();
+        let second =
+            record_api_chat_session(&store, "test-model", Some(&first), "turn two", "reply two")
+                .unwrap();
+        assert_eq!(
+            first, second,
+            "a supplied session id must be continued, not replaced"
+        );
+
+        let session = store.get_session(&first).unwrap().unwrap();
+        assert_eq!(
+            session.message_count, 4,
+            "both turns land in the same session"
+        );
+        // The first turn's title is preserved (not overwritten by turn two).
+        assert_eq!(session.title.as_deref(), Some("turn one"));
+
+        // An unknown id falls back to a fresh session.
+        let third =
+            record_api_chat_session(&store, "test-model", Some("does-not-exist"), "t3", "r3")
+                .unwrap();
+        assert_ne!(third, first);
+    }
+
     #[tokio::test]
     async fn sse_chat_emits_chunk_then_done() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1058,6 +1156,7 @@ mod tests {
                 model: None,
                 provider: None,
                 temperature: None,
+                session_id: None,
             }),
         )
         .await
@@ -1112,6 +1211,7 @@ mod tests {
                 model: None,
                 provider: None,
                 temperature: None,
+                session_id: None,
             }),
         )
         .await

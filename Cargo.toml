@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rantaiclaw"
-version = "0.6.59-alpha"
+version = "0.6.60-alpha"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "Apache-2.0"
@@ -154,7 +154,7 @@ mail-parser = "0.11.2"
 async-imap = { version = "0.11",features = ["runtime-tokio"], default-features = false }
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros", "multipart"] }
 tower = { version = "0.5", default-features = false }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
 http-body-util = "0.1"
@@ -169,6 +169,9 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
+russh = { version = "0.45", optional = true }
+russh-keys = { version = "0.45", optional = true }
+russh-sftp = { version = "2.0", optional = true }
 
 # USB device enumeration (hardware discovery) — only on platforms nusb supports
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
@@ -194,6 +197,30 @@ wa-rs-proto = { version = "0.2", optional = true, default-features = false }
 wa-rs-ureq-http = { version = "0.2", optional = true }
 wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
 
+# Knowledge Base storage backend — sqlite-vec extension for vector search.
+# Activated by --features kb.
+sqlite-vec = { version = "0.1", optional = true }
+
+# Lightweight PDF reader used by the KB extractor pipeline:
+# - `pdf_splitter` carves multi-page docs into N-page segments for the
+#   vision-LLM extractor (which has an output-token budget per call)
+# - test fixtures generate small PDFs deterministically
+# Gated behind `kb`: lopdf pulls libz (`zlib-sys`) so keeping it optional
+# saves binary size on non-KB builds. The only consumers
+# (`src/kb/extract/pdf_splitter.rs`, `tests/kb/extract_test.rs`) are
+# already `#[cfg(feature = "kb")]`-gated.
+lopdf = { version = "0.34", optional = true }
+
+# Insertion-order-preserving map backing the KB query embedding LRU cache.
+# `IndexMap` lets us move keys to the back on access without a separate
+# linked-list, which keeps the LRU port from `lru-cache.ts` simple.
+indexmap = "2"
+
+# KB office support — feature `kb-office`. Pinned now so the feature flag
+# resolves cleanly; actual code that uses these lands in later phases.
+calamine = { version = "0.30", optional = true }
+docx-rs = { version = "0.4", optional = true }
+
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.22", optional = true }
@@ -204,7 +231,7 @@ landlock = { version = "0.4" }
 libc = "0.2"
 
 [features]
-default = ["tui", "whatsapp-web"]
+default = ["tui", "whatsapp-web", "remote-install"]
 # Re-enables the pre-rig hand-rolled provider implementations for
 # Anthropic/OpenAI/Gemini. Default off — those providers route
 # through `RigProvider` (src/providers/rig_native.rs). Build with
@@ -236,6 +263,17 @@ probe = ["dep:probe-rs"]
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost"]
+# kb = Knowledge Base subsystem (sqlite-vec + PDF extraction)
+kb = ["dep:sqlite-vec", "dep:lopdf", "rag-pdf"]
+# kb-office = Office-document ingestion for the KB (docx/xlsx/pptx)
+kb-office = ["kb", "dep:calamine", "dep:docx-rs"]
+# remote-install = ssh transport (russh) + tmux pty driver for piloting remote installers
+remote-install = ["dep:russh", "dep:russh-keys", "dep:russh-sftp"]
+# Note: a future `kb-lancedb` feature + `lancedb` dep will land together with
+# the actual HNSW backend implementation. No stub feature is kept here on
+# purpose: an in-tree feature flag with no consumer is itself a YAGNI
+# violation (`docs` §3.2) and `lancedb` pulls Arrow + DataFusion + Lance
+# file format (~50MB compiled) which conflicts with the binary-size goal.
 
 [profile.release]
 opt-level = "z"      # Optimize for size
@@ -264,6 +302,8 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs"] }
 insta = { version = "1", features = ["json"] }
 mockito = "1"
+# Mock HTTP server for KB embedding/rerank/extract HTTP clients.
+wiremock = "0.6"
 # Wave 5 — drives the `setup` CLI from integration tests with a temp $HOME.
 assert_cmd = "2"
 predicates = "3"
@@ -271,3 +311,8 @@ predicates = "3"
 [[bench]]
 name = "agent_benchmarks"
 harness = false
+
+[[bench]]
+name = "kb_retrieval"
+harness = false
+required-features = ["kb"]

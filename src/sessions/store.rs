@@ -129,6 +129,21 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Delete a session and all of its messages. Returns `true` if a session
+    /// row was removed, `false` if no session matched `id`.
+    ///
+    /// Messages are deleted first, in a single transaction: the
+    /// `messages.session_id` foreign key has no `ON DELETE CASCADE`, so with
+    /// `PRAGMA foreign_keys=ON` (file-backed stores) removing the session row
+    /// first would violate the constraint.
+    pub fn delete_session(&mut self, id: &str) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
+        let removed = tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(removed > 0)
+    }
+
     /// One-shot backfill: for every session whose title is NULL or empty,
     /// derive a title from the earliest user message (first 50 chars of
     /// the first non-empty line, whitespace collapsed). Sessions with no
@@ -535,5 +550,27 @@ mod tests {
 
         let after = s.get_session(&sess.id).unwrap().unwrap();
         assert!(after.title.is_none());
+    }
+
+    #[test]
+    fn delete_session_removes_session_and_its_messages() {
+        let mut s = store();
+        let sess = s.new_session("gpt-4o", "tui").unwrap();
+        s.append_message(&Message::user(&sess.id, "hello")).unwrap();
+        s.append_message(&Message::assistant(&sess.id, "hi"))
+            .unwrap();
+
+        let removed = s.delete_session(&sess.id).unwrap();
+        assert!(removed);
+
+        assert!(s.get_session(&sess.id).unwrap().is_none());
+        assert!(s.get_messages(&sess.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_session_returns_false_for_nonexistent() {
+        let mut s = store();
+        let removed = s.delete_session("no-such-id").unwrap();
+        assert!(!removed);
     }
 }

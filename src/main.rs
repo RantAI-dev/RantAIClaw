@@ -66,6 +66,13 @@ mod health;
 mod heartbeat;
 mod identity;
 mod integrations;
+// Compile the KB modules as part of the binary crate too — required so
+// `crate::kb::axi::api::router()` returns a router parameterized with the
+// binary's `crate::gateway::AppState` (which is a distinct nominal type
+// from `rantaiclaw::gateway::AppState` even though the source is shared).
+// Gated on the `kb` feature so non-KB builds skip the whole subtree.
+#[cfg(feature = "kb")]
+mod kb;
 mod mcp;
 mod memory;
 mod migration;
@@ -84,9 +91,12 @@ mod runtime;
 mod security;
 mod service;
 mod services;
+mod webui;
 mod sessions {
     pub use rantaiclaw::sessions::*;
 }
+#[cfg(feature = "remote-install")]
+mod remote;
 mod skillforge;
 mod skills;
 mod tasks;
@@ -134,6 +144,40 @@ enum ServiceCommands {
     Status,
     /// Uninstall daemon service unit
     Uninstall,
+}
+
+#[derive(Subcommand, Debug)]
+enum UiCommands {
+    /// Install (or update) the web console into ~/.rantaiclaw/ui
+    Install {
+        /// Install directory (default: ~/.rantaiclaw/ui)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Git ref (tag or branch) to check out
+        #[arg(long)]
+        r#ref: Option<String>,
+        /// Overwrite a non-empty target directory
+        #[arg(long)]
+        force: bool,
+    },
+    /// Start the web console (Next.js dev server, foreground)
+    Start {
+        /// Install directory (default: ~/.rantaiclaw/ui)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Port to serve the console on (default: 3939)
+        #[arg(long, short)]
+        port: Option<u16>,
+        /// Gateway URL the console proxies to (default: http://127.0.0.1:3055)
+        #[arg(long)]
+        gateway: Option<String>,
+    },
+    /// Print the install directory
+    Path {
+        /// Install directory (default: ~/.rantaiclaw/ui)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -517,6 +561,22 @@ Examples:
         model: Option<String>,
     },
 
+    /// Install and run the optional web console (claw-ui)
+    #[command(long_about = "\
+Install and run the optional web console (claw-ui).
+
+The console is a separate Next.js app fetched on demand into ~/.rantaiclaw/ui —
+it is not bundled in the binary and needs a JavaScript runtime (bun or npm).
+
+Examples:
+  rantaiclaw ui install
+  rantaiclaw ui start
+  rantaiclaw ui start --gateway http://127.0.0.1:3055 --port 3939")]
+    Ui {
+        #[command(subcommand)]
+        ui_command: UiCommands,
+    },
+
     /// Manage agent memory (list, get, stats, clear)
     #[command(long_about = "\
 Manage agent memory entries.
@@ -724,6 +784,23 @@ Examples:
     Profile {
         #[command(subcommand)]
         cmd: profile::commands::ProfileCommand,
+    },
+
+    /// Knowledge Base axi-cli surface (search, ingest, list, drift, re-embed).
+    ///
+    /// Token-efficient TOON output by default; pass `--json` for full JSON.
+    /// All operations target the KB database resolved from `KB_DB_PATH` (env)
+    /// or the platform's data dir (`~/.local/share/rantaiclaw/kb.db` on Linux).
+    ///
+    /// Examples:
+    ///   rantaiclaw kb list
+    ///   rantaiclaw kb search "what is the coverage?" --top 3
+    ///   rantaiclaw kb ingest ./policy.md --category finance
+    ///   rantaiclaw kb drift
+    #[cfg(feature = "kb")]
+    Kb {
+        #[command(subcommand)]
+        cmd: rantaiclaw::kb::axi::cli::KbCommand,
     },
 }
 
@@ -1691,6 +1768,8 @@ async fn main() -> Result<()> {
             service::handle_command(&service_command, &config, init_system)
         }
 
+        Some(Commands::Ui { ui_command }) => webui::handle_command(&ui_command),
+
         Some(Commands::Doctor {
             format,
             brief,
@@ -1875,6 +1954,19 @@ async fn main() -> Result<()> {
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
                 );
                 Ok(())
+            }
+        },
+
+        // KB axi-cli — feature-gated. Exit codes flow through `process::exit`
+        // because the agent caller relies on `0` vs `1` (per axi.md §6). Any
+        // internal `KbError` is rendered as a TOON error block to stdout, NOT
+        // stderr — AXI principle 6 says agents grep one stream.
+        #[cfg(feature = "kb")]
+        Some(Commands::Kb { cmd }) => match cmd.run().await {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                println!("error[1]{{code,message}}:\n  internal,{e}");
+                std::process::exit(1);
             }
         },
 

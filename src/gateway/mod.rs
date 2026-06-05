@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api_v1;
+pub mod config_api;
 pub mod task_handlers;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
@@ -157,7 +158,7 @@ pub struct GatewayRateLimiter {
 }
 
 impl GatewayRateLimiter {
-    fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
+    pub fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
@@ -182,7 +183,7 @@ pub struct IdempotencyStore {
 }
 
 impl IdempotencyStore {
-    fn new(ttl: Duration, max_keys: usize) -> Self {
+    pub fn new(ttl: Duration, max_keys: usize) -> Self {
         Self {
             ttl,
             max_keys: max_keys.max(1),
@@ -678,12 +679,26 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
         .merge(api_v1::router())
-        .with_state(state)
+        .merge(config_api::router())
+        // The 64 KiB body cap and 120 s timeout apply to webhook + api_v1
+        // routes (small JSON bodies, fast handlers). They are deliberately NOT
+        // applied to the KB router below, which sets its own larger upload
+        // limit (KB_UPLOAD_MAX_BYTES) and longer ingest timeout. Applying these
+        // outer caps to the whole app would override the KB limits and reject
+        // large uploads (413) or cut off long embeds (408).
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ));
+
+    // KB HTTP surface (Phase 11) — only mounted when the `kb` feature is on.
+    // Keeps its own larger upload body limit + longer timeout (set on the
+    // router itself).
+    #[cfg(feature = "kb")]
+    let app = app.merge(crate::kb::axi::api::router());
+
+    let app = app.with_state(state);
 
     // Run the server
     axum::serve(

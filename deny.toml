@@ -22,6 +22,19 @@ ignore = [
     # lru v0.12.5 via ratatui 0.29 — IterMut unsound; ratatui's layout cache
     # does not expose the affected API to our render path. Unblocks on ratatui 0.30.
     "RUSTSEC-2026-0002",
+    # The four below enter via the russh SSH stack (russh 0.45 / russh-cryptovec
+    # / rsa), pulled only by the opt-in `remote-install` ssh/pty tools. They are
+    # client-side crypto advisories against hosts the operator explicitly targets
+    # (TOFU known-hosts), not a multi-tenant key-extraction surface. No fixed
+    # upstream release for the 2026 advisories yet; revisit on a russh bump.
+    # rsa Marvin timing sidechannel via russh-keys — no constant-time rsa release.
+    "RUSTSEC-2023-0071",
+    # russh-cryptovec: unchecked CryptoVec allocation/growth.
+    "RUSTSEC-2026-0153",
+    # russh: unbounded 32-bit allocation.
+    "RUSTSEC-2026-0154",
+    # russh: sender-binding gaps in channel messages.
+    "RUSTSEC-2026-0159",
 ]
 
 [licenses]
