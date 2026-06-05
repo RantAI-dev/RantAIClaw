@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api_v1;
+pub mod config_api;
 pub mod task_handlers;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
@@ -678,6 +679,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
         .merge(api_v1::router())
+        .merge(config_api::router())
         // The 64 KiB body cap and 120 s timeout apply to webhook + api_v1
         // routes (small JSON bodies, fast handlers). They are deliberately NOT
         // applied to the KB router below, which sets its own larger upload
