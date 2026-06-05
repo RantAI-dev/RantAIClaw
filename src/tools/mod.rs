@@ -45,6 +45,8 @@ pub mod schema;
 pub mod screenshot;
 pub mod shell;
 #[cfg(feature = "remote-install")]
+pub mod pty;
+#[cfg(feature = "remote-install")]
 pub mod ssh;
 pub mod skill_tool;
 pub mod skills_install;
@@ -94,6 +96,8 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+#[cfg(feature = "remote-install")]
+pub use pty::PtyTool;
 #[cfg(feature = "remote-install")]
 pub use ssh::SshTool;
 pub use skill_tool::skill_tools_from_skills;
@@ -318,6 +322,8 @@ pub fn all_tools_with_runtime(
     // Remote-install transport + tmux driver (feature-gated).
     #[cfg(feature = "remote-install")]
     tool_arcs.push(Arc::new(SshTool::new(security.clone())));
+    #[cfg(feature = "remote-install")]
+    tool_arcs.push(Arc::new(PtyTool::new(security.clone())));
 
     // Hermes-parity skill management surface — read-side first
     // (skills_list, skill_view, skills_search) is unconditional. The
