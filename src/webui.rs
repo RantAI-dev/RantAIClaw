@@ -8,7 +8,6 @@
 //! required unless the user opts into the console.
 
 use std::net::{TcpStream, ToSocketAddrs};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -227,13 +226,18 @@ fn spawn_detached(cmd: &mut Command, log: &Path) -> Result<u32> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    // SAFETY: setsid() in the child detaches it from our session/terminal so it keeps running
-    // after `ui start` returns and survives the terminal closing.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+    // On Unix, setsid() in the child detaches it from our session/terminal so it keeps running
+    // after `ui start` returns and survives the terminal closing. No-op on other platforms.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() only starts a new session in the post-fork child; nothing else runs there.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
     }
     let child = cmd.spawn().with_context(|| format!("spawn {cmd:?}"))?;
     Ok(child.id())
@@ -522,6 +526,25 @@ fn start(
     Ok(())
 }
 
+/// Terminate a background process (and its children) started by `ui start`.
+#[cfg(unix)]
+fn kill_process_group(pid: i32) -> bool {
+    // Negative pid → the whole process group (the dev server spawns child node processes).
+    unsafe { libc::kill(-pid, libc::SIGTERM) == 0 }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(pid: i32) -> bool {
+    Command::new("taskkill")
+        .arg("/T")
+        .arg("/F")
+        .arg("/PID")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Stop the background gateway + console started by `ui start`.
 fn stop(dir: Option<PathBuf>) -> Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
@@ -537,9 +560,7 @@ fn stop(dir: Option<PathBuf>) -> Result<()> {
     for line in state.lines() {
         if let Some((name, pid)) = line.split_once('=') {
             if let Ok(pid) = pid.trim().parse::<i32>() {
-                // Negative pid → signal the whole process group (the dev server spawns children).
-                let rc = unsafe { libc::kill(-pid, libc::SIGTERM) };
-                if rc == 0 {
+                if kill_process_group(pid) {
                     println!("✓ stopped {name} (pid {pid})");
                     stopped += 1;
                 }
