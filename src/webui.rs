@@ -13,7 +13,6 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 const REPO_URL: &str = "https://github.com/RantAI-dev/claw-ui.git";
-const DEFAULT_GATEWAY: &str = "http://127.0.0.1:3055";
 const DEFAULT_PORT: u16 = 3939;
 
 /// Default install location: `~/.rantaiclaw/ui` (shared across profiles).
@@ -51,14 +50,17 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-pub fn handle_command(command: &crate::UiCommands) -> Result<()> {
+pub fn handle_command(command: &crate::UiCommands, config: &crate::config::Config) -> Result<()> {
     match command {
         crate::UiCommands::Install { dir, r#ref, force } => {
             install(dir.clone(), r#ref.clone(), *force)
         }
-        crate::UiCommands::Start { dir, port, gateway } => {
-            start(dir.clone(), *port, gateway.clone())
-        }
+        crate::UiCommands::Start {
+            dir,
+            port,
+            gateway,
+            token,
+        } => start(dir.clone(), *port, gateway.clone(), token.clone(), config),
         crate::UiCommands::Path { dir } => {
             println!("{}", dir.clone().unwrap_or_else(default_dir).display());
             Ok(())
@@ -121,7 +123,13 @@ fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result
 }
 
 /// Launch the console's Next.js dev server in the foreground.
-fn start(dir: Option<PathBuf>, port: Option<u16>, gateway: Option<String>) -> Result<()> {
+fn start(
+    dir: Option<PathBuf>,
+    port: Option<u16>,
+    gateway: Option<String>,
+    token: Option<String>,
+    config: &crate::config::Config,
+) -> Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
     if !dir.join("package.json").exists() {
         bail!(
@@ -132,14 +140,50 @@ fn start(dir: Option<PathBuf>, port: Option<u16>, gateway: Option<String>) -> Re
     let runtime =
         js_runtime().context("a JavaScript runtime is required — install bun or Node.js/npm")?;
     let port = port.unwrap_or(DEFAULT_PORT);
-    let gateway = gateway.unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
 
-    // Point the console at the gateway via `.env.local` (mirrors scripts/dev.sh).
-    let env_local = format!("RANTAICLAW_GATEWAY_URL={gateway}\nRANTAICLAW_TOKEN=\n");
-    std::fs::write(dir.join(".env.local"), env_local)
+    // Resolve gateway + token without clobbering what's already there: an explicit flag wins,
+    // then the environment, then whatever is already in `.env.local` (so a paired token survives
+    // repeated `ui start`s — the previous behaviour blanked the token every run), then the config.
+    let env_path = dir.join(".env.local");
+    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let existing_val = |key: &str| -> Option<String> {
+        existing.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(key)?
+                .strip_prefix('=')
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+    };
+    let nonempty = |s: String| if s.is_empty() { None } else { Some(s) };
+
+    let gateway = gateway
+        .and_then(nonempty)
+        .or_else(|| {
+            std::env::var("RANTAICLAW_GATEWAY_URL")
+                .ok()
+                .and_then(nonempty)
+        })
+        .or_else(|| existing_val("RANTAICLAW_GATEWAY_URL"))
+        .unwrap_or_else(|| format!("http://{}:{}", config.gateway.host, config.gateway.port));
+
+    let token = token
+        .and_then(nonempty)
+        .or_else(|| std::env::var("RANTAICLAW_TOKEN").ok().and_then(nonempty))
+        .or_else(|| existing_val("RANTAICLAW_TOKEN"))
+        .unwrap_or_default();
+
+    // Point the console at the gateway via `.env.local`.
+    let env_local = format!("RANTAICLAW_GATEWAY_URL={gateway}\nRANTAICLAW_TOKEN={token}\n");
+    std::fs::write(&env_path, env_local)
         .with_context(|| format!("failed to write {}/.env.local", dir.display()))?;
 
     println!("▶ Web console → http://127.0.0.1:{port}   (gateway: {gateway})");
+    if token.is_empty() && config.gateway.require_pairing {
+        println!(
+            "  ⚠ no gateway token set, and the gateway requires pairing. Start the gateway, POST /pair\n     with the printed code, then: rantaiclaw ui start --token <token>  (it's remembered after that)."
+        );
+    }
     println!("  Press Ctrl-C to stop.\n");
 
     // Invoke Next directly so the port is honoured regardless of the package
