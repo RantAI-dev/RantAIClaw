@@ -168,9 +168,18 @@ enum UiCommands {
         /// Port to serve the console on (default: 3939)
         #[arg(long, short)]
         port: Option<u16>,
-        /// Gateway URL the console proxies to (default: http://127.0.0.1:3055)
+        /// Gateway URL the console proxies to (default: from config [gateway], else the existing .env.local)
         #[arg(long)]
         gateway: Option<String>,
+        /// Bearer token for the gateway. Remembered in .env.local; omit to keep the existing one or $RANTAICLAW_TOKEN
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Stop the background gateway + console started by `ui start`
+    Stop {
+        /// Install directory (default: ~/.rantaiclaw/ui)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
     },
     /// Print the install directory
     Path {
@@ -1768,7 +1777,7 @@ async fn main() -> Result<()> {
             service::handle_command(&service_command, &config, init_system)
         }
 
-        Some(Commands::Ui { ui_command }) => webui::handle_command(&ui_command),
+        Some(Commands::Ui { ui_command }) => webui::handle_command(&ui_command, &config),
 
         Some(Commands::Doctor {
             format,

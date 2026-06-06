@@ -970,78 +970,136 @@ impl OpenAiCompatibleProvider {
     }
 
     fn convert_messages_for_native(messages: &[ChatMessage]) -> Vec<NativeMessage> {
-        messages
-            .iter()
-            .map(|message| {
-                if message.role == "assistant" {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
-                    {
-                        if let Some(tool_calls_value) = value.get("tool_calls") {
-                            if let Ok(parsed_calls) =
-                                serde_json::from_value::<Vec<ProviderToolCall>>(
-                                    tool_calls_value.clone(),
-                                )
-                            {
-                                let tool_calls = parsed_calls
-                                    .into_iter()
-                                    .map(|tc| ToolCall {
-                                        id: Some(tc.id),
-                                        kind: Some("function".to_string()),
-                                        function: Some(Function {
-                                            name: Some(tc.name),
-                                            arguments: Some(tc.arguments),
-                                        }),
-                                        name: None,
-                                        arguments: None,
-                                        parameters: None,
-                                    })
-                                    .collect::<Vec<_>>();
+        let converted: Vec<NativeMessage> =
+            messages
+                .iter()
+                .map(|message| {
+                    if message.role == "assistant" {
+                        if let Ok(value) =
+                            serde_json::from_str::<serde_json::Value>(&message.content)
+                        {
+                            if let Some(tool_calls_value) = value.get("tool_calls") {
+                                if let Ok(parsed_calls) =
+                                    serde_json::from_value::<Vec<ProviderToolCall>>(
+                                        tool_calls_value.clone(),
+                                    )
+                                {
+                                    let tool_calls = parsed_calls
+                                        .into_iter()
+                                        .map(|tc| ToolCall {
+                                            id: Some(tc.id),
+                                            kind: Some("function".to_string()),
+                                            function: Some(Function {
+                                                name: Some(tc.name),
+                                                arguments: Some(tc.arguments),
+                                            }),
+                                            name: None,
+                                            arguments: None,
+                                            parameters: None,
+                                        })
+                                        .collect::<Vec<_>>();
 
-                                let content = value
-                                    .get("content")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
+                                    let content = value
+                                        .get("content")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(ToString::to_string);
 
-                                return NativeMessage {
-                                    role: "assistant".to_string(),
-                                    content,
-                                    tool_call_id: None,
-                                    tool_calls: Some(tool_calls),
-                                };
+                                    return NativeMessage {
+                                        role: "assistant".to_string(),
+                                        content,
+                                        tool_call_id: None,
+                                        tool_calls: Some(tool_calls),
+                                    };
+                                }
                             }
                         }
                     }
-                }
 
-                if message.role == "tool" {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content) {
-                        let tool_call_id = value
-                            .get("tool_call_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
-                        let content = value
-                            .get("content")
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string)
-                            .or_else(|| Some(message.content.clone()));
+                    if message.role == "tool" {
+                        if let Ok(value) =
+                            serde_json::from_str::<serde_json::Value>(&message.content)
+                        {
+                            let tool_call_id = value
+                                .get("tool_call_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            let content = value
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string)
+                                .or_else(|| Some(message.content.clone()));
 
-                        return NativeMessage {
-                            role: "tool".to_string(),
-                            content,
-                            tool_call_id,
-                            tool_calls: None,
-                        };
+                            return NativeMessage {
+                                role: "tool".to_string(),
+                                content,
+                                tool_call_id,
+                                tool_calls: None,
+                            };
+                        }
                     }
-                }
 
-                NativeMessage {
-                    role: message.role.clone(),
-                    content: Some(message.content.clone()),
-                    tool_call_id: None,
-                    tool_calls: None,
+                    NativeMessage {
+                        role: message.role.clone(),
+                        content: Some(message.content.clone()),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    }
+                })
+                .collect();
+        // Strict OpenAI-compatible providers (e.g. MiniMax) 400 on unmatched tool calls/results
+        // ("tool result's tool id ... not found (2013)"). Keep only well-paired calls/results.
+        Self::sanitize_tool_pairs(converted)
+    }
+
+    /// Keep only well-paired tool calls/results: drop `tool` results whose id was never emitted by
+    /// an assistant `tool_calls`, and drop assistant tool-calls that were never answered. Strict
+    /// providers (MiniMax) reject either orphan; well-formed histories pass through unchanged.
+    fn sanitize_tool_pairs(messages: Vec<NativeMessage>) -> Vec<NativeMessage> {
+        use std::collections::HashSet;
+        let emitted: HashSet<String> = messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flatten()
+            .filter_map(|tc| tc.id.clone())
+            .collect();
+        let answered: HashSet<String> = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+
+        let mut out = Vec::with_capacity(messages.len());
+        for mut m in messages {
+            if m.role == "tool" {
+                // keep only results whose call id was actually emitted
+                if m.tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| emitted.contains(id))
+                {
+                    out.push(m);
                 }
-            })
-            .collect()
+                continue;
+            }
+            if let Some(calls) = m.tool_calls.take() {
+                let kept: Vec<ToolCall> = calls
+                    .into_iter()
+                    .filter(|tc| tc.id.as_ref().is_some_and(|id| answered.contains(id)))
+                    .collect();
+                if kept.is_empty() {
+                    // no answered calls left — keep only if the message still carries text content
+                    if m.content.as_deref().is_some_and(|c| !c.is_empty()) {
+                        m.tool_calls = None;
+                        out.push(m);
+                    }
+                } else {
+                    m.tool_calls = Some(kept);
+                    out.push(m);
+                }
+                continue;
+            }
+            out.push(m);
+        }
+        out
     }
 
     fn with_prompt_guided_tool_instructions(
@@ -2345,15 +2403,85 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_maps_tool_result_payload() {
-        let input = vec![ChatMessage::tool(
-            r#"{"tool_call_id":"call_abc","content":"done"}"#,
-        )];
+        let input = vec![
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"call_abc","name":"foo","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"call_abc","content":"done"}"#),
+        ];
 
         let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "tool");
-        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
-        assert_eq!(converted[0].content.as_deref(), Some("done"));
+        let tool = converted
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("paired tool result is kept");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(tool.content.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn sanitize_tool_pairs_drops_orphans_keeps_paired() {
+        let call = |id: &str| ToolCall {
+            id: Some(id.to_string()),
+            kind: Some("function".to_string()),
+            function: Some(Function {
+                name: Some("foo".to_string()),
+                arguments: Some("{}".to_string()),
+            }),
+            name: None,
+            arguments: None,
+            parameters: None,
+        };
+        let tool_result = |id: &str| NativeMessage {
+            role: "tool".to_string(),
+            content: Some("ok".to_string()),
+            tool_call_id: Some(id.to_string()),
+            tool_calls: None,
+        };
+        let msgs = vec![
+            NativeMessage {
+                role: "assistant".to_string(),
+                content: Some(String::new()),
+                tool_call_id: None,
+                tool_calls: Some(vec![call("call_keep")]),
+            },
+            tool_result("call_keep"),   // paired → kept
+            tool_result("call_orphan"), // no emitting call → dropped
+        ];
+
+        let out = OpenAiCompatibleProvider::sanitize_tool_pairs(msgs);
+        let tool_ids: Vec<_> = out
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        assert_eq!(tool_ids, vec!["call_keep".to_string()]);
+        assert!(out
+            .iter()
+            .any(|m| m.role == "assistant" && m.tool_calls.is_some()));
+    }
+
+    #[test]
+    fn sanitize_tool_pairs_drops_unanswered_assistant_call_stub() {
+        let msgs = vec![NativeMessage {
+            role: "assistant".to_string(),
+            content: Some(String::new()),
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_unanswered".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("foo".to_string()),
+                    arguments: Some("{}".to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+            }]),
+        }];
+        // no matching tool result, and no text content → the empty tool-call stub is dropped
+        let out = OpenAiCompatibleProvider::sanitize_tool_pairs(msgs);
+        assert!(out.is_empty());
     }
 
     #[test]
