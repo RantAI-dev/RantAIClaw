@@ -175,6 +175,12 @@ enum UiCommands {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Stop the background gateway + console started by `ui start`
+    Stop {
+        /// Install directory (default: ~/.rantaiclaw/ui)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
     /// Print the install directory
     Path {
         /// Install directory (default: ~/.rantaiclaw/ui)
