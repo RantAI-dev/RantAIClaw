@@ -515,7 +515,12 @@ pub(crate) fn filter_think_tags(input: &str, in_think: &mut bool, partial: &mut 
                 // could be the start of `<think>`.
                 let tail = &combined[i..];
                 let max_partial = "<think>".len() - 1;
-                let candidate_start = tail.len().saturating_sub(max_partial);
+                // `len() - N` is a BYTE offset and can land inside a multi-byte char (e.g. an
+                // em-dash is 3 bytes) — slicing there panics. Walk back to a char boundary.
+                let mut candidate_start = tail.len().saturating_sub(max_partial);
+                while candidate_start > 0 && !tail.is_char_boundary(candidate_start) {
+                    candidate_start -= 1;
+                }
                 let suffix = &tail[candidate_start..];
                 if !suffix.is_empty() && "<think>".starts_with(suffix) {
                     out.push_str(&tail[..candidate_start]);
@@ -2524,6 +2529,17 @@ mod tests {
     fn strip_think_tags_drops_unclosed_block_suffix() {
         let input = "visible<think>hidden";
         assert_eq!(strip_think_tags(input), "visible");
+    }
+
+    #[test]
+    fn filter_think_tags_does_not_panic_on_multibyte_tail() {
+        // Regression: the partial-`<think>` window used `len()-N` (a byte offset) which could
+        // land inside a multi-byte char (em-dash = 3 bytes) → slice panic / process abort.
+        let mut in_think = false;
+        let mut partial = String::new();
+        let out = filter_think_tags(" — I'm", &mut in_think, &mut partial);
+        assert_eq!(format!("{out}{partial}"), " — I'm");
+        assert!(!in_think);
     }
 
     #[test]
