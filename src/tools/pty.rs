@@ -332,14 +332,15 @@ impl Tool for PtyTool {
         let Some(action) = str_field(&args, "action") else {
             return Ok(fail("missing `action`"));
         };
-        // Only mutating actions are gated/rate-limited; screen/wait/stop poll freely.
-        if matches!(action, "start" | "send") {
-            if !self.security.can_act() {
-                return Ok(fail("Action blocked: autonomy is read-only"));
-            }
-            if !self.security.record_action() {
-                return Ok(fail("Action blocked: rate limit exceeded"));
-            }
+        // `start` launches a process and is the rate-limited autonomous action. `send` writes
+        // keystrokes into an already-approved session — honor read-only autonomy, but do NOT
+        // count every keypress against the hourly action budget (driving a TUI is hundreds of
+        // keystrokes; otherwise even a modest limit trips mid-drive). screen/wait/stop poll freely.
+        if matches!(action, "start" | "send") && !self.security.can_act() {
+            return Ok(fail("Action blocked: autonomy is read-only"));
+        }
+        if action == "start" && !self.security.record_action() {
+            return Ok(fail("Action blocked: rate limit exceeded"));
         }
         let sess = str_field(&args, "session").unwrap_or("nqr").to_string();
         let result = match action {
