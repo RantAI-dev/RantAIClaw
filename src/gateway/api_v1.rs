@@ -1060,6 +1060,9 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(
+                crate::gateway::channel_approval::ChannelApprovalStore::default(),
+            ),
         }
     }
 

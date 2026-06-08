@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api_v1;
+pub mod channel_approval;
 pub mod config_api;
 pub mod task_handlers;
 
@@ -337,6 +338,9 @@ pub struct AppState {
     pub observer: Arc<dyn crate::observability::Observer>,
     /// Webhook trigger routes loaded from agent-runner config
     pub webhook_routes: Arc<Vec<WebhookRoute>>,
+    /// Turn-based in-chat tool-approval state for chat channels
+    /// (WhatsApp/Linq/Nextcloud) when `autonomous_tools` is off.
+    pub channel_approvals: Arc<channel_approval::ChannelApprovalStore>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -646,6 +650,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk_webhook_secret,
         observer,
         webhook_routes,
+        channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
     };
 
     // Build router with middleware
@@ -845,6 +850,9 @@ struct WebhookToolCall {
 struct GatewayChatResult {
     response: String,
     tool_calls: Vec<WebhookToolCall>,
+    /// Tools the model wanted but that were denied pending approval this
+    /// turn (empty when `autonomous_tools` is on or nothing needed approval).
+    denied_tools: Vec<String>,
 }
 
 /// Extract structured tool call info from the conversation history that
@@ -936,6 +944,9 @@ async fn run_gateway_chat_with_multimodal(
     state: &AppState,
     provider_label: &str,
     message: &str,
+    // Tool names to additionally auto-approve for this turn (a sender's
+    // "always" allowlist plus any just-granted one-shot approvals).
+    extra_auto_approve: &[String],
 ) -> anyhow::Result<GatewayChatResult> {
     let user_messages = vec![ChatMessage::user(message)];
     let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
@@ -989,9 +1000,26 @@ async fn run_gateway_chat_with_multimodal(
     // In gateway mode, tools that need approval are auto-denied (no interactive
     // prompt available). The agent sees "Denied by user." and can explain to
     // the user that the action requires a higher autonomy level.
+    //
+    // When `[channels_config] autonomous_tools` is enabled, skip the per-tool
+    // approval gate entirely so channel messages (Telegram/WhatsApp/…) can run
+    // tools unattended — the same behaviour as `rantaiclaw channels` polling.
+    // The `shell` tool still enforces its own command allowlist via
+    // SecurityPolicy, so dangerous commands stay gated.
     let approval_manager = {
         let config_guard = state.config.lock();
-        ApprovalManager::from_config(&config_guard.autonomy)
+        if config_guard.channels_config.autonomous_tools {
+            None
+        } else {
+            // Seed the per-tool allowlist with tools the sender has already
+            // approved (always-list) or just granted, so they run without
+            // re-prompting on the replay turn.
+            let mut autonomy = config_guard.autonomy.clone();
+            autonomy
+                .auto_approve
+                .extend(extra_auto_approve.iter().cloned());
+            Some(ApprovalManager::from_config(&autonomy))
+        }
     };
 
     // Run the full agentic loop: LLM → tool calls → execute → feed results → repeat.
@@ -1004,7 +1032,7 @@ async fn run_gateway_chat_with_multimodal(
         &state.model,
         state.temperature,
         true, // silent — no terminal output in gateway mode
-        Some(&approval_manager),
+        approval_manager.as_ref(),
         "webhook",
         &multimodal_config,
         GATEWAY_MAX_TOOL_ITERATIONS,
@@ -1017,10 +1045,96 @@ async fn run_gateway_chat_with_multimodal(
     // Extract tool call metadata from the conversation history for the UI.
     let tool_calls = extract_tool_calls_from_history(&history);
 
+    // Tools the model wanted but that were denied for lack of approval —
+    // the auto-deny path records each as an `ApprovalResponse::No` audit
+    // entry. The caller uses this to drive the in-chat Y/A/N prompt.
+    let denied_tools = approval_manager
+        .as_ref()
+        .map(|mgr| {
+            let mut seen = std::collections::HashSet::new();
+            mgr.audit_log()
+                .into_iter()
+                .filter(|e| e.decision == crate::approval::ApprovalResponse::No)
+                .map(|e| e.tool_name)
+                .filter(|name| seen.insert(name.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     Ok(GatewayChatResult {
         response,
         tool_calls,
+        denied_tools,
     })
+}
+
+/// Drive one chat-channel turn (WhatsApp/Linq/Nextcloud) including the
+/// turn-based in-chat tool-approval flow. Returns the text to send back.
+///
+/// Flow:
+/// - If the sender has a pending approval and this message reads as
+///   Y/A/N, resolve it: on deny, decline; on allow, replay the original
+///   request with the pending tool(s) allow-listed.
+/// - Otherwise run the message normally. If the model wanted a tool that
+///   needed approval, store it pending and ask Y/A/N instead of replying.
+///
+/// With `[channels_config] autonomous_tools = true` nothing is ever
+/// denied, so this degrades to a plain agent turn.
+async fn process_channel_chat(
+    state: &AppState,
+    provider_label: &str,
+    channel_name: &str,
+    sender: &str,
+    message: &str,
+) -> anyhow::Result<String> {
+    let key = format!("{channel_name}:{sender}");
+
+    // A pending prompt is awaiting this sender's decision.
+    if let Some((original, tools)) = state.channel_approvals.take_pending(&key) {
+        match channel_approval::parse_approval_reply(message) {
+            Some(channel_approval::ApprovalReply::Deny) => {
+                return Ok("Okay — I won't do that. Anything else?".to_string());
+            }
+            Some(reply) => {
+                if reply == channel_approval::ApprovalReply::Always {
+                    state.channel_approvals.remember_always(&key, &tools);
+                }
+                // Replay the original request with the pending tool(s) (and
+                // any always-allowed ones) approved so they now execute.
+                let mut allow = state.channel_approvals.allowlisted(&key);
+                allow.extend(tools.iter().cloned());
+                let result =
+                    run_gateway_chat_with_multimodal(state, provider_label, &original, &allow)
+                        .await?;
+                return Ok(finalize_channel_turn(state, &key, &original, result));
+            }
+            // Not a Y/A/N reply — the sender moved on. The pending request
+            // has already been taken (dropped); fall through to treat this
+            // as a fresh message.
+            None => {}
+        }
+    }
+
+    let allow = state.channel_approvals.allowlisted(&key);
+    let result = run_gateway_chat_with_multimodal(state, provider_label, message, &allow).await?;
+    Ok(finalize_channel_turn(state, &key, message, result))
+}
+
+/// If a turn produced denied tools, stash them pending and return the
+/// Y/A/N prompt; otherwise return the agent's reply.
+fn finalize_channel_turn(
+    state: &AppState,
+    key: &str,
+    message: &str,
+    result: GatewayChatResult,
+) -> String {
+    if result.denied_tools.is_empty() {
+        return result.response;
+    }
+    state
+        .channel_approvals
+        .set_pending(key, message.to_string(), result.denied_tools.clone());
+    channel_approval::format_prompt(&result.denied_tools)
 }
 
 /// Webhook request body
@@ -1144,7 +1258,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message).await {
+    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &[]).await {
         Ok(result) => {
             let duration = started_at.elapsed();
             state
@@ -1357,13 +1471,18 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
-            Ok(result) => {
+        match process_channel_chat(
+            &state,
+            &provider_label,
+            "whatsapp",
+            &msg.sender,
+            &msg.content,
+        )
+        .await
+        {
+            Ok(reply) => {
                 // Send reply via WhatsApp
-                if let Err(e) = wa
-                    .send(&SendMessage::new(result.response, &msg.reply_target))
-                    .await
-                {
+                if let Err(e) = wa.send(&SendMessage::new(reply, &msg.reply_target)).await {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
@@ -1471,13 +1590,11 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
-            Ok(result) => {
+        match process_channel_chat(&state, &provider_label, "linq", &msg.sender, &msg.content).await
+        {
+            Ok(reply) => {
                 // Send reply via Linq
-                if let Err(e) = linq
-                    .send(&SendMessage::new(result.response, &msg.reply_target))
-                    .await
-                {
+                if let Err(e) = linq.send(&SendMessage::new(reply, &msg.reply_target)).await {
                     tracing::error!("Failed to send Linq reply: {e}");
                 }
             }
@@ -1582,10 +1699,18 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_multimodal(&state, &provider_label, &msg.content).await {
-            Ok(result) => {
+        match process_channel_chat(
+            &state,
+            &provider_label,
+            "nextcloud_talk",
+            &msg.sender,
+            &msg.content,
+        )
+        .await
+        {
+            Ok(reply) => {
                 if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(result.response, &msg.reply_target))
+                    .send(&SendMessage::new(reply, &msg.reply_target))
                     .await
                 {
                     tracing::error!("Failed to send Nextcloud Talk reply: {e}");
@@ -1695,7 +1820,7 @@ async fn handle_trigger_webhook(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, &message).await {
+    match run_gateway_chat_with_multimodal(&state, &provider_label, &message, &[]).await {
         Ok(result) => {
             let mut body = serde_json::json!({
                 "response": result.response,
@@ -1796,6 +1921,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -1843,6 +1969,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer,
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2207,6 +2334,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2269,6 +2397,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2343,6 +2472,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2389,6 +2519,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2440,6 +2571,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2496,6 +2628,7 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2548,6 +2681,7 @@ mod tests {
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 

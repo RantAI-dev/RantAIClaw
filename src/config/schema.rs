@@ -2535,6 +2535,17 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// Allow the agent to run tools **unattended** when answering messages that
+    /// arrive over the gateway's channel webhooks (Telegram, WhatsApp, Linq,
+    /// Nextcloud Talk). There is no interactive approval prompt on a channel, so
+    /// by default (`false`) any tool that needs approval at the current autonomy
+    /// level is auto-denied. Set `true` to let channel messages execute tools
+    /// without prompting — equivalent to how `rantaiclaw channels` (polling)
+    /// already behaves. The `shell` tool still enforces its own command
+    /// allowlist (`[autonomy]`/SecurityPolicy), so dangerous commands remain
+    /// gated even when this is on.
+    #[serde(default)]
+    pub autonomous_tools: bool,
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
@@ -2562,6 +2573,7 @@ impl Default for ChannelsConfig {
             dingtalk: None,
             qq: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
+            autonomous_tools: false,
         }
     }
 }
@@ -4325,6 +4337,7 @@ default_temperature = 0.7
                 dingtalk: None,
                 qq: None,
                 message_timeout_secs: 300,
+                autonomous_tools: false,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -4877,6 +4890,7 @@ allowed_users = ["@ops:matrix.org"]
             dingtalk: None,
             qq: None,
             message_timeout_secs: 300,
+            autonomous_tools: false,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -5087,6 +5101,7 @@ channel_id = "C123"
             dingtalk: None,
             qq: None,
             message_timeout_secs: 300,
+            autonomous_tools: false,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -5106,6 +5121,19 @@ channel_id = "C123"
     async fn channels_config_default_has_no_nextcloud_talk() {
         let c = ChannelsConfig::default();
         assert!(c.nextcloud_talk.is_none());
+    }
+
+    #[test]
+    async fn channels_config_autonomous_tools_defaults_off_and_parses() {
+        // Default posture must stay safe: channel webhooks auto-deny tools.
+        assert!(!ChannelsConfig::default().autonomous_tools);
+        // Old configs without the key still deserialize (serde default).
+        let legacy: ChannelsConfig = toml::from_str("cli = true\n").unwrap();
+        assert!(!legacy.autonomous_tools);
+        // Opt-in parses through.
+        let opted: ChannelsConfig =
+            toml::from_str("cli = true\nautonomous_tools = true\n").unwrap();
+        assert!(opted.autonomous_tools);
     }
 
     // ══════════════════════════════════════════════════════════
