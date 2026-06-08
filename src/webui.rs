@@ -217,9 +217,13 @@ fn split_host_port(url: &str) -> (String, u16) {
 
 /// Spawn a detached background process (own session, stdio → `log`), returning its PID.
 fn spawn_detached(cmd: &mut Command, log: &Path) -> Result<u32> {
+    // Truncate (don't append): a fresh log per launch means `read_pairing_code` can't pick up a
+    // STALE pairing code from a previous/aborted run — which made auto-pair POST a dead code and
+    // fail with 404, leaving the console without a token ("gateway offline").
     let out = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(log)
         .with_context(|| format!("open {}", log.display()))?;
     let err = out.try_clone()?;
@@ -245,19 +249,21 @@ fn spawn_detached(cmd: &mut Command, log: &Path) -> Result<u32> {
 
 /// Read the gateway's one-time pairing code from its log (`X-Pairing-Code: NNNNNN`).
 fn read_pairing_code(log: &Path) -> Option<String> {
-    for _ in 0..10 {
+    for _ in 0..15 {
         if let Ok(txt) = std::fs::read_to_string(log) {
-            for line in txt.lines() {
-                if let Some(idx) = line.find("X-Pairing-Code:") {
-                    let code: String = line[idx + "X-Pairing-Code:".len()..]
-                        .trim()
-                        .chars()
-                        .take_while(char::is_ascii_digit)
-                        .collect();
-                    if !code.is_empty() {
-                        return Some(code);
-                    }
-                }
+            // Take the LAST code in the log (most recent gateway start), not the first — extra
+            // safety on top of the per-launch truncation in `spawn_detached`.
+            let latest = txt.lines().rev().find_map(|line| {
+                let idx = line.find("X-Pairing-Code:")?;
+                let code: String = line[idx + "X-Pairing-Code:".len()..]
+                    .trim()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                (!code.is_empty()).then_some(code)
+            });
+            if latest.is_some() {
+                return latest;
             }
         }
         std::thread::sleep(Duration::from_millis(400));
