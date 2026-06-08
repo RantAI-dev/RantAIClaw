@@ -333,6 +333,10 @@ async fn agent_chat_sync(
     }))
 }
 
+// Awaits live inside the spawned task + the response stream, not the outer
+// handler body, so clippy sees no top-level await — expected for an axum
+// streaming handler.
+#[allow(clippy::unused_async)]
 async fn agent_chat_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
