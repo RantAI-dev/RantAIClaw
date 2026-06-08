@@ -288,6 +288,38 @@ impl Agent {
         self.history.clear();
     }
 
+    /// Seed the agent with prior conversation turns so the model remembers
+    /// an earlier exchange — used when resuming a session (`/resume`) or
+    /// continuing a web/channel conversation. Pass `(role, content)` turns
+    /// in order (role = "user"/"assistant"/"system", default user); the
+    /// system prompt is rebuilt and placed first when the prior turns don't
+    /// already carry one, so the next `turn()` doesn't append a system
+    /// prompt out of order. Takes primitives (not `ConversationMessage`) so
+    /// callers across the lib/bin boundary stay type-compatible.
+    pub fn restore_history(&mut self, prior: &[(String, String)]) -> Result<()> {
+        self.history.clear();
+        if prior.is_empty() {
+            return Ok(());
+        }
+        let has_system = prior.iter().any(|(role, _)| role == "system");
+        if !has_system {
+            let system_prompt = self.build_system_prompt()?;
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::system(
+                    system_prompt,
+                )));
+        }
+        for (role, content) in prior {
+            let chat = match role.as_str() {
+                "system" => ChatMessage::system(content),
+                "assistant" => ChatMessage::assistant(content),
+                _ => ChatMessage::user(content),
+            };
+            self.history.push(ConversationMessage::Chat(chat));
+        }
+        Ok(())
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));

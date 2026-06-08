@@ -59,6 +59,19 @@ impl Message {
     }
 }
 
+/// Stored session messages as `(role, content)` turns for seeding agent
+/// history on resume / continuation. Empty content is skipped; tool-call
+/// metadata is not replayed (the stored assistant text already reflects
+/// the outcome). Primitive tuples keep this usable across the lib/bin
+/// boundary (no `ConversationMessage` type identity mismatch).
+pub fn messages_to_turns(messages: &[Message]) -> Vec<(String, String)> {
+    messages
+        .iter()
+        .filter(|m| !m.content.trim().is_empty())
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect()
+}
+
 /// Search result from FTS5
 #[derive(Debug, Clone)]
 pub struct SearchResult {

@@ -5283,7 +5283,23 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         }
     }
 
-    let agent = Agent::from_config(&app_config).await?;
+    let mut agent = Agent::from_config(&app_config).await?;
+
+    // `/resume`: re-feed the resumed session's prior turns so the model
+    // actually remembers the earlier conversation (not just the scrollback).
+    if let Some(resume_id) = tui_config.resume_session.as_deref() {
+        match crate::sessions::cli::open_store().and_then(|s| s.get_messages(resume_id)) {
+            Ok(msgs) => {
+                let prior = crate::sessions::messages_to_turns(&msgs);
+                if !prior.is_empty() {
+                    if let Err(e) = agent.restore_history(&prior) {
+                        tracing::warn!("failed to restore resumed history: {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("could not load resumed session {resume_id}: {e}"),
+        }
+    }
 
     let profile =
         crate::profile::ProfileManager::active().unwrap_or_else(|_| crate::profile::Profile {
