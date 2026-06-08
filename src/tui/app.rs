@@ -617,7 +617,21 @@ impl TuiApp {
             // in the buffer (multi-line prompt) instead of triggering
             // submit, which is the whole point of bracketed paste.
             Event::Paste(text) => {
-                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() {
+                // Route a bracketed-paste payload into the active setup-overlay
+                // prompt (e.g. pasting an API key during onboarding / the
+                // first-run wizard, which delegates its prompts to the same
+                // overlay). Without this, pasting into a setup prompt was
+                // silently dropped on terminals that emit `Event::Paste`,
+                // making API keys impossible to paste. Otherwise the paste
+                // lands in the chat composer as before.
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    if o.active_prompt().is_some() {
+                        // Single-line secret/URL fields: strip line breaks so a
+                        // trailing newline from the copy doesn't corrupt the value.
+                        let cleaned = text.replace(['\n', '\r'], "");
+                        o.push_str(&cleaned);
+                    }
+                } else if self.first_run_wizard.is_none() {
                     self.context.paste_at_cursor(&text);
                     self.context.exit_history_navigation();
                     self.refresh_autocomplete();
