@@ -79,11 +79,20 @@ struct PendingApproval {
     created_at: Instant,
 }
 
-/// Per-`(channel, sender)` approval state for gateway chat channels.
+/// Most recent `(role, content)` turns kept per sender so a channel bot
+/// remembers the conversation. ~20 exchanges is plenty of context without
+/// unbounded growth; older turns drop off the front.
+const MAX_CHANNEL_TURNS: usize = 40;
+
+/// Per-`(channel, sender)` state for gateway chat channels: pending
+/// approvals, the "always" allowlist, and recent conversation history.
 pub struct ChannelApprovalStore {
     pending: Mutex<HashMap<String, PendingApproval>>,
     /// Tools a sender has chosen "Always" for, scoped to this process.
     allowlist: Mutex<HashMap<String, HashSet<String>>>,
+    /// Recent conversation turns per sender (in-memory, process-scoped) so
+    /// the bot has multi-turn memory of the chat.
+    history: Mutex<HashMap<String, Vec<(String, String)>>>,
     ttl: Duration,
 }
 
@@ -100,7 +109,26 @@ impl ChannelApprovalStore {
         Self {
             pending: Mutex::new(HashMap::new()),
             allowlist: Mutex::new(HashMap::new()),
+            history: Mutex::new(HashMap::new()),
             ttl,
+        }
+    }
+
+    /// Prior conversation turns for this sender (`(role, content)`).
+    pub fn history(&self, key: &str) -> Vec<(String, String)> {
+        self.history.lock().get(key).cloned().unwrap_or_default()
+    }
+
+    /// Append a completed user→assistant exchange, trimming to the most
+    /// recent `MAX_CHANNEL_TURNS` turns.
+    pub fn append_turn(&self, key: &str, user: &str, assistant: &str) {
+        let mut guard = self.history.lock();
+        let turns = guard.entry(key.to_string()).or_default();
+        turns.push(("user".to_string(), user.to_string()));
+        turns.push(("assistant".to_string(), assistant.to_string()));
+        if turns.len() > MAX_CHANNEL_TURNS {
+            let drop = turns.len() - MAX_CHANNEL_TURNS;
+            turns.drain(0..drop);
         }
     }
 
@@ -215,5 +243,36 @@ mod tests {
         assert_eq!(got, vec!["vm.create".to_string(), "vm.start".to_string()]);
         // other senders are unaffected
         assert!(store.allowlisted("linq:bob").is_empty());
+    }
+
+    #[test]
+    fn history_accumulates_and_trims_per_sender() {
+        let store = ChannelApprovalStore::default();
+        let key = "whatsapp:+15551234";
+        assert!(store.history(key).is_empty());
+
+        store.append_turn(
+            key,
+            "what is nqrust microvm?",
+            "It's a Firecracker microVM platform.",
+        );
+        let h = store.history(key);
+        assert_eq!(h.len(), 2);
+        assert_eq!(
+            h[0],
+            ("user".to_string(), "what is nqrust microvm?".to_string())
+        );
+        assert_eq!(h[1].0, "assistant");
+
+        // Trims to the most recent MAX_CHANNEL_TURNS turns.
+        for i in 0..50 {
+            store.append_turn(key, &format!("q{i}"), &format!("a{i}"));
+        }
+        let h = store.history(key);
+        assert_eq!(h.len(), MAX_CHANNEL_TURNS);
+        // oldest kept turn is recent, not the very first message
+        assert_ne!(h[0].1, "what is nqrust microvm?");
+        // other senders isolated
+        assert!(store.history("whatsapp:+1999").is_empty());
     }
 }

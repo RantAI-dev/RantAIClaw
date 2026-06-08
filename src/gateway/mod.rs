@@ -947,6 +947,9 @@ async fn run_gateway_chat_with_multimodal(
     // Tool names to additionally auto-approve for this turn (a sender's
     // "always" allowlist plus any just-granted one-shot approvals).
     extra_auto_approve: &[String],
+    // Prior `(role, content)` turns to re-feed so a continued channel
+    // conversation has memory of the exchange (empty for one-shot webhooks).
+    prior_history: &[(String, String)],
 ) -> anyhow::Result<GatewayChatResult> {
     let user_messages = vec![ChatMessage::user(message)];
     let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
@@ -990,8 +993,17 @@ async fn run_gateway_chat_with_multimodal(
     // Append tool use protocol and tool descriptions so the LLM knows how to call them.
     system_prompt.push_str(&build_tool_instructions(&state.tools_registry));
 
-    let mut history = Vec::with_capacity(2);
+    let mut history = Vec::with_capacity(2 + prior_history.len());
     history.push(ChatMessage::system(system_prompt));
+    // Re-feed prior turns (channel conversation memory) before the new message.
+    for (role, content) in prior_history {
+        let turn = match role.as_str() {
+            "assistant" => ChatMessage::assistant(content),
+            "system" => ChatMessage::system(content),
+            _ => ChatMessage::user(content),
+        };
+        history.push(turn);
+    }
     history.extend(user_messages);
 
     let multimodal_config = state.config.lock().multimodal.clone();
@@ -1088,6 +1100,8 @@ async fn process_channel_chat(
     message: &str,
 ) -> anyhow::Result<String> {
     let key = format!("{channel_name}:{sender}");
+    // Prior conversation turns so the bot remembers the exchange.
+    let prior = state.channel_approvals.history(&key);
 
     // A pending prompt is awaiting this sender's decision.
     if let Some((original, tools)) = state.channel_approvals.take_pending(&key) {
@@ -1103,9 +1117,14 @@ async fn process_channel_chat(
                 // any always-allowed ones) approved so they now execute.
                 let mut allow = state.channel_approvals.allowlisted(&key);
                 allow.extend(tools.iter().cloned());
-                let result =
-                    run_gateway_chat_with_multimodal(state, provider_label, &original, &allow)
-                        .await?;
+                let result = run_gateway_chat_with_multimodal(
+                    state,
+                    provider_label,
+                    &original,
+                    &allow,
+                    &prior,
+                )
+                .await?;
                 return Ok(finalize_channel_turn(state, &key, &original, result));
             }
             // Not a Y/A/N reply — the sender moved on. The pending request
@@ -1116,12 +1135,14 @@ async fn process_channel_chat(
     }
 
     let allow = state.channel_approvals.allowlisted(&key);
-    let result = run_gateway_chat_with_multimodal(state, provider_label, message, &allow).await?;
+    let result =
+        run_gateway_chat_with_multimodal(state, provider_label, message, &allow, &prior).await?;
     Ok(finalize_channel_turn(state, &key, message, result))
 }
 
 /// If a turn produced denied tools, stash them pending and return the
-/// Y/A/N prompt; otherwise return the agent's reply.
+/// Y/A/N prompt; otherwise record the exchange in history and return the
+/// agent's reply.
 fn finalize_channel_turn(
     state: &AppState,
     key: &str,
@@ -1129,6 +1150,10 @@ fn finalize_channel_turn(
     result: GatewayChatResult,
 ) -> String {
     if result.denied_tools.is_empty() {
+        // Remember the completed exchange so the next message has context.
+        state
+            .channel_approvals
+            .append_turn(key, message, &result.response);
         return result.response;
     }
     state
@@ -1258,7 +1283,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &[]).await {
+    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &[], &[]).await {
         Ok(result) => {
             let duration = started_at.elapsed();
             state
@@ -1820,7 +1845,7 @@ async fn handle_trigger_webhook(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, &message, &[]).await {
+    match run_gateway_chat_with_multimodal(&state, &provider_label, &message, &[], &[]).await {
         Ok(result) => {
             let mut body = serde_json::json!({
                 "response": result.response,
