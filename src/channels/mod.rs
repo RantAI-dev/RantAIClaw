@@ -221,6 +221,14 @@ struct ChannelRuntimeContext {
     /// `PendingApprovals` registry. Read by the approval-reply parser
     /// before each inbound message is routed to the agent.
     security: Arc<crate::security::SecurityPolicy>,
+    /// Per-tool approval gate for polling channels. `Some` (default) means
+    /// tools that need approval at the current autonomy level are denied —
+    /// polling channels do NOT run tools unattended. `None` only when
+    /// `[channels_config] autonomous_tools = true`, restoring the
+    /// run-everything behaviour. The shared session-allowlist stays empty
+    /// (channels never grant interactive approval), so it's safe to share
+    /// one manager across senders.
+    channel_approval: Option<Arc<crate::approval::ApprovalManager>>,
 }
 
 #[derive(Clone)]
@@ -1510,7 +1518,7 @@ async fn process_channel_message(
                 route.model.as_str(),
                 runtime_defaults.temperature,
                 true,
-                None,
+                ctx.channel_approval.as_deref(),
                 msg.channel.as_str(),
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
@@ -3213,6 +3221,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
         security: Arc::clone(&security),
+        // Gate tools on polling channels unless explicitly opted into
+        // unattended execution. Default (off) → deny tools that need
+        // approval; the bot answers from context/RAG but won't run tools
+        // for an arbitrary chat sender. Matches the gateway default.
+        channel_approval: if config.channels_config.autonomous_tools {
+            None
+        } else {
+            Some(Arc::new(crate::approval::ApprovalManager::from_config(
+                &config.autonomy,
+            )))
+        },
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3390,6 +3409,7 @@ mod tests {
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -3843,6 +3863,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -3901,6 +3922,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -3959,6 +3981,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -4026,6 +4049,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -4114,6 +4138,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -4184,6 +4209,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -4269,6 +4295,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -4345,6 +4372,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -4408,6 +4436,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -4578,6 +4607,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4657,6 +4687,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4748,6 +4779,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4821,6 +4853,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -5330,6 +5363,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -5414,6 +5448,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
@@ -5498,6 +5533,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
         });
 
         process_channel_message(
