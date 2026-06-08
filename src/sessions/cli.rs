@@ -9,7 +9,7 @@ use chrono::{TimeZone, Utc};
 use super::SessionStore;
 
 /// Resolve the same sessions.db path the TUI opens.
-fn open_store() -> Result<SessionStore> {
+pub fn open_store() -> Result<SessionStore> {
     let data_dir = directories::ProjectDirs::from("", "", "rantaiclaw")
         .map(|d| d.data_dir().to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from(".rantaiclaw"));

@@ -617,7 +617,21 @@ impl TuiApp {
             // in the buffer (multi-line prompt) instead of triggering
             // submit, which is the whole point of bracketed paste.
             Event::Paste(text) => {
-                if self.setup_overlay.is_none() && self.first_run_wizard.is_none() {
+                // Route a bracketed-paste payload into the active setup-overlay
+                // prompt (e.g. pasting an API key during onboarding / the
+                // first-run wizard, which delegates its prompts to the same
+                // overlay). Without this, pasting into a setup prompt was
+                // silently dropped on terminals that emit `Event::Paste`,
+                // making API keys impossible to paste. Otherwise the paste
+                // lands in the chat composer as before.
+                if let Some(o) = self.setup_overlay.as_mut() {
+                    if o.active_prompt().is_some() {
+                        // Single-line secret/URL fields: strip line breaks so a
+                        // trailing newline from the copy doesn't corrupt the value.
+                        let cleaned = text.replace(['\n', '\r'], "");
+                        o.push_str(&cleaned);
+                    }
+                } else if self.first_run_wizard.is_none() {
                     self.context.paste_at_cursor(&text);
                     self.context.exit_history_navigation();
                     self.refresh_autocomplete();
@@ -5269,7 +5283,23 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         }
     }
 
-    let agent = Agent::from_config(&app_config).await?;
+    let mut agent = Agent::from_config(&app_config).await?;
+
+    // `/resume`: re-feed the resumed session's prior turns so the model
+    // actually remembers the earlier conversation (not just the scrollback).
+    if let Some(resume_id) = tui_config.resume_session.as_deref() {
+        match crate::sessions::cli::open_store().and_then(|s| s.get_messages(resume_id)) {
+            Ok(msgs) => {
+                let prior = crate::sessions::messages_to_turns(&msgs);
+                if !prior.is_empty() {
+                    if let Err(e) = agent.restore_history(&prior) {
+                        tracing::warn!("failed to restore resumed history: {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("could not load resumed session {resume_id}: {e}"),
+        }
+    }
 
     let profile =
         crate::profile::ProfileManager::active().unwrap_or_else(|_| crate::profile::Profile {

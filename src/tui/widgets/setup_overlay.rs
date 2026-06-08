@@ -253,6 +253,12 @@ impl SetupOverlayState {
         self.input.push(c);
     }
 
+    /// Append a whole string to the prompt input (used for bracketed-paste
+    /// payloads, e.g. pasting an API key during onboarding).
+    pub fn push_str(&mut self, s: &str) {
+        self.input.push_str(s);
+    }
+
     pub fn pop_char(&mut self) {
         self.input.pop();
     }
@@ -962,6 +968,28 @@ mod tests {
             multi,
         });
         s
+    }
+
+    fn open_prompt(secret: bool) -> SetupOverlayState {
+        let mut s = SetupOverlayState::new("test");
+        s.handle_event(ProvisionEvent::Prompt {
+            id: "api_key".into(),
+            label: "API key".into(),
+            default: None,
+            secret,
+        });
+        s
+    }
+
+    #[test]
+    fn push_str_appends_pasted_key_to_active_prompt() {
+        // Mirrors the bracketed-paste path: a partially-typed prefix plus a
+        // pasted remainder must concatenate into the full API key.
+        let mut s = open_prompt(true);
+        assert!(s.active_prompt().is_some());
+        s.push_char('s');
+        s.push_str("k-proj-abc123XYZ");
+        assert_eq!(s.input(), "sk-proj-abc123XYZ");
     }
 
     #[test]

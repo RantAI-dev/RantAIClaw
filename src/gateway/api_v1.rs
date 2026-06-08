@@ -136,6 +136,22 @@ fn open_session_store() -> anyhow::Result<crate::sessions::SessionStore> {
     crate::sessions::SessionStore::open(&data_dir.join("sessions.db"))
 }
 
+/// Load a session's prior turns as `(role, content)` history so a
+/// continued chat remembers the exchange. Empty/absent session → no
+/// history (a fresh conversation); store errors degrade to no history.
+fn load_session_history(session_id: Option<&str>) -> Vec<(String, String)> {
+    let Some(sid) = session_id.filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    match open_session_store().and_then(|store| store.get_messages(sid)) {
+        Ok(msgs) => crate::sessions::messages_to_turns(&msgs),
+        Err(err) => {
+            tracing::warn!(error = %err, session_id = %sid, "failed to load session history");
+            Vec::new()
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // version + status + doctor
 // ────────────────────────────────────────────────────────────────────────────
@@ -288,6 +304,12 @@ async fn agent_chat_sync(
     let mut agent = crate::agent::Agent::from_config(&config)
         .await
         .map_err(err_500)?;
+    // Continue an existing conversation: re-feed prior turns so the model
+    // remembers the exchange instead of starting cold on every message.
+    let prior = load_session_history(body.session_id.as_deref());
+    if !prior.is_empty() {
+        agent.restore_history(&prior).map_err(err_500)?;
+    }
     let text = agent.turn(&body.message).await.map_err(err_500)?;
     let mut session_id = body.session_id.clone().unwrap_or_default();
     if let Ok(store) = open_session_store() {
@@ -311,6 +333,10 @@ async fn agent_chat_sync(
     }))
 }
 
+// Awaits live inside the spawned task + the response stream, not the outer
+// handler body, so clippy sees no top-level await — expected for an axum
+// streaming handler.
+#[allow(clippy::unused_async)]
 async fn agent_chat_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -329,6 +355,7 @@ async fn agent_chat_stream(
     let user_message = body.message.clone();
     let agent_message = body.message.clone();
     let req_session_id = body.session_id.clone();
+    let history_session_id = body.session_id.clone();
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<crate::agent::AgentEvent>(64);
     let cancel = CancellationToken::new();
     let cancel_for_agent = cancel.clone();
@@ -337,6 +364,11 @@ async fn agent_chat_stream(
     tokio::spawn(async move {
         match crate::agent::Agent::from_config(&config).await {
             Ok(mut agent) => {
+                // Re-feed prior turns so a continued conversation has context.
+                let prior = load_session_history(history_session_id.as_deref());
+                if !prior.is_empty() {
+                    let _ = agent.restore_history(&prior);
+                }
                 let _ = agent
                     .turn_streaming(
                         &agent_message,
@@ -1060,6 +1092,9 @@ mod tests {
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(
+                crate::gateway::channel_approval::ChannelApprovalStore::default(),
+            ),
         }
     }
 
