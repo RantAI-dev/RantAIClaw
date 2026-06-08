@@ -67,7 +67,21 @@ pub enum EventResult {
     Quit,
 }
 
+/// Live handle to the background channel runtime spawned by the TUI.
+///
+/// Cancelling `shutdown` makes every supervised listener stop and
+/// `start_channels_with_cancellation` return; `handle` lets a restart drain
+/// the previous runtime before the new one binds the same backend (Telegram
+/// `getUpdates` is single-consumer, so overlapping pollers would 409).
+pub struct ChannelSupervisor {
+    shutdown: tokio_util::sync::CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 /// Top-level TUI application.
+// Many independent UI mode flags; grouping them into a sub-struct would not
+// improve clarity and would churn every call site.
+#[allow(clippy::struct_excessive_bools)]
 pub struct TuiApp {
     pub state: AppState,
     pub context: TuiContext,
@@ -172,6 +186,12 @@ pub struct TuiApp {
     /// pipeline that wizard close uses, so the agent picks up the
     /// change on the next turn without a restart.
     pub config_watcher: Option<crate::tui::config_watcher::ConfigWatcher>,
+    /// Handle to the background channel runtime (Telegram/Discord/Slack/…
+    /// listeners) spawned alongside the TUI. Held so a mid-session channel
+    /// or skill change can cancel and respawn the runtime in place via
+    /// `restart_channels` — newly-configured channels start polling and the
+    /// rebuilt system prompt picks up new skills without closing the TUI.
+    pub channel_supervisor: Option<ChannelSupervisor>,
     /// True while the install picker was opened from inside the first-run
     /// wizard's skills step. On picker close (Esc), we send
     /// `ProvisionResponse::InstalledSkills(installed_slugs)` back to the
@@ -389,6 +409,7 @@ impl TuiApp {
             skill_deps_install_finished_at: None,
             skills_watcher: None,
             config_watcher: None,
+            channel_supervisor: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -1696,6 +1717,69 @@ impl TuiApp {
         }
     }
 
+    /// (Re)spawn the background channel runtime from the current
+    /// `self.config`, tearing down any previously-running runtime first.
+    ///
+    /// This is the single mechanism behind two behaviours that previously
+    /// required a full TUI restart:
+    ///   * a channel configured mid-session (`/setup telegram`) starts
+    ///     polling immediately, and
+    ///   * a skill added mid-session is reflected in the channel runtime's
+    ///     system prompt (skills are baked into the prompt at
+    ///     `start_channels` build time, so the only way to pick up new
+    ///     skills is to rebuild the runtime).
+    ///
+    /// The cancel → drain → start sequence runs inside one spawned task so
+    /// the UI never blocks: the old runtime's listeners are cancelled and
+    /// awaited (bounded) before the new ones bind the same backend,
+    /// avoiding Telegram's single-consumer 409 window.
+    fn restart_channels(&mut self) {
+        let prev = self.channel_supervisor.take();
+        let configured = count_configured_channels(&self.config);
+        self.context.channels_autostart_count = configured;
+
+        if configured == 0 {
+            // Nothing to run now — just stop whatever was running (e.g. the
+            // user removed their only channel mid-session).
+            if let Some(prev) = prev {
+                prev.shutdown.cancel();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(10), prev.handle).await;
+                });
+            }
+            return;
+        }
+
+        let cfg = self.config.clone();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task_token = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            // Drain the previous runtime before starting the new one so the
+            // old and new listeners don't fight over the same backend
+            // (Telegram getUpdates returns 409 to a second concurrent
+            // poller). Cancel + bounded await guarantees the old long-poll
+            // has released first.
+            if let Some(prev) = prev {
+                prev.shutdown.cancel();
+                let _ = tokio::time::timeout(Duration::from_secs(10), prev.handle).await;
+            }
+            crate::channels::auto_start_state::mark_starting();
+            match crate::channels::start_channels_with_cancellation(cfg, task_token).await {
+                Ok(()) => {
+                    crate::channels::auto_start_state::mark_terminated();
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    tracing::warn!(
+                        "channel runtime (re)start failed (TUI continues; channels will not respond until fixed): {msg}"
+                    );
+                    crate::channels::auto_start_state::mark_failed(msg);
+                }
+            }
+        });
+        self.channel_supervisor = Some(ChannelSupervisor { shutdown, handle });
+    }
+
     fn reload_config(&mut self) -> anyhow::Result<()> {
         let path = self.profile.config_toml();
         let contents = std::fs::read_to_string(&path)
@@ -1800,25 +1884,23 @@ impl TuiApp {
             .collect();
         let new_channels_count = count_configured_channels(&config);
         self.context.channels_autostart_count = new_channels_count;
-        // v0.6.7: surface the restart-needed cue when channels were added
-        // or removed mid-session. Auto-restart is a v0.6.8 deliverable —
-        // the existing `start_channels` task can't be cleanly cancelled
-        // mid-flight without leaking the supervised listener tasks. Tell
-        // the user to restart for now.
-        if new_channels_count != prev_channels_count {
+        // When the configured channel set changes mid-session (e.g.
+        // `/setup telegram`), restart the background channel runtime in
+        // place so newly-added channels start polling — and removed ones
+        // stop — without closing the TUI. The restart itself runs after
+        // `self.config` is updated below (it reads `self.config`); surface a
+        // short status line so the user knows it's taking effect live.
+        let channels_changed = new_channels_count != prev_channels_count;
+        if channels_changed {
             let msg = if new_channels_count > prev_channels_count {
                 format!(
-                    "⚠ {} new channel(s) configured. To start polling them now \
-                     without closing this TUI, open another terminal and run \
-                     `rantaiclaw channels run` (add `&` or wrap with `nohup` to \
-                     background it). `/channels` shows the current state.",
+                    "✓ {} new channel(s) configured — starting listener(s) now. \
+                     `/channels` shows the current state.",
                     new_channels_count - prev_channels_count
                 )
             } else {
                 format!(
-                    "⚠ {} channel(s) removed. The listener(s) keep running until \
-                     you stop the background `rantaiclaw channels run` process \
-                     (Ctrl-C in its terminal, or `kill <pid>`).",
+                    "✓ {} channel(s) removed — stopping their listener(s) now.",
                     prev_channels_count - new_channels_count
                 )
             };
@@ -1826,6 +1908,9 @@ impl TuiApp {
             self.scrollback_queue.push(("system".to_string(), msg));
         }
         self.config = config.clone();
+        if channels_changed {
+            self.restart_channels();
+        }
         // Push the new config to the agent actor so the next turn uses
         // the freshly-saved provider/api_key/model. Without this the
         // agent stays pinned to the launch-time config and reports
@@ -2713,6 +2798,19 @@ impl TuiApp {
                 removed = ?prev_keys.difference(&new_keys).collect::<Vec<_>>(),
                 "skills changed on disk — dispatching agent reload"
             );
+            // The channel runtime bakes the skill list into its system
+            // prompt at build time (see `start_channels`), so the local
+            // agent reload above does not reach running channel listeners
+            // (Telegram/Discord/…). Restart the runtime in place — only
+            // when one is actually running — so the channel bot picks up the
+            // new skill set too. Skipped when no channels run, to avoid
+            // spurious teardown on skill edits in a pure local-chat session.
+            if self.channel_supervisor.is_some() {
+                let _ = self
+                    .context
+                    .append_system_message("✓ Skills changed — refreshing channel bot(s) now.");
+                self.restart_channels();
+            }
         }
 
         let items = self.skill_picker_items();
@@ -5451,23 +5549,12 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         .map(|(name, configured)| (name.to_string(), configured))
         .collect();
     if configured_channels > 0 {
-        let cfg_for_channels = app_config.clone();
-        crate::channels::auto_start_state::mark_starting();
-        tokio::spawn(async move {
-            match crate::channels::start_channels(cfg_for_channels).await {
-                Ok(()) => {
-                    crate::channels::auto_start_state::mark_terminated();
-                }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    tracing::warn!(
-                        "auto-start channels failed (TUI continues; channels will not respond until daemon is running separately): {msg}"
-                    );
-                    crate::channels::auto_start_state::mark_failed(msg);
-                }
-            }
-        });
-        app.context.channels_autostart_count = configured_channels;
+        // Spawn the channel runtime as a cancellable supervisor (stored on
+        // `app`) rather than a fire-and-forget task, so a mid-session
+        // `/setup <channel>` or skill add can restart it in place via
+        // `restart_channels`. `app.config` is `app_config.clone()` (see the
+        // `TuiApp::new` call above), so this uses the same decrypted config.
+        app.restart_channels();
     }
 
     let mut terminal = setup_terminal()?;
@@ -5796,6 +5883,7 @@ mod tests {
             skill_deps_install_finished_at: None,
             skills_watcher: None,
             config_watcher: None,
+            channel_supervisor: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -5895,6 +5983,7 @@ mod submit_tests {
             skill_deps_install_finished_at: None,
             skills_watcher: None,
             config_watcher: None,
+            channel_supervisor: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -6010,6 +6099,7 @@ mod ctrl_c_tests {
             skill_deps_install_finished_at: None,
             skills_watcher: None,
             config_watcher: None,
+            channel_supervisor: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -6104,6 +6194,7 @@ mod drain_tests {
             skill_deps_install_finished_at: None,
             skills_watcher: None,
             config_watcher: None,
+            channel_supervisor: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
@@ -6271,6 +6362,7 @@ mod retry_tests {
             skill_deps_install_finished_at: None,
             skills_watcher: None,
             config_watcher: None,
+            channel_supervisor: None,
             wizard_install_in_progress: false,
             wizard_installed_slugs: Vec::new(),
             info_panel: None,
