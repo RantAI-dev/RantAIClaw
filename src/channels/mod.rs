@@ -1208,6 +1208,7 @@ fn spawn_supervised_listener(
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     spawn_supervised_listener_with_health_interval(
         ch,
@@ -1215,6 +1216,7 @@ fn spawn_supervised_listener(
         initial_backoff_secs,
         max_backoff_secs,
         Duration::from_secs(CHANNEL_HEALTH_HEARTBEAT_SECS),
+        shutdown,
     )
 }
 
@@ -1224,6 +1226,7 @@ fn spawn_supervised_listener_with_health_interval(
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     health_interval: Duration,
+    shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let health_interval = if health_interval.is_zero() {
         Duration::from_secs(1)
@@ -1236,17 +1239,22 @@ fn spawn_supervised_listener_with_health_interval(
         let mut backoff = initial_backoff_secs.max(1);
         let max_backoff = max_backoff_secs.max(backoff);
 
-        loop {
+        'supervise: loop {
             crate::health::mark_component_ok(&component);
             let mut health = tokio::time::interval(health_interval);
             health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let result = {
-                let listen_future =
-                    ch.listen(tx.clone(), tokio_util::sync::CancellationToken::new());
+                // Pass the shared shutdown token so a well-behaved channel
+                // (e.g. Telegram) aborts its long-poll cleanly. The
+                // `shutdown.cancelled()` select arm is a backstop for
+                // channels that ignore the token: breaking the loop drops
+                // the pinned listen future, cancelling its in-flight work.
+                let listen_future = ch.listen(tx.clone(), shutdown.clone());
                 tokio::pin!(listen_future);
 
                 loop {
                     tokio::select! {
+                        () = shutdown.cancelled() => break 'supervise,
                         _ = health.tick() => {
                             crate::health::mark_component_ok(&component);
                         }
@@ -1255,7 +1263,7 @@ fn spawn_supervised_listener_with_health_interval(
                 }
             };
 
-            if tx.is_closed() {
+            if tx.is_closed() || shutdown.is_cancelled() {
                 break;
             }
 
@@ -1273,7 +1281,12 @@ fn spawn_supervised_listener_with_health_interval(
             }
 
             crate::health::bump_component_restart(&component);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            // Cancellable backoff: a restart/shutdown request must not wait
+            // out a long backoff window before the listener stops.
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+            }
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
@@ -2755,6 +2768,29 @@ pub async fn register_configured_channels(
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    // Backward-compatible entrypoint for the foreground `channels run` /
+    // daemon callers (`main.rs`): they own the whole process and stop on
+    // Ctrl-C, so they never need to cancel the runtime programmatically.
+    // The TUI uses `start_channels_with_cancellation` instead so it can
+    // restart channels in place when a channel or skill is added
+    // mid-session.
+    start_channels_with_cancellation(config, CancellationToken::new()).await
+}
+
+/// Build and run the channel runtime until every listener exits or
+/// `shutdown` is cancelled.
+///
+/// Cancelling `shutdown` makes each supervised listener stop (a
+/// well-behaved channel such as Telegram aborts its long-poll cleanly via
+/// the same token; channels that ignore it are stopped by dropping the
+/// listen future). When the listeners exit they drop their message-bus
+/// senders, which closes the dispatch loop and returns `Ok(())`. This lets
+/// the TUI tear the runtime down and respawn it with fresh config/skills
+/// without leaking listener tasks.
+pub async fn start_channels_with_cancellation(
+    config: Config,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -3172,6 +3208,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             tx.clone(),
             initial_backoff_secs,
             max_backoff_secs,
+            shutdown.clone(),
         ));
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
@@ -5897,7 +5934,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
-        let handle = spawn_supervised_listener(channel, tx, 1, 1);
+        let handle = spawn_supervised_listener(channel, tx, 1, 1, CancellationToken::new());
 
         tokio::time::sleep(Duration::from_millis(80)).await;
         drop(rx);
@@ -5932,6 +5969,7 @@ This is an example JSON object for profile settings."#;
             1,
             1,
             Duration::from_millis(20),
+            CancellationToken::new(),
         );
 
         tokio::time::sleep(Duration::from_millis(35)).await;
@@ -5958,6 +5996,41 @@ This is an example JSON object for profile settings."#;
         let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
         assert!(join.is_ok(), "listener should stop after channel shutdown");
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_stops_on_shutdown_cancellation() {
+        // Regression guard for the in-place channel restart path: cancelling
+        // the shutdown token must stop the listener even while the message
+        // bus is still open (rx alive) AND the channel ignores the token —
+        // `BlockUntilClosedChannel` parks on `tx.closed()` and never reads
+        // `_cancel`, so only the supervisor's `shutdown.cancelled()` backstop
+        // can unstick it. Without it the TUI could not restart channels.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel_name = format!("test-supervised-shutdown-{}", uuid::Uuid::new_v4());
+        let channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+        });
+
+        // Keep `_rx` alive so the bus never closes on its own — this proves
+        // cancellation, not bus teardown, is what stops the listener.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+        let shutdown = CancellationToken::new();
+        let handle = spawn_supervised_listener(channel, tx, 1, 60, shutdown.clone());
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "listener should have entered listen() before cancellation"
+        );
+
+        shutdown.cancel();
+        let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(
+            join.is_ok(),
+            "listener should stop promptly when shutdown is cancelled"
+        );
     }
 
     #[test]
