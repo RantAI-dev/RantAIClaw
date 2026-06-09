@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -90,8 +90,19 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; default-only change)
     }
 
-    // Future migrations (v3, v4, …) inserted here in order.
-    // if from < 3 { migrate_v3(raw)?; }
+    // v2 → v3: `[channels_config].autonomous_tools` (bool, default false)
+    // was added — opt-in to running tools unattended over gateway channel
+    // webhooks. Additive field with a serde default: configs that lack it
+    // deserialise fine and gain the default on next write, so there is
+    // nothing to transform. This arm exists only to burn a version slot so
+    // the schema_drift fingerprint can be accepted with intent (mirrors
+    // v1 → v2).
+    if from < 3 {
+        // (no transformation; additive default-only field)
+    }
+
+    // Future migrations (v4, v5, …) inserted here in order.
+    // if from < 4 { migrate_v4(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -136,19 +147,37 @@ mod tests {
     }
 
     #[test]
-    fn v1_to_v2_preserves_explicit_max_tool_iterations() {
+    fn v1_preserves_explicit_max_tool_iterations_through_current() {
         // A user who had set max_tool_iterations = 10 explicitly in
-        // their v1 config keeps that exact value through the v2 bump.
-        // The default change (10 → 25) doesn't override their choice.
+        // their v1 config keeps that exact value through the migration
+        // chain. The v1 → v2 default change (10 → 25) doesn't override
+        // their choice, and the later bumps are additive no-ops.
         let mut v = parse("schema_version = 1\n[agent]\nmax_tool_iterations = 10\n");
         let migrated = migrate(&mut v).unwrap();
-        assert!(migrated, "v1 → v2 bump should be reported as transformed");
-        assert_eq!(version_of(&v), Some(2));
+        assert!(migrated, "v1 config should be reported as transformed");
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         let agent = v.get("agent").unwrap().as_table().unwrap();
         assert_eq!(
             agent.get("max_tool_iterations").unwrap().as_integer(),
             Some(10),
-            "explicit 10 must survive v1 → v2 (user choice, not default)"
+            "explicit 10 must survive migration (user choice, not default)"
+        );
+    }
+
+    #[test]
+    fn v2_to_v3_is_additive_noop_preserving_content() {
+        // v2 → v3 only added `[channels_config].autonomous_tools` (additive,
+        // default false). A v2 config migrates to v3 with all content intact
+        // and without the migration injecting autonomous_tools.
+        let mut v = parse("schema_version = 2\n[channels_config]\ncli = true\n");
+        let migrated = migrate(&mut v).unwrap();
+        assert!(migrated, "v2 → v3 bump should be reported as transformed");
+        assert_eq!(version_of(&v), Some(3));
+        let cc = v.get("channels_config").unwrap().as_table().unwrap();
+        assert_eq!(cc.get("cli").unwrap().as_bool(), Some(true));
+        assert!(
+            cc.get("autonomous_tools").is_none(),
+            "migration must not inject autonomous_tools; serde default handles it"
         );
     }
 
