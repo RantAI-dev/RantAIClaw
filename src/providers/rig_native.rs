@@ -159,6 +159,17 @@ impl RigProvider {
     }
 }
 
+/// OpenAI reasoning models (the `gpt-5*` family and the `o1`/`o3`/`o4` series)
+/// reject any `temperature` other than the default of `1` — sending `0.7` yields
+/// `400 unsupported_value`. Detect them by id prefix so we omit `temperature`
+/// instead of failing the completion. Other providers (claude-*, gemini-*) are
+/// unaffected. Tolerates an optional `provider/` prefix on the id.
+fn model_locks_temperature(model: &str) -> bool {
+    let id = model.trim().to_ascii_lowercase();
+    let id = id.rsplit('/').next().unwrap_or(id.as_str());
+    id.starts_with("gpt-5") || id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4")
+}
+
 /// Build the `CompletionRequest` shape `rig` expects from our
 /// `ChatRequest` + per-call (model, temperature). System messages are
 /// flattened to the `preamble` field for compatibility with all three
@@ -219,7 +230,12 @@ fn build_rig_request(
         chat_history,
         documents: Vec::new(),
         tools,
-        temperature: Some(temperature),
+        // Reasoning models only accept the default temperature; omit ours for them.
+        temperature: if model_locks_temperature(model) {
+            None
+        } else {
+            Some(temperature)
+        },
         max_tokens: None,
         tool_choice: None,
         additional_params: None,
@@ -598,6 +614,47 @@ mod tests {
         assert_eq!(req.temperature, Some(0.5));
         // System extracted; only the user message remains in history.
         assert_eq!(req.chat_history.len(), 1);
+    }
+
+    #[test]
+    fn model_locks_temperature_flags_reasoning_models_only() {
+        for m in [
+            "gpt-5-mini",
+            "gpt-5.5",
+            "gpt-5.5-codex",
+            "o1",
+            "o3-mini",
+            "o4-mini",
+            "openai/gpt-5-nano",
+        ] {
+            assert!(model_locks_temperature(m), "{m} should lock temperature");
+        }
+        for m in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "claude-sonnet-4-6",
+            "gemini-2.0-flash",
+        ] {
+            assert!(!model_locks_temperature(m), "{m} should allow temperature");
+        }
+    }
+
+    #[test]
+    fn build_rig_request_omits_temperature_for_reasoning_models() {
+        let messages = vec![ChatMessage::user("hi")];
+        let req = build_rig_request(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+            },
+            "gpt-5-mini",
+            0.7,
+        )
+        .unwrap();
+        assert_eq!(
+            req.temperature, None,
+            "gpt-5 models reject a custom temperature; it must be omitted"
+        );
     }
 
     #[test]
