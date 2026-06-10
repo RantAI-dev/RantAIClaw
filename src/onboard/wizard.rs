@@ -1777,6 +1777,55 @@ fn load_any_cached_models_for_provider(
     load_cached_models_for_provider_internal(workspace_dir, provider_name, None)
 }
 
+/// Read-through view of a provider's model catalog for non-TUI surfaces (the web
+/// console / gateway). Resolves the **same** sources the TUI uses — the on-disk
+/// model cache (`models_cache.json`) unioned with the curated fallback, plus the
+/// canonical default — so the web UI and the TUI never drift. No network: returns
+/// whatever the cache holds (any age) else curated; refresh is explicit via
+/// [`run_models_refresh`].
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderCatalog {
+    pub models: Vec<String>,
+    pub default_model: String,
+    /// `"cache"` when populated from `models_cache.json`, else `"curated"`.
+    pub source: &'static str,
+    /// Age of the cached entry in seconds (`None` when serving curated only).
+    pub age_secs: Option<u64>,
+}
+
+pub(crate) fn provider_model_catalog(workspace_dir: &Path, provider_name: &str) -> ProviderCatalog {
+    let curated: Vec<String> = curated_models_for_provider(provider_name)
+        .into_iter()
+        .map(|(id, _label)| id)
+        .collect();
+    let default_model = default_model_for_provider(provider_name);
+
+    match load_any_cached_models_for_provider(workspace_dir, provider_name) {
+        Ok(Some(cached)) if !cached.models.is_empty() => {
+            // Cache first (the live truth), then any curated id not already present
+            // — mirrors the TUI picker which overlays live onto the curated base.
+            let mut models = cached.models;
+            for id in curated {
+                if !models.contains(&id) {
+                    models.push(id);
+                }
+            }
+            ProviderCatalog {
+                models,
+                default_model,
+                source: "cache",
+                age_secs: Some(cached.age_secs),
+            }
+        }
+        _ => ProviderCatalog {
+            models: curated,
+            default_model,
+            source: "curated",
+            age_secs: None,
+        },
+    }
+}
+
 fn humanize_age(age_secs: u64) -> String {
     if age_secs < 60 {
         format!("{age_secs}s")
@@ -5865,6 +5914,20 @@ mod tests {
     }
 
     // ── model helper coverage ───────────────────────────────────
+
+    #[test]
+    fn provider_model_catalog_falls_back_to_curated_without_cache() {
+        // No cache dir → serve the curated list + canonical default (source="curated").
+        let dir = std::path::Path::new("/nonexistent-rantaiclaw-catalog-test");
+        let cat = provider_model_catalog(dir, "openai");
+        assert_eq!(cat.source, "curated");
+        assert!(cat.age_secs.is_none());
+        assert_eq!(cat.default_model, "gpt-5.5");
+        assert!(
+            cat.models.iter().any(|m| m == "gpt-5.5"),
+            "curated openai list must include the default model"
+        );
+    }
 
     #[test]
     fn default_model_for_provider_uses_latest_defaults() {

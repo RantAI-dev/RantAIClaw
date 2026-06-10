@@ -53,6 +53,11 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/channels", get(channels_list))
         .route("/api/v1/providers", get(providers_list))
+        .route("/api/v1/providers/{id}/models", get(provider_models))
+        .route(
+            "/api/v1/providers/{id}/models/refresh",
+            post(provider_models_refresh),
+        )
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -960,6 +965,60 @@ async fn providers_list(
     Ok(Json(
         serde_json::json!({ "providers": json, "count": json.len() }),
     ))
+}
+
+/// `GET /providers/{id}/models` — the model catalog for a provider, resolved from
+/// the same on-disk cache + curated fallback the TUI uses (no network). The web
+/// console consumes this so its model list never drifts from the TUI's. Use
+/// `POST .../models/refresh` to repopulate the cache from the live provider API.
+async fn provider_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let cat = crate::onboard::wizard::provider_model_catalog(&workspace_dir, &id);
+    let count = cat.models.len();
+    Ok(Json(serde_json::json!({
+        "provider": id,
+        "models": cat.models,
+        "default": cat.default_model,
+        "source": cat.source,
+        "age_secs": cat.age_secs,
+        "count": count,
+    })))
+}
+
+/// `POST /providers/{id}/models/refresh` — fetch the provider's live model list and
+/// cache it to `models_cache.json` (the same store the TUI reads), then return the
+/// refreshed catalog. Network I/O runs on a blocking thread.
+async fn provider_models_refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let config = state.config.lock().clone();
+    let id_for_refresh = id.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::onboard::wizard::run_models_refresh(&config, Some(&id_for_refresh), true)
+    })
+    .await
+    .map_err(|e| err_500(anyhow::anyhow!("model refresh task panicked: {e}")))?
+    .map_err(err_500)?;
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    let cat = crate::onboard::wizard::provider_model_catalog(&workspace_dir, &id);
+    let count = cat.models.len();
+    Ok(Json(serde_json::json!({
+        "provider": id,
+        "models": cat.models,
+        "default": cat.default_model,
+        "source": cat.source,
+        "age_secs": cat.age_secs,
+        "count": count,
+    })))
 }
 
 #[cfg(test)]
