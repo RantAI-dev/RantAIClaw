@@ -1001,12 +1001,19 @@ async fn provider_models_refresh(
     check_auth(&state, &headers)?;
     let config = state.config.lock().clone();
     let id_for_refresh = id.clone();
-    tokio::task::spawn_blocking(move || {
+    // Best-effort: a live fetch can fail (e.g. the provider needs an API key that
+    // isn't configured). That's a normal, non-fatal condition — log it and still
+    // return the current catalog (cache/curated) so the console's refresh button
+    // never surfaces a 500. Only a task panic is a real internal error.
+    let refresh_err = tokio::task::spawn_blocking(move || {
         crate::onboard::wizard::run_models_refresh(&config, Some(&id_for_refresh), true)
     })
     .await
     .map_err(|e| err_500(anyhow::anyhow!("model refresh task panicked: {e}")))?
-    .map_err(err_500)?;
+    .err();
+    if let Some(e) = &refresh_err {
+        tracing::warn!(provider = %id, error = %e, "model refresh failed; returning existing catalog");
+    }
 
     let workspace_dir = state.config.lock().workspace_dir.clone();
     let cat = crate::onboard::wizard::provider_model_catalog(&workspace_dir, &id);
@@ -1018,6 +1025,8 @@ async fn provider_models_refresh(
         "source": cat.source,
         "age_secs": cat.age_secs,
         "count": count,
+        "refreshed": refresh_err.is_none(),
+        "detail": refresh_err.map(|e| e.to_string()),
     })))
 }
 
