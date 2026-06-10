@@ -32,6 +32,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/config", get(get_config))
         .route("/api/v1/config/model", put(set_model))
         .route("/api/v1/config/autonomy", put(set_autonomy))
+        .route("/api/v1/secrets", get(get_secrets).put(set_secrets))
         .route(
             "/api/v1/config/mcp_servers/{name}",
             post(add_mcp_server).delete(remove_mcp_server),
@@ -289,4 +290,145 @@ async fn remove_mcp_server(
     Ok(Json(
         json!({ "name": name, "removed": removed, "count": count }),
     ))
+}
+
+// ── GET/PUT /secrets ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SecretsBody {
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    api_url: Option<String>,
+}
+
+/// True when a non-empty provider key is configured.
+fn api_key_present(cfg: &crate::config::Config) -> bool {
+    cfg.api_key
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Non-secret view of the active provider credential: which provider is selected,
+/// whether a key is present (never the key itself), the optional base-URL override,
+/// and whether at-rest encryption is on.
+fn secrets_view(cfg: &crate::config::Config) -> serde_json::Value {
+    json!({
+        "provider": cfg.default_provider.clone().unwrap_or_default(),
+        "api_url": cfg.api_url,
+        "api_key_present": api_key_present(cfg),
+        "encrypt_at_rest": cfg.secrets.encrypt,
+    })
+}
+
+/// Apply a secrets mutation: a provided field sets the value (empty string clears
+/// it), an omitted field leaves the existing value untouched.
+fn apply_secrets(cfg: &mut crate::config::Config, body: &SecretsBody) {
+    if let Some(k) = body.api_key.as_ref() {
+        let k = k.trim();
+        cfg.api_key = if k.is_empty() {
+            None
+        } else {
+            Some(k.to_string())
+        };
+    }
+    if let Some(u) = body.api_url.as_ref() {
+        let u = u.trim();
+        cfg.api_url = if u.is_empty() {
+            None
+        } else {
+            Some(u.to_string())
+        };
+    }
+}
+
+/// `GET /secrets` — presence-only view; the raw key is never returned.
+async fn get_secrets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let cfg = state.config.lock().clone();
+    Ok(Json(secrets_view(&cfg)))
+}
+
+/// `PUT /secrets {api_key?, api_url?}` — set the active provider's key/base-URL and
+/// persist (encrypted at rest via [`Config::save`]). Returns presence, not the key.
+async fn set_secrets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SecretsBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let mut cfg = state.config.lock().clone();
+    apply_secrets(&mut cfg, &body);
+    let present = api_key_present(&cfg);
+    persist_and_swap(&state, cfg).await?;
+    Ok(Json(json!({ "ok": true, "api_key_present": present })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn apply_secrets_sets_then_clears_on_empty() {
+        let mut cfg = Config::default();
+        apply_secrets(
+            &mut cfg,
+            &SecretsBody {
+                api_key: Some("  sk-test  ".into()),
+                api_url: Some("https://api.example.com".into()),
+            },
+        );
+        assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(cfg.api_url.as_deref(), Some("https://api.example.com"));
+        assert!(api_key_present(&cfg));
+
+        apply_secrets(
+            &mut cfg,
+            &SecretsBody {
+                api_key: Some(String::new()),
+                api_url: Some("   ".into()),
+            },
+        );
+        assert!(cfg.api_key.is_none(), "empty key clears the credential");
+        assert!(cfg.api_url.is_none(), "blank url clears the override");
+        assert!(!api_key_present(&cfg));
+    }
+
+    #[test]
+    fn apply_secrets_omitted_field_preserves_existing() {
+        let mut cfg = Config::default();
+        cfg.api_key = Some("keep-me".into());
+        apply_secrets(
+            &mut cfg,
+            &SecretsBody {
+                api_key: None,
+                api_url: Some("http://override".into()),
+            },
+        );
+        assert_eq!(
+            cfg.api_key.as_deref(),
+            Some("keep-me"),
+            "an omitted api_key must not wipe the existing key"
+        );
+        assert_eq!(cfg.api_url.as_deref(), Some("http://override"));
+    }
+
+    #[test]
+    fn secrets_view_never_serializes_the_raw_key() {
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("openai".into());
+        cfg.api_key = Some("super-secret-key".into());
+        let view = secrets_view(&cfg);
+        assert_eq!(view["provider"], "openai");
+        assert_eq!(view["api_key_present"], true);
+        assert!(
+            !view.to_string().contains("super-secret-key"),
+            "GET /secrets must never expose the raw key"
+        );
+    }
 }
