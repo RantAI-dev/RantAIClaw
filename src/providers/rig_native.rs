@@ -170,6 +170,69 @@ fn model_locks_temperature(model: &str) -> bool {
     id.starts_with("gpt-5") || id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4")
 }
 
+/// Rebuild an assistant turn from the agent loop's native-mode JSON envelope
+/// (`{"content": <str|null>, "tool_calls": [{"id","name","arguments"}]}`) into a
+/// structured rig message carrying real `AssistantContent::ToolCall`s. Without
+/// this the tool_calls collapse into plain text and the follow-up completion has
+/// no assistant tool call for the tool result to pair with — which strict
+/// providers (OpenAI) reject. Falls back to a plain text assistant message when
+/// `content` is not that envelope. Mirrors the `convert_messages` decode the
+/// native providers already perform.
+fn assistant_message_from(content: &str) -> RigMessage {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok();
+    let Some(calls) = parsed
+        .as_ref()
+        .and_then(|v| v.get("tool_calls"))
+        .and_then(|v| serde_json::from_value::<Vec<ToolCall>>(v.clone()).ok())
+    else {
+        return RigMessage::assistant(content.to_string());
+    };
+
+    let mut blocks: Vec<AssistantContent> = Vec::new();
+    if let Some(text) = parsed
+        .as_ref()
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        blocks.push(AssistantContent::text(text));
+    }
+    for call in calls {
+        // `arguments` is a JSON string in our shape; rig wants a `Value`.
+        let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
+        blocks.push(AssistantContent::tool_call(call.id, call.name, arguments));
+    }
+
+    match OneOrMany::many(blocks) {
+        Ok(content_blocks) => RigMessage::Assistant {
+            id: None,
+            content: content_blocks,
+        },
+        // Envelope had no text and no tool calls — keep the raw text.
+        Err(_) => RigMessage::assistant(content.to_string()),
+    }
+}
+
+/// Rebuild a tool-result turn from the agent loop's JSON envelope
+/// (`{"tool_call_id": <id>, "content": <result>}`), preserving the real id so it
+/// pairs with the assistant tool call. The previous hardcoded `"unknown"` id
+/// caused OpenAI to 400 on every post-tool-call completion.
+fn tool_result_message_from(content: &str) -> RigMessage {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(id) = value.get("tool_call_id").and_then(|v| v.as_str()) {
+            let result = value
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or(content);
+            return RigMessage::tool_result(id, result);
+        }
+    }
+    // Non-conforming tool message (no envelope): best-effort passthrough.
+    RigMessage::tool_result("unknown", content.to_string())
+}
+
 /// Build the `CompletionRequest` shape `rig` expects from our
 /// `ChatRequest` + per-call (model, temperature). System messages are
 /// flattened to the `preamble` field for compatibility with all three
@@ -193,14 +256,8 @@ fn build_rig_request(
                 });
             }
             "user" => history.push(RigMessage::user(m.content.clone())),
-            "assistant" => history.push(RigMessage::assistant(m.content.clone())),
-            "tool" => {
-                // Tool results carry no id in our `ChatMessage` shape
-                // — rig requires one. Synthesize a fallback id; the
-                // agent loop already pairs tool calls with results
-                // by position when ids are missing.
-                history.push(RigMessage::tool_result("unknown", m.content.clone()));
-            }
+            "assistant" => history.push(assistant_message_from(&m.content)),
+            "tool" => history.push(tool_result_message_from(&m.content)),
             other => {
                 tracing::warn!(target: "rig_native", role = %other, "unknown role; treating as user");
                 history.push(RigMessage::user(m.content.clone()));
@@ -697,5 +754,137 @@ mod tests {
         .unwrap();
         assert_eq!(req.tools.len(), 1);
         assert_eq!(req.tools[0].name, "shell");
+    }
+
+    #[test]
+    fn build_rig_request_rebuilds_assistant_tool_calls() {
+        // The agent loop stores an assistant tool turn as JSON in `content`:
+        // {"content": <str|null>, "tool_calls": [{"id","name","arguments"}]}.
+        // It must be rebuilt as a structured AssistantContent::ToolCall (id
+        // preserved), not flattened into plain text.
+        let assistant_json = serde_json::json!({
+            "content": serde_json::Value::Null,
+            "tool_calls": [{
+                "id": "call_1",
+                "name": "glob_search",
+                "arguments": "{\"pattern\":\"**/*\"}"
+            }]
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("find files"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: assistant_json,
+            },
+        ];
+        let req = build_rig_request(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+            },
+            "gpt-5-mini",
+            0.0,
+        )
+        .unwrap();
+
+        let found = req.chat_history.clone().into_iter().any(|m| match m {
+            RigMessage::Assistant { content, .. } => content.into_iter().any(|c| {
+                matches!(
+                    c,
+                    AssistantContent::ToolCall(tc)
+                        if tc.id == "call_1" && tc.function.name == "glob_search"
+                )
+            }),
+            _ => false,
+        });
+        assert!(
+            found,
+            "assistant tool_calls must be rebuilt as AssistantContent::ToolCall with id preserved"
+        );
+    }
+
+    #[test]
+    fn build_rig_request_uses_real_tool_call_id() {
+        // The tool result is stored as {"tool_call_id": <id>, "content": <result>}.
+        // The real id must reach rig's ToolResult — never the "unknown" placeholder,
+        // which OpenAI rejects as an unmatched tool message.
+        let assistant_json = serde_json::json!({
+            "content": serde_json::Value::Null,
+            "tool_calls": [{"id": "call_1", "name": "glob_search", "arguments": "{}"}]
+        })
+        .to_string();
+        let tool_json = serde_json::json!({
+            "tool_call_id": "call_1",
+            "content": "3 files found"
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("find files"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: assistant_json,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: tool_json,
+            },
+        ];
+        let req = build_rig_request(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+            },
+            "gpt-5-mini",
+            0.0,
+        )
+        .unwrap();
+
+        let ids: Vec<String> = req
+            .chat_history
+            .clone()
+            .into_iter()
+            .filter_map(|m| match m {
+                RigMessage::User { content } => content.into_iter().find_map(|c| match c {
+                    rig_core::completion::message::UserContent::ToolResult(tr) => Some(tr.id),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            ids.contains(&"call_1".to_string()),
+            "tool result must carry the real tool_call_id; got {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "unknown"),
+            "tool result must not use the 'unknown' placeholder id"
+        );
+    }
+
+    #[test]
+    fn build_rig_request_keeps_plain_assistant_text() {
+        // Regression guard: a plain (non-JSON) assistant message must still
+        // become a text block, not be mistaken for a tool turn.
+        let messages = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("just text, no tools"),
+        ];
+        let req = build_rig_request(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+            },
+            "m",
+            0.0,
+        )
+        .unwrap();
+        let has_text = req.chat_history.clone().into_iter().any(|m| match m {
+            RigMessage::Assistant { content, .. } => content
+                .into_iter()
+                .any(|c| matches!(c, AssistantContent::Text(t) if t.text == "just text, no tools")),
+            _ => false,
+        });
+        assert!(has_text, "plain assistant text must remain a text block");
     }
 }
