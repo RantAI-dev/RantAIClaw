@@ -343,6 +343,38 @@ fn rig_tool_to_ours(id: String, f: ToolFunction) -> ToolCall {
     }
 }
 
+/// Collapse tool calls that share an id. rig's streaming can surface one
+/// logical tool call twice — once via the immediate-complete `ToolCall` event
+/// and again via the delta-accumulated copy — yielding two entries with the
+/// same id. OpenAI assigns a unique id per call, so duplicate ids are never
+/// legitimate; sending two `tool_calls` (and two tool results) with the same id
+/// makes the next completion 400. Keep first-seen order; merge a non-empty name
+/// or arguments from a later duplicate over an empty start stub.
+fn dedupe_tool_calls_by_id(calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, ToolCall> = std::collections::HashMap::new();
+    for call in calls {
+        match by_id.get_mut(&call.id) {
+            Some(existing) => {
+                if existing.name.is_empty() && !call.name.is_empty() {
+                    existing.name = call.name;
+                }
+                if existing.arguments.trim().is_empty() && !call.arguments.trim().is_empty() {
+                    existing.arguments = call.arguments;
+                }
+            }
+            None => {
+                order.push(call.id.clone());
+                by_id.insert(call.id.clone(), call);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect()
+}
+
 #[async_trait]
 impl Provider for RigProvider {
     fn capabilities(&self) -> ProviderCapabilities {
@@ -604,7 +636,10 @@ where
     };
     Ok(ChatResponse {
         text: text_opt,
-        tool_calls,
+        // rig may surface a tool call via both the immediate-complete event and
+        // the delta path; collapse same-id duplicates before they reach the
+        // next request (OpenAI 400s on duplicate tool_call ids).
+        tool_calls: dedupe_tool_calls_by_id(tool_calls),
     })
 }
 
@@ -886,5 +921,74 @@ mod tests {
             _ => false,
         });
         assert!(has_text, "plain assistant text must remain a text block");
+    }
+
+    #[test]
+    fn dedupe_tool_calls_collapses_same_id() {
+        // rig's streaming can surface one logical tool call twice (the
+        // immediate-complete event plus the delta-accumulated copy). OpenAI
+        // assigns a unique id per call, so two entries sharing an id are a
+        // duplicate and must collapse — otherwise the next request 400s.
+        let calls = vec![
+            ToolCall {
+                id: "call_1".into(),
+                name: "glob_search".into(),
+                arguments: "{\"pattern\":\"**/*\"}".into(),
+            },
+            ToolCall {
+                id: "call_1".into(),
+                name: "glob_search".into(),
+                arguments: "{\"pattern\":\"**/*\"}".into(),
+            },
+        ];
+        let deduped = dedupe_tool_calls_by_id(calls);
+        assert_eq!(deduped.len(), 1, "same-id duplicates must collapse to one");
+        assert_eq!(deduped[0].id, "call_1");
+        assert_eq!(deduped[0].arguments, "{\"pattern\":\"**/*\"}");
+    }
+
+    #[test]
+    fn dedupe_tool_calls_prefers_complete_args() {
+        // If the duplicate carries the full args and the first was an empty
+        // start stub, keep the complete arguments.
+        let calls = vec![
+            ToolCall {
+                id: "call_1".into(),
+                name: "glob_search".into(),
+                arguments: String::new(),
+            },
+            ToolCall {
+                id: "call_1".into(),
+                name: String::new(),
+                arguments: "{\"pattern\":\"src/**\"}".into(),
+            },
+        ];
+        let deduped = dedupe_tool_calls_by_id(calls);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].name, "glob_search", "non-empty name retained");
+        assert_eq!(
+            deduped[0].arguments, "{\"pattern\":\"src/**\"}",
+            "complete args retained over empty stub"
+        );
+    }
+
+    #[test]
+    fn dedupe_tool_calls_keeps_distinct_ids_in_order() {
+        let calls = vec![
+            ToolCall {
+                id: "call_a".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+            },
+            ToolCall {
+                id: "call_b".into(),
+                name: "file_read".into(),
+                arguments: "{}".into(),
+            },
+        ];
+        let deduped = dedupe_tool_calls_by_id(calls);
+        assert_eq!(deduped.len(), 2, "distinct ids must all survive");
+        assert_eq!(deduped[0].id, "call_a", "order preserved");
+        assert_eq!(deduped[1].id, "call_b");
     }
 }
