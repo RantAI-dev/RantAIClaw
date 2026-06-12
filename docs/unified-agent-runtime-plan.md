@@ -114,11 +114,13 @@ Conversation id per surface (Hermes scheme):
 | PR | Scope | Risk | Status |
 |---|---|---|---|
 | **PR1.0** | Persona parity on channels (shared `render_persona_section`) | Low | ✅ done (`c3ee0d4`) |
-| **PR1.1** | Structural builder convergence (one builder, shared tool descriptor) | Low–Med, output-changing | ⏳ pending |
+| **PR1.1** | Builder convergence — channels/gateway run the one `SystemPromptBuilder` | Low–Med | ✅ done (`77455e2`) |
 | **PR3** | `ApprovalBackend` + owner-authority gate; remove `channel_name=="cli"` | High (security) | ✅ done (`71b1768`) |
-| **PR3b** | Safety/autonomy-preset section on channels + Strict shell-filter parity | Med | ⏳ pending |
-| **PR2** | Collapse the two agent loops into one runtime | High (structural) | ⏳ pending (largest) |
-| **PR4** | `ConversationResolver` + layered memory | Medium | 🟡 resolver landing first |
+| **PR3b-strict** | Strict shell-filter parity on channels | Med | ✅ done (`a2e634b`) |
+| **PR3b-safety** | Channel-accurate safety/preset text (couples to approval) | Med | ⏳ pending |
+| **PR4-foundation** | `ConversationKey` (one tested conversation-id) | Low | ✅ done (`59df725`) |
+| **PR4-memory** | Layered global/user/workspace/conversation memory + pairing | Med | ⏳ pending |
+| **PR2** | Collapse the two agent loops into one runtime | High (largest) | ⏳ pending |
 
 > **Note:** PR3 shipped before PR1.1/PR2 because it is the actual fix for the
 > original report ("can't do X on Telegram") and is self-contained. The
@@ -205,16 +207,23 @@ section. Folds naturally into PR1.1's shared builder.
 
 `Agent::turn_inner` (`src/agent/agent.rs:872`) and `run_tool_call_loop`
 (`src/agent/loop_.rs:1302`) are independent loops with different feature sets
-(the former adds history, memory auto-save, `memory_loader` context enrichment,
-model classification, events/streaming). Recommended approach:
-1. Extract `Agent`'s per-iteration core (LLM call → parse → execute → feed) into
-   a shared function that both call, parameterized by an `ApprovalBackend`
-   (PR3) and prompt (PR1.1) — do **not** duplicate the feature set.
-2. Migrate channels/gateway to drive the `Agent` struct (or the shared core)
-   instead of `run_tool_call_loop`, preserving their per-`(channel,sender)`
-   history maps via the conversation key (PR4).
-3. Land behind tests per surface; this is the one to do on its own branch slice
-   with a full `./dev/ci.sh all` run, not bundled.
+**and different history data models** — the blocker discovered while scoping
+this: `Agent` iterates `Vec<ConversationMessage>` (tool metadata + streaming
+events + `classify_model` + memory enrichment + `trim_history`), while
+`run_tool_call_loop` iterates `Vec<ChatMessage>` with `ApprovalBackend` +
+multimodal config. Collapsing them is not an extraction; it requires unifying
+that representation across every surface (TUI streaming, channel approval,
+gateway turn-based replay), so it is the one item that must be its own branch
+slice with a full `./dev/ci.sh all`, not rushed alongside the others.
+Recommended approach:
+1. First unify the history type (pick `ConversationMessage`; teach
+   `run_tool_call_loop` to consume it) — behind tests, no behavior change.
+2. Extract the shared per-iteration core (LLM → parse → execute → feed),
+   parameterized by `ApprovalBackend` (PR3) and prompt (PR1.1).
+3. Migrate channels/gateway to drive the shared core, preserving their
+   per-`(channel,sender)` history via `ConversationKey` (PR4-foundation).
+4. Land per-surface tests; verify TUI streaming, channel owner-gated approval,
+   and gateway replay each still work.
 
 ### PR4 — ConversationResolver + layered memory (Med)
 
