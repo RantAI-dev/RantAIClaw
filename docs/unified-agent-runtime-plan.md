@@ -120,7 +120,8 @@ Conversation id per surface (Hermes scheme):
 | **PR3b-safety** | Channel-accurate safety/preset text (couples to approval) | Med | ⏳ pending |
 | **PR4-foundation** | `ConversationKey` (one tested conversation-id) | Low | ✅ done (`59df725`) |
 | **PR4-memory** | Layered global/user/workspace/conversation memory + pairing | Med | ⏳ pending |
-| **PR2** | Collapse the two agent loops into one runtime | High (largest) | ⏳ pending |
+| **PR2-step1** | Extract shared LLM-call + streaming/cancel core | Med | ✅ done (`001dd5b`) |
+| **PR2-rest** | Unify history model + merge divergent loop feature sets | High (largest) | ⏳ pending |
 
 > **Note:** PR3 shipped before PR1.1/PR2 because it is the actual fix for the
 > original report ("can't do X on Telegram") and is self-contained. The
