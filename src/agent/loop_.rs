@@ -1913,6 +1913,8 @@ pub async fn run(
         config.api_key.as_deref(),
         &config,
     );
+    // Strict preset parity (PR3b): drop `shell` on the CLI one-shot path too.
+    tools::apply_preset_tool_filter(&mut tools_registry);
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
@@ -2417,6 +2419,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
         &config,
     );
+    // Strict preset parity (PR3b): drop `shell` here too — same as TUI/channels.
+    tools::apply_preset_tool_filter(&mut tools_registry);
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);

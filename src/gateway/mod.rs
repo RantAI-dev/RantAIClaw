@@ -415,6 +415,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     );
+    // Strict preset parity (PR3b): drop `shell` on the gateway path too.
+    tools::apply_preset_tool_filter(&mut base_tools);
 
     // Load skill tools from workspace and register them as real callable tools.
     // Skills define [[tools]] blocks in SKILL.toml that become shell/http tools.
