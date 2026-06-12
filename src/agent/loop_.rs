@@ -994,10 +994,12 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
-// Unified with the dispatcher's tool-call type (PR2): one `ParsedToolCall`
-// across both agent loops, carrying the optional native `tool_call_id` so the
-// shared executor can build provider tool messages without a second type.
-use crate::agent::dispatcher::ParsedToolCall;
+// Unified with the dispatcher's tool-call types (PR2): one `ParsedToolCall` and
+// one `ToolExecutionResult` across both agent loops, carrying the optional
+// native `tool_call_id` so the shared executor can build provider tool messages
+// without a second type.
+use crate::agent::dispatcher::{ParsedToolCall, ToolExecutionResult};
+use crate::agent::events::truncate_preview;
 
 #[derive(Debug)]
 pub(crate) struct ToolLoopCancelled;
@@ -1308,6 +1310,199 @@ async fn execute_tools_sequential(
 //   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
 
+/// Execute a single parsed tool call and return a structured result. Emits
+/// paired Start/End events, records observer events, and races the tool against
+/// `cancel` (returning `ToolLoopCancelled` if it fires mid-execution). `success`
+/// reflects the tool's real outcome; error text is folded into `output`.
+/// Shared executor for both agent loops (PR2 unification).
+pub(crate) async fn execute_one_tool_structured(
+    call: &ParsedToolCall,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    events: Option<&AgentEventSender>,
+) -> Result<ToolExecutionResult> {
+    let id = Uuid::new_v4().to_string();
+
+    let Some(tool) = find_tool(tools_registry, &call.name) else {
+        if let Some(tx) = events {
+            let _ = tx
+                .send(AgentEvent::ToolCallStart {
+                    id: id.clone(),
+                    name: call.name.clone(),
+                    args: serde_json::Value::Null,
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::ToolCallEnd {
+                    id,
+                    ok: false,
+                    output_preview: format!("Unknown tool: {}", call.name),
+                })
+                .await;
+        }
+        return Ok(ToolExecutionResult {
+            name: call.name.clone(),
+            output: format!("Unknown tool: {}", call.name),
+            success: false,
+            tool_call_id: call.tool_call_id.clone(),
+        });
+    };
+
+    if let Some(tx) = events {
+        let _ = tx
+            .send(AgentEvent::ToolCallStart {
+                id: id.clone(),
+                name: call.name.clone(),
+                args: call.arguments.clone(),
+            })
+            .await;
+    }
+    observer.record_event(&ObserverEvent::ToolCallStart {
+        tool: call.name.clone(),
+    });
+    let start = Instant::now();
+
+    let tool_future = tool.execute(call.arguments.clone());
+    let outcome = if let Some(token) = cancellation_token {
+        tokio::select! {
+            () = token.cancelled() => {
+                if let Some(tx) = events {
+                    let _ = tx.send(AgentEvent::ToolCallEnd {
+                        id, ok: false, output_preview: "[cancelled]".into(),
+                    }).await;
+                }
+                return Err(ToolLoopCancelled.into());
+            }
+            r = tool_future => r,
+        }
+    } else {
+        tool_future.await
+    };
+
+    let (output, success) = match outcome {
+        Ok(r) => {
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call.name.clone(),
+                duration: start.elapsed(),
+                success: r.success,
+            });
+            if r.success {
+                (r.output, true)
+            } else {
+                (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+            }
+        }
+        Err(e) => {
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call.name.clone(),
+                duration: start.elapsed(),
+                success: false,
+            });
+            (format!("Error executing {}: {e}", call.name), false)
+        }
+    };
+
+    if let Some(tx) = events {
+        let _ = tx
+            .send(AgentEvent::ToolCallEnd {
+                id,
+                ok: success,
+                output_preview: truncate_preview(&output),
+            })
+            .await;
+    }
+
+    Ok(ToolExecutionResult {
+        name: call.name.clone(),
+        output,
+        success,
+        tool_call_id: call.tool_call_id.clone(),
+    })
+}
+
+/// Execute a batch of tool calls, returning structured results in call order.
+///
+/// Applies the owner-gated approval (`ApprovalManager` + surface backend) to
+/// each call when `approval` is set; denied calls yield a structured result
+/// carrying the denial message instead of running. Runs concurrently when
+/// `parallel` is true — the caller decides, preserving each loop's policy.
+/// Shared by both agent loops (PR2 unification).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_tool_calls_collecting(
+    calls: &[ParsedToolCall],
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    parallel: bool,
+    cancellation_token: Option<&CancellationToken>,
+    events: Option<&AgentEventSender>,
+) -> Result<Vec<ToolExecutionResult>> {
+    if parallel {
+        let futures = calls.iter().map(|call| {
+            execute_one_tool_structured(call, tools_registry, observer, cancellation_token, events)
+        });
+        return futures_util::future::try_join_all(futures).await;
+    }
+
+    let mut results = Vec::with_capacity(calls.len());
+    for call in calls {
+        if let Some(mgr) = approval {
+            if mgr.needs_approval(&call.name) {
+                let request = ApprovalRequest {
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                };
+                let backend = crate::approval::default_backend_for(channel_name);
+                let decision = backend.decide(mgr, &request);
+                mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+                if decision == ApprovalResponse::No {
+                    if let Some(tx) = events {
+                        let denial_id = Uuid::new_v4().to_string();
+                        let _ = tx
+                            .send(AgentEvent::ToolCallStart {
+                                id: denial_id.clone(),
+                                name: call.name.clone(),
+                                args: call.arguments.clone(),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(AgentEvent::ToolCallEnd {
+                                id: denial_id,
+                                ok: false,
+                                output_preview: "[denied by user]".into(),
+                            })
+                            .await;
+                    }
+                    let msg = if channel_name == "cli" {
+                        "Denied by user.".to_string()
+                    } else {
+                        format!(
+                            "Tool '{}' denied: requires approval at current autonomy level. \
+                             Ask your supervisor to promote your autonomy level to use this tool.",
+                            call.name
+                        )
+                    };
+                    results.push(ToolExecutionResult {
+                        name: call.name.clone(),
+                        output: msg,
+                        success: false,
+                        tool_call_id: call.tool_call_id.clone(),
+                    });
+                    continue;
+                }
+            }
+        }
+
+        results.push(
+            execute_one_tool_structured(call, tools_registry, observer, cancellation_token, events)
+                .await?,
+        );
+    }
+    Ok(results)
+}
+
 /// Result of one provider chat that may be cancelled mid-flight.
 pub(crate) enum ChatTurnOutcome {
     /// The provider returned a response.
@@ -1603,34 +1798,26 @@ pub(crate) async fn run_tool_call_loop(
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
         let mut tool_results = String::new();
+        // Shared executor (PR2): the caller decides parallelism, preserving the
+        // prior policy — parallelize only non-approval batches of >1 call.
         let should_parallel = should_execute_tools_in_parallel(&tool_calls, approval);
-        let individual_results = if should_parallel {
-            execute_tools_parallel(
-                &tool_calls,
-                tools_registry,
-                observer,
-                cancellation_token.as_ref(),
-                events.as_ref(),
-            )
-            .await?
-        } else {
-            execute_tools_sequential(
-                &tool_calls,
-                tools_registry,
-                observer,
-                approval,
-                channel_name,
-                cancellation_token.as_ref(),
-                events.as_ref(),
-            )
-            .await?
-        };
+        let individual_results = execute_tool_calls_collecting(
+            &tool_calls,
+            tools_registry,
+            observer,
+            approval,
+            channel_name,
+            should_parallel,
+            cancellation_token.as_ref(),
+            events.as_ref(),
+        )
+        .await?;
 
         for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                call.name, result
+                call.name, result.output
             );
 
             // Loop detection: (name, args_json, hash(result)) triple.
@@ -1640,7 +1827,7 @@ pub(crate) async fn run_tool_call_loop(
             let result_hash = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                result.hash(&mut h);
+                result.output.hash(&mut h);
                 h.finish()
             };
             let key = (call.name.clone(), args_str, result_hash);
@@ -1691,7 +1878,7 @@ pub(crate) async fn run_tool_call_loop(
             for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
-                    "content": result,
+                    "content": result.output,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
