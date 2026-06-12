@@ -995,6 +995,91 @@ async fn xml_dispatcher_multi_turn_preserves_structured_tool_history() {
     );
 }
 
+/// Memory mock that records the `session_id` each `store` was called with, so a
+/// test can assert turn memory is written under the agent's conversation scope.
+struct RecordingMemory {
+    stored: Arc<Mutex<Vec<(String, Option<String>)>>>,
+}
+
+#[async_trait]
+impl Memory for RecordingMemory {
+    fn name(&self) -> &str {
+        "recording"
+    }
+    async fn store(
+        &self,
+        key: &str,
+        _content: &str,
+        _category: crate::memory::MemoryCategory,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        self.stored
+            .lock()
+            .unwrap()
+            .push((key.to_string(), session_id.map(|s| s.to_string())));
+        Ok(())
+    }
+    async fn recall(
+        &self,
+        _q: &str,
+        _l: usize,
+        _s: Option<&str>,
+    ) -> Result<Vec<crate::memory::MemoryEntry>> {
+        Ok(vec![])
+    }
+    async fn get(&self, _k: &str) -> Result<Option<crate::memory::MemoryEntry>> {
+        Ok(None)
+    }
+    async fn list(
+        &self,
+        _c: Option<&crate::memory::MemoryCategory>,
+        _s: Option<&str>,
+    ) -> Result<Vec<crate::memory::MemoryEntry>> {
+        Ok(vec![])
+    }
+    async fn forget(&self, _k: &str) -> Result<bool> {
+        Ok(false)
+    }
+    async fn count(&self) -> Result<usize> {
+        Ok(0)
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+}
+
+/// End-to-end: an agent built with a `conversation_id` writes its turn memory
+/// under that scope (write side of layered memory). With no conversation_id it
+/// would store globally (`None`) — the prior behavior.
+#[tokio::test]
+async fn turn_stores_memory_under_conversation_scope() {
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let memory = Arc::new(RecordingMemory {
+        stored: recorded.clone(),
+    });
+    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+    let mut agent = Agent::builder()
+        .provider(provider)
+        .tools(vec![])
+        .memory(memory)
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .auto_save(true)
+        .conversation_id(Some("telegram:123".to_string()))
+        .build()
+        .unwrap();
+
+    let _ = agent.turn("hello").await.unwrap();
+
+    let recs = recorded.lock().unwrap();
+    assert!(
+        recs.iter()
+            .any(|(k, sid)| k == "user_msg" && sid.as_deref() == Some("telegram:123")),
+        "user_msg should be stored under the conversation scope, got {recs:?}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 16. Builder validation
 // ═══════════════════════════════════════════════════════════════════════════

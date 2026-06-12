@@ -53,6 +53,11 @@ pub struct Agent {
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
+    /// Conversation scope for layered memory. `None` (default) stores and
+    /// recalls turn memory globally — prior behavior. When set, this agent's
+    /// turn memory is stored under and recalled from this conversation id
+    /// (via `recall_layered`), so distinct conversations don't bleed context.
+    conversation_id: Option<String>,
 }
 
 pub struct AgentBuilder {
@@ -73,6 +78,7 @@ pub struct AgentBuilder {
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
+    conversation_id: Option<String>,
 }
 
 impl AgentBuilder {
@@ -95,7 +101,15 @@ impl AgentBuilder {
             auto_save: None,
             classification_config: None,
             available_hints: None,
+            conversation_id: None,
         }
+    }
+
+    /// Scope this agent's turn memory to a conversation id (layered memory).
+    /// Omit for the default global behavior.
+    pub fn conversation_id(mut self, conversation_id: Option<String>) -> Self {
+        self.conversation_id = conversation_id;
+        self
     }
 
     pub fn provider(mut self, provider: Box<dyn Provider>) -> Self {
@@ -234,6 +248,7 @@ impl AgentBuilder {
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
+            conversation_id: self.conversation_id,
         })
     }
 }
@@ -885,20 +900,30 @@ impl Agent {
                 )));
         }
 
+        // Store and recall turn memory under this agent's conversation scope.
+        // `None` (default) keeps the prior global behavior; when set, write-side
+        // (`store`) and read-side (`recall_layered`) agree so a conversation's
+        // memory is isolated yet still backfilled from shared/global memory.
+        let conversation_scope = self.conversation_id.as_deref();
+
         if self.auto_save {
             let _ = self
                 .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation, None)
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    conversation_scope,
+                )
                 .await;
         }
 
-        // Conversation scope is `None` here: the interactive agent stores its
-        // turn memory globally, so layered recall has nothing conversation-
-        // scoped to surface yet. The loader still routes through recall_layered,
+        // Loader routes through recall_layered with the same conversation scope
+        // used for writes above, so reads and writes stay consistent.
         // ready for when write-side scoping threads a conversation_id through.
         let context = self
             .memory_loader
-            .load_context(self.memory.as_ref(), user_message, None)
+            .load_context(self.memory.as_ref(), user_message, conversation_scope)
             .await
             .unwrap_or_default();
 
