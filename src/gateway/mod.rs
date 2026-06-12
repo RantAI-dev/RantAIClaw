@@ -1099,7 +1099,10 @@ async fn process_channel_chat(
     sender: &str,
     message: &str,
 ) -> anyhow::Result<String> {
-    let key = format!("{channel_name}:{sender}");
+    // Single source of truth for conversation identity (PR4 foundation).
+    // Behaviour-preserving for the no-thread case; thread-aware when channel
+    // adapters start plumbing a thread id through.
+    let key = crate::channels::conversation::ConversationKey::new(channel_name, sender).resolve();
     // Prior conversation turns so the bot remembers the exchange.
     let prior = state.channel_approvals.history(&key);
 

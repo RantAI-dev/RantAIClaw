@@ -17,6 +17,7 @@
 pub mod approval_relay;
 pub mod auto_start_state;
 pub mod cli;
+pub mod conversation;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
