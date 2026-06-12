@@ -338,7 +338,11 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
                     .get("arguments")
                     .or_else(|| function.get("parameters")),
             );
-            return Some(ParsedToolCall { name, arguments });
+            return Some(ParsedToolCall {
+                name,
+                arguments,
+                tool_call_id: None,
+            });
         }
     }
 
@@ -355,7 +359,11 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
 
     let arguments =
         parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
-    Some(ParsedToolCall { name, arguments })
+    Some(ParsedToolCall {
+        name,
+        arguments,
+        tool_call_id: None,
+    })
 }
 
 fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedToolCall> {
@@ -489,6 +497,7 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
         calls.push(ParsedToolCall {
             name: tool_name.to_string(),
             arguments: serde_json::Value::Object(args),
+            tool_call_id: None,
         });
     }
 
@@ -893,6 +902,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 calls.push(ParsedToolCall {
                     name: name.clone(),
                     arguments: args.clone(),
+                    tool_call_id: None,
                 });
                 if let Some(r) = raw {
                     cleaned_text = cleaned_text.replace(r, "");
@@ -930,6 +940,7 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
             name: call.name.clone(),
             arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+            tool_call_id: Some(call.id.clone()),
         })
         .collect()
 }
@@ -983,11 +994,10 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
-#[derive(Debug)]
-struct ParsedToolCall {
-    name: String,
-    arguments: serde_json::Value,
-}
+// Unified with the dispatcher's tool-call type (PR2): one `ParsedToolCall`
+// across both agent loops, carrying the optional native `tool_call_id` so the
+// shared executor can build provider tool messages without a second type.
+use crate::agent::dispatcher::ParsedToolCall;
 
 #[derive(Debug)]
 pub(crate) struct ToolLoopCancelled;
@@ -2902,6 +2912,7 @@ mod tests {
         let calls = vec![ParsedToolCall {
             name: "file_read".to_string(),
             arguments: serde_json::json!({"path": "a.txt"}),
+            tool_call_id: None,
         }];
 
         assert!(!should_execute_tools_in_parallel(&calls, None));
@@ -2913,10 +2924,12 @@ mod tests {
             ParsedToolCall {
                 name: "shell".to_string(),
                 arguments: serde_json::json!({"command": "pwd"}),
+                tool_call_id: None,
             },
             ParsedToolCall {
                 name: "http_request".to_string(),
                 arguments: serde_json::json!({"url": "https://example.com"}),
+                tool_call_id: None,
             },
         ];
         let approval_cfg = crate::config::AutonomyConfig::default();
@@ -2934,10 +2947,12 @@ mod tests {
             ParsedToolCall {
                 name: "shell".to_string(),
                 arguments: serde_json::json!({"command": "pwd"}),
+                tool_call_id: None,
             },
             ParsedToolCall {
                 name: "http_request".to_string(),
                 arguments: serde_json::json!({"url": "https://example.com"}),
+                tool_call_id: None,
             },
         ];
         let approval_cfg = crate::config::AutonomyConfig {
