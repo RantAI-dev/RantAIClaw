@@ -1117,23 +1117,12 @@ async fn process_channel_chat(
                 // their own request). Deny is handled above and is safe for
                 // anyone. Re-stash the pending request on refusal so a real
                 // owner can still approve it.
-                let owners = {
-                    state
-                        .config
-                        .lock()
-                        .channels_config
-                        .approval_owners
-                        .clone()
-                };
+                let owners = { state.config.lock().channels_config.approval_owners.clone() };
                 if !crate::approval::can_approve(&owners, sender) {
-                    state
-                        .channel_approvals
-                        .set_pending(&key, original, tools);
-                    return Ok(
-                        "You're not authorized to approve tool actions here. \
+                    state.channel_approvals.set_pending(&key, original, tools);
+                    return Ok("You're not authorized to approve tool actions here. \
                          Ask an owner to reply Y or A."
-                            .to_string(),
-                    );
+                        .to_string());
                 }
                 if reply == channel_approval::ApprovalReply::Always {
                     state.channel_approvals.remember_always(&key, &tools);

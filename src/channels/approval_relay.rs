@@ -309,7 +309,8 @@ mod tests {
 
         // Reply comes from an authorized owner.
         let owners = vec!["owner1".to_string()];
-        let ack = try_handle_reply("/allow brew", &security, "owner1", &owners).expect("recognised");
+        let ack =
+            try_handle_reply("/allow brew", &security, "owner1", &owners).expect("recognised");
         assert!(ack.contains("session"));
         assert!(ack.contains("retry"));
 
@@ -346,7 +347,8 @@ mod tests {
             .contains(&"brew".to_string()));
 
         // The pending request is still open; a real owner can resolve it.
-        let ack = try_handle_reply("/allow brew", &security, "owner1", &owners).expect("recognised");
+        let ack =
+            try_handle_reply("/allow brew", &security, "owner1", &owners).expect("recognised");
         assert!(ack.contains("session"));
         assert_eq!(task.await.unwrap(), Decision::Session);
     }
