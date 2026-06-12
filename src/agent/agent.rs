@@ -1,6 +1,4 @@
-use crate::agent::dispatcher::{
-    NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
-};
+use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::events::{AgentEvent, AgentEventSender, TurnResult};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
@@ -13,7 +11,6 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
-use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -848,217 +845,51 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
-        for _ in 0..self.config.max_tool_iterations {
-            if cancel.is_some_and(CancellationToken::is_cancelled) {
-                return Ok(TurnResult {
+        // Drive the ONE shared agentic loop (PR2). The Agent already keeps
+        // structured `ConversationMessage` history, so it passes it (and its
+        // dispatcher) straight through — no conversion. `approval = None`
+        // because the interactive agent gates via the shell relay, not an
+        // ApprovalManager; streaming goes through `events`.
+        let result = crate::agent::loop_::run_structured_loop(
+            self.provider.as_ref(),
+            &mut self.history,
+            self.tool_dispatcher.as_ref(),
+            &self.tools,
+            self.observer.as_ref(),
+            "agent",
+            &effective_model,
+            self.temperature,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            self.config.max_tool_iterations,
+            cancel.cloned(),
+            None,
+            events.cloned(),
+        )
+        .await;
+
+        self.trim_history();
+
+        match result {
+            Ok(text) => Ok(TurnResult {
+                text,
+                usage: empty_usage(&effective_model),
+                cancelled: false,
+            }),
+            // The shared loop signals cancellation via `ToolLoopCancelled`.
+            Err(e)
+                if e.downcast_ref::<crate::agent::loop_::ToolLoopCancelled>()
+                    .is_some() =>
+            {
+                Ok(TurnResult {
                     text: String::new(),
                     usage: empty_usage(&effective_model),
                     cancelled: true,
-                });
+                })
             }
-
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let request = ChatRequest {
-                messages: &messages,
-                tools: if self.tool_dispatcher.should_send_tool_specs() {
-                    Some(&self.tool_specs)
-                } else {
-                    None
-                },
-            };
-
-            // True streaming path: when an events consumer is attached and
-            // the provider supports SSE, use chat_stream so deltas reach
-            // the TUI as the model produces them. Tool-call detection
-            // still works on the assembled `full_text` for prompt-guided
-            // dispatchers; native tool_call deltas are not yet parsed
-            // mid-stream and will be picked up only at end-of-stream.
-            // `streamed_inline` also gates whether we re-emit the final text
-            // below, so keep it computed here.
-            let streamed_inline = events.is_some() && self.provider.supports_streaming();
-
-            // Shared with `run_tool_call_loop` — one place for the streaming +
-            // cancellation plumbing (unified-agent-runtime PR2, step 1).
-            let response = match crate::agent::loop_::chat_with_optional_streaming(
-                self.provider.as_ref(),
-                request,
-                &effective_model,
-                self.temperature,
-                cancel,
-                events,
-            )
-            .await?
-            {
-                crate::agent::loop_::ChatTurnOutcome::Completed(resp) => resp,
-                crate::agent::loop_::ChatTurnOutcome::Cancelled => {
-                    return Ok(TurnResult {
-                        text: String::new(),
-                        usage: empty_usage(&effective_model),
-                        cancelled: true,
-                    });
-                }
-            };
-
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
-            if calls.is_empty() {
-                let final_text = if text.is_empty() {
-                    response.text.unwrap_or_default()
-                } else {
-                    text
-                };
-
-                // When we already streamed deltas inline, don't re-emit
-                // the whole text — the TUI already has it via Chunk events.
-                if !streamed_inline {
-                    if let Some(tx) = events {
-                        if !final_text.is_empty() {
-                            let _ = tx.send(AgentEvent::Chunk(final_text.clone())).await;
-                        }
-                    }
-                }
-
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        final_text.clone(),
-                    )));
-                self.trim_history();
-
-                return Ok(TurnResult {
-                    text: final_text,
-                    usage: empty_usage(&effective_model),
-                    cancelled: false,
-                });
-            }
-
-            if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
-                if events.is_none() {
-                    // Preserve CLI streaming behavior only when no structured
-                    // events consumer is attached.
-                    print!("{text}");
-                    let _ = std::io::stdout().flush();
-                }
-            }
-
-            self.history.push(ConversationMessage::AssistantToolCalls {
-                text: response.text.clone(),
-                tool_calls: response.tool_calls.clone(),
-            });
-
-            let results = self.execute_tools_with_events(&calls, events, cancel).await;
-            let results = match results {
-                Ok(r) => r,
-                Err(cancelled) if cancelled => {
-                    return Ok(TurnResult {
-                        text: String::new(),
-                        usage: empty_usage(&effective_model),
-                        cancelled: true,
-                    });
-                }
-                Err(_) => unreachable!("execute_tools_with_events only fails on cancellation"),
-            };
-            let formatted = self.tool_dispatcher.format_results(&results);
-            self.history.push(formatted);
-            self.trim_history();
-        }
-
-        // Hit the iteration cap. Instead of bailing with an opaque
-        // anyhow error (which surfaces in the TUI as "[no response
-        // from model]"), do ONE final non-tool LLM round asking the
-        // model to summarize what it gathered. The user gets the value
-        // of the work that already ran rather than a blank turn.
-        let cap_prompt = format!(
-            "You hit the tool-call iteration cap ({} calls). Summarize \
-             what you found from the calls above and answer the user's \
-             original question with whatever data you have. Do NOT call \
-             any more tools — just respond in plain text.",
-            self.config.max_tool_iterations
-        );
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::system(cap_prompt)));
-        let final_messages = self.tool_dispatcher.to_provider_messages(&self.history);
-        let final_request = ChatRequest {
-            messages: &final_messages,
-            tools: None, // disable tools so the model can't keep looping
-        };
-        let final_response = match self
-            .provider
-            .chat(final_request, &effective_model, self.temperature)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // Even the summary call failed — fall back to the
-                // original bail behaviour so the user at least knows
-                // something went wrong.
-                anyhow::bail!(
-                    "Agent exceeded maximum tool iterations ({}) and the cap-summary fallback also failed: {e}",
-                    self.config.max_tool_iterations
-                );
-            }
-        };
-        let summary_text = final_response.text.unwrap_or_default();
-        let body = if summary_text.is_empty() {
-            format!(
-                "I hit the tool-call iteration cap ({}) before I could \
-                 finalise. Raise `agent.max_tool_iterations` in your \
-                 config.toml or rephrase the request to fewer steps.",
-                self.config.max_tool_iterations
-            )
-        } else {
-            summary_text
-        };
-        if let Some(tx) = events {
-            let _ = tx.send(AgentEvent::Chunk(body.clone())).await;
-        }
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::assistant(
-                body.clone(),
-            )));
-        self.trim_history();
-        Ok(TurnResult {
-            text: body,
-            usage: empty_usage(&effective_model),
-            cancelled: false,
-        })
-    }
-
-    /// Execute tool calls while emitting `ToolCallStart`/`ToolCallEnd` events
-    /// when a consumer is attached. Returns `Err(true)` if cancelled between
-    /// tool dispatches.
-    async fn execute_tools_with_events(
-        &self,
-        calls: &[ParsedToolCall],
-        events: Option<&AgentEventSender>,
-        cancel: Option<&CancellationToken>,
-    ) -> std::result::Result<Vec<ToolExecutionResult>, bool> {
-        // Delegate to the shared executor (PR2 unification) — the same one
-        // `run_tool_call_loop` uses. Serialize when streaming events so
-        // Start/End ordering matches observer ordering; otherwise parallelize
-        // per config (the prior policy). The Agent runs interactively without
-        // an ApprovalManager (shell-relay handles its gating), so `approval`
-        // is None and the channel is "cli".
-        let parallel = self.config.parallel_tools && events.is_none();
-        match crate::agent::loop_::execute_tool_calls_collecting(
-            calls,
-            &self.tools,
-            self.observer.as_ref(),
-            None,
-            "cli",
-            parallel,
-            cancel,
-            events,
-        )
-        .await
-        {
-            Ok(results) => Ok(results),
-            // The shared executor only errors on cancellation (tool failures
-            // are folded into the result), so map any error to the turn-level
-            // cancel signal the caller expects.
-            Err(_) => Err(true),
+            Err(e) => Err(e),
         }
     }
 
