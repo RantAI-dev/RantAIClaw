@@ -131,10 +131,33 @@ adds an approval path, behind the owner gate.
 - Route `build_system_prompt_with_mode` and the gateway through
   `SystemPromptBuilder`, preserving the stable-prefix-then-volatile ordering for
   prompt-cache hit rate.
-- **Caveat to handle:** the Strict-preset Safety text says "shell is NOT
-  registered" — true on TUI (filtered in `Agent::from_config`) but channels do
-  not currently apply that filter. PR1 must reconcile shell-registration parity
-  before emitting preset text on channels, or scope the preset text accurately.
+
+#### Slices
+
+- **PR1.0 — persona parity (DONE, commit `c3ee0d4`).** Extracted
+  `render_persona_section()` as a single source of truth; injected into the
+  channel/gateway prompt. Text-only, decoupled from approval, tested.
+- **PR1.1 — structural builder convergence (pending).** Route channels/gateway
+  through one builder via a shared tool descriptor. This *changes channel prompt
+  output* (full vs tz-only timestamp, tool schemas, section order), so it is a
+  reviewable, outward-facing product change and will touch the ~30 channel
+  prompt tests — not a free refactor.
+
+#### Discoveries (refine the design)
+
+1. **The Safety/approval-preset section moves to PR3, not PR1.** It is coupled
+   to the approval model: the Strict text claims "shell is NOT registered",
+   which is true on the TUI (`Agent::from_config` filters it at
+   `src/agent/agent.rs:389`) but **false on channels** —
+   `src/channels/mod.rs:2878` (`all_tools_with_runtime`) never applies that
+   filter. And today every approval-required tool is auto-denied on channels
+   regardless of preset, so preset text would mislead the model about what it
+   can do. Port the Safety section only once PR3 gives channels a real,
+   owner-gated approval path that honors the preset.
+2. **Strict-mode shell filter is missing on channels** — a pre-existing
+   read-only-policy gap (Strict is meant to remove `shell`, but channels keep
+   it registered; it is auto-denied at the gate but still advertised). Fold the
+   filter into PR3 so Strict means the same thing on every surface.
 
 ## 4. Non-goals
 
