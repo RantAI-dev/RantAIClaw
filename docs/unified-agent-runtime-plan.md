@@ -133,7 +133,9 @@ Conversation id per surface (Hermes scheme):
 
 **Only remaining item: PR2-rest** — the atomic loop collapse (proven scope below).
 | **PR2-step1** | Extract shared LLM-call + streaming/cancel core | Med | ✅ done (`001dd5b`) |
-| **PR2-rest** | Unify history model + merge divergent loop feature sets | High (largest) | ⏳ pending |
+| **PR2-rest-a** | Unify `ParsedToolCall` + `ToolExecutionResult` types | Med | ✅ done (`ce4b7d3`) |
+| **PR2-rest-b** | Shared tool executor (both loops use `execute_tool_calls_collecting`) | Med | ✅ done (`379ace8`,`91a226e`,`b7cb699`) |
+| **PR2-rest-c** | Merge orchestration bodies over one history model (`run_structured_loop`) | High | ⏳ in progress |
 
 > **Note:** PR3 shipped before PR1.1/PR2 because it is the actual fix for the
 > original report ("can't do X on Telegram") and is self-contained. The
