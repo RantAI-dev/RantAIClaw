@@ -1895,6 +1895,17 @@ pub fn build_system_prompt_with_mode(
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
 
+    // ── 0. Persona ──────────────────────────────────────────────
+    // Render FIRST so its tone/role guidance frames everything that follows.
+    // Shared with the TUI/`Agent`-struct prompt path via the single
+    // `render_persona_section()` source of truth, so a `personality` change
+    // reshapes the agent's voice on channels + gateway too — not just the TUI.
+    let persona = crate::agent::prompt::render_persona_section();
+    if !persona.trim().is_empty() {
+        prompt.push_str(persona.trim_end());
+        prompt.push_str("\n\n");
+    }
+
     // ── 1. Tooling ──────────────────────────────────────────────
     if !tools.is_empty() {
         prompt.push_str("## Tools\n\n");

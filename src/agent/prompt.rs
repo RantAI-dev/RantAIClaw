@@ -80,6 +80,33 @@ impl SystemPromptBuilder {
     }
 }
 
+/// Render the active profile's persona as a `## Persona` section, or an empty
+/// string when no persona is configured (fresh installs, headless tests, a
+/// profile without a `persona/` dir).
+///
+/// Single source of truth shared by [`PersonaSection`] (the `Agent`-struct /
+/// TUI prompt path) and the channel/gateway prompt path
+/// (`crate::channels::build_system_prompt_with_mode`), so every surface speaks
+/// in the same configured voice instead of only the TUI honoring `personality`.
+pub fn render_persona_section() -> String {
+    let profile = match crate::profile::ProfileManager::active() {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+    let persona = match crate::persona::read_persona_toml(&profile) {
+        Ok(Some(p)) => p,
+        _ => return String::new(),
+    };
+    let rendered = persona.render();
+    if rendered.trim().is_empty() {
+        return String::new();
+    }
+    // Wrap in an explicit section header so model output reflects intent
+    // (otherwise the persona body is just an unmarked markdown blob with no
+    // provenance).
+    format!("## Persona\n\n{}\n", rendered.trim())
+}
+
 pub struct PersonaSection;
 pub struct IdentitySection;
 pub struct ToolsSection;
@@ -106,22 +133,7 @@ impl PromptSection for PersonaSection {
     /// persona is configured (fresh installs, headless tests, profile
     /// without a `persona/` dir) — silent rather than noisy.
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        let profile = match crate::profile::ProfileManager::active() {
-            Ok(p) => p,
-            Err(_) => return Ok(String::new()),
-        };
-        let persona = match crate::persona::read_persona_toml(&profile) {
-            Ok(Some(p)) => p,
-            _ => return Ok(String::new()),
-        };
-        let rendered = persona.render();
-        if rendered.trim().is_empty() {
-            return Ok(String::new());
-        }
-        // Wrap in an explicit section header so model output reflects
-        // intent (otherwise the persona body is just an unmarked
-        // markdown blob with no provenance).
-        Ok(format!("## Persona\n\n{}\n", rendered.trim()))
+        Ok(render_persona_section())
     }
 }
 
