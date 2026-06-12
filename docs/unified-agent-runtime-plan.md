@@ -228,9 +228,20 @@ multimodal config. Collapsing them is not an extraction; it requires unifying
 that representation across every surface (TUI streaming, channel approval,
 gateway turn-based replay), so it is the one item that must be its own branch
 slice with a full `./dev/ci.sh all`, not rushed alongside the others.
+**Compiler-verified divergences** (each must be reconciled first; found by
+attempting the merge): the loops use *separate* `ParsedToolCall` types
+(`loop_::ParsedToolCall { name, arguments }` vs
+`dispatcher::ParsedToolCall { name, arguments, tool_call_id }`, threaded through
+~6 parse fns), separate tool-result types (`String` vs `ToolExecutionResult`),
+separate history models (`ChatMessage` vs `ConversationMessage`), and per-quirk
+behavior (success-always-true on the Agent path, parallel-with-events policy,
+`ToolLoopCancelled` vs `Err(true)` cancellation). A shared executor won't even
+compile until the `ParsedToolCall` types are unified first.
+
 Recommended approach:
-1. First unify the history type (pick `ConversationMessage`; teach
-   `run_tool_call_loop` to consume it) — behind tests, no behavior change.
+1. First unify the parse types (`ParsedToolCall`) and the history type
+   (`ConversationMessage`); teach `run_tool_call_loop` to consume them — behind
+   tests, no behavior change.
 2. Extract the shared per-iteration core (LLM → parse → execute → feed),
    parameterized by `ApprovalBackend` (PR3) and prompt (PR1.1).
 3. Migrate channels/gateway to drive the shared core, preserving their
