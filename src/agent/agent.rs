@@ -892,9 +892,13 @@ impl Agent {
                 .await;
         }
 
+        // Conversation scope is `None` here: the interactive agent stores its
+        // turn memory globally, so layered recall has nothing conversation-
+        // scoped to surface yet. The loader still routes through recall_layered,
+        // ready for when write-side scoping threads a conversation_id through.
         let context = self
             .memory_loader
-            .load_context(self.memory.as_ref(), user_message)
+            .load_context(self.memory.as_ref(), user_message, None)
             .await
             .unwrap_or_default();
 
