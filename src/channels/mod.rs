@@ -899,10 +899,11 @@ async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
+    conversation_id: Option<&str>,
 ) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = crate::memory::recall_layered(mem, user_msg, 5, conversation_id).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
@@ -1391,6 +1392,14 @@ async fn process_channel_message(
             return;
         }
     };
+    // Conversation scope for layered memory: one scope per chat/thread on this
+    // surface (channel:sender[:thread]), the same identity used for history
+    // keying. Stores and recalls are scoped to it so one chat's memory doesn't
+    // bleed into another's, while shared/global memory still backfills.
+    let conversation_scope = conversation::ConversationKey::new(&msg.channel, &msg.sender)
+        .in_thread(msg.thread_ts.as_deref())
+        .resolve();
+
     if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -1399,7 +1408,7 @@ async fn process_channel_message(
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
-                None,
+                Some(conversation_scope.as_str()),
             )
             .await;
     }
@@ -1430,8 +1439,13 @@ async fn process_channel_message(
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
     if !had_prior_history {
-        let memory_context =
-            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
+        let memory_context = build_memory_context(
+            ctx.memory.as_ref(),
+            &msg.content,
+            ctx.min_relevance_score,
+            Some(conversation_scope.as_str()),
+        )
+        .await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
                 last_turn.content = format!("{memory_context}{}", msg.content);
@@ -5206,9 +5220,28 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age", 0.0).await;
+        let context = build_memory_context(&mem, "age", 0.0, None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
+    }
+
+    #[tokio::test]
+    async fn build_memory_context_surfaces_conversation_scoped_entry() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        // Stored under a specific conversation scope (as the channel autosave
+        // now does), it must be recalled when that conversation asks.
+        mem.store(
+            "scoped_fact",
+            "Project ships Friday",
+            MemoryCategory::Conversation,
+            Some("telegram:u1"),
+        )
+        .await
+        .unwrap();
+
+        let context = build_memory_context(&mem, "ship", 0.0, Some("telegram:u1")).await;
+        assert!(context.contains("Project ships Friday"));
     }
 
     #[tokio::test]
