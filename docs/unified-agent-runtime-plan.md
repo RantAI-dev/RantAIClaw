@@ -116,8 +116,9 @@ Conversation id per surface (Hermes scheme):
 | **PR1.0** | Persona parity on channels (shared `render_persona_section`) | Low | ✅ done (`c3ee0d4`) |
 | **PR1.1** | Builder convergence — channels/gateway run the one `SystemPromptBuilder` | Low–Med | ✅ done (`77455e2`) |
 | **PR3** | `ApprovalBackend` + owner-authority gate; remove `channel_name=="cli"` | High (security) | ✅ done (`71b1768`) |
-| **PR3b-strict** | Strict shell-filter parity on channels | Med | ✅ done (`a2e634b`) |
-| **PR3b-safety** | Channel-accurate safety/preset text (couples to approval) | Med | ⏳ pending |
+| **PR3-relay** | `ChatRelayApprovalBackend` — in-chat owner `/approve` for whole-tool gating on polling channels | High (security) | ✅ done (`cd3ba8e`) |
+| **PR3b-strict** | Strict shell-filter parity on channels | Med | ✅ done (`a2e634b`, `222d6ea`) |
+| **PR3b-safety** | Channel-accurate safety/preset text (couples to approval) | Med | ✅ done (`39c17d4`) |
 | **PR4-foundation** | `ConversationKey` (one tested conversation-id) | Low | ✅ done (`59df725`) |
 | **PR4-memory-read** | `recall_layered` — conversation-scoped + global layering | Low | ✅ done (`d8c0478`) |
 | **PR4-memory-loader** | Memory loader routes through `recall_layered` (conversation_id param) | Low | ✅ done (`34746b9`) |
@@ -224,13 +225,27 @@ Steps:
    (`src/channels/mod.rs` `#[test] build_system_prompt_*`). This is an
    outward-facing change (every channel user's prompt) — diff-review it.
 
-### PR3b-safety — port the Safety/autonomy-preset section to channels (Med)
+### PR3b-safety — Safety/autonomy-preset section on channels (Med) — ✅ done (`39c17d4`)
 
-Now unblocked (PR3b-strict landed). The `SafetySection` preset text
-(`src/agent/prompt.rs:195`) is now accurate on channels (Strict really does
-drop `shell` there). Resolve the active preset + allowlist inside the channel
-builder (as `Agent::build_system_prompt` does at `agent.rs:707`) and emit the
-section. Folds naturally into PR1.1's shared builder.
+`SafetySection` is now surface-aware: the channel builder resolves the active
+preset and `SafetySection` renders **channel-accurate** approval text for
+Smart/Manual (owner `/approve` in chat, decline otherwise — not the TUI's
+inline Y/N/A), while Strict/Off read the same on both surfaces. The shell
+allowlist globs are deliberately not surfaced on channels (Layer-A gating
+makes them moot). Folded into PR1.1's shared builder.
+
+### PR3-relay — in-chat owner tool approval (High) — ✅ done (`cd3ba8e`)
+
+Completes PR3's `ApprovalBackend` design. `ApprovalBackend::decide` is async;
+`ChatRelayApprovalBackend` (channels) posts a pending tool call to the chat
+and awaits an authorized owner's `/approve` / `/deny` via a dedicated
+`PendingApprovals` registry (5-min auto-deny). `try_handle_tool_reply`
+resolves it, owner-gated by `can_approve` (approve owner-only; deny anyone).
+The backend is threaded through the unified loop as an optional
+`&dyn ApprovalBackend` (`None` ⇒ name-derived default, so TUI/gateway/delegate
+are behavior-preserving) and built per channel message only when gating is
+active AND an owner is configured AND a reply target exists. With no
+`approval_owners`, channels still auto-deny — no silent broadening.
 
 ### PR2 — collapse the two agent loops (High, largest)
 

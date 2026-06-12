@@ -26,15 +26,20 @@ The behavior is covered by the in-tree suites — run them scoped (never the who
 crate at once; it OOMs):
 
 ```bash
-cargo test --lib agent::          # 174 — loop, prompt, memory scoping, gate test
-cargo test --lib channels::       # 596 — channel prompt + memory + owner gate
+cargo test --lib agent::          # 178 — loop, prompt, memory scoping, gate test, injected-backend
+cargo test --lib channels::       # 603 — channel prompt + memory + owner gate + tool relay
 cargo test --lib gateway::        # 62  — SSE, channel approval owner gate
-cargo test --lib approval         # 72  — owner gate + ApprovalBackend
+cargo test --lib approval         # 80  — owner gate + ApprovalBackend
 cargo test --lib memory           # recall_layered, scoping
 ```
 
-Key gate test for the loop collapse:
-`agent::tests::xml_dispatcher_multi_turn_preserves_structured_tool_history`.
+Key gate tests:
+- loop collapse: `agent::loop_::tests::xml_dispatcher_multi_turn_preserves_structured_tool_history`
+- safety text per surface: `agent::prompt::tests::safety_section_channel_*`
+- in-chat approval seam: `agent::loop_::tests::injected_backend_overrides_non_cli_auto_deny`
+  (None backend on a channel auto-denies; an injected backend runs the tool)
+- relay owner gate: `channels::approval_relay::tests::tool_reply_*` +
+  `chat_relay_backend_*` (post→approve→Yes, timeout→deny)
 
 ## Manual checks per change
 
@@ -43,6 +48,7 @@ Key gate test for the loop collapse:
 | **PR1.1 unified prompt** | `dev/sandbox.sh agent -m "hi"` (needs key) — one builder now feeds CLI/channels/gateway; the TUI path is the same builder. Compare against `dev/sandbox.sh` (TUI). |
 | **PR2 one loop** | `dev/sandbox.sh agent -m "run a tool then summarize"` — both the TUI and CLI now drive `run_structured_loop`; a tool-calling turn that completes confirms it. |
 | **PR3 owner-gate** | Set `approval_owners` in the sandbox config (or via a channel). With it empty, an approval-required tool is auto-denied on a channel; with your sender id listed, only *your* `Y`/`A` reply is honored. (Full path needs a configured channel + key.) |
+| **PR3-relay in-chat approval** | With `approval_owners = ["<your-id>"]` and tool-gating on (default), ask the channel bot to run a non-read-only tool. It posts `🔧 …/approve <tool>` to the chat and waits; reply `/approve <tool>` (as the owner) → it runs, `/deny <tool>` → it fails. A non-owner's `/approve` is refused; no reply within 5 min auto-denies. Empty `approval_owners` ⇒ no prompt, straight auto-deny. |
 | **PR3b strict parity** | `/autonomy strict` (TUI) then confirm `shell` is absent from the tool list on both TUI and a channel. |
 | **PR4 memory scoping** | `dev/sandbox.sh memory list` — store lives at `dev-sandbox/.../workspace/memory/brain.db`. Conversation-scoping (`recall_layered`) is unit-tested; the channel/Agent paths key memory by `ConversationKey` (`channel:sender[:thread]`). |
 | **`XDG_DATA_HOME` test-isolation fix** | `cargo test --lib gateway::` repeated — `sse_chat_emits_chunk_then_done` is now stable (was flaky). |
