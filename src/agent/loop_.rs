@@ -5,7 +5,8 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, ConversationMessage, Provider, ProviderCapabilityError,
+    ToolCall,
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -945,34 +946,6 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
         .collect()
 }
 
-/// Build assistant history entry in JSON format for native tool-call APIs.
-/// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
-/// the proper `NativeMessage` with structured `tool_calls`.
-fn build_native_assistant_history(text: &str, tool_calls: &[ToolCall]) -> String {
-    let calls_json: Vec<serde_json::Value> = tool_calls
-        .iter()
-        .map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
-            })
-        })
-        .collect();
-
-    let content = if text.trim().is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(text.trim().to_string())
-    };
-
-    serde_json::json!({
-        "content": content,
-        "tool_calls": calls_json,
-    })
-    .to_string()
-}
-
 fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
     let mut parts = Vec::new();
 
@@ -998,7 +971,9 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
 // one `ToolExecutionResult` across both agent loops, carrying the optional
 // native `tool_call_id` so the shared executor can build provider tool messages
 // without a second type.
-use crate::agent::dispatcher::{ParsedToolCall, ToolExecutionResult};
+use crate::agent::dispatcher::{
+    NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
+};
 use crate::agent::events::truncate_preview;
 
 #[derive(Debug)]
@@ -1345,12 +1320,15 @@ pub(crate) async fn chat_with_optional_streaming(
     }
 }
 
-/// Execute a single turn of the agent loop: send messages, parse tool calls,
-/// execute tools, and loop until the LLM produces a final text response.
+/// Single shared agentic loop (PR2): send messages, parse tool calls, execute
+/// via the shared executor, append structured history, repeat. Operates on
+/// `Vec<ConversationMessage>` + a `ToolDispatcher` so the interactive Agent and
+/// the channel/gateway `run_tool_call_loop` adapter drive ONE implementation.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_tool_call_loop(
+pub(crate) async fn run_structured_loop(
     provider: &dyn Provider,
-    history: &mut Vec<ChatMessage>,
+    history: &mut Vec<ConversationMessage>,
+    dispatcher: &dyn ToolDispatcher,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     provider_name: &str,
@@ -1391,7 +1369,10 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
-        let image_marker_count = multimodal::count_image_markers(history);
+        // Flatten the structured history to provider messages for this turn.
+        let provider_messages = dispatcher.to_provider_messages(history);
+
+        let image_marker_count = multimodal::count_image_markers(&provider_messages);
         if image_marker_count > 0 && !provider.supports_vision() {
             return Err(ProviderCapabilityError {
                 provider: provider_name.to_string(),
@@ -1404,7 +1385,8 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+            multimodal::prepare_messages_for_provider(&provider_messages, multimodal_config)
+                .await?;
 
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
@@ -1443,62 +1425,47 @@ pub(crate) async fn run_tool_call_loop(
         )
         .await;
 
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match chat_result {
-                Ok(ChatTurnOutcome::Cancelled) => return Err(ToolLoopCancelled.into()),
-                Ok(ChatTurnOutcome::Completed(resp)) => {
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: true,
-                        error_message: None,
-                    });
+        let (response_text, parsed_text, tool_calls, native_tool_calls) = match chat_result {
+            Ok(ChatTurnOutcome::Cancelled) => return Err(ToolLoopCancelled.into()),
+            Ok(ChatTurnOutcome::Completed(resp)) => {
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: true,
+                    error_message: None,
+                });
 
-                    let response_text = resp.text_or_empty().to_string();
-                    // First try native structured tool calls (OpenAI-format).
-                    // Fall back to text-based parsing (XML tags, markdown blocks,
-                    // GLM format) only if the provider returned no native calls —
-                    // this ensures we support both native and prompt-guided models.
-                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                    let mut parsed_text = String::new();
+                let response_text = resp.text_or_empty().to_string();
+                // First try native structured tool calls (OpenAI-format).
+                // Fall back to text-based parsing (XML tags, markdown blocks,
+                // GLM format) only if the provider returned no native calls —
+                // this ensures we support both native and prompt-guided models.
+                let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                let mut parsed_text = String::new();
 
-                    if calls.is_empty() {
-                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                        if !fallback_text.is_empty() {
-                            parsed_text = fallback_text;
-                        }
-                        calls = fallback_calls;
+                if calls.is_empty() {
+                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                    if !fallback_text.is_empty() {
+                        parsed_text = fallback_text;
                     }
-
-                    // Preserve native tool call IDs in assistant history so role=tool
-                    // follow-up messages can reference the exact call id.
-                    let assistant_history_content = if resp.tool_calls.is_empty() {
-                        response_text.clone()
-                    } else {
-                        build_native_assistant_history(&response_text, &resp.tool_calls)
-                    };
-
-                    let native_calls = resp.tool_calls;
-                    (
-                        response_text,
-                        parsed_text,
-                        calls,
-                        assistant_history_content,
-                        native_calls,
-                    )
+                    calls = fallback_calls;
                 }
-                Err(e) => {
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: false,
-                        error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
-                    });
-                    return Err(e);
-                }
-            };
+
+                let native_calls = resp.tool_calls;
+                (response_text, parsed_text, calls, native_calls)
+            }
+            Err(e) => {
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                });
+                return Err(e);
+            }
+        };
 
         let display_text = if parsed_text.is_empty() {
             response_text.clone()
@@ -1551,7 +1518,9 @@ pub(crate) async fn run_tool_call_loop(
                     }
                 }
             }
-            history.push(ChatMessage::assistant(response_text.clone()));
+            history.push(ConversationMessage::Chat(ChatMessage::assistant(
+                response_text.clone(),
+            )));
             if let Some(ref tx) = events {
                 let usage = crate::cost::TokenUsage::new(model, 0, 0, 0.0, 0.0);
                 let _ = tx.send(AgentEvent::Usage(usage)).await;
@@ -1626,6 +1595,7 @@ pub(crate) async fn run_tool_call_loop(
                 return force_final_summary(
                     provider,
                     history,
+                    dispatcher,
                     multimodal_config,
                     provider_name,
                     model,
@@ -1640,22 +1610,17 @@ pub(crate) async fn run_tool_call_loop(
             }
         }
 
-        // Add assistant message with tool calls + tool results to history.
-        // Native mode: use JSON-structured messages so convert_messages() can
-        // reconstruct proper OpenAI-format tool_calls and tool result messages.
-        // Prompt mode: use XML-based text format as before.
-        history.push(ChatMessage::assistant(assistant_history_content));
-        if native_tool_calls.is_empty() {
-            history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
-        } else {
-            for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
-                let tool_msg = serde_json::json!({
-                    "tool_call_id": native_call.id,
-                    "content": result.output,
-                });
-                history.push(ChatMessage::tool(tool_msg.to_string()));
-            }
-        }
+        // Append the structured assistant tool-call entry + formatted results;
+        // the dispatcher renders them to the right provider format next turn
+        // (native: assistant+tool_calls / role=tool; prompt: XML text).
+        // `tool_results` (built above) is retained only for loop-detection
+        // hashing; the dispatcher owns the on-wire format now.
+        let _ = &tool_results;
+        history.push(ConversationMessage::AssistantToolCalls {
+            text: Some(response_text.clone()),
+            tool_calls: native_tool_calls.clone(),
+        });
+        history.push(dispatcher.format_results(&individual_results));
     }
 
     // Soft cap: instead of bailing with no output (which surfaces as
@@ -1673,6 +1638,7 @@ pub(crate) async fn run_tool_call_loop(
     force_final_summary(
         provider,
         history,
+        dispatcher,
         multimodal_config,
         provider_name,
         model,
@@ -1686,6 +1652,66 @@ pub(crate) async fn run_tool_call_loop(
     .await
 }
 
+/// Backwards-compatible adapter for the channel/gateway/CLI/delegate callers
+/// that keep flat `Vec<ChatMessage>` history. Wrap each message as a
+/// `ConversationMessage::Chat`, pick the dispatcher matching the provider's
+/// native-tool support, run the shared [`run_structured_loop`], then flatten
+/// the structured history back to provider messages — keeping those call sites
+/// unchanged while both agent loops drive ONE implementation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    events: Option<AgentEventSender>,
+) -> Result<String> {
+    let dispatcher: Box<dyn ToolDispatcher> = if provider.supports_native_tools() {
+        Box::new(NativeToolDispatcher)
+    } else {
+        Box::new(XmlToolDispatcher)
+    };
+    let mut conv: Vec<ConversationMessage> = std::mem::take(history)
+        .into_iter()
+        .map(ConversationMessage::Chat)
+        .collect();
+
+    let result = run_structured_loop(
+        provider,
+        &mut conv,
+        dispatcher.as_ref(),
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        multimodal_config,
+        max_tool_iterations,
+        cancellation_token,
+        on_delta,
+        events,
+    )
+    .await;
+
+    // Flatten structured history back to provider messages for the caller, on
+    // success or error, so the caller's `history` reflects the turn's work.
+    *history = dispatcher.to_provider_messages(&conv);
+    result
+}
+
 /// Append a tools-disabled nudge to history and make one final provider
 /// call. Used by the iteration soft-cap and the loop detector — both
 /// want to produce a real user-visible summary instead of bailing with
@@ -1693,7 +1719,8 @@ pub(crate) async fn run_tool_call_loop(
 #[allow(clippy::too_many_arguments)]
 async fn force_final_summary(
     provider: &dyn Provider,
-    history: &mut Vec<ChatMessage>,
+    history: &mut Vec<ConversationMessage>,
+    dispatcher: &dyn ToolDispatcher,
     multimodal_config: &crate::config::MultimodalConfig,
     provider_name: &str,
     model: &str,
@@ -1704,9 +1731,11 @@ async fn force_final_summary(
     on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
     nudge: String,
 ) -> Result<String> {
-    history.push(ChatMessage::user(nudge));
+    history.push(ConversationMessage::Chat(ChatMessage::user(nudge)));
 
-    let prepared = multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+    let provider_msgs = dispatcher.to_provider_messages(history);
+    let prepared =
+        multimodal::prepare_messages_for_provider(&provider_msgs, multimodal_config).await?;
     observer.record_event(&ObserverEvent::LlmRequest {
         provider: provider_name.to_string(),
         model: model.to_string(),
@@ -1785,7 +1814,7 @@ async fn force_final_summary(
         }
     }
 
-    history.push(ChatMessage::assistant(text));
+    history.push(ConversationMessage::Chat(ChatMessage::assistant(text)));
     Ok(display_text)
 }
 
