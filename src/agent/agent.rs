@@ -1,7 +1,7 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
-use crate::agent::events::{truncate_preview, AgentEvent, AgentEventSender, TurnResult};
+use crate::agent::events::{AgentEvent, AgentEventSender, TurnResult};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
@@ -17,7 +17,6 @@ use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -729,95 +728,6 @@ impl Agent {
         self.prompt_builder.build(&ctx)
     }
 
-    async fn execute_tool_call(
-        &self,
-        call: &ParsedToolCall,
-        cancel: Option<&CancellationToken>,
-    ) -> ToolExecutionResult {
-        let start = Instant::now();
-
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            let tool_future = tool.execute(call.arguments.clone());
-            // Race the tool against the cancellation token so a Ctrl+C
-            // mid-execution drops the future (and, for the shell tool
-            // with `kill_on_drop(true)`, terminates the child process).
-            // Without this race, an in-flight `pip install` ran to
-            // completion before cancel could take effect — that's what
-            // the user saw as "cancel not instant".
-            let outcome = if let Some(token) = cancel {
-                tokio::select! {
-                    () = token.cancelled() => {
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
-                            duration: start.elapsed(),
-                            success: false,
-                        });
-                        return ToolExecutionResult {
-                            name: call.name.clone(),
-                            output: "[cancelled]".to_string(),
-                            success: false,
-                            tool_call_id: call.tool_call_id.clone(),
-                        };
-                    }
-                    result = tool_future => result,
-                }
-            } else {
-                tool_future.await
-            };
-            match outcome {
-                Ok(r) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: r.success,
-                    });
-                    if r.success {
-                        r.output
-                    } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
-                    }
-                }
-                Err(e) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: false,
-                    });
-                    format!("Error executing {}: {e}", call.name)
-                }
-            }
-        } else {
-            format!("Unknown tool: {}", call.name)
-        };
-
-        ToolExecutionResult {
-            name: call.name.clone(),
-            output: result,
-            success: true,
-            tool_call_id: call.tool_call_id.clone(),
-        }
-    }
-
-    async fn execute_tools(
-        &self,
-        calls: &[ParsedToolCall],
-        cancel: Option<&CancellationToken>,
-    ) -> Vec<ToolExecutionResult> {
-        if !self.config.parallel_tools {
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                results.push(self.execute_tool_call(call, cancel).await);
-            }
-            return results;
-        }
-
-        let futs: Vec<_> = calls
-            .iter()
-            .map(|call| self.execute_tool_call(call, cancel))
-            .collect();
-        futures_util::future::join_all(futs).await
-    }
-
     fn classify_model(&self, user_message: &str) -> String {
         if let Some(hint) = super::classifier::classify(&self.classification_config, user_message) {
             if self.available_hints.contains(&hint) {
@@ -1125,61 +1035,31 @@ impl Agent {
         events: Option<&AgentEventSender>,
         cancel: Option<&CancellationToken>,
     ) -> std::result::Result<Vec<ToolExecutionResult>, bool> {
-        // Fast path: no events consumer means we can reuse the existing
-        // batch execution (potentially parallel) without per-call bookkeeping.
-        if events.is_none() {
-            if cancel.is_some_and(CancellationToken::is_cancelled) {
-                return Err(true);
-            }
-            return Ok(self.execute_tools(calls, cancel).await);
+        // Delegate to the shared executor (PR2 unification) — the same one
+        // `run_tool_call_loop` uses. Serialize when streaming events so
+        // Start/End ordering matches observer ordering; otherwise parallelize
+        // per config (the prior policy). The Agent runs interactively without
+        // an ApprovalManager (shell-relay handles its gating), so `approval`
+        // is None and the channel is "cli".
+        let parallel = self.config.parallel_tools && events.is_none();
+        match crate::agent::loop_::execute_tool_calls_collecting(
+            calls,
+            &self.tools,
+            self.observer.as_ref(),
+            None,
+            "cli",
+            parallel,
+            cancel,
+            events,
+        )
+        .await
+        {
+            Ok(results) => Ok(results),
+            // The shared executor only errors on cancellation (tool failures
+            // are folded into the result), so map any error to the turn-level
+            // cancel signal the caller expects.
+            Err(_) => Err(true),
         }
-
-        // Events path: emit Start/End per call. Run sequentially so event
-        // ordering matches observer ordering; a consumer can still interleave
-        // UI updates in real time.
-        let tx = events.expect("events is Some on this branch");
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            if cancel.is_some_and(CancellationToken::is_cancelled) {
-                return Err(true);
-            }
-
-            let id = Uuid::new_v4().to_string();
-            let _ = tx
-                .send(AgentEvent::ToolCallStart {
-                    id: id.clone(),
-                    name: call.name.clone(),
-                    args: call.arguments.clone(),
-                })
-                .await;
-
-            let result = self.execute_tool_call(call, cancel).await;
-            // execute_tool_call returns "[cancelled]" with success=false
-            // when the token fires mid-execution. Propagate that as the
-            // turn-level cancel signal so the loop exits immediately
-            // instead of looping back to another LLM call.
-            if cancel.is_some_and(CancellationToken::is_cancelled) {
-                let _ = tx
-                    .send(AgentEvent::ToolCallEnd {
-                        id,
-                        ok: false,
-                        output_preview: "[cancelled]".into(),
-                    })
-                    .await;
-                return Err(true);
-            }
-
-            let _ = tx
-                .send(AgentEvent::ToolCallEnd {
-                    id,
-                    ok: result.success,
-                    output_preview: truncate_preview(&result.output),
-                })
-                .await;
-
-            results.push(result);
-        }
-        Ok(results)
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
