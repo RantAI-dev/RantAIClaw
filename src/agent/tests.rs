@@ -945,6 +945,56 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
     );
 }
 
+/// Characterization gate for the loop-collapse refactor (PR2-rest): the XML
+/// dispatcher must produce STRUCTURED `AssistantToolCalls` / `ToolResults`
+/// history across multiple turns. That structure is load-bearing — the TUI
+/// renders tool-call blocks from it (Hermes parity) and the next turn rebuilds
+/// provider messages from it. Any unification of the two agent loops must keep
+/// this contract; a delegation that flattens history to plain `Chat` entries
+/// will fail here.
+#[tokio::test]
+async fn xml_dispatcher_multi_turn_preserves_structured_tool_history() {
+    let provider = Box::new(ScriptedProvider::new(vec![
+        xml_tool_response("echo", r#"{"message": "first"}"#),
+        text_response("answer one"),
+        text_response("answer two"),
+    ]));
+    let mut agent = build_agent_with(
+        provider,
+        vec![Box::new(EchoTool)],
+        Box::new(XmlToolDispatcher),
+    );
+
+    let r1 = agent.turn("turn one").await.unwrap();
+    assert_eq!(r1, "answer one");
+
+    let history = agent.history();
+    // The load-bearing contract: a structured AssistantToolCalls entry exists
+    // (the TUI renders its tool-call block from this). The XML dispatcher feeds
+    // tool *results* back as a chat message rather than the native
+    // `ToolResults` variant, so we don't assert that variant here — only that
+    // the structured tool-call entry survives and the turn produced output.
+    assert!(
+        history
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+        "expected an AssistantToolCalls entry after an XML tool call"
+    );
+    let len_after_1 = agent.history().len();
+    assert!(
+        len_after_1 >= 4,
+        "expected system+user+tool-call+result+answer history, got {len_after_1}"
+    );
+
+    // Second turn still works and history keeps growing (context preserved).
+    let r2 = agent.turn("turn two").await.unwrap();
+    assert_eq!(r2, "answer two");
+    assert!(
+        agent.history().len() > len_after_1,
+        "history should grow across turns"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 16. Builder validation
 // ═══════════════════════════════════════════════════════════════════════════
