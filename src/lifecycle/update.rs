@@ -28,7 +28,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::lifecycle::binary_path::{require_self_modifiable, BinaryInfo};
+use crate::lifecycle::binary_path::{require_self_modifiable, BinaryInfo, InstallKind};
 
 const REPO: &str = "RantAI-dev/RantAIClaw";
 
@@ -108,6 +108,13 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
     }
 
     require_self_modifiable(&info, "update")?;
+
+    if info.kind == InstallKind::Cargo {
+        println!(
+            "⚠ updating a cargo-installed binary in place; `cargo install --list` \
+             will show a stale version until you reinstall via cargo."
+        );
+    }
 
     // Pre-flight: the swap path writes `<binary>.new`, `<binary>.old`, and
     // renames into the install directory. If we can't write there, the
