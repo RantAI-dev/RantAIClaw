@@ -49,8 +49,31 @@ pub fn format_approval_message(basename: &str, full_command: &str) -> String {
 /// human-readable acknowledgement *and* resolves the pending request
 /// against `security`. On failure returns `None` so the caller can
 /// route the message to the agent as normal.
-pub fn try_handle_reply(text: &str, security: &SecurityPolicy) -> Option<String> {
+///
+/// `sender` + `owners` enforce the owner-authority gate: an `allow`/`/allow`
+/// reply that would grant a command is honored **only** from an authorized
+/// owner (`[channels_config] approval_owners`). Being able to chat with the
+/// bot does not make a sender able to approve its shell commands — otherwise
+/// any chat participant could allowlist arbitrary commands for the agent.
+/// `deny` is always honored regardless of sender (denying is safe and lets
+/// anyone stop a pending action).
+pub fn try_handle_reply(
+    text: &str,
+    security: &SecurityPolicy,
+    sender: &str,
+    owners: &[String],
+) -> Option<String> {
     let parsed = parse_reply(text)?;
+    if parsed.verb == ReplyVerb::Allow && !crate::approval::can_approve(owners, sender) {
+        // Recognised as an allow reply, but this sender isn't an owner.
+        // Consume the message (it WAS an approval attempt, not chat) and tell
+        // them they can't grant it. The pending request stays open so a real
+        // owner can still resolve it.
+        return Some(format!(
+            "You're not authorized to approve `{}`. Ask an owner to reply `/allow {}`.",
+            parsed.basename, parsed.basename
+        ));
+    }
     let pending = security.pending()?;
     handle_parsed(&parsed, security, &pending)
 }
@@ -284,7 +307,9 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let ack = try_handle_reply("/allow brew", &security).expect("recognised");
+        // Reply comes from an authorized owner.
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_reply("/allow brew", &security, "owner1", &owners).expect("recognised");
         assert!(ack.contains("session"));
         assert!(ack.contains("retry"));
 
@@ -293,6 +318,37 @@ mod tests {
         assert!(security
             .runtime_allowlist_snapshot()
             .contains(&"brew".to_string()));
+    }
+
+    #[tokio::test]
+    async fn try_handle_reply_allow_from_non_owner_is_refused() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+
+        let pending2 = pending.clone();
+        let task = tokio::spawn(async move {
+            pending2
+                .request_decision("brew", "brew --version", "telegram")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // A non-owner replies `/allow` — recognised as an approval attempt
+        // (so it's consumed, not routed to the agent) but NOT honored: the
+        // command must not be allowlisted and the pending request stays open.
+        let owners = vec!["owner1".to_string()];
+        let ack =
+            try_handle_reply("/allow brew", &security, "stranger", &owners).expect("recognised");
+        assert!(ack.contains("not authorized"));
+        assert!(!security
+            .runtime_allowlist_snapshot()
+            .contains(&"brew".to_string()));
+
+        // The pending request is still open; a real owner can resolve it.
+        let ack = try_handle_reply("/allow brew", &security, "owner1", &owners).expect("recognised");
+        assert!(ack.contains("session"));
+        assert_eq!(task.await.unwrap(), Decision::Session);
     }
 
     #[tokio::test]
@@ -309,7 +365,9 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let ack = try_handle_reply("n brew", &security).expect("recognised");
+        // Deny is honored regardless of sender/owner — stopping a pending
+        // action is always safe.
+        let ack = try_handle_reply("n brew", &security, "anyone", &[]).expect("recognised");
         assert!(ack.contains("Denied"));
         assert_eq!(task.await.unwrap(), Decision::Deny);
         assert!(!security
@@ -320,7 +378,7 @@ mod tests {
     #[test]
     fn try_handle_reply_returns_none_for_chat_messages() {
         let security = supervised_only_echo();
-        assert!(try_handle_reply("hello", &security).is_none());
-        assert!(try_handle_reply("can you find me a recipe", &security).is_none());
+        assert!(try_handle_reply("hello", &security, "u", &[]).is_none());
+        assert!(try_handle_reply("can you find me a recipe", &security, "u", &[]).is_none());
     }
 }

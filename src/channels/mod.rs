@@ -1723,6 +1723,10 @@ async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
     max_in_flight_messages: usize,
+    // Senders authorized to APPROVE shell-command allowlist replies over a
+    // channel (`[channels_config] approval_owners`). Empty ⇒ nobody, so an
+    // `/allow` reply is refused — only a real owner can grant commands.
+    approval_owners: Arc<Vec<String>>,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
@@ -1738,7 +1742,12 @@ async fn run_message_dispatch_loop(
         // stateless: it consults only `security.pending()` and
         // returns an acknowledgement if the text was a recognised
         // reply, otherwise `None`.
-        if let Some(reply) = approval_relay::try_handle_reply(&msg.content, ctx.security.as_ref()) {
+        if let Some(reply) = approval_relay::try_handle_reply(
+            &msg.content,
+            ctx.security.as_ref(),
+            &msg.sender,
+            &approval_owners,
+        ) {
             if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
                 let ack = traits::SendMessage::new(reply, msg.reply_target.clone())
                     .in_thread(msg.thread_ts.clone());
@@ -3282,7 +3291,8 @@ pub async fn start_channels_with_cancellation(
         },
     });
 
-    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+    let approval_owners = Arc::new(config.channels_config.approval_owners.clone());
+    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages, approval_owners).await;
 
     // Wait for all channel tasks
     for h in handles {
@@ -4684,7 +4694,7 @@ BTC is currently around $65,000 based on latest tool output."#
         drop(tx);
 
         let started = Instant::now();
-        run_message_dispatch_loop(rx, runtime_ctx, 2).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 2, std::sync::Arc::new(Vec::new())).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -4765,7 +4775,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4, std::sync::Arc::new(Vec::new())).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -4857,7 +4867,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4, std::sync::Arc::new(Vec::new())).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;

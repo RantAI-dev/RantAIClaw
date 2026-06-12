@@ -2546,6 +2546,20 @@ pub struct ChannelsConfig {
     /// gated even when this is on.
     #[serde(default)]
     pub autonomous_tools: bool,
+    /// Sender ids authorized to **approve** tool calls over a channel (the
+    /// people whose `Y` / `A` reply to an in-chat approval prompt is honored).
+    ///
+    /// This is a SEPARATE, deliberately smaller allowlist than each channel's
+    /// `allowed_users` (who may chat with the bot): being able to talk to the
+    /// bot does not make you able to approve a privileged tool call. Mirrors
+    /// OpenClaw's separate command/owner gate.
+    ///
+    /// Default empty ⇒ **no one** can approve over a channel, so approval-
+    /// required tools stay auto-denied (secure-by-default). `"*"` lets any
+    /// sender approve — insecure, opt-in only. Ignored when
+    /// `autonomous_tools = true` (which skips the approval gate entirely).
+    #[serde(default)]
+    pub approval_owners: Vec<String>,
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
@@ -2574,6 +2588,7 @@ impl Default for ChannelsConfig {
             qq: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             autonomous_tools: false,
+            approval_owners: Vec::new(),
         }
     }
 }
@@ -4338,6 +4353,7 @@ default_temperature = 0.7
                 qq: None,
                 message_timeout_secs: 300,
                 autonomous_tools: false,
+                approval_owners: Vec::new(),
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -4891,6 +4907,7 @@ allowed_users = ["@ops:matrix.org"]
             qq: None,
             message_timeout_secs: 300,
             autonomous_tools: false,
+            approval_owners: Vec::new(),
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -5102,6 +5119,7 @@ channel_id = "C123"
             qq: None,
             message_timeout_secs: 300,
             autonomous_tools: false,
+            approval_owners: Vec::new(),
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

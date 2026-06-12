@@ -1226,11 +1226,13 @@ async fn execute_tools_sequential(
                     arguments: call.arguments.clone(),
                 };
 
-                let decision = if channel_name == "cli" {
-                    mgr.prompt_cli(&request)
-                } else {
-                    ApprovalResponse::No
-                };
+                // Surface-agnostic seam: the loop asks a pluggable backend
+                // for the inline decision instead of hardcoding the surface.
+                // CLI prompts interactively; other surfaces auto-deny here and
+                // run their own owner-gated relay out-of-band. Behavior is
+                // identical to the former `if channel_name == "cli"` branch.
+                let backend = crate::approval::default_backend_for(channel_name);
+                let decision = backend.decide(mgr, &request);
 
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
 

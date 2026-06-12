@@ -156,6 +156,75 @@ impl ApprovalManager {
     }
 }
 
+// ── Owner authority gate ─────────────────────────────────────────
+
+/// Whether `sender` is authorized to **approve** a tool call on a channel.
+///
+/// The owner list (`[channels_config] approval_owners`) is a separate,
+/// deliberately smaller allowlist than each channel's `allowed_users` (who may
+/// chat): the person who *requested* an action is not automatically allowed to
+/// *approve* it. This is the command/owner gate, kept distinct from the sender
+/// gate so unifying capability across surfaces is an upgrade, not a security
+/// regression. Shared by both in-chat approval paths — the gateway turn-based
+/// flow (`crate::gateway::channel_approval`) and the polling-channel shell
+/// allowlist relay (`crate::channels::approval_relay`).
+///
+/// - Empty list ⇒ `false` for everyone (secure default: nobody can approve, so
+///   approval-required tools stay auto-denied on channels).
+/// - `"*"` ⇒ `true` for any sender (insecure; opt-in only).
+/// - Otherwise ⇒ exact sender-id match.
+pub fn can_approve(owners: &[String], sender: &str) -> bool {
+    owners.iter().any(|o| o == "*" || o == sender)
+}
+
+// ── Approval backends (surface-pluggable decision) ───────────────
+
+/// How an approval decision is obtained for a given surface.
+///
+/// Extracted so the agent loop no longer hardcodes `channel_name == "cli"`:
+/// the loop asks a backend for the decision, and each surface supplies the
+/// one that fits it (interactive terminal, in-chat relay, web modal, or
+/// auto-deny). Today only CLI prompts inline; channels/gateway auto-deny here
+/// and run their own turn-based, owner-gated approval relay out-of-band (see
+/// `crate::gateway::channel_approval`).
+pub trait ApprovalBackend: Send + Sync {
+    fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse;
+}
+
+/// Interactive terminal prompt (TUI / CLI surface).
+pub struct CliApprovalBackend;
+
+impl ApprovalBackend for CliApprovalBackend {
+    fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
+        mgr.prompt_cli(request)
+    }
+}
+
+/// Non-interactive surface with no approver present in-band: auto-deny.
+/// The surface may still offer its own out-of-band, owner-gated approval
+/// relay; this only governs the inline decision the loop makes.
+pub struct AutoDenyBackend;
+
+impl ApprovalBackend for AutoDenyBackend {
+    fn decide(&self, _mgr: &ApprovalManager, _request: &ApprovalRequest) -> ApprovalResponse {
+        ApprovalResponse::No
+    }
+}
+
+/// Pick the inline approval backend for a surface by its channel name.
+///
+/// Behavior-preserving: only the `"cli"` surface prompts interactively;
+/// every other surface auto-denies inline (and relies on its own owner-gated
+/// relay). This replaces the former hardcoded `if channel_name == "cli"`
+/// branch in the agent loop with a single, surface-agnostic seam.
+pub fn default_backend_for(channel_name: &str) -> Box<dyn ApprovalBackend> {
+    if channel_name == "cli" {
+        Box::new(CliApprovalBackend)
+    } else {
+        Box::new(AutoDenyBackend)
+    }
+}
+
 // ── CLI prompt ───────────────────────────────────────────────────
 
 /// Display the approval prompt and read user input from stdin.
@@ -237,6 +306,21 @@ mod tests {
             level: AutonomyLevel::Full,
             ..AutonomyConfig::default()
         }
+    }
+
+    // ── owner authority gate ─────────────────────────────────
+
+    #[test]
+    fn owner_gate_denies_by_default_and_matches_owners() {
+        // Empty owner list ⇒ nobody can approve (secure default).
+        assert!(!can_approve(&[], "alice"));
+        // Exact match authorizes; non-owners are rejected even if they can chat.
+        let owners = vec!["alice".to_string(), "123456".to_string()];
+        assert!(can_approve(&owners, "alice"));
+        assert!(can_approve(&owners, "123456"));
+        assert!(!can_approve(&owners, "bob"));
+        // Wildcard authorizes anyone (insecure, opt-in).
+        assert!(can_approve(&["*".to_string()], "anyone"));
     }
 
     // ── needs_approval ───────────────────────────────────────
