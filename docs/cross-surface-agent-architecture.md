@@ -8,10 +8,18 @@
 > File:line references are anchors into the source at time of writing; verify
 > before relying on exact line numbers.
 
+> **Correction (post-analysis):** an earlier draft of this section claimed "a
+> user message reaches the same agent loop on every surface." That is **wrong** —
+> there are **two** loop implementations (the `Agent` struct loop in
+> `src/agent/agent.rs`, used by the TUI; and the free `run_tool_call_loop` in
+> `src/agent/loop_.rs`, used by CLI one-shot, channels, and gateway). Collapsing
+> them into one is PR2 of `docs/unified-agent-runtime-plan.md`.
+
 ## 1. TL;DR
 
-A user message reaches the same agent loop on every surface, but two things
-diverge based on **which surface dispatched the message**:
+A user message is handled by **one of two** agent loops depending on the
+surface, and two things diverge based on **which surface dispatched the
+message**:
 
 1. **Capability gating** — tools that require approval are *interactively
    approvable on the TUI* but *hard auto-denied on every non-CLI surface* (unless
@@ -191,6 +199,7 @@ incoming message
 | Lever | Location | Effect |
 |---|---|---|
 | `[channels_config] autonomous_tools` | `src/config/schema.rs` | `true` disables Layer A on channels/gateway (Layer B still enforced for shell). |
+| `[channels_config] approval_owners` | `src/config/schema.rs` | Sender ids allowed to **approve** tool calls over a channel (separate from `allowed_users`). Empty (default) ⇒ nobody can approve ⇒ approval-required tools stay auto-denied. `"*"` ⇒ any sender (insecure). Enforced via `crate::approval::can_approve` on both in-chat approval paths. |
 | Autonomy preset (Strict/Smart/Manual/Off) | profile `policy/` + `[autonomy]` | Controls what `needs_approval` returns and the Safety section text. |
 | `[autonomy] auto_approve` | `src/config/schema.rs` | Per-tool allowlist; tools listed here skip Layer A. |
 | `[agents.<name>] system_prompt` | `src/config/schema.rs` (`DelegateAgentConfig`) | Full system-prompt override for delegate sub-agents. |

@@ -111,12 +111,19 @@ Conversation id per surface (Hermes scheme):
 
 ## 3. PR sequencing (each independently shippable + revertible)
 
-| PR | Scope | Risk | Capability change? |
+| PR | Scope | Risk | Status |
 |---|---|---|---|
-| **PR1** | Unify the system prompt builder (one builder + surface-hint sections; persona/safety parity on channels) | Low | **No** — text only |
-| **PR2** | Collapse the two agent loops into one runtime | High (structural) | No (behavior-preserving) |
-| **PR3** | `ApprovalBackend` trait + owner-authority gate; remove `channel_name=="cli"` | High (security) | **Yes** — gated behind owner allowlist, AutoDeny default |
-| **PR4** | `ConversationResolver` + layered memory | Medium | No |
+| **PR1.0** | Persona parity on channels (shared `render_persona_section`) | Low | ✅ done (`c3ee0d4`) |
+| **PR1.1** | Structural builder convergence (one builder, shared tool descriptor) | Low–Med, output-changing | ⏳ pending |
+| **PR3** | `ApprovalBackend` + owner-authority gate; remove `channel_name=="cli"` | High (security) | ✅ done (`71b1768`) |
+| **PR3b** | Safety/autonomy-preset section on channels + Strict shell-filter parity | Med | ⏳ pending |
+| **PR2** | Collapse the two agent loops into one runtime | High (structural) | ⏳ pending (largest) |
+| **PR4** | `ConversationResolver` + layered memory | Medium | 🟡 resolver landing first |
+
+> **Note:** PR3 shipped before PR1.1/PR2 because it is the actual fix for the
+> original report ("can't do X on Telegram") and is self-contained. The
+> security invariant still holds: with no `approval_owners` configured, channels
+> remain at the old auto-deny safety level.
 
 **Safety invariant across all PRs:** channels never gain the ability to run an
 approval-required tool *unless* an owner is explicitly configured AND explicitly
