@@ -1043,16 +1043,30 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// Serializes tests that mutate process-global env vars (e.g.
+    /// `XDG_DATA_HOME`). Without this, two such tests running on parallel test
+    /// threads clobber each other's value, so `open_session_store()` can read a
+    /// different test's data dir — a latent race exposed by any timing change.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
+            // Hold the lock for the guard's lifetime so concurrent env-var
+            // tests run one at a time. Ignore poisoning from an unrelated panic.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
     }
 
