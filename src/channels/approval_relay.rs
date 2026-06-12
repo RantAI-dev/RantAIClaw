@@ -30,6 +30,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::approval::{
+    can_approve, summarize_args, ApprovalBackend, ApprovalManager, ApprovalRequest,
+    ApprovalResponse,
+};
 use crate::channels::traits::{Channel, SendMessage};
 use crate::security::{Decision, PendingApprovals, SecurityPolicy};
 
@@ -224,6 +228,201 @@ pub fn spawn_relay(
     });
 }
 
+// ── Whole-tool approval over chat (Layer A: ApprovalBackend) ──────────
+//
+// The shell allowlist relay above (Layer B) only covers `shell` basenames.
+// A tool that needs approval at the current autonomy level (anything not in
+// `auto_approve`) is decided by [`ApprovalBackend`] in the agent loop, which on
+// channels defaults to auto-deny. [`ChatRelayApprovalBackend`] upgrades that on
+// owner-configured channels: it posts the pending tool call to the chat and
+// awaits an authorized owner's `/approve` / `/deny` reply, reusing the same
+// async [`PendingApprovals`] machinery the shell relay uses (the tool name sits
+// in the `basename` slot — a dedicated registry, never the shell one). Absent an
+// approving owner before the deadline, the request times out to deny, so the
+// secure-by-default posture is preserved.
+
+/// Format a pending whole-tool approval as a chat-friendly message.
+pub fn format_tool_approval_message(tool_name: &str, args_summary: &str) -> String {
+    let detail = if args_summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" — `{args_summary}`")
+    };
+    format!(
+        "🔧 The agent wants to run the `{tool_name}` tool{detail}.\n\
+         Reply with one of:\n\
+         • `/approve {tool_name}` — allow this call\n\
+         • `/deny {tool_name}` — reject it\n\
+         Auto-deny in 5 min."
+    )
+}
+
+/// In-chat, owner-gated approval backend for polling channels.
+///
+/// Constructed per inbound message (it carries the originating chat's reply
+/// target) only when an owner is configured and tool-gating is active; otherwise
+/// the loop keeps using the auto-deny default. Posting + awaiting both happen
+/// inside [`ApprovalBackend::decide`].
+pub struct ChatRelayApprovalBackend {
+    /// Dedicated tool-approval registry (NOT the shell `PendingApprovals`).
+    relay: Arc<PendingApprovals>,
+    /// Channel used to post the approval prompt back to the originating chat.
+    channel: Arc<dyn Channel>,
+    /// Reply target (chat id / room) the prompt is delivered to.
+    recipient: String,
+    /// Optional thread id so the prompt threads with the conversation.
+    thread_ts: Option<String>,
+    /// Channel name, recorded on the pending request for display/audit.
+    channel_name: String,
+}
+
+impl ChatRelayApprovalBackend {
+    pub fn new(
+        relay: Arc<PendingApprovals>,
+        channel: Arc<dyn Channel>,
+        recipient: impl Into<String>,
+        thread_ts: Option<String>,
+        channel_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            relay,
+            channel,
+            recipient: recipient.into(),
+            thread_ts,
+            channel_name: channel_name.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalBackend for ChatRelayApprovalBackend {
+    async fn decide(&self, _mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
+        let summary = summarize_args(&request.arguments);
+        let body = format_tool_approval_message(&request.tool_name, &summary);
+        let msg = SendMessage::new(body, &self.recipient).in_thread(self.thread_ts.clone());
+        if let Err(e) = self.channel.send(&msg).await {
+            // Can't ask the owner → fail closed (deny). Do not run the tool.
+            tracing::warn!(
+                target: "approval_relay",
+                channel = %self.channel_name,
+                tool = %request.tool_name,
+                error = %e,
+                "failed to post tool-approval prompt; denying"
+            );
+            return ApprovalResponse::No;
+        }
+
+        // Block this tool call until an owner resolves it (via
+        // `try_handle_tool_reply`) or the registry's deadline auto-denies.
+        match self
+            .relay
+            .request_decision(
+                request.tool_name.clone(),
+                summary,
+                self.channel_name.clone(),
+            )
+            .await
+        {
+            // A single approval grants this one call; we deliberately do NOT
+            // map Session/Persist to a session allowlist here — channel
+            // approvals stay per-call so a stranger can't ride a prior grant.
+            Decision::Once | Decision::Session | Decision::Persist => ApprovalResponse::Yes,
+            Decision::Deny => ApprovalResponse::No,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ToolReplyVerb {
+    Approve,
+    Deny,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedToolReply {
+    verb: ToolReplyVerb,
+    tool: String,
+}
+
+fn parse_tool_reply(text: &str) -> Option<ParsedToolReply> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let body = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    let mut tokens = body.split_whitespace();
+    let head = tokens.next()?;
+    let tool_raw = tokens.next()?;
+    // Reject trailing chatter so "approve web_search because…" doesn't fire.
+    if tokens.next().is_some() {
+        return None;
+    }
+    let verb = match head {
+        "approve" | "approved" => ToolReplyVerb::Approve,
+        "deny" | "reject" => ToolReplyVerb::Deny,
+        _ => return None,
+    };
+    let tool = tool_raw.trim_matches('`').trim_matches('"');
+    if tool.is_empty() || tool.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(ParsedToolReply {
+        verb,
+        tool: tool.to_string(),
+    })
+}
+
+/// Try to interpret `text` as a whole-tool approval reply (`/approve <tool>`,
+/// `/deny <tool>`, slash optional). Returns `Some(ack)` only when a matching
+/// tool request is actually pending in `relay`, so unrelated replies (including
+/// the shell `/allow` path) fall through to other handlers. The owner-authority
+/// gate mirrors the shell relay: an `approve` is honored only from an authorized
+/// owner; `deny` is honored from anyone (stopping an action is always safe).
+pub fn try_handle_tool_reply(
+    text: &str,
+    relay: &PendingApprovals,
+    sender: &str,
+    owners: &[String],
+) -> Option<String> {
+    let parsed = parse_tool_reply(text)?;
+    // Only claim the message if this tool is genuinely awaiting a decision —
+    // otherwise it may be a shell reply or normal chat.
+    let pending_for_tool = relay.list().iter().any(|r| r.basename == parsed.tool);
+    if !pending_for_tool {
+        return None;
+    }
+    match parsed.verb {
+        ToolReplyVerb::Approve => {
+            if !can_approve(owners, sender) {
+                return Some(format!(
+                    "You're not authorized to approve `{}`. Ask an owner to reply `/approve {}`.",
+                    parsed.tool, parsed.tool
+                ));
+            }
+            match relay.resolve_by_basename(&parsed.tool, Decision::Once) {
+                Some(_) => Some(format!(
+                    "✅ Approved `{}` — the agent will run it now.",
+                    parsed.tool
+                )),
+                None => Some(format!(
+                    "Couldn't approve `{}` — more than one request is queued for it.",
+                    parsed.tool
+                )),
+            }
+        }
+        ToolReplyVerb::Deny => match relay.resolve_by_basename(&parsed.tool, Decision::Deny) {
+            Some(_) => Some(format!(
+                "🚫 Denied `{}`. The tool call will fail.",
+                parsed.tool
+            )),
+            None => Some(format!(
+                "Couldn't deny `{}` — more than one request is queued for it.",
+                parsed.tool
+            )),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +581,183 @@ mod tests {
         let security = supervised_only_echo();
         assert!(try_handle_reply("hello", &security, "u", &[]).is_none());
         assert!(try_handle_reply("can you find me a recipe", &security, "u", &[]).is_none());
+    }
+
+    // ── Whole-tool relay (Layer A) ───────────────────────────────────
+
+    #[test]
+    fn parse_tool_reply_recognises_approve_deny() {
+        assert_eq!(
+            parse_tool_reply("/approve web_search").unwrap(),
+            ParsedToolReply {
+                verb: ToolReplyVerb::Approve,
+                tool: "web_search".into()
+            }
+        );
+        assert_eq!(
+            parse_tool_reply("deny shell").unwrap().verb,
+            ToolReplyVerb::Deny
+        );
+        // Chatty / unknown / empty → not a reply.
+        assert!(parse_tool_reply("approve web_search because i need it").is_none());
+        assert!(parse_tool_reply("hello").is_none());
+        assert!(parse_tool_reply("approve").is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_reply_returns_none_when_no_pending_match() {
+        // Recognised verb, but nothing pending for that tool → fall through
+        // (could be a shell reply or plain chat).
+        let relay = PendingApprovals::new(Some(Duration::from_secs(10)));
+        assert!(
+            try_handle_tool_reply("/approve web_search", &relay, "owner1", &["owner1".into()])
+                .is_none()
+        );
+        assert!(
+            try_handle_tool_reply("hello there", &relay, "owner1", &["owner1".into()]).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_reply_owner_approves_resolves_pending() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let r2 = relay.clone();
+        let task = tokio::spawn(async move {
+            r2.request_decision("web_search", "query: rust", "telegram")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_tool_reply("/approve web_search", &relay, "owner1", &owners)
+            .expect("recognised");
+        assert!(ack.contains("Approved"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    #[tokio::test]
+    async fn tool_reply_non_owner_approve_is_refused_pending_stays_open() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let r2 = relay.clone();
+        let task = tokio::spawn(async move {
+            r2.request_decision("web_search", "query: rust", "telegram")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let owners = vec!["owner1".to_string()];
+        // Stranger names the real pending tool → consumed (it WAS an approval
+        // attempt) but refused; the request stays open for a real owner.
+        let ack = try_handle_tool_reply("/approve web_search", &relay, "stranger", &owners)
+            .expect("recognised");
+        assert!(ack.contains("not authorized"), "{ack}");
+        assert_eq!(relay.list().len(), 1, "pending stays open");
+
+        // A real owner then resolves it.
+        let ack = try_handle_tool_reply("/approve web_search", &relay, "owner1", &owners)
+            .expect("recognised");
+        assert!(ack.contains("Approved"));
+        assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    #[tokio::test]
+    async fn tool_reply_deny_is_honored_from_anyone() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let r2 = relay.clone();
+        let task = tokio::spawn(async move {
+            r2.request_decision("shell", "rm -rf /tmp/x", "telegram")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Deny needs no owner authority — stopping an action is always safe.
+        let ack = try_handle_tool_reply("/deny shell", &relay, "anyone", &[]).expect("recognised");
+        assert!(ack.contains("Denied"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Deny);
+    }
+
+    /// Minimal channel that records what was posted, for backend tests.
+    #[derive(Default)]
+    struct CapturingChannel {
+        posted: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for CapturingChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.posted.lock().await.push(message.content.clone());
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_manager() -> ApprovalManager {
+        ApprovalManager::from_config(&crate::config::AutonomyConfig::default())
+    }
+
+    #[tokio::test]
+    async fn chat_relay_backend_posts_prompt_and_yields_yes_on_owner_approval() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let channel: Arc<dyn Channel> = Arc::new(CapturingChannel::default());
+        let backend = ChatRelayApprovalBackend::new(
+            relay.clone(),
+            channel.clone(),
+            "chat-1",
+            None,
+            "telegram",
+        );
+        let mgr = test_manager();
+        let request = ApprovalRequest {
+            tool_name: "web_search".into(),
+            arguments: serde_json::json!({ "query": "rust" }),
+        };
+
+        // decide() posts the prompt then blocks awaiting a reply.
+        let decide = tokio::spawn(async move { backend.decide(&mgr, &request).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let owners = vec!["owner1".to_string()];
+        try_handle_tool_reply("/approve web_search", &relay, "owner1", &owners)
+            .expect("recognised");
+
+        assert_eq!(decide.await.unwrap(), ApprovalResponse::Yes);
+        // The owner saw a prompt naming the tool.
+        let posted = relay.list();
+        assert!(posted.is_empty(), "registry cleaned up after resolve");
+    }
+
+    #[tokio::test]
+    async fn chat_relay_backend_denies_on_timeout() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_millis(50))));
+        let channel: Arc<dyn Channel> = Arc::new(CapturingChannel::default());
+        let backend = ChatRelayApprovalBackend::new(
+            relay.clone(),
+            channel.clone(),
+            "chat-1",
+            None,
+            "telegram",
+        );
+        let mgr = test_manager();
+        let request = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({ "command": "ls" }),
+        };
+        // No owner replies → the registry deadline fires → deny.
+        assert_eq!(backend.decide(&mgr, &request).await, ApprovalResponse::No);
     }
 }

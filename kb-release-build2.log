@@ -1,0 +1,43 @@
+   Compiling rantaiclaw v0.6.59-alpha (/home/shiro/rantai/RantAI-Agents/packages/rantaiclaw)
+warning: unused import: `ChatRequest`
+  --> src/agent/compaction.rs:15:37
+   |
+15 | use crate::providers::{ChatMessage, ChatRequest, ConversationMessage, ToolCall};
+   |                                     ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated function `base64::encode`: Use Engine::encode
+   --> src/onboard/provision/channels/nextcloud_talk.rs:121:31
+    |
+121 |         let encoded = base64::encode(format!("{}:{}", "", app_token.trim())); // user is empty for app token
+    |                               ^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: unused import: `ProviderClient`
+  --> src/providers/rig_native.rs:56:42
+   |
+56 | use rig_core::client::{CompletionClient, ProviderClient};
+   |                                          ^^^^^^^^^^^^^^
+
+warning: value assigned to `http_proxy` is never read
+  --> src/onboard/provision/runtime_surfaces/proxy.rs:82:30
+   |
+82 |         let mut http_proxy = None;
+   |                              ^^^^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `https_proxy` is never read
+  --> src/onboard/provision/runtime_surfaces/proxy.rs:83:31
+   |
+83 |         let mut https_proxy = None;
+   |                               ^^^^
+   |
+   = help: maybe it is overwritten before being read?
+
+warning: `rantaiclaw` (lib) generated 5 warnings (run `cargo fix --lib -p rantaiclaw` to apply 1 suggestion)
+warning: `rantaiclaw` (bin "rantaiclaw") generated 5 warnings (5 duplicates)
+    Finished `release` profile [optimized] target(s) in 10m 09s

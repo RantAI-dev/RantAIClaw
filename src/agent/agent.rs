@@ -862,6 +862,7 @@ impl Agent {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             self.config.max_tool_iterations,
             cancel.cloned(),

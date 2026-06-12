@@ -374,9 +374,11 @@ impl PromptSection for SafetySection {
                      - Read-only tools (reading files, recalling memory) run \
                      automatically.\n\
                      - Any tool that runs commands or changes state requires \
-                     approval from an authorized **owner** of this channel. \
-                     Without that approval the action is declined — there is no \
-                     inline Y/N/A prompt here.\n\
+                     approval from an authorized **owner** of this channel. When \
+                     an owner is configured the agent posts the request in chat \
+                     and waits for their `/approve`; without an approving owner \
+                     the action is declined. There is no inline Y/N/A prompt \
+                     here.\n\
                      - Never claim you ran a command or made a change that was \
                      actually declined; report the denial plainly and, if \
                      useful, list the exact commands an owner could run.\n",
@@ -404,8 +406,8 @@ impl PromptSection for SafetySection {
                 out.push_str(
                     "**Active approval policy: Manual (messaging channel).**\n\n\
                      - Every tool that runs commands or changes state requires \
-                     an authorized **owner**'s approval on this channel; \
-                     read-only file/memory tools are not gated.\n\
+                     an authorized **owner**'s in-chat approval (`/approve`) on \
+                     this channel; read-only file/memory tools are not gated.\n\
                      - Without an approving owner the action is declined — say \
                      so rather than pretending it ran.\n",
                 );

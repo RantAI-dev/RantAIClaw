@@ -229,6 +229,16 @@ struct ChannelRuntimeContext {
     /// (channels never grant interactive approval), so it's safe to share
     /// one manager across senders.
     channel_approval: Option<Arc<crate::approval::ApprovalManager>>,
+    /// Senders authorized to APPROVE tool calls over a channel
+    /// (`[channels_config] approval_owners`). Empty ⇒ nobody can approve, so the
+    /// in-chat relay is never offered and approval-required tools auto-deny.
+    /// Shared with the dispatch loop's reply parser.
+    approval_owners: Arc<Vec<String>>,
+    /// Dedicated registry for in-chat whole-tool approvals (Layer A). Separate
+    /// from the shell allowlist `PendingApprovals` on `security`. The per-message
+    /// [`ChatRelayApprovalBackend`] registers + awaits here; the dispatch loop's
+    /// `try_handle_tool_reply` resolves it when an owner replies.
+    tool_approvals: Arc<crate::security::PendingApprovals>,
 }
 
 #[derive(Clone)]
@@ -1530,6 +1540,26 @@ async fn process_channel_message(
         Cancelled,
     }
 
+    // In-chat owner approval (Layer A): only when tool-gating is active AND an
+    // owner is configured AND we can post back to the chat. Otherwise the loop
+    // keeps the auto-deny default — channels never gain approval power silently.
+    let chat_relay_backend = if ctx.channel_approval.is_some() && !ctx.approval_owners.is_empty() {
+        target_channel.as_ref().map(|chan| {
+            approval_relay::ChatRelayApprovalBackend::new(
+                Arc::clone(&ctx.tool_approvals),
+                Arc::clone(chan),
+                msg.reply_target.clone(),
+                msg.thread_ts.clone(),
+                msg.channel.clone(),
+            )
+        })
+    } else {
+        None
+    };
+    let chat_relay_backend_ref = chat_relay_backend
+        .as_ref()
+        .map(|b| b as &dyn crate::approval::ApprovalBackend);
+
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let llm_result = tokio::select! {
@@ -1547,6 +1577,7 @@ async fn process_channel_message(
                 true,
                 ctx.channel_approval.as_deref(),
                 msg.channel.as_str(),
+                chat_relay_backend_ref,
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
@@ -1751,17 +1782,27 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
-        // Intercept approval replies (`/allow X`, `deny X`, `y X`, …)
-        // before the message reaches the agent. The parser is
-        // stateless: it consults only `security.pending()` and
-        // returns an acknowledgement if the text was a recognised
-        // reply, otherwise `None`.
-        if let Some(reply) = approval_relay::try_handle_reply(
+        // Intercept approval replies before the message reaches the agent.
+        // Try the whole-tool relay first (`/approve X`, `/deny X` — Layer A),
+        // then the shell allowlist relay (`/allow X`, `y X`, … — Layer B). Both
+        // are stateless: they consult only their pending registry and return an
+        // acknowledgement if the text was a recognised reply, else `None` so
+        // normal chat falls through. Owner authority is enforced inside each.
+        let approval_reply = approval_relay::try_handle_tool_reply(
             &msg.content,
-            ctx.security.as_ref(),
+            ctx.tool_approvals.as_ref(),
             &msg.sender,
             &approval_owners,
-        ) {
+        )
+        .or_else(|| {
+            approval_relay::try_handle_reply(
+                &msg.content,
+                ctx.security.as_ref(),
+                &msg.sender,
+                &approval_owners,
+            )
+        });
+        if let Some(reply) = approval_reply {
             if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
                 let ack = traits::SendMessage::new(reply, msg.reply_target.clone())
                     .in_thread(msg.thread_ts.clone());
@@ -3099,6 +3140,8 @@ pub async fn start_channels_with_cancellation(
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
 
+    let approval_owners = Arc::new(config.channels_config.approval_owners.clone());
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -3135,9 +3178,14 @@ pub async fn start_channels_with_cancellation(
                 &config.autonomy,
             )))
         },
+        approval_owners: Arc::clone(&approval_owners),
+        // 5-minute deadline: an unanswered in-chat approval auto-denies so a
+        // forgotten prompt never leaves a tool call hanging (secure default).
+        tool_approvals: Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(300),
+        ))),
     });
 
-    let approval_owners = Arc::new(config.channels_config.approval_owners.clone());
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages, approval_owners).await;
 
     // Wait for all channel tasks
@@ -3314,6 +3362,8 @@ mod tests {
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -3768,6 +3818,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -3827,6 +3879,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -3886,6 +3940,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -3954,6 +4010,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4043,6 +4101,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4114,6 +4174,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4200,6 +4262,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4277,6 +4341,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4341,6 +4407,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4512,6 +4580,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4592,6 +4662,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4684,6 +4756,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4758,6 +4832,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -5287,6 +5363,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -5372,6 +5450,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -5457,6 +5537,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(

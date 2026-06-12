@@ -1018,6 +1018,7 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        None,
         multimodal_config,
         max_tool_iterations,
         None,
@@ -1183,6 +1184,7 @@ pub(crate) async fn execute_tool_calls_collecting(
     observer: &dyn Observer,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
     parallel: bool,
     cancellation_token: Option<&CancellationToken>,
     events: Option<&AgentEventSender>,
@@ -1202,8 +1204,18 @@ pub(crate) async fn execute_tool_calls_collecting(
                     tool_name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 };
-                let backend = crate::approval::default_backend_for(channel_name);
-                let decision = backend.decide(mgr, &request);
+                // Prefer the injected surface backend (e.g. the channel
+                // in-chat owner relay); fall back to the name-derived default
+                // (CLI prompt / auto-deny) when none was supplied.
+                let default_backend;
+                let backend: &dyn crate::approval::ApprovalBackend = match approval_backend {
+                    Some(b) => b,
+                    None => {
+                        default_backend = crate::approval::default_backend_for(channel_name);
+                        default_backend.as_ref()
+                    }
+                };
+                let decision = backend.decide(mgr, &request).await;
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
                 if decision == ApprovalResponse::No {
                     if let Some(tx) = events {
@@ -1337,6 +1349,10 @@ pub(crate) async fn run_structured_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    // Surface-specific inline approval backend. `None` ⇒ derive from
+    // `channel_name` (CLI prompts, every other surface auto-denies). `Some`
+    // injects a richer backend — e.g. the channel in-chat owner relay.
+    approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
@@ -1549,6 +1565,7 @@ pub(crate) async fn run_structured_loop(
             observer,
             approval,
             channel_name,
+            approval_backend,
             should_parallel,
             cancellation_token.as_ref(),
             events.as_ref(),
@@ -1670,6 +1687,7 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
@@ -1698,6 +1716,7 @@ pub(crate) async fn run_tool_call_loop(
         silent,
         approval,
         channel_name,
+        approval_backend,
         multimodal_config,
         max_tool_iterations,
         cancellation_token,
@@ -2178,6 +2197,7 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            None,
             &config.multimodal,
             config.agent.max_tool_iterations,
             None,
@@ -2323,6 +2343,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                None,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
                 None,
@@ -2803,6 +2824,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             3,
             None,
@@ -2848,6 +2870,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &multimodal,
             3,
             None,
@@ -2887,6 +2910,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             3,
             None,
@@ -3013,6 +3037,7 @@ mod tests {
             true,
             Some(&approval_mgr),
             "telegram",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -3049,6 +3074,119 @@ mod tests {
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
         );
+    }
+
+    /// Tool that records whether it ran, so we can prove approval gating.
+    struct RanFlagTool {
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for RanFlagTool {
+        fn name(&self) -> &str {
+            "do_thing"
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "did the thing".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Always approves — stands in for an in-chat owner who replied `/approve`.
+    struct AlwaysYesBackend;
+
+    #[async_trait::async_trait]
+    impl crate::approval::ApprovalBackend for AlwaysYesBackend {
+        async fn decide(
+            &self,
+            _mgr: &ApprovalManager,
+            _request: &ApprovalRequest,
+        ) -> ApprovalResponse {
+            ApprovalResponse::Yes
+        }
+    }
+
+    fn supervised_manager() -> ApprovalManager {
+        ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            ..crate::config::AutonomyConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn injected_backend_overrides_non_cli_auto_deny() {
+        // A non-CLI surface with an approval manager that gates `do_thing`.
+        let mgr = supervised_manager();
+        assert!(mgr.needs_approval("do_thing"));
+        let call = ParsedToolCall {
+            name: "do_thing".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+
+        // No backend ⇒ name-derived default ⇒ telegram auto-denies, tool stays unrun.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran),
+        })];
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "auto-deny must not run the tool"
+        );
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("denied") || results[0].output.contains("approval"));
+
+        // Injected always-yes backend ⇒ the same gated call runs.
+        let ran2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools2: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran2),
+        })];
+        let backend = AlwaysYesBackend;
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools2,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            Some(&backend as &dyn crate::approval::ApprovalBackend),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ran2.load(Ordering::SeqCst),
+            "approved call must run the tool"
+        );
+        assert!(results[0].success);
+        assert_eq!(results[0].output, "did the thing");
     }
 
     #[test]
@@ -4176,6 +4314,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None,
             &multimodal,
             5,
             None,
@@ -4274,6 +4413,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None,
             &multimodal,
             5,
             None,
@@ -4368,6 +4508,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None,
             &multimodal,
             5,
             Some(token),
@@ -4416,6 +4557,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None,
             &multimodal,
             5,
             None,

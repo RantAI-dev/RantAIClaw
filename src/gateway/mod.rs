@@ -1048,6 +1048,10 @@ async fn run_gateway_chat_with_multimodal(
         true, // silent — no terminal output in gateway mode
         approval_manager.as_ref(),
         "webhook",
+        // Gateway has its own turn-based, owner-gated approval flow
+        // (`channel_approval`); the inline backend stays the name-derived
+        // default (auto-deny) here.
+        None,
         &multimodal_config,
         GATEWAY_MAX_TOOL_ITERATIONS,
         None, // no cancellation token

@@ -183,19 +183,21 @@ pub fn can_approve(owners: &[String], sender: &str) -> bool {
 ///
 /// Extracted so the agent loop no longer hardcodes `channel_name == "cli"`:
 /// the loop asks a backend for the decision, and each surface supplies the
-/// one that fits it (interactive terminal, in-chat relay, web modal, or
-/// auto-deny). Today only CLI prompts inline; channels/gateway auto-deny here
-/// and run their own turn-based, owner-gated approval relay out-of-band (see
-/// `crate::gateway::channel_approval`).
+/// one that fits it (interactive terminal, in-chat owner relay, web modal, or
+/// auto-deny). `decide` is async because the in-chat relay must post a message
+/// and await an owner's reply (a separate inbound message); the terminal and
+/// auto-deny backends resolve synchronously and just return.
+#[async_trait::async_trait]
 pub trait ApprovalBackend: Send + Sync {
-    fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse;
+    async fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse;
 }
 
 /// Interactive terminal prompt (TUI / CLI surface).
 pub struct CliApprovalBackend;
 
+#[async_trait::async_trait]
 impl ApprovalBackend for CliApprovalBackend {
-    fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
+    async fn decide(&self, mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
         mgr.prompt_cli(request)
     }
 }
@@ -205,8 +207,9 @@ impl ApprovalBackend for CliApprovalBackend {
 /// relay; this only governs the inline decision the loop makes.
 pub struct AutoDenyBackend;
 
+#[async_trait::async_trait]
 impl ApprovalBackend for AutoDenyBackend {
-    fn decide(&self, _mgr: &ApprovalManager, _request: &ApprovalRequest) -> ApprovalResponse {
+    async fn decide(&self, _mgr: &ApprovalManager, _request: &ApprovalRequest) -> ApprovalResponse {
         ApprovalResponse::No
     }
 }
@@ -250,7 +253,7 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
 }
 
 /// Produce a short human-readable summary of tool arguments.
-fn summarize_args(args: &serde_json::Value) -> String {
+pub(crate) fn summarize_args(args: &serde_json::Value) -> String {
     match args {
         serde_json::Value::Object(map) => {
             let parts: Vec<String> = map
