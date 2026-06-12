@@ -1899,13 +1899,20 @@ pub fn build_system_prompt_with_mode(
     // Tool-call protocol instructions are appended by the caller via
     // `build_tool_instructions`, so `dispatcher_instructions` stays empty here.
     //
-    // `autonomy_preset` is `None` on purpose: the preset-specific safety text
-    // describes the TUI's inline Y/N/A prompt, which a channel does not do
-    // (it auto-denies / owner-relays), so channels render the safety floor
-    // only — matching prior behavior. Channel-accurate preset text is future
-    // work (see docs/unified-agent-runtime-plan.md PR3b-safety).
+    // Resolve the active approval preset so SafetySection renders the
+    // channel-accurate guidance (Strict really drops `shell` here after
+    // PR3b-strict; Smart/Manual describe owner-approval, not the TUI's inline
+    // Y/N/A). Failure to read the policy is non-fatal — `None` falls back to the
+    // generic safety floor. The shell allowlist is intentionally NOT surfaced on
+    // channels: the Layer-A approval manager gates non-read-only tools before
+    // the Layer-B shell allowlist applies, so listing globs here would mislead.
     use crate::agent::prompt::{DescriptorTool, PromptContext, PromptSurface, SystemPromptBuilder};
     use crate::tools::Tool;
+
+    let autonomy_preset = crate::profile::ProfileManager::active()
+        .ok()
+        .map(|profile| crate::approval::policy_writer::read_active_preset(&profile.policy_dir()))
+        .unwrap_or(None);
 
     let stub_tools: Vec<Box<dyn Tool>> = tools
         .iter()
@@ -1922,7 +1929,7 @@ pub fn build_system_prompt_with_mode(
         skills_prompt_mode,
         identity_config,
         dispatcher_instructions: "",
-        autonomy_preset: None,
+        autonomy_preset,
         allowed_commands: &[],
     };
 

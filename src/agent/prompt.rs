@@ -338,6 +338,16 @@ impl PromptSection for SafetySection {
              - When in doubt, ask before acting externally.\n\n",
         );
 
+        // Whether this prompt targets a messaging channel. On channels the
+        // approval *mechanism* differs from the TUI's inline single-key Y/N/A
+        // prompt: there is no terminal to prompt, so a tool that needs approval
+        // is decided by an authorized **owner** of the channel (the owner-gated
+        // relay) and, absent an approving owner, is declined. The preset text
+        // must describe that reality, not the TUI prompt, or the model will
+        // promise a Y/N/A flow that never appears. Strict/Off read the same on
+        // both surfaces (shell un-registered / no per-call gate respectively).
+        let is_channel = matches!(ctx.surface, PromptSurface::Channel { .. });
+
         match ctx.autonomy_preset {
             Some(PolicyPreset::Strict) => {
                 // Plan-mode analog: shell is unavailable to the model in
@@ -358,6 +368,20 @@ impl PromptSection for SafetySection {
                      or `/autonomy off`. Don't suggest it unless they ask.\n",
                 );
             }
+            Some(PolicyPreset::Smart) if is_channel => {
+                out.push_str(
+                    "**Active approval policy: Smart (messaging channel).**\n\n\
+                     - Read-only tools (reading files, recalling memory) run \
+                     automatically.\n\
+                     - Any tool that runs commands or changes state requires \
+                     approval from an authorized **owner** of this channel. \
+                     Without that approval the action is declined — there is no \
+                     inline Y/N/A prompt here.\n\
+                     - Never claim you ran a command or made a change that was \
+                     actually declined; report the denial plainly and, if \
+                     useful, list the exact commands an owner could run.\n",
+                );
+            }
             Some(PolicyPreset::Smart) => {
                 out.push_str(
                     "**Active approval policy: Smart.**\n\n\
@@ -375,6 +399,16 @@ impl PromptSection for SafetySection {
                         let _ = writeln!(out, "- `{pat}`");
                     }
                 }
+            }
+            Some(PolicyPreset::Manual) if is_channel => {
+                out.push_str(
+                    "**Active approval policy: Manual (messaging channel).**\n\n\
+                     - Every tool that runs commands or changes state requires \
+                     an authorized **owner**'s approval on this channel; \
+                     read-only file/memory tools are not gated.\n\
+                     - Without an approving owner the action is declined — say \
+                     so rather than pretending it ran.\n",
+                );
             }
             Some(PolicyPreset::Manual) => {
                 out.push_str(
@@ -710,6 +744,97 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    #[test]
+    fn safety_section_channel_smart_describes_owner_approval_not_yna() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Channel { native_tools: true },
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Smart),
+            allowed_commands: &["ls *".to_string()],
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(
+            out.contains("messaging channel"),
+            "channel-specific heading: {out}"
+        );
+        assert!(
+            out.contains("authorized **owner**"),
+            "owner approval wording: {out}"
+        );
+        assert!(
+            !out.contains("(Y/N/A)") || out.contains("no inline Y/N/A"),
+            "channel text must not promise a TUI Y/N/A prompt: {out}"
+        );
+        // Shell allowlist globs are not surfaced on channels (Layer-A gating).
+        assert!(
+            !out.contains("ls *"),
+            "channel must not print shell allowlist: {out}"
+        );
+    }
+
+    #[test]
+    fn safety_section_agent_smart_keeps_yna_prompt_text() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Smart),
+            allowed_commands: &["ls *".to_string()],
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(
+            out.contains("(Y/N/A)"),
+            "TUI keeps inline prompt text: {out}"
+        );
+        assert!(
+            out.contains("ls *"),
+            "TUI surfaces the shell allowlist: {out}"
+        );
+        assert!(!out.contains("messaging channel"));
+    }
+
+    #[test]
+    fn safety_section_channel_manual_requires_owner() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Channel {
+                native_tools: false,
+            },
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Manual),
+            allowed_commands: &[],
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(out.contains("Manual (messaging channel)"), "{out}");
+        assert!(out.contains("owner"), "{out}");
+        assert!(out.contains("declined"), "{out}");
     }
 
     #[test]
