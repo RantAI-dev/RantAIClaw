@@ -122,7 +122,16 @@ Conversation id per surface (Hermes scheme):
 | **PR4-memory-read** | `recall_layered` — conversation-scoped + global layering | Low | ✅ done (`d8c0478`) |
 | **PR4-memory-loader** | Memory loader routes through `recall_layered` (conversation_id param) | Low | ✅ done (`34746b9`) |
 | **PR4-memory-agent** | Agent read+write conversation scoping (builder `conversation_id`) | Low | ✅ done (`7e0986d`) |
-| **PR4-memory-channels** | Memory load/store on the channel path + surface threading + pairing | Med | ⏳ pending (channels currently have no memory integration in `run_tool_call_loop`) |
+| **PR4-memory-channels** | Conversation-scope channel recall/store via `ConversationKey` | Low | ✅ done (`d9b145c`) |
+
+> **PR4-memory is complete** for every surface that recalls memory for context:
+> Agent/TUI (`recall_layered` + scoped store), polling channels (`build_memory_context`
+> via `recall_layered` + scoped store), and the gateway (its conversation context
+> is `channel_approvals.history`, already keyed by `ConversationKey`). Cross-surface
+> identity **pairing** remains a deliberately separate auth feature (plan §4
+> non-goal: "pairing is explicit, never auto-merged"), not part of memory layering.
+
+**Only remaining item: PR2-rest** — the atomic loop collapse (proven scope below).
 | **PR2-step1** | Extract shared LLM-call + streaming/cancel core | Med | ✅ done (`001dd5b`) |
 | **PR2-rest** | Unify history model + merge divergent loop feature sets | High (largest) | ⏳ pending |
 
