@@ -94,7 +94,9 @@ mod tests {
 
     #[test]
     fn empty_thread_is_treated_as_no_thread() {
-        let a = ConversationKey::new("slack", "u1").in_thread(Some("")).resolve();
+        let a = ConversationKey::new("slack", "u1")
+            .in_thread(Some(""))
+            .resolve();
         let b = ConversationKey::new("slack", "u1").resolve();
         assert_eq!(a, b);
     }
