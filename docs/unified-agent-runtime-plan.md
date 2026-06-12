@@ -166,6 +166,66 @@ adds an approval path, behind the owner gate.
    it registered; it is auto-denied at the gate but still advertised). Fold the
    filter into PR3 so Strict means the same thing on every surface.
 
+## 3.1 Remaining work — ready-to-execute specs
+
+Shipped this pass: PR1.0 (`c3ee0d4`), PR3 (`71b1768`), PR3b-strict (`a2e634b`),
+docs (`0d051b8`, `f6f3eb9`, `e45d8e7`), fmt (`1f9725f`). All compile, are tested,
+and are rustfmt/clippy-clean. The pieces below are deliberately **not** rushed —
+they are larger and (PR2 especially) touch every surface's agent path.
+
+### PR1.1 — structural prompt-builder convergence (Low–Med)
+
+Goal: one builder feeds every surface. Blocker: `SystemPromptBuilder` consumes
+`&[Box<dyn Tool>]` (with schemas) but the channel path passes `&[(&str,&str)]`.
+
+Steps:
+1. Add `pub struct ToolDescriptor { name, description, schema: Option<Value> }`
+   in `src/agent/prompt.rs`; change `PromptContext.tools` to `&[ToolDescriptor]`.
+2. TUI builds descriptors from `Box<dyn Tool>` (schema `Some`); channels/gateway
+   from `(name, desc)` (schema `None`). Real tool registry IS in scope at
+   `src/channels/mod.rs:~2912` (`tools_registry`) if richer descriptors wanted.
+3. Add surface-hint sections gated by a `Surface` field: `HardwareSection`,
+   `TaskSection` (native vs xml), `ChannelCapabilitiesSection` — port verbatim
+   from `build_system_prompt_with_mode`.
+4. Route `build_system_prompt_with_mode` (`src/channels/mod.rs:1885`) and the
+   gateway (`src/gateway/mod.rs:983`) through `SystemPromptBuilder`.
+5. **Expect prompt-output changes** → update the ~30 channel prompt tests
+   (`src/channels/mod.rs` `#[test] build_system_prompt_*`). This is an
+   outward-facing change (every channel user's prompt) — diff-review it.
+
+### PR3b-safety — port the Safety/autonomy-preset section to channels (Med)
+
+Now unblocked (PR3b-strict landed). The `SafetySection` preset text
+(`src/agent/prompt.rs:195`) is now accurate on channels (Strict really does
+drop `shell` there). Resolve the active preset + allowlist inside the channel
+builder (as `Agent::build_system_prompt` does at `agent.rs:707`) and emit the
+section. Folds naturally into PR1.1's shared builder.
+
+### PR2 — collapse the two agent loops (High, largest)
+
+`Agent::turn_inner` (`src/agent/agent.rs:872`) and `run_tool_call_loop`
+(`src/agent/loop_.rs:1302`) are independent loops with different feature sets
+(the former adds history, memory auto-save, `memory_loader` context enrichment,
+model classification, events/streaming). Recommended approach:
+1. Extract `Agent`'s per-iteration core (LLM call → parse → execute → feed) into
+   a shared function that both call, parameterized by an `ApprovalBackend`
+   (PR3) and prompt (PR1.1) — do **not** duplicate the feature set.
+2. Migrate channels/gateway to drive the `Agent` struct (or the shared core)
+   instead of `run_tool_call_loop`, preserving their per-`(channel,sender)`
+   history maps via the conversation key (PR4).
+3. Land behind tests per surface; this is the one to do on its own branch slice
+   with a full `./dev/ci.sh all` run, not bundled.
+
+### PR4 — ConversationResolver + layered memory (Med)
+
+1. `ConversationResolver`: map `(surface, sender, thread)` → conversation id
+   (Hermes scheme `{surface}:{sender}[:{thread}]`). Replace ad-hoc
+   `format!("{channel}:{sender}")` at `src/gateway/mod.rs:1102` and the channels
+   `conversation_histories` keys; thread-aware so Discord/Slack threads scope
+   separately. Plumb `thread_id` from channel adapters into `process_channel_chat`.
+2. Memory layers global/user/workspace/conversation; cross-surface identity via
+   explicit pairing only (never auto-merge). Additive over `src/memory/`.
+
 ## 4. Non-goals
 
 - No new heavy dependencies.
