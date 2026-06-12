@@ -2899,6 +2899,12 @@ pub async fn start_channels_with_cancellation(
         &config,
     );
 
+    // Strict preset parity: drop `shell` on channels too when the active
+    // policy is Strict (read-only), matching `Agent::from_config`. Without
+    // this, Strict mode left `shell` registered on channels — the model was
+    // told it could run commands that would then be denied at the gate.
+    tools::apply_preset_tool_filter(&mut all_tools);
+
     // Merge peripheral tools (UNO Q Bridge, RPi GPIO, etc.)
     let peripheral_tools = crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     if !peripheral_tools.is_empty() {

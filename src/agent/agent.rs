@@ -373,27 +373,11 @@ impl Agent {
             config,
         );
 
-        // Strict preset filter: when the active policy is Strict, drop
-        // the `shell` tool from the registry so the model can't even
-        // attempt a call (CC plan-mode analog). The model is also told
-        // about this via SafetySection, so the prompt + tool list agree.
-        // Manual / Smart / Off keep shell; the gate handles per-call
-        // approval there.
-        if matches!(
-            crate::profile::ProfileManager::active().ok().and_then(|p| {
-                crate::approval::policy_writer::read_active_preset(&p.policy_dir())
-            }),
-            Some(crate::approval::policy_writer::PolicyPreset::Strict)
-        ) {
-            let before = tools.len();
-            tools.retain(|t| t.name() != "shell");
-            if tools.len() < before {
-                tracing::info!(
-                    target: "agent",
-                    "Strict preset active — `shell` tool removed from registry"
-                );
-            }
-        }
+        // Strict preset filter: when the active policy is Strict, drop the
+        // `shell` tool so the model can't even attempt a call (plan-mode
+        // analog). Shared with the channels runtime via `apply_preset_tool_filter`
+        // so Strict means the same thing on every surface.
+        tools::apply_preset_tool_filter(&mut tools);
 
         // MCP discovery — spawn each configured server, query
         // `tools/list`, splice each tool into the registry as an
