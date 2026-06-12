@@ -120,7 +120,9 @@ Conversation id per surface (Hermes scheme):
 | **PR3b-safety** | Channel-accurate safety/preset text (couples to approval) | Med | ⏳ pending |
 | **PR4-foundation** | `ConversationKey` (one tested conversation-id) | Low | ✅ done (`59df725`) |
 | **PR4-memory-read** | `recall_layered` — conversation-scoped + global layering | Low | ✅ done (`d8c0478`) |
-| **PR4-memory-rest** | Thread `conversation_id` into the memory loader + write-side scoping + pairing | Med | ⏳ pending |
+| **PR4-memory-loader** | Memory loader routes through `recall_layered` (conversation_id param) | Low | ✅ done (`34746b9`) |
+| **PR4-memory-agent** | Agent read+write conversation scoping (builder `conversation_id`) | Low | ✅ done (`7e0986d`) |
+| **PR4-memory-channels** | Memory load/store on the channel path + surface threading + pairing | Med | ⏳ pending (channels currently have no memory integration in `run_tool_call_loop`) |
 | **PR2-step1** | Extract shared LLM-call + streaming/cancel core | Med | ✅ done (`001dd5b`) |
 | **PR2-rest** | Unify history model + merge divergent loop feature sets | High (largest) | ⏳ pending |
 
