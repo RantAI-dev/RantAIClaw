@@ -1298,6 +1298,75 @@ async fn execute_tools_sequential(
 //   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
 
+/// Result of one provider chat that may be cancelled mid-flight.
+pub(crate) enum ChatTurnOutcome {
+    /// The provider returned a response.
+    Completed(crate::providers::ChatResponse),
+    /// The cancellation token fired before the response arrived.
+    Cancelled,
+}
+
+/// Issue ONE provider chat for an agentic iteration, streaming text deltas to
+/// `events` as [`AgentEvent::Chunk`] when the provider supports streaming and a
+/// consumer is attached; otherwise a plain `chat`. Honors `cancel` (returns
+/// [`ChatTurnOutcome::Cancelled`] if it fires first); provider errors propagate
+/// as `Err`.
+///
+/// First shared piece of the unified agent loop: previously `run_tool_call_loop`
+/// and `Agent::turn_inner` each carried a near-identical copy of this streaming +
+/// cancellation plumbing. Centralizing it removes that duplication and is a
+/// behavior-preserving step toward collapsing the two loops (see
+/// `docs/unified-agent-runtime-plan.md` PR2).
+pub(crate) async fn chat_with_optional_streaming(
+    provider: &dyn Provider,
+    request: ChatRequest<'_>,
+    model: &str,
+    temperature: f64,
+    cancel: Option<&CancellationToken>,
+    events: Option<&AgentEventSender>,
+) -> Result<ChatTurnOutcome> {
+    let streamed_inline = events.is_some() && provider.supports_streaming();
+
+    if streamed_inline {
+        let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let events_clone = events.cloned();
+        let forwarder = async move {
+            while let Some(piece) = text_rx.recv().await {
+                if let Some(ref tx) = events_clone {
+                    if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        };
+        let stream_future = provider.chat_stream(request, model, temperature, text_tx);
+        let combined = async {
+            let (r, ()) = tokio::join!(stream_future, forwarder);
+            r
+        };
+        let resp = if let Some(token) = cancel {
+            tokio::select! {
+                () = token.cancelled() => return Ok(ChatTurnOutcome::Cancelled),
+                result = combined => result?,
+            }
+        } else {
+            combined.await?
+        };
+        Ok(ChatTurnOutcome::Completed(resp))
+    } else {
+        let chat_future = provider.chat(request, model, temperature);
+        let resp = if let Some(token) = cancel {
+            tokio::select! {
+                () = token.cancelled() => return Ok(ChatTurnOutcome::Cancelled),
+                result = chat_future => result?,
+            }
+        } else {
+            chat_future.await?
+        };
+        Ok(ChatTurnOutcome::Completed(resp))
+    }
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 #[allow(clippy::too_many_arguments)]
@@ -1379,70 +1448,27 @@ pub(crate) async fn run_tool_call_loop(
         // provider opts into streaming, use `chat_stream` so text deltas
         // arrive in real time. Tool calls + final text still get assembled
         // into a `ChatResponse` so the rest of the loop is unchanged.
+        // `streamed_inline` is recomputed (cheaply) because it also gates the
+        // post-response chunking further down.
         let streamed_inline = events.is_some() && provider.supports_streaming();
 
-        let chat_result = if streamed_inline {
-            let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
-            let events_for_forwarder = events.clone();
-            let cancel_for_forwarder = cancellation_token.clone();
-            let stream_future = provider.chat_stream(
-                ChatRequest {
-                    messages: &prepared_messages.messages,
-                    tools: request_tools,
-                },
-                model,
-                temperature,
-                text_tx,
-            );
-            let forwarder = async move {
-                while let Some(piece) = text_rx.recv().await {
-                    if cancel_for_forwarder
-                        .as_ref()
-                        .is_some_and(CancellationToken::is_cancelled)
-                    {
-                        break;
-                    }
-                    if let Some(ref tx) = events_for_forwarder {
-                        if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            };
-            let combined = async {
-                let (r, ()) = tokio::join!(stream_future, forwarder);
-                r
-            };
-            if let Some(token) = cancellation_token.as_ref() {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    result = combined => result,
-                }
-            } else {
-                combined.await
-            }
-        } else {
-            let chat_future = provider.chat(
-                ChatRequest {
-                    messages: &prepared_messages.messages,
-                    tools: request_tools,
-                },
-                model,
-                temperature,
-            );
-            if let Some(token) = cancellation_token.as_ref() {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    result = chat_future => result,
-                }
-            } else {
-                chat_future.await
-            }
-        };
+        let chat_result = chat_with_optional_streaming(
+            provider,
+            ChatRequest {
+                messages: &prepared_messages.messages,
+                tools: request_tools,
+            },
+            model,
+            temperature,
+            cancellation_token.as_ref(),
+            events.as_ref(),
+        )
+        .await;
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             match chat_result {
-                Ok(resp) => {
+                Ok(ChatTurnOutcome::Cancelled) => return Err(ToolLoopCancelled.into()),
+                Ok(ChatTurnOutcome::Completed(resp)) => {
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
                         model: model.to_string(),

@@ -934,58 +934,29 @@ impl Agent {
             // still works on the assembled `full_text` for prompt-guided
             // dispatchers; native tool_call deltas are not yet parsed
             // mid-stream and will be picked up only at end-of-stream.
+            // `streamed_inline` also gates whether we re-emit the final text
+            // below, so keep it computed here.
             let streamed_inline = events.is_some() && self.provider.supports_streaming();
 
-            let response = if streamed_inline {
-                let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
-                let events_clone = events.cloned();
-                let forwarder = async move {
-                    while let Some(piece) = text_rx.recv().await {
-                        if let Some(ref tx) = events_clone {
-                            if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                };
-                let stream_future =
-                    self.provider
-                        .chat_stream(request, &effective_model, self.temperature, text_tx);
-                let combined = async {
-                    let (r, ()) = tokio::join!(stream_future, forwarder);
-                    r
-                };
-                if let Some(token) = cancel {
-                    tokio::select! {
-                        () = token.cancelled() => {
-                            return Ok(TurnResult {
-                                text: String::new(),
-                                usage: empty_usage(&effective_model),
-                                cancelled: true,
-                            });
-                        }
-                        result = combined => result?,
-                    }
-                } else {
-                    combined.await?
-                }
-            } else {
-                let chat_future = self
-                    .provider
-                    .chat(request, &effective_model, self.temperature);
-                if let Some(token) = cancel {
-                    tokio::select! {
-                        () = token.cancelled() => {
-                            return Ok(TurnResult {
-                                text: String::new(),
-                                usage: empty_usage(&effective_model),
-                                cancelled: true,
-                            });
-                        }
-                        result = chat_future => result?,
-                    }
-                } else {
-                    chat_future.await?
+            // Shared with `run_tool_call_loop` — one place for the streaming +
+            // cancellation plumbing (unified-agent-runtime PR2, step 1).
+            let response = match crate::agent::loop_::chat_with_optional_streaming(
+                self.provider.as_ref(),
+                request,
+                &effective_model,
+                self.temperature,
+                cancel,
+                events,
+            )
+            .await?
+            {
+                crate::agent::loop_::ChatTurnOutcome::Completed(resp) => resp,
+                crate::agent::loop_::ChatTurnOutcome::Cancelled => {
+                    return Ok(TurnResult {
+                        text: String::new(),
+                        usage: empty_usage(&effective_model),
+                        cancelled: true,
+                    });
                 }
             };
 
