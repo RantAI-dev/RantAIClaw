@@ -131,23 +131,25 @@ Conversation id per surface (Hermes scheme):
 > identity **pairing** remains a deliberately separate auth feature (plan §4
 > non-goal: "pairing is explicit, never auto-merged"), not part of memory layering.
 
-**Only remaining item: PR2-rest** — the atomic loop collapse (proven scope below).
+**All work items complete.** The two agent loops are collapsed into one
+`run_structured_loop`; see the PR2-rest rows above.
 | **PR2-step1** | Extract shared LLM-call + streaming/cancel core | Med | ✅ done (`001dd5b`) |
 | **PR2-rest-a** | Unify `ParsedToolCall` + `ToolExecutionResult` types | Med | ✅ done (`ce4b7d3`) |
 | **PR2-rest-b** | Shared tool executor (both loops use `execute_tool_calls_collecting`) | Med | ✅ done (`379ace8`,`91a226e`,`b7cb699`) |
-| **PR2-rest-c** | Merge orchestration bodies over one history model (`run_structured_loop`) | High | ⏳ needs dedicated debugging session |
+| **PR2-rest-c** | Merge orchestration bodies over one history model (`run_structured_loop`) | High | ✅ done (`2dde1d3`,`9df2908`) |
 
-> **PR2-rest-c was attempted and reverted** (empirical finding): with all
-> primitives pre-unified, a full `run_structured_loop` transformation
-> (ConversationMessage + dispatcher, with `run_tool_call_loop` as an internal
-> adapter) compiled and passed loop_/channels in isolation, but introduced a
-> **flaky failure in `gateway::api_v1::tests::sse_chat_emits_chunk_then_done`**
-> (~50% in the full parallel gateway suite; passes alone). The committed state
-> passes that suite 4/4, so the merge introduced/exposed an SSE-streaming race.
-> Reverted to keep the branch green. This confirms — empirically, not by
-> estimate — that the shell-merge needs a dedicated session to root-cause the
-> SSE timing interaction before it can land. The shared primitives (types,
-> executor, LLM-call core) remain committed and green.
+> **PR2 is complete.** The two agent loops are collapsed into one
+> `run_structured_loop` (ConversationMessage + dispatcher). `Agent::turn_inner`
+> calls it directly (passing its structured history + dispatcher, no
+> conversion); `run_tool_call_loop` is a thin adapter (wrap → run → flatten) so
+> channels/gateway/CLI/delegate callers are unchanged.
+>
+> The flaky `sse_chat_emits_chunk_then_done` failure seen during the first
+> attempt was diagnosed as a **pre-existing `XDG_DATA_HOME` test-isolation race**
+> (two gateway tests clobber the process-global env var), not a fault in the
+> transformation — fixed in `e598205` (`EnvVarGuard` now serializes env-mutating
+> tests). With that fix, the transformation is stable: gateway suite 10/10, and
+> agent/channels/memory/approval all green.
 
 > **Note:** PR3 shipped before PR1.1/PR2 because it is the actual fix for the
 > original report ("can't do X on Telegram") and is self-contained. The
