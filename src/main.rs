@@ -1321,7 +1321,7 @@ async fn main() -> Result<()> {
             "prerelease" | "pre" => rantaiclaw::lifecycle::update::Channel::Prerelease,
             other => bail!("unknown channel: {other} (expected `stable` or `prerelease`)"),
         };
-        return rantaiclaw::lifecycle::update::run(rantaiclaw::lifecycle::update::UpdateOpts {
+        let opts = rantaiclaw::lifecycle::update::UpdateOpts {
             check: *check,
             channel,
             to: to.clone(),
@@ -1329,7 +1329,14 @@ async fn main() -> Result<()> {
             release_base_url: std::env::var("RANTAICLAW_RELEASE_BASE_URL").ok(),
             yes: *yes,
             backup: *backup,
-        });
+        };
+        // `update::run` uses reqwest::blocking, which builds its own Tokio
+        // runtime; calling it directly inside `#[tokio::main]` panics with
+        // "Cannot drop a runtime in a context where blocking is not allowed".
+        // Run it on a blocking thread, mirroring the onboard wizard below.
+        return tokio::task::spawn_blocking(move || rantaiclaw::lifecycle::update::run(opts))
+            .await
+            .map_err(|e| anyhow::anyhow!("update task panicked: {e}"))?;
     }
     if let Some(Commands::Rollback {
         list,
