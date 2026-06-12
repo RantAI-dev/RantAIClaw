@@ -701,6 +701,8 @@ impl Agent {
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             model_name: &self.model_name,
+            surface: crate::agent::prompt::PromptSurface::Agent,
+            bootstrap_max_chars: 20_000,
             tools: &self.tools,
             skills: &self.skills,
             skills_prompt_mode: self.skills_prompt_mode,
