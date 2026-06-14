@@ -5,6 +5,34 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.73-alpha] — 2026-06-14
+
+Unified agent runtime: the TUI, CLI, channels, and gateway/console now share
+one prompt builder and one agentic loop, with a single owner-gated approval
+model across surfaces.
+
+### Added
+
+- **Unified approval model** — pluggable `ApprovalBackend` with all four
+  surfaces wired: CLI prompt, auto-deny, **in-chat owner `/approve`** for
+  polling channels (`ChatRelayApprovalBackend`), and an **in-browser modal**
+  for the console SSE chat (`WebModalApprovalBackend` + `POST /api/v1/approvals/{id}`).
+- **Owner-authority gate** (`can_approve` / `[channels_config] approval_owners`)
+  — the requester is not automatically allowed to approve; secure-by-default
+  (no owner ⇒ approval-required tools auto-deny).
+- `PUT /api/v1/personality` now accepts the full persona (name/role/tone/avoid),
+  not just the preset — enabling live persona switching from a console.
+- Layered, conversation-scoped memory (`recall_layered` + `ConversationKey`).
+
+### Changed
+
+- Collapsed the two agent loops into one `run_structured_loop`
+  (`ConversationMessage` + `ToolDispatcher`); channels/gateway/CLI/delegate use
+  a thin adapter, behavior-preserving.
+- Channel system prompts run through the same `SystemPromptBuilder` as the TUI,
+  with surface-accurate Safety/preset text (owner approval, not the TUI's Y/N/A).
+- Strict preset shell-filter parity applied across CLI, gateway, and channels.
+
 ## [0.6.40-alpha] — 2026-05-14
 
 Approval policy preset rename: drop the `L1` / `L2` / `L3` / `L4`
