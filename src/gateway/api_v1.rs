@@ -914,9 +914,22 @@ async fn personality_get(
 #[derive(Deserialize)]
 struct PersonalityBody {
     /// Optional: when absent, the current preset is kept (and a Default persona
-    /// is created if none exists). Lets callers update only `always_on_kbs`.
+    /// is created if none exists). Lets callers update only other fields.
     #[serde(default)]
     preset: Option<String>,
+    /// Each of the following overwrites that persona field only when supplied,
+    /// so a partial PUT preserves the rest. Together they let a console switch
+    /// to a fully custom persona live (not just one of the built-in presets).
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    tone: Option<String>,
+    /// `avoid`: a non-empty string sets the "things to avoid" block; an empty
+    /// string clears it. Absent leaves it unchanged.
+    #[serde(default)]
+    avoid: Option<String>,
     #[serde(default)]
     always_on_kbs: Option<Vec<String>>,
 }
@@ -950,8 +963,25 @@ async fn personality_set(
             other => return Err(err_400(format!("unknown preset `{other}`"))),
         };
     }
-    // Only overwrite always_on_kbs when the caller supplied it, so a
-    // preset-only update preserves the existing KB selection.
+    // Each field overwrites only when supplied, so a partial PUT preserves the
+    // rest of the persona.
+    if let Some(name) = body.name {
+        next.name = name;
+    }
+    if let Some(role) = body.role {
+        next.role = role;
+    }
+    if let Some(tone) = body.tone {
+        next.tone = tone;
+    }
+    if let Some(avoid) = body.avoid {
+        // Empty string clears the avoid block (renderer treats blank as none).
+        next.avoid = if avoid.trim().is_empty() {
+            None
+        } else {
+            Some(avoid)
+        };
+    }
     if let Some(kbs) = body.always_on_kbs {
         next.always_on_kbs = kbs;
     }
@@ -959,6 +989,10 @@ async fn personality_set(
     crate::persona::render_system_md(&profile, &next).map_err(err_500)?;
     Ok(Json(serde_json::json!({
         "preset": next.preset.slug(),
+        "name": next.name,
+        "role": next.role,
+        "tone": next.tone,
+        "avoid": next.avoid,
         "always_on_kbs": next.always_on_kbs,
     })))
 }
