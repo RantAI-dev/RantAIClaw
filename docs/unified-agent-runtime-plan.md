@@ -117,6 +117,7 @@ Conversation id per surface (Hermes scheme):
 | **PR1.1** | Builder convergence — channels/gateway run the one `SystemPromptBuilder` | Low–Med | ✅ done (`77455e2`) |
 | **PR3** | `ApprovalBackend` + owner-authority gate; remove `channel_name=="cli"` | High (security) | ✅ done (`71b1768`) |
 | **PR3-relay** | `ChatRelayApprovalBackend` — in-chat owner `/approve` for whole-tool gating on polling channels | High (security) | ✅ done (`cd3ba8e`) |
+| **PR3-webmodal** | `WebModalApprovalBackend` — in-browser approve/deny modal for the console SSE chat (`POST /api/v1/approvals/{id}`) | High (security) | ✅ done (`6f8649a`) |
 | **PR3b-strict** | Strict shell-filter parity on channels | Med | ✅ done (`a2e634b`, `222d6ea`) |
 | **PR3b-safety** | Channel-accurate safety/preset text (couples to approval) | Med | ✅ done (`39c17d4`) |
 | **PR4-foundation** | `ConversationKey` (one tested conversation-id) | Low | ✅ done (`59df725`) |
@@ -246,6 +247,22 @@ The backend is threaded through the unified loop as an optional
 are behavior-preserving) and built per channel message only when gating is
 active AND an owner is configured AND a reply target exists. With no
 `approval_owners`, channels still auto-deny — no silent broadening.
+
+### PR3-webmodal — in-browser tool approval (High) — ✅ done (`6f8649a`)
+
+Fourth `ApprovalBackend` from PR3's design. The console chat runs the `Agent`
+over an open SSE stream (`api_v1::agent_chat_stream`) and previously did no
+Layer-A gating. Now `Agent` accepts an optional injected
+`(ApprovalManager, ApprovalBackend)` (`set_approval`); the console handler sets
+an `ApprovalManager` + `WebModalApprovalBackend`, gated off when
+`autonomous_tools` is on. The backend emits `AgentEvent::ApprovalRequest`
+(new variant; TUI no-op arm) over the SSE stream and awaits the client's reply
+via a dedicated `PendingApprovals` registry on `AppState.web_approvals` (id in
+the basename slot, 5-min auto-deny, fail-closed if the receiver is gone).
+`POST /api/v1/approvals/{id}` (auth-gated) resolves the paused turn. TUI /
+`agent run` are unchanged (both injections default to `None`). **All four
+ApprovalBackends from PR3's design now exist** (CLI / AutoDeny / ChatRelay /
+WebModal).
 
 ### PR2 — collapse the two agent loops (High, largest)
 
