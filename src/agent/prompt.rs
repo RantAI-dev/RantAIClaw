@@ -9,10 +9,67 @@ use std::path::Path;
 
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
+/// Which surface the prompt is being built for. Selects the surface-specific
+/// hint sections (hardware/task/channel-capabilities) while keeping the
+/// capability-defining sections (persona/identity/tools/safety/skills)
+/// identical everywhere. One builder, surface-aware tail — the core of the
+/// unified-agent-runtime prompt design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptSurface {
+    /// Interactive agent surface (TUI / `agent run`). No channel delivery hints.
+    Agent,
+    /// Messaging channel or gateway. Adds the "Your Task" action framing and
+    /// the "Channel Capabilities" delivery hints. `native_tools` picks the
+    /// native-vs-XML wording of the task block.
+    Channel { native_tools: bool },
+}
+
+/// Minimal [`Tool`] carrying only a name + description, for prompt rendering on
+/// surfaces that have tool *descriptions* but not the live tool objects (the
+/// channel/gateway path passes `(name, description)` pairs). `execute` is never
+/// called — these exist only to feed [`ToolsSection`] through the one builder.
+pub struct DescriptorTool {
+    name: String,
+    description: String,
+}
+
+impl DescriptorTool {
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for DescriptorTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    /// Empty schema — [`ToolsSection`] omits the `Parameters:` line for these,
+    /// so channel tool listings stay `- **name**: description`.
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+        anyhow::bail!("DescriptorTool is prompt-only and not executable")
+    }
+}
+
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
+    /// Surface this prompt targets — selects the surface-specific hint sections.
+    pub surface: PromptSurface,
+    /// Per-file truncation cap for injected bootstrap/identity files. Lets the
+    /// channel surface honor `compact_context` token savings; defaults to
+    /// [`BOOTSTRAP_MAX_CHARS`] on the agent surface.
+    pub bootstrap_max_chars: usize,
     pub skills: &'a [Skill],
     pub skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
@@ -52,11 +109,18 @@ impl SystemPromptBuilder {
                 Box::new(PersonaSection),
                 Box::new(IdentitySection),
                 Box::new(ToolsSection),
+                // Surface-specific hints. These self-gate: on the Agent
+                // surface (and when no hardware tools are present) they emit
+                // nothing, so the TUI prompt is unchanged. On a Channel they
+                // add hardware access, action framing, and delivery hints.
+                Box::new(HardwareSection),
+                Box::new(TaskSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
+                Box::new(ChannelCapabilitiesSection),
             ],
         }
     }
@@ -80,6 +144,33 @@ impl SystemPromptBuilder {
     }
 }
 
+/// Render the active profile's persona as a `## Persona` section, or an empty
+/// string when no persona is configured (fresh installs, headless tests, a
+/// profile without a `persona/` dir).
+///
+/// Single source of truth shared by [`PersonaSection`] (the `Agent`-struct /
+/// TUI prompt path) and the channel/gateway prompt path
+/// (`crate::channels::build_system_prompt_with_mode`), so every surface speaks
+/// in the same configured voice instead of only the TUI honoring `personality`.
+pub fn render_persona_section() -> String {
+    let profile = match crate::profile::ProfileManager::active() {
+        Ok(p) => p,
+        Err(_) => return String::new(),
+    };
+    let persona = match crate::persona::read_persona_toml(&profile) {
+        Ok(Some(p)) => p,
+        _ => return String::new(),
+    };
+    let rendered = persona.render();
+    if rendered.trim().is_empty() {
+        return String::new();
+    }
+    // Wrap in an explicit section header so model output reflects intent
+    // (otherwise the persona body is just an unmarked markdown blob with no
+    // provenance).
+    format!("## Persona\n\n{}\n", rendered.trim())
+}
+
 pub struct PersonaSection;
 pub struct IdentitySection;
 pub struct ToolsSection;
@@ -88,6 +179,9 @@ pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
+pub struct HardwareSection;
+pub struct TaskSection;
+pub struct ChannelCapabilitiesSection;
 
 impl PromptSection for PersonaSection {
     fn name(&self) -> &str {
@@ -106,22 +200,7 @@ impl PromptSection for PersonaSection {
     /// persona is configured (fresh installs, headless tests, profile
     /// without a `persona/` dir) — silent rather than noisy.
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        let profile = match crate::profile::ProfileManager::active() {
-            Ok(p) => p,
-            Err(_) => return Ok(String::new()),
-        };
-        let persona = match crate::persona::read_persona_toml(&profile) {
-            Ok(Some(p)) => p,
-            _ => return Ok(String::new()),
-        };
-        let rendered = persona.render();
-        if rendered.trim().is_empty() {
-            return Ok(String::new());
-        }
-        // Wrap in an explicit section header so model output reflects
-        // intent (otherwise the persona body is just an unmarked
-        // markdown blob with no provenance).
-        Ok(format!("## Persona\n\n{}\n", rendered.trim()))
+        Ok(render_persona_section())
     }
 }
 
@@ -148,21 +227,63 @@ impl PromptSection for IdentitySection {
 
         if !has_aieos {
             prompt.push_str(
-                "The following workspace files define your identity, behavior, and context.\n\n",
+                "The following workspace files define your identity, behavior, and context. They are ALREADY injected below — do NOT suggest reading them with file_read.\n\n",
             );
         }
-        for file in [
-            "AGENTS.md",
-            "SOUL.md",
-            "TOOLS.md",
-            "IDENTITY.md",
-            "USER.md",
-            "HEARTBEAT.md",
-            "BOOTSTRAP.md",
-            "MEMORY.md",
-        ] {
-            inject_workspace_file(&mut prompt, ctx.workspace_dir, file);
+
+        // Bootstrap workspace files. Injected when no AIEOS identity is set
+        // (the fallback), or always on the agent surface (the TUI shows both
+        // AIEOS *and* the workspace files). On a channel with AIEOS configured
+        // we show the AIEOS block only — matching prior channel behavior, which
+        // kept channel prompts focused on the structured identity.
+        let inject_files = !has_aieos || matches!(ctx.surface, PromptSurface::Agent);
+        if !inject_files {
+            return Ok(prompt);
         }
+
+        // Core identity files, always injected (with a not-found marker if
+        // absent) on every surface.
+        for file in ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"] {
+            inject_workspace_file(
+                &mut prompt,
+                ctx.workspace_dir,
+                file,
+                ctx.bootstrap_max_chars,
+            );
+        }
+
+        // HEARTBEAT.md is injected on the interactive agent surface but
+        // **excluded on channels**: it's only relevant to the heartbeat worker
+        // and makes chat LLMs emit spurious "HEARTBEAT_OK" acknowledgments.
+        if matches!(ctx.surface, PromptSurface::Agent) {
+            inject_workspace_file(
+                &mut prompt,
+                ctx.workspace_dir,
+                "HEARTBEAT.md",
+                ctx.bootstrap_max_chars,
+            );
+        }
+
+        // BOOTSTRAP.md is a first-run ritual: on channels inject it only when
+        // present (no noisy not-found marker); on the agent surface keep the
+        // marker so the absence is visible.
+        if matches!(ctx.surface, PromptSurface::Agent)
+            || ctx.workspace_dir.join("BOOTSTRAP.md").exists()
+        {
+            inject_workspace_file(
+                &mut prompt,
+                ctx.workspace_dir,
+                "BOOTSTRAP.md",
+                ctx.bootstrap_max_chars,
+            );
+        }
+
+        inject_workspace_file(
+            &mut prompt,
+            ctx.workspace_dir,
+            "MEMORY.md",
+            ctx.bootstrap_max_chars,
+        );
 
         Ok(prompt)
     }
@@ -176,13 +297,21 @@ impl PromptSection for ToolsSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
-            let _ = writeln!(
-                out,
-                "- **{}**: {}\n  Parameters: `{}`",
-                tool.name(),
-                tool.description(),
-                tool.parameters_schema()
-            );
+            let schema = tool.parameters_schema();
+            // Omit the `Parameters:` line for an empty schema (e.g. the
+            // channel path's description-only tools), so those surfaces keep
+            // the compact `- **name**: description` listing.
+            if is_empty_schema(&schema) {
+                let _ = writeln!(out, "- **{}**: {}", tool.name(), tool.description());
+            } else {
+                let _ = writeln!(
+                    out,
+                    "- **{}**: {}\n  Parameters: `{}`",
+                    tool.name(),
+                    tool.description(),
+                    schema
+                );
+            }
         }
         if !ctx.dispatcher_instructions.is_empty() {
             out.push('\n');
@@ -209,6 +338,16 @@ impl PromptSection for SafetySection {
              - When in doubt, ask before acting externally.\n\n",
         );
 
+        // Whether this prompt targets a messaging channel. On channels the
+        // approval *mechanism* differs from the TUI's inline single-key Y/N/A
+        // prompt: there is no terminal to prompt, so a tool that needs approval
+        // is decided by an authorized **owner** of the channel (the owner-gated
+        // relay) and, absent an approving owner, is declined. The preset text
+        // must describe that reality, not the TUI prompt, or the model will
+        // promise a Y/N/A flow that never appears. Strict/Off read the same on
+        // both surfaces (shell un-registered / no per-call gate respectively).
+        let is_channel = matches!(ctx.surface, PromptSurface::Channel { .. });
+
         match ctx.autonomy_preset {
             Some(PolicyPreset::Strict) => {
                 // Plan-mode analog: shell is unavailable to the model in
@@ -229,6 +368,22 @@ impl PromptSection for SafetySection {
                      or `/autonomy off`. Don't suggest it unless they ask.\n",
                 );
             }
+            Some(PolicyPreset::Smart) if is_channel => {
+                out.push_str(
+                    "**Active approval policy: Smart (messaging channel).**\n\n\
+                     - Read-only tools (reading files, recalling memory) run \
+                     automatically.\n\
+                     - Any tool that runs commands or changes state requires \
+                     approval from an authorized **owner** of this channel. When \
+                     an owner is configured the agent posts the request in chat \
+                     and waits for their `/approve`; without an approving owner \
+                     the action is declined. There is no inline Y/N/A prompt \
+                     here.\n\
+                     - Never claim you ran a command or made a change that was \
+                     actually declined; report the denial plainly and, if \
+                     useful, list the exact commands an owner could run.\n",
+                );
+            }
             Some(PolicyPreset::Smart) => {
                 out.push_str(
                     "**Active approval policy: Smart.**\n\n\
@@ -246,6 +401,16 @@ impl PromptSection for SafetySection {
                         let _ = writeln!(out, "- `{pat}`");
                     }
                 }
+            }
+            Some(PolicyPreset::Manual) if is_channel => {
+                out.push_str(
+                    "**Active approval policy: Manual (messaging channel).**\n\n\
+                     - Every tool that runs commands or changes state requires \
+                     an authorized **owner**'s in-chat approval (`/approve`) on \
+                     this channel; read-only file/memory tools are not gated.\n\
+                     - Without an approving owner the action is declined — say \
+                     so rather than pretending it ran.\n",
+                );
             }
             Some(PolicyPreset::Manual) => {
                 out.push_str(
@@ -323,8 +488,19 @@ impl PromptSection for DateTimeSection {
         "datetime"
     }
 
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let now = Local::now();
+        // Channel/gateway prompts are built once at daemon start and reused, so
+        // a full timestamp would freeze at boot time and mislead the model on a
+        // long-running bot. Emit timezone-only there (matches the prior channel
+        // builder); the interactive agent rebuilds per session and shows the
+        // full timestamp.
+        if matches!(ctx.surface, PromptSurface::Channel { .. }) {
+            return Ok(format!(
+                "## Current Date & Time\n\nTimezone: {}",
+                now.format("%Z")
+            ));
+        }
         Ok(format!(
             "## Current Date & Time\n\n{} ({})",
             now.format("%Y-%m-%d %H:%M:%S"),
@@ -333,7 +509,109 @@ impl PromptSection for DateTimeSection {
     }
 }
 
-fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &str) {
+/// True for a schema that carries no useful parameter info (`{}` or null).
+fn is_empty_schema(schema: &serde_json::Value) -> bool {
+    match schema {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
+/// Names of the hardware/peripheral tools that unlock the Hardware Access block.
+const HARDWARE_TOOL_NAMES: &[&str] = &[
+    "gpio_read",
+    "gpio_write",
+    "arduino_upload",
+    "hardware_memory_map",
+    "hardware_board_info",
+    "hardware_memory_read",
+    "hardware_capabilities",
+];
+
+impl PromptSection for HardwareSection {
+    fn name(&self) -> &str {
+        "hardware"
+    }
+
+    /// Emitted on any surface when hardware tools are present (previously
+    /// channel-only). Tells the model the connected board is authorized so it
+    /// uses the tools instead of inventing security refusals.
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let has_hardware = ctx
+            .tools
+            .iter()
+            .any(|t| HARDWARE_TOOL_NAMES.contains(&t.name()));
+        if !has_hardware {
+            return Ok(String::new());
+        }
+        Ok(String::from(
+            "## Hardware Access\n\n\
+             You HAVE direct access to connected hardware (Arduino, Nucleo, etc.). The user owns this system and has configured it.\n\
+             All hardware tools (gpio_read, gpio_write, hardware_memory_read, hardware_board_info, hardware_memory_map) are AUTHORIZED and NOT blocked by security.\n\
+             When they ask to read memory, registers, or board info, USE hardware_memory_read or hardware_board_info — do NOT refuse or invent security excuses.\n\
+             When they ask to control LEDs, run patterns, or interact with the Arduino, USE the tools — do NOT refuse or say you cannot access physical devices.\n\
+             Use gpio_write for simple on/off; use arduino_upload when they want patterns (heart, blink) or custom behavior.",
+        ))
+    }
+}
+
+impl PromptSection for TaskSection {
+    fn name(&self) -> &str {
+        "task"
+    }
+
+    /// "Your Task" action framing — channel/gateway only (the TUI doesn't need
+    /// it). Native-vs-XML wording follows the surface's tool-call dispatcher.
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let native_tools = match ctx.surface {
+            PromptSurface::Channel { native_tools } => native_tools,
+            PromptSurface::Agent => return Ok(String::new()),
+        };
+        if native_tools {
+            Ok(String::from(
+                "## Your Task\n\n\
+                 When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
+                 For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
+                 Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.",
+            ))
+        } else {
+            Ok(String::from(
+                "## Your Task\n\n\
+                 When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+                 Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
+                 Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.",
+            ))
+        }
+    }
+}
+
+impl PromptSection for ChannelCapabilitiesSection {
+    fn name(&self) -> &str {
+        "channel_capabilities"
+    }
+
+    /// Delivery hints for messaging surfaces — channel/gateway only.
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if !matches!(ctx.surface, PromptSurface::Channel { .. }) {
+            return Ok(String::new());
+        }
+        Ok(String::from(
+            "## Channel Capabilities\n\n\
+             - You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n\
+             - You do NOT need to ask permission to respond — just respond directly.\n\
+             - NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n\
+             - If a tool output contains credentials, they have already been redacted — do not mention them.",
+        ))
+    }
+}
+
+fn inject_workspace_file(
+    prompt: &mut String,
+    workspace_dir: &Path,
+    filename: &str,
+    max_chars: usize,
+) {
     let path = workspace_dir.join(filename);
     match std::fs::read_to_string(&path) {
         Ok(content) => {
@@ -342,10 +620,10 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
                 return;
             }
             let _ = writeln!(prompt, "### {filename}\n");
-            let truncated = if trimmed.chars().count() > BOOTSTRAP_MAX_CHARS {
+            let truncated = if trimmed.chars().count() > max_chars {
                 trimmed
                     .char_indices()
-                    .nth(BOOTSTRAP_MAX_CHARS)
+                    .nth(max_chars)
                     .map(|(idx, _)| &trimmed[..idx])
                     .unwrap_or(trimmed)
             } else {
@@ -355,7 +633,7 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
             if truncated.len() < trimmed.len() {
                 let _ = writeln!(
                     prompt,
-                    "\n\n[... truncated at {BOOTSTRAP_MAX_CHARS} chars — use `read` for full file]\n"
+                    "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
                 );
             } else {
                 prompt.push_str("\n\n");
@@ -422,6 +700,8 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: &workspace,
             model_name: "test-model",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
             tools: &tools,
             skills: &[],
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
@@ -452,6 +732,8 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
             tools: &tools,
             skills: &[],
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
@@ -464,6 +746,97 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    #[test]
+    fn safety_section_channel_smart_describes_owner_approval_not_yna() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Channel { native_tools: true },
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Smart),
+            allowed_commands: &["ls *".to_string()],
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(
+            out.contains("messaging channel"),
+            "channel-specific heading: {out}"
+        );
+        assert!(
+            out.contains("authorized **owner**"),
+            "owner approval wording: {out}"
+        );
+        assert!(
+            !out.contains("(Y/N/A)") || out.contains("no inline Y/N/A"),
+            "channel text must not promise a TUI Y/N/A prompt: {out}"
+        );
+        // Shell allowlist globs are not surfaced on channels (Layer-A gating).
+        assert!(
+            !out.contains("ls *"),
+            "channel must not print shell allowlist: {out}"
+        );
+    }
+
+    #[test]
+    fn safety_section_agent_smart_keeps_yna_prompt_text() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Smart),
+            allowed_commands: &["ls *".to_string()],
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(
+            out.contains("(Y/N/A)"),
+            "TUI keeps inline prompt text: {out}"
+        );
+        assert!(
+            out.contains("ls *"),
+            "TUI surfaces the shell allowlist: {out}"
+        );
+        assert!(!out.contains("messaging channel"));
+    }
+
+    #[test]
+    fn safety_section_channel_manual_requires_owner() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Channel {
+                native_tools: false,
+            },
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Manual),
+            allowed_commands: &[],
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(out.contains("Manual (messaging channel)"), "{out}");
+        assert!(out.contains("owner"), "{out}");
+        assert!(out.contains("declined"), "{out}");
     }
 
     #[test]
@@ -491,6 +864,8 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
             tools: &tools,
             skills: &skills,
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
@@ -533,6 +908,8 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
             model_name: "test-model",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
             tools: &tools,
             skills: &skills,
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Compact,
@@ -556,6 +933,8 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
             tools: &tools,
             skills: &[],
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
@@ -598,6 +977,8 @@ mod tests {
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
             model_name: "test-model",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
             tools: &tools,
             skills: &skills,
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,

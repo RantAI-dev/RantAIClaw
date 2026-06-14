@@ -450,13 +450,16 @@ mod tests {
             install_recipes: Vec::new(),
         });
         let result = cmd.execute("summarizer", &mut ctx).unwrap();
+        // A known skill name renders its detail in an InfoPanel (since v0.6.23),
+        // not a plain Message.
         match result {
-            CommandResult::Message(msg) => {
-                assert!(msg.contains("summarizer"));
-                assert!(msg.contains("0.2.0"));
-                assert!(msg.contains("bullets"));
+            CommandResult::OpenInfoPanel(panel) => {
+                let blob = format!("{panel:?}");
+                assert!(blob.contains("summarizer"), "{blob}");
+                assert!(blob.contains("0.2.0"), "{blob}");
+                assert!(blob.contains("bullets"), "{blob}");
             }
-            _ => panic!("Expected Message result"),
+            other => panic!("Expected OpenInfoPanel result, got {other:?}"),
         }
     }
 
@@ -505,11 +508,15 @@ mod tests {
 
         let result = cmd.execute("", &mut ctx).unwrap();
 
+        // Insights renders an InfoPanel (since the stats refactor), not a Message.
         match result {
-            CommandResult::Message(msg) => {
-                assert!(msg.contains("Total sessions"));
+            CommandResult::OpenInfoPanel(panel) => {
+                assert_eq!(panel.title, "Insights");
+                let blob = format!("{panel:?}");
+                assert!(blob.contains("Sessions"), "{blob}");
+                assert!(blob.contains("Total"), "{blob}");
             }
-            _ => panic!("Expected Message result"),
+            other => panic!("Expected OpenInfoPanel result, got {other:?}"),
         }
     }
 }

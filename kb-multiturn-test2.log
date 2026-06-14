@@ -1,0 +1,50 @@
+   Compiling rantaiclaw v0.6.59-alpha (/home/shiro/rantai/RantAI-Agents/packages/rantaiclaw)
+warning: unused import: `ChatRequest`
+  --> src/agent/compaction.rs:15:37
+   |
+15 | use crate::providers::{ChatMessage, ChatRequest, ConversationMessage, ToolCall};
+   |                                     ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ProviderClient`
+  --> src/providers/rig_native.rs:56:42
+   |
+56 | use rig_core::client::{CompletionClient, ProviderClient};
+   |                                          ^^^^^^^^^^^^^^
+
+warning: use of deprecated function `base64::encode`: Use Engine::encode
+   --> src/onboard/provision/channels/nextcloud_talk.rs:121:31
+    |
+121 |         let encoded = base64::encode(format!("{}:{}", "", app_token.trim())); // user is empty for app token
+    |                               ^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: value assigned to `http_proxy` is never read
+  --> src/onboard/provision/runtime_surfaces/proxy.rs:82:30
+   |
+82 |         let mut http_proxy = None;
+   |                              ^^^^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `https_proxy` is never read
+  --> src/onboard/provision/runtime_surfaces/proxy.rs:83:31
+   |
+83 |         let mut https_proxy = None;
+   |                               ^^^^
+   |
+   = help: maybe it is overwritten before being read?
+
+warning: `rantaiclaw` (lib test) generated 5 warnings (run `cargo fix --lib -p rantaiclaw --tests` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 19s
+     Running unittests src/lib.rs (target/debug/deps/rantaiclaw-4cc839742d4882cd)
+
+running 2 tests
+test gateway::api_v1::tests::record_api_chat_session_persists_user_and_assistant_messages ... ok
+test gateway::api_v1::tests::record_api_chat_session_continues_existing_session ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3140 filtered out; finished in 0.00s
+

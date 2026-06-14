@@ -1213,19 +1213,38 @@ mod tests {
     }
 
     #[test]
-    fn navigation_wraps_within_current_page_only() {
+    fn navigation_traverses_pages_and_returns_to_search() {
+        // 12 items → pages of 5, 5, 2. Since v0.6.8, Down at the last item of a
+        // page advances to the next page (and Up at the first item of a non-first
+        // page steps back), rather than wrapping within the current page.
         let mut p = picker(many_items(12));
         // First Down moves focus from Search→List (selected stays 0).
-        // Subsequent Downs advance: 0→1→2→3→4 (4 advances after entry).
-        p.move_down(); // enter list
+        p.move_down();
+        assert_eq!(p.focus, Focus::List);
         assert_eq!(p.selected, 0);
+        assert_eq!(p.page, 0);
+        // Advance to the last item of page 0: 0→1→2→3→4.
         for _ in 0..4 {
             p.move_down();
         }
         assert_eq!(p.selected, 4);
+        assert_eq!(p.page, 0);
+        // Down at the last item of the page advances to the next page (cross-page).
         p.move_down();
-        assert_eq!(p.selected, 0); // wrapped within page, not advanced
-        p.move_up(); // selected=0 → focus back to Search, selected stays 0
+        assert_eq!(p.page, 1);
+        assert_eq!(p.selected, 0);
+        // Up at the first item of a non-first page steps back to the previous
+        // page's last item (mirror of the cross-page Down).
+        p.move_up();
+        assert_eq!(p.page, 0);
+        assert_eq!(p.selected, 4);
+        // Walk back to the top of page 0, then one more Up returns focus to Search.
+        for _ in 0..4 {
+            p.move_up();
+        }
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.focus, Focus::List);
+        p.move_up();
         assert_eq!(p.focus, Focus::Search);
         assert_eq!(p.selected, 0);
     }

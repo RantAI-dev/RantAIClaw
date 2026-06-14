@@ -1,7 +1,5 @@
-use crate::agent::dispatcher::{
-    NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
-};
-use crate::agent::events::{truncate_preview, AgentEvent, AgentEventSender, TurnResult};
+use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
+use crate::agent::events::{AgentEvent, AgentEventSender, TurnResult};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
@@ -13,11 +11,9 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
-use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -53,6 +49,20 @@ pub struct Agent {
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
+    /// Conversation scope for layered memory. `None` (default) stores and
+    /// recalls turn memory globally — prior behavior. When set, this agent's
+    /// turn memory is stored under and recalled from this conversation id
+    /// (via `recall_layered`), so distinct conversations don't bleed context.
+    conversation_id: Option<String>,
+    /// Optional Layer-A tool-approval gate. `None` (default — TUI / `agent run`)
+    /// means tools are not gated here (the shell tool's own `PendingApprovals`
+    /// still applies). The console SSE surface sets this so non-read-only tools
+    /// require an in-browser decision via `approval_backend`.
+    approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
+    /// Inline approval backend used when `approval_manager` gates a call.
+    /// `None` falls back to the CLI prompt for the `cli` channel. The console
+    /// sets a `WebModalApprovalBackend`.
+    approval_backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
 }
 
 pub struct AgentBuilder {
@@ -73,6 +83,9 @@ pub struct AgentBuilder {
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
+    conversation_id: Option<String>,
+    approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
+    approval_backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
 }
 
 impl AgentBuilder {
@@ -95,7 +108,30 @@ impl AgentBuilder {
             auto_save: None,
             classification_config: None,
             available_hints: None,
+            conversation_id: None,
+            approval_manager: None,
+            approval_backend: None,
         }
+    }
+
+    /// Gate non-read-only tools through `manager`, deciding each via `backend`
+    /// (e.g. the console's web-modal). Both default to `None` (no Layer-A gate),
+    /// preserving TUI / `agent run` behavior.
+    pub fn approval(
+        mut self,
+        manager: Option<Arc<crate::approval::ApprovalManager>>,
+        backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
+    ) -> Self {
+        self.approval_manager = manager;
+        self.approval_backend = backend;
+        self
+    }
+
+    /// Scope this agent's turn memory to a conversation id (layered memory).
+    /// Omit for the default global behavior.
+    pub fn conversation_id(mut self, conversation_id: Option<String>) -> Self {
+        self.conversation_id = conversation_id;
+        self
     }
 
     pub fn provider(mut self, provider: Box<dyn Provider>) -> Self {
@@ -234,6 +270,9 @@ impl AgentBuilder {
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
+            conversation_id: self.conversation_id,
+            approval_manager: self.approval_manager,
+            approval_backend: self.approval_backend,
         })
     }
 }
@@ -373,27 +412,11 @@ impl Agent {
             config,
         );
 
-        // Strict preset filter: when the active policy is Strict, drop
-        // the `shell` tool from the registry so the model can't even
-        // attempt a call (CC plan-mode analog). The model is also told
-        // about this via SafetySection, so the prompt + tool list agree.
-        // Manual / Smart / Off keep shell; the gate handles per-call
-        // approval there.
-        if matches!(
-            crate::profile::ProfileManager::active().ok().and_then(|p| {
-                crate::approval::policy_writer::read_active_preset(&p.policy_dir())
-            }),
-            Some(crate::approval::policy_writer::PolicyPreset::Strict)
-        ) {
-            let before = tools.len();
-            tools.retain(|t| t.name() != "shell");
-            if tools.len() < before {
-                tracing::info!(
-                    target: "agent",
-                    "Strict preset active — `shell` tool removed from registry"
-                );
-            }
-        }
+        // Strict preset filter: when the active policy is Strict, drop the
+        // `shell` tool so the model can't even attempt a call (plan-mode
+        // analog). Shared with the channels runtime via `apply_preset_tool_filter`
+        // so Strict means the same thing on every surface.
+        tools::apply_preset_tool_filter(&mut tools);
 
         // MCP discovery — spawn each configured server, query
         // `tools/list`, splice each tool into the registry as an
@@ -487,6 +510,18 @@ impl Agent {
                 agent.mcp_tools_by_server = mcp_tools_by_server;
                 agent
             })
+    }
+
+    /// Inject (or clear) the Layer-A tool-approval gate after construction.
+    /// `from_config` leaves these `None`; the console SSE surface calls this to
+    /// gate non-read-only tools through an in-browser `WebModalApprovalBackend`.
+    pub fn set_approval(
+        &mut self,
+        manager: Option<Arc<crate::approval::ApprovalManager>>,
+        backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
+    ) {
+        self.approval_manager = manager;
+        self.approval_backend = backend;
     }
 
     /// Shared security policy handle — `Some` when the agent was built
@@ -717,6 +752,8 @@ impl Agent {
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             model_name: &self.model_name,
+            surface: crate::agent::prompt::PromptSurface::Agent,
+            bootstrap_max_chars: 20_000,
             tools: &self.tools,
             skills: &self.skills,
             skills_prompt_mode: self.skills_prompt_mode,
@@ -726,95 +763,6 @@ impl Agent {
             allowed_commands: &allowed_commands,
         };
         self.prompt_builder.build(&ctx)
-    }
-
-    async fn execute_tool_call(
-        &self,
-        call: &ParsedToolCall,
-        cancel: Option<&CancellationToken>,
-    ) -> ToolExecutionResult {
-        let start = Instant::now();
-
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            let tool_future = tool.execute(call.arguments.clone());
-            // Race the tool against the cancellation token so a Ctrl+C
-            // mid-execution drops the future (and, for the shell tool
-            // with `kill_on_drop(true)`, terminates the child process).
-            // Without this race, an in-flight `pip install` ran to
-            // completion before cancel could take effect — that's what
-            // the user saw as "cancel not instant".
-            let outcome = if let Some(token) = cancel {
-                tokio::select! {
-                    () = token.cancelled() => {
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
-                            duration: start.elapsed(),
-                            success: false,
-                        });
-                        return ToolExecutionResult {
-                            name: call.name.clone(),
-                            output: "[cancelled]".to_string(),
-                            success: false,
-                            tool_call_id: call.tool_call_id.clone(),
-                        };
-                    }
-                    result = tool_future => result,
-                }
-            } else {
-                tool_future.await
-            };
-            match outcome {
-                Ok(r) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: r.success,
-                    });
-                    if r.success {
-                        r.output
-                    } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
-                    }
-                }
-                Err(e) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: false,
-                    });
-                    format!("Error executing {}: {e}", call.name)
-                }
-            }
-        } else {
-            format!("Unknown tool: {}", call.name)
-        };
-
-        ToolExecutionResult {
-            name: call.name.clone(),
-            output: result,
-            success: true,
-            tool_call_id: call.tool_call_id.clone(),
-        }
-    }
-
-    async fn execute_tools(
-        &self,
-        calls: &[ParsedToolCall],
-        cancel: Option<&CancellationToken>,
-    ) -> Vec<ToolExecutionResult> {
-        if !self.config.parallel_tools {
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                results.push(self.execute_tool_call(call, cancel).await);
-            }
-            return results;
-        }
-
-        let futs: Vec<_> = calls
-            .iter()
-            .map(|call| self.execute_tool_call(call, cancel))
-            .collect();
-        futures_util::future::join_all(futs).await
     }
 
     fn classify_model(&self, user_message: &str) -> String {
@@ -899,16 +847,30 @@ impl Agent {
                 )));
         }
 
+        // Store and recall turn memory under this agent's conversation scope.
+        // `None` (default) keeps the prior global behavior; when set, write-side
+        // (`store`) and read-side (`recall_layered`) agree so a conversation's
+        // memory is isolated yet still backfilled from shared/global memory.
+        let conversation_scope = self.conversation_id.as_deref();
+
         if self.auto_save {
             let _ = self
                 .memory
-                .store("user_msg", user_message, MemoryCategory::Conversation, None)
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    conversation_scope,
+                )
                 .await;
         }
 
+        // Loader routes through recall_layered with the same conversation scope
+        // used for writes above, so reads and writes stay consistent.
+        // ready for when write-side scoping threads a conversation_id through.
         let context = self
             .memory_loader
-            .load_context(self.memory.as_ref(), user_message)
+            .load_context(self.memory.as_ref(), user_message, conversation_scope)
             .await
             .unwrap_or_default();
 
@@ -923,277 +885,55 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
-        for _ in 0..self.config.max_tool_iterations {
-            if cancel.is_some_and(CancellationToken::is_cancelled) {
-                return Ok(TurnResult {
+        // Drive the ONE shared agentic loop (PR2). The Agent already keeps
+        // structured `ConversationMessage` history, so it passes it (and its
+        // dispatcher) straight through — no conversion. `approval_manager` is
+        // `None` for the interactive agent (it gates via the shell relay, not a
+        // Layer-A manager); the console SSE surface injects a manager + a
+        // web-modal backend so non-read-only tools require an in-browser
+        // decision. Streaming goes through `events`.
+        let result = crate::agent::loop_::run_structured_loop(
+            self.provider.as_ref(),
+            &mut self.history,
+            self.tool_dispatcher.as_ref(),
+            &self.tools,
+            self.observer.as_ref(),
+            "agent",
+            &effective_model,
+            self.temperature,
+            true,
+            self.approval_manager.as_deref(),
+            "cli",
+            self.approval_backend.as_deref(),
+            &crate::config::MultimodalConfig::default(),
+            self.config.max_tool_iterations,
+            cancel.cloned(),
+            None,
+            events.cloned(),
+        )
+        .await;
+
+        self.trim_history();
+
+        match result {
+            Ok(text) => Ok(TurnResult {
+                text,
+                usage: empty_usage(&effective_model),
+                cancelled: false,
+            }),
+            // The shared loop signals cancellation via `ToolLoopCancelled`.
+            Err(e)
+                if e.downcast_ref::<crate::agent::loop_::ToolLoopCancelled>()
+                    .is_some() =>
+            {
+                Ok(TurnResult {
                     text: String::new(),
                     usage: empty_usage(&effective_model),
                     cancelled: true,
-                });
-            }
-
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let request = ChatRequest {
-                messages: &messages,
-                tools: if self.tool_dispatcher.should_send_tool_specs() {
-                    Some(&self.tool_specs)
-                } else {
-                    None
-                },
-            };
-
-            // True streaming path: when an events consumer is attached and
-            // the provider supports SSE, use chat_stream so deltas reach
-            // the TUI as the model produces them. Tool-call detection
-            // still works on the assembled `full_text` for prompt-guided
-            // dispatchers; native tool_call deltas are not yet parsed
-            // mid-stream and will be picked up only at end-of-stream.
-            let streamed_inline = events.is_some() && self.provider.supports_streaming();
-
-            let response = if streamed_inline {
-                let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
-                let events_clone = events.cloned();
-                let forwarder = async move {
-                    while let Some(piece) = text_rx.recv().await {
-                        if let Some(ref tx) = events_clone {
-                            if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                };
-                let stream_future =
-                    self.provider
-                        .chat_stream(request, &effective_model, self.temperature, text_tx);
-                let combined = async {
-                    let (r, ()) = tokio::join!(stream_future, forwarder);
-                    r
-                };
-                if let Some(token) = cancel {
-                    tokio::select! {
-                        () = token.cancelled() => {
-                            return Ok(TurnResult {
-                                text: String::new(),
-                                usage: empty_usage(&effective_model),
-                                cancelled: true,
-                            });
-                        }
-                        result = combined => result?,
-                    }
-                } else {
-                    combined.await?
-                }
-            } else {
-                let chat_future = self
-                    .provider
-                    .chat(request, &effective_model, self.temperature);
-                if let Some(token) = cancel {
-                    tokio::select! {
-                        () = token.cancelled() => {
-                            return Ok(TurnResult {
-                                text: String::new(),
-                                usage: empty_usage(&effective_model),
-                                cancelled: true,
-                            });
-                        }
-                        result = chat_future => result?,
-                    }
-                } else {
-                    chat_future.await?
-                }
-            };
-
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
-            if calls.is_empty() {
-                let final_text = if text.is_empty() {
-                    response.text.unwrap_or_default()
-                } else {
-                    text
-                };
-
-                // When we already streamed deltas inline, don't re-emit
-                // the whole text — the TUI already has it via Chunk events.
-                if !streamed_inline {
-                    if let Some(tx) = events {
-                        if !final_text.is_empty() {
-                            let _ = tx.send(AgentEvent::Chunk(final_text.clone())).await;
-                        }
-                    }
-                }
-
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        final_text.clone(),
-                    )));
-                self.trim_history();
-
-                return Ok(TurnResult {
-                    text: final_text,
-                    usage: empty_usage(&effective_model),
-                    cancelled: false,
-                });
-            }
-
-            if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
-                if events.is_none() {
-                    // Preserve CLI streaming behavior only when no structured
-                    // events consumer is attached.
-                    print!("{text}");
-                    let _ = std::io::stdout().flush();
-                }
-            }
-
-            self.history.push(ConversationMessage::AssistantToolCalls {
-                text: response.text.clone(),
-                tool_calls: response.tool_calls.clone(),
-            });
-
-            let results = self.execute_tools_with_events(&calls, events, cancel).await;
-            let results = match results {
-                Ok(r) => r,
-                Err(cancelled) if cancelled => {
-                    return Ok(TurnResult {
-                        text: String::new(),
-                        usage: empty_usage(&effective_model),
-                        cancelled: true,
-                    });
-                }
-                Err(_) => unreachable!("execute_tools_with_events only fails on cancellation"),
-            };
-            let formatted = self.tool_dispatcher.format_results(&results);
-            self.history.push(formatted);
-            self.trim_history();
-        }
-
-        // Hit the iteration cap. Instead of bailing with an opaque
-        // anyhow error (which surfaces in the TUI as "[no response
-        // from model]"), do ONE final non-tool LLM round asking the
-        // model to summarize what it gathered. The user gets the value
-        // of the work that already ran rather than a blank turn.
-        let cap_prompt = format!(
-            "You hit the tool-call iteration cap ({} calls). Summarize \
-             what you found from the calls above and answer the user's \
-             original question with whatever data you have. Do NOT call \
-             any more tools — just respond in plain text.",
-            self.config.max_tool_iterations
-        );
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::system(cap_prompt)));
-        let final_messages = self.tool_dispatcher.to_provider_messages(&self.history);
-        let final_request = ChatRequest {
-            messages: &final_messages,
-            tools: None, // disable tools so the model can't keep looping
-        };
-        let final_response = match self
-            .provider
-            .chat(final_request, &effective_model, self.temperature)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // Even the summary call failed — fall back to the
-                // original bail behaviour so the user at least knows
-                // something went wrong.
-                anyhow::bail!(
-                    "Agent exceeded maximum tool iterations ({}) and the cap-summary fallback also failed: {e}",
-                    self.config.max_tool_iterations
-                );
-            }
-        };
-        let summary_text = final_response.text.unwrap_or_default();
-        let body = if summary_text.is_empty() {
-            format!(
-                "I hit the tool-call iteration cap ({}) before I could \
-                 finalise. Raise `agent.max_tool_iterations` in your \
-                 config.toml or rephrase the request to fewer steps.",
-                self.config.max_tool_iterations
-            )
-        } else {
-            summary_text
-        };
-        if let Some(tx) = events {
-            let _ = tx.send(AgentEvent::Chunk(body.clone())).await;
-        }
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::assistant(
-                body.clone(),
-            )));
-        self.trim_history();
-        Ok(TurnResult {
-            text: body,
-            usage: empty_usage(&effective_model),
-            cancelled: false,
-        })
-    }
-
-    /// Execute tool calls while emitting `ToolCallStart`/`ToolCallEnd` events
-    /// when a consumer is attached. Returns `Err(true)` if cancelled between
-    /// tool dispatches.
-    async fn execute_tools_with_events(
-        &self,
-        calls: &[ParsedToolCall],
-        events: Option<&AgentEventSender>,
-        cancel: Option<&CancellationToken>,
-    ) -> std::result::Result<Vec<ToolExecutionResult>, bool> {
-        // Fast path: no events consumer means we can reuse the existing
-        // batch execution (potentially parallel) without per-call bookkeeping.
-        if events.is_none() {
-            if cancel.is_some_and(CancellationToken::is_cancelled) {
-                return Err(true);
-            }
-            return Ok(self.execute_tools(calls, cancel).await);
-        }
-
-        // Events path: emit Start/End per call. Run sequentially so event
-        // ordering matches observer ordering; a consumer can still interleave
-        // UI updates in real time.
-        let tx = events.expect("events is Some on this branch");
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            if cancel.is_some_and(CancellationToken::is_cancelled) {
-                return Err(true);
-            }
-
-            let id = Uuid::new_v4().to_string();
-            let _ = tx
-                .send(AgentEvent::ToolCallStart {
-                    id: id.clone(),
-                    name: call.name.clone(),
-                    args: call.arguments.clone(),
                 })
-                .await;
-
-            let result = self.execute_tool_call(call, cancel).await;
-            // execute_tool_call returns "[cancelled]" with success=false
-            // when the token fires mid-execution. Propagate that as the
-            // turn-level cancel signal so the loop exits immediately
-            // instead of looping back to another LLM call.
-            if cancel.is_some_and(CancellationToken::is_cancelled) {
-                let _ = tx
-                    .send(AgentEvent::ToolCallEnd {
-                        id,
-                        ok: false,
-                        output_preview: "[cancelled]".into(),
-                    })
-                    .await;
-                return Err(true);
             }
-
-            let _ = tx
-                .send(AgentEvent::ToolCallEnd {
-                    id,
-                    ok: result.success,
-                    output_preview: truncate_preview(&result.output),
-                })
-                .await;
-
-            results.push(result);
+            Err(e) => Err(e),
         }
-        Ok(results)
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {

@@ -11,6 +11,7 @@ pub mod api_v1;
 pub mod channel_approval;
 pub mod config_api;
 pub mod task_handlers;
+pub mod web_approval;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::approval::ApprovalManager;
@@ -341,6 +342,10 @@ pub struct AppState {
     /// Turn-based in-chat tool-approval state for chat channels
     /// (WhatsApp/Linq/Nextcloud) when `autonomous_tools` is off.
     pub channel_approvals: Arc<channel_approval::ChannelApprovalStore>,
+    /// In-browser modal tool-approval registry for the console SSE chat. The
+    /// `WebModalApprovalBackend` registers + awaits here; `POST /api/v1/approvals/{id}`
+    /// resolves it. Separate from the channel/shell registries.
+    pub web_approvals: Arc<crate::security::PendingApprovals>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -415,6 +420,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     );
+    // Strict preset parity (PR3b): drop `shell` on the gateway path too.
+    tools::apply_preset_tool_filter(&mut base_tools);
 
     // Load skill tools from workspace and register them as real callable tools.
     // Skills define [[tools]] blocks in SKILL.toml that become shell/http tools.
@@ -651,6 +658,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         observer,
         webhook_routes,
         channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+        // In-browser (console SSE) modal tool-approval registry. 5-minute
+        // deadline auto-denies an unanswered modal so a paused turn never
+        // hangs forever (secure default, mirrors the channel relay).
+        web_approvals: Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(300),
+        ))),
     };
 
     // Build router with middleware
@@ -1046,6 +1059,10 @@ async fn run_gateway_chat_with_multimodal(
         true, // silent — no terminal output in gateway mode
         approval_manager.as_ref(),
         "webhook",
+        // Gateway has its own turn-based, owner-gated approval flow
+        // (`channel_approval`); the inline backend stays the name-derived
+        // default (auto-deny) here.
+        None,
         &multimodal_config,
         GATEWAY_MAX_TOOL_ITERATIONS,
         None, // no cancellation token
@@ -1099,7 +1116,10 @@ async fn process_channel_chat(
     sender: &str,
     message: &str,
 ) -> anyhow::Result<String> {
-    let key = format!("{channel_name}:{sender}");
+    // Single source of truth for conversation identity (PR4 foundation).
+    // Behaviour-preserving for the no-thread case; thread-aware when channel
+    // adapters start plumbing a thread id through.
+    let key = crate::channels::conversation::ConversationKey::new(channel_name, sender).resolve();
     // Prior conversation turns so the bot remembers the exchange.
     let prior = state.channel_approvals.history(&key);
 
@@ -1110,6 +1130,20 @@ async fn process_channel_chat(
                 return Ok("Okay — I won't do that. Anything else?".to_string());
             }
             Some(reply) => {
+                // Allow / Always require OWNER authority — a separate, smaller
+                // gate than channel chat access. The sender who can talk to the
+                // bot is NOT automatically allowed to approve a privileged tool
+                // call (otherwise any group member or paired user could approve
+                // their own request). Deny is handled above and is safe for
+                // anyone. Re-stash the pending request on refusal so a real
+                // owner can still approve it.
+                let owners = { state.config.lock().channels_config.approval_owners.clone() };
+                if !crate::approval::can_approve(&owners, sender) {
+                    state.channel_approvals.set_pending(&key, original, tools);
+                    return Ok("You're not authorized to approve tool actions here. \
+                         Ask an owner to reply Y or A."
+                        .to_string());
+                }
                 if reply == channel_approval::ApprovalReply::Always {
                     state.channel_approvals.remember_always(&key, &tools);
                 }
@@ -1947,6 +1981,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -1995,6 +2030,7 @@ mod tests {
             observer,
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2360,6 +2396,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2423,6 +2460,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2498,6 +2536,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2545,6 +2584,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2597,6 +2637,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2654,6 +2695,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2707,6 +2749,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 

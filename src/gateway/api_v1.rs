@@ -35,6 +35,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/status", get(status))
         .route("/api/v1/doctor", get(doctor))
         .route("/api/v1/agent/chat", post(agent_chat))
+        .route("/api/v1/approvals/{id}", post(resolve_approval))
         .route("/api/v1/sessions", get(sessions_list))
         .route("/api/v1/sessions/search", post(sessions_search))
         .route(
@@ -258,6 +259,34 @@ async fn agent_chat(
     agent_chat_dispatch(State(state), headers, Query(query), Json(body)).await
 }
 
+#[derive(serde::Deserialize)]
+struct ApprovalDecisionBody {
+    /// `true` = approve (run the tool once), `false` = deny.
+    approve: bool,
+}
+
+/// Resolve an in-browser tool-approval modal raised during an SSE chat turn.
+/// The `id` is the one carried by the `approval_request` SSE event. Auth-gated:
+/// the API token is the approver. Returns 404 if no request with that id is
+/// pending (already resolved, timed out, or unknown).
+async fn resolve_approval(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ApprovalDecisionBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    if crate::gateway::web_approval::resolve(&state.web_approvals, &id, body.approve) {
+        Ok(Json(serde_json::json!({
+            "resolved": true,
+            "id": id,
+            "approved": body.approve,
+        })))
+    } else {
+        Err(err_404("no pending approval with that id"))
+    }
+}
+
 async fn agent_chat_dispatch(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -365,10 +394,30 @@ async fn agent_chat_stream(
     let cancel = CancellationToken::new();
     let cancel_for_agent = cancel.clone();
     let cancel_for_stream = cancel.clone();
+    // Registry shared with `POST /api/v1/approvals/{id}`; only used when
+    // tool-gating is on (default — unless `autonomous_tools`).
+    let web_approvals = state.web_approvals.clone();
+    let gate_tools = !config.channels_config.autonomous_tools;
 
     tokio::spawn(async move {
         match crate::agent::Agent::from_config(&config).await {
             Ok(mut agent) => {
+                // Gate non-read-only tools through an in-browser modal: the
+                // agent pauses, emits `AgentEvent::ApprovalRequest` over this
+                // SSE stream, and waits for `POST /approvals/{id}`. Off when
+                // `autonomous_tools` is set (run unattended).
+                if gate_tools {
+                    let manager = std::sync::Arc::new(
+                        crate::approval::ApprovalManager::from_config(&config.autonomy),
+                    );
+                    let backend = std::sync::Arc::new(
+                        crate::gateway::web_approval::WebModalApprovalBackend::new(
+                            web_approvals,
+                            events_tx.clone(),
+                        ),
+                    );
+                    agent.set_approval(Some(manager), Some(backend));
+                }
                 // Re-feed prior turns so a continued conversation has context.
                 let prior = load_session_history(history_session_id.as_deref());
                 if !prior.is_empty() {
@@ -458,6 +507,15 @@ async fn agent_chat_stream(
                     "id": id,
                     "ok": ok,
                     "output_preview": output_preview,
+                }),
+                // The agent is paused awaiting in-browser approval. The client
+                // renders a modal and resolves it via `POST /api/v1/approvals/{id}`,
+                // which unblocks the paused turn (the stream then resumes).
+                crate::agent::AgentEvent::ApprovalRequest { id, tool, args } => serde_json::json!({
+                    "type": "approval_request",
+                    "id": id,
+                    "tool": tool,
+                    "args": args,
                 }),
                 // Gateway endpoint operates on a per-turn agent built
                 // for the request — reload events are a TUI-only
@@ -856,9 +914,22 @@ async fn personality_get(
 #[derive(Deserialize)]
 struct PersonalityBody {
     /// Optional: when absent, the current preset is kept (and a Default persona
-    /// is created if none exists). Lets callers update only `always_on_kbs`.
+    /// is created if none exists). Lets callers update only other fields.
     #[serde(default)]
     preset: Option<String>,
+    /// Each of the following overwrites that persona field only when supplied,
+    /// so a partial PUT preserves the rest. Together they let a console switch
+    /// to a fully custom persona live (not just one of the built-in presets).
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    tone: Option<String>,
+    /// `avoid`: a non-empty string sets the "things to avoid" block; an empty
+    /// string clears it. Absent leaves it unchanged.
+    #[serde(default)]
+    avoid: Option<String>,
     #[serde(default)]
     always_on_kbs: Option<Vec<String>>,
 }
@@ -892,8 +963,25 @@ async fn personality_set(
             other => return Err(err_400(format!("unknown preset `{other}`"))),
         };
     }
-    // Only overwrite always_on_kbs when the caller supplied it, so a
-    // preset-only update preserves the existing KB selection.
+    // Each field overwrites only when supplied, so a partial PUT preserves the
+    // rest of the persona.
+    if let Some(name) = body.name {
+        next.name = name;
+    }
+    if let Some(role) = body.role {
+        next.role = role;
+    }
+    if let Some(tone) = body.tone {
+        next.tone = tone;
+    }
+    if let Some(avoid) = body.avoid {
+        // Empty string clears the avoid block (renderer treats blank as none).
+        next.avoid = if avoid.trim().is_empty() {
+            None
+        } else {
+            Some(avoid)
+        };
+    }
     if let Some(kbs) = body.always_on_kbs {
         next.always_on_kbs = kbs;
     }
@@ -901,6 +989,10 @@ async fn personality_set(
     crate::persona::render_system_md(&profile, &next).map_err(err_500)?;
     Ok(Json(serde_json::json!({
         "preset": next.preset.slug(),
+        "name": next.name,
+        "role": next.role,
+        "tone": next.tone,
+        "avoid": next.avoid,
         "always_on_kbs": next.always_on_kbs,
     })))
 }
@@ -1043,16 +1135,30 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// Serializes tests that mutate process-global env vars (e.g.
+    /// `XDG_DATA_HOME`). Without this, two such tests running on parallel test
+    /// threads clobber each other's value, so `open_session_store()` can read a
+    /// different test's data dir — a latent race exposed by any timing change.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
+            // Hold the lock for the guard's lifetime so concurrent env-var
+            // tests run one at a time. Ignore poisoning from an unrelated panic.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
     }
 
@@ -1163,6 +1269,7 @@ mod tests {
             channel_approvals: Arc::new(
                 crate::gateway::channel_approval::ChannelApprovalStore::default(),
             ),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
         }
     }
 
@@ -1327,5 +1434,44 @@ mod tests {
         assert_eq!(json["model"], "test-model");
         assert_eq!(json["provider"], "test-sse");
         assert!(json["duration_ms"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_endpoint_resolves_pending_request() {
+        let state = test_state();
+        // A WebModalApprovalBackend would register this while a turn is paused.
+        let producer = state.web_approvals.clone();
+        let task = tokio::spawn(async move {
+            producer
+                .request_decision("modal-1", "tool: web_search", "console")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let resp = resolve_approval(
+            State(state),
+            HeaderMap::new(),
+            Path("modal-1".to_string()),
+            Json(ApprovalDecisionBody { approve: true }),
+        )
+        .await
+        .expect("resolve ok");
+        assert_eq!(resp.0["resolved"], true);
+        assert_eq!(resp.0["approved"], true);
+        assert_eq!(task.await.unwrap(), crate::security::Decision::Once);
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_endpoint_unknown_id_is_404() {
+        let state = test_state();
+        let err = resolve_approval(
+            State(state),
+            HeaderMap::new(),
+            Path("does-not-exist".to_string()),
+            Json(ApprovalDecisionBody { approve: false }),
+        )
+        .await
+        .expect_err("unknown id should 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 }

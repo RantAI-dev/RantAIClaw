@@ -359,11 +359,158 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
     }
 }
 
+/// Recall memories across the layered scopes for one turn: the active
+/// conversation's own scope first, then the rest of memory as a backfill.
+///
+/// The read side of the layered-memory model (unified-agent-runtime PR4).
+/// `Memory::recall(.., None)` returns entries across *all* scopes, so this
+/// surfaces conversation-scoped hits (`session_id = conversation_id`) ahead of
+/// everything else and de-duplicates by key, giving "prefer this conversation's
+/// context, fall back to shared/global memory" without double-counting. With no
+/// `conversation_id` it degrades to a plain global recall. Backends that ignore
+/// `session_id` (e.g. markdown) simply return their normal results.
+pub async fn recall_layered(
+    memory: &dyn Memory,
+    query: &str,
+    limit: usize,
+    conversation_id: Option<&str>,
+) -> anyhow::Result<Vec<MemoryEntry>> {
+    let Some(cid) = conversation_id else {
+        return memory.recall(query, limit, None).await;
+    };
+
+    let mut out: Vec<MemoryEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Conversation-scoped hits first — more specific context wins.
+    for entry in memory.recall(query, limit, Some(cid)).await? {
+        if seen.insert(entry.key.clone()) {
+            out.push(entry);
+        }
+    }
+    // Backfill with the rest of memory, skipping anything already surfaced.
+    if out.len() < limit {
+        for entry in memory.recall(query, limit, None).await? {
+            if seen.insert(entry.key.clone()) {
+                out.push(entry);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    out.truncate(limit);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{EmbeddingRouteConfig, StorageProviderConfig};
     use tempfile::TempDir;
+
+    /// Minimal session-aware memory for exercising `recall_layered`:
+    /// `recall(.., Some(sid))` returns entries for that session; `recall(.., None)`
+    /// returns ALL entries (matching the real backends' "no filter = all").
+    struct ScopedMockMemory {
+        entries: Vec<MemoryEntry>,
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for ScopedMockMemory {
+        fn name(&self) -> &str {
+            "scoped-mock"
+        }
+        async fn store(
+            &self,
+            _k: &str,
+            _c: &str,
+            _cat: MemoryCategory,
+            _sid: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            let mut out: Vec<MemoryEntry> = self
+                .entries
+                .iter()
+                .filter(|e| match session_id {
+                    Some(sid) => e.session_id.as_deref() == Some(sid),
+                    None => true,
+                })
+                .cloned()
+                .collect();
+            out.truncate(limit);
+            Ok(out)
+        }
+        async fn get(&self, _k: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _cat: Option<&MemoryCategory>,
+            _sid: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.entries.len())
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn entry(key: &str, session: Option<&str>) -> MemoryEntry {
+        MemoryEntry {
+            id: key.to_string(),
+            key: key.to_string(),
+            content: format!("content-{key}"),
+            category: MemoryCategory::Conversation,
+            timestamp: "t".to_string(),
+            session_id: session.map(|s| s.to_string()),
+            score: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_layered_prioritizes_conversation_then_backfills_and_dedups() {
+        let mem = ScopedMockMemory {
+            entries: vec![
+                entry("conv_only", Some("conv1")),
+                entry("global_a", None),
+                entry("other_conv", Some("conv2")),
+            ],
+        };
+
+        let got = recall_layered(&mem, "q", 10, Some("conv1")).await.unwrap();
+        let keys: Vec<&str> = got.iter().map(|e| e.key.as_str()).collect();
+
+        // Conversation-scoped entry surfaces first.
+        assert_eq!(keys.first(), Some(&"conv_only"));
+        // Backfill includes global + other entries, but conv_only is not
+        // duplicated even though recall(None) also returns it.
+        assert_eq!(keys.iter().filter(|k| **k == "conv_only").count(), 1);
+        assert!(keys.contains(&"global_a"));
+    }
+
+    #[tokio::test]
+    async fn recall_layered_without_conversation_is_plain_global_recall() {
+        let mem = ScopedMockMemory {
+            entries: vec![entry("a", None), entry("b", Some("conv1"))],
+        };
+        let got = recall_layered(&mem, "q", 10, None).await.unwrap();
+        // No conversation scope → plain recall(None) → all entries, no reordering.
+        assert_eq!(got.len(), 2);
+    }
 
     #[test]
     fn factory_sqlite() {

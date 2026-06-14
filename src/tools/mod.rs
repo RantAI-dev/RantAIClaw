@@ -206,6 +206,33 @@ pub fn all_tools(
     )
 }
 
+/// Drop tools forbidden by the active autonomy preset from a registry.
+///
+/// Currently the **Strict** (read-only) preset removes `shell` so the model
+/// cannot even attempt a call — a plan-mode analog. Extracted so every surface
+/// applies the *same* filter: previously only `Agent::from_config` (TUI) did,
+/// leaving `shell` registered on channels in Strict mode, so "Strict" meant
+/// different things on different surfaces. Keep this the single place that
+/// encodes preset → tool-registry effects.
+pub fn apply_preset_tool_filter(tools: &mut Vec<Box<dyn crate::tools::traits::Tool>>) {
+    let strict = matches!(
+        crate::profile::ProfileManager::active()
+            .ok()
+            .and_then(|p| crate::approval::policy_writer::read_active_preset(&p.policy_dir())),
+        Some(crate::approval::policy_writer::PolicyPreset::Strict)
+    );
+    if strict {
+        let before = tools.len();
+        tools.retain(|t| t.name() != "shell");
+        if tools.len() < before {
+            tracing::info!(
+                target: "tools",
+                "Strict preset active — `shell` tool removed from registry"
+            );
+        }
+    }
+}
+
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools_with_runtime(

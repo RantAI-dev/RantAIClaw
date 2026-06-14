@@ -52,3 +52,4 @@ artifacts/
 # enter source control.
 tests/fixtures/sample-text.pdf
 tests/fixtures/sample-8-page.pdf
+dev-sandbox/

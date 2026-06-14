@@ -794,9 +794,15 @@ async fn turn_preserves_text_alongside_tool_calls() {
         "Expected non-empty final response after mixed text+tool"
     );
 
-    // The intermediate text should be in history
+    // The intermediate text must be preserved in history. The unified loop
+    // keeps it on the structured `AssistantToolCalls.text` (one assistant
+    // message carrying both text and tool calls — the correct provider shape),
+    // rather than a separate `Chat` message; accept either.
     let has_intermediate = agent.history().iter().any(|msg| match msg {
         ConversationMessage::Chat(c) => c.role == "assistant" && c.content.contains("Let me check"),
+        ConversationMessage::AssistantToolCalls { text, .. } => {
+            text.as_deref().is_some_and(|t| t.contains("Let me check"))
+        }
         _ => false,
     });
     assert!(has_intermediate, "Intermediate text should be in history");
@@ -942,6 +948,141 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
     assert!(matches!(&history[3], ConversationMessage::ToolResults(_)));
     assert!(
         matches!(&history[4], ConversationMessage::Chat(c) if c.role == "assistant" && c.content == "final answer")
+    );
+}
+
+/// Characterization gate for the loop-collapse refactor (PR2-rest): the XML
+/// dispatcher must produce STRUCTURED `AssistantToolCalls` / `ToolResults`
+/// history across multiple turns. That structure is load-bearing — the TUI
+/// renders tool-call blocks from it (Hermes parity) and the next turn rebuilds
+/// provider messages from it. Any unification of the two agent loops must keep
+/// this contract; a delegation that flattens history to plain `Chat` entries
+/// will fail here.
+#[tokio::test]
+async fn xml_dispatcher_multi_turn_preserves_structured_tool_history() {
+    let provider = Box::new(ScriptedProvider::new(vec![
+        xml_tool_response("echo", r#"{"message": "first"}"#),
+        text_response("answer one"),
+        text_response("answer two"),
+    ]));
+    let mut agent = build_agent_with(
+        provider,
+        vec![Box::new(EchoTool)],
+        Box::new(XmlToolDispatcher),
+    );
+
+    let r1 = agent.turn("turn one").await.unwrap();
+    assert_eq!(r1, "answer one");
+
+    let history = agent.history();
+    // The load-bearing contract: a structured AssistantToolCalls entry exists
+    // (the TUI renders its tool-call block from this). The XML dispatcher feeds
+    // tool *results* back as a chat message rather than the native
+    // `ToolResults` variant, so we don't assert that variant here — only that
+    // the structured tool-call entry survives and the turn produced output.
+    assert!(
+        history
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+        "expected an AssistantToolCalls entry after an XML tool call"
+    );
+    let len_after_1 = agent.history().len();
+    assert!(
+        len_after_1 >= 4,
+        "expected system+user+tool-call+result+answer history, got {len_after_1}"
+    );
+
+    // Second turn still works and history keeps growing (context preserved).
+    let r2 = agent.turn("turn two").await.unwrap();
+    assert_eq!(r2, "answer two");
+    assert!(
+        agent.history().len() > len_after_1,
+        "history should grow across turns"
+    );
+}
+
+/// Memory mock that records the `session_id` each `store` was called with, so a
+/// test can assert turn memory is written under the agent's conversation scope.
+struct RecordingMemory {
+    stored: Arc<Mutex<Vec<(String, Option<String>)>>>,
+}
+
+#[async_trait]
+impl Memory for RecordingMemory {
+    fn name(&self) -> &str {
+        "recording"
+    }
+    async fn store(
+        &self,
+        key: &str,
+        _content: &str,
+        _category: crate::memory::MemoryCategory,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        self.stored
+            .lock()
+            .unwrap()
+            .push((key.to_string(), session_id.map(|s| s.to_string())));
+        Ok(())
+    }
+    async fn recall(
+        &self,
+        _q: &str,
+        _l: usize,
+        _s: Option<&str>,
+    ) -> Result<Vec<crate::memory::MemoryEntry>> {
+        Ok(vec![])
+    }
+    async fn get(&self, _k: &str) -> Result<Option<crate::memory::MemoryEntry>> {
+        Ok(None)
+    }
+    async fn list(
+        &self,
+        _c: Option<&crate::memory::MemoryCategory>,
+        _s: Option<&str>,
+    ) -> Result<Vec<crate::memory::MemoryEntry>> {
+        Ok(vec![])
+    }
+    async fn forget(&self, _k: &str) -> Result<bool> {
+        Ok(false)
+    }
+    async fn count(&self) -> Result<usize> {
+        Ok(0)
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+}
+
+/// End-to-end: an agent built with a `conversation_id` writes its turn memory
+/// under that scope (write side of layered memory). With no conversation_id it
+/// would store globally (`None`) — the prior behavior.
+#[tokio::test]
+async fn turn_stores_memory_under_conversation_scope() {
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let memory = Arc::new(RecordingMemory {
+        stored: recorded.clone(),
+    });
+    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+    let mut agent = Agent::builder()
+        .provider(provider)
+        .tools(vec![])
+        .memory(memory)
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .auto_save(true)
+        .conversation_id(Some("telegram:123".to_string()))
+        .build()
+        .unwrap();
+
+    let _ = agent.turn("hello").await.unwrap();
+
+    let recs = recorded.lock().unwrap();
+    assert!(
+        recs.iter()
+            .any(|(k, sid)| k == "user_msg" && sid.as_deref() == Some("telegram:123")),
+        "user_msg should be stored under the conversation scope, got {recs:?}"
     );
 }
 

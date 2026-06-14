@@ -5,7 +5,8 @@ use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
+    self, ChatMessage, ChatRequest, ConversationMessage, Provider, ProviderCapabilityError,
+    ToolCall,
 };
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -338,7 +339,11 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
                     .get("arguments")
                     .or_else(|| function.get("parameters")),
             );
-            return Some(ParsedToolCall { name, arguments });
+            return Some(ParsedToolCall {
+                name,
+                arguments,
+                tool_call_id: None,
+            });
         }
     }
 
@@ -355,7 +360,11 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
 
     let arguments =
         parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
-    Some(ParsedToolCall { name, arguments })
+    Some(ParsedToolCall {
+        name,
+        arguments,
+        tool_call_id: None,
+    })
 }
 
 fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedToolCall> {
@@ -489,6 +498,7 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
         calls.push(ParsedToolCall {
             name: tool_name.to_string(),
             arguments: serde_json::Value::Object(args),
+            tool_call_id: None,
         });
     }
 
@@ -893,6 +903,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 calls.push(ParsedToolCall {
                     name: name.clone(),
                     arguments: args.clone(),
+                    tool_call_id: None,
                 });
                 if let Some(r) = raw {
                     cleaned_text = cleaned_text.replace(r, "");
@@ -930,36 +941,9 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
             name: call.name.clone(),
             arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+            tool_call_id: Some(call.id.clone()),
         })
         .collect()
-}
-
-/// Build assistant history entry in JSON format for native tool-call APIs.
-/// `convert_messages` in the OpenRouter provider parses this JSON to reconstruct
-/// the proper `NativeMessage` with structured `tool_calls`.
-fn build_native_assistant_history(text: &str, tool_calls: &[ToolCall]) -> String {
-    let calls_json: Vec<serde_json::Value> = tool_calls
-        .iter()
-        .map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
-            })
-        })
-        .collect();
-
-    let content = if text.trim().is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(text.trim().to_string())
-    };
-
-    serde_json::json!({
-        "content": content,
-        "tool_calls": calls_json,
-    })
-    .to_string()
 }
 
 fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
@@ -983,11 +967,14 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     parts.join("\n")
 }
 
-#[derive(Debug)]
-struct ParsedToolCall {
-    name: String,
-    arguments: serde_json::Value,
-}
+// Unified with the dispatcher's tool-call types (PR2): one `ParsedToolCall` and
+// one `ToolExecutionResult` across both agent loops, carrying the optional
+// native `tool_call_id` so the shared executor can build provider tool messages
+// without a second type.
+use crate::agent::dispatcher::{
+    NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
+};
+use crate::agent::events::truncate_preview;
 
 #[derive(Debug)]
 pub(crate) struct ToolLoopCancelled;
@@ -1031,6 +1018,7 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        None,
         multimodal_config,
         max_tool_iterations,
         None,
@@ -1038,123 +1026,6 @@ pub(crate) async fn agent_turn(
         None,
     )
     .await
-}
-
-async fn execute_one_tool(
-    call_id: String,
-    call_name: &str,
-    call_arguments: serde_json::Value,
-    tools_registry: &[Box<dyn Tool>],
-    observer: &dyn Observer,
-    cancellation_token: Option<&CancellationToken>,
-    events: Option<AgentEventSender>,
-) -> Result<String> {
-    let Some(tool) = find_tool(tools_registry, call_name) else {
-        // Emit start + immediate end (ok=false) so callers always see paired events.
-        if let Some(ref tx) = events {
-            let _ = tx
-                .send(AgentEvent::ToolCallStart {
-                    id: call_id.clone(),
-                    name: call_name.to_string(),
-                    args: serde_json::Value::Null,
-                })
-                .await;
-            let _ = tx
-                .send(AgentEvent::ToolCallEnd {
-                    id: call_id,
-                    ok: false,
-                    output_preview: format!("Unknown tool: {call_name}"),
-                })
-                .await;
-        }
-        return Ok(format!("Unknown tool: {call_name}"));
-    };
-
-    // Emit ToolCallStart before execution.
-    if let Some(ref tx) = events {
-        let _ = tx
-            .send(AgentEvent::ToolCallStart {
-                id: call_id.clone(),
-                name: call_name.to_string(),
-                args: call_arguments.clone(),
-            })
-            .await;
-    }
-
-    observer.record_event(&ObserverEvent::ToolCallStart {
-        tool: call_name.to_string(),
-    });
-    let start = Instant::now();
-
-    let tool_future = tool.execute(call_arguments);
-    let tool_result = if let Some(token) = cancellation_token {
-        tokio::select! {
-            () = token.cancelled() => {
-                if let Some(ref tx) = events {
-                    let _ = tx.send(AgentEvent::ToolCallEnd {
-                        id: call_id.clone(),
-                        ok: false,
-                        output_preview: "[cancelled]".into(),
-                    }).await;
-                }
-                return Err(ToolLoopCancelled.into());
-            }
-            result = tool_future => result,
-        }
-    } else {
-        tool_future.await
-    };
-
-    match tool_result {
-        Ok(r) => {
-            observer.record_event(&ObserverEvent::ToolCall {
-                tool: call_name.to_string(),
-                duration: start.elapsed(),
-                success: r.success,
-            });
-            let (ok, output) = if r.success {
-                (true, scrub_credentials(&r.output))
-            } else {
-                (
-                    false,
-                    format!(
-                        "Error: {}",
-                        r.error.clone().unwrap_or_else(|| r.output.clone())
-                    ),
-                )
-            };
-            // Emit ToolCallEnd after execution.
-            if let Some(ref tx) = events {
-                let _ = tx
-                    .send(AgentEvent::ToolCallEnd {
-                        id: call_id,
-                        ok,
-                        output_preview: crate::agent::events::truncate_preview(&output),
-                    })
-                    .await;
-            }
-            Ok(output)
-        }
-        Err(e) => {
-            observer.record_event(&ObserverEvent::ToolCall {
-                tool: call_name.to_string(),
-                duration: start.elapsed(),
-                success: false,
-            });
-            let output = format!("Error executing {call_name}: {e}");
-            // Emit ToolCallEnd (ok=false) on execution error.
-            if let Some(ref tx) = events {
-                let _ = tx
-                    .send(AgentEvent::ToolCallEnd {
-                        id: call_id,
-                        ok: false,
-                        output_preview: crate::agent::events::truncate_preview(&output),
-                    })
-                    .await;
-            }
-            Ok(output)
-        }
-    }
 }
 
 fn should_execute_tools_in_parallel(
@@ -1176,64 +1047,176 @@ fn should_execute_tools_in_parallel(
     true
 }
 
-async fn execute_tools_parallel(
-    tool_calls: &[ParsedToolCall],
+// ── Agent Tool-Call Loop ──────────────────────────────────────────────────
+// Core agentic iteration: send conversation to the LLM, parse any tool
+// calls from the response, execute them, append results to history, and
+// repeat until the LLM produces a final text-only answer.
+//
+// Loop invariant: at the start of each iteration, `history` contains the
+// full conversation so far (system prompt + user messages + prior tool
+// results). The loop exits when:
+//   • the LLM returns no tool calls (final answer), or
+//   • max_iterations is reached (runaway safety), or
+//   • the cancellation token fires (external abort).
+
+/// Execute a single parsed tool call and return a structured result. Emits
+/// paired Start/End events, records observer events, and races the tool against
+/// `cancel` (returning `ToolLoopCancelled` if it fires mid-execution). `success`
+/// reflects the tool's real outcome; error text is folded into `output`.
+/// Shared executor for both agent loops (PR2 unification).
+pub(crate) async fn execute_one_tool_structured(
+    call: &ParsedToolCall,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     events: Option<&AgentEventSender>,
-) -> Result<Vec<String>> {
-    let futures: Vec<_> = tool_calls
-        .iter()
-        .map(|call| {
-            let call_id = Uuid::new_v4().to_string();
-            // Clone the sender so each future owns its copy (Sender is cheap to clone).
-            let events_for_call = events.cloned();
-            execute_one_tool(
-                call_id,
-                &call.name,
-                call.arguments.clone(),
-                tools_registry,
-                observer,
-                cancellation_token,
-                events_for_call,
-            )
-        })
-        .collect();
+) -> Result<ToolExecutionResult> {
+    let id = Uuid::new_v4().to_string();
 
-    let results = futures_util::future::join_all(futures).await;
-    results.into_iter().collect()
+    let Some(tool) = find_tool(tools_registry, &call.name) else {
+        if let Some(tx) = events {
+            let _ = tx
+                .send(AgentEvent::ToolCallStart {
+                    id: id.clone(),
+                    name: call.name.clone(),
+                    args: serde_json::Value::Null,
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::ToolCallEnd {
+                    id,
+                    ok: false,
+                    output_preview: format!("Unknown tool: {}", call.name),
+                })
+                .await;
+        }
+        return Ok(ToolExecutionResult {
+            name: call.name.clone(),
+            output: format!("Unknown tool: {}", call.name),
+            success: false,
+            tool_call_id: call.tool_call_id.clone(),
+        });
+    };
+
+    if let Some(tx) = events {
+        let _ = tx
+            .send(AgentEvent::ToolCallStart {
+                id: id.clone(),
+                name: call.name.clone(),
+                args: call.arguments.clone(),
+            })
+            .await;
+    }
+    observer.record_event(&ObserverEvent::ToolCallStart {
+        tool: call.name.clone(),
+    });
+    let start = Instant::now();
+
+    let tool_future = tool.execute(call.arguments.clone());
+    let outcome = if let Some(token) = cancellation_token {
+        tokio::select! {
+            () = token.cancelled() => {
+                if let Some(tx) = events {
+                    let _ = tx.send(AgentEvent::ToolCallEnd {
+                        id, ok: false, output_preview: "[cancelled]".into(),
+                    }).await;
+                }
+                return Err(ToolLoopCancelled.into());
+            }
+            r = tool_future => r,
+        }
+    } else {
+        tool_future.await
+    };
+
+    let (output, success) = match outcome {
+        Ok(r) => {
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call.name.clone(),
+                duration: start.elapsed(),
+                success: r.success,
+            });
+            if r.success {
+                (r.output, true)
+            } else {
+                (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+            }
+        }
+        Err(e) => {
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call.name.clone(),
+                duration: start.elapsed(),
+                success: false,
+            });
+            (format!("Error executing {}: {e}", call.name), false)
+        }
+    };
+
+    if let Some(tx) = events {
+        let _ = tx
+            .send(AgentEvent::ToolCallEnd {
+                id,
+                ok: success,
+                output_preview: truncate_preview(&output),
+            })
+            .await;
+    }
+
+    Ok(ToolExecutionResult {
+        name: call.name.clone(),
+        output,
+        success,
+        tool_call_id: call.tool_call_id.clone(),
+    })
 }
 
-async fn execute_tools_sequential(
-    tool_calls: &[ParsedToolCall],
+/// Execute a batch of tool calls, returning structured results in call order.
+///
+/// Applies the owner-gated approval (`ApprovalManager` + surface backend) to
+/// each call when `approval` is set; denied calls yield a structured result
+/// carrying the denial message instead of running. Runs concurrently when
+/// `parallel` is true — the caller decides, preserving each loop's policy.
+/// Shared by both agent loops (PR2 unification).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_tool_calls_collecting(
+    calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
+    parallel: bool,
     cancellation_token: Option<&CancellationToken>,
     events: Option<&AgentEventSender>,
-) -> Result<Vec<String>> {
-    let mut individual_results: Vec<String> = Vec::with_capacity(tool_calls.len());
+) -> Result<Vec<ToolExecutionResult>> {
+    if parallel {
+        let futures = calls.iter().map(|call| {
+            execute_one_tool_structured(call, tools_registry, observer, cancellation_token, events)
+        });
+        return futures_util::future::try_join_all(futures).await;
+    }
 
-    for call in tool_calls {
-        let call_id = Uuid::new_v4().to_string();
-
+    let mut results = Vec::with_capacity(calls.len());
+    for call in calls {
         if let Some(mgr) = approval {
             if mgr.needs_approval(&call.name) {
                 let request = ApprovalRequest {
                     tool_name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 };
-
-                let decision = if channel_name == "cli" {
-                    mgr.prompt_cli(&request)
-                } else {
-                    ApprovalResponse::No
+                // Prefer the injected surface backend (e.g. the channel
+                // in-chat owner relay); fall back to the name-derived default
+                // (CLI prompt / auto-deny) when none was supplied.
+                let default_backend;
+                let backend: &dyn crate::approval::ApprovalBackend = match approval_backend {
+                    Some(b) => b,
+                    None => {
+                        default_backend = crate::approval::default_backend_for(channel_name);
+                        default_backend.as_ref()
+                    }
                 };
-
+                let decision = backend.decide(mgr, &request).await;
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
-
                 if decision == ApprovalResponse::No {
                     if let Some(tx) = events {
                         let denial_id = Uuid::new_v4().to_string();
@@ -1261,47 +1244,103 @@ async fn execute_tools_sequential(
                             call.name
                         )
                     };
-                    individual_results.push(msg);
+                    results.push(ToolExecutionResult {
+                        name: call.name.clone(),
+                        output: msg,
+                        success: false,
+                        tool_call_id: call.tool_call_id.clone(),
+                    });
                     continue;
                 }
             }
         }
 
-        let result = execute_one_tool(
-            call_id,
-            &call.name,
-            call.arguments.clone(),
-            tools_registry,
-            observer,
-            cancellation_token,
-            // Clone the sender for each sequential call so it can be consumed.
-            events.cloned(),
-        )
-        .await?;
-        individual_results.push(result);
+        results.push(
+            execute_one_tool_structured(call, tools_registry, observer, cancellation_token, events)
+                .await?,
+        );
     }
-
-    Ok(individual_results)
+    Ok(results)
 }
 
-// ── Agent Tool-Call Loop ──────────────────────────────────────────────────
-// Core agentic iteration: send conversation to the LLM, parse any tool
-// calls from the response, execute them, append results to history, and
-// repeat until the LLM produces a final text-only answer.
-//
-// Loop invariant: at the start of each iteration, `history` contains the
-// full conversation so far (system prompt + user messages + prior tool
-// results). The loop exits when:
-//   • the LLM returns no tool calls (final answer), or
-//   • max_iterations is reached (runaway safety), or
-//   • the cancellation token fires (external abort).
+/// Result of one provider chat that may be cancelled mid-flight.
+pub(crate) enum ChatTurnOutcome {
+    /// The provider returned a response.
+    Completed(crate::providers::ChatResponse),
+    /// The cancellation token fired before the response arrived.
+    Cancelled,
+}
 
-/// Execute a single turn of the agent loop: send messages, parse tool calls,
-/// execute tools, and loop until the LLM produces a final text response.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_tool_call_loop(
+/// Issue ONE provider chat for an agentic iteration, streaming text deltas to
+/// `events` as [`AgentEvent::Chunk`] when the provider supports streaming and a
+/// consumer is attached; otherwise a plain `chat`. Honors `cancel` (returns
+/// [`ChatTurnOutcome::Cancelled`] if it fires first); provider errors propagate
+/// as `Err`.
+///
+/// First shared piece of the unified agent loop: previously `run_tool_call_loop`
+/// and `Agent::turn_inner` each carried a near-identical copy of this streaming +
+/// cancellation plumbing. Centralizing it removes that duplication and is a
+/// behavior-preserving step toward collapsing the two loops (see
+/// `docs/unified-agent-runtime-plan.md` PR2).
+pub(crate) async fn chat_with_optional_streaming(
     provider: &dyn Provider,
-    history: &mut Vec<ChatMessage>,
+    request: ChatRequest<'_>,
+    model: &str,
+    temperature: f64,
+    cancel: Option<&CancellationToken>,
+    events: Option<&AgentEventSender>,
+) -> Result<ChatTurnOutcome> {
+    let streamed_inline = events.is_some() && provider.supports_streaming();
+
+    if streamed_inline {
+        let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let events_clone = events.cloned();
+        let forwarder = async move {
+            while let Some(piece) = text_rx.recv().await {
+                if let Some(ref tx) = events_clone {
+                    if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        };
+        let stream_future = provider.chat_stream(request, model, temperature, text_tx);
+        let combined = async {
+            let (r, ()) = tokio::join!(stream_future, forwarder);
+            r
+        };
+        let resp = if let Some(token) = cancel {
+            tokio::select! {
+                () = token.cancelled() => return Ok(ChatTurnOutcome::Cancelled),
+                result = combined => result?,
+            }
+        } else {
+            combined.await?
+        };
+        Ok(ChatTurnOutcome::Completed(resp))
+    } else {
+        let chat_future = provider.chat(request, model, temperature);
+        let resp = if let Some(token) = cancel {
+            tokio::select! {
+                () = token.cancelled() => return Ok(ChatTurnOutcome::Cancelled),
+                result = chat_future => result?,
+            }
+        } else {
+            chat_future.await?
+        };
+        Ok(ChatTurnOutcome::Completed(resp))
+    }
+}
+
+/// Single shared agentic loop (PR2): send messages, parse tool calls, execute
+/// via the shared executor, append structured history, repeat. Operates on
+/// `Vec<ConversationMessage>` + a `ToolDispatcher` so the interactive Agent and
+/// the channel/gateway `run_tool_call_loop` adapter drive ONE implementation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_structured_loop(
+    provider: &dyn Provider,
+    history: &mut Vec<ConversationMessage>,
+    dispatcher: &dyn ToolDispatcher,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     provider_name: &str,
@@ -1310,6 +1349,10 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    // Surface-specific inline approval backend. `None` ⇒ derive from
+    // `channel_name` (CLI prompts, every other surface auto-denies). `Some`
+    // injects a richer backend — e.g. the channel in-chat owner relay.
+    approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
@@ -1342,7 +1385,10 @@ pub(crate) async fn run_tool_call_loop(
             return Err(ToolLoopCancelled.into());
         }
 
-        let image_marker_count = multimodal::count_image_markers(history);
+        // Flatten the structured history to provider messages for this turn.
+        let provider_messages = dispatcher.to_provider_messages(history);
+
+        let image_marker_count = multimodal::count_image_markers(&provider_messages);
         if image_marker_count > 0 && !provider.supports_vision() {
             return Err(ProviderCapabilityError {
                 provider: provider_name.to_string(),
@@ -1355,7 +1401,8 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         let prepared_messages =
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+            multimodal::prepare_messages_for_provider(&provider_messages, multimodal_config)
+                .await?;
 
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
@@ -1377,122 +1424,64 @@ pub(crate) async fn run_tool_call_loop(
         // provider opts into streaming, use `chat_stream` so text deltas
         // arrive in real time. Tool calls + final text still get assembled
         // into a `ChatResponse` so the rest of the loop is unchanged.
+        // `streamed_inline` is recomputed (cheaply) because it also gates the
+        // post-response chunking further down.
         let streamed_inline = events.is_some() && provider.supports_streaming();
 
-        let chat_result = if streamed_inline {
-            let (text_tx, mut text_rx) = tokio::sync::mpsc::channel::<String>(64);
-            let events_for_forwarder = events.clone();
-            let cancel_for_forwarder = cancellation_token.clone();
-            let stream_future = provider.chat_stream(
-                ChatRequest {
-                    messages: &prepared_messages.messages,
-                    tools: request_tools,
-                },
-                model,
-                temperature,
-                text_tx,
-            );
-            let forwarder = async move {
-                while let Some(piece) = text_rx.recv().await {
-                    if cancel_for_forwarder
-                        .as_ref()
-                        .is_some_and(CancellationToken::is_cancelled)
-                    {
-                        break;
+        let chat_result = chat_with_optional_streaming(
+            provider,
+            ChatRequest {
+                messages: &prepared_messages.messages,
+                tools: request_tools,
+            },
+            model,
+            temperature,
+            cancellation_token.as_ref(),
+            events.as_ref(),
+        )
+        .await;
+
+        let (response_text, parsed_text, tool_calls, native_tool_calls) = match chat_result {
+            Ok(ChatTurnOutcome::Cancelled) => return Err(ToolLoopCancelled.into()),
+            Ok(ChatTurnOutcome::Completed(resp)) => {
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: true,
+                    error_message: None,
+                });
+
+                let response_text = resp.text_or_empty().to_string();
+                // First try native structured tool calls (OpenAI-format).
+                // Fall back to text-based parsing (XML tags, markdown blocks,
+                // GLM format) only if the provider returned no native calls —
+                // this ensures we support both native and prompt-guided models.
+                let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                let mut parsed_text = String::new();
+
+                if calls.is_empty() {
+                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                    if !fallback_text.is_empty() {
+                        parsed_text = fallback_text;
                     }
-                    if let Some(ref tx) = events_for_forwarder {
-                        if tx.send(AgentEvent::Chunk(piece)).await.is_err() {
-                            break;
-                        }
-                    }
+                    calls = fallback_calls;
                 }
-            };
-            let combined = async {
-                let (r, ()) = tokio::join!(stream_future, forwarder);
-                r
-            };
-            if let Some(token) = cancellation_token.as_ref() {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    result = combined => result,
-                }
-            } else {
-                combined.await
+
+                let native_calls = resp.tool_calls;
+                (response_text, parsed_text, calls, native_calls)
             }
-        } else {
-            let chat_future = provider.chat(
-                ChatRequest {
-                    messages: &prepared_messages.messages,
-                    tools: request_tools,
-                },
-                model,
-                temperature,
-            );
-            if let Some(token) = cancellation_token.as_ref() {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    result = chat_future => result,
-                }
-            } else {
-                chat_future.await
+            Err(e) => {
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                });
+                return Err(e);
             }
         };
-
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match chat_result {
-                Ok(resp) => {
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: true,
-                        error_message: None,
-                    });
-
-                    let response_text = resp.text_or_empty().to_string();
-                    // First try native structured tool calls (OpenAI-format).
-                    // Fall back to text-based parsing (XML tags, markdown blocks,
-                    // GLM format) only if the provider returned no native calls —
-                    // this ensures we support both native and prompt-guided models.
-                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                    let mut parsed_text = String::new();
-
-                    if calls.is_empty() {
-                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                        if !fallback_text.is_empty() {
-                            parsed_text = fallback_text;
-                        }
-                        calls = fallback_calls;
-                    }
-
-                    // Preserve native tool call IDs in assistant history so role=tool
-                    // follow-up messages can reference the exact call id.
-                    let assistant_history_content = if resp.tool_calls.is_empty() {
-                        response_text.clone()
-                    } else {
-                        build_native_assistant_history(&response_text, &resp.tool_calls)
-                    };
-
-                    let native_calls = resp.tool_calls;
-                    (
-                        response_text,
-                        parsed_text,
-                        calls,
-                        assistant_history_content,
-                        native_calls,
-                    )
-                }
-                Err(e) => {
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: false,
-                        error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
-                    });
-                    return Err(e);
-                }
-            };
 
         let display_text = if parsed_text.is_empty() {
             response_text.clone()
@@ -1545,7 +1534,9 @@ pub(crate) async fn run_tool_call_loop(
                     }
                 }
             }
-            history.push(ChatMessage::assistant(response_text.clone()));
+            history.push(ConversationMessage::Chat(ChatMessage::assistant(
+                response_text.clone(),
+            )));
             if let Some(ref tx) = events {
                 let usage = crate::cost::TokenUsage::new(model, 0, 0, 0.0, 0.0);
                 let _ = tx.send(AgentEvent::Usage(usage)).await;
@@ -1565,34 +1556,27 @@ pub(crate) async fn run_tool_call_loop(
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
         let mut tool_results = String::new();
+        // Shared executor (PR2): the caller decides parallelism, preserving the
+        // prior policy — parallelize only non-approval batches of >1 call.
         let should_parallel = should_execute_tools_in_parallel(&tool_calls, approval);
-        let individual_results = if should_parallel {
-            execute_tools_parallel(
-                &tool_calls,
-                tools_registry,
-                observer,
-                cancellation_token.as_ref(),
-                events.as_ref(),
-            )
-            .await?
-        } else {
-            execute_tools_sequential(
-                &tool_calls,
-                tools_registry,
-                observer,
-                approval,
-                channel_name,
-                cancellation_token.as_ref(),
-                events.as_ref(),
-            )
-            .await?
-        };
+        let individual_results = execute_tool_calls_collecting(
+            &tool_calls,
+            tools_registry,
+            observer,
+            approval,
+            channel_name,
+            approval_backend,
+            should_parallel,
+            cancellation_token.as_ref(),
+            events.as_ref(),
+        )
+        .await?;
 
         for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                call.name, result
+                call.name, result.output
             );
 
             // Loop detection: (name, args_json, hash(result)) triple.
@@ -1602,7 +1586,7 @@ pub(crate) async fn run_tool_call_loop(
             let result_hash = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                result.hash(&mut h);
+                result.output.hash(&mut h);
                 h.finish()
             };
             let key = (call.name.clone(), args_str, result_hash);
@@ -1628,6 +1612,7 @@ pub(crate) async fn run_tool_call_loop(
                 return force_final_summary(
                     provider,
                     history,
+                    dispatcher,
                     multimodal_config,
                     provider_name,
                     model,
@@ -1642,22 +1627,17 @@ pub(crate) async fn run_tool_call_loop(
             }
         }
 
-        // Add assistant message with tool calls + tool results to history.
-        // Native mode: use JSON-structured messages so convert_messages() can
-        // reconstruct proper OpenAI-format tool_calls and tool result messages.
-        // Prompt mode: use XML-based text format as before.
-        history.push(ChatMessage::assistant(assistant_history_content));
-        if native_tool_calls.is_empty() {
-            history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
-        } else {
-            for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
-                let tool_msg = serde_json::json!({
-                    "tool_call_id": native_call.id,
-                    "content": result,
-                });
-                history.push(ChatMessage::tool(tool_msg.to_string()));
-            }
-        }
+        // Append the structured assistant tool-call entry + formatted results;
+        // the dispatcher renders them to the right provider format next turn
+        // (native: assistant+tool_calls / role=tool; prompt: XML text).
+        // `tool_results` (built above) is retained only for loop-detection
+        // hashing; the dispatcher owns the on-wire format now.
+        let _ = &tool_results;
+        history.push(ConversationMessage::AssistantToolCalls {
+            text: Some(response_text.clone()),
+            tool_calls: native_tool_calls.clone(),
+        });
+        history.push(dispatcher.format_results(&individual_results));
     }
 
     // Soft cap: instead of bailing with no output (which surfaces as
@@ -1675,6 +1655,7 @@ pub(crate) async fn run_tool_call_loop(
     force_final_summary(
         provider,
         history,
+        dispatcher,
         multimodal_config,
         provider_name,
         model,
@@ -1688,6 +1669,68 @@ pub(crate) async fn run_tool_call_loop(
     .await
 }
 
+/// Backwards-compatible adapter for the channel/gateway/CLI/delegate callers
+/// that keep flat `Vec<ChatMessage>` history. Wrap each message as a
+/// `ConversationMessage::Chat`, pick the dispatcher matching the provider's
+/// native-tool support, run the shared [`run_structured_loop`], then flatten
+/// the structured history back to provider messages — keeping those call sites
+/// unchanged while both agent loops drive ONE implementation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    events: Option<AgentEventSender>,
+) -> Result<String> {
+    let dispatcher: Box<dyn ToolDispatcher> = if provider.supports_native_tools() {
+        Box::new(NativeToolDispatcher)
+    } else {
+        Box::new(XmlToolDispatcher)
+    };
+    let mut conv: Vec<ConversationMessage> = std::mem::take(history)
+        .into_iter()
+        .map(ConversationMessage::Chat)
+        .collect();
+
+    let result = run_structured_loop(
+        provider,
+        &mut conv,
+        dispatcher.as_ref(),
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        approval_backend,
+        multimodal_config,
+        max_tool_iterations,
+        cancellation_token,
+        on_delta,
+        events,
+    )
+    .await;
+
+    // Flatten structured history back to provider messages for the caller, on
+    // success or error, so the caller's `history` reflects the turn's work.
+    *history = dispatcher.to_provider_messages(&conv);
+    result
+}
+
 /// Append a tools-disabled nudge to history and make one final provider
 /// call. Used by the iteration soft-cap and the loop detector — both
 /// want to produce a real user-visible summary instead of bailing with
@@ -1695,7 +1738,8 @@ pub(crate) async fn run_tool_call_loop(
 #[allow(clippy::too_many_arguments)]
 async fn force_final_summary(
     provider: &dyn Provider,
-    history: &mut Vec<ChatMessage>,
+    history: &mut Vec<ConversationMessage>,
+    dispatcher: &dyn ToolDispatcher,
     multimodal_config: &crate::config::MultimodalConfig,
     provider_name: &str,
     model: &str,
@@ -1706,9 +1750,11 @@ async fn force_final_summary(
     on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
     nudge: String,
 ) -> Result<String> {
-    history.push(ChatMessage::user(nudge));
+    history.push(ConversationMessage::Chat(ChatMessage::user(nudge)));
 
-    let prepared = multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+    let provider_msgs = dispatcher.to_provider_messages(history);
+    let prepared =
+        multimodal::prepare_messages_for_provider(&provider_msgs, multimodal_config).await?;
     observer.record_event(&ObserverEvent::LlmRequest {
         provider: provider_name.to_string(),
         model: model.to_string(),
@@ -1787,7 +1833,7 @@ async fn force_final_summary(
         }
     }
 
-    history.push(ChatMessage::assistant(text));
+    history.push(ConversationMessage::Chat(ChatMessage::assistant(text)));
     Ok(display_text)
 }
 
@@ -1886,6 +1932,8 @@ pub async fn run(
         config.api_key.as_deref(),
         &config,
     );
+    // Strict preset parity (PR3b): drop `shell` on the CLI one-shot path too.
+    tools::apply_preset_tool_filter(&mut tools_registry);
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
@@ -2149,6 +2197,7 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            None,
             &config.multimodal,
             config.agent.max_tool_iterations,
             None,
@@ -2294,6 +2343,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                None,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
                 None,
@@ -2390,6 +2440,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
         &config,
     );
+    // Strict preset parity (PR3b): drop `shell` here too — same as TUI/channels.
+    tools::apply_preset_tool_filter(&mut tools_registry);
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
@@ -2772,6 +2824,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             3,
             None,
@@ -2817,6 +2870,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &multimodal,
             3,
             None,
@@ -2856,6 +2910,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             &crate::config::MultimodalConfig::default(),
             3,
             None,
@@ -2874,6 +2929,7 @@ mod tests {
         let calls = vec![ParsedToolCall {
             name: "file_read".to_string(),
             arguments: serde_json::json!({"path": "a.txt"}),
+            tool_call_id: None,
         }];
 
         assert!(!should_execute_tools_in_parallel(&calls, None));
@@ -2885,10 +2941,12 @@ mod tests {
             ParsedToolCall {
                 name: "shell".to_string(),
                 arguments: serde_json::json!({"command": "pwd"}),
+                tool_call_id: None,
             },
             ParsedToolCall {
                 name: "http_request".to_string(),
                 arguments: serde_json::json!({"url": "https://example.com"}),
+                tool_call_id: None,
             },
         ];
         let approval_cfg = crate::config::AutonomyConfig::default();
@@ -2906,10 +2964,12 @@ mod tests {
             ParsedToolCall {
                 name: "shell".to_string(),
                 arguments: serde_json::json!({"command": "pwd"}),
+                tool_call_id: None,
             },
             ParsedToolCall {
                 name: "http_request".to_string(),
                 arguments: serde_json::json!({"url": "https://example.com"}),
+                tool_call_id: None,
             },
         ];
         let approval_cfg = crate::config::AutonomyConfig {
@@ -2977,6 +3037,7 @@ mod tests {
             true,
             Some(&approval_mgr),
             "telegram",
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -3013,6 +3074,119 @@ mod tests {
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
         );
+    }
+
+    /// Tool that records whether it ran, so we can prove approval gating.
+    struct RanFlagTool {
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for RanFlagTool {
+        fn name(&self) -> &str {
+            "do_thing"
+        }
+        fn description(&self) -> &str {
+            "test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "did the thing".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Always approves — stands in for an in-chat owner who replied `/approve`.
+    struct AlwaysYesBackend;
+
+    #[async_trait::async_trait]
+    impl crate::approval::ApprovalBackend for AlwaysYesBackend {
+        async fn decide(
+            &self,
+            _mgr: &ApprovalManager,
+            _request: &ApprovalRequest,
+        ) -> ApprovalResponse {
+            ApprovalResponse::Yes
+        }
+    }
+
+    fn supervised_manager() -> ApprovalManager {
+        ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            ..crate::config::AutonomyConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn injected_backend_overrides_non_cli_auto_deny() {
+        // A non-CLI surface with an approval manager that gates `do_thing`.
+        let mgr = supervised_manager();
+        assert!(mgr.needs_approval("do_thing"));
+        let call = ParsedToolCall {
+            name: "do_thing".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+
+        // No backend ⇒ name-derived default ⇒ telegram auto-denies, tool stays unrun.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran),
+        })];
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "auto-deny must not run the tool"
+        );
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("denied") || results[0].output.contains("approval"));
+
+        // Injected always-yes backend ⇒ the same gated call runs.
+        let ran2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools2: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran2),
+        })];
+        let backend = AlwaysYesBackend;
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools2,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            Some(&backend as &dyn crate::approval::ApprovalBackend),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ran2.load(Ordering::SeqCst),
+            "approved call must run the tool"
+        );
+        assert!(results[0].success);
+        assert_eq!(results[0].output, "did the thing");
     }
 
     #[test]
@@ -4140,6 +4314,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None,
             &multimodal,
             5,
             None,
@@ -4238,6 +4413,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None,
             &multimodal,
             5,
             None,
@@ -4332,6 +4508,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None,
             &multimodal,
             5,
             Some(token),
@@ -4380,6 +4557,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None,
             &multimodal,
             5,
             None,

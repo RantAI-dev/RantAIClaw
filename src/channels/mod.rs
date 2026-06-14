@@ -17,6 +17,7 @@
 pub mod approval_relay;
 pub mod auto_start_state;
 pub mod cli;
+pub mod conversation;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
@@ -67,7 +68,6 @@ pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::Config;
-use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, Provider};
@@ -229,6 +229,16 @@ struct ChannelRuntimeContext {
     /// (channels never grant interactive approval), so it's safe to share
     /// one manager across senders.
     channel_approval: Option<Arc<crate::approval::ApprovalManager>>,
+    /// Senders authorized to APPROVE tool calls over a channel
+    /// (`[channels_config] approval_owners`). Empty ⇒ nobody can approve, so the
+    /// in-chat relay is never offered and approval-required tools auto-deny.
+    /// Shared with the dispatch loop's reply parser.
+    approval_owners: Arc<Vec<String>>,
+    /// Dedicated registry for in-chat whole-tool approvals (Layer A). Separate
+    /// from the shell allowlist `PendingApprovals` on `security`. The per-message
+    /// [`ChatRelayApprovalBackend`] registers + awaits here; the dispatch loop's
+    /// `try_handle_tool_reply` resolves it when an owner replies.
+    tool_approvals: Arc<crate::security::PendingApprovals>,
 }
 
 #[derive(Clone)]
@@ -899,10 +909,11 @@ async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
+    conversation_id: Option<&str>,
 ) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, None).await {
+    if let Ok(entries) = crate::memory::recall_layered(mem, user_msg, 5, conversation_id).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
@@ -1391,6 +1402,14 @@ async fn process_channel_message(
             return;
         }
     };
+    // Conversation scope for layered memory: one scope per chat/thread on this
+    // surface (channel:sender[:thread]), the same identity used for history
+    // keying. Stores and recalls are scoped to it so one chat's memory doesn't
+    // bleed into another's, while shared/global memory still backfills.
+    let conversation_scope = conversation::ConversationKey::new(&msg.channel, &msg.sender)
+        .in_thread(msg.thread_ts.as_deref())
+        .resolve();
+
     if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -1399,7 +1418,7 @@ async fn process_channel_message(
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
-                None,
+                Some(conversation_scope.as_str()),
             )
             .await;
     }
@@ -1430,8 +1449,13 @@ async fn process_channel_message(
     // Only enrich with memory context when there is no prior conversation
     // history. Follow-up turns already include context from previous messages.
     if !had_prior_history {
-        let memory_context =
-            build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
+        let memory_context = build_memory_context(
+            ctx.memory.as_ref(),
+            &msg.content,
+            ctx.min_relevance_score,
+            Some(conversation_scope.as_str()),
+        )
+        .await;
         if let Some(last_turn) = prior_turns.last_mut() {
             if last_turn.role == "user" && !memory_context.is_empty() {
                 last_turn.content = format!("{memory_context}{}", msg.content);
@@ -1516,6 +1540,26 @@ async fn process_channel_message(
         Cancelled,
     }
 
+    // In-chat owner approval (Layer A): only when tool-gating is active AND an
+    // owner is configured AND we can post back to the chat. Otherwise the loop
+    // keeps the auto-deny default — channels never gain approval power silently.
+    let chat_relay_backend = if ctx.channel_approval.is_some() && !ctx.approval_owners.is_empty() {
+        target_channel.as_ref().map(|chan| {
+            approval_relay::ChatRelayApprovalBackend::new(
+                Arc::clone(&ctx.tool_approvals),
+                Arc::clone(chan),
+                msg.reply_target.clone(),
+                msg.thread_ts.clone(),
+                msg.channel.clone(),
+            )
+        })
+    } else {
+        None
+    };
+    let chat_relay_backend_ref = chat_relay_backend
+        .as_ref()
+        .map(|b| b as &dyn crate::approval::ApprovalBackend);
+
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let llm_result = tokio::select! {
@@ -1533,6 +1577,7 @@ async fn process_channel_message(
                 true,
                 ctx.channel_approval.as_deref(),
                 msg.channel.as_str(),
+                chat_relay_backend_ref,
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
@@ -1723,6 +1768,10 @@ async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
     max_in_flight_messages: usize,
+    // Senders authorized to APPROVE shell-command allowlist replies over a
+    // channel (`[channels_config] approval_owners`). Empty ⇒ nobody, so an
+    // `/allow` reply is refused — only a real owner can grant commands.
+    approval_owners: Arc<Vec<String>>,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
@@ -1733,12 +1782,27 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
-        // Intercept approval replies (`/allow X`, `deny X`, `y X`, …)
-        // before the message reaches the agent. The parser is
-        // stateless: it consults only `security.pending()` and
-        // returns an acknowledgement if the text was a recognised
-        // reply, otherwise `None`.
-        if let Some(reply) = approval_relay::try_handle_reply(&msg.content, ctx.security.as_ref()) {
+        // Intercept approval replies before the message reaches the agent.
+        // Try the whole-tool relay first (`/approve X`, `/deny X` — Layer A),
+        // then the shell allowlist relay (`/allow X`, `y X`, … — Layer B). Both
+        // are stateless: they consult only their pending registry and return an
+        // acknowledgement if the text was a recognised reply, else `None` so
+        // normal chat falls through. Owner authority is enforced inside each.
+        let approval_reply = approval_relay::try_handle_tool_reply(
+            &msg.content,
+            ctx.tool_approvals.as_ref(),
+            &msg.sender,
+            &approval_owners,
+        )
+        .or_else(|| {
+            approval_relay::try_handle_reply(
+                &msg.content,
+                ctx.security.as_ref(),
+                &msg.sender,
+                &approval_owners,
+            )
+        });
+        if let Some(reply) = approval_reply {
             if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
                 let ack = traits::SendMessage::new(reply, msg.reply_target.clone())
                     .in_thread(msg.thread_ts.clone());
@@ -1820,32 +1884,6 @@ async fn run_message_dispatch_loop(
     }
 }
 
-/// Load OpenClaw format bootstrap files into the prompt.
-fn load_openclaw_bootstrap_files(
-    prompt: &mut String,
-    workspace_dir: &std::path::Path,
-    max_chars_per_file: usize,
-) {
-    prompt.push_str(
-        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
-    );
-
-    let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
-
-    for filename in &bootstrap_files {
-        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
-    }
-
-    // BOOTSTRAP.md — only if it exists (first-run ritual)
-    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
-    if bootstrap_path.exists() {
-        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
-    }
-
-    // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
-}
-
 /// Load workspace identity files and build a system prompt.
 ///
 /// Follows the `OpenClaw` framework structure by default:
@@ -1892,196 +1930,59 @@ pub fn build_system_prompt_with_mode(
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
 ) -> String {
-    use std::fmt::Write;
-    let mut prompt = String::with_capacity(8192);
+    // Unified prompt builder: the SAME `SystemPromptBuilder` the TUI/`Agent`
+    // path uses, with `surface = Channel` so the surface-specific hint sections
+    // (Hardware / Your Task / Channel Capabilities) and the timezone-only
+    // datetime turn on while persona/identity/tools/safety/skills stay shared.
+    //
+    // Description-only tools `(name, desc)` are wrapped as `DescriptorTool` so
+    // the one `ToolsSection` renders them (no `Parameters:` line for these).
+    // Tool-call protocol instructions are appended by the caller via
+    // `build_tool_instructions`, so `dispatcher_instructions` stays empty here.
+    //
+    // Resolve the active approval preset so SafetySection renders the
+    // channel-accurate guidance (Strict really drops `shell` here after
+    // PR3b-strict; Smart/Manual describe owner-approval, not the TUI's inline
+    // Y/N/A). Failure to read the policy is non-fatal — `None` falls back to the
+    // generic safety floor. The shell allowlist is intentionally NOT surfaced on
+    // channels: the Layer-A approval manager gates non-read-only tools before
+    // the Layer-B shell allowlist applies, so listing globs here would mislead.
+    use crate::agent::prompt::{DescriptorTool, PromptContext, PromptSurface, SystemPromptBuilder};
+    use crate::tools::Tool;
 
-    // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
-        prompt.push_str("## Tools\n\n");
-        prompt.push_str("You have access to the following tools:\n\n");
-        for (name, desc) in tools {
-            let _ = writeln!(prompt, "- **{name}**: {desc}");
-        }
-        prompt.push('\n');
-    }
+    let autonomy_preset = crate::profile::ProfileManager::active()
+        .ok()
+        .map(|profile| crate::approval::policy_writer::read_active_preset(&profile.policy_dir()))
+        .unwrap_or(None);
 
-    // ── 1b. Hardware (when gpio/arduino tools present) ───────────
-    let has_hardware = tools.iter().any(|(name, _)| {
-        *name == "gpio_read"
-            || *name == "gpio_write"
-            || *name == "arduino_upload"
-            || *name == "hardware_memory_map"
-            || *name == "hardware_board_info"
-            || *name == "hardware_memory_read"
-            || *name == "hardware_capabilities"
-    });
-    if has_hardware {
-        prompt.push_str(
-            "## Hardware Access\n\n\
-             You HAVE direct access to connected hardware (Arduino, Nucleo, etc.). The user owns this system and has configured it.\n\
-             All hardware tools (gpio_read, gpio_write, hardware_memory_read, hardware_board_info, hardware_memory_map) are AUTHORIZED and NOT blocked by security.\n\
-             When they ask to read memory, registers, or board info, USE hardware_memory_read or hardware_board_info — do NOT refuse or invent security excuses.\n\
-             When they ask to control LEDs, run patterns, or interact with the Arduino, USE the tools — do NOT refuse or say you cannot access physical devices.\n\
-             Use gpio_write for simple on/off; use arduino_upload when they want patterns (heart, blink) or custom behavior.\n\n",
-        );
-    }
+    let stub_tools: Vec<Box<dyn Tool>> = tools
+        .iter()
+        .map(|(name, desc)| Box::new(DescriptorTool::new(*name, *desc)) as Box<dyn Tool>)
+        .collect();
 
-    // ── 1c. Action instruction (avoid meta-summary) ───────────────
-    if native_tools {
-        prompt.push_str(
-            "## Your Task\n\n\
-             When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
-             For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
-             Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
-        );
-    } else {
-        prompt.push_str(
-            "## Your Task\n\n\
-             When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
-             Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
-             Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
-        );
-    }
+    let ctx = PromptContext {
+        workspace_dir,
+        model_name,
+        surface: PromptSurface::Channel { native_tools },
+        bootstrap_max_chars: bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS),
+        tools: &stub_tools,
+        skills,
+        skills_prompt_mode,
+        identity_config,
+        dispatcher_instructions: "",
+        autonomy_preset,
+        allowed_commands: &[],
+    };
 
-    // ── 2. Safety ───────────────────────────────────────────────
-    prompt.push_str("## Safety\n\n");
-    prompt.push_str(
-        "- Do not exfiltrate private data.\n\
-         - Do not run destructive commands without asking.\n\
-         - Do not bypass oversight or approval mechanisms.\n\
-         - Prefer `trash` over `rm` (recoverable beats gone forever).\n\
-         - When in doubt, ask before acting externally.\n\n",
-    );
+    let prompt = SystemPromptBuilder::with_defaults()
+        .build(&ctx)
+        .unwrap_or_default();
 
-    // ── 3. Skills (full or compact, based on config) ─────────────
-    if !skills.is_empty() {
-        prompt.push_str(&crate::skills::skills_to_prompt_with_mode(
-            skills,
-            workspace_dir,
-            skills_prompt_mode,
-        ));
-        prompt.push_str("\n\n");
-    }
-
-    // ── 4. Workspace ────────────────────────────────────────────
-    let _ = writeln!(
-        prompt,
-        "## Workspace\n\nWorking directory: `{}`\n",
-        workspace_dir.display()
-    );
-
-    // ── 5. Bootstrap files (injected into context) ──────────────
-    prompt.push_str("## Project Context\n\n");
-
-    // Check if AIEOS identity is configured
-    if let Some(config) = identity_config {
-        if identity::is_aieos_configured(config) {
-            // Load AIEOS identity
-            match identity::load_aieos_identity(config, workspace_dir) {
-                Ok(Some(aieos_identity)) => {
-                    let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
-                    if !aieos_prompt.is_empty() {
-                        prompt.push_str(&aieos_prompt);
-                        prompt.push_str("\n\n");
-                    }
-                }
-                Ok(None) => {
-                    // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
-                    // Fall back to OpenClaw bootstrap files
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-                }
-                Err(e) => {
-                    // Log error but don't fail - fall back to OpenClaw
-                    eprintln!(
-                        "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
-                    );
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-                }
-            }
-        } else {
-            // OpenClaw format
-            let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-        }
-    } else {
-        // No identity config - use OpenClaw format
-        let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
-    }
-
-    // ── 6. Date & Time ──────────────────────────────────────────
-    let now = chrono::Local::now();
-    let tz = now.format("%Z").to_string();
-    let _ = writeln!(prompt, "## Current Date & Time\n\nTimezone: {tz}\n");
-
-    // ── 7. Runtime ──────────────────────────────────────────────
-    let host =
-        hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-    let _ = writeln!(
-        prompt,
-        "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
-        std::env::consts::OS,
-    );
-
-    // ── 8. Channel Capabilities ─────────────────────────────────────
-    prompt.push_str("## Channel Capabilities\n\n");
-    prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
-    prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
-    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
-
-    if prompt.is_empty() {
+    if prompt.trim().is_empty() {
         "You are RantaiClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
             .to_string()
     } else {
         prompt
-    }
-}
-
-/// Inject a single workspace file into the prompt with truncation and missing-file markers.
-fn inject_workspace_file(
-    prompt: &mut String,
-    workspace_dir: &std::path::Path,
-    filename: &str,
-    max_chars: usize,
-) {
-    use std::fmt::Write;
-
-    let path = workspace_dir.join(filename);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            let _ = writeln!(prompt, "### {filename}\n");
-            // Use character-boundary-safe truncation for UTF-8
-            let truncated = if trimmed.chars().count() > max_chars {
-                trimmed
-                    .char_indices()
-                    .nth(max_chars)
-                    .map(|(idx, _)| &trimmed[..idx])
-                    .unwrap_or(trimmed)
-            } else {
-                trimmed
-            };
-            if truncated.len() < trimmed.len() {
-                prompt.push_str(truncated);
-                let _ = writeln!(
-                    prompt,
-                    "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
-                );
-            } else {
-                prompt.push_str(trimmed);
-                prompt.push_str("\n\n");
-            }
-        }
-        Err(_) => {
-            // Missing-file marker (matches OpenClaw behavior)
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
-        }
     }
 }
 
@@ -2879,6 +2780,12 @@ pub async fn start_channels_with_cancellation(
         &config,
     );
 
+    // Strict preset parity: drop `shell` on channels too when the active
+    // policy is Strict (read-only), matching `Agent::from_config`. Without
+    // this, Strict mode left `shell` registered on channels — the model was
+    // told it could run commands that would then be denied at the gate.
+    tools::apply_preset_tool_filter(&mut all_tools);
+
     // Merge peripheral tools (UNO Q Bridge, RPi GPIO, etc.)
     let peripheral_tools = crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     if !peripheral_tools.is_empty() {
@@ -3233,6 +3140,8 @@ pub async fn start_channels_with_cancellation(
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
 
+    let approval_owners = Arc::new(config.channels_config.approval_owners.clone());
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -3269,9 +3178,15 @@ pub async fn start_channels_with_cancellation(
                 &config.autonomy,
             )))
         },
+        approval_owners: Arc::clone(&approval_owners),
+        // 5-minute deadline: an unanswered in-chat approval auto-denies so a
+        // forgotten prompt never leaves a tool call hanging (secure default).
+        tool_approvals: Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(300),
+        ))),
     });
 
-    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages, approval_owners).await;
 
     // Wait for all channel tasks
     for h in handles {
@@ -3447,6 +3362,8 @@ mod tests {
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -3901,6 +3818,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -3960,6 +3879,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4019,6 +3940,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4087,6 +4010,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4176,6 +4101,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4247,6 +4174,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4333,6 +4262,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4410,6 +4341,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4474,6 +4407,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -4645,6 +4580,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4673,7 +4610,7 @@ BTC is currently around $65,000 based on latest tool output."#
         drop(tx);
 
         let started = Instant::now();
-        run_message_dispatch_loop(rx, runtime_ctx, 2).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 2, std::sync::Arc::new(Vec::new())).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -4725,6 +4662,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4754,7 +4693,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4, std::sync::Arc::new(Vec::new())).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -4817,6 +4756,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4846,7 +4787,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4, std::sync::Arc::new(Vec::new())).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -4891,6 +4832,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -5360,9 +5303,28 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
 
-        let context = build_memory_context(&mem, "age", 0.0).await;
+        let context = build_memory_context(&mem, "age", 0.0, None).await;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("Age is 45"));
+    }
+
+    #[tokio::test]
+    async fn build_memory_context_surfaces_conversation_scoped_entry() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        // Stored under a specific conversation scope (as the channel autosave
+        // now does), it must be recalled when that conversation asks.
+        mem.store(
+            "scoped_fact",
+            "Project ships Friday",
+            MemoryCategory::Conversation,
+            Some("telegram:u1"),
+        )
+        .await
+        .unwrap();
+
+        let context = build_memory_context(&mem, "ship", 0.0, Some("telegram:u1")).await;
+        assert!(context.contains("Project ships Friday"));
     }
 
     #[tokio::test]
@@ -5401,6 +5363,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -5486,6 +5450,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
@@ -5571,6 +5537,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(crate::security::SecurityPolicy::default()),
             channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
         });
 
         process_channel_message(
