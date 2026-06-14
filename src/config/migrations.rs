@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 4;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -101,8 +101,19 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive default-only field)
     }
 
-    // Future migrations (v4, v5, …) inserted here in order.
-    // if from < 4 { migrate_v4(raw)?; }
+    // v3 → v4: `[channels_config].approval_owners` (Vec<String>, default empty)
+    // was added — the owner-authority allowlist for in-chat / in-browser tool
+    // approval (unified-agent-runtime). Additive field with a serde default:
+    // configs that lack it deserialise fine and gain the default (`[]`,
+    // secure — nobody can approve) on next write, so there is nothing to
+    // transform. This arm exists only to burn a version slot so the
+    // schema_drift fingerprint can be accepted with intent (mirrors v2 → v3).
+    if from < 4 {
+        // (no transformation; additive default-only field)
+    }
+
+    // Future migrations (v5, v6, …) inserted here in order.
+    // if from < 5 { migrate_v5(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -171,13 +182,33 @@ mod tests {
         // and without the migration injecting autonomous_tools.
         let mut v = parse("schema_version = 2\n[channels_config]\ncli = true\n");
         let migrated = migrate(&mut v).unwrap();
-        assert!(migrated, "v2 → v3 bump should be reported as transformed");
-        assert_eq!(version_of(&v), Some(3));
+        assert!(migrated, "v2 bump should be reported as transformed");
+        // migrate() always stamps to CURRENT_VERSION (the chain can't stop at an
+        // intermediate version); the v2→v3 step is the additive autonomous_tools
+        // field, which must not be injected by the migration.
+        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
         let cc = v.get("channels_config").unwrap().as_table().unwrap();
         assert_eq!(cc.get("cli").unwrap().as_bool(), Some(true));
         assert!(
             cc.get("autonomous_tools").is_none(),
             "migration must not inject autonomous_tools; serde default handles it"
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_is_additive_noop_preserving_content() {
+        // v3 → v4 only added `[channels_config].approval_owners` (additive,
+        // default empty). A v3 config migrates to v4 with all content intact
+        // and without the migration injecting approval_owners.
+        let mut v = parse("schema_version = 3\n[channels_config]\ncli = true\n");
+        let migrated = migrate(&mut v).unwrap();
+        assert!(migrated, "v3 bump should be reported as transformed");
+        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+        let cc = v.get("channels_config").unwrap().as_table().unwrap();
+        assert_eq!(cc.get("cli").unwrap().as_bool(), Some(true));
+        assert!(
+            cc.get("approval_owners").is_none(),
+            "migration must not inject approval_owners; serde default handles it"
         );
     }
 
