@@ -30,6 +30,20 @@ pub enum AgentEvent {
         output_preview: String,
     },
 
+    /// A tool call is paused awaiting approval. Emitted by the web-modal
+    /// approval backend so an in-browser client can render an approve/deny
+    /// modal; the client resolves it out-of-band (e.g. `POST /approvals/{id}`)
+    /// and the paused turn resumes. Surfaces that don't gate tools (TUI, plain
+    /// channels) never emit this.
+    ApprovalRequest {
+        /// Opaque id the client echoes back to resolve this request.
+        id: String,
+        /// Tool the model wants to run.
+        tool: String,
+        /// Tool arguments (for display in the modal).
+        args: serde_json::Value,
+    },
+
     /// Usage totals for the turn. Emitted once, immediately before `Done`.
     Usage(TokenUsage),
 

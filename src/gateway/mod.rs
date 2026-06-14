@@ -11,6 +11,7 @@ pub mod api_v1;
 pub mod channel_approval;
 pub mod config_api;
 pub mod task_handlers;
+pub mod web_approval;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::approval::ApprovalManager;
@@ -341,6 +342,10 @@ pub struct AppState {
     /// Turn-based in-chat tool-approval state for chat channels
     /// (WhatsApp/Linq/Nextcloud) when `autonomous_tools` is off.
     pub channel_approvals: Arc<channel_approval::ChannelApprovalStore>,
+    /// In-browser modal tool-approval registry for the console SSE chat. The
+    /// `WebModalApprovalBackend` registers + awaits here; `POST /api/v1/approvals/{id}`
+    /// resolves it. Separate from the channel/shell registries.
+    pub web_approvals: Arc<crate::security::PendingApprovals>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -653,6 +658,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         observer,
         webhook_routes,
         channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+        // In-browser (console SSE) modal tool-approval registry. 5-minute
+        // deadline auto-denies an unanswered modal so a paused turn never
+        // hangs forever (secure default, mirrors the channel relay).
+        web_approvals: Arc::new(crate::security::PendingApprovals::new(Some(
+            std::time::Duration::from_secs(300),
+        ))),
     };
 
     // Build router with middleware
@@ -1970,6 +1981,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2018,6 +2030,7 @@ mod tests {
             observer,
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2383,6 +2396,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2446,6 +2460,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2521,6 +2536,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2568,6 +2584,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2620,6 +2637,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2677,6 +2695,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 
@@ -2730,6 +2749,7 @@ mod tests {
             observer: Arc::new(crate::observability::NoopObserver),
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         };
 

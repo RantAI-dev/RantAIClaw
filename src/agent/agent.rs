@@ -54,6 +54,15 @@ pub struct Agent {
     /// turn memory is stored under and recalled from this conversation id
     /// (via `recall_layered`), so distinct conversations don't bleed context.
     conversation_id: Option<String>,
+    /// Optional Layer-A tool-approval gate. `None` (default — TUI / `agent run`)
+    /// means tools are not gated here (the shell tool's own `PendingApprovals`
+    /// still applies). The console SSE surface sets this so non-read-only tools
+    /// require an in-browser decision via `approval_backend`.
+    approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
+    /// Inline approval backend used when `approval_manager` gates a call.
+    /// `None` falls back to the CLI prompt for the `cli` channel. The console
+    /// sets a `WebModalApprovalBackend`.
+    approval_backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
 }
 
 pub struct AgentBuilder {
@@ -75,6 +84,8 @@ pub struct AgentBuilder {
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     conversation_id: Option<String>,
+    approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
+    approval_backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
 }
 
 impl AgentBuilder {
@@ -98,7 +109,22 @@ impl AgentBuilder {
             classification_config: None,
             available_hints: None,
             conversation_id: None,
+            approval_manager: None,
+            approval_backend: None,
         }
+    }
+
+    /// Gate non-read-only tools through `manager`, deciding each via `backend`
+    /// (e.g. the console's web-modal). Both default to `None` (no Layer-A gate),
+    /// preserving TUI / `agent run` behavior.
+    pub fn approval(
+        mut self,
+        manager: Option<Arc<crate::approval::ApprovalManager>>,
+        backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
+    ) -> Self {
+        self.approval_manager = manager;
+        self.approval_backend = backend;
+        self
     }
 
     /// Scope this agent's turn memory to a conversation id (layered memory).
@@ -245,6 +271,8 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             conversation_id: self.conversation_id,
+            approval_manager: self.approval_manager,
+            approval_backend: self.approval_backend,
         })
     }
 }
@@ -482,6 +510,18 @@ impl Agent {
                 agent.mcp_tools_by_server = mcp_tools_by_server;
                 agent
             })
+    }
+
+    /// Inject (or clear) the Layer-A tool-approval gate after construction.
+    /// `from_config` leaves these `None`; the console SSE surface calls this to
+    /// gate non-read-only tools through an in-browser `WebModalApprovalBackend`.
+    pub fn set_approval(
+        &mut self,
+        manager: Option<Arc<crate::approval::ApprovalManager>>,
+        backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
+    ) {
+        self.approval_manager = manager;
+        self.approval_backend = backend;
     }
 
     /// Shared security policy handle — `Some` when the agent was built
@@ -847,9 +887,11 @@ impl Agent {
 
         // Drive the ONE shared agentic loop (PR2). The Agent already keeps
         // structured `ConversationMessage` history, so it passes it (and its
-        // dispatcher) straight through — no conversion. `approval = None`
-        // because the interactive agent gates via the shell relay, not an
-        // ApprovalManager; streaming goes through `events`.
+        // dispatcher) straight through — no conversion. `approval_manager` is
+        // `None` for the interactive agent (it gates via the shell relay, not a
+        // Layer-A manager); the console SSE surface injects a manager + a
+        // web-modal backend so non-read-only tools require an in-browser
+        // decision. Streaming goes through `events`.
         let result = crate::agent::loop_::run_structured_loop(
             self.provider.as_ref(),
             &mut self.history,
@@ -860,9 +902,9 @@ impl Agent {
             &effective_model,
             self.temperature,
             true,
-            None,
+            self.approval_manager.as_deref(),
             "cli",
-            None,
+            self.approval_backend.as_deref(),
             &crate::config::MultimodalConfig::default(),
             self.config.max_tool_iterations,
             cancel.cloned(),
