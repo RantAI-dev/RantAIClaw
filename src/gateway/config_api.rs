@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::AppState;
-use crate::config::schema::McpServerConfig;
+use crate::config::schema::{McpServerConfig, TelegramConfig};
 use crate::security::AutonomyLevel;
 
 /// Build the `/api/v1/config*` router. Merged alongside `api_v1::router()` so
@@ -36,6 +36,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/config/mcp_servers/{name}",
             post(add_mcp_server).delete(remove_mcp_server),
+        )
+        // Experimental: connect/disconnect a messaging channel from the console.
+        .route(
+            "/api/v1/channels/telegram",
+            post(connect_telegram).delete(disconnect_telegram),
         )
 }
 
@@ -100,6 +105,11 @@ async fn get_config(
     cfg.storage.provider.config.db_url = None;
     for agent in cfg.agents.values_mut() {
         agent.api_key = None;
+    }
+    // Channel credentials are secrets too — never return a live bot token over
+    // the API (the connect flow already avoids echoing it). Clear before serialising.
+    if let Some(tg) = cfg.channels_config.telegram.as_mut() {
+        tg.bot_token.clear();
     }
     let val = serde_json::to_value(&cfg).map_err(err_500)?;
     Ok(Json(val))
@@ -292,6 +302,124 @@ async fn remove_mcp_server(
     ))
 }
 
+// ── POST/DELETE /channels/telegram (experimental connect) ────────────────────
+
+#[derive(Deserialize)]
+struct TelegramConnectBody {
+    /// Bot API token from @BotFather. Validated live (`getMe`) before persisting.
+    bot_token: String,
+    /// Telegram user ids/usernames allowed to talk to the bot. Empty = deny all
+    /// (the channel stays secure until owners are added).
+    #[serde(default)]
+    allowed_users: Vec<String>,
+}
+
+/// Connect a Telegram channel from the console: validate the token against
+/// Telegram, then persist it into `channels_config.telegram`. The token is a
+/// secret and is never echoed back in responses. NOTE: channel tokens are
+/// currently stored in plaintext in `config.toml` (unlike `api_key`, they are
+/// not yet routed through the at-rest secret encryption) — treat the host /
+/// config file as trusted. `get_config` redacts the token from reads.
+///
+/// The polling runtime is a separate process (`rantaiclaw channels`), so this
+/// configures + validates the channel; it begins receiving messages when that
+/// runtime (re)starts. Experimental.
+async fn connect_telegram(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TelegramConnectBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let token = body.bot_token.trim().to_string();
+    if token.is_empty() {
+        return Err(err_400("bot_token must not be empty"));
+    }
+    // The token is interpolated into the Telegram API URL path
+    // (`/bot{token}/getMe`), so enforce the real bot-token shape
+    // (`<digits>:<alphanumeric/_-/>`) up front — this both rejects garbage early
+    // and prevents URL-significant characters (`/ ? # @` or whitespace) from
+    // manipulating the request path.
+    if !is_valid_telegram_token(&token) {
+        return Err(err_400(
+            "bot_token is not a valid Telegram token (expected `<digits>:<token>`)",
+        ));
+    }
+
+    // Validate the token live BEFORE persisting — fail closed so we never save a
+    // credential that doesn't work. Uses a side-effect-free `getMe` probe (not a
+    // full TelegramChannel, which would set up pairing + print a code).
+    let bot_username = crate::channels::telegram::validate_bot_token(&token)
+        .await
+        .map_err(|e| {
+            // `e` does not contain the token. We can't always tell a bad token
+            // from an unreachable Telegram, so the message covers both.
+            err_400(format!(
+                "could not validate the bot token with Telegram (invalid token, or Telegram unreachable): {e}"
+            ))
+        })?;
+
+    // Build TelegramConfig via serde so the optional fields inherit their
+    // configured defaults (stream mode, draft interval, …) without duplicating
+    // them here.
+    let tg: TelegramConfig = serde_json::from_value(json!({
+        "bot_token": token,
+        "allowed_users": body.allowed_users,
+    }))
+    .map_err(err_500)?;
+
+    let mut cfg = state.config.lock().clone();
+    cfg.channels_config.telegram = Some(tg);
+    persist_and_swap(&state, cfg).await?;
+
+    let warning = if body.allowed_users.is_empty() {
+        Some("allowed_users is empty — the bot will deny ALL senders until you add Telegram user ids/usernames.")
+    } else if body.allowed_users.iter().any(|u| u.trim() == "*") {
+        Some("allowed_users contains \"*\" — the bot will respond to ANYONE who messages it. Use specific user ids/usernames unless this is intentional.")
+    } else {
+        None
+    };
+    Ok(Json(json!({
+        "connected": true,
+        "channel": "telegram",
+        "bot_username": bot_username,
+        "allowed_users": body.allowed_users.len(),
+        "experimental": true,
+        "warning": warning,
+        "note": "Validated + saved. The channel starts receiving messages when the channels runtime (`rantaiclaw channels`) (re)starts.",
+    })))
+}
+
+/// Whether `token` matches the Telegram bot-token shape `<digits>:<token-chars>`.
+/// Conservative on purpose: only ASCII digits before the colon and
+/// `[A-Za-z0-9_-]` after it, so no URL-significant character can reach the
+/// interpolated request path.
+fn is_valid_telegram_token(token: &str) -> bool {
+    let Some((id, secret)) = token.split_once(':') else {
+        return false;
+    };
+    !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && secret.len() >= 20
+        && secret
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Disconnect the Telegram channel: clear `channels_config.telegram` + persist.
+async fn disconnect_telegram(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let mut cfg = state.config.lock().clone();
+    let was_configured = cfg.channels_config.telegram.is_some();
+    cfg.channels_config.telegram = None;
+    persist_and_swap(&state, cfg).await?;
+    Ok(Json(
+        json!({ "disconnected": was_configured, "channel": "telegram" }),
+    ))
+}
+
 // ── GET/PUT /secrets ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -372,6 +500,23 @@ async fn set_secrets(
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn telegram_token_shape_is_enforced() {
+        // Real shape: <digits>:<>=20 token chars>.
+        assert!(is_valid_telegram_token(&format!("123456789:{}", "A".repeat(35))));
+        assert!(is_valid_telegram_token("42:AA_bb-cc11223344556677889900"));
+        // Rejected: missing colon, non-digit id, short secret, empty.
+        assert!(!is_valid_telegram_token("nope"));
+        assert!(!is_valid_telegram_token("abc:AAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(!is_valid_telegram_token("123:short"));
+        assert!(!is_valid_telegram_token(""));
+        // Rejected: URL-significant chars can't reach the interpolated path.
+        assert!(!is_valid_telegram_token("123:AAAA/AAAA/../../evilAAAAAAAAA"));
+        assert!(!is_valid_telegram_token("123:AAAA?x=1AAAAAAAAAAAAAAAAAAAA"));
+        assert!(!is_valid_telegram_token("123:AAAA AAAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(!is_valid_telegram_token("123:AAAA@host.comAAAAAAAAAAAAAAA"));
+    }
 
     #[test]
     fn apply_secrets_sets_then_clears_on_empty() {

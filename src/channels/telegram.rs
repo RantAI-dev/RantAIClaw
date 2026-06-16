@@ -328,6 +328,31 @@ pub struct TelegramChannel {
     bot_username: Mutex<Option<String>>,
 }
 
+/// Validate a Telegram bot token by calling `getMe` directly, returning the
+/// bot's username on success. Deliberately does NOT build a [`TelegramChannel`]
+/// (which sets up pairing state and can print a one-time pairing code) — it is
+/// a side-effect-free probe used by the webui "connect channel" flow to confirm
+/// a token works before persisting it. The caller distinguishes "invalid token"
+/// from "Telegram unreachable" only by the message; both are connect failures.
+pub async fn validate_bot_token(bot_token: &str) -> anyhow::Result<String> {
+    let url = format!("https://api.telegram.org/bot{bot_token}/getMe");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .context("could not reach Telegram")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Telegram getMe returned HTTP {}", resp.status());
+    }
+    let data: serde_json::Value = resp.json().await.context("parse getMe response")?;
+    data.get("result")
+        .and_then(|r| r.get("username"))
+        .and_then(|u| u.as_str())
+        .map(str::to_string)
+        .context("bot username missing from getMe response")
+}
+
 impl TelegramChannel {
     pub fn new(bot_token: String, allowed_users: Vec<String>, mention_only: bool) -> Self {
         let normalized_allowed = Self::normalize_allowed_users(allowed_users);
