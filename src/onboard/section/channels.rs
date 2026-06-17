@@ -37,12 +37,46 @@ impl SetupSection for ChannelsSection {
             return Ok(());
         }
         ctx.config.channels_config = wizard::setup_channels()?;
+        // Unified approval model: a configured channel lets people CHAT, but
+        // nobody can APPROVE a gated tool call until an owner is set. If a
+        // channel was configured and no owner exists yet, walk the user through
+        // claiming ownership from chat so approval-required tools don't all
+        // silently auto-deny.
+        if any_channel_set(&ctx.config.channels_config)
+            && ctx.config.channels_config.approval_owners.is_empty()
+        {
+            print_owner_claim_guidance();
+        }
         Ok(())
     }
 
     fn headless_hint(&self) -> &'static str {
-        "rantaiclaw channel add <platform> '<json>'  # see `rantaiclaw channel --help`"
+        "rantaiclaw channel add <platform> '<json>'  # see `rantaiclaw channel --help`\n\
+         # then set an approval owner so in-chat /approve works:\n\
+         #   [channels_config] approval_owners = [\"<your telegram id/username>\"]\n\
+         #   (or DM the bot `/claim <code>` once it's running in pairing mode)"
     }
+}
+
+/// Print guidance for designating an approval owner over a channel. The
+/// owner-authority gate (`channels_config.approval_owners`) is separate from a
+/// channel's `allowed_users`: being able to chat does not let you approve a
+/// privileged tool call. With no owner set, approval-required tools auto-deny
+/// over channels (secure default). The recommended path is the `/claim <code>`
+/// pairing flow — the bot records your real account id from chat.
+fn print_owner_claim_guidance() {
+    eprintln!();
+    eprintln!("🔐 Approval owner (who can approve tool calls over a channel)");
+    eprintln!(
+        "   Your channel can chat now, but NO approval owner is set — any tool that\n   \
+         needs approval will be auto-denied over the channel until you add one."
+    );
+    eprintln!("   Recommended — claim ownership from chat (captures your real id):");
+    eprintln!("     1. Start the channel runtime:  rantaiclaw channels");
+    eprintln!("        (with an empty allowed_users it prints a one-time pairing code)");
+    eprintln!("     2. DM your bot:  /claim <code>   → registers you as an approval owner.");
+    eprintln!("   Or set manually:  [channels_config] approval_owners = [\"<your id/username>\"]");
+    eprintln!();
 }
 
 /// Returns `true` if any non-CLI channel has at least one configuration

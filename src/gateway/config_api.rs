@@ -504,7 +504,10 @@ mod tests {
     #[test]
     fn telegram_token_shape_is_enforced() {
         // Real shape: <digits>:<>=20 token chars>.
-        assert!(is_valid_telegram_token(&format!("123456789:{}", "A".repeat(35))));
+        assert!(is_valid_telegram_token(&format!(
+            "123456789:{}",
+            "A".repeat(35)
+        )));
         assert!(is_valid_telegram_token("42:AA_bb-cc11223344556677889900"));
         // Rejected: missing colon, non-digit id, short secret, empty.
         assert!(!is_valid_telegram_token("nope"));
@@ -512,7 +515,9 @@ mod tests {
         assert!(!is_valid_telegram_token("123:short"));
         assert!(!is_valid_telegram_token(""));
         // Rejected: URL-significant chars can't reach the interpolated path.
-        assert!(!is_valid_telegram_token("123:AAAA/AAAA/../../evilAAAAAAAAA"));
+        assert!(!is_valid_telegram_token(
+            "123:AAAA/AAAA/../../evilAAAAAAAAA"
+        ));
         assert!(!is_valid_telegram_token("123:AAAA?x=1AAAAAAAAAAAAAAAAAAAA"));
         assert!(!is_valid_telegram_token("123:AAAA AAAAAAAAAAAAAAAAAAAAAAA"));
         assert!(!is_valid_telegram_token("123:AAAA@host.comAAAAAAAAAAAAAAA"));

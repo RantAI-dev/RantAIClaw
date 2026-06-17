@@ -17,6 +17,11 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
+/// `/claim <code>` — like `/bind`, but also registers the sender as an
+/// approval **owner** (`channels_config.approval_owners`), i.e. someone whose
+/// in-chat `/approve` of a gated tool is honored. Reuses the same one-time
+/// pairing code as `/bind`.
+const TELEGRAM_CLAIM_COMMAND: &str = "/claim";
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
@@ -461,6 +466,38 @@ impl TelegramChannel {
         Ok(())
     }
 
+    /// Add `identities` to `channels_config.approval_owners` and persist.
+    /// Owners are matched against the inbound sender id by [`crate::approval::can_approve`],
+    /// which resolves to the username (if any) else the numeric id — so we
+    /// persist BOTH forms (when distinct) to guarantee a match either way.
+    /// Takes effect for in-chat approval when the channels runtime (re)starts.
+    async fn persist_approval_owner(&self, identities: &[String]) -> anyhow::Result<()> {
+        let mut config = Self::load_config_without_env().await?;
+        let mut changed = false;
+        for id in identities {
+            let normalized = Self::normalize_identity(id);
+            if normalized.is_empty() {
+                continue;
+            }
+            if !config
+                .channels_config
+                .approval_owners
+                .iter()
+                .any(|o| o == &normalized)
+            {
+                config.channels_config.approval_owners.push(normalized);
+                changed = true;
+            }
+        }
+        if changed {
+            config
+                .save()
+                .await
+                .context("Failed to persist approval_owners to config.toml")?;
+        }
+        Ok(())
+    }
+
     fn add_allowed_identity_runtime(&self, identity: &str) {
         let normalized = Self::normalize_identity(identity);
         if normalized.is_empty() {
@@ -473,14 +510,24 @@ impl TelegramChannel {
         }
     }
 
-    fn extract_bind_code(text: &str) -> Option<&str> {
+    /// Parse `<command> <code>` (tolerating `<command>@botname`), returning the
+    /// trimmed non-empty code. Shared by `/bind` and `/claim`.
+    fn extract_command_code<'a>(text: &'a str, command: &str) -> Option<&'a str> {
         let mut parts = text.split_whitespace();
-        let command = parts.next()?;
-        let base_command = command.split('@').next().unwrap_or(command);
-        if base_command != TELEGRAM_BIND_COMMAND {
+        let cmd = parts.next()?;
+        let base_command = cmd.split('@').next().unwrap_or(cmd);
+        if base_command != command {
             return None;
         }
         parts.next().map(str::trim).filter(|code| !code.is_empty())
+    }
+
+    fn extract_bind_code(text: &str) -> Option<&str> {
+        Self::extract_command_code(text, TELEGRAM_BIND_COMMAND)
+    }
+
+    fn extract_claim_code(text: &str) -> Option<&str> {
+        Self::extract_command_code(text, TELEGRAM_CLAIM_COMMAND)
     }
 
     fn pairing_code_active(&self) -> bool {
@@ -625,6 +672,119 @@ impl TelegramChannel {
         I: IntoIterator<Item = &'a str>,
     {
         identities.into_iter().any(|id| self.is_user_allowed(id))
+    }
+
+    /// Handle a `/claim <code>` owner-claim. Returns `true` if the update was a
+    /// claim attempt (handled here — must NOT be forwarded to the agent).
+    ///
+    /// Validates the one-time pairing code (same code as `/bind`), then registers
+    /// the sender as an approval **owner** (`channels_config.approval_owners`) and
+    /// an allowed user. Works whether or not the sender is already allowed, so it
+    /// covers both the initial pairing bootstrap and an allowed user claiming
+    /// ownership. The owner key is the sender's numeric id + username (both
+    /// persisted, since `can_approve` resolves the sender to username-else-id).
+    async fn try_handle_claim(&self, update: &serde_json::Value) -> bool {
+        let Some(message) = update.get("message") else {
+            return false;
+        };
+        let text = message
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let Some(code) = Self::extract_claim_code(text) else {
+            return false;
+        };
+        let code = code.to_string();
+
+        let Some(chat_id) = message
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())
+        else {
+            return true; // recognised as /claim but malformed — consume it
+        };
+
+        let from = message.get("from");
+        let sender_id = from
+            .and_then(|f| f.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+        let username = from
+            .and_then(|f| f.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|u| !u.is_empty() && u != "unknown");
+
+        // Persist both forms to approval_owners; primary (id-preferred) to the
+        // chat allowlist so the owner can also talk to the bot.
+        let mut owner_identities: Vec<String> = Vec::new();
+        if let Some(ref id) = sender_id {
+            owner_identities.push(id.clone());
+        }
+        if let Some(ref u) = username {
+            owner_identities.push(u.clone());
+        }
+        let primary = sender_id.clone().or_else(|| username.clone());
+        let Some(primary) = primary else {
+            let _ = self
+                .send(&SendMessage::new(
+                    "Couldn't determine your Telegram id, so I can't make you an owner.",
+                    &chat_id,
+                ))
+                .await;
+            return true;
+        };
+
+        let Some(pairing) = self.pairing.as_ref() else {
+            let _ = self
+                .send(&SendMessage::new(
+                    "Pairing isn't active, so `/claim` can't be verified. Ask the operator to (re)start the channel with an empty `allowed_users` (pairing mode) so a one-time code is issued.",
+                    &chat_id,
+                ))
+                .await;
+            return true;
+        };
+
+        match pairing.try_pair(&code, &chat_id).await {
+            Ok(Some(_token)) => {
+                self.add_allowed_identity_runtime(&primary);
+                let _ = self.persist_allowed_identity(&primary).await;
+                match self.persist_approval_owner(&owner_identities).await {
+                    Ok(()) => {
+                        let _ = self
+                            .send(&SendMessage::new(
+                                format!(
+                                    "✅ You're now an approval owner ({primary}). You can `/approve` tool calls in chat. \
+If approvals don't take effect right away, the operator may need to restart the channel runtime."
+                                ),
+                                &chat_id,
+                            ))
+                            .await;
+                        tracing::info!(
+                            "Telegram: /claim registered approval owner(s)={owner_identities:?}"
+                        );
+                    }
+                    Err(e) => {
+                        let _ = self
+                            .send(&SendMessage::new(
+                                format!("Added you as an allowed user, but failed to set you as an owner: {e}"),
+                                &chat_id,
+                            ))
+                            .await;
+                    }
+                }
+            }
+            Ok(None) | Err(_) => {
+                let _ = self
+                    .send(&SendMessage::new(
+                        "❌ Invalid or expired claim code. Ask the operator for a fresh one.",
+                        &chat_id,
+                    ))
+                    .await;
+            }
+        }
+        true
     }
 
     async fn handle_unauthorized_message(&self, update: &serde_json::Value) {
@@ -1902,6 +2062,12 @@ Ensure only one `rantaiclaw` process is using this bot token."
                         offset = uid + 1;
                     }
 
+                    // Intercept `/claim <code>` (owner pairing) before routing —
+                    // handled regardless of allowlist status, never forwarded.
+                    if self.try_handle_claim(update).await {
+                        continue;
+                    }
+
                     let Some((mut msg, photo_file_id)) = self.parse_update_message(update) else {
                         self.handle_unauthorized_message(update).await;
                         continue;
@@ -2202,6 +2368,22 @@ mod tests {
             TelegramChannel::extract_bind_code("/bind 123456"),
             Some("123456")
         );
+    }
+
+    #[test]
+    fn telegram_extract_claim_code_parses_and_rejects() {
+        assert_eq!(
+            TelegramChannel::extract_claim_code("/claim 654321"),
+            Some("654321")
+        );
+        assert_eq!(
+            TelegramChannel::extract_claim_code("/claim@rantaiclaw_bot 99"),
+            Some("99")
+        );
+        // Not a claim / missing code.
+        assert_eq!(TelegramChannel::extract_claim_code("/claim"), None);
+        assert_eq!(TelegramChannel::extract_claim_code("/bind 123456"), None);
+        assert_eq!(TelegramChannel::extract_claim_code("hello"), None);
     }
 
     #[test]
