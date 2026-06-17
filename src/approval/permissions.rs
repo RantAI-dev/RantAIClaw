@@ -147,6 +147,8 @@ pub fn apply(cc: &mut ChannelsConfig, target: Target, op: Op, value: &str) -> Ch
 /// `auto_approve` list) so the reader sees the *effective* guest tool ceiling,
 /// not just the additive allowlist.
 pub fn render(cc: &ChannelsConfig, safe_tools: &[String]) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::new();
     out.push_str("Per-role permissions\n");
     out.push_str("────────────────────\n");
@@ -159,7 +161,7 @@ pub fn render(cc: &ChannelsConfig, safe_tools: &[String]) -> String {
         out.push_str("  * (ANY sender is an owner — insecure, review this)\n");
     } else {
         for o in &cc.approval_owners {
-            out.push_str(&format!("  • {o}\n"));
+            let _ = writeln!(out, "  • {o}");
         }
     }
 
@@ -171,10 +173,7 @@ pub fn render(cc: &ChannelsConfig, safe_tools: &[String]) -> String {
     if cc.guest_allowed_tools.is_empty() {
         out.push_str("  extra : (none)\n");
     } else {
-        out.push_str(&format!(
-            "  extra : {}\n",
-            cc.guest_allowed_tools.join(", ")
-        ));
+        let _ = writeln!(out, "  extra : {}", cc.guest_allowed_tools.join(", "));
     }
 
     // Guest command ceiling.
@@ -183,7 +182,7 @@ pub fn render(cc: &ChannelsConfig, safe_tools: &[String]) -> String {
         out.push_str("  (none — guests may run no shell commands)\n");
     } else {
         for c in &cc.guest_allowed_commands {
-            out.push_str(&format!("  • {c}\n"));
+            let _ = writeln!(out, "  • {c}");
         }
     }
 

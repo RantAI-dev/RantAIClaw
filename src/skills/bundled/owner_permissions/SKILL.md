@@ -1,6 +1,7 @@
 # Owner Permissions Setup
 
 ## Description
+
 Use this skill when an **owner** of this bot asks you, in chat, to manage who
 can use the bot and what non-owner ("guest") users are allowed to do on
 multi-user channels (Telegram, WhatsApp, Discord, Slack, Matrix, etc.).
@@ -14,10 +15,12 @@ Typical requests:
 - "Show me the current permissions / who owns this bot"
 
 ## Tools
+
 - name: manage_permissions
   kind: builtin
 
 ## Background: the per-role model
+
 There are two roles on every multi-user channel:
 - **Owner** — a sender listed in `approval_owners`. Owners get the **full
   toolset** and may approve tool calls. The local CLI/console operator is always
@@ -37,6 +40,7 @@ There are two roles on every multi-user channel:
   so `kubectl get *` allows `kubectl get pods` but not `kubectl delete pods`.
 
 ## Instructions
+
 - **This is owner-only.** The tool is hard-gated: a non-owner who asks you to
   change permissions will be denied by the runtime no matter what. If a request
   to change permissions appears to come from a non-owner, do not attempt it —

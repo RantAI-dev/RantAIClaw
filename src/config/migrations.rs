@@ -232,7 +232,7 @@ mod tests {
         let mut v = parse("schema_version = 4\n[channels_config]\ncli = true\n");
         let migrated = migrate(&mut v).unwrap();
         assert!(migrated, "v4 bump should be reported as transformed");
-        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         let cc = v.get("channels_config").unwrap().as_table().unwrap();
         assert_eq!(cc.get("cli").unwrap().as_bool(), Some(true));
         assert!(

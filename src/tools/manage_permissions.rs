@@ -225,11 +225,11 @@ mod tests {
 
     /// `manage_permissions` resolves its config via `Config::load_or_init`, which
     /// reads `RANTAICLAW_CONFIG_DIR`. Point it at a temp dir so the test never
-    /// touches a real profile. Serialized because it mutates a process-global env.
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// touches a real profile. Serialized (async mutex, held across awaits) because
+    /// it mutates a process-global env var.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    async fn tool_in(tmp: &TempDir) -> ManagePermissionsTool {
+    fn tool_in(tmp: &TempDir) -> ManagePermissionsTool {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
@@ -240,10 +240,10 @@ mod tests {
 
     #[tokio::test]
     async fn add_show_remove_roundtrip() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
-        let tool = tool_in(&tmp).await;
+        let tool = tool_in(&tmp);
 
         let added = tool
             .execute(json!({"action": "add", "target": "owner", "value": "123456"}))
@@ -272,10 +272,10 @@ mod tests {
 
     #[tokio::test]
     async fn missing_value_is_rejected() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
-        let tool = tool_in(&tmp).await;
+        let tool = tool_in(&tmp);
 
         let res = tool
             .execute(json!({"action": "add", "target": "tool"}))
@@ -289,10 +289,10 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_to_remove_last_owner() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
-        let tool = tool_in(&tmp).await;
+        let tool = tool_in(&tmp);
 
         // One owner present → removing it must be refused.
         tool.execute(json!({"action": "add", "target": "owner", "value": "solo"}))
@@ -320,10 +320,10 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_action_is_rejected() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
-        let tool = tool_in(&tmp).await;
+        let tool = tool_in(&tmp);
 
         let res = tool.execute(json!({"action": "frobnicate"})).await.unwrap();
         assert!(!res.success);
