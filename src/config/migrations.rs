@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 4;
+pub const CURRENT_VERSION: u32 = 5;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -112,8 +112,19 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive default-only field)
     }
 
-    // Future migrations (v5, v6, …) inserted here in order.
-    // if from < 5 { migrate_v5(raw)?; }
+    // v4 → v5: `[channels_config].guest_allowed_tools` + `guest_allowed_commands`
+    // (Vec<String>, default empty) were added — the per-role capability ceiling
+    // for non-owner ("normal") users. Additive fields with serde defaults:
+    // configs that lack them deserialise fine and gain the defaults (`[]`,
+    // secure — guests get only read-only tools + skills) on next write, so there
+    // is nothing to transform. Burns a version slot so schema_drift is accepted
+    // with intent (mirrors v3 → v4).
+    if from < 5 {
+        // (no transformation; additive default-only fields)
+    }
+
+    // Future migrations (v6, v7, …) inserted here in order.
+    // if from < 6 { migrate_v6(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -209,6 +220,24 @@ mod tests {
         assert!(
             cc.get("approval_owners").is_none(),
             "migration must not inject approval_owners; serde default handles it"
+        );
+    }
+
+    #[test]
+    fn v4_to_v5_is_additive_noop_preserving_content() {
+        // v4 → v5 only added `[channels_config].guest_allowed_tools` +
+        // `guest_allowed_commands` (additive, default empty). A v4 config
+        // migrates to current with content intact and without the migration
+        // injecting the guest fields.
+        let mut v = parse("schema_version = 4\n[channels_config]\ncli = true\n");
+        let migrated = migrate(&mut v).unwrap();
+        assert!(migrated, "v4 bump should be reported as transformed");
+        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+        let cc = v.get("channels_config").unwrap().as_table().unwrap();
+        assert_eq!(cc.get("cli").unwrap().as_bool(), Some(true));
+        assert!(
+            cc.get("guest_allowed_tools").is_none() && cc.get("guest_allowed_commands").is_none(),
+            "migration must not inject guest fields; serde defaults handle them"
         );
     }
 

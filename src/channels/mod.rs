@@ -239,6 +239,11 @@ struct ChannelRuntimeContext {
     /// [`ChatRelayApprovalBackend`] registers + awaits here; the dispatch loop's
     /// `try_handle_tool_reply` resolves it when an owner replies.
     tool_approvals: Arc<crate::security::PendingApprovals>,
+    /// Per-role capability ceiling applied to non-owner ("guest") senders. The
+    /// ceiling is role-based (same for every guest), so it's built once from
+    /// config; a turn uses it only when the sender isn't an owner. Owners get
+    /// the full toolset.
+    guest_gate: Arc<crate::approval::GuestGate>,
 }
 
 #[derive(Clone)]
@@ -1560,6 +1565,15 @@ async fn process_channel_message(
         .as_ref()
         .map(|b| b as &dyn crate::approval::ApprovalBackend);
 
+    // Per-role capability ceiling: owners (senders in approval_owners) get the
+    // full toolset; everyone else runs under the guest gate (safe tools +
+    // guest_allowed_tools, shell limited to guest_allowed_commands).
+    let guest_gate_ref = if crate::approval::can_approve(&ctx.approval_owners, &msg.sender) {
+        None
+    } else {
+        Some(ctx.guest_gate.as_ref())
+    };
+
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let llm_result = tokio::select! {
@@ -1578,6 +1592,7 @@ async fn process_channel_message(
                 ctx.channel_approval.as_deref(),
                 msg.channel.as_str(),
                 chat_relay_backend_ref,
+                guest_gate_ref,
                 &ctx.multimodal,
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
@@ -3184,6 +3199,14 @@ pub async fn start_channels_with_cancellation(
         tool_approvals: Arc::new(crate::security::PendingApprovals::new(Some(
             std::time::Duration::from_secs(300),
         ))),
+        // Role ceiling for non-owner senders: safe (auto-approved) tools +
+        // configured guest_allowed_tools, with shell limited to
+        // guest_allowed_commands. Built once (role-based, not per-user).
+        guest_gate: Arc::new(crate::approval::GuestGate::new(
+            config.autonomy.auto_approve.clone(),
+            &config.channels_config.guest_allowed_tools,
+            &config.channels_config.guest_allowed_commands,
+        )),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages, approval_owners).await;
@@ -3364,6 +3387,11 @@ mod tests {
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -3820,6 +3848,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -3881,6 +3914,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -3942,6 +3980,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -4012,6 +4055,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -4103,6 +4151,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -4176,6 +4229,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -4264,6 +4322,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -4343,6 +4406,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -4409,6 +4477,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -4582,6 +4655,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4664,6 +4742,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4758,6 +4841,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4834,6 +4922,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -5365,6 +5458,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -5452,6 +5550,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(
@@ -5539,6 +5642,11 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_approval: None,
             approval_owners: Arc::new(Vec::new()),
             tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
         });
 
         process_channel_message(

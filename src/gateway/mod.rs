@@ -963,6 +963,10 @@ async fn run_gateway_chat_with_multimodal(
     // Prior `(role, content)` turns to re-feed so a continued channel
     // conversation has memory of the exchange (empty for one-shot webhooks).
     prior_history: &[(String, String)],
+    // Per-role capability ceiling for a non-owner ("guest") sender. `None` ⇒
+    // owner / trusted webhook (full toolset). Built by the caller from the
+    // channel sender + config; applies regardless of `autonomous_tools`.
+    guest_gate: Option<&crate::approval::GuestGate>,
 ) -> anyhow::Result<GatewayChatResult> {
     let user_messages = vec![ChatMessage::user(message)];
     let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
@@ -1063,6 +1067,7 @@ async fn run_gateway_chat_with_multimodal(
         // (`channel_approval`); the inline backend stays the name-derived
         // default (auto-deny) here.
         None,
+        guest_gate,
         &multimodal_config,
         GATEWAY_MAX_TOOL_ITERATIONS,
         None, // no cancellation token
@@ -1109,6 +1114,24 @@ async fn run_gateway_chat_with_multimodal(
 ///
 /// With `[channels_config] autonomous_tools = true` nothing is ever
 /// denied, so this degrades to a plain agent turn.
+/// Build the per-role capability ceiling for a channel `sender`: `None` if the
+/// sender is an approval owner (full toolset), else a `GuestGate` from
+/// `guest_allowed_tools` / `guest_allowed_commands` + the safe auto-approve set.
+/// Applies regardless of `autonomous_tools`.
+fn build_guest_gate(state: &AppState, sender: &str) -> Option<crate::approval::GuestGate> {
+    let cfg = state.config.lock();
+    let cc = &cfg.channels_config;
+    if crate::approval::can_approve(&cc.approval_owners, sender) {
+        None
+    } else {
+        Some(crate::approval::GuestGate::new(
+            cfg.autonomy.auto_approve.clone(),
+            &cc.guest_allowed_tools,
+            &cc.guest_allowed_commands,
+        ))
+    }
+}
+
 async fn process_channel_chat(
     state: &AppState,
     provider_label: &str,
@@ -1122,6 +1145,8 @@ async fn process_channel_chat(
     let key = crate::channels::conversation::ConversationKey::new(channel_name, sender).resolve();
     // Prior conversation turns so the bot remembers the exchange.
     let prior = state.channel_approvals.history(&key);
+    // Per-role capability ceiling: owner ⇒ None (full toolset); guest ⇒ limited.
+    let guest_gate = build_guest_gate(state, sender);
 
     // A pending prompt is awaiting this sender's decision.
     if let Some((original, tools)) = state.channel_approvals.take_pending(&key) {
@@ -1157,6 +1182,7 @@ async fn process_channel_chat(
                     &original,
                     &allow,
                     &prior,
+                    guest_gate.as_ref(),
                 )
                 .await?;
                 return Ok(finalize_channel_turn(state, &key, &original, result));
@@ -1169,8 +1195,15 @@ async fn process_channel_chat(
     }
 
     let allow = state.channel_approvals.allowlisted(&key);
-    let result =
-        run_gateway_chat_with_multimodal(state, provider_label, message, &allow, &prior).await?;
+    let result = run_gateway_chat_with_multimodal(
+        state,
+        provider_label,
+        message,
+        &allow,
+        &prior,
+        guest_gate.as_ref(),
+    )
+    .await?;
     Ok(finalize_channel_turn(state, &key, message, result))
 }
 
@@ -1317,7 +1350,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &[], &[]).await {
+    match run_gateway_chat_with_multimodal(&state, &provider_label, message, &[], &[], None).await {
         Ok(result) => {
             let duration = started_at.elapsed();
             state
@@ -1879,7 +1912,8 @@ async fn handle_trigger_webhook(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
-    match run_gateway_chat_with_multimodal(&state, &provider_label, &message, &[], &[]).await {
+    match run_gateway_chat_with_multimodal(&state, &provider_label, &message, &[], &[], None).await
+    {
         Ok(result) => {
             let mut body = serde_json::json!({
                 "response": result.response,

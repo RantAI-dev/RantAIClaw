@@ -1019,6 +1019,7 @@ pub(crate) async fn agent_turn(
         None,
         "channel",
         None,
+        None,
         multimodal_config,
         max_tool_iterations,
         None,
@@ -1185,11 +1186,16 @@ pub(crate) async fn execute_tool_calls_collecting(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
+    // Per-role capability ceiling for a non-owner ("guest") turn. `None` ⇒ owner
+    // / CLI / console — no restriction.
+    guest_gate: Option<&crate::approval::GuestGate>,
     parallel: bool,
     cancellation_token: Option<&CancellationToken>,
     events: Option<&AgentEventSender>,
 ) -> Result<Vec<ToolExecutionResult>> {
-    if parallel {
+    // A guest turn must run serially so every call passes the gate below; the
+    // parallel fast-path skips per-call checks.
+    if parallel && guest_gate.is_none() {
         let futures = calls.iter().map(|call| {
             execute_one_tool_structured(call, tools_registry, observer, cancellation_token, events)
         });
@@ -1198,6 +1204,37 @@ pub(crate) async fn execute_tool_calls_collecting(
 
     let mut results = Vec::with_capacity(calls.len());
     for call in calls {
+        // Role ceiling (guests): deny disallowed tools / out-of-allowlist shell
+        // commands outright — a hard ceiling, never escalated to an owner.
+        if let Some(gate) = guest_gate {
+            if let Some(reason) = gate.deny_reason(&call.name, &call.arguments) {
+                if let Some(tx) = events {
+                    let id = Uuid::new_v4().to_string();
+                    let _ = tx
+                        .send(AgentEvent::ToolCallStart {
+                            id: id.clone(),
+                            name: call.name.clone(),
+                            args: call.arguments.clone(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(AgentEvent::ToolCallEnd {
+                            id,
+                            ok: false,
+                            output_preview: "[denied: guest capability ceiling]".into(),
+                        })
+                        .await;
+                }
+                results.push(ToolExecutionResult {
+                    name: call.name.clone(),
+                    output: reason,
+                    success: false,
+                    tool_call_id: call.tool_call_id.clone(),
+                });
+                continue;
+            }
+        }
+
         if let Some(mgr) = approval {
             if mgr.needs_approval(&call.name) {
                 let request = ApprovalRequest {
@@ -1353,6 +1390,7 @@ pub(crate) async fn run_structured_loop(
     // `channel_name` (CLI prompts, every other surface auto-denies). `Some`
     // injects a richer backend — e.g. the channel in-chat owner relay.
     approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
+    guest_gate: Option<&crate::approval::GuestGate>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
@@ -1566,6 +1604,7 @@ pub(crate) async fn run_structured_loop(
             approval,
             channel_name,
             approval_backend,
+            guest_gate,
             should_parallel,
             cancellation_token.as_ref(),
             events.as_ref(),
@@ -1688,6 +1727,7 @@ pub(crate) async fn run_tool_call_loop(
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
+    guest_gate: Option<&crate::approval::GuestGate>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
@@ -1717,6 +1757,7 @@ pub(crate) async fn run_tool_call_loop(
         approval,
         channel_name,
         approval_backend,
+        guest_gate,
         multimodal_config,
         max_tool_iterations,
         cancellation_token,
@@ -2198,6 +2239,7 @@ pub async fn run(
             Some(&approval_manager),
             "cli",
             None,
+            None,
             &config.multimodal,
             config.agent.max_tool_iterations,
             None,
@@ -2343,6 +2385,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                None,
                 None,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
@@ -2825,6 +2868,7 @@ mod tests {
             None,
             "cli",
             None,
+            None,
             &crate::config::MultimodalConfig::default(),
             3,
             None,
@@ -2871,6 +2915,7 @@ mod tests {
             None,
             "cli",
             None,
+            None,
             &multimodal,
             3,
             None,
@@ -2910,6 +2955,7 @@ mod tests {
             true,
             None,
             "cli",
+            None,
             None,
             &crate::config::MultimodalConfig::default(),
             3,
@@ -3038,6 +3084,7 @@ mod tests {
             Some(&approval_mgr),
             "telegram",
             None,
+            None,
             &crate::config::MultimodalConfig::default(),
             4,
             None,
@@ -3149,6 +3196,7 @@ mod tests {
             Some(&mgr),
             "telegram",
             None,
+            None,
             false,
             None,
             None,
@@ -3175,6 +3223,7 @@ mod tests {
             Some(&mgr),
             "telegram",
             Some(&backend as &dyn crate::approval::ApprovalBackend),
+            None,
             false,
             None,
             None,
@@ -3187,6 +3236,43 @@ mod tests {
         );
         assert!(results[0].success);
         assert_eq!(results[0].output, "did the thing");
+    }
+
+    #[tokio::test]
+    async fn guest_gate_denies_disallowed_tool_in_executor() {
+        // A guest gate that does NOT permit `do_thing` → the executor denies it
+        // (hard ceiling) and the tool never runs.
+        let call = ParsedToolCall {
+            name: "do_thing".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran),
+        })];
+        // Guest may use only `file_read`; `do_thing` is not permitted.
+        let gate = crate::approval::GuestGate::new(["file_read".to_string()], &[], &[]);
+        let results = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            None,
+            "telegram",
+            None,
+            Some(&gate),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "guest gate must prevent the tool from running"
+        );
+        assert!(!results[0].success);
+        assert!(results[0].output.contains("non-owner"));
     }
 
     #[test]
@@ -4315,6 +4401,7 @@ Let me check the result."#;
             None,
             "test",
             None,
+            None,
             &multimodal,
             5,
             None,
@@ -4414,6 +4501,7 @@ Let me check the result."#;
             None,
             "test",
             None,
+            None,
             &multimodal,
             5,
             None,
@@ -4509,6 +4597,7 @@ Let me check the result."#;
             None,
             "test",
             None,
+            None,
             &multimodal,
             5,
             Some(token),
@@ -4557,6 +4646,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None,
             None,
             &multimodal,
             5,
