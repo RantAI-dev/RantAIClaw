@@ -2038,23 +2038,31 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     updated.save().await?;
     println!("✅ Bound Telegram identity: {normalized}");
     println!("   Saved to {}", updated.config_path.display());
+    announce_daemon_reload();
+    Ok(())
+}
+
+/// Try to reload a running managed daemon service after a config change, and
+/// print a clear note about what happened either way. Shared by the channel
+/// allowlist binder and the `permissions` CLI so config edits made on disk are
+/// picked up without the user having to remember to bounce the service.
+pub(crate) fn announce_daemon_reload() {
     match maybe_restart_managed_daemon_service() {
         Ok(true) => {
             println!("🔄 Detected running managed daemon service; reloaded automatically.");
         }
         Ok(false) => {
             println!(
-                "ℹ️ No managed daemon service detected. If `rantaiclaw daemon`/`channel start` is already running, restart it to load the updated allowlist."
+                "ℹ️ No managed daemon service detected. If `rantaiclaw daemon`/`channel start` is already running, restart it to load the change."
             );
         }
         Err(e) => {
             eprintln!(
-                "⚠️ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
+                "⚠️ Saved, but failed to reload daemon service automatically: {e}\n\
                  Restart service manually with `rantaiclaw service stop && rantaiclaw service start`."
             );
         }
     }
-    Ok(())
 }
 
 fn maybe_restart_managed_daemon_service() -> Result<bool> {

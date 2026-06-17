@@ -473,6 +473,32 @@ Examples:
         channel_command: ChannelCommands,
     },
 
+    /// Manage per-role channel permissions (owners + the non-owner "guest"
+    /// capability ceiling)
+    ///
+    /// Owners (senders in `approval_owners`) get the full toolset on every
+    /// multi-user channel and may approve tool calls. Everyone else who can
+    /// chat is a "guest" whose turns run under a ceiling you set here:
+    /// `guest-tool` widens which tools the agent may use on their behalf, and
+    /// `guest-command` is the shell-command glob allowlist (e.g.
+    /// `"kubectl get *"`). The CLI/console operator is always an owner.
+    #[command(long_about = "\
+Manage the per-role permission model shared by all multi-user channels.
+
+Examples:
+  rantaiclaw permissions show
+  rantaiclaw permissions add owner 123456789        # Telegram numeric user ID
+  rantaiclaw permissions add owner alice            # Slack/Discord/etc username
+  rantaiclaw permissions add tool shell             # let guests use the shell tool
+  rantaiclaw permissions add command 'kubectl get *'  # ...but only these commands
+  rantaiclaw permissions remove owner alice
+
+Targets: owner | tool | command (aliases: owners, tools, commands, cmd).")]
+    Permissions {
+        #[command(subcommand)]
+        permissions_command: PermissionsCommands,
+    },
+
     /// Browse 50+ integrations
     Integrations {
         #[command(subcommand)]
@@ -1077,6 +1103,27 @@ enum ChannelCommands {
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PermissionsCommands {
+    /// Show current owners and the non-owner (guest) capability ceiling
+    Show,
+    /// Add an entry to a permission list
+    Add {
+        /// What to add: `owner` | `tool` | `command`
+        target: String,
+        /// The value: a sender identity (owner), tool name (tool), or
+        /// shell-command glob (command, e.g. `"kubectl get *"`)
+        value: String,
+    },
+    /// Remove an entry from a permission list
+    Remove {
+        /// What to remove: `owner` | `tool` | `command`
+        target: String,
+        /// The value to remove (exact match)
+        value: String,
     },
 }
 
@@ -1851,6 +1898,10 @@ async fn main() -> Result<()> {
             other => channels::handle_command(other, &config).await,
         },
 
+        Some(Commands::Permissions {
+            permissions_command,
+        }) => handle_permissions_command(permissions_command, config).await,
+
         Some(Commands::Integrations {
             integration_command,
         }) => integrations::handle_command(integration_command, &config),
@@ -2199,6 +2250,51 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
+async fn handle_permissions_command(
+    permissions_command: PermissionsCommands,
+    config: Config,
+) -> Result<()> {
+    use approval::permissions::{self, Op, Target};
+
+    // `Show` just renders; `Add`/`Remove` mutate then persist.
+    let (op, target_str, value) = match permissions_command {
+        PermissionsCommands::Show => {
+            print!(
+                "{}",
+                permissions::render(&config.channels_config, &config.autonomy.auto_approve)
+            );
+            return Ok(());
+        }
+        PermissionsCommands::Add { target, value } => (Op::Add, target, value),
+        PermissionsCommands::Remove { target, value } => (Op::Remove, target, value),
+    };
+
+    let target = Target::parse(&target_str).ok_or_else(|| {
+        anyhow::anyhow!("unknown target `{target_str}`; expected one of: owner | tool | command")
+    })?;
+
+    let mut updated = config.clone();
+    let outcome = permissions::apply(&mut updated.channels_config, target, op, &value);
+
+    if !outcome.changed {
+        println!("ℹ️ {}", outcome.message);
+        return Ok(());
+    }
+
+    // Loud, opt-in warning if the operator just made every sender an owner.
+    if target == Target::Owner && op == Op::Add && value.trim() == "*" {
+        println!(
+            "⚠️ `*` makes ANY sender an owner with the full toolset on every channel — insecure. Remove it with `rantaiclaw permissions remove owner '*'` unless you really mean it."
+        );
+    }
+
+    updated.save().await?;
+    println!("✅ {}", outcome.message);
+    println!("   Saved to {}", updated.config_path.display());
+    channels::announce_daemon_reload();
+    Ok(())
+}
+
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
 

@@ -4,6 +4,7 @@
 //! with session-scoped "Always" allowlists and audit logging.
 
 pub mod guest;
+pub mod permissions;
 pub mod policy_writer;
 
 pub use guest::GuestGate;
