@@ -5,6 +5,18 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.76-alpha] — 2026-06-18
+
+### Changed
+
+- **Knowledge Base is now in the default build.** `kb` (sqlite-vec vector store
+  + PDF/markdown/image ingestion) moved into the default feature set, so a
+  classic install/build ships the `rantaiclaw kb` command (search / ingest /
+  list / get / delete / drift / re-embed) without `--features kb`. Verified to
+  cross-compile on all six release targets. Costs ~5MB of binary size (≈31MB);
+  the release binary-size safeguard was raised one tier (30→35MB, advisory
+  25→30MB) per the documented floor-history policy.
+
 ## [0.6.75-alpha] — 2026-06-17
 
 Per-role channel permissions: owners get the full toolset; everyone else who
