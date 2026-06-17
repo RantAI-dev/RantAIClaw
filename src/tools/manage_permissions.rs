@@ -152,6 +152,32 @@ impl Tool for ManagePermissionsTool {
             return Ok(err("missing `value` (the entry to add/remove)"));
         }
 
+        // Lockout guard: refuse to remove the last owner FROM CHAT. With no
+        // owners, every sender (including the requester) becomes a guest, and
+        // `manage_permissions` is owner-only — so the chat surface could never
+        // re-add an owner. The local CLI/TUI operator can still empty the list
+        // deliberately (they have machine access); this guard is chat-only.
+        if target == Target::Owner
+            && op == Op::Remove
+            && config.channels_config.approval_owners.len() == 1
+            && config
+                .channels_config
+                .approval_owners
+                .first()
+                .map(String::as_str)
+                == Some(value)
+        {
+            return Ok(err(
+                "refusing to remove the last owner from chat — that would lock everyone out of \
+                 chat-based permission management. Use the `rantaiclaw permissions` CLI if you \
+                 really want zero owners.",
+            ));
+        }
+
+        // Serialize this tool's load→apply→save so two concurrent owner calls
+        // can't read-modify-write over each other (last-writer-wins data loss).
+        let _save_guard = SAVE_LOCK.lock().await;
+
         let outcome = permissions::apply(&mut config.channels_config, target, op, value);
         if !outcome.changed {
             // Nothing to persist; report the no-op outcome as success.
@@ -169,6 +195,11 @@ impl Tool for ManagePermissionsTool {
 
         let mut output = outcome.message;
         if target == Target::Owner && op == Op::Add && value == "*" {
+            // Surface to the operator log too, not just the chat reply.
+            tracing::warn!(
+                target: "permissions",
+                "approval_owners set to wildcard '*' via chat — ANY sender is now an owner"
+            );
             output.push_str(
                 "\n⚠️ `*` makes ANY sender an owner with the full toolset — this is insecure.",
             );
@@ -182,6 +213,10 @@ impl Tool for ManagePermissionsTool {
         })
     }
 }
+
+/// Serializes `manage_permissions` config writes process-wide so concurrent
+/// owner calls don't clobber each other's load→apply→save.
+static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -221,6 +256,10 @@ mod tests {
         assert!(shown.success);
         assert!(shown.output.contains("123456"));
 
+        // Add a second owner so removing the first isn't the last-owner lockout.
+        tool.execute(json!({"action": "add", "target": "owner", "value": "789"}))
+            .await
+            .unwrap();
         let removed = tool
             .execute(json!({"action": "remove", "target": "owner", "value": "123456"}))
             .await
@@ -244,6 +283,37 @@ mod tests {
             .unwrap();
         assert!(!res.success);
         assert!(res.error.unwrap_or_default().contains("missing `value`"));
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_remove_last_owner() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
+        let tool = tool_in(&tmp).await;
+
+        // One owner present → removing it must be refused.
+        tool.execute(json!({"action": "add", "target": "owner", "value": "solo"}))
+            .await
+            .unwrap();
+        let res = tool
+            .execute(json!({"action": "remove", "target": "owner", "value": "solo"}))
+            .await
+            .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap_or_default().contains("last owner"));
+
+        // With two owners, removing one is fine.
+        tool.execute(json!({"action": "add", "target": "owner", "value": "second"}))
+            .await
+            .unwrap();
+        let ok = tool
+            .execute(json!({"action": "remove", "target": "owner", "value": "solo"}))
+            .await
+            .unwrap();
+        assert!(ok.success, "{:?}", ok.error);
 
         std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
