@@ -159,6 +159,13 @@ fn prompt_owners_and_guest_ceiling(ctx: &mut SetupContext) -> Result<()> {
         }
     }
 
+    // Make sure the owner can ask the bot to manage this from chat: install the
+    // owner-permissions skill (idempotent) now that a multi-user channel exists,
+    // even if the skills section was skipped.
+    if let Err(e) = crate::skills::bundled::install_core_skills(ctx.profile) {
+        eprintln!("   (note: could not install owner-permissions skill: {e})");
+    }
+
     eprintln!(
         "   Tip: change any of this later with `rantaiclaw permissions ...`, the TUI\n   \
          `/permissions` command, or by asking the bot in chat (owners only)."

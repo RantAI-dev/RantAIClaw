@@ -38,8 +38,18 @@ impl GuestGate {
         }
     }
 
-    /// Whether a guest may invoke `tool` at all.
+    /// Tools that are **owner-only**, no matter what `guest_allowed_tools`
+    /// says. These mutate authority itself (who owns the bot / what guests may
+    /// do), so allowing a guest to call one — even by an owner's misconfiguration
+    /// — would be a privilege-escalation hole. Checked before the allowlist.
+    pub const OWNER_ONLY_TOOLS: &'static [&'static str] = &["manage_permissions"];
+
+    /// Whether a guest may invoke `tool` at all. Owner-only tools are always
+    /// denied; otherwise the tool must be in the permitted set.
     pub fn tool_permitted(&self, tool: &str) -> bool {
+        if Self::OWNER_ONLY_TOOLS.contains(&tool) {
+            return false;
+        }
         self.permitted_tools.contains(tool)
     }
 
@@ -67,6 +77,12 @@ impl GuestGate {
     /// (used to extract the shell command). Returns `None` if permitted, or
     /// `Some(reason)` to deny with that message.
     pub fn deny_reason(&self, tool: &str, arguments: &serde_json::Value) -> Option<String> {
+        if Self::OWNER_ONLY_TOOLS.contains(&tool) {
+            return Some(format!(
+                "The `{tool}` tool is owner-only and cannot be used by non-owner users \
+                 (it changes who owns the bot). An owner must do this."
+            ));
+        }
         if !self.tool_permitted(tool) {
             return Some(format!(
                 "The `{tool}` tool isn't available to non-owner users on this channel. \
@@ -165,6 +181,20 @@ mod tests {
         assert!(!g.command_permitted("kubectl get pods > /etc/x"));
         assert!(!g.command_permitted("kubectl get $(whoami)"));
         assert!(!g.command_permitted(""));
+    }
+
+    #[test]
+    fn owner_only_tools_never_permitted_for_guests() {
+        // Even if an owner mistakenly adds `manage_permissions` to the guest
+        // allowlist, the hard owner-only denylist still blocks it.
+        let g = GuestGate::new(
+            ["file_read".to_string()],
+            &["manage_permissions".to_string()],
+            &[],
+        );
+        assert!(!g.tool_permitted("manage_permissions"));
+        let reason = g.deny_reason("manage_permissions", &json!({})).unwrap();
+        assert!(reason.contains("owner-only"));
     }
 
     #[test]

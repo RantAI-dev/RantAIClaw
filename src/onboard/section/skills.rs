@@ -41,6 +41,12 @@ impl SetupSection for SkillsSection {
     }
 
     fn run(&self, ctx: &mut SetupContext) -> Result<()> {
+        // Always-on core skills (owner permissions setup) — independent of the
+        // optional starter-pack choice below.
+        let core = bundled::install_core_skills(ctx.profile)?;
+        if !core.is_empty() {
+            eprintln!("Installed core skill(s): {}", core.join(", "));
+        }
         if ctx.interactive {
             run_interactive(ctx.profile)?;
         } else {
