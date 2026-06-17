@@ -5,6 +5,41 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.75-alpha] — 2026-06-17
+
+Per-role channel permissions: owners get the full toolset; everyone else who
+can chat is a "guest" under a configurable capability ceiling. Applies to every
+multi-user channel, configurable via CLI, TUI, the onboarding wizard, or by
+asking the bot in chat (owners only).
+
+### Added
+
+- **Guest capability ceiling** (`[channels_config] guest_allowed_tools` /
+  `guest_allowed_commands`) — non-owner turns may use skills + read-only tools
+  plus any allowlisted tools, and (for `shell`) only allowlisted command globs
+  (e.g. `kubectl get *`). Out-of-ceiling calls are denied outright — never
+  escalated to an owner — and the ceiling applies regardless of
+  `autonomous_tools`. Enforced in the shared agent loop (`GuestGate`) on every
+  polling channel and gateway/webhook channel; owners and the CLI/console
+  operator are unrestricted. Config schema v4 → v5 (additive migration).
+- **`rantaiclaw permissions`** CLI — `show`, `add`/`remove <owner|tool|command>
+  <value>`; persists and reloads a managed daemon.
+- **`/permissions`** TUI command (aliases `/perms`, `/owners`) — show or
+  add/remove; the running runtime reloads on save.
+- **Onboarding wizard** prompts for owners + the guest ceiling after a
+  multi-user channel is configured.
+- **`manage_permissions`** owner-only tool + bundled `owner-permissions` skill —
+  owners can set ownership and the guest ceiling by asking the bot in chat.
+
+### Security
+
+- `manage_permissions` is hard-gated: `GuestGate::OWNER_ONLY_TOOLS` always denies
+  it (and `delegate`/`ssh`/`pty`) for non-owners, regardless of the guest
+  allowlist; refuses to remove the last owner from chat; serializes its writes.
+- Guest shell commands reject all `$` (command substitution, `$VAR` env
+  exfiltration, `$'…'` ANSI-C injection) and chaining/redirect/subshell/tab
+  metacharacters before glob matching.
+
 ## [0.6.74-alpha] — 2026-06-14
 
 Unified agent runtime: the TUI, CLI, channels, and gateway/console now share

@@ -208,7 +208,12 @@ impl StaticMemoryLoader {
 
 #[async_trait]
 impl MemoryLoader for StaticMemoryLoader {
-    async fn load_context(&self, _memory: &dyn Memory, _user_message: &str) -> Result<String> {
+    async fn load_context(
+        &self,
+        _memory: &dyn Memory,
+        _user_message: &str,
+        _conversation_id: Option<&str>,
+    ) -> Result<String> {
         Ok(self.context.clone())
     }
 }

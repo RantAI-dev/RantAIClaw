@@ -2560,6 +2560,26 @@ pub struct ChannelsConfig {
     /// `autonomous_tools = true` (which skips the approval gate entirely).
     #[serde(default)]
     pub approval_owners: Vec<String>,
+    /// Tools a **normal user** (allowed to chat but NOT in `approval_owners`)
+    /// may have the agent use on their behalf. Owners always get the full
+    /// toolset; this is the capability ceiling for everyone else.
+    ///
+    /// Empty (default) ⇒ guests get only the always-safe set (read-only file +
+    /// memory tools) and skills — no privileged tools. List specific tool names
+    /// (e.g. `"shell"`, `"web_search"`) to widen what guests may use. Read-only
+    /// tools and skills are always available regardless of this list.
+    #[serde(default)]
+    pub guest_allowed_tools: Vec<String>,
+    /// Shell-command glob patterns a **normal user** may have the agent run
+    /// (only relevant when `"shell"` is in `guest_allowed_tools`). Same glob
+    /// matcher as the autonomy command allowlist. Acts as a HARD ceiling for
+    /// guests: a command that doesn't match is denied outright (never escalated
+    /// to an owner). Owners are unaffected.
+    ///
+    /// Example: `["kubectl get *", "kubectl describe *", "ls *"]`. Empty
+    /// (default) ⇒ guests may run no shell commands even if `shell` is allowed.
+    #[serde(default)]
+    pub guest_allowed_commands: Vec<String>,
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
@@ -2589,6 +2609,8 @@ impl Default for ChannelsConfig {
             message_timeout_secs: default_channel_message_timeout_secs(),
             autonomous_tools: false,
             approval_owners: Vec::new(),
+            guest_allowed_tools: Vec::new(),
+            guest_allowed_commands: Vec::new(),
         }
     }
 }
@@ -4354,6 +4376,8 @@ default_temperature = 0.7
                 message_timeout_secs: 300,
                 autonomous_tools: false,
                 approval_owners: Vec::new(),
+                guest_allowed_tools: Vec::new(),
+                guest_allowed_commands: Vec::new(),
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -4908,6 +4932,8 @@ allowed_users = ["@ops:matrix.org"]
             message_timeout_secs: 300,
             autonomous_tools: false,
             approval_owners: Vec::new(),
+            guest_allowed_tools: Vec::new(),
+            guest_allowed_commands: Vec::new(),
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -5120,6 +5146,8 @@ channel_id = "C123"
             message_timeout_secs: 300,
             autonomous_tools: false,
             approval_owners: Vec::new(),
+            guest_allowed_tools: Vec::new(),
+            guest_allowed_commands: Vec::new(),
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

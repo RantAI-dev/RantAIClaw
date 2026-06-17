@@ -34,6 +34,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod manage_permissions;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -270,6 +271,10 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
+        // Owner-only: manage channel owners + the non-owner capability ceiling
+        // from chat. The per-turn GuestGate hard-denies it for non-owners
+        // (see GuestGate::OWNER_ONLY_TOOLS), so only owner/operator turns reach it.
+        Arc::new(crate::tools::manage_permissions::ManagePermissionsTool::new(config.clone())),
         Arc::new(GitOperationsTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),

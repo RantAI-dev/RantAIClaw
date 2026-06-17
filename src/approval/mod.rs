@@ -3,7 +3,11 @@
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
 
+pub mod guest;
+pub mod permissions;
 pub mod policy_writer;
+
+pub use guest::GuestGate;
 
 use crate::config::AutonomyConfig;
 use crate::security::AutonomyLevel;

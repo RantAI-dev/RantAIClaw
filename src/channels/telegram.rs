@@ -365,9 +365,7 @@ impl TelegramChannel {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
                 println!("  🔐 Telegram pairing required. One-time code: {code}");
-                println!(
-                    "     DM the bot `{TELEGRAM_BIND_COMMAND} {code}` to let yourself chat,"
-                );
+                println!("     DM the bot `{TELEGRAM_BIND_COMMAND} {code}` to let yourself chat,");
                 println!(
                     "     or `{TELEGRAM_CLAIM_COMMAND} {code}` to also become an approval owner (can /approve tools)."
                 );

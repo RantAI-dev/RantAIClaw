@@ -63,19 +63,27 @@ pub const STARTER_PACK: &[StarterPackSkill] = &[
     },
 ];
 
-/// Idempotently install the five-skill starter pack into the profile's
-/// `skills/` directory. Returns the slugs that were newly created (i.e.
-/// the ones whose directory did not exist beforehand).
-///
-/// Existing skill directories are left untouched — this function never
-/// overwrites user edits.
-pub fn install_starter_pack(profile: &Profile) -> Result<Vec<String>> {
+/// Core skills installed for **every** profile regardless of the optional
+/// starter-pack choice. These cover built-in administration the owner is
+/// expected to be able to drive from chat — currently just the owner-only
+/// permissions setup skill, which pairs with the `manage_permissions` tool.
+pub const CORE_PACK: &[StarterPackSkill] = &[StarterPackSkill {
+    slug: "owner-permissions",
+    display_name: "Owner Permissions Setup",
+    summary: "Owner-only: manage owners + the non-owner capability ceiling from chat.",
+    skill_md: include_str!("owner_permissions/SKILL.md"),
+}];
+
+/// Idempotently install a set of bundled skills into the profile's `skills/`
+/// directory. Returns the slugs that were newly created (dirs that did not
+/// exist). Never overwrites an existing skill directory (preserves user edits).
+fn install_pack(profile: &Profile, pack: &[StarterPackSkill]) -> Result<Vec<String>> {
     let skills_root = profile.skills_dir();
     fs::create_dir_all(&skills_root)
         .with_context(|| format!("create skills dir {}", skills_root.display()))?;
 
     let mut installed = Vec::new();
-    for skill in STARTER_PACK {
+    for skill in pack {
         let dir = skills_root.join(skill.slug);
         if dir.exists() {
             continue;
@@ -87,6 +95,23 @@ pub fn install_starter_pack(profile: &Profile) -> Result<Vec<String>> {
         installed.push(skill.slug.to_string());
     }
     Ok(installed)
+}
+
+/// Idempotently install the five-skill starter pack into the profile's
+/// `skills/` directory. Returns the slugs that were newly created (i.e.
+/// the ones whose directory did not exist beforehand).
+///
+/// Existing skill directories are left untouched — this function never
+/// overwrites user edits.
+pub fn install_starter_pack(profile: &Profile) -> Result<Vec<String>> {
+    install_pack(profile, STARTER_PACK)
+}
+
+/// Idempotently install the always-on [`CORE_PACK`] skills. Call this on any
+/// setup path that should guarantee the owner can self-serve administration
+/// from chat (fresh onboarding, channel configuration).
+pub fn install_core_skills(profile: &Profile) -> Result<Vec<String>> {
+    install_pack(profile, CORE_PACK)
 }
 
 /// Look up a starter-pack entry by slug. Used by the wizard to render

@@ -905,6 +905,9 @@ impl Agent {
             self.approval_manager.as_deref(),
             "cli",
             self.approval_backend.as_deref(),
+            // No guest gate on the interactive/console agent — the local or
+            // authenticated user is the owner.
+            None,
             &crate::config::MultimodalConfig::default(),
             self.config.max_tool_iterations,
             cancel.cloned(),

@@ -38,14 +38,15 @@ impl SetupSection for ChannelsSection {
         }
         ctx.config.channels_config = wizard::setup_channels()?;
         // Unified approval model: a configured channel lets people CHAT, but
-        // nobody can APPROVE a gated tool call until an owner is set. If a
-        // channel was configured and no owner exists yet, walk the user through
-        // claiming ownership from chat so approval-required tools don't all
-        // silently auto-deny.
-        if any_channel_set(&ctx.config.channels_config)
-            && ctx.config.channels_config.approval_owners.is_empty()
-        {
-            print_owner_claim_guidance();
+        // nobody can APPROVE a gated tool call until an owner is set. Owners get
+        // the full toolset; everyone else is a "guest" under a capability
+        // ceiling. If a multi-user channel was configured, offer to set both
+        // now (and fall back to /claim guidance if no owner ends up set).
+        if any_channel_set(&ctx.config.channels_config) {
+            prompt_owners_and_guest_ceiling(ctx)?;
+            if ctx.config.channels_config.approval_owners.is_empty() {
+                print_owner_claim_guidance();
+            }
         }
         Ok(())
     }
@@ -56,6 +57,120 @@ impl SetupSection for ChannelsSection {
          #   [channels_config] approval_owners = [\"<your telegram id/username>\"]\n\
          #   (or DM the bot `/claim <code>` once it's running in pairing mode)"
     }
+}
+
+/// Interactively set channel owners and the non-owner ("guest") capability
+/// ceiling, mutating `ctx.config.channels_config` in place via the shared
+/// [`crate::approval::permissions`] editor (so the wizard, the CLI, and the
+/// chat tool stay consistent). All prompts are optional and default to "no" —
+/// declining leaves the secure defaults (no owner ⇒ owner-claim guidance is
+/// printed by the caller; empty guest lists ⇒ guests get only read-only tools).
+fn prompt_owners_and_guest_ceiling(ctx: &mut SetupContext) -> Result<()> {
+    use crate::approval::permissions::{apply, Op, Target};
+    use dialoguer::{theme::ColorfulTheme, Confirm, Input};
+
+    let theme = ColorfulTheme::default();
+
+    eprintln!();
+    eprintln!("🔐 Owners get the FULL toolset on every channel and may approve tool calls.");
+    eprintln!("   Everyone else who can chat is a \"guest\" under a capability ceiling you set.");
+
+    // ── Owners ──────────────────────────────────────────────────
+    let set_owner_now = Confirm::with_theme(&theme)
+        .with_prompt("Add an approval owner now? (you can also DM the bot `/claim <code>` later)")
+        .default(true)
+        .interact()?;
+    if set_owner_now {
+        eprintln!(
+            "   Enter the owner's account identity for your channel — e.g. a Telegram\n   \
+             numeric user id, or a Slack/Discord/Matrix username. Blank line to finish."
+        );
+        loop {
+            let entry: String = Input::with_theme(&theme)
+                .with_prompt("  Owner identity (blank to finish)")
+                .allow_empty(true)
+                .interact_text()?;
+            let entry = entry.trim().to_string();
+            if entry.is_empty() {
+                break;
+            }
+            let outcome = apply(
+                &mut ctx.config.channels_config,
+                Target::Owner,
+                Op::Add,
+                &entry,
+            );
+            eprintln!("   {}", outcome.message);
+        }
+    }
+
+    // ── Guest tool ceiling ──────────────────────────────────────
+    let set_guest_now = Confirm::with_theme(&theme)
+        .with_prompt("Configure what NON-owner users may do (guest ceiling)?")
+        .default(false)
+        .interact()?;
+    if set_guest_now {
+        eprintln!(
+            "   Guests always get skills + read-only tools. Add extra tool names to widen\n   \
+             that (comma-separated, e.g. `shell, web_search`). Blank to skip."
+        );
+        let tools: String = Input::with_theme(&theme)
+            .with_prompt("  Guest tools to allow")
+            .allow_empty(true)
+            .interact_text()?;
+        for t in tools.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let outcome = apply(
+                &mut ctx.config.channels_config,
+                Target::GuestTool,
+                Op::Add,
+                t,
+            );
+            eprintln!("   {}", outcome.message);
+        }
+
+        if ctx
+            .config
+            .channels_config
+            .guest_allowed_tools
+            .iter()
+            .any(|t| t == "shell")
+        {
+            eprintln!(
+                "   You allowed the `shell` tool for guests. Restrict it to specific commands\n   \
+                 (glob patterns, one per line, e.g. `kubectl get *`). Blank line to finish."
+            );
+            loop {
+                let cmd: String = Input::with_theme(&theme)
+                    .with_prompt("  Guest shell command glob (blank to finish)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                let cmd = cmd.trim().to_string();
+                if cmd.is_empty() {
+                    break;
+                }
+                let outcome = apply(
+                    &mut ctx.config.channels_config,
+                    Target::GuestCommand,
+                    Op::Add,
+                    &cmd,
+                );
+                eprintln!("   {}", outcome.message);
+            }
+        }
+    }
+
+    // Make sure the owner can ask the bot to manage this from chat: install the
+    // owner-permissions skill (idempotent) now that a multi-user channel exists,
+    // even if the skills section was skipped.
+    if let Err(e) = crate::skills::bundled::install_core_skills(ctx.profile) {
+        eprintln!("   (note: could not install owner-permissions skill: {e})");
+    }
+
+    eprintln!(
+        "   Tip: change any of this later with `rantaiclaw permissions ...`, the TUI\n   \
+         `/permissions` command, or by asking the bot in chat (owners only)."
+    );
+    Ok(())
 }
 
 /// Print guidance for designating an approval owner over a channel. The
