@@ -231,7 +231,7 @@ landlock = { version = "0.4" }
 libc = "0.2"
 
 [features]
-default = ["tui", "whatsapp-web", "remote-install"]
+default = ["tui", "whatsapp-web", "remote-install", "kb"]
 # Re-enables the pre-rig hand-rolled provider implementations for
 # Anthropic/OpenAI/Gemini. Default off — those providers route
 # through `RigProvider` (src/providers/rig_native.rs). Build with
