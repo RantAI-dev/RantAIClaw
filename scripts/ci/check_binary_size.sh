@@ -8,8 +8,8 @@
 #   label        Optional label for step summary (e.g. target triple)
 #
 # Thresholds:
-#   >30MB  — hard error (safeguard)
-#   >25MB  — warning (advisory)
+#   >35MB  — hard error (safeguard)
+#   >30MB  — warning (advisory)
 #   >5MB   — warning (target)
 #
 # Floor history:
@@ -20,6 +20,11 @@
 #             20→25. WhatsApp Web is the second-largest messaging
 #             platform globally; gating it behind a build flag broke
 #             the "complete but still light" thesis.
+#   v0.6.76 → kb (sqlite-vec vector store + lopdf/pdf-extract ingestion)
+#             moved into default features (+~5MB → ~31MB). Safeguard
+#             30→35, advisory 25→30. A knowledge base is core to the
+#             agent's usefulness out of the box; gating `rantaiclaw kb`
+#             behind a build flag meant shipped binaries had no KB at all.
 #
 # Release profile is already maximally tuned (opt-level=z, lto=fat,
 # strip=true, panic=abort, codegen-units=1). The 5MB target is kept
@@ -48,11 +53,11 @@ if [ -n "$LABEL" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   echo "- Size: ${SIZE_MB}MB ($SIZE bytes)" >> "$GITHUB_STEP_SUMMARY"
 fi
 
-if [ "$SIZE" -gt 31457280 ]; then
-  echo "::error::Binary exceeds 30MB safeguard (${SIZE_MB}MB)"
+if [ "$SIZE" -gt 36700160 ]; then
+  echo "::error::Binary exceeds 35MB safeguard (${SIZE_MB}MB)"
   exit 1
-elif [ "$SIZE" -gt 26214400 ]; then
-  echo "::warning::Binary exceeds 25MB advisory target (${SIZE_MB}MB)"
+elif [ "$SIZE" -gt 31457280 ]; then
+  echo "::warning::Binary exceeds 30MB advisory target (${SIZE_MB}MB)"
 elif [ "$SIZE" -gt 5242880 ]; then
   echo "::warning::Binary exceeds 5MB target (${SIZE_MB}MB)"
 else
