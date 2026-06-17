@@ -580,6 +580,14 @@ mod tests {
 
     #[async_trait]
     impl Provider for OneToolThenFinalProvider {
+        // This mock returns native structured `tool_calls`, so it must declare
+        // native-tool support — otherwise the loop picks the XML dispatcher and
+        // renders tool results as role=user, and the `role == "tool"` check below
+        // never fires (the loop would spin until the iteration cap).
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -615,10 +623,20 @@ mod tests {
         }
     }
 
-    struct InfiniteToolCallProvider;
+    /// Always asks for the same tool — would loop forever without the
+    /// iteration cap. Counts `chat` calls so a test can assert the loop is
+    /// bounded. Declares native-tool support to match its native `tool_calls`.
+    #[derive(Default)]
+    struct InfiniteToolCallProvider {
+        chat_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
 
     #[async_trait]
     impl Provider for InfiniteToolCallProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -635,6 +653,8 @@ mod tests {
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(ChatResponse {
                 text: None,
                 tool_calls: vec![ToolCall {
@@ -1061,18 +1081,24 @@ mod tests {
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
 
-        let provider = InfiniteToolCallProvider;
+        let provider = InfiniteToolCallProvider::default();
+        let chat_calls = Arc::clone(&provider.chat_calls);
         let result = tool
             .execute_agentic("agentic", &config, &provider, "run", 0.2)
             .await
             .unwrap();
 
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("maximum tool iterations (2)"));
+        // A provider that always asks for another tool would loop forever, but
+        // the loop caps at max_iterations (2) and then makes ONE final
+        // tools-disabled summary call — so exactly 3 provider chats, not ∞.
+        assert_eq!(
+            chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "loop must stop at the iteration cap (2 tool turns + 1 forced summary)"
+        );
+        // The cap now yields a forced summary (success), not a hard error — the
+        // model can't extend the turn, but the user still gets a response.
+        assert!(result.success);
     }
 
     #[tokio::test]
