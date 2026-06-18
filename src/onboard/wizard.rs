@@ -763,16 +763,16 @@ fn default_model_for_provider(provider: &str) -> String {
         "venice" => "zai-org-glm-5.1".into(),
         "groq" => "llama-spark".into(),
         "mistral" => "mistral-large-latest".into(),
-        "deepseek" => "deepseek-chat".into(),
+        "deepseek" => "deepseek-v4-pro".into(),
         "xai" => "grok-4-1-fast-reasoning".into(),
         "perplexity" => "sonar-pro".into(),
         "fireworks" => "accounts/fireworks/models/llama-spark".into(),
         "together-ai" => "meta-llama/Llama-Spark".into(),
         "cohere" => "command-a-03-2025".into(),
         "moonshot" => "kimi-k2.6".into(),
-        "glm" | "zai" => "glm-5.1".into(),
+        "glm" | "zai" => "glm-5.2".into(),
         "minimax" => "MiniMax-M3".into(),
-        "qwen" => "qwen3.6-plus".into(),
+        "qwen" => "qwen3.7-plus".into(),
         "qwen-code" => "qwen3.6-coder-plus".into(),
         "ollama" => "llama-spark".into(),
         "llamacpp" => "ggml-org/llama-spark-GGUF".into(),
@@ -842,8 +842,12 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
                 "Claude Sonnet 4.6 (balanced, recommended)".to_string(),
             ),
             (
+                "claude-opus-4-8".to_string(),
+                "Claude Opus 4.8 (best quality)".to_string(),
+            ),
+            (
                 "claude-opus-4-7".to_string(),
-                "Claude Opus 4.7 (best quality)".to_string(),
+                "Claude Opus 4.7 (previous flagship)".to_string(),
             ),
             (
                 "claude-haiku-4-5-20251001".to_string(),
@@ -967,6 +971,14 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "deepseek" => vec![
             (
+                "deepseek-v4-pro".to_string(),
+                "DeepSeek V4 Pro (latest flagship, recommended)".to_string(),
+            ),
+            (
+                "deepseek-v4-flash".to_string(),
+                "DeepSeek V4 Flash (fast, cost-efficient)".to_string(),
+            ),
+            (
                 "deepseek-chat".to_string(),
                 "DeepSeek Chat (mapped to V3.2 non-thinking)".to_string(),
             ),
@@ -1063,8 +1075,12 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "moonshot" => vec![
             (
+                "kimi-k2.7-code".to_string(),
+                "Kimi K2.7 Code (latest, agentic coding)".to_string(),
+            ),
+            (
                 "kimi-k2.6".to_string(),
-                "Kimi K2.6 (latest flagship, recommended)".to_string(),
+                "Kimi K2.6 (flagship, recommended)".to_string(),
             ),
             (
                 "kimi-k2.5".to_string(),
@@ -1081,10 +1097,14 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "glm" | "zai" => vec![
             (
-                "glm-5.1".to_string(),
-                "GLM-5.1 (latest flagship, recommended)".to_string(),
+                "glm-5.2".to_string(),
+                "GLM-5.2 (latest flagship, recommended)".to_string(),
             ),
-            ("glm-5".to_string(), "GLM-5 (previous flagship)".to_string()),
+            (
+                "glm-5.1".to_string(),
+                "GLM-5.1 (previous flagship)".to_string(),
+            ),
+            ("glm-5".to_string(), "GLM-5 (stable)".to_string()),
             (
                 "glm-4.7".to_string(),
                 "GLM-4.7 (strong general-purpose, stable)".to_string(),
@@ -1118,21 +1138,24 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "qwen" => vec![
             (
+                "qwen3.7-max".to_string(),
+                "Qwen 3.7 Max (latest flagship, highest quality)".to_string(),
+            ),
+            (
+                "qwen3.7-plus".to_string(),
+                "Qwen 3.7 Plus (balanced default)".to_string(),
+            ),
+            (
                 "qwen3.6-max".to_string(),
-                "Qwen 3.6 Max (latest flagship, highest quality)".to_string(),
+                "Qwen 3.6 Max (previous flagship)".to_string(),
             ),
             (
                 "qwen3.6-plus".to_string(),
-                "Qwen 3.6 Plus (balanced default)".to_string(),
+                "Qwen 3.6 Plus (balanced)".to_string(),
             ),
             (
                 "qwen3.6-turbo".to_string(),
                 "Qwen 3.6 Turbo (fast, cost-efficient)".to_string(),
-            ),
-            ("qwen-max".to_string(), "Qwen Max (legacy 3.5)".to_string()),
-            (
-                "qwen-plus".to_string(),
-                "Qwen Plus (legacy 3.5)".to_string(),
             ),
         ],
         "qwen-code" => vec![
@@ -5942,15 +5965,15 @@ mod tests {
         assert_eq!(default_model_for_provider("openai"), "gpt-5.5");
         assert_eq!(default_model_for_provider("openai-codex"), "gpt-5.5-codex");
         assert_eq!(default_model_for_provider("anthropic"), "claude-sonnet-4-6");
-        assert_eq!(default_model_for_provider("qwen"), "qwen3.6-plus");
-        assert_eq!(default_model_for_provider("qwen-intl"), "qwen3.6-plus");
+        assert_eq!(default_model_for_provider("qwen"), "qwen3.7-plus");
+        assert_eq!(default_model_for_provider("qwen-intl"), "qwen3.7-plus");
         assert_eq!(
             default_model_for_provider("qwen-code"),
             "qwen3.6-coder-plus"
         );
-        assert_eq!(default_model_for_provider("glm-cn"), "glm-5.1");
+        assert_eq!(default_model_for_provider("glm-cn"), "glm-5.2");
         assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M3");
-        assert_eq!(default_model_for_provider("zai-cn"), "glm-5.1");
+        assert_eq!(default_model_for_provider("zai-cn"), "glm-5.2");
         assert_eq!(default_model_for_provider("gemini"), "gemini-3-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-3-pro");
         assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
