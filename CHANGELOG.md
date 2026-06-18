@@ -5,6 +5,25 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.79-alpha] — 2026-06-18
+
+### Added
+
+New flagship models across providers added to the curated catalog (setup wizard,
+`/model` picker, provisioner). Model IDs were sourced from the `rig-core` model
+constants where available and cross-checked against provider docs otherwise; the
+providers below have no credentials in this environment, so IDs could not be
+live-API-tested (unlike MiniMax-M3 in 0.6.78):
+
+- **Anthropic**: `claude-opus-4-8` (rig-verified). Default stays `claude-sonnet-4-6`.
+- **DeepSeek**: `deepseek-v4-pro` (new default) + `deepseek-v4-flash` (rig-verified).
+- **Qwen**: `qwen3.7-max` + `qwen3.7-plus` (new default).
+- **GLM / Z.ai**: `glm-5.2` (new default).
+- **Moonshot**: `kimi-k2.7-code`. Default stays `kimi-k2.6`.
+
+OpenAI (gpt-5.5), xAI (grok-4.1), Mistral, and Cohere were already current. GPT-5.6
+(unreleased) and Claude Fable 5 (suspended) were intentionally excluded.
+
 ## [0.6.78-alpha] — 2026-06-18
 
 ### Added
