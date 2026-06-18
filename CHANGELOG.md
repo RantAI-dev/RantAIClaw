@@ -5,6 +5,20 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.80-alpha] — 2026-06-18
+
+### Fixed
+
+- **OpenAI: removed phantom model ids that 404'd.** The catalog pointed the
+  `openai-codex` provider default at `gpt-5.5-codex` and listed `gpt-5.5-codex`
+  and a bare `gpt-5.3` under `openai` — none of which exist on the OpenAI API
+  (verified against `/v1/models` with a live key). Replaced with real ids:
+  `gpt-5.3-codex` (newest codex that actually exists) is now the `openai-codex`
+  default and recommended entry, and `gpt-5.4` replaces the bogus entries in the
+  `openai` list. Added regression tests asserting the phantom ids never reappear.
+  (The phantom `gpt-5.5-codex` predated the recent model refreshes — it was
+  introduced in #45.)
+
 ## [0.6.79-alpha] — 2026-06-18
 
 ### Added
