@@ -771,7 +771,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "cohere" => "command-a-03-2025".into(),
         "moonshot" => "kimi-k2.6".into(),
         "glm" | "zai" => "glm-5.1".into(),
-        "minimax" => "MiniMax-M2.7".into(),
+        "minimax" => "MiniMax-M3".into(),
         "qwen" => "qwen3.6-plus".into(),
         "qwen-code" => "qwen3.6-coder-plus".into(),
         "ollama" => "llama-spark".into(),
@@ -1096,8 +1096,12 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "minimax" => vec![
             (
+                "MiniMax-M3".to_string(),
+                "MiniMax M3 (latest flagship, recommended)".to_string(),
+            ),
+            (
                 "MiniMax-M2.7".to_string(),
-                "MiniMax M2.7 (latest flagship, recommended)".to_string(),
+                "MiniMax M2.7 (previous flagship)".to_string(),
             ),
             (
                 "MiniMax-M2.7-highspeed".to_string(),
@@ -1105,7 +1109,7 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
             ),
             (
                 "MiniMax-M2.5".to_string(),
-                "MiniMax M2.5 (previous flagship)".to_string(),
+                "MiniMax M2.5 (stable)".to_string(),
             ),
             (
                 "MiniMax-M2.1".to_string(),
@@ -5945,7 +5949,7 @@ mod tests {
             "qwen3.6-coder-plus"
         );
         assert_eq!(default_model_for_provider("glm-cn"), "glm-5.1");
-        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.7");
+        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M3");
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5.1");
         assert_eq!(default_model_for_provider("gemini"), "gemini-3-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-3-pro");
