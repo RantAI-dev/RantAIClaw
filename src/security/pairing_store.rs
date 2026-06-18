@@ -245,6 +245,23 @@ pub fn prune(profile_root: &Path, now: i64) -> Result<()> {
     save(profile_root, &store)
 }
 
+/// Non-consuming probe: does a live, surface-scoped code matching `code` exist?
+///
+/// Unlike [`try_consume`] this does not increment `uses` or persist, so callers
+/// that must first decide *whether* the store owns a code (e.g. a channel with a
+/// legacy in-memory pairing path to fall back to) can check without burning a
+/// claim. Returns `Ok(false)` on a missing store.
+pub fn contains(profile_root: &Path, surface: &str, code: &str, now: i64) -> Result<bool> {
+    let _guard = lock(profile_root)?;
+    let store = load(profile_root);
+    let target = hash(code);
+    Ok(store.codes.iter().any(|entry| {
+        entry.surface == surface
+            && entry.is_live(now)
+            && constant_time_eq(&entry.code_hash, &target)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +333,32 @@ mod tests {
         let p = dir.path();
         let code = mint(p, "telegram", 900, None, true, 1_000).unwrap();
         assert!(try_consume(p, "slack", &code, 1_100).unwrap().is_none());
+    }
+
+    #[test]
+    fn contains_probes_without_consuming() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let code = mint(p, "telegram", 900, Some(1), true, 1_000).unwrap();
+
+        // Live, matching, right surface → true. Probing twice does not burn the
+        // single allowed use (a real `try_consume` would still succeed after).
+        assert!(contains(p, "telegram", &code, 1_100).unwrap());
+        assert!(contains(p, "telegram", &code, 1_100).unwrap());
+
+        // Wrong surface / wrong code / expired → false.
+        assert!(!contains(p, "slack", &code, 1_100).unwrap());
+        assert!(!contains(p, "telegram", "ZZZZ-ZZZZ", 1_100).unwrap());
+        assert!(!contains(p, "telegram", &code, 2_000).unwrap());
+
+        // The probe didn't consume the single use.
+        assert!(try_consume(p, "telegram", &code, 1_100).unwrap().is_some());
+    }
+
+    #[test]
+    fn contains_false_on_missing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!contains(dir.path(), "telegram", "ABCD-EFGH", 1_000).unwrap());
     }
 
     #[test]

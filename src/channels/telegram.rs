@@ -677,6 +677,125 @@ impl TelegramChannel {
         identities.into_iter().any(|id| self.is_user_allowed(id))
     }
 
+    /// Extract `(text, chat_id, identities)` from an inbound update for the
+    /// shared pairing path. `identities` is `[numeric_id, username]` (each
+    /// included only when present and non-empty) — the same forms the legacy
+    /// bind/claim path persists, so `can_approve` resolves either. Returns
+    /// `None` when the update has no text message or no chat id.
+    fn extract_pairing_context(
+        update: &serde_json::Value,
+    ) -> Option<(String, String, Vec<String>)> {
+        let message = update.get("message")?;
+        let text = message.get("text").and_then(serde_json::Value::as_str)?;
+        let chat_id = message
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+
+        let from = message.get("from");
+        let mut identities: Vec<String> = Vec::new();
+        if let Some(id) = from
+            .and_then(|f| f.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            identities.push(id.to_string());
+        }
+        if let Some(username) = from
+            .and_then(|f| f.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .map(Self::normalize_identity)
+            .filter(|u| !u.is_empty() && u != "unknown")
+        {
+            identities.push(username);
+        }
+
+        Some((text.to_string(), chat_id, identities))
+    }
+
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("Telegram pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Shared-store fallback for a `/bind`/`/claim` whose code the in-memory
+    /// [`PairingGuard`] did not recognize.
+    ///
+    /// Operators mint on-demand codes (`rantaiclaw channels pair`) into the
+    /// shared [`crate::security::pairing_store`] without restarting the daemon.
+    /// This consults that store via the shared
+    /// [`crate::channels::pairing::try_handle_pairing`] core (which appends the
+    /// sender to `allowed_users` and, for an owner-capable `/claim`, to
+    /// `approval_owners`, then persists `config.toml`). It only *consumes* a
+    /// store code when one actually matches (probed first via
+    /// [`crate::security::pairing_store::contains`]), so a non-matching code
+    /// falls through to the legacy in-memory PairingGuard path and the startup
+    /// code keeps working.
+    ///
+    /// `identities` must be the sender's persisted forms — `[numeric_id,
+    /// username]` (both when present) — matching what the legacy path stores.
+    /// Returns `true` if the store owned and handled the command (the caller
+    /// must then NOT send its own reply or forward the message).
+    async fn try_handle_store_pairing(
+        &self,
+        text: &str,
+        chat_id: &str,
+        identities: &[String],
+    ) -> bool {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let Some(cmd) = parse_pairing_command(text) else {
+            return false;
+        };
+        let Some(root) = Self::pairing_profile_root() else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Only take ownership of the command when the store actually has a live
+        // matching code; otherwise let the legacy in-memory path handle it.
+        match pairing_store::contains(&root, "telegram", &cmd.code, now) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                tracing::warn!("Telegram pairing store probe failed: {e:#}");
+                return false;
+            }
+        }
+
+        let Some(reply) = try_handle_pairing(
+            text,
+            "telegram",
+            AllowlistField::AllowedUsers,
+            identities,
+            &root,
+        )
+        .await
+        else {
+            // Shouldn't happen (we only get here for a parsed command), but be safe.
+            return false;
+        };
+
+        // Mirror the new identities into the runtime allowlist so the change
+        // takes effect immediately without a restart (config is already saved).
+        for id in identities {
+            self.add_allowed_identity_runtime(id);
+        }
+
+        let _ = self.send(&SendMessage::new(reply, chat_id)).await;
+        true
+    }
+
     /// Handle a `/claim <code>` owner-claim. Returns `true` if the update was a
     /// claim attempt (handled here — must NOT be forwarded to the agent).
     ///
@@ -2065,6 +2184,22 @@ Ensure only one `rantaiclaw` process is using this bot token."
                         offset = uid + 1;
                     }
 
+                    // Intercept on-demand store-minted pairing codes first
+                    // (`rantaiclaw channels pair`) for both `/bind` and `/claim`
+                    // — accepted without a daemon restart. Only consumes the
+                    // update when the store actually owns the code; otherwise it
+                    // falls through to the legacy in-memory PairingGuard path
+                    // below so the startup code keeps working.
+                    if let Some((text, chat_id, identities)) = Self::extract_pairing_context(update)
+                    {
+                        if self
+                            .try_handle_store_pairing(&text, &chat_id, &identities)
+                            .await
+                        {
+                            continue;
+                        }
+                    }
+
                     // Intercept `/claim <code>` (owner pairing) before routing —
                     // handled regardless of allowlist status, never forwarded.
                     if self.try_handle_claim(update).await {
@@ -2166,6 +2301,112 @@ Ensure only one `rantaiclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── shared-store pairing (Task 4) ────────────────────────
+
+    /// `extract_pairing_context` pulls `[numeric_id, username]` (both forms)
+    /// plus the text and chat id from a representative Telegram update.
+    #[test]
+    fn extract_pairing_context_collects_both_identity_forms() {
+        let update = serde_json::json!({
+            "message": {
+                "text": "/claim ABCD-EFGH",
+                "chat": { "id": 4242 },
+                "from": { "id": 999, "username": "carol" }
+            }
+        });
+        let (text, chat_id, identities) =
+            TelegramChannel::extract_pairing_context(&update).expect("should extract");
+        assert_eq!(text, "/claim ABCD-EFGH");
+        assert_eq!(chat_id, "4242");
+        assert_eq!(identities, vec!["999".to_string(), "carol".to_string()]);
+    }
+
+    /// A `/bind` with no live store code falls through (returns false) so the
+    /// legacy in-memory PairingGuard path still owns the startup code. This also
+    /// exercises that no network reply is sent on the fall-through.
+    #[tokio::test]
+    async fn store_pairing_falls_through_when_no_store_code() {
+        let ch = TelegramChannel::new("t".into(), vec![], false);
+        let handled = ch
+            .try_handle_store_pairing("/bind ABCD-EFGH", "123", &["999".to_string()])
+            .await;
+        assert!(
+            !handled,
+            "no store code => must fall through to legacy path"
+        );
+    }
+
+    // Serialize the env-mutating Config::load_or_init test against itself.
+    static PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A store-minted "telegram" code (the kind `rantaiclaw channels pair`
+    /// issues) is accepted on `/claim`: the shared core lands the sender in
+    /// `allowed_users` AND `approval_owners`. Drives the same code path
+    /// `try_handle_store_pairing` invokes after its `contains` gate, without the
+    /// network `send`.
+    #[tokio::test]
+    async fn store_minted_telegram_code_claims_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let _guard = PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        // Seed a config with a telegram section so apply_pairing has a target.
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.telegram = Some(crate::config::TelegramConfig {
+                bot_token: "x".into(),
+                allowed_users: vec![],
+                stream_mode: crate::config::StreamMode::Off,
+                draft_update_interval_ms: 500,
+                interrupt_on_new_message: false,
+                mention_only: false,
+            });
+            seed.save().await.unwrap();
+        }
+
+        // Mint an owner-capable "telegram" code into the same profile root.
+        // `try_handle_pairing` consumes against the real wall clock, so mint at
+        // real `now` with a generous TTL and probe the gate the same way.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "telegram", 3_600, None, true, now).unwrap();
+        assert!(pairing_store::contains(root, "telegram", &code, now + 1).unwrap());
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "telegram",
+            AllowlistField::AllowedUsers,
+            &["999".to_string(), "carol".to_string()],
+            root,
+        )
+        .await
+        .expect("a /claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let users = &config
+            .channels_config
+            .telegram
+            .as_ref()
+            .unwrap()
+            .allowed_users;
+        assert!(users.contains(&"999".to_string()), "users: {users:?}");
+        assert!(users.contains(&"carol".to_string()), "users: {users:?}");
+        let owners = &config.channels_config.approval_owners;
+        assert!(owners.contains(&"999".to_string()), "owners: {owners:?}");
+        assert!(owners.contains(&"carol".to_string()), "owners: {owners:?}");
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    }
 
     #[test]
     fn telegram_channel_name() {
