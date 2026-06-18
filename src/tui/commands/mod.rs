@@ -8,6 +8,7 @@ mod cron;
 mod mcp;
 mod memory;
 mod model;
+mod pairing;
 mod permissions;
 mod session;
 pub mod setup;
@@ -154,6 +155,7 @@ impl CommandRegistry {
         self.register(Box::new(allowlist::AllowlistCommand));
         self.register(Box::new(autonomy::AutonomyCommand));
         self.register(Box::new(permissions::PermissionsCommand));
+        self.register(Box::new(pairing::PairCommand));
         self.register(Box::new(calls::CallsCommand));
         self.register(Box::new(mcp::McpCommand));
     }
