@@ -18,6 +18,8 @@ Typical requests:
 
 - name: manage_permissions
   kind: builtin
+- name: issue_pairing_code
+  kind: builtin
 
 ## Background: the per-role model
 
@@ -38,6 +40,33 @@ There are two roles on every multi-user channel:
 - `target: command` — a shell-command glob a guest may run (e.g.
   `kubectl get *`). `*` matches any run of characters; the pattern is anchored,
   so `kubectl get *` allows `kubectl get pods` but not `kubectl delete pods`.
+
+## Issuing invite codes
+
+Instead of asking for someone's identity up front, an owner can hand out a
+**pairing code** and let the new user onboard themselves. When an owner asks
+something like "give me an invite code for Telegram" or "make a single-use
+WhatsApp code that expires in 5 minutes", call `issue_pairing_code`:
+
+- `channel` (required) — the surface, e.g. `telegram`, `whatsapp`, `discord`,
+  `slack`, or `gateway`. A code minted for one channel cannot be claimed on
+  another.
+- `ttl_minutes` (default 15) — how long the code stays valid.
+- `max_uses` (optional) — bound the number of claims; omit for unlimited within
+  the window.
+- `owner` (default true) — whether the code may promote its recipient to owner.
+  Set it to false for a chat-only invite.
+
+Forward the returned code to the recipient. They DM the bot:
+- `/claim <code>` — become an **owner** (only if the code grants owner), or
+- `/bind <code>`  — become an allowed **chat** user.
+
+This is owner-only and authority-granting (an owner-capable code can promote its
+recipient), so it is hard-gated exactly like `manage_permissions` — a non-owner
+can never call it. Prefer the narrowest code that does the job: a short TTL,
+`max_uses: 1` for a single person, and `owner: false` unless they truly want to
+hand over ownership. No daemon restart is needed — a running channel validates
+the code on the next `/claim`/`/bind` message.
 
 ## Instructions
 

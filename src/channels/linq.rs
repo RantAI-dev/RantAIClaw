@@ -1,5 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use parking_lot::RwLock;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Linq channel — uses the Linq Partner V3 API for iMessage, RCS, and SMS.
@@ -11,7 +13,10 @@ use uuid::Uuid;
 pub struct LinqChannel {
     api_token: String,
     from_phone: String,
-    allowed_senders: Vec<String>,
+    /// Allowed sender phone numbers (E.164). Wrapped so `/bind`/`/claim`
+    /// self-onboarding can append a newly-paired sender at runtime without a
+    /// daemon restart (mirrors the persisted config update).
+    allowed_senders: Arc<RwLock<Vec<String>>>,
     client: reqwest::Client,
 }
 
@@ -22,14 +27,94 @@ impl LinqChannel {
         Self {
             api_token,
             from_phone,
-            allowed_senders,
+            allowed_senders: Arc::new(RwLock::new(allowed_senders)),
             client: reqwest::Client::new(),
         }
     }
 
     /// Check if a sender phone number is allowed (E.164 format: +1234567890)
     fn is_sender_allowed(&self, phone: &str) -> bool {
-        self.allowed_senders.iter().any(|n| n == "*" || n == phone)
+        self.allowed_senders
+            .read()
+            .iter()
+            .any(|n| n == "*" || n == phone)
+    }
+
+    /// Append a newly-paired sender to the runtime allowlist (deduped). Used by
+    /// the shared `/bind`/`/claim` flow so the very next message from a paired
+    /// sender is accepted without restarting the gateway. Config persistence is
+    /// handled separately by the shared pairing core.
+    pub fn add_allowed_sender_runtime(&self, phone: &str) {
+        let phone = phone.trim();
+        if phone.is_empty() {
+            return;
+        }
+        let mut list = self.allowed_senders.write();
+        if !list.iter().any(|n| n == phone) {
+            list.push(phone.to_string());
+        }
+    }
+
+    /// Extract `(text, normalized_sender, reply_target)` from a raw inbound Linq
+    /// webhook payload for the shared `/bind`/`/claim` pairing path — *before*
+    /// the allowlist gate in [`Self::parse_webhook_payload`] drops unknown
+    /// senders. `normalized_sender` is the E.164 form used in the allowlist
+    /// check (same identity persisted on a successful pairing). Returns `None`
+    /// for non-message events, bot self-messages, or payloads with no text body.
+    pub fn extract_pairing_context(
+        payload: &serde_json::Value,
+    ) -> Option<(String, String, String)> {
+        if payload
+            .get("event_type")
+            .and_then(|e| e.as_str())
+            .unwrap_or("")
+            != "message.received"
+        {
+            return None;
+        }
+        let data = payload.get("data")?;
+        if data
+            .get("is_from_me")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let from = data.get("from").and_then(|f| f.as_str())?;
+        let normalized_from = if from.starts_with('+') {
+            from.to_string()
+        } else {
+            format!("+{from}")
+        };
+
+        let parts = data
+            .get("message")
+            .and_then(|m| m.get("parts"))
+            .and_then(|p| p.as_array())?;
+        let text = parts
+            .iter()
+            .filter_map(|part| {
+                if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    part.get("value").and_then(|v| v.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+
+        let chat_id = data.get("chat_id").and_then(|c| c.as_str()).unwrap_or("");
+        let reply_target = if chat_id.is_empty() {
+            normalized_from.clone()
+        } else {
+            chat_id.to_string()
+        };
+
+        Some((text.to_string(), normalized_from, reply_target))
     }
 
     /// Get the bot's phone number
@@ -793,5 +878,155 @@ mod tests {
     fn linq_phone_number_accessor() {
         let ch = make_channel();
         assert_eq!(ch.phone_number(), "+15551234567");
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Pairing (`/bind` / `/claim`) self-onboarding
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn linq_extract_pairing_context_normalizes_sender() {
+        // API sends `from` without a leading `+`; pairing identity must be the
+        // E.164 form used in the allowlist check.
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat_id": "chat-789",
+                "from": "1234567890",
+                "is_from_me": false,
+                "message": {
+                    "id": "msg-abc",
+                    "parts": [{ "type": "text", "value": "/bind ABCD-EFGH" }]
+                }
+            }
+        });
+        let (text, sender, reply_target) =
+            LinqChannel::extract_pairing_context(&payload).expect("should extract");
+        assert_eq!(text, "/bind ABCD-EFGH");
+        assert_eq!(sender, "+1234567890");
+        assert_eq!(reply_target, "chat-789");
+    }
+
+    #[test]
+    fn linq_extract_pairing_context_skips_self_and_non_message() {
+        // is_from_me must not be paired against.
+        let from_me = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "from": "+1234567890",
+                "is_from_me": true,
+                "message": { "parts": [{ "type": "text", "value": "/bind X" }] }
+            }
+        });
+        assert!(LinqChannel::extract_pairing_context(&from_me).is_none());
+
+        // Non-message events are ignored.
+        let delivered = serde_json::json!({
+            "event_type": "message.delivered",
+            "data": { "from": "+1234567890" }
+        });
+        assert!(LinqChannel::extract_pairing_context(&delivered).is_none());
+    }
+
+    #[test]
+    fn linq_extract_pairing_context_falls_back_to_sender_reply_target() {
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "from": "+1234567890",
+                "is_from_me": false,
+                "message": { "parts": [{ "type": "text", "value": "/claim WXYZ-1234" }] }
+            }
+        });
+        let (_, sender, reply_target) =
+            LinqChannel::extract_pairing_context(&payload).expect("should extract");
+        assert_eq!(reply_target, sender);
+    }
+
+    #[test]
+    fn linq_add_allowed_sender_runtime_accepts_paired_sender() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec![]);
+        assert!(!ch.is_sender_allowed("+1999999999"));
+        ch.add_allowed_sender_runtime("+1999999999");
+        assert!(ch.is_sender_allowed("+1999999999"));
+        // Dedupe: adding again keeps a single entry.
+        ch.add_allowed_sender_runtime("+1999999999");
+        assert_eq!(
+            ch.allowed_senders
+                .read()
+                .iter()
+                .filter(|n| n.as_str() == "+1999999999")
+                .count(),
+            1
+        );
+    }
+
+    /// Serialize the env-mutating `Config::load_or_init` test against itself.
+    static LINQ_PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A store-minted "linq" code (the kind `rantaiclaw channels pair --channel
+    /// linq` issues) is accepted on `/claim`: the shared core lands the sender in
+    /// `allowed_senders` AND `approval_owners`. Mirrors telegram's
+    /// `store_minted_telegram_code_claims_owner` against the linq surface/field.
+    #[tokio::test]
+    async fn store_minted_linq_code_claims_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let _guard = LINQ_PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        // Seed a config with a linq section so apply_pairing has a target.
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.linq = Some(crate::config::schema::LinqConfig {
+                api_token: "x".into(),
+                from_phone: "+15551234567".into(),
+                allowed_senders: vec![],
+                signing_secret: None,
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "linq", 3_600, None, true, now).unwrap();
+        assert!(pairing_store::contains(root, "linq", &code, now + 1).unwrap());
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "linq",
+            AllowlistField::AllowedSenders,
+            &["+1999999999".to_string()],
+            root,
+        )
+        .await
+        .expect("a /claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let senders = &config
+            .channels_config
+            .linq
+            .as_ref()
+            .unwrap()
+            .allowed_senders;
+        assert!(
+            senders.contains(&"+1999999999".to_string()),
+            "senders: {senders:?}"
+        );
+        let owners = &config.channels_config.approval_owners;
+        assert!(
+            owners.contains(&"+1999999999".to_string()),
+            "owners: {owners:?}"
+        );
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }

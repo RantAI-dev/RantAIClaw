@@ -28,6 +28,7 @@ pub mod firejail;
 #[cfg(target_os = "linux")]
 pub mod landlock;
 pub mod pairing;
+pub mod pairing_store;
 pub mod pending;
 pub mod policy;
 pub mod runtime_overlay;

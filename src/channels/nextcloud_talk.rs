@@ -29,6 +29,104 @@ impl NextcloudTalkChannel {
         self.allowed_users.iter().any(|u| u == "*" || u == actor_id)
     }
 
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("Nextcloud Talk pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Extract `(room_token, actor_id, content)` from a webhook payload for the
+    /// shared pairing path, *without* the allowlist gate (so an unenrolled actor's
+    /// `/bind`/`/claim` is still seen). Bot-originated and non-comment events are
+    /// skipped. Returns `None` when the payload has no actionable user text.
+    fn extract_pairing_context(payload: &serde_json::Value) -> Option<(String, String, String)> {
+        if let Some(event_type) = payload.get("type").and_then(|v| v.as_str()) {
+            if !event_type.eq_ignore_ascii_case("message") {
+                return None;
+            }
+        }
+        let message_obj = payload.get("message")?;
+
+        let room_token = payload
+            .get("object")
+            .and_then(|obj| obj.get("token"))
+            .and_then(|v| v.as_str())
+            .or_else(|| message_obj.get("token").and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|token| !token.is_empty())?;
+
+        let actor_type = message_obj
+            .get("actorType")
+            .and_then(|v| v.as_str())
+            .or_else(|| payload.get("actorType").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        if actor_type.eq_ignore_ascii_case("bots") {
+            return None;
+        }
+
+        let actor_id = message_obj
+            .get("actorId")
+            .and_then(|v| v.as_str())
+            .or_else(|| payload.get("actorId").and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|id| !id.is_empty())?;
+
+        let content = message_obj
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|content| !content.is_empty())?;
+
+        Some((
+            room_token.to_string(),
+            actor_id.to_string(),
+            content.to_string(),
+        ))
+    }
+
+    /// Self-onboarding hook: if the payload carries a `/bind`/`/claim` command,
+    /// validate it against the shared [`crate::security::pairing_store`] (appending
+    /// the actor id to `allowed_users` and, for an owner-capable `/claim`, to
+    /// `approval_owners`, then persisting `config.toml`) and reply in-room.
+    ///
+    /// Returns `true` when the payload WAS a pairing command (handled here — must
+    /// NOT be parsed/dispatched), `false` otherwise.
+    pub async fn try_handle_store_pairing(&self, payload: &serde_json::Value) -> bool {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+
+        let Some((room_token, actor_id, content)) = Self::extract_pairing_context(payload) else {
+            return false;
+        };
+        if parse_pairing_command(&content).is_none() {
+            return false;
+        }
+        let Some(root) = Self::pairing_profile_root() else {
+            return false;
+        };
+
+        let Some(reply) = try_handle_pairing(
+            &content,
+            "nextcloud_talk",
+            AllowlistField::AllowedUsers,
+            &[actor_id],
+            &root,
+        )
+        .await
+        else {
+            return false;
+        };
+
+        if let Err(e) = self.send_to_room(&room_token, &reply).await {
+            tracing::warn!("Nextcloud Talk pairing: failed to send reply: {e:#}");
+        }
+        true
+    }
+
     fn now_unix_secs() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -485,5 +583,86 @@ mod tests {
         assert!(verify_nextcloud_talk_signature(
             secret, random, body, &signature
         ));
+    }
+
+    /// The pairing context is extracted even for an actor not (yet) in the
+    /// allowlist, so an unenrolled user's `/bind`/`/claim` reaches the shared core.
+    #[test]
+    fn nextcloud_talk_extract_pairing_context_ignores_allowlist() {
+        let payload = serde_json::json!({
+            "type": "message",
+            "object": {"token": "room-token-123"},
+            "message": {
+                "actorType": "users",
+                "actorId": "user_not_allowed",
+                "message": "/bind ABCD-EFGH"
+            }
+        });
+        let (room, actor, content) =
+            NextcloudTalkChannel::extract_pairing_context(&payload).expect("should extract");
+        assert_eq!(room, "room-token-123");
+        assert_eq!(actor, "user_not_allowed");
+        assert_eq!(content, "/bind ABCD-EFGH");
+    }
+
+    /// A store-minted owner code consumed for the `nextcloud_talk` surface appends
+    /// the actor id to `allowed_users` and `approval_owners` and persists the
+    /// config — the shared-core path `try_handle_store_pairing` invokes before the
+    /// allowlist gate (the OCS reply send is exercised in integration, so we assert
+    /// the store + config mutation here).
+    #[tokio::test]
+    async fn nextcloud_talk_store_minted_claim_grants_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.nextcloud_talk = Some(crate::config::NextcloudTalkConfig {
+                base_url: "https://cloud.example.com".into(),
+                app_token: "tok".into(),
+                webhook_secret: None,
+                allowed_users: vec![],
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "nextcloud_talk", 900, None, true, now).unwrap();
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "nextcloud_talk",
+            AllowlistField::AllowedUsers,
+            &["actor_99".to_string()],
+            root,
+        )
+        .await
+        .expect("pairing command should be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let users = &config
+            .channels_config
+            .nextcloud_talk
+            .as_ref()
+            .unwrap()
+            .allowed_users;
+        assert!(users.contains(&"actor_99".to_string()));
+        assert!(config
+            .channels_config
+            .approval_owners
+            .contains(&"actor_99".to_string()));
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }

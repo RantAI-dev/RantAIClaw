@@ -170,6 +170,56 @@ impl MatrixChannel {
         allowed_users.iter().any(|u| u.eq_ignore_ascii_case(sender))
     }
 
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("Matrix pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Self-onboarding hook: if `body` is a `/bind`/`/claim` command, validate it
+    /// against the shared [`crate::security::pairing_store`] (appending the sender
+    /// to `allowed_users` and, for an owner-capable `/claim`, to `approval_owners`,
+    /// then persisting `config.toml`) and reply in-room. Matrix matches the
+    /// allowlist case-insensitively, so the sender `@user:server` is passed as-is.
+    ///
+    /// Returns `true` when the message WAS a pairing command (handled here — must
+    /// NOT be forwarded to the agent), `false` otherwise (normal message → gate).
+    async fn try_handle_store_pairing(room: &Room, sender: &str, body: &str) -> bool {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+
+        if parse_pairing_command(body).is_none() {
+            return false;
+        }
+        let Some(root) = Self::pairing_profile_root() else {
+            return false;
+        };
+
+        let Some(reply) = try_handle_pairing(
+            body,
+            "matrix",
+            AllowlistField::AllowedUsers,
+            &[sender.to_string()],
+            &root,
+        )
+        .await
+        else {
+            return false;
+        };
+
+        if let Err(e) = room
+            .send(RoomMessageEventContent::text_markdown(&reply))
+            .await
+        {
+            tracing::warn!("Matrix pairing: failed to send reply: {e:#}");
+        }
+        true
+    }
+
     fn is_supported_message_type(msgtype: &str) -> bool {
         matches!(msgtype, "m.text" | "m.notice")
     }
@@ -567,9 +617,6 @@ impl Channel for MatrixChannel {
                 }
 
                 let sender = event.sender.to_string();
-                if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
-                    return;
-                }
 
                 let body = match &event.content.msgtype {
                     MessageType::Text(content) => content.body.clone(),
@@ -578,6 +625,17 @@ impl Channel for MatrixChannel {
                 };
 
                 if !MatrixChannel::has_non_empty_body(&body) {
+                    return;
+                }
+
+                // Intercept on-demand store-minted `/bind`/`/claim` pairing codes
+                // before the allowlist gate so unenrolled users can self-onboard
+                // without a daemon restart. Consumes the message when handled.
+                if MatrixChannel::try_handle_store_pairing(&room, &sender, &body).await {
+                    return;
+                }
+
+                if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
                     return;
                 }
 
@@ -662,6 +720,69 @@ mod tests {
         assert_eq!(ch.access_token, "syt_test_token");
         assert_eq!(ch.room_id, "!room:matrix.org");
         assert_eq!(ch.allowed_users.len(), 1);
+    }
+
+    /// A store-minted owner code consumed for the `matrix` surface appends the
+    /// sender to `allowed_users` and `approval_owners` and persists the config —
+    /// the same shared-core path `try_handle_store_pairing` invokes before the
+    /// allowlist gate (the in-room reply send needs a live SDK Room, exercised in
+    /// integration, so we assert the store + config mutation here).
+    #[tokio::test]
+    async fn matrix_store_minted_claim_grants_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.matrix = Some(crate::config::MatrixConfig {
+                homeserver: "https://matrix.org".into(),
+                access_token: "tok".into(),
+                room_id: "!r:matrix.org".into(),
+                allowed_users: vec![],
+                user_id: None,
+                device_id: None,
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "matrix", 900, None, true, now).unwrap();
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "matrix",
+            AllowlistField::AllowedUsers,
+            &["@newuser:matrix.org".to_string()],
+            root,
+        )
+        .await
+        .expect("pairing command should be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let users = &config
+            .channels_config
+            .matrix
+            .as_ref()
+            .unwrap()
+            .allowed_users;
+        assert!(users.contains(&"@newuser:matrix.org".to_string()));
+        assert!(config
+            .channels_config
+            .approval_owners
+            .contains(&"@newuser:matrix.org".to_string()));
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     #[test]

@@ -41,15 +41,22 @@ impl GuestGate {
     /// Tools that are **owner-only**, no matter what `guest_allowed_tools`
     /// says — even if an owner adds one by mistake. Checked before the allowlist.
     /// Two reasons a tool lands here:
-    ///   * it mutates authority itself (`manage_permissions` — who owns the bot);
+    ///   * it mutates authority itself (`manage_permissions` — who owns the bot;
+    ///     `issue_pairing_code` — mints a code that can promote its recipient to
+    ///     owner, so a guest minting one would be an authority escalation);
     ///   * it executes code outside this gate's reach, so the guest ceiling
     ///     can't constrain it:
     ///       - `delegate` spawns a sub-agent loop with NO guest gate, so any tool
     ///         the sub-agent is allowed runs unconstrained — a full bypass;
     ///       - `ssh` / `pty` run arbitrary commands on a remote host / live tmux
     ///         session and don't carry a glob-checkable single command.
-    pub const OWNER_ONLY_TOOLS: &'static [&'static str] =
-        &["manage_permissions", "delegate", "ssh", "pty"];
+    pub const OWNER_ONLY_TOOLS: &'static [&'static str] = &[
+        "manage_permissions",
+        "issue_pairing_code",
+        "delegate",
+        "ssh",
+        "pty",
+    ];
 
     /// Whether a guest may invoke `tool` at all. Owner-only tools are always
     /// denied; otherwise the tool must be in the permitted set.
@@ -209,13 +216,20 @@ mod tests {
             ["file_read".to_string()],
             &[
                 "manage_permissions".to_string(),
+                "issue_pairing_code".to_string(),
                 "delegate".to_string(),
                 "ssh".to_string(),
                 "pty".to_string(),
             ],
             &[],
         );
-        for tool in ["manage_permissions", "delegate", "ssh", "pty"] {
+        for tool in [
+            "manage_permissions",
+            "issue_pairing_code",
+            "delegate",
+            "ssh",
+            "pty",
+        ] {
             assert!(!g.tool_permitted(tool), "{tool} must stay owner-only");
             let reason = g.deny_reason(tool, &json!({})).unwrap();
             assert!(reason.contains("owner-only"), "{tool}: {reason}");

@@ -156,6 +156,24 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Issue an on-demand pairing code (no daemon restart needed).
+    ///
+    /// Mints a time-windowed, multi-claim code into the shared store. A running
+    /// channel validates it on the next `/bind`/`/claim` message — no restart.
+    Pair {
+        /// Channel surface the code is scoped to (telegram, discord, …).
+        #[arg(long, default_value = "telegram")]
+        channel: String,
+        /// Validity window in minutes.
+        #[arg(long, default_value_t = 15)]
+        ttl: i64,
+        /// Maximum number of claims within the window (default: unlimited).
+        #[arg(long)]
+        max_uses: Option<u32>,
+        /// Disallow `/claim` (owner) with this code — chat-only `/bind`.
+        #[arg(long)]
+        no_owner: bool,
+    },
 }
 
 /// Skills management subcommands

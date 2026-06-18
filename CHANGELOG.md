@@ -5,6 +5,37 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.82-alpha] — 2026-06-18
+
+Universal, on-demand pairing codes: mint a fresh code without restarting the
+daemon, and self-onboard via `/bind` / `/claim` on every multi-user channel.
+
+### Added
+
+- **On-demand pairing codes (no daemon restart).** `rantaiclaw channels pair
+  [--channel <name>] [--ttl <min>] [--max-uses <n>] [--no-owner]` mints a
+  time-windowed, multi-claim code into a shared on-disk store; a running daemon
+  picks it up on the next `/bind`/`/claim` with no restart. Also mintable by an
+  owner from chat (owner-only `issue_pairing_code` tool) and from the TUI
+  (`/pair`).
+- **Universal `/bind` + `/claim`.** Self-onboarding now works on Telegram,
+  Discord, Slack, Mattermost, Matrix, Signal, WhatsApp (Cloud + Web), IRC, Lark,
+  DingTalk, QQ, Linq, Nextcloud Talk, and iMessage. `/bind <code>` grants chat
+  access; `/claim <code>` also makes the sender an approval owner. Each channel
+  keys on its native identity (numeric id / username / phone / contact) and
+  appends to that channel's allowlist + `approval_owners`, effective immediately
+  (no restart). Multiple owners can claim one code within its TTL window.
+- **Gateway pairing on demand.** `--channel gateway` mints a code the gateway
+  `POST /pair` accepts in addition to its startup code — add an API/console
+  client without restarting the gateway.
+
+### Security
+
+- Pairing codes are surface-scoped (a code for one channel can't claim on
+  another), SHA-256-hashed at rest in a `0600` store, and bounded by TTL +
+  max-uses. `issue_pairing_code` is owner-only (`GuestGate::OWNER_ONLY_TOOLS`),
+  so guests can't mint codes. No `config.toml` schema change.
+
 ## [0.6.81-alpha] — 2026-06-18
 
 ### Fixed

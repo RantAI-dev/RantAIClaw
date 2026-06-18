@@ -30,6 +30,7 @@ pub mod linq;
 pub mod matrix;
 pub mod mattermost;
 pub mod nextcloud_talk;
+pub mod pairing;
 pub mod qq;
 pub mod qr_terminal;
 pub mod signal;
@@ -2042,6 +2043,53 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the active profile root for the on-disk pairing-code store.
+fn pairing_profile_root() -> Result<PathBuf> {
+    Ok(crate::profile::ProfileManager::active()?.root)
+}
+
+/// Mint an on-demand pairing code for `channel` into the shared store and print
+/// the code plus `/bind`/`/claim` instructions. Works whether or not the daemon
+/// is running — a running daemon validates the code on the next pairing message
+/// without a restart.
+///
+/// `ttl_minutes` is the validity window; `max_uses` bounds claims (`None` =
+/// unlimited within the window); `grant_owner` permits `/claim` (owner). Returns
+/// the minted plaintext code (also used by tests to assert it is non-empty).
+fn pair_channel(
+    channel: &str,
+    ttl_minutes: i64,
+    max_uses: Option<u32>,
+    grant_owner: bool,
+) -> Result<String> {
+    let root = pairing_profile_root()?;
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let code = crate::security::pairing_store::mint(
+        &root,
+        channel,
+        ttl_minutes.saturating_mul(60),
+        max_uses,
+        grant_owner,
+        now,
+    )
+    .with_context(|| format!("minting pairing code for {channel}"))?;
+
+    let uses = match max_uses {
+        Some(1) => "single-use".to_string(),
+        Some(n) => format!("up to {n} uses"),
+        None => "multi-use".to_string(),
+    };
+    println!("🔐 Pairing code for {channel}: {code}   (valid {ttl_minutes} min, {uses})");
+    println!("   DM the bot:  /bind {code}  (chat)  |  /claim {code}  (owner)");
+    println!(
+        "   No daemon restart needed — a running channel picks this up on the next pairing message."
+    );
+    Ok(code)
+}
+
 /// Try to reload a running managed daemon service after a config change, and
 /// print a clear note about what happened either way. Shared by the channel
 /// allowlist binder and the `permissions` CLI so config edits made on disk are
@@ -2231,6 +2279,15 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         }
         crate::ChannelCommands::BindTelegram { identity } => {
             bind_telegram_identity(config, &identity).await
+        }
+        crate::ChannelCommands::Pair {
+            channel,
+            ttl,
+            max_uses,
+            no_owner,
+        } => {
+            pair_channel(&channel, ttl, max_uses, !no_owner)?;
+            Ok(())
         }
     }
 }
@@ -3238,6 +3295,32 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    // ── channels pair (Task 3) ───────────────────────────────
+
+    /// Minting an on-demand code into a tempdir profile (the work `channels
+    /// pair` does after resolving the profile root) returns a non-empty,
+    /// dash-grouped code that immediately validates for the same surface.
+    #[test]
+    fn channels_pair_mints_non_empty_code() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let now = 1_000;
+
+        let code = crate::security::pairing_store::mint(root, "telegram", 15 * 60, None, true, now)
+            .expect("mint should succeed");
+
+        assert!(!code.is_empty(), "minted code must not be empty");
+        assert!(code.contains('-'), "code should be grouped: {code}");
+
+        // A daemon validating against the same store accepts it without restart.
+        let outcome = crate::security::pairing_store::try_consume(root, "telegram", &code, now + 5)
+            .expect("consume should succeed");
+        assert!(
+            outcome.map(|o| o.grant_owner).unwrap_or(false),
+            "owner-capable code should consume with grant_owner",
+        );
+    }
 
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();

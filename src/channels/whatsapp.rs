@@ -1,5 +1,6 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 /// `WhatsApp` channel — uses `WhatsApp` Business Cloud API
@@ -26,7 +27,9 @@ pub struct WhatsAppChannel {
     access_token: String,
     endpoint_id: String,
     verify_token: String,
-    allowed_numbers: Vec<String>,
+    /// Allowed sender numbers (E.164) or `"*"`. Behind a lock so an in-chat
+    /// `/bind`/`/claim` can extend it at runtime without a daemon restart.
+    allowed_numbers: Arc<RwLock<Vec<String>>>,
 }
 
 impl WhatsAppChannel {
@@ -40,7 +43,7 @@ impl WhatsAppChannel {
             access_token,
             endpoint_id,
             verify_token,
-            allowed_numbers,
+            allowed_numbers: Arc::new(RwLock::new(allowed_numbers)),
         }
     }
 
@@ -48,9 +51,148 @@ impl WhatsAppChannel {
         crate::config::build_runtime_proxy_client("channel.whatsapp")
     }
 
+    /// Normalize a sender to the allowlist comparison form: ensure a leading `+`.
+    /// Matches the inbound normalization in [`Self::parse_webhook_payload`], so a
+    /// paired identity matches future messages.
+    fn normalize_phone(phone: &str) -> String {
+        let trimmed = phone.trim();
+        if trimmed.starts_with('+') {
+            trimmed.to_string()
+        } else {
+            format!("+{trimmed}")
+        }
+    }
+
     /// Check if a phone number is allowed (E.164 format: +1234567890)
     fn is_number_allowed(&self, phone: &str) -> bool {
-        self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
+        let Ok(allowed) = self.allowed_numbers.read() else {
+            return false;
+        };
+        allowed.iter().any(|n| n == "*" || n == phone)
+    }
+
+    /// Append a freshly-paired number to the runtime allowlist so a successful
+    /// `/bind`/`/claim` takes effect immediately, before the persisted config is
+    /// reloaded on the next restart.
+    fn add_allowed_number_runtime(&self, phone: &str) {
+        let phone = phone.trim();
+        if phone.is_empty() {
+            return;
+        }
+        if let Ok(mut allowed) = self.allowed_numbers.write() {
+            if !allowed.iter().any(|n| n == phone) {
+                allowed.push(phone.to_string());
+            }
+        }
+    }
+
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("WhatsApp pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Pull `(text, normalized_from)` for every inbound text message in a webhook
+    /// payload — regardless of the allowlist — so an unknown sender's
+    /// `/bind`/`/claim` can be processed. Non-text messages are skipped.
+    fn extract_pairing_candidates(payload: &serde_json::Value) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let Some(entries) = payload.get("entry").and_then(|e| e.as_array()) else {
+            return out;
+        };
+        for entry in entries {
+            let Some(changes) = entry.get("changes").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for change in changes {
+                let Some(msgs) = change
+                    .get("value")
+                    .and_then(|v| v.get("messages"))
+                    .and_then(|m| m.as_array())
+                else {
+                    continue;
+                };
+                for msg in msgs {
+                    let Some(from) = msg.get("from").and_then(|f| f.as_str()) else {
+                        continue;
+                    };
+                    let Some(text) = msg
+                        .get("text")
+                        .and_then(|t| t.get("body"))
+                        .and_then(|b| b.as_str())
+                    else {
+                        continue;
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
+                    out.push((text.to_string(), Self::normalize_phone(from)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Handle any `/bind`/`/claim` self-onboarding in this webhook payload.
+    ///
+    /// Mirrors the Telegram store path: for each text message, probe
+    /// [`crate::security::pairing_store`] (surface `"whatsapp"`); only take
+    /// ownership when a live matching code exists. On a hit the shared
+    /// [`crate::channels::pairing::try_handle_pairing`] appends the sender to
+    /// `allowed_numbers` (+ `approval_owners` for an owner-capable `/claim`) and
+    /// persists `config.toml`; we extend the runtime allowlist and reply.
+    ///
+    /// Pairing commands are never forwarded to the agent — [`Self::parse_webhook_payload`]
+    /// drops them — so this is the only place they are actioned.
+    pub async fn handle_inbound_pairing(&self, payload: &serde_json::Value) {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let candidates = Self::extract_pairing_candidates(payload);
+        if candidates.is_empty() {
+            return;
+        }
+        let Some(root) = Self::pairing_profile_root() else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        for (text, phone) in candidates {
+            let Some(cmd) = parse_pairing_command(&text) else {
+                continue;
+            };
+            match pairing_store::contains(&root, "whatsapp", &cmd.code, now) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!("WhatsApp pairing store probe failed: {e:#}");
+                    continue;
+                }
+            }
+            let Some(reply) = try_handle_pairing(
+                &text,
+                "whatsapp",
+                AllowlistField::AllowedNumbers,
+                std::slice::from_ref(&phone),
+                &root,
+            )
+            .await
+            else {
+                continue;
+            };
+            self.add_allowed_number_runtime(&phone);
+            if let Err(e) = self.send(&SendMessage::new(reply, &phone)).await {
+                tracing::error!("WhatsApp pairing reply send failed: {e}");
+            }
+        }
     }
 
     /// Get the verify token for webhook verification
@@ -119,6 +261,13 @@ impl WhatsAppChannel {
                     };
 
                     if content.is_empty() {
+                        continue;
+                    }
+
+                    // Pairing commands (`/bind`/`/claim`) are self-onboarding,
+                    // not agent messages — they are actioned by
+                    // `handle_inbound_pairing` and must never be dispatched.
+                    if crate::channels::pairing::parse_pairing_command(&content).is_some() {
                         continue;
                     }
 
@@ -1113,6 +1262,151 @@ mod tests {
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Line 1\nLine 2\nLine 3");
+    }
+
+    // ── shared-store pairing ─────────────────────────────────
+
+    #[test]
+    fn whatsapp_normalize_phone_adds_plus() {
+        assert_eq!(
+            WhatsAppChannel::normalize_phone("1234567890"),
+            "+1234567890"
+        );
+        assert_eq!(
+            WhatsAppChannel::normalize_phone("+1234567890"),
+            "+1234567890"
+        );
+        assert_eq!(
+            WhatsAppChannel::normalize_phone("  1234567890  "),
+            "+1234567890"
+        );
+    }
+
+    #[test]
+    fn whatsapp_add_allowed_number_runtime_appends_and_dedupes() {
+        let ch = make_channel(); // allowlist = ["+1234567890"]
+        assert!(!ch.is_number_allowed("+9999999999"));
+        ch.add_allowed_number_runtime("+9999999999");
+        assert!(ch.is_number_allowed("+9999999999"));
+        ch.add_allowed_number_runtime("+9999999999");
+        assert_eq!(ch.allowed_numbers.read().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn whatsapp_extract_pairing_candidates_includes_unauthorized() {
+        // The candidate extractor ignores the allowlist so a new sender can pair.
+        let ch = make_channel(); // allowlist = ["+1234567890"]
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "9999999999",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "/claim ABCD-EFGH" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let _ = &ch;
+        let candidates = WhatsAppChannel::extract_pairing_candidates(&payload);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "/claim ABCD-EFGH");
+        assert_eq!(candidates[0].1, "+9999999999");
+    }
+
+    #[test]
+    fn whatsapp_parse_skips_pairing_commands() {
+        // A `/bind`/`/claim` from an allowed user is consumed by the pairing path,
+        // never dispatched to the agent.
+        let ch = make_channel(); // allowlist = ["+1234567890"]
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [
+                            { "from": "1234567890", "timestamp": "1", "type": "text", "text": { "body": "/bind ABCD-EFGH" } },
+                            { "from": "1234567890", "timestamp": "2", "type": "text", "text": { "body": "hello agent" } }
+                        ]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1, "pairing command must not be dispatched");
+        assert_eq!(msgs[0].content, "hello agent");
+    }
+
+    // Serialize the env-mutating Config::load_or_init test against itself.
+    static PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A store-minted "whatsapp" code is accepted on `/claim`: the shared core
+    /// lands the (normalized) sender in `allowed_numbers` AND `approval_owners`.
+    #[tokio::test]
+    async fn store_minted_whatsapp_code_claims_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let _guard = PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+                access_token: None,
+                phone_number_id: None,
+                verify_token: None,
+                app_secret: None,
+                session_path: None,
+                pair_phone: None,
+                pair_code: None,
+                allowed_numbers: vec![],
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "whatsapp", 3_600, None, true, now).unwrap();
+        assert!(pairing_store::contains(root, "whatsapp", &code, now + 1).unwrap());
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "whatsapp",
+            AllowlistField::AllowedNumbers,
+            &[WhatsAppChannel::normalize_phone("9999999999")],
+            root,
+        )
+        .await
+        .expect("a /claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let numbers = &config
+            .channels_config
+            .whatsapp
+            .as_ref()
+            .unwrap()
+            .allowed_numbers;
+        assert!(
+            numbers.contains(&"+9999999999".to_string()),
+            "allowed_numbers: {numbers:?}"
+        );
+        let owners = &config.channels_config.approval_owners;
+        assert!(
+            owners.contains(&"+9999999999".to_string()),
+            "owners: {owners:?}"
+        );
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     #[test]

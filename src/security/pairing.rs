@@ -183,6 +183,20 @@ impl PairingGuard {
         let tokens = self.paired_tokens.lock();
         tokens.iter().cloned().collect()
     }
+
+    /// Issue a fresh bearer token *unconditionally* — without matching the
+    /// startup pairing code — and store its hash. Used when the code was
+    /// validated out-of-band (e.g. consumed from the on-disk
+    /// [`crate::security::pairing_store`] for an on-demand `channels pair
+    /// --channel gateway` code). Returns the plaintext token once; only the hash
+    /// is retained. Mirrors the token generation+storage in `try_pair_blocking`'s
+    /// success branch so both paths yield interchangeable tokens.
+    pub fn issue_token(&self) -> String {
+        let token = generate_token();
+        let mut tokens = self.paired_tokens.lock();
+        tokens.insert(hash_token(&token));
+        token
+    }
 }
 
 /// Generate a 6-digit numeric pairing code using cryptographically secure randomness.

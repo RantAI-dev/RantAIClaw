@@ -139,6 +139,10 @@ fn build_state(require_pairing: bool, tokens: &[String]) -> AppState {
         tools_registry: Arc::new(Vec::new()),
         webhook_secret_hash: None,
         pairing: Arc::new(PairingGuard::new(require_pairing, tokens)),
+        channel_approvals: Arc::new(
+            rantaiclaw::gateway::channel_approval::ChannelApprovalStore::default(),
+        ),
+        web_approvals: Arc::new(rantaiclaw::security::PendingApprovals::default()),
         trust_forwarded_headers: false,
         rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
         idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
