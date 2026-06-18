@@ -759,7 +759,7 @@ fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-6".into(),
         "openai" => "gpt-5.5".into(),
-        "openai-codex" => "gpt-5.5-codex".into(),
+        "openai-codex" => "gpt-5.3-codex".into(),
         "venice" => "zai-org-glm-5.1".into(),
         "groq" => "llama-spark".into(),
         "mistral" => "mistral-large-latest".into(),
@@ -864,16 +864,12 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
                 "GPT-5.5 (latest flagship, recommended)".to_string(),
             ),
             (
-                "gpt-5.5-codex".to_string(),
-                "GPT-5.5 Codex (agentic coding flagship)".to_string(),
-            ),
-            (
-                "gpt-5.3".to_string(),
-                "GPT-5.3 (previous flagship, stable)".to_string(),
+                "gpt-5.4".to_string(),
+                "GPT-5.4 (previous flagship, stable)".to_string(),
             ),
             (
                 "gpt-5.3-codex".to_string(),
-                "GPT-5.3 Codex (previous coding)".to_string(),
+                "GPT-5.3 Codex (agentic coding)".to_string(),
             ),
             ("gpt-5.2".to_string(), "GPT-5.2 (older, stable)".to_string()),
             (
@@ -891,12 +887,8 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "openai-codex" => vec![
             (
-                "gpt-5.5-codex".to_string(),
-                "GPT-5.5 Codex (latest, recommended)".to_string(),
-            ),
-            (
                 "gpt-5.3-codex".to_string(),
-                "GPT-5.3 Codex (previous flagship)".to_string(),
+                "GPT-5.3 Codex (latest, recommended)".to_string(),
             ),
             (
                 "gpt-5.2-codex".to_string(),
@@ -5963,7 +5955,7 @@ mod tests {
             "anthropic/claude-sonnet-4.6"
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.5");
-        assert_eq!(default_model_for_provider("openai-codex"), "gpt-5.5-codex");
+        assert_eq!(default_model_for_provider("openai-codex"), "gpt-5.3-codex");
         assert_eq!(default_model_for_provider("anthropic"), "claude-sonnet-4-6");
         assert_eq!(default_model_for_provider("qwen"), "qwen3.7-plus");
         assert_eq!(default_model_for_provider("qwen-intl"), "qwen3.7-plus");
@@ -6024,13 +6016,16 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        // 5.5 is the canonical default; older 5.3 / 5.2 / mini / nano stay
-        // in the list as fallbacks for users on older API tiers.
+        // 5.5 is the canonical default; 5.4 / 5.2 / mini / nano stay in the
+        // list as fallbacks for users on older API tiers.
         assert!(ids.contains(&"gpt-5.5".to_string()));
-        assert!(ids.contains(&"gpt-5.5-codex".to_string()));
-        assert!(ids.contains(&"gpt-5.3".to_string()));
+        assert!(ids.contains(&"gpt-5.4".to_string()));
         assert!(ids.contains(&"gpt-5.2".to_string()));
         assert!(ids.contains(&"gpt-5-mini".to_string()));
+        // Phantom ids must never reappear: the OpenAI API has no `gpt-5.5-codex`
+        // and no bare `gpt-5.3` (only `gpt-5.3-chat-latest` / `gpt-5.3-codex`).
+        assert!(!ids.contains(&"gpt-5.5-codex".to_string()));
+        assert!(!ids.contains(&"gpt-5.3".to_string()));
     }
 
     #[test]
@@ -6054,14 +6049,16 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        // 5.5-codex is the new canonical recommendation; previous codex
-        // models stay in the list so users on older account tiers can pick
-        // one that's actually enabled for them.
-        assert!(ids.contains(&"gpt-5.5-codex".to_string()));
+        // gpt-5.3-codex is the newest codex that actually exists on the OpenAI
+        // API (there is no gpt-5.5-codex / gpt-5.4-codex); previous codex models
+        // stay in the list so users on older account tiers can pick one that's
+        // actually enabled for them.
         assert!(ids.contains(&"gpt-5.3-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
         assert!(ids.contains(&"gpt-5.1-codex-mini".to_string()));
         assert!(ids.contains(&"gpt-5-codex".to_string()));
+        // Phantom id must never reappear.
+        assert!(!ids.contains(&"gpt-5.5-codex".to_string()));
     }
 
     #[test]
