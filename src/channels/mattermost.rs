@@ -2,6 +2,7 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use std::sync::{Arc, RwLock};
 
 /// Mattermost channel — polls channel posts via REST API v4.
 /// Mattermost is API-compatible with many Slack patterns but uses a dedicated v4 structure.
@@ -9,7 +10,9 @@ pub struct MattermostChannel {
     base_url: String, // e.g., https://mm.example.com
     bot_token: String,
     channel_id: Option<String>,
-    allowed_users: Vec<String>,
+    /// `Arc<RwLock<..>>` so a successful `/bind`/`/claim` can append the sender
+    /// at runtime (immediate access without a channel restart).
+    allowed_users: Arc<RwLock<Vec<String>>>,
     /// When true (default), replies thread on the original post's root_id.
     /// When false, replies go to the channel root.
     thread_replies: bool,
@@ -34,7 +37,7 @@ impl MattermostChannel {
             base_url,
             bot_token,
             channel_id,
-            allowed_users,
+            allowed_users: Arc::new(RwLock::new(allowed_users)),
             thread_replies,
             mention_only,
             typing_handle: Mutex::new(None),
@@ -48,7 +51,80 @@ impl MattermostChannel {
     /// Check if a user ID is in the allowlist.
     /// Empty list means deny everyone. "*" means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        self.allowed_users
+            .read()
+            .map(|users| users.iter().any(|u| u == "*" || u == user_id))
+            .unwrap_or(false)
+    }
+
+    /// Append a freshly-paired identity to the runtime allowlist (deduped) so
+    /// access is effective immediately. The persisted config (saved by the
+    /// pairing core) is the source of truth across restarts.
+    fn add_allowed_identity_runtime(&self, identity: &str) {
+        let identity = identity.trim();
+        if identity.is_empty() {
+            return;
+        }
+        if let Ok(mut users) = self.allowed_users.write() {
+            if !users.iter().any(|u| u == identity) {
+                users.push(identity.to_string());
+            }
+        }
+    }
+
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("Mattermost pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Self-onboarding hook for a not-yet-allowed sender's `/bind`/`/claim
+    /// <code>` (minted via `rantaiclaw channels pair`). Returns `true` when the
+    /// post was a pairing command that the shared store handled — the caller
+    /// must then NOT forward it. On success the sender lands in `allowed_users`
+    /// (and, for an owner `/claim`, `approval_owners`) and the reply is posted
+    /// in the same channel/thread.
+    async fn try_handle_pairing_post(&self, post: &serde_json::Value, channel_id: &str) -> bool {
+        let user_id = post.get("user_id").and_then(|u| u.as_str()).unwrap_or("");
+        let text = post.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        if user_id.is_empty() || text.is_empty() {
+            return false;
+        }
+        let Some(root) = Self::pairing_profile_root() else {
+            return false;
+        };
+        let identities = vec![user_id.to_string()];
+        let Some(reply) = crate::channels::pairing::try_handle_pairing(
+            text,
+            "mattermost",
+            crate::channels::pairing::AllowlistField::AllowedUsers,
+            &identities,
+            &root,
+        )
+        .await
+        else {
+            return false;
+        };
+
+        self.add_allowed_identity_runtime(user_id);
+
+        // Reply in-thread when the post is itself in a thread; else channel root.
+        let root_id = post.get("root_id").and_then(|r| r.as_str()).unwrap_or("");
+        let post_id = post.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        let recipient = if !root_id.is_empty() {
+            format!("{channel_id}:{root_id}")
+        } else if self.thread_replies && !post_id.is_empty() {
+            format!("{channel_id}:{post_id}")
+        } else {
+            channel_id.to_string()
+        };
+        let _ = self.send(&SendMessage::new(reply, recipient)).await;
+        true
     }
 
     /// Get the bot's own user ID and username so we can ignore our own messages
@@ -184,6 +260,24 @@ impl Channel for MattermostChannel {
                 post_list.sort_by_key(|p| p.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0));
 
                 for post in post_list {
+                    let create_at = post
+                        .get("create_at")
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(last_create_at);
+
+                    // Before the allowlist gate, let a not-yet-allowed user
+                    // self-onboard via `/bind`/`/claim <code>`. Only for fresh,
+                    // non-bot posts from a sender who isn't allowed yet.
+                    let post_user = post.get("user_id").and_then(|u| u.as_str()).unwrap_or("");
+                    if create_at > last_create_at
+                        && post_user != bot_user_id
+                        && !self.is_user_allowed(post_user)
+                        && self.try_handle_pairing_post(post, &channel_id).await
+                    {
+                        last_create_at = last_create_at.max(create_at);
+                        continue;
+                    }
+
                     let msg = self.parse_mattermost_post(
                         post,
                         &bot_user_id,
@@ -191,10 +285,6 @@ impl Channel for MattermostChannel {
                         last_create_at,
                         &channel_id,
                     );
-                    let create_at = post
-                        .get("create_at")
-                        .and_then(|c| c.as_i64())
-                        .unwrap_or(last_create_at);
                     last_create_at = last_create_at.max(create_at);
 
                     if let Some(channel_msg) = msg {
@@ -918,5 +1008,82 @@ mod tests {
         let result =
             normalize_mattermost_content("@mybot hello @mybotx world", "bot123", "mybot", &post);
         assert_eq!(result.as_deref(), Some("hello @mybotx world"));
+    }
+
+    // ── pairing (/bind, /claim) ──────────────────────────────
+
+    #[test]
+    fn add_allowed_identity_runtime_grants_immediate_access() {
+        let ch = make_channel(vec![], false);
+        assert!(!ch.is_user_allowed("u999"));
+        ch.add_allowed_identity_runtime("u999");
+        assert!(ch.is_user_allowed("u999"));
+        // Dedupes.
+        ch.add_allowed_identity_runtime("u999");
+        assert_eq!(ch.allowed_users.read().unwrap().len(), 1);
+    }
+
+    // Serialize the env-mutating Config::load_or_init test against itself.
+    static PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A store-minted "mattermost" code (the kind `rantaiclaw channels pair`
+    /// issues) is accepted on `/claim`: the shared core lands the sender in
+    /// `allowed_users` AND `approval_owners`. Drives the same code path the
+    /// inbound loop invokes.
+    #[tokio::test]
+    async fn store_minted_mattermost_code_claims_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let _guard = PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        // Seed a config with a mattermost section so apply_pairing has a target.
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
+                url: "https://mm.example.com".into(),
+                bot_token: "x".into(),
+                channel_id: Some("c1".into()),
+                allowed_users: vec![],
+                thread_replies: Some(true),
+                mention_only: Some(false),
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "mattermost", 3_600, None, true, now).unwrap();
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "mattermost",
+            AllowlistField::AllowedUsers,
+            &["u999".to_string()],
+            root,
+        )
+        .await
+        .expect("a /claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let users = &config
+            .channels_config
+            .mattermost
+            .as_ref()
+            .unwrap()
+            .allowed_users;
+        assert!(users.contains(&"u999".to_string()), "users: {users:?}");
+        let owners = &config.channels_config.approval_owners;
+        assert!(owners.contains(&"u999".to_string()), "owners: {owners:?}");
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }
