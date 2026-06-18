@@ -45,6 +45,67 @@ impl DingTalkChannel {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("DingTalk pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Self-onboarding hook: if `content` is a `/bind`/`/claim` command, validate
+    /// it against the shared [`crate::security::pairing_store`] (appending the
+    /// sender staff id to `allowed_users` and, for an owner-capable `/claim`, to
+    /// `approval_owners`, then persisting `config.toml`) and reply via the
+    /// message's session webhook.
+    ///
+    /// Returns `true` when the message WAS a pairing command (handled here — must
+    /// NOT be forwarded to the agent), `false` otherwise (normal message → gate).
+    async fn try_handle_store_pairing(
+        &self,
+        content: &str,
+        sender_id: &str,
+        chat_id: &str,
+        session_webhook: Option<&str>,
+    ) -> bool {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+
+        if parse_pairing_command(content).is_none() {
+            return false;
+        }
+        let Some(root) = Self::pairing_profile_root() else {
+            return false;
+        };
+
+        let Some(reply) = try_handle_pairing(
+            content,
+            "dingtalk",
+            AllowlistField::AllowedUsers,
+            &[sender_id.to_string()],
+            &root,
+        )
+        .await
+        else {
+            return false;
+        };
+
+        // Register the session webhook so the reply (and future messages) can be
+        // sent back to this now-paired chat.
+        if let Some(webhook) = session_webhook {
+            let mut webhooks = self.session_webhooks.write().await;
+            webhooks.insert(chat_id.to_string(), webhook.to_string());
+            webhooks.insert(sender_id.to_string(), webhook.to_string());
+        }
+
+        if let Err(e) = self.send(&SendMessage::new(reply, chat_id)).await {
+            tracing::warn!("DingTalk pairing: failed to send reply: {e:#}");
+        }
+        true
+    }
+
     fn parse_stream_data(frame: &serde_json::Value) -> Option<serde_json::Value> {
         match frame.get("data") {
             Some(serde_json::Value::String(raw)) => serde_json::from_str(raw).ok(),
@@ -231,15 +292,26 @@ impl Channel for DingTalkChannel {
                         .and_then(|s| s.as_str())
                         .unwrap_or("unknown");
 
+                    // Private chat uses sender ID, group chat uses conversation ID.
+                    let chat_id = Self::resolve_chat_id(&data, sender_id);
+
+                    // Intercept on-demand store-minted `/bind`/`/claim` pairing
+                    // codes before the allowlist gate so unenrolled users can
+                    // self-onboard without a daemon restart. Consumes when handled.
+                    let session_webhook = data.get("sessionWebhook").and_then(|w| w.as_str());
+                    if self
+                        .try_handle_store_pairing(content, sender_id, &chat_id, session_webhook)
+                        .await
+                    {
+                        continue;
+                    }
+
                     if !self.is_user_allowed(sender_id) {
                         tracing::warn!(
                             "DingTalk: ignoring message from unauthorized user: {sender_id}"
                         );
                         continue;
                     }
-
-                    // Private chat uses sender ID, group chat uses conversation ID.
-                    let chat_id = Self::resolve_chat_id(&data, sender_id);
 
                     // Store session webhook for later replies
                     if let Some(webhook) = data.get("sessionWebhook").and_then(|w| w.as_str()) {
@@ -372,6 +444,66 @@ client_secret = "secret"
             parsed.get("text").and_then(|v| v.get("content")),
             Some(&serde_json::json!("hello"))
         );
+    }
+
+    /// A store-minted owner code consumed for the `dingtalk` surface appends the
+    /// sender staff id to `allowed_users` and `approval_owners` and persists the
+    /// config — the shared-core path `try_handle_store_pairing` invokes before the
+    /// allowlist gate (the session-webhook reply send is exercised in integration,
+    /// so we assert the store + config mutation here).
+    #[tokio::test]
+    async fn dingtalk_store_minted_claim_grants_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
+                client_id: "id".into(),
+                client_secret: "secret".into(),
+                allowed_users: vec![],
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "dingtalk", 900, None, true, now).unwrap();
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "dingtalk",
+            AllowlistField::AllowedUsers,
+            &["staff_abc".to_string()],
+            root,
+        )
+        .await
+        .expect("pairing command should be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let users = &config
+            .channels_config
+            .dingtalk
+            .as_ref()
+            .unwrap()
+            .allowed_users;
+        assert!(users.contains(&"staff_abc".to_string()));
+        assert!(config
+            .channels_config
+            .approval_owners
+            .contains(&"staff_abc".to_string()));
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     #[test]
