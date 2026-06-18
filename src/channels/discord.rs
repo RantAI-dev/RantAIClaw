@@ -4,6 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -11,7 +12,9 @@ use uuid::Uuid;
 pub struct DiscordChannel {
     bot_token: String,
     guild_id: Option<String>,
-    allowed_users: Vec<String>,
+    /// `Arc<RwLock<..>>` so a successful `/bind`/`/claim` can append the sender
+    /// at runtime (immediate access without a channel restart).
+    allowed_users: Arc<RwLock<Vec<String>>>,
     listen_to_bots: bool,
     mention_only: bool,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
@@ -28,7 +31,7 @@ impl DiscordChannel {
         Self {
             bot_token,
             guild_id,
-            allowed_users,
+            allowed_users: Arc::new(RwLock::new(allowed_users)),
             listen_to_bots,
             mention_only,
             typing_handles: Mutex::new(HashMap::new()),
@@ -43,13 +46,67 @@ impl DiscordChannel {
     /// Empty list means deny everyone until explicitly configured.
     /// `"*"` means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        self.allowed_users
+            .read()
+            .map(|users| users.iter().any(|u| u == "*" || u == user_id))
+            .unwrap_or(false)
+    }
+
+    /// Append a freshly-paired identity to the runtime allowlist (deduped) so
+    /// access is effective immediately. The persisted config (saved by the
+    /// pairing core) is the source of truth across restarts.
+    fn add_allowed_identity_runtime(&self, identity: &str) {
+        let identity = identity.trim();
+        if identity.is_empty() {
+            return;
+        }
+        if let Ok(mut users) = self.allowed_users.write() {
+            if !users.iter().any(|u| u == identity) {
+                users.push(identity.to_string());
+            }
+        }
     }
 
     fn bot_user_id_from_token(token: &str) -> Option<String> {
         // Discord bot tokens are base64(bot_user_id).timestamp.hmac
         let part = token.split('.').next()?;
         base64_decode(part)
+    }
+
+    /// Sender identity form(s) for the shared pairing store, drawn from a
+    /// `MESSAGE_CREATE` payload's `author`. Returns `[user_id, username]`
+    /// (username only when present), matching the `is_user_allowed` key (the
+    /// `user_id`) plus the readily-available handle so `can_approve` resolves
+    /// either form after a `/claim`.
+    fn extract_pairing_identities(d: &serde_json::Value) -> Vec<String> {
+        let author = d.get("author");
+        let mut identities = Vec::new();
+        if let Some(id) = author
+            .and_then(|a| a.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            identities.push(id.to_string());
+        }
+        if let Some(username) = author
+            .and_then(|a| a.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            identities.push(username.to_string());
+        }
+        identities
+    }
+
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("Discord pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
     }
 }
 
@@ -381,6 +438,41 @@ impl Channel for DiscordChannel {
 
                     // Sender validation
                     if !self.is_user_allowed(author_id) {
+                        // Before rejecting, let a not-yet-allowed user self-onboard
+                        // with a `/bind`/`/claim <code>` minted via
+                        // `rantaiclaw channels pair`. Uses the raw content (not the
+                        // mention-stripped form) so DMs and unmentioned messages are
+                        // still seen. On success the sender lands in `allowed_users`
+                        // (and, for an owner-capable `/claim`, `approval_owners`).
+                        let raw_content = d
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        if let Some(root) = Self::pairing_profile_root() {
+                            let identities = Self::extract_pairing_identities(d);
+                            if let Some(reply) = crate::channels::pairing::try_handle_pairing(
+                                raw_content,
+                                "discord",
+                                crate::channels::pairing::AllowlistField::AllowedUsers,
+                                &identities,
+                                &root,
+                            )
+                            .await
+                            {
+                                // Mirror into the runtime allowlist so access is
+                                // effective immediately (config is already saved).
+                                for id in &identities {
+                                    self.add_allowed_identity_runtime(id);
+                                }
+                                let channel_id = d
+                                    .get("channel_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(author_id);
+                                let _ = self.send(&SendMessage::new(reply, channel_id)).await;
+                                continue;
+                            }
+                        }
                         tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
                         continue;
                     }
@@ -973,5 +1065,98 @@ mod tests {
         for part in &parts {
             assert!(part.len() <= DISCORD_MAX_MESSAGE_LENGTH);
         }
+    }
+
+    // ── pairing (/bind, /claim) ──────────────────────────────
+
+    #[test]
+    fn extract_pairing_identities_collects_id_and_username() {
+        let d = serde_json::json!({
+            "author": { "id": "999", "username": "carol" },
+            "content": "/claim ABCD-EFGH"
+        });
+        let identities = DiscordChannel::extract_pairing_identities(&d);
+        assert_eq!(identities, vec!["999".to_string(), "carol".to_string()]);
+    }
+
+    #[test]
+    fn extract_pairing_identities_id_only_when_no_username() {
+        let d = serde_json::json!({ "author": { "id": "999" } });
+        let identities = DiscordChannel::extract_pairing_identities(&d);
+        assert_eq!(identities, vec!["999".to_string()]);
+    }
+
+    #[test]
+    fn add_allowed_identity_runtime_grants_immediate_access() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        assert!(!ch.is_user_allowed("999"));
+        ch.add_allowed_identity_runtime("999");
+        assert!(ch.is_user_allowed("999"));
+        // Dedupes.
+        ch.add_allowed_identity_runtime("999");
+        assert_eq!(ch.allowed_users.read().unwrap().len(), 1);
+    }
+
+    // Serialize the env-mutating Config::load_or_init test against itself.
+    static PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A store-minted "discord" code (the kind `rantaiclaw channels pair` issues)
+    /// is accepted on `/claim`: the shared core lands the sender in `allowed_users`
+    /// AND `approval_owners`. Drives the same code path the inbound loop invokes.
+    #[tokio::test]
+    async fn store_minted_discord_code_claims_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let _guard = PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        // Seed a config with a discord section so apply_pairing has a target.
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.discord = Some(crate::config::DiscordConfig {
+                bot_token: "x".into(),
+                guild_id: None,
+                allowed_users: vec![],
+                listen_to_bots: false,
+                mention_only: false,
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "discord", 3_600, None, true, now).unwrap();
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "discord",
+            AllowlistField::AllowedUsers,
+            &["999".to_string(), "carol".to_string()],
+            root,
+        )
+        .await
+        .expect("a /claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let users = &config
+            .channels_config
+            .discord
+            .as_ref()
+            .unwrap()
+            .allowed_users;
+        assert!(users.contains(&"999".to_string()), "users: {users:?}");
+        assert!(users.contains(&"carol".to_string()), "users: {users:?}");
+        let owners = &config.channels_config.approval_owners;
+        assert!(owners.contains(&"999".to_string()), "owners: {owners:?}");
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }
