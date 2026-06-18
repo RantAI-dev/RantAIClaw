@@ -32,6 +32,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
+#[cfg(feature = "whatsapp-web")]
+use std::sync::RwLock;
 use tokio::select;
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
@@ -56,8 +58,9 @@ pub struct WhatsAppWebChannel {
     pair_phone: Option<String>,
     /// Custom pair code (optional)
     pair_code: Option<String>,
-    /// Allowed phone numbers (E.164 format) or "*" for all
-    allowed_numbers: Vec<String>,
+    /// Allowed phone numbers (E.164 format) or "*" for all. Behind a lock so an
+    /// in-chat `/bind`/`/claim` can extend it at runtime without a restart.
+    allowed_numbers: Arc<RwLock<Vec<String>>>,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -86,7 +89,7 @@ impl WhatsAppWebChannel {
             session_path,
             pair_phone,
             pair_code,
-            allowed_numbers,
+            allowed_numbers: Arc::new(RwLock::new(allowed_numbers)),
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -96,7 +99,128 @@ impl WhatsAppWebChannel {
     /// Check if a phone number is allowed (E.164 format: +1234567890)
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed(&self, phone: &str) -> bool {
-        self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
+        Self::number_allowed_in(&self.allowed_numbers, phone)
+    }
+
+    /// Whether `phone` is permitted by the given allowlist snapshot. Shared by
+    /// the channel method and the event loop (which holds an `Arc` clone).
+    #[cfg(feature = "whatsapp-web")]
+    fn number_allowed_in(allowed: &Arc<RwLock<Vec<String>>>, phone: &str) -> bool {
+        let Ok(allowed) = allowed.read() else {
+            return false;
+        };
+        allowed.iter().any(|n| n == "*" || n == phone)
+    }
+
+    /// Append a freshly-paired number to the runtime allowlist so a successful
+    /// `/bind`/`/claim` takes effect immediately, before the persisted config is
+    /// reloaded on the next restart.
+    #[cfg(feature = "whatsapp-web")]
+    fn add_allowed_number_in(allowed: &Arc<RwLock<Vec<String>>>, phone: &str) {
+        let phone = phone.trim();
+        if phone.is_empty() {
+            return;
+        }
+        if let Ok(mut allowed) = allowed.write() {
+            if !allowed.iter().any(|n| n == phone) {
+                allowed.push(phone.to_string());
+            }
+        }
+    }
+
+    /// Resolve the active profile root for the shared pairing-code store.
+    #[cfg(feature = "whatsapp-web")]
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("WhatsApp Web pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Try to handle `text` from `phone` (already normalized to `+E.164`) as a
+    /// `/bind`/`/claim` against the shared pairing store at `root` (surface
+    /// `"whatsapp"`).
+    ///
+    /// Returns `Some(reply)` when the message WAS a live pairing command — the
+    /// caller must then send the reply and NOT forward the message — and `None`
+    /// otherwise (normal message, or no live store code). On a hit it appends the
+    /// sender to `allowed_numbers` (+ `approval_owners` for an owner-capable
+    /// `/claim`) and persists `config.toml` via the shared core, then extends the
+    /// supplied runtime allowlist for immediate effect. Extracted as a free-
+    /// standing helper (takes `root` explicitly) so the wa-rs event loop stays
+    /// thin and this stays unit-testable against a tempdir store.
+    #[cfg(feature = "whatsapp-web")]
+    async fn handle_pairing_for(
+        allowed_numbers: &Arc<RwLock<Vec<String>>>,
+        text: &str,
+        phone: &str,
+        root: &std::path::Path,
+    ) -> Option<String> {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let cmd = parse_pairing_command(text)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        match pairing_store::contains(root, "whatsapp", &cmd.code, now) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(e) => {
+                tracing::warn!("WhatsApp Web pairing store probe failed: {e:#}");
+                return None;
+            }
+        }
+
+        let reply = try_handle_pairing(
+            text,
+            "whatsapp",
+            AllowlistField::AllowedNumbers,
+            &[phone.to_string()],
+            root,
+        )
+        .await?;
+
+        Self::add_allowed_number_in(allowed_numbers, phone);
+        Some(reply)
+    }
+
+    /// Run the full pairing branch for one inbound message and send the reply via
+    /// the live wa-rs `client`. Returns `true` when the message WAS a pairing
+    /// command (caller must not forward it). Kept as its own `async fn` (rather
+    /// than inlined into the event-loop closure) so its sizeable future —
+    /// `Config` load/save + a wa-rs `send_message` — does not bloat the closure's
+    /// future; the caller `Box::pin`s this.
+    #[cfg(feature = "whatsapp-web")]
+    async fn try_reply_pairing(
+        allowed_numbers: &Arc<RwLock<Vec<String>>>,
+        client: &Arc<wa_rs::Client>,
+        text: &str,
+        phone: &str,
+        chat_jid: wa_rs_binary::jid::Jid,
+    ) -> bool {
+        let Some(root) = Self::pairing_profile_root() else {
+            return false;
+        };
+        let Some(reply) = Self::handle_pairing_for(allowed_numbers, text, phone, &root).await
+        else {
+            return false;
+        };
+        let outgoing = wa_rs_proto::whatsapp::Message {
+            conversation: Some(reply),
+            ..Default::default()
+        };
+        // `send_message` returns a large future; box it so it doesn't bloat this
+        // fn's (already boxed) future further.
+        if let Err(e) = Box::pin(client.send_message(chat_jid, outgoing)).await {
+            tracing::error!("WhatsApp Web pairing reply send failed: {e}");
+        }
+        true
     }
 
     /// Normalize phone number to E.164 format (strips JID domain, ensures + prefix)
@@ -245,7 +369,7 @@ impl Channel for WhatsAppWebChannel {
             .with_backend(backend)
             .with_transport_factory(transport_factory)
             .with_http_client(http_client)
-            .on_event(move |event, _client| {
+            .on_event(move |event, client| {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
                 async move {
@@ -255,7 +379,8 @@ impl Channel for WhatsAppWebChannel {
                             let text = msg.text_content().unwrap_or("");
                             let sender = info.source.sender.user().to_string();
                             let sender_jid = info.source.sender.to_string();
-                            let chat = info.source.chat.to_string();
+                            let chat_jid = info.source.chat.clone();
+                            let chat = chat_jid.to_string();
 
                             tracing::info!(
                                 "WhatsApp Web message from {} in {}: {}",
@@ -276,6 +401,23 @@ impl Channel for WhatsAppWebChannel {
                                 format!("+{sender}")
                             };
 
+                            // Intercept on-demand store-minted pairing codes
+                            // (`/bind`/`/claim`) BEFORE the allowlist gate so an
+                            // unknown number can self-onboard without a restart.
+                            // Never forwarded to the agent. Boxed so the pairing
+                            // future (config I/O + send) doesn't bloat this loop.
+                            let handled = Box::pin(Self::try_reply_pairing(
+                                &allowed_numbers,
+                                &client,
+                                text,
+                                &normalized,
+                                chat_jid,
+                            ))
+                            .await;
+                            if handled {
+                                return;
+                            }
+
                             // For LID senders we cannot match against phone-based
                             // allowed_numbers, so allow them through when the list
                             // is non-empty (the user has configured filtering intent
@@ -283,9 +425,10 @@ impl Channel for WhatsAppWebChannel {
                             let is_allowed = if is_lid {
                                 // Allow LID senders unless allowed_numbers is empty
                                 // (empty = deny-all secure default).
-                                allowed_numbers.iter().any(|n| n == "*") || !allowed_numbers.is_empty()
+                                let allowed = allowed_numbers.read().ok();
+                                allowed.is_some_and(|a| a.iter().any(|n| n == "*") || !a.is_empty())
                             } else {
-                                allowed_numbers.iter().any(|n| n == "*" || n == &normalized)
+                                Self::number_allowed_in(&allowed_numbers, &normalized)
                             };
 
                             if is_allowed {
@@ -661,4 +804,153 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
         }
         yield PairEvent::Failed("channel closed".into());
     })
+}
+
+#[cfg(all(test, feature = "whatsapp-web"))]
+mod tests {
+    use super::*;
+
+    fn make_channel(allowed: Vec<String>) -> WhatsAppWebChannel {
+        WhatsAppWebChannel::new("/tmp/wa-test.db".into(), None, None, allowed)
+    }
+
+    #[test]
+    fn normalize_phone_strips_jid_and_adds_plus() {
+        let ch = make_channel(vec![]);
+        assert_eq!(ch.normalize_phone("1234567890"), "+1234567890");
+        assert_eq!(ch.normalize_phone("+1234567890"), "+1234567890");
+        // JID form: strip the domain suffix, then prefix +.
+        assert_eq!(
+            ch.normalize_phone("1234567890@s.whatsapp.net"),
+            "+1234567890"
+        );
+    }
+
+    #[test]
+    fn is_number_allowed_reads_through_lock() {
+        let ch = make_channel(vec!["+1234567890".into()]);
+        assert!(ch.is_number_allowed("+1234567890"));
+        assert!(!ch.is_number_allowed("+9999999999"));
+    }
+
+    #[test]
+    fn add_allowed_number_in_appends_and_dedupes() {
+        let allowed: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(vec!["+1234567890".into()]));
+        WhatsAppWebChannel::add_allowed_number_in(&allowed, "+9999999999");
+        assert!(WhatsAppWebChannel::number_allowed_in(
+            &allowed,
+            "+9999999999"
+        ));
+        WhatsAppWebChannel::add_allowed_number_in(&allowed, "+9999999999");
+        assert_eq!(allowed.read().unwrap().len(), 2);
+        // Blank input is ignored.
+        WhatsAppWebChannel::add_allowed_number_in(&allowed, "   ");
+        assert_eq!(allowed.read().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn handle_pairing_for_non_command_returns_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let allowed: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(vec![]));
+        let reply = WhatsAppWebChannel::handle_pairing_for(
+            &allowed,
+            "hello agent",
+            "+9999999999",
+            dir.path(),
+        )
+        .await;
+        assert!(reply.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_pairing_for_falls_through_when_no_store_code() {
+        // A `/bind` with no live store code returns None (not owned).
+        let dir = tempfile::TempDir::new().unwrap();
+        let allowed: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(vec![]));
+        let reply = WhatsAppWebChannel::handle_pairing_for(
+            &allowed,
+            "/bind ABCD-EFGH",
+            "+9999999999",
+            dir.path(),
+        )
+        .await;
+        assert!(reply.is_none());
+    }
+
+    // Serialize the env-mutating Config::load_or_init test against itself.
+    static PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A store-minted "whatsapp" code is accepted on `/claim` via the extracted
+    /// helper: the shared core lands the sender in `allowed_numbers` AND
+    /// `approval_owners`, and `handle_pairing_for` extends the runtime allowlist.
+    #[tokio::test]
+    async fn store_minted_whatsapp_code_claims_owner_and_extends_runtime() {
+        use crate::security::pairing_store;
+
+        let _guard = PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.whatsapp = Some(crate::config::schema::WhatsAppConfig {
+                access_token: None,
+                phone_number_id: None,
+                verify_token: None,
+                app_secret: None,
+                session_path: Some("/tmp/wa.db".into()),
+                pair_phone: None,
+                pair_code: None,
+                allowed_numbers: vec![],
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "whatsapp", 3_600, None, true, now).unwrap();
+        assert!(pairing_store::contains(root, "whatsapp", &code, now + 1).unwrap());
+
+        let allowed: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(vec![]));
+        let reply = WhatsAppWebChannel::handle_pairing_for(
+            &allowed,
+            &format!("/claim {code}"),
+            "+9999999999",
+            root,
+        )
+        .await
+        .expect("a /claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        // Runtime allowlist extended immediately.
+        assert!(WhatsAppWebChannel::number_allowed_in(
+            &allowed,
+            "+9999999999"
+        ));
+
+        // Config persisted.
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let numbers = &config
+            .channels_config
+            .whatsapp
+            .as_ref()
+            .unwrap()
+            .allowed_numbers;
+        assert!(
+            numbers.contains(&"+9999999999".to_string()),
+            "allowed_numbers: {numbers:?}"
+        );
+        let owners = &config.channels_config.approval_owners;
+        assert!(
+            owners.contains(&"+9999999999".to_string()),
+            "owners: {owners:?}"
+        );
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    }
 }
