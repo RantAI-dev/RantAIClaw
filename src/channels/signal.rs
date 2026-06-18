@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -25,7 +26,9 @@ pub struct SignalChannel {
     http_url: String,
     account: String,
     group_id: Option<String>,
-    allowed_from: Vec<String>,
+    /// Allowed sender numbers (E.164) / UUIDs, or `"*"`. Behind a lock so an
+    /// in-chat `/bind`/`/claim` can extend it at runtime without a restart.
+    allowed_from: Arc<RwLock<Vec<String>>>,
     ignore_attachments: bool,
     ignore_stories: bool,
 }
@@ -84,7 +87,7 @@ impl SignalChannel {
             http_url,
             account,
             group_id,
-            allowed_from,
+            allowed_from: Arc::new(RwLock::new(allowed_from)),
             ignore_attachments,
             ignore_stories,
         }
@@ -106,10 +109,111 @@ impl SignalChannel {
     }
 
     fn is_sender_allowed(&self, sender: &str) -> bool {
-        if self.allowed_from.iter().any(|u| u == "*") {
+        let Ok(allowed) = self.allowed_from.read() else {
+            return false;
+        };
+        if allowed.iter().any(|u| u == "*") {
             return true;
         }
-        self.allowed_from.iter().any(|u| u == sender)
+        allowed.iter().any(|u| u == sender)
+    }
+
+    /// Append a freshly-paired sender to the runtime allowlist so a successful
+    /// `/bind`/`/claim` takes effect immediately, before the persisted config is
+    /// reloaded on the next restart. Signal compares senders verbatim (no
+    /// normalization), so the stored identity is the sender string as-is.
+    fn add_allowed_from_runtime(&self, sender: &str) {
+        let sender = sender.trim();
+        if sender.is_empty() {
+            return;
+        }
+        if let Ok(mut allowed) = self.allowed_from.write() {
+            if !allowed.iter().any(|u| u == sender) {
+                allowed.push(sender.to_string());
+            }
+        }
+    }
+
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("Signal pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Extract `(text, sender, reply_target)` from an inbound envelope for the
+    /// shared pairing path — even when the sender is not (yet) allowlisted, so a
+    /// brand-new user can self-onboard. Returns `None` for envelopes without a
+    /// usable text message or sender (stories/attachment-only are not pairing).
+    fn extract_pairing_context(&self, envelope: &Envelope) -> Option<(String, String, String)> {
+        if self.ignore_stories && envelope.story_message.is_some() {
+            return None;
+        }
+        let data_msg = envelope.data_message.as_ref()?;
+        let text = data_msg.message.as_deref().filter(|t| !t.is_empty())?;
+        let sender = Self::sender(envelope)?;
+        // Honour the configured group filter so a code can't be claimed from an
+        // unrelated group the operator isn't watching.
+        if !self.matches_group(data_msg) {
+            return None;
+        }
+        let target = self.reply_target(data_msg, &sender);
+        Some((text.to_string(), sender, target))
+    }
+
+    /// Shared-store `/bind`/`/claim` handler. Returns `true` when the message
+    /// WAS a live pairing command (so the caller must not also dispatch it).
+    ///
+    /// Mirrors the Telegram store path: probe [`crate::security::pairing_store`]
+    /// first (surface `"signal"`); only take ownership when a live matching code
+    /// exists, otherwise fall through so a normal message reaches the agent. On a
+    /// hit, the shared [`crate::channels::pairing::try_handle_pairing`] appends
+    /// the sender to `allowed_from` (+ `approval_owners` for an owner-capable
+    /// `/claim`) and persists `config.toml`; we also extend the runtime allowlist
+    /// for immediate effect, then reply.
+    async fn try_handle_store_pairing(&self, text: &str, sender: &str, reply_target: &str) -> bool {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let Some(cmd) = parse_pairing_command(text) else {
+            return false;
+        };
+        let Some(root) = Self::pairing_profile_root() else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        match pairing_store::contains(&root, "signal", &cmd.code, now) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                tracing::warn!("Signal pairing store probe failed: {e:#}");
+                return false;
+            }
+        }
+
+        let Some(reply) = try_handle_pairing(
+            text,
+            "signal",
+            AllowlistField::AllowedFrom,
+            &[sender.to_string()],
+            &root,
+        )
+        .await
+        else {
+            return false;
+        };
+
+        self.add_allowed_from_runtime(sender);
+        let _ = self.send(&SendMessage::new(reply, reply_target)).await;
+        true
     }
 
     fn is_e164(recipient: &str) -> bool {
@@ -373,6 +477,21 @@ impl Channel for SignalChannel {
                             match serde_json::from_str::<SseEnvelope>(&current_data) {
                                 Ok(sse) => {
                                     if let Some(ref envelope) = sse.envelope {
+                                        // Intercept on-demand store-minted pairing
+                                        // codes (`/bind`/`/claim`) before the
+                                        // allowlist gate, so an unknown sender can
+                                        // self-onboard without a daemon restart.
+                                        if let Some((text, sender, target)) =
+                                            self.extract_pairing_context(envelope)
+                                        {
+                                            if self
+                                                .try_handle_store_pairing(&text, &sender, &target)
+                                                .await
+                                            {
+                                                current_data.clear();
+                                                continue;
+                                            }
+                                        }
                                         if let Some(msg) = self.process_envelope(envelope) {
                                             if tx.send(msg).await.is_err() {
                                                 return Ok(());
@@ -499,7 +618,7 @@ mod tests {
         assert_eq!(ch.http_url, "http://127.0.0.1:8686");
         assert_eq!(ch.account, "+1234567890");
         assert!(ch.group_id.is_none());
-        assert_eq!(ch.allowed_from.len(), 1);
+        assert_eq!(ch.allowed_from.read().unwrap().len(), 1);
         assert!(!ch.ignore_attachments);
         assert!(!ch.ignore_stories);
     }
@@ -910,5 +1029,109 @@ mod tests {
         assert!(env.data_message.is_none());
         assert!(env.story_message.is_none());
         assert!(env.timestamp.is_none());
+    }
+
+    // ── shared-store pairing ─────────────────────────────────
+
+    /// `extract_pairing_context` surfaces an unknown sender's `/claim` text so
+    /// the pairing path can run even though the allowlist would reject them.
+    #[test]
+    fn extract_pairing_context_from_unknown_sender() {
+        let ch = make_channel(); // allowlist = ["+1111111111"]
+        let env = make_envelope(Some("+9999999999"), Some("/claim ABCD-EFGH"));
+        let (text, sender, target) = ch.extract_pairing_context(&env).expect("should extract");
+        assert_eq!(text, "/claim ABCD-EFGH");
+        assert_eq!(sender, "+9999999999");
+        // DM → reply target is the sender.
+        assert_eq!(target, "+9999999999");
+    }
+
+    /// `add_allowed_from_runtime` extends the live allowlist verbatim and dedupes.
+    #[test]
+    fn add_allowed_from_runtime_appends_and_dedupes() {
+        let ch = make_channel();
+        assert!(!ch.is_sender_allowed("+9999999999"));
+        ch.add_allowed_from_runtime("+9999999999");
+        assert!(ch.is_sender_allowed("+9999999999"));
+        ch.add_allowed_from_runtime("+9999999999");
+        assert_eq!(ch.allowed_from.read().unwrap().len(), 2);
+    }
+
+    /// A `/bind` with no live store code falls through (returns false) so the
+    /// message is not consumed and no reply is sent.
+    #[tokio::test]
+    async fn store_pairing_falls_through_when_no_store_code() {
+        let ch = make_channel();
+        let handled = ch
+            .try_handle_store_pairing("/bind ABCD-EFGH", "+9999999999", "+9999999999")
+            .await;
+        assert!(!handled, "no store code => must fall through");
+    }
+
+    // Serialize the env-mutating Config::load_or_init test against itself.
+    static PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A store-minted "signal" code (the kind `rantaiclaw channels pair --channel
+    /// signal` issues) is accepted on `/claim`: the shared core lands the sender
+    /// in `allowed_from` AND `approval_owners`. Drives the same code path
+    /// `try_handle_store_pairing` invokes after its `contains` gate, without the
+    /// network `send`.
+    #[tokio::test]
+    async fn store_minted_signal_code_claims_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let _guard = PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        // Seed a config with a signal section so apply_pairing has a target.
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.signal = Some(crate::config::schema::SignalConfig {
+                http_url: "http://127.0.0.1:8686".into(),
+                account: "+1234567890".into(),
+                group_id: None,
+                allowed_from: vec![],
+                ignore_attachments: false,
+                ignore_stories: false,
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "signal", 3_600, None, true, now).unwrap();
+        assert!(pairing_store::contains(root, "signal", &code, now + 1).unwrap());
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "signal",
+            AllowlistField::AllowedFrom,
+            &["+9999999999".to_string()],
+            root,
+        )
+        .await
+        .expect("a /claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let allowed = &config.channels_config.signal.as_ref().unwrap().allowed_from;
+        assert!(
+            allowed.contains(&"+9999999999".to_string()),
+            "allowed_from: {allowed:?}"
+        );
+        let owners = &config.channels_config.approval_owners;
+        assert!(
+            owners.contains(&"+9999999999".to_string()),
+            "owners: {owners:?}"
+        );
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }
