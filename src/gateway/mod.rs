@@ -1582,6 +1582,11 @@ async fn handle_whatsapp_message(
         );
     };
 
+    // Handle on-demand store-minted pairing codes (`/bind`/`/claim`) first so an
+    // unknown sender can self-onboard without a restart. These are consumed here
+    // and never surface as agent messages (parse_webhook_payload drops them).
+    wa.handle_inbound_pairing(&payload).await;
+
     // Parse messages from the webhook payload
     let messages = wa.parse_webhook_payload(&payload);
 
