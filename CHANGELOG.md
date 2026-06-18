@@ -5,6 +5,23 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.77-alpha] — 2026-06-18
+
+Agent-authored skills: tell the bot "make me a skill that does X" and it
+scaffolds a ready-to-use skill for you.
+
+### Added
+
+- **`author_skill` tool** — the write-side counterpart to the read/install
+  skill tools. The agent creates a brand-new local skill from a plain-language
+  request and writes a loader-valid `SKILL.md` into the active profile, where
+  it loads on the next turn. Only `name` + `description` are required; the tool
+  fills in sensible default instructions when none are given, so even a minimal
+  call yields a complete, well-structured skill. Slugs are sanitized to a
+  filesystem-safe form (no path traversal), an existing skill is never
+  overwritten without `overwrite: true`, and the tool is approval-gated by name
+  like `skills_install`.
+
 ## [0.6.76-alpha] — 2026-06-18
 
 ### Changed
