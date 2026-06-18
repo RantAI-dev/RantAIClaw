@@ -35,6 +35,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod issue_pairing_code;
 pub mod manage_permissions;
 pub mod memory_forget;
 pub mod memory_recall;
@@ -277,6 +278,11 @@ pub fn all_tools_with_runtime(
         // from chat. The per-turn GuestGate hard-denies it for non-owners
         // (see GuestGate::OWNER_ONLY_TOOLS), so only owner/operator turns reach it.
         Arc::new(crate::tools::manage_permissions::ManagePermissionsTool::new(config.clone())),
+        // Owner-only: mint an on-demand pairing code from chat so a new user or
+        // device can self-onboard (/claim or /bind) without a daemon restart.
+        // Hard-denied for non-owners via GuestGate::OWNER_ONLY_TOOLS; resolves
+        // the active profile root itself, so it needs no constructor args.
+        Arc::new(crate::tools::issue_pairing_code::IssuePairingCodeTool::new()),
         Arc::new(GitOperationsTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
