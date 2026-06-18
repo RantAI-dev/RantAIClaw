@@ -1,11 +1,14 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use std::sync::{Arc, RwLock};
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
     bot_token: String,
     channel_id: Option<String>,
-    allowed_users: Vec<String>,
+    /// `Arc<RwLock<..>>` so a successful `/bind`/`/claim` can append the sender
+    /// at runtime (immediate access without a channel restart).
+    allowed_users: Arc<RwLock<Vec<String>>>,
 }
 
 impl SlackChannel {
@@ -13,7 +16,7 @@ impl SlackChannel {
         Self {
             bot_token,
             channel_id,
-            allowed_users,
+            allowed_users: Arc::new(RwLock::new(allowed_users)),
         }
     }
 
@@ -25,7 +28,36 @@ impl SlackChannel {
     /// Empty list means deny everyone until explicitly configured.
     /// `"*"` means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        self.allowed_users
+            .read()
+            .map(|users| users.iter().any(|u| u == "*" || u == user_id))
+            .unwrap_or(false)
+    }
+
+    /// Append a freshly-paired identity to the runtime allowlist (deduped) so
+    /// access is effective immediately. The persisted config (saved by the
+    /// pairing core) is the source of truth across restarts.
+    fn add_allowed_identity_runtime(&self, identity: &str) {
+        let identity = identity.trim();
+        if identity.is_empty() {
+            return;
+        }
+        if let Ok(mut users) = self.allowed_users.write() {
+            if !users.iter().any(|u| u == identity) {
+                users.push(identity.to_string());
+            }
+        }
+    }
+
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("Slack pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
     }
 
     /// Get the bot's own user ID so we can ignore our own messages
@@ -172,6 +204,34 @@ impl Channel for SlackChannel {
 
                     // Sender validation
                     if !self.is_user_allowed(user) {
+                        // Before rejecting, let a not-yet-allowed user self-onboard
+                        // with a `/bind`/`/claim <code>` minted via
+                        // `rantaiclaw channels pair`. On success the sender lands in
+                        // `allowed_users` (and, for an owner `/claim`, `approval_owners`).
+                        if !text.is_empty() && ts > last_ts.as_str() {
+                            if let Some(root) = Self::pairing_profile_root() {
+                                let identities = vec![user.to_string()];
+                                if let Some(reply) = crate::channels::pairing::try_handle_pairing(
+                                    text,
+                                    "slack",
+                                    crate::channels::pairing::AllowlistField::AllowedUsers,
+                                    &identities,
+                                    &root,
+                                )
+                                .await
+                                {
+                                    // Advance the cursor so this command isn't
+                                    // re-processed on the next poll, mirror into the
+                                    // runtime allowlist, and reply in-channel.
+                                    last_ts = ts.to_string();
+                                    self.add_allowed_identity_runtime(user);
+                                    let reply_msg = SendMessage::new(reply, channel_id.clone())
+                                        .in_thread(Self::inbound_thread_ts(msg, ts));
+                                    let _ = self.send(&reply_msg).await;
+                                    continue;
+                                }
+                            }
+                        }
                         tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
                         continue;
                     }
@@ -355,5 +415,74 @@ mod tests {
 
         let thread_ts = SlackChannel::inbound_thread_ts(&msg, "");
         assert_eq!(thread_ts, None);
+    }
+
+    // ── pairing (/bind, /claim) ──────────────────────────────
+
+    #[test]
+    fn add_allowed_identity_runtime_grants_immediate_access() {
+        let ch = SlackChannel::new("fake".into(), Some("C1".into()), vec![]);
+        assert!(!ch.is_user_allowed("U999"));
+        ch.add_allowed_identity_runtime("U999");
+        assert!(ch.is_user_allowed("U999"));
+        // Dedupes.
+        ch.add_allowed_identity_runtime("U999");
+        assert_eq!(ch.allowed_users.read().unwrap().len(), 1);
+    }
+
+    // Serialize the env-mutating Config::load_or_init test against itself.
+    static PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A store-minted "slack" code (the kind `rantaiclaw channels pair` issues)
+    /// is accepted on `/claim`: the shared core lands the sender in `allowed_users`
+    /// AND `approval_owners`. Drives the same code path the inbound loop invokes.
+    #[tokio::test]
+    async fn store_minted_slack_code_claims_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let _guard = PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        // Seed a config with a slack section so apply_pairing has a target.
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.slack = Some(crate::config::SlackConfig {
+                bot_token: "x".into(),
+                app_token: None,
+                channel_id: Some("C1".into()),
+                allowed_users: vec![],
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "slack", 3_600, None, true, now).unwrap();
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "slack",
+            AllowlistField::AllowedUsers,
+            &["U999".to_string()],
+            root,
+        )
+        .await
+        .expect("a /claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let users = &config.channels_config.slack.as_ref().unwrap().allowed_users;
+        assert!(users.contains(&"U999".to_string()), "users: {users:?}");
+        let owners = &config.channels_config.approval_owners;
+        assert!(owners.contains(&"U999".to_string()), "owners: {owners:?}");
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }
