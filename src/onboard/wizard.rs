@@ -311,6 +311,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         schema_version: crate::config::migrations::CURRENT_VERSION,
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
+        provider_api_keys: Default::default(),
         api_key: if api_key.is_empty() {
             None
         } else {
@@ -571,6 +572,7 @@ async fn run_quick_setup_with_home(
         schema_version: crate::config::migrations::CURRENT_VERSION,
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
+        provider_api_keys: Default::default(),
         api_key: credential_override.map(|c| {
             let mut s = String::with_capacity(c.len());
             s.push_str(c);

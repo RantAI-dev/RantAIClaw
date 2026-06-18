@@ -607,6 +607,17 @@ fn resolve_minimax_oauth_refresh_token(name: &str) -> Option<String> {
     }
 }
 
+/// Normalize a provider name/alias to a stable canonical form for keying
+/// per-provider state (e.g. `minimax-cn` → `minimax`, `z.ai` → `zai`). Regional
+/// China aliases collapse to their family; everything else is returned trimmed
+/// and lowercased as-is. Used to key `Config::provider_api_keys`.
+pub fn normalize_provider_name(name: &str) -> String {
+    let lower = name.trim().to_ascii_lowercase();
+    canonical_china_provider_name(&lower)
+        .map(|s| s.to_string())
+        .unwrap_or(lower)
+}
+
 pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> {
     if is_qwen_alias(name) {
         Some("qwen")

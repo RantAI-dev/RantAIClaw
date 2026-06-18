@@ -2001,9 +2001,10 @@ pub async fn run(
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
 
+    let provider_credential = config.resolve_key_for_provider(provider_name);
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
-        config.api_key.as_deref(),
+        provider_credential.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
@@ -2500,9 +2501,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
+    let provider_credential = config.resolve_key_for_provider(provider_name);
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
-        config.api_key.as_deref(),
+        provider_credential.as_deref(),
         config.api_url.as_deref(),
         &config.reliability,
         &config.model_routes,
