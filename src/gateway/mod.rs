@@ -39,7 +39,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -793,26 +793,18 @@ async fn handle_pair(
     match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
-            if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
-                tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
-                let body = serde_json::json!({
-                    "paired": true,
-                    "persisted": false,
-                    "token": token,
-                    "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
-                });
-                return (StatusCode::OK, Json(body));
-            }
-
-            let body = serde_json::json!({
-                "paired": true,
-                "persisted": true,
-                "token": token,
-                "message": "Save this token — use it as Authorization: Bearer <token>"
-            });
-            (StatusCode::OK, Json(body))
+            pair_success_response(&state, token).await
         }
         Ok(None) => {
+            // In-memory startup code missed. Fall back to the on-disk store: an
+            // operator may have minted an on-demand "gateway" code via
+            // `rantaiclaw channels pair --channel gateway` (or the chat tool /
+            // TUI), which the daemon must honour without a restart. A store hit
+            // issues+persists a token exactly like the in-memory success path.
+            if let Some(token) = try_consume_gateway_store_code(&state, code) {
+                tracing::info!("🔐 New client paired via on-demand store code");
+                return pair_success_response(&state, token).await;
+            }
             tracing::warn!("🔐 Pairing attempt with invalid code");
             let err = serde_json::json!({"error": "Invalid pairing code"});
             (StatusCode::FORBIDDEN, Json(err))
@@ -826,6 +818,62 @@ async fn handle_pair(
                 "retry_after": lockout_secs
             });
             (StatusCode::TOO_MANY_REQUESTS, Json(err))
+        }
+    }
+}
+
+/// Build the `POST /pair` success response for an already-issued `token`:
+/// persist the token set to `config.toml` and report whether persistence
+/// succeeded. Shared by the in-memory startup-code path and the on-demand
+/// store-code path so both yield an identical response shape.
+async fn pair_success_response(
+    state: &AppState,
+    token: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+        tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
+        let body = serde_json::json!({
+            "paired": true,
+            "persisted": false,
+            "token": token,
+            "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
+        });
+        return (StatusCode::OK, Json(body));
+    }
+    let body = serde_json::json!({
+        "paired": true,
+        "persisted": true,
+        "token": token,
+        "message": "Save this token — use it as Authorization: Bearer <token>"
+    });
+    (StatusCode::OK, Json(body))
+}
+
+/// Consult the on-disk pairing-code store for a live `"gateway"` code matching
+/// `code`. On a hit, consume one use and issue+store a fresh bearer token via
+/// [`PairingGuard::issue_token`], returning the plaintext token. Returns `None`
+/// when the store has no matching live code (or on any store error — the caller
+/// then reports the generic "invalid code" rejection, never leaking store
+/// state). `grant_owner` is irrelevant for the gateway (it has no owner role),
+/// so it is ignored.
+fn try_consume_gateway_store_code(state: &AppState, code: &str) -> Option<String> {
+    let root = match crate::profile::ProfileManager::active() {
+        Ok(p) => p.root,
+        Err(e) => {
+            tracing::warn!("🔐 Could not resolve profile root for gateway store pairing: {e:#}");
+            return None;
+        }
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match crate::security::pairing_store::try_consume(&root, "gateway", code, now) {
+        Ok(Some(_outcome)) => Some(state.pairing.issue_token()),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("🔐 Gateway pairing store consult failed: {e:#}");
+            None
         }
     }
 }
@@ -2244,6 +2292,78 @@ mod tests {
         let in_memory = shared_config.lock();
         assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
         assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
+    }
+
+    /// Serializes the `HOME`-mutating gateway store-pairing test (process-global
+    /// env var). Held with `std::sync::Mutex` because the test body is sync.
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Minimal `AppState` for the store-pairing test: a fresh pairing guard plus
+    /// the smallest set of mocks. Only `pairing` and `config` matter here.
+    fn store_pairing_test_state(config: Config) -> AppState {
+        AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(true, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            tools_registry: Arc::new(Vec::new()),
+        }
+    }
+
+    /// A "gateway" code minted into the on-disk store (as `rantaiclaw channels
+    /// pair --channel gateway` does) is accepted by the gateway pair path's
+    /// store-consult fallback — the in-memory startup code never matched it —
+    /// and yields a bearer token that authenticates. A wrong/unminted code
+    /// returns `None`.
+    #[test]
+    fn gateway_store_minted_code_is_consumed_and_issues_token() {
+        let _g = HOME_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+
+        // Resolve the same profile root the handler will, and mint a "gateway"
+        // code into its store. The handler consumes against the real wall clock,
+        // so mint with the real `now` and a generous TTL to stay live.
+        let root = crate::profile::ProfileManager::active().unwrap().root;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = crate::security::pairing_store::mint(&root, "gateway", 3_600, None, false, now)
+            .expect("mint gateway code");
+
+        let state = store_pairing_test_state(Config::default());
+
+        // A wrong code is not in the store → no token.
+        assert!(try_consume_gateway_store_code(&state, "ZZZZ-ZZZZ").is_none());
+
+        // The minted code is consumed and a usable bearer token is issued.
+        let token =
+            try_consume_gateway_store_code(&state, &code).expect("store code should issue a token");
+        assert!(token.starts_with("zc_"), "token shape: {token}");
+        assert!(
+            state.pairing.is_authenticated(&token),
+            "issued token must authenticate against the guard"
+        );
+
+        std::env::remove_var("HOME");
     }
 
     #[test]
