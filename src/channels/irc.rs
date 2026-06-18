@@ -26,7 +26,9 @@ pub struct IrcChannel {
     nickname: String,
     username: String,
     channels: Vec<String>,
-    allowed_users: Vec<String>,
+    /// `Arc<RwLock<..>>` so a successful `/bind`/`/claim` can append the sender's
+    /// nick at runtime (immediate access without a channel restart).
+    allowed_users: Arc<std::sync::RwLock<Vec<String>>>,
     server_password: Option<String>,
     nickserv_password: Option<String>,
     sasl_password: Option<String>,
@@ -248,7 +250,7 @@ impl IrcChannel {
             nickname: cfg.nickname,
             username,
             channels: cfg.channels,
-            allowed_users: cfg.allowed_users,
+            allowed_users: Arc::new(std::sync::RwLock::new(cfg.allowed_users)),
             server_password: cfg.server_password,
             nickserv_password: cfg.nickserv_password,
             sasl_password: cfg.sasl_password,
@@ -258,12 +260,39 @@ impl IrcChannel {
     }
 
     fn is_user_allowed(&self, nick: &str) -> bool {
-        if self.allowed_users.iter().any(|u| u == "*") {
+        let Ok(users) = self.allowed_users.read() else {
+            return false;
+        };
+        if users.iter().any(|u| u == "*") {
             return true;
         }
-        self.allowed_users
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(nick))
+        users.iter().any(|u| u.eq_ignore_ascii_case(nick))
+    }
+
+    /// Append a freshly-paired nick to the runtime allowlist (case-insensitive
+    /// dedupe) so access is effective immediately. The persisted config (saved
+    /// by the pairing core) is the source of truth across restarts.
+    fn add_allowed_identity_runtime(&self, nick: &str) {
+        let nick = nick.trim();
+        if nick.is_empty() {
+            return;
+        }
+        if let Ok(mut users) = self.allowed_users.write() {
+            if !users.iter().any(|u| u.eq_ignore_ascii_case(nick)) {
+                users.push(nick.to_string());
+            }
+        }
+    }
+
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("IRC pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
     }
 
     /// Create a TLS connection to the IRC server.
@@ -552,13 +581,40 @@ impl Channel for IrcChannel {
                         continue;
                     }
 
-                    if !self.is_user_allowed(sender_nick) {
-                        continue;
-                    }
-
                     // Determine reply target: if sent to a channel, reply to channel;
                     // if DM (target == our nick), reply to sender
                     let is_channel = target.starts_with('#') || target.starts_with('&');
+
+                    if !self.is_user_allowed(sender_nick) {
+                        // Before rejecting, let a not-yet-allowed nick self-onboard
+                        // with a `/bind`/`/claim <code>` minted via
+                        // `rantaiclaw channels pair`. On success the nick lands in
+                        // `allowed_users` (and, for an owner `/claim`, `approval_owners`).
+                        if let Some(root) = Self::pairing_profile_root() {
+                            let identities = vec![sender_nick.to_string()];
+                            if let Some(reply) = crate::channels::pairing::try_handle_pairing(
+                                text,
+                                "irc",
+                                crate::channels::pairing::AllowlistField::AllowedUsers,
+                                &identities,
+                                &root,
+                            )
+                            .await
+                            {
+                                self.add_allowed_identity_runtime(sender_nick);
+                                let pair_reply_target = if is_channel {
+                                    target.to_string()
+                                } else {
+                                    sender_nick.to_string()
+                                };
+                                let _ =
+                                    self.send(&SendMessage::new(reply, pair_reply_target)).await;
+                                continue;
+                            }
+                        }
+                        continue;
+                    }
+
                     let reply_target = if is_channel {
                         target.to_string()
                     } else {
@@ -934,7 +990,7 @@ mod tests {
         assert_eq!(ch.nickname, "zcbot");
         assert_eq!(ch.username, "rantaiclaw");
         assert_eq!(ch.channels, vec!["#test"]);
-        assert_eq!(ch.allowed_users, vec!["alice"]);
+        assert_eq!(*ch.allowed_users.read().unwrap(), vec!["alice".to_string()]);
         assert_eq!(ch.server_password.as_deref(), Some("serverpass"));
         assert_eq!(ch.nickserv_password.as_deref(), Some("nspass"));
         assert_eq!(ch.sasl_password.as_deref(), Some("saslpass"));
@@ -1002,6 +1058,98 @@ nickname = "bot"
         let json = r#"{"server":"irc.test","nickname":"bot"}"#;
         let parsed: IrcConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.port, 6697);
+    }
+
+    // ── pairing (/bind, /claim) ──────────────────────────────
+
+    fn empty_allowlist_channel() -> IrcChannel {
+        IrcChannel::new(IrcChannelConfig {
+            server: "irc.test".into(),
+            port: 6697,
+            nickname: "bot".into(),
+            username: None,
+            channels: vec![],
+            allowed_users: vec![],
+            server_password: None,
+            nickserv_password: None,
+            sasl_password: None,
+            verify_tls: true,
+        })
+    }
+
+    #[test]
+    fn add_allowed_identity_runtime_grants_immediate_access() {
+        let ch = empty_allowlist_channel();
+        assert!(!ch.is_user_allowed("alice"));
+        ch.add_allowed_identity_runtime("alice");
+        assert!(ch.is_user_allowed("alice"));
+        // Case-insensitive dedupe (matches the allowlist semantics).
+        ch.add_allowed_identity_runtime("ALICE");
+        assert_eq!(ch.allowed_users.read().unwrap().len(), 1);
+    }
+
+    // Serialize the env-mutating Config::load_or_init test against itself.
+    static PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A store-minted "irc" code (the kind `rantaiclaw channels pair` issues) is
+    /// accepted on `/claim`: the shared core lands the sender's nick in
+    /// `allowed_users` AND `approval_owners`. Drives the same code path the
+    /// PRIVMSG handler invokes.
+    #[tokio::test]
+    async fn store_minted_irc_code_claims_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::config::schema::IrcConfig;
+        use crate::security::pairing_store;
+
+        let _guard = PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        // Seed a config with an irc section so apply_pairing has a target.
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.irc = Some(IrcConfig {
+                server: "irc.test".into(),
+                port: 6697,
+                nickname: "bot".into(),
+                username: None,
+                channels: vec![],
+                allowed_users: vec![],
+                server_password: None,
+                nickserv_password: None,
+                sasl_password: None,
+                verify_tls: Some(true),
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "irc", 3_600, None, true, now).unwrap();
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "irc",
+            AllowlistField::AllowedUsers,
+            &["alice".to_string()],
+            root,
+        )
+        .await
+        .expect("a /claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let users = &config.channels_config.irc.as_ref().unwrap().allowed_users;
+        assert!(users.contains(&"alice".to_string()), "users: {users:?}");
+        let owners = &config.channels_config.approval_owners;
+        assert!(owners.contains(&"alice".to_string()), "owners: {owners:?}");
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
     // ── Helpers ─────────────────────────────────────────────
