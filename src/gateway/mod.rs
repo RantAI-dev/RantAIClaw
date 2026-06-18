@@ -1700,6 +1700,35 @@ async fn handle_linq_webhook(
         );
     };
 
+    // Intercept `/bind` / `/claim` self-onboarding BEFORE the allowlist gate in
+    // `parse_webhook_payload` drops unknown senders. A successful pairing appends
+    // the sender to `allowed_senders` (+ `approval_owners` for an owner-capable
+    // `/claim`) and persists config; mirror it into the runtime allowlist so the
+    // next message is accepted without a gateway restart. The message is
+    // consumed (never forwarded to the agent).
+    if let Some((text, sender, reply_target)) = LinqChannel::extract_pairing_context(&payload) {
+        if let Some(root) = crate::profile::ProfileManager::active()
+            .ok()
+            .map(|p| p.root)
+        {
+            if let Some(reply) = crate::channels::pairing::try_handle_pairing(
+                &text,
+                "linq",
+                crate::channels::pairing::AllowlistField::AllowedSenders,
+                std::slice::from_ref(&sender),
+                &root,
+            )
+            .await
+            {
+                linq.add_allowed_sender_runtime(&sender);
+                if let Err(e) = linq.send(&SendMessage::new(reply, &reply_target)).await {
+                    tracing::error!("Failed to send Linq pairing reply: {e}");
+                }
+                return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+            }
+        }
+    }
+
     // Parse messages from the webhook payload
     let messages = linq.parse_webhook_payload(&payload);
 
