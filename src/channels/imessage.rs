@@ -1,33 +1,99 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use directories::UserDirs;
+use parking_lot::RwLock;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// iMessage channel using macOS `AppleScript` bridge.
 /// Polls the Messages database for new messages and sends replies via `osascript`.
 #[derive(Clone)]
 pub struct IMessageChannel {
-    allowed_contacts: Vec<String>,
+    /// Allowed contact handles (phone/email). Wrapped so `/bind`/`/claim`
+    /// self-onboarding can append a newly-paired contact at runtime without a
+    /// daemon restart (mirrors the persisted config update).
+    allowed_contacts: Arc<RwLock<Vec<String>>>,
     poll_interval_secs: u64,
 }
 
 impl IMessageChannel {
     pub fn new(allowed_contacts: Vec<String>) -> Self {
         Self {
-            allowed_contacts,
+            allowed_contacts: Arc::new(RwLock::new(allowed_contacts)),
             poll_interval_secs: 3,
         }
     }
 
     fn is_contact_allowed(&self, sender: &str) -> bool {
-        if self.allowed_contacts.iter().any(|u| u == "*") {
+        let contacts = self.allowed_contacts.read();
+        if contacts.iter().any(|u| u == "*") {
             return true;
         }
-        self.allowed_contacts
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(sender))
+        contacts.iter().any(|u| u.eq_ignore_ascii_case(sender))
+    }
+
+    /// Append a newly-paired contact to the runtime allowlist (case-insensitive
+    /// dedupe). Used by the shared `/bind`/`/claim` flow so the next message
+    /// from a paired contact is accepted without restarting the daemon. Config
+    /// persistence is handled separately by the shared pairing core.
+    fn add_allowed_contact_runtime(&self, handle: &str) {
+        let handle = handle.trim();
+        if handle.is_empty() {
+            return;
+        }
+        let mut contacts = self.allowed_contacts.write();
+        if !contacts.iter().any(|u| u.eq_ignore_ascii_case(handle)) {
+            contacts.push(handle.to_string());
+        }
+    }
+
+    /// Resolve the active profile root for the shared pairing-code store.
+    /// Returns `None` (pairing simply unavailable) when no profile is active.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        crate::profile::ProfileManager::active()
+            .ok()
+            .map(|p| p.root)
+    }
+
+    /// Try to handle an inbound `/bind`/`/claim` from `sender` against the shared
+    /// pairing store. Returns `true` if the message WAS a pairing command (the
+    /// caller must then NOT forward it to the agent). On a valid code the shared
+    /// core appends `sender` to `allowed_contacts` (+ `approval_owners` for an
+    /// owner-capable `/claim`) and persists config; we mirror it into the runtime
+    /// allowlist and reply via `osascript`.
+    ///
+    /// `sender` is the iMessage handle (phone/email) — the same identity used in
+    /// the [`Self::is_contact_allowed`] gate.
+    async fn try_handle_pairing(&self, text: &str, sender: &str) -> bool {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+
+        if parse_pairing_command(text).is_none() {
+            return false;
+        }
+        let Some(root) = Self::pairing_profile_root() else {
+            return false;
+        };
+        let Some(reply) = try_handle_pairing(
+            text,
+            "imessage",
+            AllowlistField::AllowedContacts,
+            std::slice::from_ref(&sender.to_string()),
+            &root,
+        )
+        .await
+        else {
+            // parse_pairing_command matched, so try_handle_pairing returns Some;
+            // be defensive regardless.
+            return false;
+        };
+
+        self.add_allowed_contact_runtime(sender);
+        if let Err(e) = self.send(&SendMessage::new(reply, sender)).await {
+            tracing::error!("Failed to send iMessage pairing reply: {e}");
+        }
+        true
     }
 }
 
@@ -217,6 +283,14 @@ end tell"#
                             last_rowid = rowid;
                         }
 
+                        // Intercept `/bind`/`/claim` self-onboarding before the
+                        // allowlist gate so an unknown contact can enrol with an
+                        // on-demand code (`rantaiclaw channels pair --channel
+                        // imessage`). Consumed: never forwarded to the agent.
+                        if self.try_handle_pairing(&text, &sender).await {
+                            continue;
+                        }
+
                         if !self.is_contact_allowed(&sender) {
                             continue;
                         }
@@ -324,14 +398,14 @@ mod tests {
     #[test]
     fn creates_with_contacts() {
         let ch = IMessageChannel::new(vec!["+1234567890".into()]);
-        assert_eq!(ch.allowed_contacts.len(), 1);
+        assert_eq!(ch.allowed_contacts.read().len(), 1);
         assert_eq!(ch.poll_interval_secs, 3);
     }
 
     #[test]
     fn creates_with_empty_contacts() {
         let ch = IMessageChannel::new(vec![]);
-        assert!(ch.allowed_contacts.is_empty());
+        assert!(ch.allowed_contacts.read().is_empty());
     }
 
     #[test]
@@ -982,5 +1056,92 @@ mod tests {
         // Very large rowid should return empty (no messages after this)
         let result = fetch_new_messages(&db_path, i64::MAX - 1).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Pairing (`/bind` / `/claim`) self-onboarding
+    //
+    // The inbound `/bind`/`/claim` hook lives in `listen`, which polls the
+    // macOS Messages SQLite DB and is only exercisable at runtime on macOS.
+    // These tests cover the non-gated pieces: the runtime-allowlist mirror and
+    // the shared pairing core against the imessage surface/field (the same code
+    // path `try_handle_pairing` drives, minus the `osascript` reply).
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn add_allowed_contact_runtime_accepts_paired_contact() {
+        let ch = IMessageChannel::new(vec![]);
+        assert!(!ch.is_contact_allowed("user@icloud.com"));
+        ch.add_allowed_contact_runtime("user@icloud.com");
+        assert!(ch.is_contact_allowed("user@icloud.com"));
+        // Case-insensitive dedupe (matches is_contact_allowed semantics).
+        ch.add_allowed_contact_runtime("USER@ICLOUD.COM");
+        assert_eq!(ch.allowed_contacts.read().len(), 1);
+    }
+
+    /// Serialize the env-mutating `Config::load_or_init` test against itself.
+    static IMSG_PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A store-minted "imessage" code (the kind `rantaiclaw channels pair
+    /// --channel imessage` issues) is accepted on `/claim`: the shared core
+    /// lands the contact in `allowed_contacts` AND `approval_owners`. Mirrors
+    /// telegram's store-minted-claim test against the imessage surface/field.
+    #[tokio::test]
+    async fn store_minted_imessage_code_claims_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        let _guard = IMSG_PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        // Seed a config with an imessage section so apply_pairing has a target.
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.imessage = Some(crate::config::IMessageConfig {
+                allowed_contacts: vec![],
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "imessage", 3_600, None, true, now).unwrap();
+        assert!(pairing_store::contains(root, "imessage", &code, now + 1).unwrap());
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "imessage",
+            AllowlistField::AllowedContacts,
+            &["user@icloud.com".to_string()],
+            root,
+        )
+        .await
+        .expect("a /claim must be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let contacts = &config
+            .channels_config
+            .imessage
+            .as_ref()
+            .unwrap()
+            .allowed_contacts;
+        assert!(
+            contacts.contains(&"user@icloud.com".to_string()),
+            "contacts: {contacts:?}"
+        );
+        let owners = &config.channels_config.approval_owners;
+        assert!(
+            owners.contains(&"user@icloud.com".to_string()),
+            "owners: {owners:?}"
+        );
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }
