@@ -580,10 +580,6 @@ impl LarkChannel {
                     if recv.sender.sender_type == "app" || recv.sender.sender_type == "bot" { continue; }
 
                     let sender_open_id = recv.sender.sender_id.open_id.as_deref().unwrap_or("");
-                    if !self.is_user_allowed(sender_open_id) {
-                        tracing::warn!("Lark WS: ignoring {sender_open_id} (not in allowed_users)");
-                        continue;
-                    }
 
                     let lark_msg = &recv.message;
 
@@ -629,6 +625,22 @@ impl LarkChannel {
                         continue;
                     }
 
+                    // Intercept on-demand store-minted `/bind`/`/claim` pairing
+                    // codes before the allowlist gate so unenrolled users can
+                    // self-onboard without a daemon restart. Identity is the
+                    // sender open_id; the reply routes to the chat_id.
+                    if self
+                        .try_handle_store_pairing(&text, sender_open_id, &lark_msg.chat_id)
+                        .await
+                    {
+                        continue;
+                    }
+
+                    if !self.is_user_allowed(sender_open_id) {
+                        tracing::warn!("Lark WS: ignoring {sender_open_id} (not in allowed_users)");
+                        continue;
+                    }
+
                     self.try_add_ack_reaction(&lark_msg.message_id).await;
 
                     let channel_msg = ChannelMessage {
@@ -655,6 +667,118 @@ impl LarkChannel {
     /// Check if a user open_id is allowed
     fn is_user_allowed(&self, open_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == open_id)
+    }
+
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("Lark pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Self-onboarding hook: if `text` is a `/bind`/`/claim` command, validate it
+    /// against the shared [`crate::security::pairing_store`] (appending the sender
+    /// open_id to `allowed_users` and, for an owner-capable `/claim`, to
+    /// `approval_owners`, then persisting `config.toml`) and reply to the chat.
+    /// Shared by the websocket and webhook inbound paths; `chat_id` is the reply
+    /// target (Lark sends with `receive_id_type=chat_id`).
+    ///
+    /// Returns `true` when the message WAS a pairing command (handled here — must
+    /// NOT be forwarded to the agent), `false` otherwise (normal message → gate).
+    async fn try_handle_store_pairing(&self, text: &str, open_id: &str, chat_id: &str) -> bool {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+
+        if parse_pairing_command(text).is_none() {
+            return false;
+        }
+        let Some(root) = Self::pairing_profile_root() else {
+            return false;
+        };
+
+        let Some(reply) = try_handle_pairing(
+            text,
+            "lark",
+            AllowlistField::AllowedUsers,
+            &[open_id.to_string()],
+            &root,
+        )
+        .await
+        else {
+            return false;
+        };
+
+        if let Err(e) = self.send(&SendMessage::new(reply, chat_id)).await {
+            tracing::warn!("Lark pairing: failed to send reply: {e:#}");
+        }
+        true
+    }
+
+    /// Extract `(text, open_id, chat_id)` from a webhook event payload for the
+    /// shared pairing path, *without* the allowlist gate (so an unenrolled user's
+    /// `/bind`/`/claim` is still seen). Returns `None` when the payload carries no
+    /// actionable text message.
+    fn extract_pairing_context(payload: &serde_json::Value) -> Option<(String, String, String)> {
+        let event_type = payload
+            .pointer("/header/event_type")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        if event_type != "im.message.receive_v1" {
+            return None;
+        }
+        let event = payload.get("event")?;
+
+        let open_id = event
+            .pointer("/sender/sender_id/open_id")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())?;
+
+        let msg_type = event
+            .pointer("/message/message_type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        let content_str = event
+            .pointer("/message/content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+
+        let text: String = match msg_type {
+            "text" => serde_json::from_str::<serde_json::Value>(content_str)
+                .ok()
+                .and_then(|v| {
+                    v.get("text")
+                        .and_then(|t| t.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                })?,
+            "post" => parse_post_content(content_str)?,
+            _ => return None,
+        };
+        let text = strip_at_placeholders(&text).trim().to_string();
+        if text.is_empty() {
+            return None;
+        }
+
+        let chat_id = event
+            .pointer("/message/chat_id")
+            .and_then(|c| c.as_str())
+            .unwrap_or(open_id);
+
+        Some((text, open_id.to_string(), chat_id.to_string()))
+    }
+
+    /// Webhook-payload wrapper around [`Self::try_handle_store_pairing`]. Returns
+    /// `true` when the payload WAS a pairing command (handled here — must NOT be
+    /// parsed/dispatched), `false` otherwise.
+    pub async fn try_handle_store_pairing_payload(&self, payload: &serde_json::Value) -> bool {
+        let Some((text, open_id, chat_id)) = Self::extract_pairing_context(payload) else {
+            return false;
+        };
+        self.try_handle_store_pairing(&text, &open_id, &chat_id)
+            .await
     }
 
     /// Get or refresh tenant access token
@@ -938,6 +1062,17 @@ impl LarkChannel {
 
                 let resp = serde_json::json!({ "challenge": challenge });
                 return (StatusCode::OK, Json(resp)).into_response();
+            }
+
+            // Intercept on-demand store-minted `/bind`/`/claim` pairing codes
+            // before the allowlist gate (in `parse_event_payload`) so unenrolled
+            // users can self-onboard without a daemon restart.
+            if state
+                .channel
+                .try_handle_store_pairing_payload(&payload)
+                .await
+            {
+                return (StatusCode::OK, "ok").into_response();
             }
 
             // Parse event messages
@@ -1545,5 +1680,88 @@ mod tests {
             ch_intl.message_reaction_url("om_test_message_id"),
             "https://open.larksuite.com/open-apis/im/v1/messages/om_test_message_id/reactions"
         );
+    }
+
+    /// The pairing context is extracted even for a user not (yet) in the
+    /// allowlist, so an unenrolled user's `/bind`/`/claim` reaches the shared core;
+    /// the reply routes to the chat_id, the identity is the open_id.
+    #[test]
+    fn lark_extract_pairing_context_ignores_allowlist() {
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_not_allowed" } },
+                "message": {
+                    "message_type": "text",
+                    "content": "{\"text\":\"/bind ABCD-EFGH\"}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+        let (text, open_id, chat_id) =
+            LarkChannel::extract_pairing_context(&payload).expect("should extract");
+        assert_eq!(text, "/bind ABCD-EFGH");
+        assert_eq!(open_id, "ou_not_allowed");
+        assert_eq!(chat_id, "oc_chat");
+    }
+
+    /// A store-minted owner code consumed for the `lark` surface appends the
+    /// sender open_id to `allowed_users` and `approval_owners` and persists the
+    /// config — the shared-core path `try_handle_store_pairing` invokes before the
+    /// allowlist gate (the API reply send is exercised in integration, so we assert
+    /// the store + config mutation here).
+    #[tokio::test]
+    async fn lark_store_minted_claim_grants_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.lark = Some(crate::config::schema::LarkConfig {
+                app_id: "id".into(),
+                app_secret: "secret".into(),
+                encrypt_key: None,
+                verification_token: None,
+                allowed_users: vec![],
+                use_feishu: false,
+                receive_mode: crate::config::schema::LarkReceiveMode::default(),
+                port: None,
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "lark", 900, None, true, now).unwrap();
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "lark",
+            AllowlistField::AllowedUsers,
+            &["ou_new".to_string()],
+            root,
+        )
+        .await
+        .expect("pairing command should be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let users = &config.channels_config.lark.as_ref().unwrap().allowed_users;
+        assert!(users.contains(&"ou_new".to_string()));
+        assert!(config
+            .channels_config
+            .approval_owners
+            .contains(&"ou_new".to_string()));
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }

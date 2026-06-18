@@ -54,6 +54,54 @@ impl QQChannel {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
+    /// Resolve the active profile root for the shared pairing-code store.
+    fn pairing_profile_root() -> Option<std::path::PathBuf> {
+        match crate::profile::ProfileManager::active() {
+            Ok(p) => Some(p.root),
+            Err(e) => {
+                tracing::warn!("QQ pairing: couldn't resolve profile root: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Self-onboarding hook: if `content` is a `/bind`/`/claim` command, validate
+    /// it against the shared [`crate::security::pairing_store`] (appending the
+    /// sender openid to `allowed_users` and, for an owner-capable `/claim`, to
+    /// `approval_owners`, then persisting `config.toml`) and reply to the chat.
+    /// Shared by the C2C and group reject points; `chat_id` is the pre-formatted
+    /// `user:`/`group:` reply target.
+    ///
+    /// Returns `true` when the message WAS a pairing command (handled here — must
+    /// NOT be forwarded to the agent), `false` otherwise (normal message → gate).
+    async fn try_handle_store_pairing(&self, content: &str, user_id: &str, chat_id: &str) -> bool {
+        use crate::channels::pairing::{parse_pairing_command, try_handle_pairing, AllowlistField};
+
+        if parse_pairing_command(content).is_none() {
+            return false;
+        }
+        let Some(root) = Self::pairing_profile_root() else {
+            return false;
+        };
+
+        let Some(reply) = try_handle_pairing(
+            content,
+            "qq",
+            AllowlistField::AllowedUsers,
+            &[user_id.to_string()],
+            &root,
+        )
+        .await
+        else {
+            return false;
+        };
+
+        if let Err(e) = self.send(&SendMessage::new(reply, chat_id)).await {
+            tracing::warn!("QQ pairing: failed to send reply: {e:#}");
+        }
+        true
+    }
+
     /// Fetch an access token from QQ's OAuth2 endpoint.
     async fn fetch_access_token(&self) -> anyhow::Result<(String, u64)> {
         let body = json!({
@@ -374,12 +422,19 @@ impl Channel for QQChannel {
                             // For QQ, user_openid is the identifier
                             let user_openid = d.get("author").and_then(|a| a.get("user_openid")).and_then(|u| u.as_str()).unwrap_or(author_id);
 
+                            let chat_id = format!("user:{user_openid}");
+
+                            // Intercept on-demand store-minted `/bind`/`/claim`
+                            // pairing codes before the allowlist gate so unenrolled
+                            // users can self-onboard without a daemon restart.
+                            if self.try_handle_store_pairing(content, user_openid, &chat_id).await {
+                                continue;
+                            }
+
                             if !self.is_user_allowed(user_openid) {
                                 tracing::warn!("QQ: ignoring C2C message from unauthorized user: {user_openid}");
                                 continue;
                             }
-
-                            let chat_id = format!("user:{user_openid}");
 
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
@@ -412,13 +467,20 @@ impl Channel for QQChannel {
 
                             let author_id = d.get("author").and_then(|a| a.get("member_openid")).and_then(|m| m.as_str()).unwrap_or("unknown");
 
+                            let group_openid = d.get("group_openid").and_then(|g| g.as_str()).unwrap_or("unknown");
+                            let chat_id = format!("group:{group_openid}");
+
+                            // Intercept on-demand store-minted `/bind`/`/claim`
+                            // pairing codes before the allowlist gate so unenrolled
+                            // users can self-onboard without a daemon restart.
+                            if self.try_handle_store_pairing(content, author_id, &chat_id).await {
+                                continue;
+                            }
+
                             if !self.is_user_allowed(author_id) {
                                 tracing::warn!("QQ: ignoring group message from unauthorized user: {author_id}");
                                 continue;
                             }
-
-                            let group_openid = d.get("group_openid").and_then(|g| g.as_str()).unwrap_or("unknown");
-                            let chat_id = format!("group:{group_openid}");
 
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
@@ -508,5 +570,60 @@ allowed_users = ["user1"]
         assert_eq!(config.app_id, "12345");
         assert_eq!(config.app_secret, "secret_abc");
         assert_eq!(config.allowed_users, vec!["user1"]);
+    }
+
+    /// A store-minted owner code consumed for the `qq` surface appends the sender
+    /// openid to `allowed_users` and `approval_owners` and persists the config —
+    /// the shared-core path `try_handle_store_pairing` invokes before both (C2C +
+    /// group) allowlist gates (the API reply send is exercised in integration, so
+    /// we assert the store + config mutation here).
+    #[tokio::test]
+    async fn qq_store_minted_claim_grants_owner() {
+        use crate::channels::pairing::{try_handle_pairing, AllowlistField};
+        use crate::security::pairing_store;
+
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+        {
+            let mut seed = crate::config::Config::load_or_init().await.unwrap();
+            seed.channels_config.qq = Some(crate::config::schema::QQConfig {
+                app_id: "id".into(),
+                app_secret: "secret".into(),
+                allowed_users: vec![],
+            });
+            seed.save().await.unwrap();
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let code = pairing_store::mint(root, "qq", 900, None, true, now).unwrap();
+
+        let reply = try_handle_pairing(
+            &format!("/claim {code}"),
+            "qq",
+            AllowlistField::AllowedUsers,
+            &["openid_xyz".to_string()],
+            root,
+        )
+        .await
+        .expect("pairing command should be handled");
+        assert!(reply.contains("owner"), "reply was: {reply}");
+
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        let users = &config.channels_config.qq.as_ref().unwrap().allowed_users;
+        assert!(users.contains(&"openid_xyz".to_string()));
+        assert!(config
+            .channels_config
+            .approval_owners
+            .contains(&"openid_xyz".to_string()));
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 }
