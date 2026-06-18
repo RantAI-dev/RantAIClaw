@@ -69,6 +69,13 @@ pub struct Config {
     pub config_path: PathBuf,
     /// API key for the selected provider. Overridden by `RANTAICLAW_API_KEY` or `API_KEY` env vars.
     pub api_key: Option<String>,
+    /// Per-provider API keys, keyed by canonical provider name (e.g. `"openai"`,
+    /// `"minimax"`). Lets the console store a distinct key per provider so
+    /// switching the active provider never reuses another provider's credential.
+    /// Encrypted at rest like `api_key`. The top-level `api_key` remains the
+    /// active (`default_provider`) provider's key for backward compatibility.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub provider_api_keys: HashMap<String, String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
     pub api_url: Option<String>,
     /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
@@ -3138,6 +3145,7 @@ impl Default for Config {
             workspace_dir: rantaiclaw_dir.join("workspace"),
             config_path: rantaiclaw_dir.join("config.toml"),
             api_key: None,
+            provider_api_keys: HashMap::new(),
             api_url: None,
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
@@ -3493,6 +3501,42 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
 }
 
 impl Config {
+    /// Resolve the API key to use for a specific provider.
+    ///
+    /// Resolution order:
+    /// 1. `provider_api_keys` (keyed by canonical provider name, then the raw
+    ///    name) — the per-provider store written by the console.
+    /// 2. the top-level `api_key`, but **only** when `provider` is the active
+    ///    `default_provider` (the top-level key is that provider's key).
+    /// 3. otherwise `None`, so [`crate::providers::resolve_provider_credential`]
+    ///    falls back to the provider-specific env var instead of sending the
+    ///    wrong provider's key — which is what caused 401s after switching
+    ///    providers in the console.
+    pub fn resolve_key_for_provider(&self, provider: &str) -> Option<String> {
+        let canonical = crate::providers::normalize_provider_name(provider);
+        for candidate in [canonical.as_str(), provider] {
+            if let Some(k) = self.provider_api_keys.get(candidate) {
+                let k = k.trim();
+                if !k.is_empty() {
+                    return Some(k.to_string());
+                }
+            }
+        }
+        let default_canonical = self
+            .default_provider
+            .as_deref()
+            .map(crate::providers::normalize_provider_name);
+        if default_canonical.as_deref() == Some(canonical.as_str()) {
+            if let Some(k) = self.api_key.as_deref() {
+                let k = k.trim();
+                if !k.is_empty() {
+                    return Some(k.to_string());
+                }
+            }
+        }
+        None
+    }
+
     pub async fn load_or_init() -> Result<Self> {
         // v0.5.0 introduces a profile-aware storage layout
         // (~/.rantaiclaw/profiles/<name>/...). On first run after upgrading
@@ -3602,6 +3646,11 @@ impl Config {
 
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
+            }
+            for key in config.provider_api_keys.values_mut() {
+                let mut wrapped = Some(std::mem::take(key));
+                decrypt_optional_secret(&store, &mut wrapped, "config.provider_api_keys.*")?;
+                *key = wrapped.unwrap_or_default();
             }
             config.apply_env_overrides();
             config.validate()?;
@@ -4037,6 +4086,12 @@ impl Config {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
         }
 
+        for key in config_to_save.provider_api_keys.values_mut() {
+            let mut wrapped = Some(std::mem::take(key));
+            encrypt_optional_secret(&store, &mut wrapped, "config.provider_api_keys.*")?;
+            *key = wrapped.unwrap_or_default();
+        }
+
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
@@ -4142,6 +4197,34 @@ mod tests {
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn resolve_key_for_provider_is_provider_aware() {
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("minimax".into());
+        cfg.api_key = Some("minimax-key".into());
+        cfg.provider_api_keys
+            .insert("openai".into(), "openai-key".into());
+
+        // per-provider store wins
+        assert_eq!(
+            cfg.resolve_key_for_provider("openai").as_deref(),
+            Some("openai-key")
+        );
+        // top-level api_key applies to the active default provider (+ aliases)
+        assert_eq!(
+            cfg.resolve_key_for_provider("minimax").as_deref(),
+            Some("minimax-key")
+        );
+        assert_eq!(
+            cfg.resolve_key_for_provider("minimax-cn").as_deref(),
+            Some("minimax-key")
+        );
+        // THE bug: the default provider's key must NOT leak to a different
+        // provider with no stored key → None, so the env-var fallback applies
+        // instead of sending the wrong key.
+        assert_eq!(cfg.resolve_key_for_provider("anthropic"), None);
+    }
 
     // ── Defaults ─────────────────────────────────────────────
 
@@ -4312,6 +4395,10 @@ default_temperature = 0.7
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
+            provider_api_keys: HashMap::from([(
+                "openai".to_string(),
+                "sk-openai-roundtrip".to_string(),
+            )]),
             api_url: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
@@ -4405,6 +4492,7 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(&toml_str).unwrap();
 
         assert_eq!(parsed.api_key, config.api_key);
+        assert_eq!(parsed.provider_api_keys, config.provider_api_keys);
         assert_eq!(parsed.default_provider, config.default_provider);
         assert_eq!(parsed.default_model, config.default_model);
         assert!((parsed.default_temperature - config.default_temperature).abs() < f64::EPSILON);
@@ -4536,6 +4624,7 @@ tool_dispatcher = "xml"
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),
+            provider_api_keys: HashMap::new(),
             api_url: None,
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),

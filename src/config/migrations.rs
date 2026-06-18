@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 5;
+pub const CURRENT_VERSION: u32 = 6;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -123,8 +123,19 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive default-only fields)
     }
 
-    // Future migrations (v6, v7, …) inserted here in order.
-    // if from < 6 { migrate_v6(raw)?; }
+    // v5 → v6: `provider_api_keys` (HashMap<String, String>, default empty) was
+    // added — a per-provider API key store so switching the active provider in
+    // the console no longer reuses another provider's credential. Additive with
+    // a serde default: configs that lack it deserialise fine and gain the
+    // default (`{}`) on next write, so there is nothing to transform. This arm
+    // burns a version slot so the schema_drift fingerprint is accepted with
+    // intent (mirrors v3 → v4 / v4 → v5).
+    if from < 6 {
+        // (no transformation; additive default-only field)
+    }
+
+    // Future migrations (v7, v8, …) inserted here in order.
+    // if from < 7 { migrate_v7(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)

@@ -459,9 +459,13 @@ impl Agent {
             .unwrap_or("anthropic/claude-sonnet-4-20250514")
             .to_string();
 
+        // Resolve the key for THIS provider (not blindly the top-level api_key,
+        // which belongs to `default_provider`) so a per-request provider
+        // override doesn't reuse another provider's credential.
+        let provider_credential = config.resolve_key_for_provider(provider_name);
         let provider: Box<dyn Provider> = providers::create_routed_provider(
             provider_name,
-            config.api_key.as_deref(),
+            provider_credential.as_deref(),
             config.api_url.as_deref(),
             &config.reliability,
             &config.model_routes,

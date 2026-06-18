@@ -144,11 +144,12 @@ async fn set_model(
     check_auth(&state, &headers)?;
     let mut cfg = state.config.lock().clone();
     if let Some(p) = body.provider {
-        cfg.default_provider = if p.trim().is_empty() {
+        let new_provider = if p.trim().is_empty() {
             None
         } else {
             Some(p.trim().to_string())
         };
+        switch_active_provider(&mut cfg, new_provider);
     }
     if let Some(m) = body.model {
         cfg.default_model = if m.trim().is_empty() {
@@ -452,9 +453,43 @@ fn secrets_view(cfg: &crate::config::Config) -> serde_json::Value {
 
 /// Apply a secrets mutation: a provided field sets the value (empty string clears
 /// it), an omitted field leaves the existing value untouched.
+/// Switch the active provider, carrying per-provider keys correctly: preserve
+/// the outgoing provider's key in the per-provider store (covers keys that only
+/// ever lived in the top-level `api_key`), then point the top-level `api_key` at
+/// the new provider's stored key (`None` if it has none yet, so the console
+/// prompts for it). This is what stops a switch from sending the previous
+/// provider's key to the new one.
+fn switch_active_provider(cfg: &mut crate::config::Config, new_provider: Option<String>) {
+    if let (Some(old), Some(key)) = (cfg.default_provider.as_deref(), cfg.api_key.as_deref()) {
+        let key = key.trim();
+        if !key.is_empty() {
+            let canon = crate::providers::normalize_provider_name(old);
+            cfg.provider_api_keys
+                .entry(canon)
+                .or_insert_with(|| key.to_string());
+        }
+    }
+    cfg.api_key = new_provider
+        .as_deref()
+        .map(crate::providers::normalize_provider_name)
+        .and_then(|canon| cfg.provider_api_keys.get(&canon).cloned());
+    cfg.default_provider = new_provider;
+}
+
 fn apply_secrets(cfg: &mut crate::config::Config, body: &SecretsBody) {
     if let Some(k) = body.api_key.as_ref() {
         let k = k.trim();
+        // Mirror the key into the per-provider store, keyed by the active
+        // provider, so switching providers later resolves the right credential
+        // (and switching back restores this one). Empty clears both.
+        if let Some(p) = cfg.default_provider.as_deref() {
+            let canon = crate::providers::normalize_provider_name(p);
+            if k.is_empty() {
+                cfg.provider_api_keys.remove(&canon);
+            } else {
+                cfg.provider_api_keys.insert(canon, k.to_string());
+            }
+        }
         cfg.api_key = if k.is_empty() {
             None
         } else {
@@ -500,6 +535,61 @@ async fn set_secrets(
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn apply_secrets_mirrors_key_into_per_provider_store() {
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("openai".into());
+        apply_secrets(
+            &mut cfg,
+            &SecretsBody {
+                api_key: Some("  sk-openai  ".into()),
+                api_url: None,
+            },
+        );
+        assert_eq!(cfg.api_key.as_deref(), Some("sk-openai"));
+        assert_eq!(
+            cfg.provider_api_keys.get("openai").map(String::as_str),
+            Some("sk-openai")
+        );
+    }
+
+    #[test]
+    fn switch_active_provider_carries_per_provider_keys() {
+        let mut cfg = Config::default();
+        // Pre-existing setup: minimax active with its key only in top-level.
+        cfg.default_provider = Some("minimax".into());
+        cfg.api_key = Some("minimax-key".into());
+
+        // Switch to openai (no key yet): top-level clears, minimax key preserved.
+        switch_active_provider(&mut cfg, Some("openai".into()));
+        assert_eq!(cfg.default_provider.as_deref(), Some("openai"));
+        assert_eq!(cfg.api_key, None, "openai has no saved key yet");
+        assert_eq!(
+            cfg.provider_api_keys.get("minimax").map(String::as_str),
+            Some("minimax-key"),
+            "previous provider's key must be preserved"
+        );
+
+        // Save the openai key, switch back to minimax: its key returns.
+        apply_secrets(
+            &mut cfg,
+            &SecretsBody {
+                api_key: Some("openai-key".into()),
+                api_url: None,
+            },
+        );
+        switch_active_provider(&mut cfg, Some("minimax".into()));
+        assert_eq!(cfg.api_key.as_deref(), Some("minimax-key"));
+        assert_eq!(
+            cfg.resolve_key_for_provider("openai").as_deref(),
+            Some("openai-key")
+        );
+        assert_eq!(
+            cfg.resolve_key_for_provider("minimax").as_deref(),
+            Some("minimax-key")
+        );
+    }
 
     #[test]
     fn telegram_token_shape_is_enforced() {

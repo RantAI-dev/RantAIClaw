@@ -5,6 +5,27 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.81-alpha] — 2026-06-18
+
+### Fixed
+
+- **Changing a provider's API key in the console no longer 401s the other
+  provider.** There was a single shared `api_key` (the active provider's key);
+  switching the active provider in the console kept the old key, so e.g. an
+  OpenAI request was sent with the MiniMax key → `401 invalid_api_key` ("rig
+  openai completion failed"). Resolution also short-circuited on any non-empty
+  key without consulting the provider's env var.
+
+### Added
+
+- **Per-provider API key store** (`provider_api_keys`, encrypted at rest like
+  `api_key`; config schema v5→v6, additive). The console now saves each
+  provider's key separately; switching the active provider carries that
+  provider's key (and preserves the previous one). Credential resolution is now
+  provider-aware (`Config::resolve_key_for_provider`): per-provider key →
+  top-level `api_key` only for the active provider → provider-specific env var.
+  Existing single-provider configs are unaffected.
+
 ## [0.6.80-alpha] — 2026-06-18
 
 ### Fixed
