@@ -5,6 +5,17 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.78-alpha] — 2026-06-18
+
+### Added
+
+- **MiniMax M3** is now the recommended MiniMax model. Added `MiniMax-M3` to the
+  curated model catalog (setup wizard, `/model` picker, provisioner) and made it
+  the default for the `minimax` provider, replacing `MiniMax-M2.7` (now listed as
+  "previous flagship"). The ID was verified live against the MiniMax API; a
+  `MiniMax-M3-highspeed` variant was checked and intentionally **not** added
+  because the API rejects it (does not exist yet).
+
 ## [0.6.77-alpha] — 2026-06-18
 
 Agent-authored skills: tell the bot "make me a skill that does X" and it
