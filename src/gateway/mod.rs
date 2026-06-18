@@ -1812,6 +1812,13 @@ async fn handle_nextcloud_talk_webhook(
         );
     };
 
+    // Intercept on-demand store-minted `/bind`/`/claim` pairing codes before the
+    // allowlist gate (which lives in `parse_webhook_payload`) so unenrolled actors
+    // can self-onboard without a daemon restart. Consumes the message when handled.
+    if nextcloud_talk.try_handle_store_pairing(&payload).await {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
     // Parse messages from webhook payload
     let messages = nextcloud_talk.parse_webhook_payload(&payload);
     if messages.is_empty() {
