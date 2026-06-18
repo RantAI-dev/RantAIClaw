@@ -886,6 +886,14 @@ fn parse_yaml_frontmatter(content: &str) -> std::collections::HashMap<String, St
     out
 }
 
+/// Test-only re-export of the private frontmatter parser so sibling modules
+/// (e.g. `tools::author_skill`) can assert that what they generate actually
+/// satisfies the real loader, not a copy of it.
+#[cfg(test)]
+pub(crate) fn test_parse_frontmatter(content: &str) -> std::collections::HashMap<String, String> {
+    parse_yaml_frontmatter(content)
+}
+
 fn parse_yaml_list(raw: &str) -> Vec<String> {
     let s = raw.trim();
     let inner = s
