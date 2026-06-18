@@ -30,6 +30,7 @@ pub mod linq;
 pub mod matrix;
 pub mod mattermost;
 pub mod nextcloud_talk;
+pub mod pairing;
 pub mod qq;
 pub mod qr_terminal;
 pub mod signal;
