@@ -66,7 +66,7 @@ Operational note for container users:
 | Key | Default | Purpose |
 |---|---|---|
 | `compact_context` | `false` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
-| `max_tool_iterations` | `10` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
+| `max_tool_iterations` | `50` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
@@ -294,7 +294,7 @@ Notes:
 | `workspace_only` | `true` | restrict writes/command paths to workspace scope |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names |
 | `forbidden_paths` | `[]` | explicit path denylist |
-| `max_actions_per_hour` | `100` | per-policy action budget |
+| `max_actions_per_hour` | `200` | per-policy action budget |
 | `max_cost_per_day_cents` | `1000` | per-policy spend guardrail |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
@@ -411,7 +411,7 @@ Top-level channel options are configured under `channels_config`.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
+| `message_timeout_secs` | `600` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
 
 Examples:
 

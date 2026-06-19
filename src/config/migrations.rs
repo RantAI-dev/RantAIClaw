@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 6;
+pub const CURRENT_VERSION: u32 = 7;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -134,8 +134,20 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive default-only field)
     }
 
-    // Future migrations (v7, v8, …) inserted here in order.
-    // if from < 7 { migrate_v7(raw)?; }
+    // v6 → v7: raised several limit DEFAULTS (no key/surface change, no
+    // transformation): `[autonomy].max_actions_per_hour` 20→200,
+    // `[agent].max_tool_iterations` 25→50,
+    // `[channels_config].message_timeout_secs` 300→600,
+    // `[reliability].provider_retries` 2→3. Configs that set these explicitly
+    // keep their values; configs that omit them pick up the new defaults. This
+    // arm burns a version slot so the schema_drift fingerprint (which embeds
+    // default values) is accepted with intent.
+    if from < 7 {
+        // (no transformation; default-value change only)
+    }
+
+    // Future migrations (v8, v9, …) inserted here in order.
+    // if from < 8 { migrate_v8(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)

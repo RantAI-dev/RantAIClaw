@@ -5,6 +5,28 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.83-alpha] — 2026-06-19
+
+### Changed
+
+- **Raised default limits that were cutting chats off mid-answer.** These are
+  the values applied to configs that don't set them explicitly (existing configs
+  with explicit values are unaffected):
+  - `[autonomy] max_actions_per_hour`: `20` → `200` (hourly tool-call budget —
+    the old default was exhausted quickly, surfacing as "Rate limit exceeded"
+    mid-turn).
+  - `[agent] max_tool_iterations`: `25` → `50` (per-turn tool-loop cap — long
+    multi-tool tasks no longer stop early with a "reached maximum tool calls"
+    message).
+  - `[channels_config] message_timeout_secs`: `300` → `600` (per-turn channel
+    budget; still scales up to 4x with tool-loop depth).
+  - `[reliability] provider_retries`: `2` → `3` (a transient provider/network
+    blip is less likely to fail the whole turn).
+
+  Security-by-default is unchanged: approval gating (`autonomous_tools=false`,
+  empty `approval_owners`), `require_approval_for_medium_risk`, and the shell
+  allowlist keep their conservative defaults.
+
 ## [0.6.82-alpha] — 2026-06-18
 
 Universal, on-demand pairing codes: mint a fresh code without restarting the
