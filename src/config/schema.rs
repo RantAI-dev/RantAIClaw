@@ -407,8 +407,10 @@ fn default_agent_max_tool_iterations() -> usize {
     // ~15 tool calls before producing a final answer; the 10-call cap
     // surfaced as "Agent exceeded maximum tool iterations" mid-skill
     // with an empty "[no response from model]" body. Cap is still
-    // bounded — runaway loops bail at 25 instead of being unlimited.
-    25
+    // bounded — runaway loops bail at 50 instead of being unlimited.
+    // Bumped 25 → 50 so long multi-tool turns finish instead of cutting off
+    // with a "reached maximum tool calls" message mid-task.
+    50
 }
 
 fn default_agent_max_history_messages() -> usize {
@@ -2039,7 +2041,7 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
+            max_actions_per_hour: 200,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
@@ -2185,7 +2187,9 @@ pub struct ReliabilityConfig {
 }
 
 fn default_provider_retries() -> u32 {
-    2
+    // Bumped 2 → 3 so a transient provider/network blip is less likely to fail
+    // the whole turn before a response is produced.
+    3
 }
 
 fn default_provider_backoff_ms() -> u64 {
@@ -2590,7 +2594,9 @@ pub struct ChannelsConfig {
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
-    300
+    // Bumped 300 → 600 so slow models + tool loops have room to finish a turn
+    // before the channel drops the response. Still scales up to 4x with depth.
+    600
 }
 
 impl Default for ChannelsConfig {
@@ -4299,7 +4305,7 @@ mod tests {
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, 20);
+        assert_eq!(a.max_actions_per_hour, 200);
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
@@ -4574,7 +4580,7 @@ reasoning_enabled = false
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
-        assert_eq!(cfg.max_tool_iterations, 25);
+        assert_eq!(cfg.max_tool_iterations, 50);
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
