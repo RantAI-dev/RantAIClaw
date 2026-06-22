@@ -1,6 +1,5 @@
 ---
 source: tests/schema_drift.rs
-assertion_line: 42
 description: "Config JSON Schema fingerprint. If this test fails, you changed the on-disk config.toml surface. Bump config::migrations::CURRENT_VERSION, add a migrate_vN function, write a unit test, then `cargo insta accept` here."
 expression: pretty
 ---
@@ -448,7 +447,7 @@ expression: pretty
       "description": "On-disk schema version. Stamped by `config::migrations::migrate`\nat load time and round-tripped on every write so the next\nload can skip migrations that already ran. Absent on configs\nwritten by pre-v0.6.45 binaries — the migrator treats those\nas version `0` and stamps the current version.",
       "type": "integer",
       "format": "uint32",
-      "default": 7,
+      "default": 8,
       "minimum": 0
     },
     "secrets": {
@@ -546,7 +545,7 @@ expression: pretty
           "minimum": 0
         },
         "max_tool_iterations": {
-          "description": "Maximum tool-call loop turns per user message. Default: `10`.\nSetting to `0` falls back to the safe default of `10`.",
+          "description": "Maximum tool-call loop turns per user message. Default: `50`.\nSetting to `0` falls back to the safe runtime cap of `10`.",
           "type": "integer",
           "format": "uint",
           "default": 50,
@@ -610,17 +609,17 @@ expression: pretty
           }
         },
         "level": {
-          "description": "Autonomy level: `read_only`, `supervised` (default), or `full`.",
+          "description": "Autonomy level: `readonly`, `supervised` (default), or `full`.",
           "$ref": "#/$defs/AutonomyLevel"
         },
         "max_actions_per_hour": {
-          "description": "Maximum actions allowed per hour per policy. Default: `100`.",
+          "description": "Maximum tool actions per hour per policy — the primary runaway guard\nactually enforced in the agent loop. Default: `200`.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
         },
         "max_cost_per_day_cents": {
-          "description": "Maximum cost per day in cents per policy. Default: `1000`.",
+          "description": "Per-policy daily cost ceiling in cents. NOTE: currently tracked for\nreporting/telemetry only — it is not enforced as a hard stop in the\nagent loop, so it will not interrupt a turn. The enforced runaway guard\nis `max_actions_per_hour`.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0

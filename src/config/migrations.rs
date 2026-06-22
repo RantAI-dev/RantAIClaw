@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 7;
+pub const CURRENT_VERSION: u32 = 8;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -146,8 +146,21 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; default-value change only)
     }
 
-    // Future migrations (v8, v9, …) inserted here in order.
-    // if from < 8 { migrate_v8(raw)?; }
+    // v7 → v8: documentation-only schema changes. Corrected doc comments that
+    // the JSON-schema fingerprint embeds: `[autonomy].level` `read_only`→
+    // `readonly` (the value that errors if mistyped), the stale `Default:`
+    // annotations on `[agent].max_tool_iterations` (`10`→`25`) and
+    // `[autonomy].max_actions_per_hour` (`100`→`200`), and a note that
+    // `max_cost_per_day_cents` is tracked but not enforced. No key, surface, or
+    // default-value change → nothing to transform. This arm burns a version slot
+    // so the schema_drift fingerprint (which embeds doc strings) is accepted with
+    // intent (mirrors v6 → v7).
+    if from < 8 {
+        // (no transformation; documentation-only fingerprint change)
+    }
+
+    // Future migrations (v9, v10, …) inserted here in order.
+    // if from < 9 { migrate_v9(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -226,6 +239,24 @@ mod tests {
         assert!(
             cc.get("autonomous_tools").is_none(),
             "migration must not inject autonomous_tools; serde default handles it"
+        );
+    }
+
+    #[test]
+    fn v7_to_v8_is_doc_only_noop_preserving_content() {
+        // v7 → v8 only corrected doc comments embedded in the JSON-schema
+        // fingerprint (no key/surface/default-value change). A v7 config
+        // migrates to v8 (CURRENT_VERSION) with all content intact and without
+        // the migration injecting or transforming anything.
+        let mut v = parse("schema_version = 7\n[autonomy]\nlevel = \"full\"\n");
+        let migrated = migrate(&mut v).unwrap();
+        assert!(migrated, "v7 bump should be reported as transformed");
+        assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+        let autonomy = v.get("autonomy").unwrap().as_table().unwrap();
+        assert_eq!(
+            autonomy.get("level").unwrap().as_str(),
+            Some("full"),
+            "doc-only migration must not touch config content"
         );
     }
 
