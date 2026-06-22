@@ -5,6 +5,36 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.84-alpha] — 2026-06-19
+
+### Fixed
+
+- **In-chat approvals no longer get stuck.** Approving a gated tool/command over
+  a channel now accepts forgiving replies — a bare `/approve`, `approve`, `yes`,
+  `y`, `ok` (or `/deny`, `no`) resolves the single pending request, and naming
+  the command resolves the one pending tool — instead of requiring the exact
+  `/approve <tool>` / `/allow <basename>` token, which silently hung to the
+  5-minute auto-deny. With multiple requests pending, the bot lists them and asks
+  you to pick one. Owner-authority is unchanged (only owners approve; deny is
+  honored from anyone).
+
+### Added
+
+- **Live config reload for the channel runtime — no restart.** `rantaiclaw
+  channels run` now hot-reloads owners (`approval_owners`), the guest capability
+  ceiling (`guest_allowed_tools`/`guest_allowed_commands`), and the owner command
+  allowlist (`autonomy.allowed_commands`) when `config.toml` changes — CLI / TUI
+  `/permissions` / chat edits apply on the next message (~instantly), reusing the
+  existing per-message config-stamp reload. (Removing a command from the allowlist
+  still takes effect on restart — the live sync only widens.)
+- **Manage the owner command allowlist from the permissions surface.** A new
+  `allow-command` target on `rantaiclaw permissions`, the `/permissions` TUI
+  command, and the owner-only `manage_permissions` chat tool edits
+  `autonomy.allowed_commands` — the command BASENAMES an owner may run without an
+  approval prompt (e.g. `permissions add allow-command kubectl`, or ask the bot
+  "let me run kubectl"). Basenames here, not globs — globs are the guest
+  `command` list.
+
 ## [0.6.83-alpha] — 2026-06-19
 
 ### Changed
