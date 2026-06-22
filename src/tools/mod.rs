@@ -15,6 +15,21 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+/// Appended to rate-limit tool errors so the dead-end names the knob and the
+/// reset behaviour. The per-hour action budget is the only runaway guard
+/// actually enforced in the loop, so it surfaces on heavy/long-running chats.
+pub(crate) const RATE_LIMIT_REMEDIATION: &str = "\nThe per-hour action budget \
+resets on a rolling 1-hour window. For heavier use, an operator can raise \
+[autonomy].max_actions_per_hour in config.toml.";
+
+/// Appended to path-policy tool errors so the operator learns why a path was
+/// rejected and how to allow it, instead of dead-ending (as real sessions did
+/// when a file lived outside the workspace).
+pub(crate) const PATH_POLICY_REMEDIATION: &str = "\nFile tools are confined to \
+the workspace directory; [autonomy].workspace_only and [autonomy].forbidden_paths \
+in config.toml control this. Move the file into the workspace, or have an operator \
+relax those settings.";
+
 pub mod author_skill;
 pub mod browser;
 pub mod browser_open;

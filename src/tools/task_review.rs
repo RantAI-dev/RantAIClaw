@@ -77,7 +77,10 @@ impl Tool for TaskReviewTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Rate limit exceeded".into()),
+                error: Some(format!(
+                    "Rate limit exceeded.{}",
+                    crate::tools::RATE_LIMIT_REMEDIATION
+                )),
             });
         }
 

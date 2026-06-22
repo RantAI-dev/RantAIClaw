@@ -31,7 +31,10 @@ impl CronUpdateTool {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
+                error: Some(format!(
+                    "Rate limit exceeded: too many actions in the last hour.{}",
+                    crate::tools::RATE_LIMIT_REMEDIATION
+                )),
             });
         }
 
@@ -39,7 +42,10 @@ impl CronUpdateTool {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
+                error: Some(format!(
+                    "Rate limit exceeded: action budget exhausted.{}",
+                    crate::tools::RATE_LIMIT_REMEDIATION
+                )),
             });
         }
 
