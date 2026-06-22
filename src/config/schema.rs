@@ -386,8 +386,8 @@ pub struct AgentConfig {
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
     #[serde(default)]
     pub compact_context: bool,
-    /// Maximum tool-call loop turns per user message. Default: `10`.
-    /// Setting to `0` falls back to the safe default of `10`.
+    /// Maximum tool-call loop turns per user message. Default: `50`.
+    /// Setting to `0` falls back to the safe runtime cap of `10`.
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
     /// Maximum conversation history messages retained per session. Default: `50`.
@@ -1962,7 +1962,7 @@ impl Default for ObservabilityConfig {
 /// risk approval gates, and per-policy budgets.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
-    /// Autonomy level: `read_only`, `supervised` (default), or `full`.
+    /// Autonomy level: `readonly`, `supervised` (default), or `full`.
     pub level: AutonomyLevel,
     /// Restrict file writes and command paths to the workspace directory. Default: `true`.
     pub workspace_only: bool,
@@ -1970,9 +1970,13 @@ pub struct AutonomyConfig {
     pub allowed_commands: Vec<String>,
     /// Explicit path denylist. Default includes system-critical paths.
     pub forbidden_paths: Vec<String>,
-    /// Maximum actions allowed per hour per policy. Default: `100`.
+    /// Maximum tool actions per hour per policy — the primary runaway guard
+    /// actually enforced in the agent loop. Default: `200`.
     pub max_actions_per_hour: u32,
-    /// Maximum cost per day in cents per policy. Default: `1000`.
+    /// Per-policy daily cost ceiling in cents. NOTE: currently tracked for
+    /// reporting/telemetry only — it is not enforced as a hard stop in the
+    /// agent loop, so it will not interrupt a turn. The enforced runaway guard
+    /// is `max_actions_per_hour`.
     pub max_cost_per_day_cents: u32,
 
     /// Require explicit approval for medium-risk shell commands.
@@ -4141,6 +4145,23 @@ impl Config {
             .await
             .context("Failed to fsync temporary config file")?;
         drop(temp_file);
+
+        // Secure-by-default: the config holds bot tokens / API keys, so restrict
+        // it to the owner (0600) before it becomes the live file. Set on the temp
+        // path so the atomic rename publishes an already-locked file — otherwise
+        // the daemon only *warns* about world-readable configs on the next load.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to restrict config permissions to 0600: {}",
+                        temp_path.display()
+                    )
+                })?;
+        }
 
         let had_existing_config = self.config_path.exists();
         if had_existing_config {
@@ -6649,22 +6670,45 @@ default_model = "legacy-model"
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
 
-        // Create a config and save it
+        // Create a config and save it. `save()` itself must publish the file
+        // owner-only (0600) — no external chmod step — since it carries secrets.
         let mut config = Config::default();
         config.config_path = config_path.clone();
         config.save().await.unwrap();
-
-        // Apply the same permission logic as load_or_init
-        fs::set_permissions(&config_path, Permissions::from_mode(0o600))
-            .await
-            .expect("Failed to set permissions");
 
         let meta = fs::metadata(&config_path).await.unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
-            "New config file should be owner-only (0600), got {mode:o}"
+            "save() must produce an owner-only (0600) config, got {mode:o}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn resaving_world_readable_config_relocks_to_0600() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Simulate a pre-existing world-readable config (the state real hosts
+        // were found in: an external edit left it 0664).
+        let mut config = Config::default();
+        config.config_path = config_path.clone();
+        config.save().await.unwrap();
+        fs::set_permissions(&config_path, Permissions::from_mode(0o664))
+            .await
+            .unwrap();
+
+        // A subsequent save (e.g. a `bind-telegram` allowlist edit) must re-lock.
+        config.save().await.unwrap();
+
+        let mode = fs::metadata(&config_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "re-save must re-lock to 0600, got {mode:o}");
     }
 
     #[cfg(unix)]
