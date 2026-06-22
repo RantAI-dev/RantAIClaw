@@ -1130,15 +1130,19 @@ enum PermissionsCommands {
     Show,
     /// Add an entry to a permission list
     Add {
-        /// What to add: `owner` | `tool` | `command`
+        /// What to add: `owner` | `tool` | `command` | `allow-command`.
+        /// `allow-command` is the owner autonomy allowlist (autonomy.allowed_commands)
+        /// and takes a command BASENAME (e.g. `kubectl`), not a glob — the glob form
+        /// (`"kubectl *"`) belongs to the guest `command` list.
         target: String,
-        /// The value: a sender identity (owner), tool name (tool), or
-        /// shell-command glob (command, e.g. `"kubectl get *"`)
+        /// The value: a sender identity (owner), tool name (tool),
+        /// shell-command glob (command, e.g. `"kubectl get *"`), or a command
+        /// basename (allow-command, e.g. `kubectl`)
         value: String,
     },
     /// Remove an entry from a permission list
     Remove {
-        /// What to remove: `owner` | `tool` | `command`
+        /// What to remove: `owner` | `tool` | `command` | `allow-command`
         target: String,
         /// The value to remove (exact match)
         value: String,
@@ -2279,7 +2283,7 @@ async fn handle_permissions_command(
         PermissionsCommands::Show => {
             print!(
                 "{}",
-                permissions::render(&config.channels_config, &config.autonomy.auto_approve)
+                permissions::render(&config, &config.autonomy.auto_approve)
             );
             return Ok(());
         }
@@ -2288,11 +2292,13 @@ async fn handle_permissions_command(
     };
 
     let target = Target::parse(&target_str).ok_or_else(|| {
-        anyhow::anyhow!("unknown target `{target_str}`; expected one of: owner | tool | command")
+        anyhow::anyhow!(
+            "unknown target `{target_str}`; expected one of: owner | tool | command | allow-command"
+        )
     })?;
 
     let mut updated = config.clone();
-    let outcome = permissions::apply(&mut updated.channels_config, target, op, &value);
+    let outcome = permissions::apply(&mut updated, target, op, &value);
 
     if !outcome.changed {
         println!("ℹ️ {}", outcome.message);

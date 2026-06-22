@@ -6,6 +6,7 @@
 //!
 //! > "add my colleague @bob as an owner"
 //! > "let normal users run `kubectl get` and `kubectl describe`"
+//! > "let me run kubectl without approval"  (→ add allow-command kubectl)
 //! > "show me the current permissions"
 //!
 //! ## Why this is safe to expose
@@ -64,13 +65,18 @@ impl Tool for ManagePermissionsTool {
     }
 
     fn description(&self) -> &str {
-        "Owner-only. Manage who owns this bot and what NON-owner (\"guest\") users \
-         may do on multi-user channels. Owners get the full toolset and may approve \
+        "Owner-only. Manage who owns this bot, what NON-owner (\"guest\") users \
+         may do on multi-user channels, and which shell commands an owner may run \
+         without an approval prompt. Owners get the full toolset and may approve \
          tool calls; guests run under a capability ceiling. Use action=show to \
-         review, add/remove with target=owner|tool|command to change. \
+         review, add/remove with target=owner|tool|command|allow-command to change. \
          target=owner takes a sender identity (e.g. a Telegram numeric user id or a \
          Slack/Discord username); target=tool takes a tool name (e.g. shell, \
-         web_search); target=command takes a shell-command glob (e.g. 'kubectl get *')."
+         web_search); target=command takes a GUEST shell-command glob (e.g. \
+         'kubectl get *'); target=allow-command adds an OWNER command BASENAME to \
+         the autonomy allowlist so the shell tool may run it without prompting \
+         (e.g. value='kubectl' — a basename, NOT a glob). So 'let me run kubectl' \
+         → add allow-command kubectl."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -84,12 +90,12 @@ impl Tool for ManagePermissionsTool {
                 },
                 "target": {
                     "type": "string",
-                    "enum": ["owner", "tool", "command"],
-                    "description": "Which list to change (required for add/remove). owner = full-privilege sender; tool = a tool guests may use; command = a shell-command glob guests may run"
+                    "enum": ["owner", "tool", "command", "allow-command"],
+                    "description": "Which list to change (required for add/remove). owner = full-privilege sender; tool = a tool guests may use; command = a shell-command glob guests may run; allow-command = an OWNER command BASENAME (e.g. 'kubectl', NOT a glob) the shell tool may run without an approval prompt (autonomy.allowed_commands)"
                 },
                 "value": {
                     "type": "string",
-                    "description": "The entry to add/remove: a sender identity (owner), tool name (tool), or shell-command glob (command). Required for add/remove."
+                    "description": "The entry to add/remove: a sender identity (owner), tool name (tool), shell-command glob (command), or command basename (allow-command, e.g. 'kubectl'). Required for add/remove."
                 }
             },
             "required": ["action"]
@@ -113,8 +119,7 @@ impl Tool for ManagePermissionsTool {
         };
 
         if action == "show" {
-            let rendered =
-                permissions::render(&config.channels_config, &config.autonomy.auto_approve);
+            let rendered = permissions::render(&config, &config.autonomy.auto_approve);
             return Ok(ToolResult {
                 success: true,
                 output: rendered,
@@ -139,7 +144,7 @@ impl Tool for ManagePermissionsTool {
             .trim();
         let Some(target) = Target::parse(target_str) else {
             return Ok(err(format!(
-                "unknown or missing target `{target_str}` (expected: owner | tool | command)"
+                "unknown or missing target `{target_str}` (expected: owner | tool | command | allow-command)"
             )));
         };
 
@@ -178,7 +183,7 @@ impl Tool for ManagePermissionsTool {
         // can't read-modify-write over each other (last-writer-wins data loss).
         let _save_guard = SAVE_LOCK.lock().await;
 
-        let outcome = permissions::apply(&mut config.channels_config, target, op, value);
+        let outcome = permissions::apply(&mut config, target, op, value);
         if !outcome.changed {
             // Nothing to persist; report the no-op outcome as success.
             return Ok(ToolResult {

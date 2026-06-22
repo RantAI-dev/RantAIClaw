@@ -35,7 +35,7 @@ use crate::approval::{
     ApprovalResponse,
 };
 use crate::channels::traits::{Channel, SendMessage};
-use crate::security::{Decision, PendingApprovals, SecurityPolicy};
+use crate::security::{Decision, PendingApprovals, PendingRequest, SecurityPolicy};
 
 /// Format a new approval request as a chat-friendly message.
 pub fn format_approval_message(basename: &str, full_command: &str) -> String {
@@ -67,19 +67,47 @@ pub fn try_handle_reply(
     sender: &str,
     owners: &[String],
 ) -> Option<String> {
-    let parsed = parse_reply(text)?;
-    if parsed.verb == ReplyVerb::Allow && !crate::approval::can_approve(owners, sender) {
-        // Recognised as an allow reply, but this sender isn't an owner.
-        // Consume the message (it WAS an approval attempt, not chat) and tell
-        // them they can't grant it. The pending request stays open so a real
-        // owner can still resolve it.
-        return Some(format!(
-            "You're not authorized to approve `{}`. Ask an owner to reply `/allow {}`.",
-            parsed.basename, parsed.basename
-        ));
+    if let Some(parsed) = parse_reply(text) {
+        if parsed.verb == ReplyVerb::Allow && !can_approve(owners, sender) {
+            // Recognised as an allow reply, but this sender isn't an owner.
+            // Consume the message (it WAS an approval attempt, not chat) and tell
+            // them they can't grant it. The pending request stays open so a real
+            // owner can still resolve it.
+            return Some(format!(
+                "You're not authorized to approve `{}`. Ask an owner to reply `/allow {}`.",
+                parsed.basename, parsed.basename
+            ));
+        }
+        let pending = security.pending()?;
+        return handle_parsed(&parsed, security, &pending);
     }
+
+    // Forgiving bare-verb form (`allow`, `yes`, `ok`, `deny`, `no`, …) with no
+    // target token: resolve the single pending shell request, if exactly one.
+    let verb = parse_bare_verb(text)?;
     let pending = security.pending()?;
-    handle_parsed(&parsed, security, &pending)
+    let snapshot = pending.list();
+    match snapshot.len() {
+        0 => None, // nothing pending → normal chat ("yes please").
+        1 => {
+            let basename = snapshot[0].basename.clone();
+            let parsed = ParsedReply {
+                verb: match verb {
+                    BareVerb::Approve => ReplyVerb::Allow,
+                    BareVerb::Deny => ReplyVerb::Deny,
+                },
+                basename: basename.clone(),
+                persist: false,
+            };
+            if parsed.verb == ReplyVerb::Allow && !can_approve(owners, sender) {
+                return Some(format!(
+                    "You're not authorized to approve `{basename}`. Ask an owner to reply `/allow {basename}`."
+                ));
+            }
+            handle_parsed(&parsed, security, &pending)
+        }
+        _ => Some(ambiguous_pending_message(&snapshot, "allow")),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -338,6 +366,38 @@ enum ToolReplyVerb {
     Deny,
 }
 
+/// A bare approval verb with no target token (`approve`, `yes`, `ok`, `deny`,
+/// `no`, …). Shared by both relays so a single pending request can be resolved
+/// without forcing the owner to type the exact tool/command token.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum BareVerb {
+    Approve,
+    Deny,
+}
+
+/// Parse `text` as a bare approval/deny verb with NO target token. Returns
+/// `None` for anything carrying extra tokens (so `/approve shell` and chatty
+/// sentences like `yes please` are NOT treated as bare verbs). Case-insensitive;
+/// an optional single leading slash is allowed.
+fn parse_bare_verb(text: &str) -> Option<BareVerb> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let body = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    let mut tokens = body.split_whitespace();
+    let head = tokens.next()?;
+    // Bare means exactly one token.
+    if tokens.next().is_some() {
+        return None;
+    }
+    match head.to_ascii_lowercase().as_str() {
+        "approve" | "approved" | "yes" | "y" | "ok" | "allow" => Some(BareVerb::Approve),
+        "deny" | "no" | "n" | "reject" => Some(BareVerb::Deny),
+        _ => None,
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedToolReply {
     verb: ToolReplyVerb,
@@ -384,43 +444,98 @@ pub fn try_handle_tool_reply(
     sender: &str,
     owners: &[String],
 ) -> Option<String> {
-    let parsed = parse_tool_reply(text)?;
-    // Only claim the message if this tool is genuinely awaiting a decision —
-    // otherwise it may be a shell reply or normal chat.
-    let pending_for_tool = relay.list().iter().any(|r| r.basename == parsed.tool);
-    if !pending_for_tool {
+    // First try the exact / loose-name form (`/approve <token>`).
+    if let Some(parsed) = parse_tool_reply(text) {
+        let pending = relay.list();
+        // Exact tool basename match keeps the original behavior.
+        if pending.iter().any(|r| r.basename == parsed.tool) {
+            return Some(resolve_tool(
+                relay,
+                &parsed.tool,
+                parsed.verb,
+                sender,
+                owners,
+            ));
+        }
+        // Loose name: the token isn't an exact tool basename, but if there's
+        // exactly one request pending, treat it as that one (e.g. `/approve
+        // kubectl` → the single pending `shell` request).
+        if pending.len() == 1 {
+            return Some(resolve_tool(
+                relay,
+                &pending[0].basename,
+                parsed.verb,
+                sender,
+                owners,
+            ));
+        }
+        // Token names something not pending and the queue is empty or
+        // ambiguous → not ours (could be a shell reply or plain chat).
         return None;
     }
-    match parsed.verb {
+
+    // Otherwise try a bare verb with no target token (`approve`, `yes`, `ok`,
+    // `deny`, `no`, …). Only meaningful when something is actually pending.
+    let verb = parse_bare_verb(text)?;
+    let verb = match verb {
+        BareVerb::Approve => ToolReplyVerb::Approve,
+        BareVerb::Deny => ToolReplyVerb::Deny,
+    };
+    let pending = relay.list();
+    match pending.len() {
+        0 => None, // nothing pending → normal chat ("yes please").
+        1 => Some(resolve_tool(
+            relay,
+            &pending[0].basename,
+            verb,
+            sender,
+            owners,
+        )),
+        _ => Some(ambiguous_pending_message(&pending, "approve")),
+    }
+}
+
+/// Resolve a single tool request (already known to be pending) honoring the
+/// owner gate for approvals.
+fn resolve_tool(
+    relay: &PendingApprovals,
+    tool: &str,
+    verb: ToolReplyVerb,
+    sender: &str,
+    owners: &[String],
+) -> String {
+    match verb {
         ToolReplyVerb::Approve => {
             if !can_approve(owners, sender) {
-                return Some(format!(
-                    "You're not authorized to approve `{}`. Ask an owner to reply `/approve {}`.",
-                    parsed.tool, parsed.tool
-                ));
+                return format!(
+                    "You're not authorized to approve `{tool}`. Ask an owner to reply `/approve {tool}`."
+                );
             }
-            match relay.resolve_by_basename(&parsed.tool, Decision::Once) {
-                Some(_) => Some(format!(
-                    "✅ Approved `{}` — the agent will run it now.",
-                    parsed.tool
-                )),
-                None => Some(format!(
-                    "Couldn't approve `{}` — more than one request is queued for it.",
-                    parsed.tool
-                )),
+            match relay.resolve_by_basename(tool, Decision::Once) {
+                Some(_) => format!("✅ Approved `{tool}` — the agent will run it now."),
+                None => {
+                    format!("Couldn't approve `{tool}` — more than one request is queued for it.")
+                }
             }
         }
-        ToolReplyVerb::Deny => match relay.resolve_by_basename(&parsed.tool, Decision::Deny) {
-            Some(_) => Some(format!(
-                "🚫 Denied `{}`. The tool call will fail.",
-                parsed.tool
-            )),
-            None => Some(format!(
-                "Couldn't deny `{}` — more than one request is queued for it.",
-                parsed.tool
-            )),
+        ToolReplyVerb::Deny => match relay.resolve_by_basename(tool, Decision::Deny) {
+            Some(_) => format!("🚫 Denied `{tool}`. The tool call will fail."),
+            None => format!("Couldn't deny `{tool}` — more than one request is queued for it."),
         },
     }
+}
+
+/// Build a "which one?" message listing the pending basenames so the owner can
+/// name a specific target rather than us guessing.
+fn ambiguous_pending_message(pending: &[PendingRequest], verb: &str) -> String {
+    let names: Vec<String> = pending
+        .iter()
+        .map(|r| format!("`{}`", r.basename))
+        .collect();
+    format!(
+        "Multiple approvals are pending: {}. Reply `/{verb} <name>` to pick one.",
+        names.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -658,6 +773,169 @@ mod tests {
             .expect("recognised");
         assert!(ack.contains("Approved"));
         assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    // ── Forgiving bare-verb / loose-name replies ─────────────────────
+
+    #[tokio::test]
+    async fn bare_approve_resolves_single_pending_tool() {
+        for verb in ["/approve", "approve", "yes", "y", "ok"] {
+            let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+            let r2 = relay.clone();
+            let task = tokio::spawn(async move {
+                r2.request_decision("web_search", "query: rust", "telegram")
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let owners = vec!["owner1".to_string()];
+            let ack = try_handle_tool_reply(verb, &relay, "owner1", &owners)
+                .unwrap_or_else(|| panic!("recognised: {verb}"));
+            assert!(ack.contains("Approved"), "verb={verb} ack={ack}");
+            assert_eq!(task.await.unwrap(), Decision::Once, "verb={verb}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_verb_returns_none_when_no_tool_pending() {
+        // Nothing pending → must fall through (normal chat like "yes please").
+        let relay = PendingApprovals::new(Some(Duration::from_secs(10)));
+        let owners = vec!["owner1".to_string()];
+        assert!(try_handle_tool_reply("yes", &relay, "owner1", &owners).is_none());
+        assert!(try_handle_tool_reply("ok", &relay, "owner1", &owners).is_none());
+        assert!(try_handle_tool_reply("/approve", &relay, "owner1", &owners).is_none());
+    }
+
+    #[tokio::test]
+    async fn bare_verb_lists_pending_when_multiple_tools() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let r1 = relay.clone();
+        let r2 = relay.clone();
+        let t1 = tokio::spawn(async move { r1.request_decision("web_search", "q", "t").await });
+        let t2 = tokio::spawn(async move { r2.request_decision("shell", "ls", "t").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_tool_reply("approve", &relay, "owner1", &owners)
+            .expect("consumed: ambiguous");
+        assert!(ack.contains("web_search"), "{ack}");
+        assert!(ack.contains("shell"), "{ack}");
+        // Nothing resolved — both still pending.
+        assert_eq!(relay.list().len(), 2);
+
+        // Clean up the spawned waiters.
+        relay.resolve_by_basename("web_search", Decision::Deny);
+        relay.resolve_by_basename("shell", Decision::Deny);
+        let _ = t1.await;
+        let _ = t2.await;
+    }
+
+    #[tokio::test]
+    async fn loose_name_resolves_single_pending_tool() {
+        // `/approve kubectl` resolves the single pending `shell` request even
+        // though `kubectl` is not the exact tool basename.
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let r2 = relay.clone();
+        let task =
+            tokio::spawn(
+                async move { r2.request_decision("shell", "kubectl get pods", "t").await },
+            );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_tool_reply("/approve kubectl", &relay, "owner1", &owners)
+            .expect("recognised");
+        assert!(ack.contains("Approved"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    #[tokio::test]
+    async fn bare_approve_from_non_owner_is_refused_and_does_not_resolve() {
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let r2 = relay.clone();
+        let task = tokio::spawn(async move { r2.request_decision("web_search", "q", "t").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_tool_reply("approve", &relay, "stranger", &owners).expect("consumed");
+        assert!(ack.contains("not authorized"), "{ack}");
+        assert_eq!(relay.list().len(), 1, "pending stays open");
+
+        // A real owner can still resolve.
+        try_handle_tool_reply("yes", &relay, "owner1", &owners).expect("recognised");
+        assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    #[tokio::test]
+    async fn bare_allow_resolves_single_pending_shell() {
+        for verb in ["/allow", "allow", "yes", "y", "ok"] {
+            let security = supervised_only_echo();
+            let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+            security.set_pending(pending.clone());
+            let p2 = pending.clone();
+            let task =
+                tokio::spawn(
+                    async move { p2.request_decision("brew", "brew --version", "t").await },
+                );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let owners = vec!["owner1".to_string()];
+            let ack = try_handle_reply(verb, &security, "owner1", &owners)
+                .unwrap_or_else(|| panic!("recognised: {verb}"));
+            assert!(ack.contains("session"), "verb={verb} ack={ack}");
+            assert_eq!(task.await.unwrap(), Decision::Session, "verb={verb}");
+            assert!(security
+                .runtime_allowlist_snapshot()
+                .contains(&"brew".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_allow_returns_none_when_no_shell_pending() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending);
+        let owners = vec!["owner1".to_string()];
+        assert!(try_handle_reply("yes", &security, "owner1", &owners).is_none());
+        assert!(try_handle_reply("/allow", &security, "owner1", &owners).is_none());
+    }
+
+    #[tokio::test]
+    async fn bare_deny_resolves_single_pending_shell_from_anyone() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p2 = pending.clone();
+        let task =
+            tokio::spawn(async move { p2.request_decision("brew", "brew --version", "t").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let ack = try_handle_reply("no", &security, "anyone", &[]).expect("recognised");
+        assert!(ack.contains("Denied"), "{ack}");
+        assert_eq!(task.await.unwrap(), Decision::Deny);
+    }
+
+    #[tokio::test]
+    async fn bare_verb_lists_pending_when_multiple_shell() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p1 = pending.clone();
+        let p2 = pending.clone();
+        let t1 = tokio::spawn(async move { p1.request_decision("brew", "brew", "t").await });
+        let t2 = tokio::spawn(async move { p2.request_decision("npm", "npm i", "t").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let owners = vec!["owner1".to_string()];
+        let ack = try_handle_reply("allow", &security, "owner1", &owners).expect("consumed");
+        assert!(ack.contains("brew"), "{ack}");
+        assert!(ack.contains("npm"), "{ack}");
+        assert_eq!(pending.list().len(), 2);
+
+        pending.resolve_by_basename("brew", Decision::Deny);
+        pending.resolve_by_basename("npm", Decision::Deny);
+        let _ = t1.await;
+        let _ = t2.await;
     }
 
     #[tokio::test]
