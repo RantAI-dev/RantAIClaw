@@ -169,6 +169,18 @@ struct ChannelRuntimeDefaults {
     api_key: Option<String>,
     api_url: Option<String>,
     reliability: crate::config::ReliabilityConfig,
+    /// Senders authorized to approve over a channel
+    /// (`[channels_config] approval_owners`). Reloaded from disk so owner
+    /// changes apply without a `channels run` restart. `Arc` keeps `.clone()`
+    /// cheap.
+    approval_owners: Arc<Vec<String>>,
+    /// Per-role capability ceiling for non-owners. Rebuilt from config on
+    /// reload so guest tool/command allowances apply without a restart.
+    guest_gate: Arc<crate::approval::GuestGate>,
+    /// Autonomy shell-command basenames (`[autonomy] allowed_commands`). Synced
+    /// into the live `SecurityPolicy` runtime allowlist on reload so
+    /// owner-added commands take effect without a restart.
+    allowed_commands: Arc<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,6 +445,13 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
+        approval_owners: Arc::new(config.channels_config.approval_owners.clone()),
+        guest_gate: Arc::new(crate::approval::GuestGate::new(
+            config.autonomy.auto_approve.clone(),
+            &config.channels_config.guest_allowed_tools,
+            &config.channels_config.guest_allowed_commands,
+        )),
+        allowed_commands: Arc::new(config.autonomy.allowed_commands.clone()),
     }
 }
 
@@ -453,6 +472,10 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         }
     }
 
+    // Fallback only when the store has no entry for this config path. The store
+    // is seeded at startup in `start_channels`, so in production the snapshot
+    // above is authoritative; this mirrors the startup `ctx` fields for the
+    // ad-hoc/test path.
     ChannelRuntimeDefaults {
         default_provider: ctx.default_provider.as_str().to_string(),
         model: ctx.model.as_str().to_string(),
@@ -460,7 +483,17 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
+        approval_owners: Arc::clone(&ctx.approval_owners),
+        guest_gate: Arc::clone(&ctx.guest_gate),
+        allowed_commands: Arc::new(Vec::new()),
     }
+}
+
+/// Current approval owners from the live runtime-defaults store (or the startup
+/// `ctx` fallback). Mirrors `runtime_defaults_snapshot` so `/approve` / `/allow`
+/// reply authorization tracks owner changes without a `channels run` restart.
+fn live_approval_owners(ctx: &ChannelRuntimeContext) -> Arc<Vec<String>> {
+    runtime_defaults_snapshot(ctx).approval_owners
 }
 
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
@@ -550,6 +583,16 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             next_defaults.default_provider.clone(),
             Arc::clone(&next_default_provider),
         );
+    }
+
+    // Sync the autonomy command allowlist into the live SecurityPolicy so the
+    // shell tool picks up newly-owner-allowed commands without a restart.
+    // `add_runtime_command` is idempotent (dedup via a HashSet); the runtime
+    // allowlist only ever grows here, so command *removals* from config still
+    // require a restart — an acceptable limitation for a security boundary that
+    // we only ever widen at runtime, never silently narrow.
+    for cmd in next_defaults.allowed_commands.iter() {
+        let _ = ctx.security.add_runtime_command(cmd, false);
     }
 
     {
@@ -1549,19 +1592,20 @@ async fn process_channel_message(
     // In-chat owner approval (Layer A): only when tool-gating is active AND an
     // owner is configured AND we can post back to the chat. Otherwise the loop
     // keeps the auto-deny default — channels never gain approval power silently.
-    let chat_relay_backend = if ctx.channel_approval.is_some() && !ctx.approval_owners.is_empty() {
-        target_channel.as_ref().map(|chan| {
-            approval_relay::ChatRelayApprovalBackend::new(
-                Arc::clone(&ctx.tool_approvals),
-                Arc::clone(chan),
-                msg.reply_target.clone(),
-                msg.thread_ts.clone(),
-                msg.channel.clone(),
-            )
-        })
-    } else {
-        None
-    };
+    let chat_relay_backend =
+        if ctx.channel_approval.is_some() && !runtime_defaults.approval_owners.is_empty() {
+            target_channel.as_ref().map(|chan| {
+                approval_relay::ChatRelayApprovalBackend::new(
+                    Arc::clone(&ctx.tool_approvals),
+                    Arc::clone(chan),
+                    msg.reply_target.clone(),
+                    msg.thread_ts.clone(),
+                    msg.channel.clone(),
+                )
+            })
+        } else {
+            None
+        };
     let chat_relay_backend_ref = chat_relay_backend
         .as_ref()
         .map(|b| b as &dyn crate::approval::ApprovalBackend);
@@ -1569,11 +1613,12 @@ async fn process_channel_message(
     // Per-role capability ceiling: owners (senders in approval_owners) get the
     // full toolset; everyone else runs under the guest gate (safe tools +
     // guest_allowed_tools, shell limited to guest_allowed_commands).
-    let guest_gate_ref = if crate::approval::can_approve(&ctx.approval_owners, &msg.sender) {
-        None
-    } else {
-        Some(ctx.guest_gate.as_ref())
-    };
+    let guest_gate_ref =
+        if crate::approval::can_approve(&runtime_defaults.approval_owners, &msg.sender) {
+            None
+        } else {
+            Some(runtime_defaults.guest_gate.as_ref())
+        };
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
@@ -1784,10 +1829,6 @@ async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
     max_in_flight_messages: usize,
-    // Senders authorized to APPROVE shell-command allowlist replies over a
-    // channel (`[channels_config] approval_owners`). Empty ⇒ nobody, so an
-    // `/allow` reply is refused — only a real owner can grant commands.
-    approval_owners: Arc<Vec<String>>,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
@@ -1804,18 +1845,25 @@ async fn run_message_dispatch_loop(
         // are stateless: they consult only their pending registry and return an
         // acknowledgement if the text was a recognised reply, else `None` so
         // normal chat falls through. Owner authority is enforced inside each.
+        // Refresh runtime config from disk first so reply authorization reads
+        // the LIVE owner list (mirrors the per-message path) — owner changes
+        // apply without a `channels run` restart.
+        if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
+            tracing::warn!("Failed to apply runtime config update: {err}");
+        }
+        let live_owners = live_approval_owners(ctx.as_ref());
         let approval_reply = approval_relay::try_handle_tool_reply(
             &msg.content,
             ctx.tool_approvals.as_ref(),
             &msg.sender,
-            &approval_owners,
+            &live_owners,
         )
         .or_else(|| {
             approval_relay::try_handle_reply(
                 &msg.content,
                 ctx.security.as_ref(),
                 &msg.sender,
-                &approval_owners,
+                &live_owners,
             )
         });
         if let Some(reply) = approval_reply {
@@ -3274,7 +3322,7 @@ pub async fn start_channels_with_cancellation(
         )),
     });
 
-    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages, approval_owners).await;
+    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
 
     // Wait for all channel tasks
     for h in handles {
@@ -4376,6 +4424,13 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_key: None,
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
+                        approval_owners: Arc::new(Vec::new()),
+                        guest_gate: Arc::new(crate::approval::GuestGate::new(
+                            Vec::<String>::new(),
+                            &[],
+                            &[],
+                        )),
+                        allowed_commands: Arc::new(Vec::new()),
                     },
                     last_applied_stamp: None,
                 },
@@ -4451,6 +4506,131 @@ BTC is currently around $65,000 based on latest tool output."#
                 .as_slice(),
             &["hot-reloaded-model".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn maybe_apply_runtime_config_update_hot_reloads_owners_guest_gate_and_allowed_commands()
+    {
+        // Owners / guest-gate / autonomy allowed-commands must hot-reload from
+        // disk when the config-file stamp changes — no `channels run` restart.
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+
+        // Build a valid config via round-trip serialization so every required
+        // schema field is present; only the three hot-reload-relevant fields
+        // vary between the initial and the rewritten config.
+        let write_config =
+            |owners: Vec<String>, guest_commands: Vec<String>, allowed_commands: Vec<String>| {
+                let mut config = crate::config::Config::default();
+                config.default_provider = Some("openrouter".to_string());
+                config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+                config.autonomy.allowed_commands = allowed_commands;
+                config.channels_config.approval_owners = owners;
+                config.channels_config.guest_allowed_commands = guest_commands;
+                let toml = toml::to_string(&config).expect("serialize config");
+                std::fs::write(&config_path, toml).expect("write config");
+            };
+
+        // Initial config: no owners, no guest commands, baseline allowlist.
+        write_config(vec![], vec![], vec!["ls".to_string()]);
+
+        let mut channels_by_name = HashMap::new();
+        let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("startup-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                rantaiclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+        };
+
+        // First apply: seeds the store from the initial config.
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("initial apply");
+        let initial = runtime_defaults_snapshot(&ctx);
+        assert!(initial.approval_owners.is_empty());
+        assert!(!ctx.security.is_command_allowed("brew --version"));
+
+        // Rewrite config with new owners, guest commands, and an extra
+        // autonomy allowed-command. Sleep ensures the mtime/len stamp changes.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_config(
+            vec!["rantaiclaw_user".to_string()],
+            vec!["echo *".to_string()],
+            vec!["ls".to_string(), "brew".to_string()],
+        );
+
+        // Second apply: stamp changed -> reload.
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload apply");
+
+        let reloaded = runtime_defaults_snapshot(&ctx);
+        assert_eq!(
+            reloaded.approval_owners.as_slice(),
+            &["rantaiclaw_user".to_string()],
+            "owners hot-reloaded into the runtime store"
+        );
+        assert!(
+            crate::approval::can_approve(&reloaded.approval_owners, "rantaiclaw_user"),
+            "new owner recognized by can_approve via the live snapshot"
+        );
+        // guest_gate rebuilt: a non-owner may now run the guest command.
+        assert!(
+            reloaded.guest_gate.command_permitted("echo hi"),
+            "guest_gate hot-reloaded the new guest_allowed_command"
+        );
+        // Security policy picked up the newly-owner-allowed command.
+        assert!(
+            ctx.security.is_command_allowed("brew --version"),
+            "autonomy allowed_commands synced into the live SecurityPolicy"
+        );
+
+        // live_approval_owners mirrors the snapshot owners for reply auth.
+        assert_eq!(
+            live_approval_owners(&ctx).as_slice(),
+            &["rantaiclaw_user".to_string()]
+        );
+
+        {
+            let mut store = runtime_config_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.remove(&config_path);
+        }
     }
 
     // TODO(agent-loop): regressed between v0.4 and v0.6 — the agent returns
@@ -4779,7 +4959,7 @@ BTC is currently around $65,000 based on latest tool output."#
         drop(tx);
 
         let started = Instant::now();
-        run_message_dispatch_loop(rx, runtime_ctx, 2, std::sync::Arc::new(Vec::new())).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 2).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -4867,7 +5047,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4, std::sync::Arc::new(Vec::new())).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -4966,7 +5146,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4, std::sync::Arc::new(Vec::new())).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
