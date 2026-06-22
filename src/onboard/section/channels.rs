@@ -94,12 +94,7 @@ fn prompt_owners_and_guest_ceiling(ctx: &mut SetupContext) -> Result<()> {
             if entry.is_empty() {
                 break;
             }
-            let outcome = apply(
-                &mut ctx.config.channels_config,
-                Target::Owner,
-                Op::Add,
-                &entry,
-            );
+            let outcome = apply(&mut ctx.config, Target::Owner, Op::Add, &entry);
             eprintln!("   {}", outcome.message);
         }
     }
@@ -119,12 +114,7 @@ fn prompt_owners_and_guest_ceiling(ctx: &mut SetupContext) -> Result<()> {
             .allow_empty(true)
             .interact_text()?;
         for t in tools.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let outcome = apply(
-                &mut ctx.config.channels_config,
-                Target::GuestTool,
-                Op::Add,
-                t,
-            );
+            let outcome = apply(&mut ctx.config, Target::GuestTool, Op::Add, t);
             eprintln!("   {}", outcome.message);
         }
 
@@ -148,12 +138,7 @@ fn prompt_owners_and_guest_ceiling(ctx: &mut SetupContext) -> Result<()> {
                 if cmd.is_empty() {
                     break;
                 }
-                let outcome = apply(
-                    &mut ctx.config.channels_config,
-                    Target::GuestCommand,
-                    Op::Add,
-                    &cmd,
-                );
+                let outcome = apply(&mut ctx.config, Target::GuestCommand, Op::Add, &cmd);
                 eprintln!("   {}", outcome.message);
             }
         }

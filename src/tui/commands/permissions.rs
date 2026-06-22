@@ -4,8 +4,11 @@
 //! [`crate::approval::permissions`] so they behave identically.
 //!
 //! - `/permissions` — show owners + the non-owner (guest) capability ceiling.
-//! - `/permissions add <owner|tool|command> <value>` — widen a list.
-//! - `/permissions remove <owner|tool|command> <value>` — narrow a list.
+//! - `/permissions add <owner|tool|command|allow-command> <value>` — widen a list.
+//! - `/permissions remove <owner|tool|command|allow-command> <value>` — narrow a list.
+//!
+//! `allow-command` edits the owner autonomy allowlist (`autonomy.allowed_commands`)
+//! and takes a command BASENAME (e.g. `kubectl`), not a glob.
 //!
 //! Writes go to `config.toml`; the TUI's `config_watcher` reloads the runtime
 //! within ~500ms so a live channel session picks up the change.
@@ -32,7 +35,7 @@ impl CommandHandler for PermissionsCommand {
     }
 
     fn usage(&self) -> &str {
-        "/permissions [add|remove <owner|tool|command> <value>]"
+        "/permissions [add|remove <owner|tool|command|allow-command> <value>]"
     }
 
     fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
@@ -42,7 +45,7 @@ impl CommandHandler for PermissionsCommand {
         if args.is_empty() {
             return match load_config() {
                 Ok(config) => Ok(CommandResult::Message(permissions::render(
-                    &config.channels_config,
+                    &config,
                     &config.autonomy.auto_approve,
                 ))),
                 Err(e) => Ok(CommandResult::Message(format!(
@@ -65,7 +68,7 @@ impl CommandHandler for PermissionsCommand {
         };
         let Some(target) = Target::parse(target_tok) else {
             return Ok(CommandResult::Message(format!(
-                "✗ Unknown target `{target_tok}`. Expected: owner | tool | command."
+                "✗ Unknown target `{target_tok}`. Expected: owner | tool | command | allow-command."
             )));
         };
         if value.is_empty() {
@@ -112,7 +115,7 @@ fn mutate_and_save(
     tokio::task::block_in_place(|| {
         handle.block_on(async move {
             let mut config = crate::config::Config::load_or_init().await?;
-            let outcome = permissions::apply(&mut config.channels_config, target, op, value);
+            let outcome = permissions::apply(&mut config, target, op, value);
             if outcome.changed {
                 config.save().await?;
             }
