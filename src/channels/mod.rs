@@ -2091,6 +2091,45 @@ async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     Ok(())
 }
 
+async fn unbind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
+    let normalized = normalize_telegram_identity(identity);
+    if normalized.is_empty() {
+        anyhow::bail!("Telegram identity cannot be empty");
+    }
+
+    let mut updated = config.clone();
+    let Some(telegram) = updated.channels_config.telegram.as_mut() else {
+        anyhow::bail!(
+            "Telegram channel is not configured. Run `rantaiclaw onboard --channels-only` first"
+        );
+    };
+
+    let before = telegram.allowed_users.len();
+    telegram
+        .allowed_users
+        .retain(|entry| normalize_telegram_identity(entry) != normalized);
+    let removed = before - telegram.allowed_users.len();
+
+    if removed == 0 {
+        println!("ℹ️ Telegram identity not in allowlist: {normalized} (nothing to remove)");
+        return Ok(());
+    }
+
+    let now_empty = telegram.allowed_users.is_empty();
+    updated.save().await?;
+    let plural = if removed == 1 { "entry" } else { "entries" };
+    println!("✅ Removed Telegram identity: {normalized} ({removed} {plural} dropped)");
+    println!("   Saved to {}", updated.config_path.display());
+    if now_empty {
+        println!(
+            "⚠️ The Telegram allowlist is now empty — the bot will respond to NO ONE. \
+             Add yourself with `rantaiclaw channel bind-telegram <your-username-or-id>`."
+        );
+    }
+    announce_daemon_reload();
+    Ok(())
+}
+
 /// Resolve the active profile root for the on-disk pairing-code store.
 fn pairing_profile_root() -> Result<PathBuf> {
     Ok(crate::profile::ProfileManager::active()?.root)
@@ -2327,6 +2366,9 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         }
         crate::ChannelCommands::BindTelegram { identity } => {
             bind_telegram_identity(config, &identity).await
+        }
+        crate::ChannelCommands::UnbindTelegram { identity } => {
+            unbind_telegram_identity(config, &identity).await
         }
         crate::ChannelCommands::Pair {
             channel,
@@ -3343,6 +3385,66 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// Build a saveable `Config` whose Telegram allowlist is `users`, backed by
+    /// a `config.toml` inside `dir`. Returns the config plus its path so tests
+    /// can reload and assert the persisted allowlist.
+    fn telegram_config_in(dir: &TempDir, users: &[&str]) -> (Config, std::path::PathBuf) {
+        let cfg_path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.config_path = cfg_path.clone();
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "test-token".into(),
+            allowed_users: users.iter().map(|u| u.to_string()).collect(),
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        (config, cfg_path)
+    }
+
+    fn reload_allowed_users(cfg_path: &std::path::Path) -> Vec<String> {
+        let contents = std::fs::read_to_string(cfg_path).unwrap();
+        let reloaded: Config = toml::from_str(&contents).unwrap();
+        reloaded.channels_config.telegram.unwrap().allowed_users
+    }
+
+    #[tokio::test]
+    async fn unbind_telegram_removes_wildcard_and_keeps_explicit_entries() {
+        let tmp = TempDir::new().unwrap();
+        let (config, cfg_path) = telegram_config_in(&tmp, &["*", "rantaiclaw_user"]);
+
+        unbind_telegram_identity(&config, "*").await.unwrap();
+
+        assert_eq!(reload_allowed_users(&cfg_path), vec!["rantaiclaw_user"]);
+    }
+
+    #[tokio::test]
+    async fn unbind_telegram_normalizes_at_prefix_when_matching() {
+        let tmp = TempDir::new().unwrap();
+        let (config, cfg_path) = telegram_config_in(&tmp, &["rantaiclaw_user", "123456789"]);
+
+        // Leading '@' is stripped before comparison, mirroring bind/auth.
+        unbind_telegram_identity(&config, "@rantaiclaw_user")
+            .await
+            .unwrap();
+
+        assert_eq!(reload_allowed_users(&cfg_path), vec!["123456789"]);
+    }
+
+    #[tokio::test]
+    async fn unbind_telegram_missing_identity_is_noop_and_does_not_write() {
+        let tmp = TempDir::new().unwrap();
+        let (config, cfg_path) = telegram_config_in(&tmp, &["rantaiclaw_user"]);
+
+        unbind_telegram_identity(&config, "someone_else")
+            .await
+            .unwrap();
+
+        // Nothing removed ⇒ no save ⇒ file was never written.
+        assert!(!cfg_path.exists());
+    }
 
     // ── channels pair (Task 3) ───────────────────────────────
 

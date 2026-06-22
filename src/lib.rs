@@ -156,6 +156,22 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Remove a Telegram identity (or the `*` wildcard) from the allowlist
+    #[command(long_about = "\
+Remove a Telegram identity from the allowlist.
+
+Removes a username (without the '@' prefix), a numeric user ID, or the \
+`*` wildcard so the agent stops responding to that identity. Pass `*` \
+to lock an open allowlist down to its explicit entries.
+
+Examples:
+  rantaiclaw channel unbind-telegram rantaiclaw_user
+  rantaiclaw channel unbind-telegram 123456789
+  rantaiclaw channel unbind-telegram '*'")]
+    UnbindTelegram {
+        /// Telegram identity to remove (username without '@', numeric user ID, or `*`)
+        identity: String,
+    },
     /// Issue an on-demand pairing code (no daemon restart needed).
     ///
     /// Mints a time-windowed, multi-claim code into the shared store. A running
