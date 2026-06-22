@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
+use crate::tools::{PATH_POLICY_REMEDIATION, RATE_LIMIT_REMEDIATION};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -58,7 +59,9 @@ impl Tool for FileReadTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                error: Some(format!(
+                    "Rate limit exceeded: too many actions in the last hour.{RATE_LIMIT_REMEDIATION}"
+                )),
             });
         }
 
@@ -67,7 +70,9 @@ impl Tool for FileReadTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
+                error: Some(format!(
+                    "Path not allowed by security policy: {path}{PATH_POLICY_REMEDIATION}"
+                )),
             });
         }
 
@@ -78,7 +83,9 @@ impl Tool for FileReadTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
+                error: Some(format!(
+                    "Rate limit exceeded: action budget exhausted.{RATE_LIMIT_REMEDIATION}"
+                )),
             });
         }
 

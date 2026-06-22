@@ -290,12 +290,12 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `level` | `supervised` | `read_only`, `supervised`, or `full` |
+| `level` | `supervised` | `readonly`, `supervised`, or `full` |
 | `workspace_only` | `true` | restrict writes/command paths to workspace scope |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names |
 | `forbidden_paths` | `[]` | explicit path denylist |
 | `max_actions_per_hour` | `200` | per-policy action budget |
-| `max_cost_per_day_cents` | `1000` | per-policy spend guardrail |
+| `max_cost_per_day_cents` | `500` | per-policy daily cost ceiling (cents); tracked for reporting only — not enforced as a hard stop |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |

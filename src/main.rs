@@ -1104,6 +1104,11 @@ enum ChannelCommands {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Remove a Telegram identity (or the `*` wildcard) from the allowlist
+    UnbindTelegram {
+        /// Telegram identity to remove (username without '@', numeric user ID, or `*`)
+        identity: String,
+    },
     /// Issue an on-demand pairing code (no daemon restart needed).
     ///
     /// Mints a time-windowed, multi-claim code into the shared store. A running

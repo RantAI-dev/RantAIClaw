@@ -5,6 +5,45 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.85-alpha] — 2026-06-23
+
+### Fixed
+
+- **Telegram permission setup no longer silently fails.** `approval_owners`
+  matching now strips a leading `@` the same way the `allowed_users` gate does,
+  so a hand-written `approval_owners = ["@dramnerf"]` actually authorizes sender
+  `dramnerf` (it previously did a raw compare and silently denied, leaving the
+  operator unable to approve anything — the bot looked dead). Matching stays
+  case-sensitive, identical to `allowed_users`, so the two gates never disagree.
+- **Telegram config error messages named the wrong section.** "Missing
+  `[channels.telegram]`" / "check `[channels.telegram]`" now correctly say
+  `[channels_config.telegram]` — following the old text created an ignored
+  section and left the bot unconfigured.
+- **Config file is now written `0600`.** `Config::save()` restricts the file to
+  the owner before publishing it (it carries bot tokens / API keys); previously
+  the daemon only *warned* that the on-disk config was world-readable.
+- **Corrected inaccurate `[autonomy]`/`[agent]` documentation.** The
+  `autonomy.level` doc said `read_only` (mistyping it errors with "unknown
+  variant"); it now says `readonly`. Stale `Default:` annotations were fixed
+  (`max_tool_iterations` 10→25, `max_actions_per_hour` 100→200), and
+  `max_cost_per_day_cents` is now documented as tracked-for-reporting-only — it
+  is not enforced as a hard stop in the agent loop.
+
+### Added
+
+- **`rantaiclaw channel unbind-telegram <identity>`.** Removes a username,
+  numeric id, or the `*` wildcard from the Telegram allowlist — so you can lock
+  an open (`["*"]`) allowlist down to explicit entries without hand-editing
+  `config.toml`. Warns when the removal empties the allowlist.
+- **Actionable remediation in blocked / rate-limited / path-policy errors.**
+  When a tool is blocked, rate-limited, denied on a channel, or hits a
+  path-policy wall, the error now names the concrete knob to fix it
+  (`rantaiclaw autonomy full` / `[autonomy].allowed_commands` /
+  `[autonomy].max_actions_per_hour` / `[channels_config].approval_owners` /
+  `autonomous_tools` / the workspace + `forbidden_paths` policy) instead of
+  dead-ending. Applied across the shell, file, pdf, cron, glob, schedule, and
+  task tools.
+
 ## [0.6.84-alpha] — 2026-06-19
 
 ### Fixed

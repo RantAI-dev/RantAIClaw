@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::{Decision, SecurityPolicy};
+use crate::tools::RATE_LIMIT_REMEDIATION;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -15,6 +16,17 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
+
+/// Appended to hard-blocked shell errors so the operator discovers a concrete
+/// next step instead of dead-ending. Real sessions showed users grinding
+/// through manual config edits because the bare "Command not allowed" message
+/// named no remediation. `rantaiclaw autonomy full` removes all gating
+/// (Full autonomy bypasses the command allowlist), while the allowlist edit is
+/// the narrower, safer option for a single recurring command.
+const BLOCKED_COMMAND_REMEDIATION: &str = "\nBlocked by the active security policy. \
+An operator can allow the base command via [autonomy].allowed_commands in config.toml, \
+or remove approval prompts entirely with `rantaiclaw autonomy full` \
+(no prompts — use only in trusted/sandboxed environments).";
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
@@ -97,7 +109,9 @@ impl Tool for ShellTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                error: Some(format!(
+                    "Rate limit exceeded: too many actions in the last hour.{RATE_LIMIT_REMEDIATION}"
+                )),
             });
         }
 
@@ -138,7 +152,7 @@ impl Tool for ShellTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(reason),
+                            error: Some(format!("{reason}{BLOCKED_COMMAND_REMEDIATION}")),
                         });
                     };
                     let decision = approvals
@@ -186,7 +200,9 @@ impl Tool for ShellTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
+                error: Some(format!(
+                    "Rate limit exceeded: action budget exhausted.{RATE_LIMIT_REMEDIATION}"
+                )),
             });
         }
 

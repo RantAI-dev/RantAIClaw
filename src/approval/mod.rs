@@ -176,9 +176,17 @@ impl ApprovalManager {
 /// - Empty list ⇒ `false` for everyone (secure default: nobody can approve, so
 ///   approval-required tools stay auto-denied on channels).
 /// - `"*"` ⇒ `true` for any sender (insecure; opt-in only).
-/// - Otherwise ⇒ exact sender-id match.
+/// - Otherwise ⇒ sender match, normalized exactly like the per-channel
+///   `allowed_users` gate: a leading `@` is stripped on both sides (so a
+///   hand-written `approval_owners = ["@dramnerf"]` authorizes sender
+///   `dramnerf`), but matching is otherwise exact and **case-sensitive** —
+///   identical to `allowed_users`, so the two gates never disagree.
 pub fn can_approve(owners: &[String], sender: &str) -> bool {
-    owners.iter().any(|o| o == "*" || o == sender)
+    fn normalize(s: &str) -> &str {
+        s.trim().trim_start_matches('@')
+    }
+    let sender = normalize(sender);
+    owners.iter().any(|o| o == "*" || normalize(o) == sender)
 }
 
 // ── Approval backends (surface-pluggable decision) ───────────────
@@ -328,6 +336,15 @@ mod tests {
         assert!(!can_approve(&owners, "bob"));
         // Wildcard authorizes anyone (insecure, opt-in).
         assert!(can_approve(&["*".to_string()], "anyone"));
+
+        // Normalization matches the allowed_users gate exactly: a leading `@`
+        // is stripped on both sides (so a hand-edited config doesn't silently
+        // fail), but matching stays case-sensitive — the two gates never disagree.
+        let owners = vec!["@dramnerf".to_string()];
+        assert!(can_approve(&owners, "dramnerf"));
+        assert!(can_approve(&owners, "@dramnerf"));
+        assert!(!can_approve(&owners, "Dramnerf")); // case-sensitive, like allowed_users
+        assert!(!can_approve(&owners, "someone_else"));
     }
 
     // ── needs_approval ───────────────────────────────────────

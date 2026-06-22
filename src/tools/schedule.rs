@@ -161,7 +161,10 @@ impl ScheduleTool {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
+                error: Some(format!(
+                    "Rate limit exceeded: action budget exhausted.{}",
+                    crate::tools::RATE_LIMIT_REMEDIATION
+                )),
             });
         }
 

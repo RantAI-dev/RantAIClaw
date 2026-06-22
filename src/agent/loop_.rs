@@ -1276,8 +1276,11 @@ pub(crate) async fn execute_tool_calls_collecting(
                         "Denied by user.".to_string()
                     } else {
                         format!(
-                            "Tool '{}' denied: requires approval at current autonomy level. \
-                             Ask your supervisor to promote your autonomy level to use this tool.",
+                            "Tool '{}' denied: requires approval, but none was granted. \
+                             An operator can enable in-chat approval via \
+                             [channels_config].approval_owners (then reply `/approve`), \
+                             set [channels_config].autonomous_tools = true, or raise autonomy \
+                             with `rantaiclaw autonomy full` (trusted/sandboxed only).",
                             call.name
                         )
                     };
