@@ -526,7 +526,7 @@ impl Tool for GitOperationsTool {
                 });
             }
 
-            match self.security.autonomy {
+            match self.security.effective_autonomy() {
                 AutonomyLevel::ReadOnly => {
                     return Ok(ToolResult {
                         success: false,

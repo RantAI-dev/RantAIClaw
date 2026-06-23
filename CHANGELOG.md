@@ -5,6 +5,24 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.87-alpha] — 2026-06-23
+
+### Fixed
+
+- **Autonomy level now hot-reloads on running channels — no daemon restart.**
+  Switching the approval preset (`rantaiclaw autonomy off`/`smart`/`strict`/…)
+  previously only took effect for a freshly-started `channels run`/daemon: the
+  per-message config reload synced the command *allowlist* but never the
+  autonomy *level*, so e.g. `autonomy off` left the live Telegram daemon still
+  enforcing the old `Supervised` gate until restart. The level is now shared
+  via an interior `Arc<RwLock>` (mirroring `runtime_allowlist`) and re-applied
+  on each config-file change, so all channel surfaces pick it up at the next
+  message. Reads go through `SecurityPolicy::effective_autonomy()`; the channel
+  reload calls `set_autonomy()`. (Command allowlist, approval owners, and the
+  guest gate already hot-reloaded; `forbidden_paths` and the medium/high-risk
+  approval flags still require a restart by design — they narrow the security
+  boundary and are applied at boot only.)
+
 ## [0.6.86-alpha] — 2026-06-23
 
 ### Added
