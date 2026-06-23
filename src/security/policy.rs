@@ -112,6 +112,12 @@ pub struct SecurityPolicy {
     /// attached after construction (`Default::default()` leaves it
     /// `None`).
     pub pending: Arc<RwLock<Option<Arc<PendingApprovals>>>>,
+    /// Live override for the autonomy level, shared across clones via the
+    /// inner `Arc` (mirrors `runtime_allowlist`). `None` means "use the
+    /// boot-time `autonomy` field above". A running daemon writes this on
+    /// config hot-reload so `rantaiclaw autonomy <preset>` (e.g. Off → Full)
+    /// takes effect without a restart. Read through `effective_autonomy`.
+    pub autonomy_runtime: Arc<RwLock<Option<AutonomyLevel>>>,
 }
 
 impl Default for SecurityPolicy {
@@ -165,6 +171,7 @@ impl Default for SecurityPolicy {
             runtime_allowlist: Arc::new(RwLock::new(HashSet::new())),
             policy_dir: None,
             pending: Arc::new(RwLock::new(None)),
+            autonomy_runtime: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -541,7 +548,7 @@ impl SecurityPolicy {
             if self.block_high_risk_commands {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
-            if self.autonomy == AutonomyLevel::Supervised && !approved {
+            if self.effective_autonomy() == AutonomyLevel::Supervised && !approved {
                 return Err(
                     "Command requires explicit approval (approved=true): high-risk operation"
                         .into(),
@@ -550,7 +557,7 @@ impl SecurityPolicy {
         }
 
         if risk == CommandRiskLevel::Medium
-            && self.autonomy == AutonomyLevel::Supervised
+            && self.effective_autonomy() == AutonomyLevel::Supervised
             && self.require_approval_for_medium_risk
             && !approved
         {
@@ -576,14 +583,30 @@ impl SecurityPolicy {
     /// - Blocks single `&` background chaining (`&&` remains supported)
     /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
+    /// The autonomy level currently in force: the live override applied via
+    /// [`set_autonomy`] if present, else the boot-time `autonomy` field. All
+    /// gate checks read through this so a hot-reloaded level takes effect on
+    /// `SecurityPolicy` clones already held by running tools.
+    pub fn effective_autonomy(&self) -> AutonomyLevel {
+        self.autonomy_runtime.read().unwrap_or(self.autonomy)
+    }
+
+    /// Hot-swap the autonomy level on a running policy. Shared across every
+    /// clone via the inner `Arc`, so tools holding their own `SecurityPolicy`
+    /// clone observe the change immediately — used by the channel config
+    /// hot-reload so `rantaiclaw autonomy <preset>` applies without a restart.
+    pub fn set_autonomy(&self, level: AutonomyLevel) {
+        *self.autonomy_runtime.write() = Some(level);
+    }
+
     pub fn is_command_allowed(&self, command: &str) -> bool {
-        if self.autonomy == AutonomyLevel::ReadOnly {
+        if self.effective_autonomy() == AutonomyLevel::ReadOnly {
             return false;
         }
 
         // In Full autonomy mode, allow everything — the environment is
         // expected to be sandboxed (e.g. isolated Docker container).
-        if self.autonomy == AutonomyLevel::Full {
+        if self.effective_autonomy() == AutonomyLevel::Full {
             return !command.trim().is_empty();
         }
 
@@ -760,7 +783,7 @@ impl SecurityPolicy {
 
     /// Check if autonomy level permits any action at all
     pub fn can_act(&self) -> bool {
-        self.autonomy != AutonomyLevel::ReadOnly
+        self.effective_autonomy() != AutonomyLevel::ReadOnly
     }
 
     // ── Tool Operation Gating ──────────────────────────────────────────────
@@ -854,6 +877,7 @@ impl SecurityPolicy {
             runtime_allowlist: Arc::new(RwLock::new(runtime_set)),
             policy_dir,
             pending: Arc::new(RwLock::new(None)),
+            autonomy_runtime: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -915,7 +939,8 @@ impl SecurityPolicy {
     /// approving `brew` makes the next attempt at `brew --version`
     /// succeed.
     pub fn first_unallowed_basename(&self, command: &str) -> Option<String> {
-        if self.autonomy == AutonomyLevel::ReadOnly || self.autonomy == AutonomyLevel::Full {
+        let autonomy = self.effective_autonomy();
+        if autonomy == AutonomyLevel::ReadOnly || autonomy == AutonomyLevel::Full {
             return None;
         }
         // Structural rules: don't surface a basename when the rejection
@@ -1001,6 +1026,35 @@ mod tests {
     #[test]
     fn can_act_supervised_true() {
         assert!(default_policy().can_act());
+    }
+
+    #[test]
+    fn set_autonomy_hot_swaps_across_clones() {
+        // A running daemon shares its SecurityPolicy by clone; the autonomy
+        // level must hot-swap through the shared `autonomy_runtime` Arc so a
+        // tool holding its own clone sees the new level without being rebuilt
+        // — the channel config hot-reload relies on exactly this.
+        let daemon = default_policy(); // Supervised + default allowlist
+        let tool = daemon.clone();
+        // Supervised: a non-allowlisted command is blocked for the tool.
+        assert!(!tool.is_command_allowed("kubectl get pods"));
+        // Operator flips autonomy to Full on the daemon's policy handle.
+        daemon.set_autonomy(AutonomyLevel::Full);
+        // The clone observes it immediately via the shared override Arc.
+        assert_eq!(tool.effective_autonomy(), AutonomyLevel::Full);
+        assert!(tool.is_command_allowed("kubectl get pods"));
+        // Tightening back propagates too (the level is a deliberate setting,
+        // applied verbatim — not append-only like the allowlist).
+        daemon.set_autonomy(AutonomyLevel::ReadOnly);
+        assert!(!tool.can_act());
+        assert!(!tool.is_command_allowed("ls"));
+    }
+
+    #[test]
+    fn effective_autonomy_falls_back_to_boot_level() {
+        // With no override set, effective_autonomy returns the boot field.
+        let p = default_policy();
+        assert_eq!(p.effective_autonomy(), AutonomyLevel::Supervised);
     }
 
     #[test]

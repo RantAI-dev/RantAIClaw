@@ -181,6 +181,10 @@ struct ChannelRuntimeDefaults {
     /// into the live `SecurityPolicy` runtime allowlist on reload so
     /// owner-added commands take effect without a restart.
     allowed_commands: Arc<Vec<String>>,
+    /// Autonomy level (`[autonomy] level`). Hot-swapped into the live
+    /// `SecurityPolicy` on reload so `rantaiclaw autonomy <preset>` (e.g.
+    /// Off → Full) applies without a `channels run`/daemon restart.
+    autonomy_level: crate::security::AutonomyLevel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,6 +456,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
             &config.channels_config.guest_allowed_commands,
         )),
         allowed_commands: Arc::new(config.autonomy.allowed_commands.clone()),
+        autonomy_level: config.autonomy.level,
     }
 }
 
@@ -486,6 +491,7 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         approval_owners: Arc::clone(&ctx.approval_owners),
         guest_gate: Arc::clone(&ctx.guest_gate),
         allowed_commands: Arc::new(Vec::new()),
+        autonomy_level: ctx.security.effective_autonomy(),
     }
 }
 
@@ -594,6 +600,12 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     for cmd in next_defaults.allowed_commands.iter() {
         let _ = ctx.security.add_runtime_command(cmd, false);
     }
+
+    // Hot-swap the autonomy level too. Unlike the allowlist (which only ever
+    // grows at runtime), the level is a deliberate operator setting, so we
+    // apply it verbatim — `rantaiclaw autonomy off`/`strict`/etc. takes effect
+    // on the running daemon at the next message, no restart required.
+    ctx.security.set_autonomy(next_defaults.autonomy_level);
 
     {
         let mut store = runtime_config_store()
@@ -4533,6 +4545,7 @@ BTC is currently around $65,000 based on latest tool output."#
                             &[],
                         )),
                         allowed_commands: Arc::new(Vec::new()),
+                        autonomy_level: crate::security::AutonomyLevel::Supervised,
                     },
                     last_applied_stamp: None,
                 },
