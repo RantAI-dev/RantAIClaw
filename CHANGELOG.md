@@ -5,6 +5,29 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.89-alpha] — 2026-06-23
+
+### Changed
+
+- **Easy-mode defaults — RantaiClaw is now useful out of the box (config schema v9).**
+  Fresh installs ship with local capability tools **enabled** instead of
+  deny-by-default, so the agent can search the web and fetch URLs without an
+  operator editing config first:
+  - `[web_search] enabled = true`
+  - `[browser] enabled = true`
+  - `[http_request] enabled = true`, `allowed_domains = ["*"]` (new allow-all
+    wildcard), `max_response_size = 5 MiB`, `timeout_secs = 20`
+  - `[autonomy] block_high_risk_commands = false` (e.g. `curl`/`wget` run; they
+    still pass the normal allowlist/approval path)
+
+  **Unchanged (secure at the exposure boundary):** autonomy `level` stays
+  `Supervised`; gateway pairing, localhost bind, `allow_public_bind = false`,
+  and rate limits are untouched — exposing the agent to the network is still
+  opt-in. **Existing configs are not modified**: the v8→v9 migration preserves
+  any values you set explicitly; only omitted keys pick up the new defaults.
+  The engineering protocol (`CLAUDE.md` §3.6) was rewritten to match: usable by
+  default for local capability, deny-by-default only at the exposure boundary.
+
 ## [0.6.88-alpha] — 2026-06-23
 
 ### Fixed
