@@ -5,6 +5,23 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.88-alpha] — 2026-06-23
+
+### Fixed
+
+- **Channel conversations now survive a daemon restart.** Per-sender
+  conversation history (user + assistant turns, keyed `channel_sender`) was
+  held only in memory and rebuilt empty on every boot, so restarting the
+  channels daemon wiped every live thread (e.g. Telegram "forgot" the
+  conversation). History is now persisted write-through to a `channel_history`
+  table in the existing `brain.db` and reloaded at startup, so threads resume
+  exactly where they left off across restarts. Enabled automatically when the
+  memory backend is `sqlite`; markdown/none backends keep the prior in-memory
+  behavior. Persistence failures degrade gracefully (log + in-memory only) and
+  never block message handling; stored history is bounded by the existing
+  history cap. A dedicated `ChannelHistoryStore` opens its own WAL connection
+  with `busy_timeout` so it coexists with the memory backend's connection.
+
 ## [0.6.87-alpha] — 2026-06-23
 
 ### Fixed

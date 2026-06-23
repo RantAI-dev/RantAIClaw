@@ -21,6 +21,7 @@ pub mod conversation;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
+mod history_store;
 pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
@@ -224,6 +225,12 @@ struct ChannelRuntimeContext {
     max_tool_iterations: usize,
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
+    /// Durable backing for `conversation_histories`. `Some` persists each
+    /// in-memory mutation to `brain.db` (and seeds the map at startup) so
+    /// conversation threads survive daemon restarts. `None` means persistence
+    /// is disabled (non-sqlite memory backends, or an open failure) and history
+    /// stays in-memory only, exactly as before.
+    history_store: Option<Arc<history_store::ChannelHistoryStore>>,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
     api_key: Option<String>,
@@ -666,6 +673,13 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key);
+
+    // Persistence must never break message handling: log and ignore errors.
+    if let Some(store) = ctx.history_store.as_ref() {
+        if let Err(e) = store.delete(sender_key) {
+            tracing::warn!("failed to delete persisted channel history for {sender_key}: {e}");
+        }
+    }
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
@@ -696,11 +710,29 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 
     if compacted.is_empty() {
         turns.clear();
+        // Persist the now-empty state (save with [] deletes the row).
+        let snapshot: Vec<ChatMessage> = Vec::new();
+        drop(histories);
+        persist_sender_turns(ctx, sender_key, &snapshot);
         return false;
     }
 
     *turns = compacted;
+    let snapshot = turns.clone();
+    drop(histories);
+    persist_sender_turns(ctx, sender_key, &snapshot);
     true
+}
+
+/// Write-through helper: persist the current turns for a sender to the durable
+/// store, if persistence is enabled. Errors are logged and ignored — durability
+/// must never break live message handling.
+fn persist_sender_turns(ctx: &ChannelRuntimeContext, sender_key: &str, turns: &[ChatMessage]) {
+    if let Some(store) = ctx.history_store.as_ref() {
+        if let Err(e) = store.save(sender_key, turns) {
+            tracing::warn!("failed to persist channel history for {sender_key}: {e}");
+        }
+    }
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
@@ -713,6 +745,9 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     while turns.len() > MAX_CHANNEL_HISTORY {
         turns.remove(0);
     }
+    let snapshot = turns.clone();
+    drop(histories);
+    persist_sender_turns(ctx, sender_key, &snapshot);
 }
 
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
@@ -3324,6 +3359,45 @@ pub async fn start_channels_with_cancellation(
 
     let approval_owners = Arc::new(config.channels_config.approval_owners.clone());
 
+    // Persist conversation history across restarts only when the memory backend
+    // is sqlite (it owns `brain.db`). For markdown/none backends we leave
+    // persistence off so we don't create a brain.db they otherwise wouldn't have.
+    // On open failure we degrade gracefully to in-memory-only history.
+    let history_store: Option<Arc<history_store::ChannelHistoryStore>> =
+        if config.memory.backend == "sqlite" {
+            match history_store::ChannelHistoryStore::open(&config.workspace_dir) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(e) => {
+                    tracing::warn!(
+                        "channel history persistence disabled (open failed): {e}; \
+                         conversation history will be in-memory only"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // Seed the in-memory map from disk so a restart resumes live threads.
+    let mut seeded_histories: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+    if let Some(store) = history_store.as_ref() {
+        match store.load_all() {
+            Ok(loaded) => {
+                if !loaded.is_empty() {
+                    tracing::info!(
+                        "loaded {} persisted channel conversation(s) from brain.db",
+                        loaded.len()
+                    );
+                }
+                seeded_histories = loaded;
+            }
+            Err(e) => {
+                tracing::warn!("failed to load persisted channel history: {e}");
+            }
+        }
+    }
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -3337,7 +3411,8 @@ pub async fn start_channels_with_cancellation(
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
-        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        conversation_histories: Arc::new(Mutex::new(seeded_histories)),
+        history_store,
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),
@@ -3629,6 +3704,7 @@ mod tests {
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4087,6 +4163,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4153,6 +4230,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4219,6 +4297,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4294,6 +4373,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4390,6 +4470,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
             api_key: None,
@@ -4468,6 +4549,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4566,6 +4648,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4667,6 +4750,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4778,6 +4862,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 12,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -4849,6 +4934,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 3,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5027,6 +5113,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5114,6 +5201,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5213,6 +5301,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5294,6 +5383,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5830,6 +5920,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -5922,6 +6013,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6014,6 +6106,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_store: None,
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
