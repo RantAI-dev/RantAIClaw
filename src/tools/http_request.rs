@@ -371,6 +371,10 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
 }
 
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
+    // Explicit allow-all wildcard: "*" permits any host (easy-mode default).
+    if allowed_domains.iter().any(|d| d == "*") {
+        return true;
+    }
     allowed_domains.iter().any(|domain| {
         host == domain
             || host
@@ -466,6 +470,20 @@ mod tests {
             "https://example.com/".into(),
         ]);
         assert_eq!(got, vec!["example.com".to_string()]);
+    }
+
+    #[test]
+    fn wildcard_allows_any_host() {
+        // A "*" entry permits an arbitrary host (easy-mode allow-all).
+        assert!(host_matches_allowlist(
+            "api.anything.com",
+            &["*".to_string()]
+        ));
+        // A non-wildcard list still rejects a host that is not listed.
+        assert!(!host_matches_allowlist(
+            "api.anything.com",
+            &["example.com".to_string()]
+        ));
     }
 
     #[test]

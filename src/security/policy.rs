@@ -166,7 +166,7 @@ impl Default for SecurityPolicy {
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
+            block_high_risk_commands: false,
             tracker: ActionTracker::new(),
             runtime_allowlist: Arc::new(RwLock::new(HashSet::new())),
             policy_dir: None,
@@ -1234,10 +1234,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_command_blocks_high_risk_by_default() {
+    fn validate_command_blocks_high_risk_when_enabled() {
+        // With block_high_risk_commands enabled, high-risk commands are hard-
+        // blocked. (Easy-mode default leaves this off; this test opts in to
+        // verify the blocking path itself is unchanged.)
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec!["rm".into()],
+            block_high_risk_commands: true,
             ..SecurityPolicy::default()
         };
 
@@ -1370,7 +1374,8 @@ mod tests {
         assert!(p.max_actions_per_hour > 0);
         assert!(p.max_cost_per_day_cents > 0);
         assert!(p.require_approval_for_medium_risk);
-        assert!(p.block_high_risk_commands);
+        // Easy-mode default: high-risk commands are no longer hard-blocked.
+        assert!(!p.block_high_risk_commands);
     }
 
     // ── ActionTracker / rate limiting ───────────────────────

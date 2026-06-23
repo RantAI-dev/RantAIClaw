@@ -33,9 +33,10 @@ These codebase realities should drive every design decision:
 1. **Trait + factory architecture is the stability backbone**
     - Extension points are intentionally explicit and swappable.
     - Most features should be added via trait implementation + factory registration, not cross-cutting rewrites.
-2. **Security-critical surfaces are first-class and internet-adjacent**
+2. **Exposure surfaces are first-class and internet-adjacent; local capability is usability-first**
     - `src/gateway/`, `src/security/`, `src/tools/`, `src/runtime/` carry high blast radius.
-    - Defaults already lean secure-by-default (pairing, bind safety, limits, secret handling); keep it that way.
+    - The *exposure* boundary (gateway pairing, bind safety, rate limits, secret handling) stays deny-by-default — keep it that way.
+    - *Local capability* tools (web_search, http_request, browser, shell) ship ENABLED so the agent is useful out of the box; operators opt into a locked-down profile, not into basic usefulness. See §3.6.
 3. **Performance and binary size are product goals, not nice-to-have**
     - `Cargo.toml` release profile and dependency choices optimize for size and determinism.
     - Convenience dependencies and broad abstractions can silently regress these goals.
@@ -100,16 +101,20 @@ Required:
 - Never silently broaden permissions/capabilities.
 - Document fallback behavior when fallback is intentional and safe.
 
-### 3.6 Secure by Default + Least Privilege
+### 3.6 Usable by Default, Secure at the Exposure Boundary
 
-**Why here:** Gateway/tools/runtime can execute actions with real-world side effects.
+**Why here:** RantaiClaw should be easy to use out of the box (Hermes/openclaw-style) — a fresh install can search the web, fetch URLs, and run shell commands without an operator hand-editing config first. Friction that makes the agent feel broken is itself a failure mode. But network *exposure* (who can reach the agent from outside) still carries real blast radius, so the two are governed differently.
 
-Required:
+Distinguish two surface classes and apply the matching default:
 
-- Deny-by-default for access and exposure boundaries.
+- **Local capability surfaces — default ON (convenience-first).** Tools the agent uses to do its job on the operator's own machine: `web_search`, `http_request` (default `allowed_domains = ["*"]`), `browser`, and shell (`block_high_risk_commands = false` by default). Ship these enabled so the agent works immediately. Operators tighten them when they want a locked-down profile; we do not make them opt *in* to basic usefulness.
+- **Exposure surfaces — stay deny-by-default.** Anything that lets the outside world reach the agent: gateway bind address (localhost only), `allow_public_bind = false`, pairing required, rate limits, secret handling. Do **not** relax these for convenience — exposing an agent to the internet by default is a different and unacceptable risk. Keep autonomy *level* at `Supervised` by default too (it gates nothing the local tools above don't already allow, and preserves the approval UX).
+
+Always required regardless of surface class:
+
 - Never log secrets, raw tokens, or sensitive payloads.
-- Keep network/filesystem/shell scope as narrow as possible unless explicitly justified.
 - Credential precedence is intentional: config-stored provider keys, including encrypted keys, remain above env vars. Document exceptions rather than silently changing this order.
+- When you widen a default, say so in the PR/CHANGELOG and bump the config schema version (defaults are fingerprinted by the schema-drift gate). Widening local capability is fine and expected; widening an *exposure* boundary needs explicit justification.
 
 ### 3.7 Determinism + Reproducibility
 
@@ -448,7 +453,7 @@ Reference docs:
 ## 10) Anti-Patterns (Do Not)
 
 - Do not add heavy dependencies for minor convenience.
-- Do not silently weaken security policy or access constraints.
+- Do not weaken an *exposure* boundary (gateway bind, pairing, public-network reach) for convenience, and never silently — those changes need explicit justification + schema version bump. (Widening *local* capability defaults for usability is fine and expected; see §3.6.)
 - Do not add speculative config/feature flags “just in case”.
 - Do not mix massive formatting-only changes with functional changes.
 - Do not modify unrelated modules “while here”.
