@@ -1104,7 +1104,7 @@ fn default_browser_webdriver_url() -> String {
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             allowed_domains: Vec::new(),
             session_name: None,
             backend: default_browser_backend(),
@@ -1120,8 +1120,10 @@ impl Default for BrowserConfig {
 
 /// HTTP request tool configuration (`[http_request]` section).
 ///
-/// Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+/// Easy-mode default: enabled with `allowed_domains = ["*"]` (allow-all wildcard).
+/// If `enabled` is true but `allowed_domains` is empty, all HTTP requests are
+/// rejected (the guard protects users who enable without configuring a list).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
     #[serde(default)]
@@ -1143,6 +1145,17 @@ fn default_http_max_response_size() -> usize {
 
 fn default_http_timeout_secs() -> u64 {
     30
+}
+
+impl Default for HttpRequestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_domains: vec!["*".to_string()],
+            max_response_size: 5_242_880, // 5 MiB
+            timeout_secs: 20,
+        }
+    }
 }
 
 // ── Web search ───────────────────────────────────────────────────
@@ -1188,7 +1201,7 @@ fn default_web_search_timeout_secs() -> u64 {
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
             searxng_url: None,
@@ -2048,7 +2061,7 @@ impl Default for AutonomyConfig {
             max_actions_per_hour: 200,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
+            block_high_risk_commands: false,
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
         }
@@ -4329,7 +4342,8 @@ mod tests {
         assert_eq!(a.max_actions_per_hour, 200);
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
-        assert!(a.block_high_risk_commands);
+        // Easy-mode default: high-risk commands are no longer hard-blocked.
+        assert!(!a.block_high_risk_commands);
     }
 
     #[test]
@@ -5514,14 +5528,14 @@ default_temperature = 0.7
         assert!(!c.composio.enabled);
         assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
-        assert!(!c.browser.enabled);
+        assert!(c.browser.enabled);
         assert!(c.browser.allowed_domains.is_empty());
     }
 
     #[test]
-    async fn browser_config_default_disabled() {
+    async fn browser_config_default_enabled() {
         let b = BrowserConfig::default();
-        assert!(!b.enabled);
+        assert!(b.enabled);
         assert!(b.allowed_domains.is_empty());
         assert_eq!(b.backend, "agent_browser");
         assert!(b.native_headless);
@@ -5587,7 +5601,7 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
-        assert!(!parsed.browser.enabled);
+        assert!(parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
     }
 

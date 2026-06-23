@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 8;
+pub const CURRENT_VERSION: u32 = 9;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -159,8 +159,21 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; documentation-only fingerprint change)
     }
 
-    // Future migrations (v9, v10, …) inserted here in order.
-    // if from < 9 { migrate_v9(raw)?; }
+    // v8 → v9: flipped several tool/security DEFAULTS to "easy mode" (no
+    // key/surface change, no transformation): `[web_search].enabled` false→true,
+    // `[browser].enabled` false→true, `[http_request]` enabled with
+    // `allowed_domains = ["*"]` (allow-all wildcard) + `max_response_size`
+    // 1MB→5MiB + `timeout_secs` 30→20, and `[autonomy].block_high_risk_commands`
+    // true→false. Configs that set these explicitly keep their values; configs
+    // that omit them pick up the new defaults. This arm burns a version slot so
+    // the schema_drift fingerprint (which embeds default values) is accepted with
+    // intent (mirrors v6 → v7).
+    if from < 9 {
+        // (no transformation; default-value change only)
+    }
+
+    // Future migrations (v10, v11, …) inserted here in order.
+    // if from < 10 { migrate_v10(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -257,6 +270,24 @@ mod tests {
             autonomy.get("level").unwrap().as_str(),
             Some("full"),
             "doc-only migration must not touch config content"
+        );
+    }
+
+    #[test]
+    fn v8_to_v9_is_default_only_noop_preserving_content() {
+        // v8 → v9 only flipped tool/security DEFAULTS to "easy mode" (no
+        // key/surface change). A v8 config that set values explicitly migrates
+        // to CURRENT_VERSION with all content intact and without the migration
+        // injecting or transforming anything.
+        let mut v = parse("schema_version = 8\n[autonomy]\nblock_high_risk_commands = true\n");
+        let migrated = migrate(&mut v).unwrap();
+        assert!(migrated, "v8 bump should be reported as transformed");
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        let autonomy = v.get("autonomy").unwrap().as_table().unwrap();
+        assert_eq!(
+            autonomy.get("block_high_risk_commands").unwrap().as_bool(),
+            Some(true),
+            "default-only migration must not touch an explicit user value"
         );
     }
 
