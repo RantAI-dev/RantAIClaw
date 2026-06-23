@@ -5,6 +5,21 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.86-alpha] — 2026-06-23
+
+### Added
+
+- **Native MiniMax embedding provider (`embo-01`) for semantic memory.** Set
+  `[memory] embedding_provider = "minimax"` (with `embedding_model = "embo-01"`,
+  `embedding_dimensions = 1536`) to enable vector recall using MiniMax. The
+  embedding API key reuses the main MiniMax provider key — no second credential
+  to enter. Uses MiniMax's native request format (`texts` + `type: "db"`) and
+  response envelope (`vectors` + `base_resp`), so non-zero `base_resp.status_code`
+  surfaces as an explicit error. Defaults to the global base
+  `https://api.minimax.io/v1`; override with `MINIMAX_EMBED_BASE_URL` (e.g. the
+  CN base `https://api.minimaxi.com/v1`). A `GroupId` is optional and only sent
+  when `MINIMAX_GROUP_ID` is set. Verified live against the global endpoint.
+
 ## [0.6.85-alpha] — 2026-06-23
 
 ### Fixed
