@@ -5,6 +5,42 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.90-alpha] — 2026-06-26
+
+### Fixed
+
+- **KB design/scan-heavy PDFs now extract via OCR.** A port regression
+  (`UnpdfExtractor` returned `pages: None`) collapsed the per-page sufficiency
+  heuristic, so image-layout PDFs (brochures, scans) were accepted with thin
+  text and never routed to OCR — they ingested as semantically-thin documents
+  the agent could not read. Restored real page counts and added a
+  text/file-size density guard so large low-text PDFs route to the vision-LLM
+  extractor. Vision OCR now also falls back to the embedding API key when its
+  own key is unset.
+- **KB retrieval surfaces more documents per query.** A single answer could
+  cluster in a few documents; retrieval now fetches a wider candidate pool and
+  caps chunks per document so multi-document questions span more sources.
+- **Ingest no longer leaves orphan 0-chunk documents** — the document row is
+  rolled back if chunk storage fails.
+
+### Added
+
+- **Reliable KB enumeration.** The retrieval context now prepends the full
+  document inventory, so "what's in this knowledge base?" lists every document
+  regardless of which chunks were retrieved.
+- **Ingest observability.** Extraction quality (chars / pages / low-text
+  density) is logged and returned in the ingest response so poor extractions
+  are visible instead of silent.
+
+### Security
+
+- Bumped `lopdf` 0.34/0.38 → 0.42.0 ([RUSTSEC-2026-0187], PDF-parser
+  stack-overflow DoS on crafted input — the KB parses untrusted uploaded PDFs)
+  and `quinn-proto` → 0.11.15 ([RUSTSEC-2026-0185], remote memory exhaustion).
+
+[RUSTSEC-2026-0187]: https://rustsec.org/advisories/RUSTSEC-2026-0187
+[RUSTSEC-2026-0185]: https://rustsec.org/advisories/RUSTSEC-2026-0185
+
 ## [0.6.89-alpha] — 2026-06-23
 
 ### Changed
