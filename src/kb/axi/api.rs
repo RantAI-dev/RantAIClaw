@@ -980,14 +980,23 @@ async fn ingest(
         retrieval_count: 0,
         last_retrieved_at: None,
     };
-    ctx.store
-        .create_document(&document)
-        .await
-        .map_err(ApiError::from)?;
-    ctx.store
-        .store_chunks(&doc_id, &chunks, &embeddings, ctx.embedder.model())
-        .await
-        .map_err(ApiError::from)?;
+    if let Err(e) = crate::kb::store::store_document_with_chunks(
+        ctx.store.as_ref(),
+        &document,
+        &chunks,
+        &embeddings,
+        ctx.embedder.model(),
+    )
+    .await
+    {
+        tracing::error!(
+            target: "kb::ingest",
+            filename = %original_name,
+            error = %e,
+            "persist failed; document rolled back if it was created"
+        );
+        return Err(ApiError::from(e).into());
+    }
 
     // Attach the document to any groups named in the `groups` form field
     // (single id or comma-separated, already split into `groups`). Idempotent
