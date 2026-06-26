@@ -7,7 +7,7 @@ use chrono::Utc;
 use tempfile::TempDir;
 
 use rantaiclaw::kb::store::sqlite::SqliteStore;
-use rantaiclaw::kb::store::{KbStore, SearchFilter};
+use rantaiclaw::kb::store::{store_document_with_chunks, KbStore, SearchFilter};
 use rantaiclaw::kb::{Chunk, ChunkMetadata, Document, DocumentId};
 
 fn ones(dim: usize) -> Vec<f32> {
@@ -558,5 +558,51 @@ async fn count_by_embedding_model_aggregates() {
             (Some("rantaiclaw_model_a".into()), 2),
             (Some("rantaiclaw_model_b".into()), 1),
         ]
+    );
+}
+
+#[tokio::test]
+async fn store_document_with_chunks_rolls_back_on_chunk_failure() {
+    // create_document + store_chunks are separate transactions; if chunk
+    // storage fails after the document row is created, the orphan 0-chunk
+    // document must be rolled back rather than left behind.
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    let doc = sample_doc("rantaiclaw_doc_rollback", "Doc Rollback");
+    let chunks = vec![Chunk {
+        content: "alpha".into(),
+        metadata: ChunkMetadata {
+            document_title: "Doc Rollback".into(),
+            category: "FAQ".into(),
+            subcategory: None,
+            section: None,
+            chunk_index: 0,
+            contextual_prefix: None,
+        },
+    }];
+    // Dimension 8 != the store's 4 → store_chunks fails after create_document.
+    let bad_embeds = vec![ones(8)];
+
+    let result = store_document_with_chunks(
+        &store,
+        &doc,
+        &chunks,
+        &bad_embeds,
+        "rantaiclaw_test_model_a",
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "dimension mismatch must surface as an error"
+    );
+
+    let docs = store.list_documents(None).await.unwrap();
+    assert!(
+        docs.is_empty(),
+        "orphan document must be rolled back, found {}",
+        docs.len()
     );
 }

@@ -16,6 +16,11 @@ pub struct RouterOpts {
     /// Maximum `$X,XXX` currency patterns. Financial tables exceed this
     /// quickly; plain prose rarely does.
     pub max_currency_matches: usize,
+    /// Minimum ratio of extracted-text bytes to source-file bytes below which a
+    /// large PDF is treated as image/design-heavy (the real content lives in
+    /// pictures the text layer can't read) and routed to OCR. Only applied to
+    /// files above `SIZE_FLOOR_BYTES`. Default 0.005 (0.5%).
+    pub min_text_filesize_ratio: f32,
 }
 
 impl Default for RouterOpts {
@@ -24,6 +29,7 @@ impl Default for RouterOpts {
             min_chars_per_page: 300,
             max_columnar_lines: 5,
             max_currency_matches: 10,
+            min_text_filesize_ratio: 0.005,
         }
     }
 }
@@ -129,6 +135,34 @@ pub fn is_unpdf_sufficient(text: &str, page_count: u32, opts: &RouterOpts) -> bo
     }
     if has_dense_currency(text, opts.max_currency_matches) {
         return false;
+    }
+    true
+}
+
+/// Like [`is_unpdf_sufficient`] but also rejects large PDFs whose extracted
+/// text is a tiny fraction of the source file — a strong signal the document
+/// is image/design-heavy (e.g. brochures) where the real content lives in
+/// pictures the text layer can't see. [`SmartRouter`] uses this since it has
+/// the original byte length on hand.
+///
+/// [`SmartRouter`]: crate::kb::extract::smart_router::SmartRouterExtractor
+pub fn is_unpdf_sufficient_with_size(
+    text: &str,
+    page_count: u32,
+    file_bytes: usize,
+    opts: &RouterOpts,
+) -> bool {
+    if !is_unpdf_sufficient(text, page_count, opts) {
+        return false;
+    }
+    // Below this size the text/file ratio is too noisy to trust (small PDFs are
+    // mostly structure overhead), so the density guard is skipped.
+    const SIZE_FLOOR_BYTES: usize = 1_000_000;
+    if file_bytes > SIZE_FLOOR_BYTES {
+        let ratio = text.len() as f32 / file_bytes as f32;
+        if ratio < opts.min_text_filesize_ratio {
+            return false;
+        }
     }
     true
 }

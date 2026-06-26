@@ -135,3 +135,29 @@ pub trait KbStore: Send + Sync {
         new_model: &str,
     ) -> KbResult<()>;
 }
+
+/// Persist a document then its chunks, rolling the document row back if chunk
+/// storage fails. `create_document` and `store_chunks` are separate
+/// transactions, so a mid-way failure would otherwise leave an orphan 0-chunk
+/// document that lists in the UI but is never retrievable. Rolls back via a
+/// hard delete. If `create_document` itself fails, nothing was created and the
+/// error is returned as-is.
+pub async fn store_document_with_chunks(
+    store: &dyn KbStore,
+    document: &Document,
+    chunks: &[Chunk],
+    embeddings: &[Vec<f32>],
+    embedding_model: &str,
+) -> KbResult<()> {
+    store.create_document(document).await?;
+    if let Err(e) = store
+        .store_chunks(&document.id, chunks, embeddings, embedding_model)
+        .await
+    {
+        // Compensating action — best-effort; the original error is what the
+        // caller acts on.
+        let _ = store.delete_document(&document.id, false).await;
+        return Err(e);
+    }
+    Ok(())
+}

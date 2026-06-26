@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-use crate::kb::extract::text_layer_signals::{is_unpdf_sufficient, RouterOpts};
+use crate::kb::extract::text_layer_signals::{is_unpdf_sufficient_with_size, RouterOpts};
 use crate::kb::extract::{ExtractionResult, Extractor};
 use crate::kb::{KbError, KbResult};
 
@@ -64,7 +64,7 @@ impl Extractor for SmartRouterExtractor {
 
         if let Some(ref tl) = text_layer_result {
             let pages = tl.pages.unwrap_or(1);
-            if is_unpdf_sufficient(&tl.text, pages, &self.opts) {
+            if is_unpdf_sufficient_with_size(&tl.text, pages, pdf_bytes.len(), &self.opts) {
                 let inner_model = if tl.model.is_empty() {
                     self.text_layer.name().to_string()
                 } else {

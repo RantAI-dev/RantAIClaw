@@ -16,7 +16,8 @@ use rantaiclaw::kb::extract::mineru::MineruExtractor;
 use rantaiclaw::kb::extract::pdf_splitter::{get_page_count, split_pdf_by_page_count};
 use rantaiclaw::kb::extract::smart_router::SmartRouterExtractor;
 use rantaiclaw::kb::extract::text_layer_signals::{
-    has_columnar_lines, has_dense_currency, is_unpdf_sufficient, RouterOpts,
+    has_columnar_lines, has_dense_currency, is_unpdf_sufficient, is_unpdf_sufficient_with_size,
+    RouterOpts,
 };
 use rantaiclaw::kb::extract::unpdf::UnpdfExtractor;
 use rantaiclaw::kb::extract::vision_llm::VisionLlmExtractor;
@@ -174,6 +175,48 @@ async fn unpdf_returns_extraction_error_on_garbage_input() {
         msg.contains("extraction failed") || msg.contains("unpdf"),
         "expected extraction-failure message, got: {msg}"
     );
+}
+
+// ----- unpdf page-count regression (2026-06-26) --------------------------
+
+#[tokio::test]
+async fn unpdf_reports_real_page_count() {
+    // Regression: unpdf returned pages=None, which collapses SmartRouter's
+    // per-page sufficiency threshold (300 chars/page) to a 300-char *total*
+    // threshold so OCR fallback never fires on design/scan-heavy PDFs. The TS
+    // original (unpdf-extractor.ts) returns totalPages.
+    let path = ensure_8_page_pdf();
+    let bytes = std::fs::read(&path).unwrap();
+    let result = UnpdfExtractor::new().extract(&bytes).await.unwrap();
+    assert_eq!(
+        result.pages,
+        Some(8),
+        "unpdf must report the real page count"
+    );
+}
+
+#[tokio::test]
+async fn smart_router_routes_low_density_multipage_pdf_to_ocr_fallback() {
+    // 8 pages x ~115 chars of prose = ~920 chars total.
+    //   Buggy (unpdf pages=None -> 1): 920 >= 300 -> "sufficient" -> NO fallback (the bug).
+    //   Fixed (unpdf pages=8):         920 < 300*8=2400 -> "insufficient" -> OCR fallback.
+    let pages: Vec<String> = (1..=8)
+        .map(|i| format!("Page {i} {}", "lorem ipsum dolor sit ".repeat(5)))
+        .collect();
+    let refs: Vec<&str> = pages.iter().map(String::as_str).collect();
+    let pdf = build_pdf(&refs);
+
+    let text_layer = Box::new(UnpdfExtractor::new()); // REAL unpdf — exercises the pages plumbing
+    let fallback = Box::new(CannedExtractor::ok("vision", "OCR STRUCTURED OUTPUT", 8));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+
+    let r = router.extract(&pdf).await.unwrap();
+    assert!(
+        r.model.contains("fallback:"),
+        "low-density multipage PDF must route to OCR fallback once page count is real; got model: {}",
+        r.model
+    );
+    assert_eq!(r.text, "OCR STRUCTURED OUTPUT");
 }
 
 // ----- task 5.3: PDF splitter --------------------------------------------
@@ -468,6 +511,22 @@ fn signals_dense_currency_triggers_fallback() {
     assert!(!is_unpdf_sufficient(&text, 1, &opts));
 }
 
+#[test]
+fn signals_low_text_to_filesize_ratio_triggers_fallback() {
+    // Reproduces the real-world NQRust brochures: ~10 KB of scattered text in a
+    // ~16 MB design PDF. The per-page char floor is CLEARED (so the page-count
+    // check alone accepts it), but text is a tiny fraction of the file, so it's
+    // image-heavy and must route to OCR.
+    let opts = RouterOpts::default();
+    let text = "lorem ipsum dolor ".repeat(560); // ~10080 chars
+                                                 // Page-count check accepts it: 10080 >= 300 * 30.
+    assert!(is_unpdf_sufficient(&text, 30, &opts));
+    // Size-aware check rejects it: ~10 KB / 16 MB ≈ 0.063% < 0.5% floor.
+    assert!(!is_unpdf_sufficient_with_size(&text, 30, 16_000_000, &opts));
+    // Small file (<1 MB): density guard does not apply → stays sufficient.
+    assert!(is_unpdf_sufficient_with_size(&text, 30, 50_000, &opts));
+}
+
 // ----- task 5.7: SmartRouter + Hybrid ------------------------------------
 
 /// A canned-result extractor used to drive SmartRouter/Hybrid behavior
@@ -538,6 +597,25 @@ async fn smart_router_returns_text_layer_when_sufficient() {
         "fallback must not be invoked, got: {}",
         r.model
     );
+}
+
+#[tokio::test]
+async fn smart_router_routes_large_low_density_pdf_to_ocr_fallback() {
+    // A 16 MB design PDF whose text layer clears the per-page floor but is a
+    // tiny fraction of the file → image-heavy → must route to OCR. Exercises
+    // SmartRouter threading the input byte length into the sufficiency check.
+    let text = "lorem ipsum dolor ".repeat(560); // ~10 KB, clears 300 * 30
+    let text_layer = Box::new(CannedExtractor::ok("unpdf", &text, 30));
+    let fallback = Box::new(CannedExtractor::ok("vision", "OCR STRUCTURED OUTPUT", 30));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+    let big_pdf = vec![0u8; 16_000_000];
+    let r = router.extract(&big_pdf).await.unwrap();
+    assert!(
+        r.model.contains("fallback:"),
+        "large low-density PDF must route to OCR, got model: {}",
+        r.model
+    );
+    assert_eq!(r.text, "OCR STRUCTURED OUTPUT");
 }
 
 #[tokio::test]

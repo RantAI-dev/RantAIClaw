@@ -114,6 +114,7 @@ impl VisionLlmExtractor {
             client: &self.client,
             base_url: &self.cfg.extract_vision_base_url,
             api_key_override: &self.cfg.extract_vision_api_key,
+            embedding_api_key_fallback: &self.cfg.embedding_api_key,
             model: &self.model,
             max_tokens: self.max_tokens,
             pdf_bytes,
@@ -133,6 +134,9 @@ struct SendCallArgs<'a> {
     client: &'a reqwest::Client,
     base_url: &'a str,
     api_key_override: &'a str,
+    /// Secondary credential tried before `OPENROUTER_API_KEY` — the embedding
+    /// key, so OCR works when only `KB_EMBEDDING_API_KEY` is configured.
+    embedding_api_key_fallback: &'a str,
     model: &'a str,
     max_tokens: u32,
     pdf_bytes: &'a [u8],
@@ -152,12 +156,13 @@ async fn send_single_pdf_call(args: SendCallArgs<'_>) -> KbResult<ExtractionResu
         None => String::new(),
     };
 
-    let api_key = KbConfig::resolve_key(args.api_key_override);
+    let api_key =
+        KbConfig::resolve_key_with_fallback(args.api_key_override, args.embedding_api_key_fallback);
     if api_key.is_empty() {
         return Err(KbError::Extraction {
             extractor: args.model.to_string(),
             message: format!(
-                "{prefix}No API key configured: set KB_EXTRACT_VISION_API_KEY or OPENROUTER_API_KEY"
+                "{prefix}No API key configured: set KB_EXTRACT_VISION_API_KEY, KB_EMBEDDING_API_KEY, or OPENROUTER_API_KEY"
             ),
         });
     }
@@ -293,6 +298,7 @@ impl Extractor for VisionLlmExtractor {
             let worker_ext = WorkerCtx {
                 client: self.client.clone(),
                 api_key_override: self.cfg.extract_vision_api_key.clone(),
+                embedding_api_key_fallback: self.cfg.embedding_api_key.clone(),
                 base_url: self.cfg.extract_vision_base_url.clone(),
                 model: self.model.clone(),
                 max_tokens: self.max_tokens,
@@ -359,6 +365,7 @@ impl Extractor for VisionLlmExtractor {
 struct WorkerCtx {
     client: reqwest::Client,
     api_key_override: String,
+    embedding_api_key_fallback: String,
     base_url: String,
     model: String,
     max_tokens: u32,
@@ -378,6 +385,7 @@ impl WorkerCtx {
             client: &self.client,
             base_url: &self.base_url,
             api_key_override: &self.api_key_override,
+            embedding_api_key_fallback: &self.embedding_api_key_fallback,
             model: &self.model,
             max_tokens: self.max_tokens,
             pdf_bytes,

@@ -296,10 +296,14 @@ async fn cmd_ingest(
         retrieval_count: 0,
         last_retrieved_at: None,
     };
-    store.create_document(&document).await?;
-    store
-        .store_chunks(&doc_id, &chunks, &embeddings, embedder.model())
-        .await?;
+    crate::kb::store::store_document_with_chunks(
+        store.as_ref(),
+        &document,
+        &chunks,
+        &embeddings,
+        embedder.model(),
+    )
+    .await?;
 
     // u128 → u64 cast: ingestion that takes more than ~584 million years
     // worth of milliseconds is not a realistic case.

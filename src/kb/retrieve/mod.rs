@@ -54,6 +54,21 @@ pub struct RetrievalResult {
 /// below 0.30 cosine are dropped before they ever reach the LLM.
 const DEFAULT_MIN_SIMILARITY: f32 = 0.30;
 
+/// Default cap on chunks a single document may contribute to the final top-K,
+/// so one document's chunks can't crowd others out — improves coverage across
+/// documents for multi-document questions. A deliberate divergence from the TS
+/// source (added 2026-06-26).
+const DEFAULT_MAX_PER_DOC: usize = 3;
+
+/// Extra candidate multiplier (relative to `max_chunks`) fetched when
+/// diversifying, so under-represented documents have chunks in the pool to
+/// promote into the top-K.
+const DIVERSIFY_FETCH_MULTIPLIER: usize = 4;
+
+/// Cap on how many document titles the inventory lists before summarizing the
+/// remainder, so large knowledge bases don't bloat the prompt.
+const INVENTORY_MAX_LISTED: usize = 50;
+
 /// Orchestrator that ties together: query expansion → vector + BM25 search in
 /// parallel → RRF → optional rerank → prompt formatting. Mirrors
 /// `retrieveContext` in `src/lib/rag/retriever.ts`.
@@ -100,7 +115,12 @@ impl Retriever {
         let fetch_limit = if self.reranker.is_some() {
             self.cfg.rerank_initial_k.max(max_chunks)
         } else {
+            // Wider than max_chunks so per-document diversification can promote
+            // chunks from documents that would otherwise be crowded out of the
+            // top-K by a single document's many chunks.
             max_chunks
+                .saturating_mul(DIVERSIFY_FETCH_MULTIPLIER)
+                .max(max_chunks)
         };
 
         // Query expansion — opt-in, fail-soft. Returns `[query]` when disabled.
@@ -173,11 +193,20 @@ impl Retriever {
         // the fused set is larger than max_chunks (no point reordering a set
         // that already fits).
         chunks = self.apply_rerank(query, chunks, max_chunks).await;
+        // Spread the final top-K across documents so one document's chunks
+        // don't crowd others out of a single answer.
+        chunks = diversify_by_document(chunks, DEFAULT_MAX_PER_DOC);
         chunks.truncate(max_chunks);
+
+        // Document inventory for the queried scope — lets enumeration questions
+        // ("what's in here?") see the FULL document set, not just the retrieved
+        // top-K. Returned even when no chunk matched so the agent still knows
+        // what exists.
+        let inventory = self.build_document_inventory(&opts).await;
 
         if chunks.is_empty() {
             return Ok(RetrievalResult {
-                context: String::new(),
+                context: inventory,
                 sources: Vec::new(),
                 chunks: Vec::new(),
             });
@@ -210,7 +239,12 @@ impl Retriever {
             };
             parts.push(format!("{source}\n{prefix}{}", chunk.content));
         }
-        let context = parts.join("\n\n---\n\n");
+        let body = parts.join("\n\n---\n\n");
+        let context = if inventory.is_empty() {
+            body
+        } else {
+            format!("{inventory}\n{body}")
+        };
 
         // Unique sources keyed by (title, section). Preserves insertion order
         // so the source list mirrors the order chunks appear in `context`.
@@ -247,6 +281,25 @@ impl Retriever {
         opts: RetrieveOptions,
     ) -> KbResult<RetrievalResult> {
         self.retrieve(query, opts).await
+    }
+
+    /// Build the document inventory (titles in scope) for the retrieval
+    /// context. Group-scoped when `opts.group_ids` is set, else the whole KB.
+    /// Best-effort: store errors yield an empty inventory.
+    async fn build_document_inventory(&self, opts: &RetrieveOptions) -> String {
+        let docs = if opts.group_ids.is_empty() {
+            self.store.list_documents(None).await.unwrap_or_default()
+        } else {
+            let mut all = Vec::new();
+            for g in &opts.group_ids {
+                if let Ok(mut ds) = self.store.list_group_documents(g).await {
+                    all.append(&mut ds);
+                }
+            }
+            all
+        };
+        let titles: Vec<String> = docs.into_iter().map(|d| d.title).collect();
+        format_document_inventory(&titles, INVENTORY_MAX_LISTED)
     }
 
     /// Vector search arm. Single-query path uses `embed_query` + a single
@@ -362,5 +415,131 @@ impl Retriever {
                 chunks
             }
         }
+    }
+}
+
+/// Reorder so no document contributes more than `max_per_doc` chunks to the
+/// front of the list, promoting under-represented documents into the top-K.
+/// Over-cap chunks are pushed to the tail (kept, not dropped) so a larger
+/// `max_chunks` still includes them. `max_per_doc == 0` is a no-op.
+fn diversify_by_document(chunks: Vec<SearchResult>, max_per_doc: usize) -> Vec<SearchResult> {
+    if max_per_doc == 0 {
+        return chunks;
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut kept: Vec<SearchResult> = Vec::with_capacity(chunks.len());
+    let mut overflow: Vec<SearchResult> = Vec::new();
+    for c in chunks {
+        let count = counts.entry(c.document_id.0.clone()).or_insert(0);
+        if *count < max_per_doc {
+            *count += 1;
+            kept.push(c);
+        } else {
+            overflow.push(c);
+        }
+    }
+    kept.extend(overflow);
+    kept
+}
+
+/// Format a deduplicated, capped document inventory for the retrieval context,
+/// so enumeration questions ("what's in here?") see the FULL document set
+/// regardless of which chunks were retrieved. Empty input → empty string.
+fn format_document_inventory(titles: &[String], max_listed: usize) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique: Vec<&str> = Vec::new();
+    for t in titles {
+        let s = t.as_str();
+        if !s.is_empty() && seen.insert(s) {
+            unique.push(s);
+        }
+    }
+    if unique.is_empty() {
+        return String::new();
+    }
+    let total = unique.len();
+    let mut out = format!("## Documents in this knowledge base ({total}):\n");
+    for t in unique.iter().take(max_listed) {
+        out.push_str("- ");
+        out.push_str(t);
+        out.push('\n');
+    }
+    if total > max_listed {
+        out.push_str(&format!("- … and {} more\n", total - max_listed));
+    }
+    out
+}
+
+#[cfg(test)]
+mod diversify_tests {
+    use super::*;
+
+    fn sr(id: &str, doc: &str) -> SearchResult {
+        SearchResult {
+            id: ChunkId(id.into()),
+            document_id: DocumentId(doc.into()),
+            document_title: doc.into(),
+            content: String::new(),
+            categories: Vec::new(),
+            subcategory: None,
+            section: None,
+            similarity: 0.0,
+            contextual_prefix: None,
+        }
+    }
+
+    #[test]
+    fn diversify_promotes_underrepresented_documents() {
+        // d1 dominates the head; with cap=2 its 3rd chunk is demoted so d2/d3
+        // surface inside the first four results.
+        let chunks = vec![
+            sr("a1", "d1"),
+            sr("a2", "d1"),
+            sr("a3", "d1"),
+            sr("b1", "d2"),
+            sr("c1", "d3"),
+        ];
+        let out = diversify_by_document(chunks, 2);
+        let head: Vec<&str> = out
+            .iter()
+            .take(4)
+            .map(|c| c.document_id.0.as_str())
+            .collect();
+        assert_eq!(head, vec!["d1", "d1", "d2", "d3"]);
+        // The demoted chunk is kept at the tail, not dropped.
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[4].id.0, "a3");
+    }
+
+    #[test]
+    fn diversify_is_noop_when_cap_zero() {
+        let chunks = vec![sr("a1", "d1"), sr("a2", "d1")];
+        let out = diversify_by_document(chunks, 0);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id.0, "a1");
+    }
+
+    #[test]
+    fn format_document_inventory_dedupes_caps_and_formats() {
+        // Empty input -> empty string (no inventory section).
+        assert_eq!(format_document_inventory(&[], 50), "");
+        // Dedup by title; header count reflects the unique total.
+        let titles = vec![
+            "Storage".to_string(),
+            "Identity".to_string(),
+            "Storage".to_string(),
+        ];
+        let out = format_document_inventory(&titles, 50);
+        assert!(
+            out.starts_with("## Documents in this knowledge base (2):"),
+            "got: {out}"
+        );
+        assert_eq!(out.matches("- Storage").count(), 1, "deduped: {out}");
+        assert!(out.contains("- Identity"));
+        // Cap with an overflow note.
+        let many: Vec<String> = (1..=60).map(|i| format!("Doc{i}")).collect();
+        let capped = format_document_inventory(&many, 50);
+        assert!(capped.contains("## Documents in this knowledge base (60):"));
+        assert!(capped.contains("and 10 more"), "got: {capped}");
     }
 }

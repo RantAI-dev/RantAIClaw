@@ -349,6 +349,13 @@ struct IngestResponse {
     document_id: String,
     chunks_stored: usize,
     elapsed_ms: u64,
+    /// Characters of text extracted from the upload (so the UI can warn when a
+    /// document extracted poorly).
+    chars_extracted: usize,
+    /// PDF page count when known.
+    pages: Option<u32>,
+    /// `true` when the extraction looks near-empty for the page count.
+    low_text_density: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -902,6 +909,14 @@ async fn ingest(
         .first()
         .cloned()
         .unwrap_or_else(|| "RANTAICLAW".to_string());
+
+    // Extraction-quality signal for observability + the ingest response.
+    let chars_extracted = processed.content.chars().count();
+    let pages = crate::kb::extract::pdf_splitter::get_page_count(&bytes)
+        .await
+        .ok();
+    let low_density = low_text_density(chars_extracted, pages);
+
     let chunks = smart_chunk_document(
         &processed.content,
         &title,
@@ -910,6 +925,13 @@ async fn ingest(
         SmartChunkOptions::default(),
     );
     if chunks.is_empty() {
+        tracing::warn!(
+            target: "kb::ingest",
+            filename = %original_name,
+            chars = chars_extracted,
+            pages = ?pages,
+            "ingest produced no chunks"
+        );
         return Err(ApiError::bad_request(format!(
             "no chunks produced from upload {original_name}"
         ))
@@ -917,11 +939,15 @@ async fn ingest(
     }
 
     let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-    let embeddings = ctx
-        .embedder
-        .embed_many(&texts)
-        .await
-        .map_err(ApiError::from)?;
+    let embeddings = ctx.embedder.embed_many(&texts).await.map_err(|e| {
+        tracing::warn!(
+            target: "kb::ingest",
+            filename = %original_name,
+            error = %e,
+            "embedding failed during ingest"
+        );
+        ApiError::from(e)
+    })?;
 
     let doc_id = DocumentId(uuid::Uuid::new_v4().to_string());
     let now = chrono::Utc::now();
@@ -954,14 +980,23 @@ async fn ingest(
         retrieval_count: 0,
         last_retrieved_at: None,
     };
-    ctx.store
-        .create_document(&document)
-        .await
-        .map_err(ApiError::from)?;
-    ctx.store
-        .store_chunks(&doc_id, &chunks, &embeddings, ctx.embedder.model())
-        .await
-        .map_err(ApiError::from)?;
+    if let Err(e) = crate::kb::store::store_document_with_chunks(
+        ctx.store.as_ref(),
+        &document,
+        &chunks,
+        &embeddings,
+        ctx.embedder.model(),
+    )
+    .await
+    {
+        tracing::error!(
+            target: "kb::ingest",
+            filename = %original_name,
+            error = %e,
+            "persist failed; document rolled back if it was created"
+        );
+        return Err(ApiError::from(e).into());
+    }
 
     // Attach the document to any groups named in the `groups` form field
     // (single id or comma-separated, already split into `groups`). Idempotent
@@ -978,11 +1013,43 @@ async fn ingest(
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
+    if low_density {
+        tracing::warn!(
+            target: "kb::ingest",
+            filename = %original_name,
+            chars = chars_extracted,
+            pages = ?pages,
+            chunks = chunks.len(),
+            "ingest ok but low text density — document may retrieve poorly; consider OCR"
+        );
+    } else {
+        tracing::info!(
+            target: "kb::ingest",
+            filename = %original_name,
+            chars = chars_extracted,
+            pages = ?pages,
+            chunks = chunks.len(),
+            "ingest ok"
+        );
+    }
+
     Ok(Json(IngestResponse {
         document_id: doc_id.0,
         chunks_stored: chunks.len(),
         elapsed_ms,
+        chars_extracted,
+        pages,
+        low_text_density: low_density,
     }))
+}
+
+/// True when extracted text is suspiciously thin for the page count — a
+/// near-empty extraction the operator (and UI) should be warned about.
+/// Conservative (~100 chars/page) so legitimately sparse design documents
+/// aren't flagged.
+fn low_text_density(chars: usize, pages: Option<u32>) -> bool {
+    let pages = pages.unwrap_or(1).max(1) as usize;
+    chars < 100usize.saturating_mul(pages)
 }
 
 /// Split a CSV cell into trimmed, non-empty entries. Used for `categories`
@@ -1040,6 +1107,16 @@ mod tests {
         );
         assert!(split_csv("").is_empty());
         assert!(split_csv("   ").is_empty());
+    }
+
+    #[test]
+    fn low_text_density_flags_near_empty_extraction() {
+        // ~100 chars/page floor: near-empty extraction is flagged.
+        assert!(low_text_density(40, Some(1))); // 40 < 100
+        assert!(low_text_density(200, Some(8))); // 200 < 800
+                                                 // Legitimately sparse design docs (a few hundred chars/page) are not.
+        assert!(!low_text_density(9000, Some(30))); // 9000 >= 3000
+        assert!(!low_text_density(500, None)); // None -> 1 page; 500 >= 100
     }
 
     #[test]
