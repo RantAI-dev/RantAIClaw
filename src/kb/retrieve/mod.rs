@@ -54,6 +54,17 @@ pub struct RetrievalResult {
 /// below 0.30 cosine are dropped before they ever reach the LLM.
 const DEFAULT_MIN_SIMILARITY: f32 = 0.30;
 
+/// Default cap on chunks a single document may contribute to the final top-K,
+/// so one document's chunks can't crowd others out — improves coverage across
+/// documents for multi-document questions. A deliberate divergence from the TS
+/// source (added 2026-06-26).
+const DEFAULT_MAX_PER_DOC: usize = 3;
+
+/// Extra candidate multiplier (relative to `max_chunks`) fetched when
+/// diversifying, so under-represented documents have chunks in the pool to
+/// promote into the top-K.
+const DIVERSIFY_FETCH_MULTIPLIER: usize = 4;
+
 /// Orchestrator that ties together: query expansion → vector + BM25 search in
 /// parallel → RRF → optional rerank → prompt formatting. Mirrors
 /// `retrieveContext` in `src/lib/rag/retriever.ts`.
@@ -100,7 +111,12 @@ impl Retriever {
         let fetch_limit = if self.reranker.is_some() {
             self.cfg.rerank_initial_k.max(max_chunks)
         } else {
+            // Wider than max_chunks so per-document diversification can promote
+            // chunks from documents that would otherwise be crowded out of the
+            // top-K by a single document's many chunks.
             max_chunks
+                .saturating_mul(DIVERSIFY_FETCH_MULTIPLIER)
+                .max(max_chunks)
         };
 
         // Query expansion — opt-in, fail-soft. Returns `[query]` when disabled.
@@ -173,6 +189,9 @@ impl Retriever {
         // the fused set is larger than max_chunks (no point reordering a set
         // that already fits).
         chunks = self.apply_rerank(query, chunks, max_chunks).await;
+        // Spread the final top-K across documents so one document's chunks
+        // don't crowd others out of a single answer.
+        chunks = diversify_by_document(chunks, DEFAULT_MAX_PER_DOC);
         chunks.truncate(max_chunks);
 
         if chunks.is_empty() {
@@ -362,5 +381,79 @@ impl Retriever {
                 chunks
             }
         }
+    }
+}
+
+/// Reorder so no document contributes more than `max_per_doc` chunks to the
+/// front of the list, promoting under-represented documents into the top-K.
+/// Over-cap chunks are pushed to the tail (kept, not dropped) so a larger
+/// `max_chunks` still includes them. `max_per_doc == 0` is a no-op.
+fn diversify_by_document(chunks: Vec<SearchResult>, max_per_doc: usize) -> Vec<SearchResult> {
+    if max_per_doc == 0 {
+        return chunks;
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut kept: Vec<SearchResult> = Vec::with_capacity(chunks.len());
+    let mut overflow: Vec<SearchResult> = Vec::new();
+    for c in chunks {
+        let count = counts.entry(c.document_id.0.clone()).or_insert(0);
+        if *count < max_per_doc {
+            *count += 1;
+            kept.push(c);
+        } else {
+            overflow.push(c);
+        }
+    }
+    kept.extend(overflow);
+    kept
+}
+
+#[cfg(test)]
+mod diversify_tests {
+    use super::*;
+
+    fn sr(id: &str, doc: &str) -> SearchResult {
+        SearchResult {
+            id: ChunkId(id.into()),
+            document_id: DocumentId(doc.into()),
+            document_title: doc.into(),
+            content: String::new(),
+            categories: Vec::new(),
+            subcategory: None,
+            section: None,
+            similarity: 0.0,
+            contextual_prefix: None,
+        }
+    }
+
+    #[test]
+    fn diversify_promotes_underrepresented_documents() {
+        // d1 dominates the head; with cap=2 its 3rd chunk is demoted so d2/d3
+        // surface inside the first four results.
+        let chunks = vec![
+            sr("a1", "d1"),
+            sr("a2", "d1"),
+            sr("a3", "d1"),
+            sr("b1", "d2"),
+            sr("c1", "d3"),
+        ];
+        let out = diversify_by_document(chunks, 2);
+        let head: Vec<&str> = out
+            .iter()
+            .take(4)
+            .map(|c| c.document_id.0.as_str())
+            .collect();
+        assert_eq!(head, vec!["d1", "d1", "d2", "d3"]);
+        // The demoted chunk is kept at the tail, not dropped.
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[4].id.0, "a3");
+    }
+
+    #[test]
+    fn diversify_is_noop_when_cap_zero() {
+        let chunks = vec![sr("a1", "d1"), sr("a2", "d1")];
+        let out = diversify_by_document(chunks, 0);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id.0, "a1");
     }
 }
