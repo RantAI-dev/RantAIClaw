@@ -176,6 +176,48 @@ async fn unpdf_returns_extraction_error_on_garbage_input() {
     );
 }
 
+// ----- unpdf page-count regression (2026-06-26) --------------------------
+
+#[tokio::test]
+async fn unpdf_reports_real_page_count() {
+    // Regression: unpdf returned pages=None, which collapses SmartRouter's
+    // per-page sufficiency threshold (300 chars/page) to a 300-char *total*
+    // threshold so OCR fallback never fires on design/scan-heavy PDFs. The TS
+    // original (unpdf-extractor.ts) returns totalPages.
+    let path = ensure_8_page_pdf();
+    let bytes = std::fs::read(&path).unwrap();
+    let result = UnpdfExtractor::new().extract(&bytes).await.unwrap();
+    assert_eq!(
+        result.pages,
+        Some(8),
+        "unpdf must report the real page count"
+    );
+}
+
+#[tokio::test]
+async fn smart_router_routes_low_density_multipage_pdf_to_ocr_fallback() {
+    // 8 pages x ~115 chars of prose = ~920 chars total.
+    //   Buggy (unpdf pages=None -> 1): 920 >= 300 -> "sufficient" -> NO fallback (the bug).
+    //   Fixed (unpdf pages=8):         920 < 300*8=2400 -> "insufficient" -> OCR fallback.
+    let pages: Vec<String> = (1..=8)
+        .map(|i| format!("Page {i} {}", "lorem ipsum dolor sit ".repeat(5)))
+        .collect();
+    let refs: Vec<&str> = pages.iter().map(String::as_str).collect();
+    let pdf = build_pdf(&refs);
+
+    let text_layer = Box::new(UnpdfExtractor::new()); // REAL unpdf — exercises the pages plumbing
+    let fallback = Box::new(CannedExtractor::ok("vision", "OCR STRUCTURED OUTPUT", 8));
+    let router = SmartRouterExtractor::new(text_layer, fallback);
+
+    let r = router.extract(&pdf).await.unwrap();
+    assert!(
+        r.model.contains("fallback:"),
+        "low-density multipage PDF must route to OCR fallback once page count is real; got model: {}",
+        r.model
+    );
+    assert_eq!(r.text, "OCR STRUCTURED OUTPUT");
+}
+
 // ----- task 5.3: PDF splitter --------------------------------------------
 
 #[tokio::test]

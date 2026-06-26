@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
+use crate::kb::extract::pdf_splitter::get_page_count;
 use crate::kb::extract::{elapsed_ms, ExtractionResult, Extractor};
 use crate::kb::{KbError, KbResult};
 
@@ -44,10 +45,17 @@ impl Extractor for UnpdfExtractor {
         .await
         .map_err(|e| KbError::Other(format!("unpdf join error: {e}")))??;
 
+        // Page count restores parity with the TS port (`unpdf-extractor.ts`
+        // returns `totalPages`). Without it, SmartRouter's per-page sufficiency
+        // heuristic collapses to a 300-char *total* threshold and never triggers
+        // OCR on design/scan-heavy PDFs. Best-effort: a parse failure yields
+        // `None` — the pre-fix behavior for that one doc.
+        let pages = get_page_count(pdf_bytes).await.ok();
+
         Ok(ExtractionResult {
             text,
             elapsed_ms: elapsed_ms(t0),
-            pages: None,
+            pages,
             model: "unpdf".into(),
             prompt_tokens: None,
             completion_tokens: None,
