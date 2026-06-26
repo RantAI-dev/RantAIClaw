@@ -98,6 +98,17 @@ impl KbConfig {
         }
         env::var("OPENROUTER_API_KEY").unwrap_or_default()
     }
+
+    /// Like [`resolve_key`] but tries a `secondary` credential (e.g. the
+    /// embedding key) before the `OPENROUTER_API_KEY` env var. KB usually
+    /// shares one provider, so OCR can reuse the embedding key instead of
+    /// failing when only `KB_EMBEDDING_API_KEY` is configured.
+    pub fn resolve_key_with_fallback(primary: &str, secondary: &str) -> String {
+        if !primary.is_empty() {
+            return primary.into();
+        }
+        Self::resolve_key(secondary)
+    }
 }
 
 /// Parse an env var as `T` (any `FromStr`), returning `fallback` when the

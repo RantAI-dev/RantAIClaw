@@ -101,3 +101,26 @@ fn invalid_int_returns_error() {
     assert!(result.is_err());
     // Cleanup runs via EnvGuard::drop.
 }
+
+#[test]
+fn resolve_key_with_fallback_prefers_override_then_secondary_then_env() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
+    // Deterministic env fallthrough: remove any ambient OpenRouter key.
+    unsafe {
+        std::env::remove_var("OPENROUTER_API_KEY");
+    }
+    // Primary override wins.
+    assert_eq!(
+        KbConfig::resolve_key_with_fallback("primary", "secondary"),
+        "primary"
+    );
+    // Empty primary -> secondary (e.g. the embedding key) is used so OCR can
+    // reuse the embedding credential instead of failing.
+    assert_eq!(
+        KbConfig::resolve_key_with_fallback("", "secondary"),
+        "secondary"
+    );
+    // Both empty -> OPENROUTER_API_KEY env (removed above) -> "".
+    assert_eq!(KbConfig::resolve_key_with_fallback("", ""), "");
+}
