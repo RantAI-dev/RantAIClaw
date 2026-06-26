@@ -182,7 +182,7 @@ nusb = { version = "0.2", default-features = false, optional = true }
 probe-rs = { version = "0.31", optional = true }
 
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
-pdf-extract = { version = "0.10", optional = true }
+pdf-extract = { version = "0.12", optional = true }
 
 # Terminal QR rendering (used by `whatsapp-web` for pairing display, and any
 # future channels that need QR-driven linking). Pure Rust, no_std-friendly.
@@ -209,7 +209,7 @@ sqlite-vec = { version = "0.1", optional = true }
 # saves binary size on non-KB builds. The only consumers
 # (`src/kb/extract/pdf_splitter.rs`, `tests/kb/extract_test.rs`) are
 # already `#[cfg(feature = "kb")]`-gated.
-lopdf = { version = "0.34", optional = true }
+lopdf = { version = "0.42", optional = true }
 
 # Insertion-order-preserving map backing the KB query embedding LRU cache.
 # `IndexMap` lets us move keys to the back on access without a separate
