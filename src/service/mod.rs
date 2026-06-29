@@ -184,26 +184,35 @@ fn is_service_running(config: &Config, init_system: InitSystem) -> bool {
     }
 }
 
-/// Make the running daemon reflect the current config after a channel change.
-/// Restart if a service exists; otherwise install + start. Best-effort: prints an
-/// actionable hint on failure and returns `Ok` so callers (setup) never abort.
-pub fn apply_channel_config(config: &Config, init_system: InitSystem) -> Result<()> {
-    let installed = is_service_installed(config, init_system);
-    let result = match decide_apply_action(installed) {
-        ApplyAction::Restart => {
-            restart(config, init_system).map(|()| "↳ daemon restarted to apply channel changes ✓")
-        }
-        ApplyAction::InstallThenStart => install(config, init_system)
-            .and_then(|()| start_inner(config, init_system))
-            .map(|()| "↳ installed + started daemon service ✓"),
-    };
-    match result {
-        Ok(msg) => println!("{msg}"),
-        Err(e) => println!(
-            "↳ could not auto-apply channel change ({e}). Run `rantaiclaw service restart` manually."
-        ),
+/// Make the running daemon reflect the current config after a channel change:
+/// restart if the service exists, else install + start. Returns a short human
+/// message describing what happened (caller decides how to surface it — UI event
+/// or CLI print). Quiet by design (no `println!`) so it is safe to call from the
+/// TUI setup overlay, where stray stdout corrupts the alt-screen.
+///
+/// Auto-apply targets the common systemd user daemon. On other init systems /
+/// platforms it returns a manual hint rather than guessing.
+pub fn apply_channel_config(config: &Config, init_system: InitSystem) -> Result<String> {
+    let resolved = init_system.resolve().unwrap_or(InitSystem::Auto);
+    if !cfg!(target_os = "linux") || resolved != InitSystem::Systemd {
+        return Ok("run `rantaiclaw service restart` to apply the channel change".to_string());
     }
-    Ok(())
+    match decide_apply_action(is_service_installed(config, init_system)) {
+        ApplyAction::Restart => {
+            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+            run_checked(Command::new("systemctl").args([
+                "--user",
+                "restart",
+                "rantaiclaw.service",
+            ]))?;
+            Ok("daemon restarted to apply channel changes".to_string())
+        }
+        ApplyAction::InstallThenStart => {
+            install(config, init_system)?;
+            run_checked(Command::new("systemctl").args(["--user", "start", "rantaiclaw.service"]))?;
+            Ok("installed + started daemon service".to_string())
+        }
+    }
 }
 
 pub fn handle_command(

@@ -225,6 +225,27 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
                     })
                     .await
                     .ok();
+
+                // Apply the new channel config to the running daemon so the bot
+                // answers immediately — no manual restart needed. Quiet (no
+                // stdout) so it is safe inside the TUI overlay; the result is
+                // surfaced via the provision event stream.
+                let (severity, text) = match crate::service::apply_channel_config(
+                    config,
+                    crate::service::InitSystem::Auto,
+                ) {
+                    Ok(msg) => (Severity::Success, format!("↳ {msg}")),
+                    Err(e) => (
+                        Severity::Warn,
+                        format!(
+                            "config saved, but auto-apply failed: {e}. Run `rantaiclaw service restart`."
+                        ),
+                    ),
+                };
+                events
+                    .send(ProvisionEvent::Message { severity, text })
+                    .await
+                    .ok();
             }
             Err(e) => {
                 events
