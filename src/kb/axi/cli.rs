@@ -25,13 +25,16 @@ use clap::Subcommand;
 use crate::kb::chunk::{smart_chunk_document, SmartChunkOptions};
 use crate::kb::embed;
 use crate::kb::file::{process_file, ProcessingOptions};
+use crate::kb::intelligence::extract::llm::CombinedLlmExtractor;
+use crate::kb::intelligence::extract_document_intelligence;
+use crate::kb::intelligence::types::{Entity, Relation};
 use crate::kb::maintenance::{
     check_drift, run_bulk_re_embed, BulkReEmbedOptions, BulkReEmbedReport, DriftReport,
 };
 use crate::kb::rerank;
 use crate::kb::retrieve::{RetrieveOptions, Retriever, SourceRef};
 use crate::kb::store::sqlite::SqliteStore;
-use crate::kb::store::KbStore;
+use crate::kb::store::{Graph, IntelligenceStore, KbStore};
 use crate::kb::{Document, DocumentId, KbConfig, KbResult, SearchResult};
 
 /// Preview length used when rendering chunk content into TOON rows. Keeps
@@ -121,6 +124,26 @@ pub enum KbCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show the entities and relations extracted from a document.
+    Intelligence {
+        /// Document id
+        document_id: String,
+        /// Output JSON instead of TOON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the cross-document knowledge graph (top entities by degree).
+    Graph {
+        /// Filter to a knowledge base group's documents
+        #[arg(long)]
+        group: Option<String>,
+        /// Max nodes (defaults to KB_GRAPH_MAX_NODES)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Output JSON instead of TOON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl KbCommand {
@@ -130,7 +153,13 @@ impl KbCommand {
     /// - `Err(KbError)` — internal failure; caller decides how to render.
     pub async fn run(self) -> KbResult<i32> {
         let cfg = KbConfig::from_env()?;
-        let store = open_store(&cfg).await?;
+        // Build the concrete store once, then alias it through both trait
+        // views. `SqliteStore` implements `KbStore` and `IntelligenceStore`;
+        // `Arc<dyn KbStore>` can't be upcast to `Arc<dyn IntelligenceStore>`,
+        // so we keep a second handle over the same `SqliteStore` (mirrors the
+        // HTTP `KbContext`). They share one DB handle.
+        let concrete = open_store(&cfg).await?;
+        let store: Arc<dyn KbStore> = concrete.clone();
 
         match self {
             Self::Search {
@@ -146,7 +175,10 @@ impl KbCommand {
                 categories,
                 groups,
                 json,
-            } => cmd_ingest(&cfg, store, path, title, categories, groups, json).await,
+            } => {
+                let intel: Arc<dyn IntelligenceStore> = concrete;
+                cmd_ingest(&cfg, store, intel, path, title, categories, groups, json).await
+            }
             Self::List { organization, json } => {
                 cmd_list(store, organization.as_deref(), json).await
             }
@@ -159,6 +191,14 @@ impl KbCommand {
                 batch_size,
                 json,
             } => cmd_re_embed(&cfg, store, include_current, dry_run, batch_size, json).await,
+            Self::Intelligence { document_id, json } => {
+                let intel: Arc<dyn IntelligenceStore> = concrete;
+                cmd_intelligence(intel, document_id, json).await
+            }
+            Self::Graph { group, limit, json } => {
+                let intel: Arc<dyn IntelligenceStore> = concrete;
+                cmd_graph(&cfg, intel, group, limit, json).await
+            }
         }
     }
 }
@@ -216,6 +256,7 @@ async fn cmd_search(
 async fn cmd_ingest(
     cfg: &KbConfig,
     store: Arc<dyn KbStore>,
+    intel: Arc<dyn IntelligenceStore>,
     path: PathBuf,
     title: Option<String>,
     categories: Vec<String>,
@@ -304,6 +345,34 @@ async fn cmd_ingest(
         embedder.model(),
     )
     .await?;
+
+    // Document intelligence: gated on the `intelligence_enabled` flag (off by
+    // default). Unlike the HTTP ingest — which detaches via `tokio::spawn` so
+    // the response returns immediately — the CLI is a short-lived invocation
+    // that exits as soon as `run` returns, so a detached task would be dropped
+    // before it ran. We therefore await it inline. Extraction failure never
+    // fails the ingest: errors are warned (doc id only), not propagated. The
+    // API key is passed by value into the extractor and never logged.
+    if cfg.intelligence_enabled {
+        let extractor = build_intelligence_extractor(cfg);
+        let chunk_refs: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+        if let Err(e) = extract_document_intelligence(
+            intel.as_ref(),
+            &extractor,
+            &doc_id.0,
+            &chunk_refs,
+            &cfg.intelligence_resolution,
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "kb::ingest",
+                document_id = %doc_id.0,
+                error = %e,
+                "document intelligence extraction failed (non-fatal)"
+            );
+        }
+    }
 
     // u128 → u64 cast: ingestion that takes more than ~584 million years
     // worth of milliseconds is not a realistic case.
@@ -504,9 +573,149 @@ async fn cmd_re_embed(
     Ok(0)
 }
 
+async fn cmd_intelligence(
+    intel: Arc<dyn IntelligenceStore>,
+    document_id: String,
+    json: bool,
+) -> KbResult<i32> {
+    let (entities, relations) = intel.intelligence_for_document(&document_id).await?;
+    if json {
+        let payload = serde_json::json!({
+            "entities": entities.iter().map(entity_to_json).collect::<Vec<_>>(),
+            "relations": relations.iter().map(relation_to_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        let entity_rows: Vec<serde_json::Value> = entities.iter().map(entity_to_json).collect();
+        print!(
+            "{}",
+            super::format_toon(
+                "entities",
+                &entity_rows,
+                &["id", "name", "entity_type", "confidence"],
+            )
+        );
+        let relation_rows: Vec<serde_json::Value> =
+            relations.iter().map(relation_to_json).collect();
+        print!(
+            "{}",
+            super::format_toon(
+                "relations",
+                &relation_rows,
+                &["source", "target", "relation_type", "confidence"],
+            )
+        );
+    }
+    Ok(0)
+}
+
+async fn cmd_graph(
+    cfg: &KbConfig,
+    intel: Arc<dyn IntelligenceStore>,
+    group: Option<String>,
+    limit: Option<usize>,
+    json: bool,
+) -> KbResult<i32> {
+    let limit = limit.unwrap_or(cfg.graph_max_nodes);
+    let graph = intel.graph(group.as_deref(), limit).await?;
+    if json {
+        println!("{}", graph_to_json(&graph));
+    } else {
+        let node_rows: Vec<serde_json::Value> = graph
+            .nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "entity_type": n.entity_type,
+                    "degree": n.degree,
+                    "doc_count": n.doc_count,
+                })
+            })
+            .collect();
+        print!(
+            "{}",
+            super::format_toon(
+                "nodes",
+                &node_rows,
+                &["id", "name", "entity_type", "degree", "doc_count"],
+            )
+        );
+        let edge_rows: Vec<serde_json::Value> = graph
+            .edges
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "source": e.source,
+                    "target": e.target,
+                    "relation_type": e.relation_type,
+                })
+            })
+            .collect();
+        print!(
+            "{}",
+            super::format_toon("edges", &edge_rows, &["source", "target", "relation_type"]),
+        );
+    }
+    Ok(0)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build the document-intelligence LLM extractor from KB config — the same
+/// fields the HTTP ingest path uses: `intelligence_model`, the OpenRouter chat
+/// endpoint, and the resolved embedding/`OPENROUTER_API_KEY` credential. The
+/// key is passed by value into the extractor and never logged.
+fn build_intelligence_extractor(cfg: &KbConfig) -> CombinedLlmExtractor {
+    CombinedLlmExtractor::new(
+        cfg.intelligence_model.clone(),
+        cfg.openrouter_chat_url.clone(),
+        KbConfig::resolve_key(&cfg.embedding_api_key),
+    )
+}
+
+/// JSON/TOON row for an entity. `entity_type` is the string form of the typed
+/// enum (via `EntityType::as_str`).
+fn entity_to_json(e: &Entity) -> serde_json::Value {
+    serde_json::json!({
+        "id": e.id,
+        "name": e.name,
+        "entity_type": e.entity_type.as_str(),
+        "confidence": e.confidence,
+    })
+}
+
+/// JSON/TOON row for a relation, keyed by source/target entity ids.
+fn relation_to_json(r: &Relation) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.id,
+        "source": r.source_entity_id,
+        "target": r.target_entity_id,
+        "relation_type": r.relation_type.as_str(),
+        "confidence": r.confidence,
+    })
+}
+
+fn graph_to_json(g: &Graph) -> String {
+    let payload = serde_json::json!({
+        "nodes": g.nodes.iter().map(|n| serde_json::json!({
+            "id": n.id,
+            "name": n.name,
+            "entity_type": n.entity_type,
+            "degree": n.degree,
+            "doc_count": n.doc_count,
+        })).collect::<Vec<_>>(),
+        "edges": g.edges.iter().map(|e| serde_json::json!({
+            "source": e.source,
+            "target": e.target,
+            "relation_type": e.relation_type,
+        })).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
+}
 
 /// Resolve the on-disk path for the KB SQLite database.
 ///
@@ -530,7 +739,10 @@ pub(crate) fn resolve_kb_db_path() -> PathBuf {
     PathBuf::from("./kb.db")
 }
 
-async fn open_store(cfg: &KbConfig) -> KbResult<Arc<dyn KbStore>> {
+/// Open the SQLite store as a concrete `Arc<SqliteStore>` so the caller can
+/// alias it through both the [`KbStore`] and [`IntelligenceStore`] seams (an
+/// `Arc<dyn KbStore>` can't be upcast to `Arc<dyn IntelligenceStore>`).
+async fn open_store(cfg: &KbConfig) -> KbResult<Arc<SqliteStore>> {
     let path = resolve_kb_db_path();
     let store = SqliteStore::open(&path, cfg.embedding_dim).await?;
     Ok(Arc::new(store))

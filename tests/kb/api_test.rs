@@ -457,6 +457,113 @@ async fn kb_routes_require_auth_when_pairing_enabled() {
 }
 
 #[tokio::test]
+async fn kb_intelligence_returns_entities_relations_and_stats() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, EntityType, ExtractSource};
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            // Seed a document plus one intelligence entity + a mention of it,
+            // exactly as the orchestrator would (Task-4 seeding pattern).
+            store
+                .create_document(&sample_doc("rantaiclaw_doc_intel", "Intel Doc"))
+                .await
+                .expect("seed doc");
+            let entity_id = store
+                .upsert_entity(&Entity {
+                    id: "e_nqrust".into(),
+                    canonical_key: "nqrust:Product".into(),
+                    name: "NQRust".into(),
+                    entity_type: EntityType::Product,
+                    confidence: 0.9,
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .expect("seed entity");
+            store
+                .add_mention(&EntityMention {
+                    id: "m_nqrust".into(),
+                    entity_id,
+                    document_id: "rantaiclaw_doc_intel".into(),
+                    chunk_index: Some(0),
+                    context: None,
+                    source: ExtractSource::Llm,
+                })
+                .await
+                .expect("seed mention");
+        })
+    })
+    .await;
+
+    let resp = reqwest::get(format!(
+        "{}/api/v1/kb/documents/rantaiclaw_doc_intel/intelligence",
+        h.base_url
+    ))
+    .await
+    .expect("request");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json body");
+
+    assert!(body["entities"].is_array(), "entities missing: {body}");
+    assert!(body["relations"].is_array(), "relations missing: {body}");
+    assert!(body["stats"].is_object(), "stats missing: {body}");
+
+    let entities = body["entities"].as_array().unwrap();
+    assert_eq!(entities.len(), 1, "one seeded entity: {body}");
+    assert_eq!(entities[0]["name"], "NQRust");
+    assert_eq!(entities[0]["entity_type"], "Product");
+
+    assert_eq!(body["stats"]["total_entities"], 1);
+    assert_eq!(body["stats"]["total_relations"], 0);
+    assert_eq!(body["stats"]["entity_types"]["Product"], 1);
+}
+
+#[tokio::test]
+async fn kb_graph_returns_nodes_edges_and_stats() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, EntityType, ExtractSource};
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            let entity_id = store
+                .upsert_entity(&Entity {
+                    id: "e_g".into(),
+                    canonical_key: "nqrust:Product".into(),
+                    name: "NQRust".into(),
+                    entity_type: EntityType::Product,
+                    confidence: 0.9,
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .expect("seed entity");
+            store
+                .add_mention(&EntityMention {
+                    id: "m_g".into(),
+                    entity_id,
+                    document_id: "rantaiclaw_doc_g".into(),
+                    chunk_index: Some(0),
+                    context: None,
+                    source: ExtractSource::Llm,
+                })
+                .await
+                .expect("seed mention");
+        })
+    })
+    .await;
+
+    let resp = reqwest::get(format!("{}/api/v1/kb/graph?limit=10", h.base_url))
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json body");
+    assert!(body["nodes"].is_array(), "nodes missing: {body}");
+    assert!(body["edges"].is_array(), "edges missing: {body}");
+    assert!(body["stats"].is_object(), "stats missing: {body}");
+    assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(body["nodes"][0]["name"], "NQRust");
+}
+
+#[tokio::test]
 async fn kb_ingest_missing_file_field_returns_400() {
     let h = start_harness(|_store| Box::pin(async move {})).await;
 

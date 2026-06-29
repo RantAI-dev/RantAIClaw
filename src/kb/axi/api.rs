@@ -39,13 +39,16 @@ use crate::gateway::AppState;
 use crate::kb::chunk::{smart_chunk_document, SmartChunkOptions};
 use crate::kb::embed::{self, EmbeddingProvider};
 use crate::kb::file::{detect_file_type, process_file, ProcessingOptions};
+use crate::kb::intelligence::extract::llm::CombinedLlmExtractor;
+use crate::kb::intelligence::types::{Entity, Relation};
+use crate::kb::intelligence::{extract_document_intelligence, IntelligenceSummary};
 use crate::kb::maintenance::{
     check_drift, run_bulk_re_embed, BulkReEmbedOptions, BulkReEmbedReport, DriftReport,
 };
 use crate::kb::rerank::{self, Reranker};
 use crate::kb::retrieve::{RetrieveOptions, Retriever, SourceRef};
 use crate::kb::store::sqlite::SqliteStore;
-use crate::kb::store::KbStore;
+use crate::kb::store::{Graph, IntelligenceStore, KbStore};
 use crate::kb::{Document, DocumentId, KbConfig, KbError, KbGroup, KbGroupSummary};
 
 /// Upload size cap for the KB ingest route. 32 MiB covers a typical
@@ -88,6 +91,15 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/kb/drift", get(drift))
         .route("/api/v1/kb/re-embed", post(re_embed))
+        .route(
+            "/api/v1/kb/documents/{id}/intelligence",
+            get(get_intelligence),
+        )
+        .route(
+            "/api/v1/kb/documents/{id}/re-extract",
+            post(re_extract_document),
+        )
+        .route("/api/v1/kb/graph", get(get_graph))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(KB_UPLOAD_MAX_BYTES))
         .layer(TimeoutLayer::with_status_code(
@@ -105,6 +117,11 @@ pub fn router() -> Router<AppState> {
 pub(crate) struct KbContext {
     pub cfg: KbConfig,
     pub store: Arc<dyn KbStore>,
+    /// Same concrete `SqliteStore` as `store`, viewed through the
+    /// [`IntelligenceStore`] seam. Held as a second handle because
+    /// `Arc<dyn KbStore>` can't be upcast to `Arc<dyn IntelligenceStore>`;
+    /// both alias one `SqliteStore` so they share state.
+    pub intel: Arc<dyn IntelligenceStore>,
     pub embedder: Arc<dyn EmbeddingProvider>,
     /// Optional reranker. `None` when rerank is disabled (the default).
     pub reranker: Option<Arc<dyn Reranker>>,
@@ -155,12 +172,18 @@ async fn build_ctx(path: &std::path::Path) -> Result<Arc<KbContext>, String> {
     let store = SqliteStore::open(path, cfg.embedding_dim)
         .await
         .map_err(|e| format!("sqlite open ({}): {e}", path.display()))?;
-    let store: Arc<dyn KbStore> = Arc::new(store);
+    // Build the concrete store once, then alias it through both trait views.
+    // `SqliteStore` implements `KbStore` and `IntelligenceStore`; sharing one
+    // `Arc<SqliteStore>` keeps a single DB handle behind both seams.
+    let concrete = Arc::new(store);
+    let store: Arc<dyn KbStore> = concrete.clone();
+    let intel: Arc<dyn IntelligenceStore> = concrete;
     let embedder = embed::make_provider(&cfg).map_err(|e| format!("embed provider: {e}"))?;
     let reranker = rerank::make_reranker(&cfg).map(Arc::from);
     Ok(Arc::new(KbContext {
         cfg,
         store,
+        intel,
         embedder,
         reranker,
     }))
@@ -445,6 +468,199 @@ impl From<&BulkReEmbedReport> for ReEmbedResponse {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Intelligence / graph response shapes.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// JSON-friendly entity view. `entity_type` is the string form of the typed
+/// enum (via `EntityType::as_str`).
+#[derive(Debug, Serialize)]
+struct EntityJson {
+    id: String,
+    name: String,
+    entity_type: String,
+    confidence: f32,
+}
+
+impl From<&Entity> for EntityJson {
+    fn from(e: &Entity) -> Self {
+        Self {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            entity_type: e.entity_type.as_str().into_owned(),
+            confidence: e.confidence,
+        }
+    }
+}
+
+/// JSON-friendly relation view. `relation_type` is the string form of the
+/// typed enum.
+#[derive(Debug, Serialize)]
+struct RelationJson {
+    id: String,
+    source: String,
+    target: String,
+    relation_type: String,
+    confidence: f32,
+}
+
+impl From<&Relation> for RelationJson {
+    fn from(r: &Relation) -> Self {
+        Self {
+            id: r.id.clone(),
+            source: r.source_entity_id.clone(),
+            target: r.target_entity_id.clone(),
+            relation_type: r.relation_type.as_str().into_owned(),
+            confidence: r.confidence,
+        }
+    }
+}
+
+/// Aggregate counts over an entity/relation set, keyed by type.
+#[derive(Debug, Serialize)]
+struct IntelligenceStats {
+    total_entities: usize,
+    total_relations: usize,
+    entity_types: std::collections::BTreeMap<String, usize>,
+    relation_types: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct IntelligenceResponse {
+    entities: Vec<EntityJson>,
+    relations: Vec<RelationJson>,
+    stats: IntelligenceStats,
+}
+
+impl IntelligenceResponse {
+    fn build(entities: &[Entity], relations: &[Relation]) -> Self {
+        let mut entity_types: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for e in entities {
+            *entity_types
+                .entry(e.entity_type.as_str().into_owned())
+                .or_default() += 1;
+        }
+        let mut relation_types: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for r in relations {
+            *relation_types
+                .entry(r.relation_type.as_str().into_owned())
+                .or_default() += 1;
+        }
+        Self {
+            entities: entities.iter().map(EntityJson::from).collect(),
+            relations: relations.iter().map(RelationJson::from).collect(),
+            stats: IntelligenceStats {
+                total_entities: entities.len(),
+                total_relations: relations.len(),
+                entity_types,
+                relation_types,
+            },
+        }
+    }
+}
+
+/// JSON-friendly graph node — flattens the denormalized fan-out counts.
+#[derive(Debug, Serialize)]
+struct GraphNodeJson {
+    id: String,
+    name: String,
+    entity_type: String,
+    degree: usize,
+    doc_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphEdgeJson {
+    source: String,
+    target: String,
+    relation_type: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphStats {
+    total_nodes: usize,
+    total_edges: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphResponse {
+    nodes: Vec<GraphNodeJson>,
+    edges: Vec<GraphEdgeJson>,
+    stats: GraphStats,
+}
+
+impl From<Graph> for GraphResponse {
+    fn from(g: Graph) -> Self {
+        let stats = GraphStats {
+            total_nodes: g.nodes.len(),
+            total_edges: g.edges.len(),
+        };
+        Self {
+            nodes: g
+                .nodes
+                .into_iter()
+                .map(|n| GraphNodeJson {
+                    id: n.id,
+                    name: n.name,
+                    entity_type: n.entity_type,
+                    degree: n.degree,
+                    doc_count: n.doc_count,
+                })
+                .collect(),
+            edges: g
+                .edges
+                .into_iter()
+                .map(|e| GraphEdgeJson {
+                    source: e.source,
+                    target: e.target,
+                    relation_type: e.relation_type,
+                })
+                .collect(),
+            stats,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GraphQuery {
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReExtractResponse {
+    document_id: String,
+    entities: usize,
+    relations: usize,
+}
+
+impl ReExtractResponse {
+    fn new(document_id: String, summary: IntelligenceSummary) -> Self {
+        Self {
+            document_id,
+            entities: summary.entities,
+            relations: summary.relations,
+        }
+    }
+}
+
+/// Build the document-intelligence LLM extractor from KB config. Reuses the
+/// same chat endpoint (`openrouter_chat_url`) and credential resolution
+/// (`resolve_key` over the embedding key → `OPENROUTER_API_KEY`) that the
+/// reranker / embedders use, so intelligence works with the same provider
+/// setup. The key is passed by value into the extractor and never logged.
+fn build_intelligence_extractor(cfg: &KbConfig) -> CombinedLlmExtractor {
+    CombinedLlmExtractor::new(
+        cfg.intelligence_model.clone(),
+        cfg.openrouter_chat_url.clone(),
+        KbConfig::resolve_key(&cfg.embedding_api_key),
+    )
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Handlers.
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -618,6 +834,87 @@ async fn re_embed(
     .await
     .map_err(ApiError::from)?;
     Ok(Json(ReEmbedResponse::from(&report)))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Document intelligence + cross-document graph.
+// ────────────────────────────────────────────────────────────────────────────
+
+async fn get_intelligence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<IntelligenceResponse>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let ctx = ensure_kb_ctx().await?;
+    let (entities, relations) = ctx
+        .intel
+        .intelligence_for_document(&id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(IntelligenceResponse::build(&entities, &relations)))
+}
+
+async fn get_graph(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<GraphQuery>,
+) -> Result<Json<GraphResponse>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let ctx = ensure_kb_ctx().await?;
+    let limit = q.limit.unwrap_or(ctx.cfg.graph_max_nodes);
+    let graph = ctx
+        .intel
+        .graph(q.group.as_deref(), limit)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(GraphResponse::from(graph)))
+}
+
+async fn re_extract_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<ReExtractResponse>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let ctx = ensure_kb_ctx().await?;
+
+    // Load the stored document content and re-chunk it so extraction sees the
+    // same chunk boundaries as ingest.
+    let doc = ctx
+        .store
+        .get_document(&DocumentId(id.clone()))
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("document {id} not found")))?;
+
+    let primary_category = doc
+        .categories
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "RANTAICLAW".to_string());
+    let chunks = smart_chunk_document(
+        &doc.content,
+        &doc.title,
+        &primary_category,
+        doc.subcategory.as_deref(),
+        SmartChunkOptions::default(),
+    );
+    let chunk_texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    let chunk_refs: Vec<&str> = chunk_texts.iter().map(String::as_str).collect();
+
+    let extractor = build_intelligence_extractor(&ctx.cfg);
+    let summary = extract_document_intelligence(
+        &*ctx.intel,
+        &extractor,
+        &id,
+        &chunk_refs,
+        &ctx.cfg.intelligence_resolution,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(ReExtractResponse::new(id, summary)))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1006,6 +1303,39 @@ async fn ingest(
             .add_document_to_group(&doc_id.0, group_id)
             .await
             .map_err(ApiError::from)?;
+    }
+
+    // Document intelligence: fire-and-forget. tokio::spawn detaches the
+    // (LLM-bound, slow) extraction so the ingest response returns immediately
+    // and an extraction failure never affects the upload result. Mirrors the
+    // `record_retrieval_hits` detach pattern in `kb::retrieve`. Gated on the
+    // `intelligence_enabled` flag (off by default). The API key is never
+    // logged — only the doc id / count surface on warn.
+    if ctx.cfg.intelligence_enabled {
+        let cfg = ctx.cfg.clone();
+        let intel = Arc::clone(&ctx.intel);
+        let extract_doc_id = doc_id.0.clone();
+        let chunk_texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+        tokio::spawn(async move {
+            let extractor = build_intelligence_extractor(&cfg);
+            let chunk_refs: Vec<&str> = chunk_texts.iter().map(String::as_str).collect();
+            if let Err(e) = extract_document_intelligence(
+                &*intel,
+                &extractor,
+                &extract_doc_id,
+                &chunk_refs,
+                &cfg.intelligence_resolution,
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "kb::ingest",
+                    document_id = %extract_doc_id,
+                    error = %e,
+                    "document intelligence extraction failed (fire-and-forget)"
+                );
+            }
+        });
     }
 
     // u128 → u64 ms: see comments on the CLI side; the cast is safe in any
