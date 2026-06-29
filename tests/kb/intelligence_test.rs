@@ -42,3 +42,75 @@ fn canonical_key_merges_same_entity_across_casing_and_whitespace() {
     // Different type → different node.
     assert_ne!(a, canonical_key("NQRust", &EntityType::Organization));
 }
+
+#[tokio::test]
+async fn upsert_entity_merges_by_canonical_key_across_documents() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention};
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use tempfile::TempDir;
+
+    fn ent(key: &str, name: &str) -> Entity {
+        Entity {
+            id: format!("e_{key}"),
+            canonical_key: key.into(),
+            name: name.into(),
+            entity_type: EntityType::Product,
+            confidence: 0.9,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    let id1 = store
+        .upsert_entity(&ent("nqrust:Product", "NQRust"))
+        .await
+        .unwrap();
+    let id2 = store
+        .upsert_entity(&ent("nqrust:Product", "NQRust"))
+        .await
+        .unwrap();
+    assert_eq!(
+        id1, id2,
+        "same canonical_key must resolve to one entity row"
+    );
+
+    store
+        .add_mention(&EntityMention {
+            id: "m1".into(),
+            entity_id: id1.clone(),
+            document_id: "d1".into(),
+            chunk_index: Some(0),
+            context: Some("x".into()),
+            source: ExtractSource::Llm,
+        })
+        .await
+        .unwrap();
+    store
+        .add_mention(&EntityMention {
+            id: "m2".into(),
+            entity_id: id2.clone(),
+            document_id: "d2".into(),
+            chunk_index: Some(1),
+            context: None,
+            source: ExtractSource::Pattern,
+        })
+        .await
+        .unwrap();
+
+    let graph = store.graph(None, 100).await.unwrap();
+    assert_eq!(graph.nodes.len(), 1, "one global node");
+    assert_eq!(graph.nodes[0].doc_count, 2, "merged across two documents");
+
+    store.delete_document_intelligence("d1").await.unwrap();
+    assert_eq!(store.graph(None, 100).await.unwrap().nodes[0].doc_count, 1);
+    store.delete_document_intelligence("d2").await.unwrap();
+    assert!(
+        store.graph(None, 100).await.unwrap().nodes.is_empty(),
+        "orphan entity GC'd"
+    );
+}

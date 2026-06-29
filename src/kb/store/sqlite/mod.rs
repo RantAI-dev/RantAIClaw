@@ -16,6 +16,7 @@ pub mod chunks;
 pub mod documents;
 pub mod drift;
 pub mod groups;
+pub mod intelligence;
 pub mod schema;
 mod trait_impl;
 

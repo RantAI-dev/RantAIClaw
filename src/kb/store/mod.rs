@@ -136,6 +136,68 @@ pub trait KbStore: Send + Sync {
     ) -> KbResult<()>;
 }
 
+// ---------------------------------------------------------------------------
+// Cross-document knowledge graph (SP-2 KB Document Intelligence)
+// ---------------------------------------------------------------------------
+
+/// A canonical entity rendered as a graph node, with denormalized fan-out
+/// counts. `degree` = number of incident relations; `doc_count` = distinct
+/// documents that mention the entity.
+#[derive(Debug, Clone)]
+pub struct GraphNode {
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+    pub degree: usize,
+    pub doc_count: usize,
+}
+
+/// A directed edge between two graph nodes (both endpoints are in the node set).
+#[derive(Debug, Clone)]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+    pub relation_type: String,
+}
+
+/// A materialized slice of the cross-document knowledge graph: the top-N
+/// entities by degree and the relations whose endpoints both fall in that set.
+#[derive(Debug, Clone, Default)]
+pub struct Graph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Persistence seam for the cross-document knowledge graph. Kept separate from
+/// [`KbStore`] (ISP) so backends can implement entity intelligence
+/// independently of core document/chunk storage. Entities are deduplicated by
+/// `canonical_key`; mentions and relations link entities to source documents.
+#[async_trait]
+pub trait IntelligenceStore: Send + Sync {
+    /// Insert an entity, deduplicating by `canonical_key`. Returns the id of
+    /// the canonical (first-seen) row, which may differ from `e.id` when the
+    /// key already exists.
+    async fn upsert_entity(&self, e: &crate::kb::intelligence::types::Entity) -> KbResult<String>;
+    /// Record a mention of an entity in a specific document/chunk.
+    async fn add_mention(&self, m: &crate::kb::intelligence::types::EntityMention) -> KbResult<()>;
+    /// Record a directed relation between two entities within a document.
+    async fn add_relation(&self, r: &crate::kb::intelligence::types::Relation) -> KbResult<()>;
+    /// Fetch the entities (via mentions) and relations attached to a document.
+    async fn intelligence_for_document(
+        &self,
+        document_id: &str,
+    ) -> KbResult<(
+        Vec<crate::kb::intelligence::types::Entity>,
+        Vec<crate::kb::intelligence::types::Relation>,
+    )>;
+    /// Materialize the graph: top-`limit` entities by degree, optionally scoped
+    /// to a group's documents, plus relations internal to that node set.
+    async fn graph(&self, group_id: Option<&str>, limit: usize) -> KbResult<Graph>;
+    /// Remove a document's mentions and relations, then GC any entity left with
+    /// zero mentions (orphan cleanup).
+    async fn delete_document_intelligence(&self, document_id: &str) -> KbResult<()>;
+}
+
 /// Persist a document then its chunks, rolling the document row back if chunk
 /// storage fails. `create_document` and `store_chunks` are separate
 /// transactions, so a mid-way failure would otherwise leave an orphan 0-chunk
