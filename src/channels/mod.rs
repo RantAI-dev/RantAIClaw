@@ -1148,6 +1148,32 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+/// Shown when the model finishes a turn (often after tool calls) without any
+/// final answer text, so the user never receives an empty or annotation-only
+/// bubble.
+const CHANNEL_EMPTY_REPLY_FALLBACK: &str =
+    "I worked on that but don't have a final answer to show — want me to try again?";
+
+/// Make a reply safe to deliver to a human: strip a leading internal
+/// `[Used tools: …]` annotation (that belongs in history, not the chat) and
+/// substitute a graceful message when nothing meaningful remains. The tool
+/// summary is still recorded separately in conversation history.
+fn clean_delivered_reply(text: &str) -> String {
+    let mut s = text.trim_start();
+    if s.starts_with("[Used tools:") {
+        s = match s.find('\n') {
+            Some(nl) => s[nl + 1..].trim_start(),
+            None => "",
+        };
+    }
+    let s = s.trim();
+    if s.is_empty() {
+        CHANNEL_EMPTY_REPLY_FALLBACK.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -1808,6 +1834,11 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+            // Deliver the model's answer only: history keeps the tool summary,
+            // but the user must never receive a bare `[Used tools: …]` line or an
+            // empty bubble (e.g. when the model ends a turn after tool calls
+            // without final text).
+            let delivered_response = clean_delivered_reply(&delivered_response);
             tracing::info!(
                 ms = started_at.elapsed().as_millis() as u64,
                 "channel reply: {}",
@@ -6281,6 +6312,31 @@ Mon Feb 20
 
         let summary = extract_tool_context_summary(&history, 1);
         assert_eq!(summary, "[Used tools: fresh_tool]");
+    }
+
+    #[test]
+    fn clean_delivered_reply_strips_leading_tool_annotation() {
+        let out = clean_delivered_reply("[Used tools: cron_list]\nAll set.");
+        assert_eq!(out, "All set.");
+    }
+
+    #[test]
+    fn clean_delivered_reply_annotation_only_becomes_fallback() {
+        let out = clean_delivered_reply("[Used tools: cron_list, manage_permissions]");
+        assert_eq!(out, CHANNEL_EMPTY_REPLY_FALLBACK);
+    }
+
+    #[test]
+    fn clean_delivered_reply_empty_becomes_fallback() {
+        assert_eq!(clean_delivered_reply("   "), CHANNEL_EMPTY_REPLY_FALLBACK);
+    }
+
+    #[test]
+    fn clean_delivered_reply_passes_through_normal_text() {
+        assert_eq!(
+            clean_delivered_reply("Here is your answer."),
+            "Here is your answer."
+        );
     }
 
     #[test]
