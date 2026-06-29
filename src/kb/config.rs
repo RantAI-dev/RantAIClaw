@@ -40,6 +40,18 @@ pub struct KbConfig {
     /// override this. Mirrors the same env-override pattern as
     /// `KB_EMBEDDING_BASE_URL`.
     pub openrouter_chat_url: String,
+    /// Enable document intelligence (graph extraction, entity linking).
+    /// Reads `KB_INTELLIGENCE_ENABLED`; off by default.
+    pub intelligence_enabled: bool,
+    /// Model used by the intelligence extractor (entity/relation extraction).
+    /// Reads `KB_INTELLIGENCE_MODEL`; defaults to `openai/gpt-4.1-nano`.
+    pub intelligence_model: String,
+    /// Resolution mode for intelligence extraction (`exact` or `fuzzy`).
+    /// Reads `KB_INTELLIGENCE_RESOLUTION`; defaults to `exact`.
+    pub intelligence_resolution: String,
+    /// Maximum nodes retained in the in-memory knowledge graph.
+    /// Reads `KB_GRAPH_MAX_NODES`; defaults to `200`.
+    pub graph_max_nodes: usize,
 }
 
 impl KbConfig {
@@ -87,6 +99,14 @@ impl KbConfig {
             )?,
             openrouter_chat_url: env::var("KB_OPENROUTER_CHAT_URL")
                 .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".into()),
+            intelligence_enabled: env::var("KB_INTELLIGENCE_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            intelligence_model: env::var("KB_INTELLIGENCE_MODEL")
+                .unwrap_or_else(|_| "openai/gpt-4.1-nano".into()),
+            intelligence_resolution: env::var("KB_INTELLIGENCE_RESOLUTION")
+                .unwrap_or_else(|_| "exact".into()),
+            graph_max_nodes: parse_env("KB_GRAPH_MAX_NODES", 200)?,
         })
     }
 

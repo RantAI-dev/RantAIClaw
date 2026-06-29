@@ -124,3 +124,26 @@ fn resolve_key_with_fallback_prefers_override_then_secondary_then_env() {
     // Both empty -> OPENROUTER_API_KEY env (removed above) -> "".
     assert_eq!(KbConfig::resolve_key_with_fallback("", ""), "");
 }
+
+#[test]
+fn intelligence_config_defaults_and_overrides() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _e = EnvGuard(vec!["KB_INTELLIGENCE_ENABLED", "KB_GRAPH_MAX_NODES"]);
+    for (k, _) in std::env::vars() {
+        if k.starts_with("KB_INTELLIGENCE") {
+            unsafe {
+                std::env::remove_var(&k);
+            }
+        }
+    }
+    let cfg = KbConfig::from_env().expect("cfg");
+    assert!(!cfg.intelligence_enabled, "off by default");
+    assert_eq!(cfg.graph_max_nodes, 200);
+    unsafe {
+        std::env::set_var("KB_INTELLIGENCE_ENABLED", "true");
+        std::env::set_var("KB_GRAPH_MAX_NODES", "50");
+    }
+    let cfg = KbConfig::from_env().expect("cfg");
+    assert!(cfg.intelligence_enabled);
+    assert_eq!(cfg.graph_max_nodes, 50);
+}

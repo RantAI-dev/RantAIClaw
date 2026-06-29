@@ -146,6 +146,10 @@ fn test_cfg() -> KbConfig {
         // Default points at the public URL; per-test we overwrite to
         // `server.uri()` so we don't have to set KB_OPENROUTER_CHAT_URL.
         openrouter_chat_url: "http://localhost".into(),
+        intelligence_enabled: false,
+        intelligence_model: "openai/gpt-4.1-nano".into(),
+        intelligence_resolution: "exact".into(),
+        graph_max_nodes: 200,
     }
 }
 
