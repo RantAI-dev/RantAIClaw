@@ -294,6 +294,19 @@ impl WhatsAppWebChannel {
         }
         chat.to_string()
     }
+
+    /// Normalize an inbound sender to the E.164 `+` form used for allowlist and
+    /// owner matching. `resolved_pn` is the phone number a LID resolved to (when
+    /// known); otherwise the raw user part is used. Pure so it is unit-testable
+    /// without a live wa-rs client.
+    #[cfg(feature = "whatsapp-web")]
+    fn normalize_sender(resolved_pn: Option<&str>, sender_user: &str) -> String {
+        match resolved_pn {
+            Some(pn) => format!("+{pn}"),
+            None if sender_user.starts_with('+') => sender_user.to_string(),
+            None => format!("+{sender_user}"),
+        }
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -414,17 +427,26 @@ impl Channel for WhatsAppWebChannel {
                                 text
                             );
 
-                            // Detect LID (Linked Identity) senders — WhatsApp may use
-                            // opaque LID identifiers instead of phone numbers.
-                            // LIDs have the @lid domain suffix.
+                            // Detect LID (Linked Identity) senders — WhatsApp often
+                            // addresses 1:1 chats by an opaque LID instead of the
+                            // phone number. Resolve it to the phone number (learned
+                            // in wa-rs's `lid_pn_cache`, including from this very
+                            // message) so owner/allowlist matching runs on the REAL
+                            // number. Without this the sender never equals an entry
+                            // in `approval_owners`, so the user is silently treated
+                            // as a guest and every owner-only feature (cron,
+                            // permissions, owner commands) is gated off.
                             let is_lid = sender_jid.contains("@lid");
-
-                            // Check if sender is allowed
-                            let normalized = if sender.starts_with('+') {
-                                sender.clone()
+                            let resolved_pn = if is_lid {
+                                client.get_phone_number_from_lid(&sender).await
                             } else {
-                                format!("+{sender}")
+                                None
                             };
+
+                            // Sender in E.164 `+` form (resolved phone number when
+                            // available, else the raw user part).
+                            let normalized =
+                                Self::normalize_sender(resolved_pn.as_deref(), &sender);
 
                             // Intercept on-demand store-minted pairing codes
                             // (`/bind`/`/claim`) BEFORE the allowlist gate so an
@@ -443,13 +465,11 @@ impl Channel for WhatsAppWebChannel {
                                 return;
                             }
 
-                            // For LID senders we cannot match against phone-based
-                            // allowed_numbers, so allow them through when the list
-                            // is non-empty (the user has configured filtering intent
-                            // but LIDs are unverifiable). Wildcard "*" always passes.
-                            let is_allowed = if is_lid {
-                                // Allow LID senders unless allowed_numbers is empty
-                                // (empty = deny-all secure default).
+                            // A LID resolved to a phone number is matched like any
+                            // number. An *unmapped* LID is unverifiable, so allow it
+                            // through when the list is non-empty / has "*" (the user
+                            // configured filtering intent). Wildcard "*" always passes.
+                            let is_allowed = if is_lid && resolved_pn.is_none() {
                                 let allowed = allowed_numbers.read().ok();
                                 allowed.is_some_and(|a| a.iter().any(|n| n == "*") || !a.is_empty())
                             } else {
@@ -862,6 +882,32 @@ mod tests {
         let ch = make_channel(vec!["+1234567890".into()]);
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(!ch.is_number_allowed("+9999999999"));
+    }
+
+    #[test]
+    fn normalize_sender_uses_resolved_phone_number() {
+        // A LID sender resolved to its phone number matches owner/allowlist on
+        // the real number, not the opaque LID.
+        assert_eq!(
+            WhatsAppWebChannel::normalize_sender(Some("6285228485826"), "207550217756908"),
+            "+6285228485826"
+        );
+    }
+
+    #[test]
+    fn normalize_sender_falls_back_to_raw_user() {
+        assert_eq!(
+            WhatsAppWebChannel::normalize_sender(None, "1234567890"),
+            "+1234567890"
+        );
+    }
+
+    #[test]
+    fn normalize_sender_keeps_existing_plus() {
+        assert_eq!(
+            WhatsAppWebChannel::normalize_sender(None, "+1234567890"),
+            "+1234567890"
+        );
     }
 
     #[test]

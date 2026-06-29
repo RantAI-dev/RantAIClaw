@@ -5,6 +5,20 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.93-alpha] — 2026-06-29
+
+### Fixed
+
+- **WhatsApp owner is recognized over LID.** The inbound WhatsApp sender was the
+  opaque LID (e.g. `+207550217756908`), never the real phone number, so it never
+  matched `approval_owners` — the operator was silently treated as a guest and
+  every owner-only feature (cron, permissions, owner commands) was unavailable,
+  surfacing as empty/"no final answer" replies. The sender is now resolved
+  LID→phone-number via wa-rs's `lid_pn_cache` (the same mapping the reply-target
+  fix uses), so owner and allowlist matching run on the real number. Unmapped
+  LIDs keep the prior unverifiable-allowlist behavior. You can now also set your
+  real number in `allowed_numbers` instead of `*`.
+
 ## [0.6.92-alpha] — 2026-06-29
 
 ### Added
