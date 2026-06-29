@@ -269,6 +269,34 @@ impl WhatsAppWebChannel {
 
         Ok(wa_rs_binary::jid::Jid::pn(digits))
     }
+
+    /// Resolve an inbound chat JID to the addressing WhatsApp actually delivers
+    /// 1:1 replies on.
+    ///
+    /// WhatsApp hands many direct chats to us **LID-addressed** (`<id>@lid`, a
+    /// privacy identifier — not a phone number). Replying to the bare LID lands
+    /// in a separate thread the recipient never sees (the "bot types but never
+    /// answers" symptom): wa-rs preserves a LID target as-is and only resolves
+    /// PN→LID for the encryption session, so a LID `to` is delivered to the LID
+    /// thread rather than the visible phone-number chat.
+    ///
+    /// When the chat is a LID and wa-rs has learned the phone-number mapping
+    /// from the inbound message (its `lid_pn_cache`), reply on the phone-number
+    /// (PN) thread instead. Falls back to the original JID for groups,
+    /// broadcasts, and unmapped LIDs so nothing regresses.
+    #[cfg(feature = "whatsapp-web")]
+    async fn resolve_reply_target(
+        client: &wa_rs::Client,
+        chat: &wa_rs_binary::jid::Jid,
+    ) -> String {
+        use wa_rs_binary::jid::{JidExt as _, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER};
+        if chat.server() == HIDDEN_USER_SERVER {
+            if let Some(pn) = client.get_phone_number_from_lid(chat.user()).await {
+                return format!("{pn}@{DEFAULT_USER_SERVER}");
+            }
+        }
+        chat.to_string()
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -411,7 +439,7 @@ impl Channel for WhatsAppWebChannel {
                                 &client,
                                 text,
                                 &normalized,
-                                chat_jid,
+                                chat_jid.clone(),
                             ))
                             .await;
                             if handled {
@@ -441,13 +469,19 @@ impl Channel for WhatsAppWebChannel {
                                     return;
                                 }
 
+                                // Reply on the chat WhatsApp actually delivers to:
+                                // for LID-addressed DMs that means the phone-number
+                                // thread, not the bare `@lid` (which silently lands
+                                // in a thread the user never sees). Typing reuses
+                                // this target, so it follows the reply.
+                                let reply_target =
+                                    Self::resolve_reply_target(&client, &chat_jid).await;
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
                                         id: uuid::Uuid::new_v4().to_string(),
                                         channel: "whatsapp".to_string(),
                                         sender: normalized.clone(),
-                                        // Reply to the originating chat JID (DM or group).
-                                        reply_target: chat,
+                                        reply_target,
                                         content: trimmed.to_string(),
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
