@@ -133,9 +133,9 @@ fn is_service_installed(config: &Config, init_system: InitSystem) -> bool {
         macos_service_file().map(|p| p.exists()).unwrap_or(false)
     } else if cfg!(target_os = "linux") {
         match init_system.resolve() {
-            Ok(InitSystem::Systemd) => {
-                linux_service_file(config).map(|p| p.exists()).unwrap_or(false)
-            }
+            Ok(InitSystem::Systemd) => linux_service_file(config)
+                .map(|p| p.exists())
+                .unwrap_or(false),
             Ok(InitSystem::Openrc) => std::path::Path::new("/etc/init.d/rantaiclaw").exists(),
             _ => false,
         }

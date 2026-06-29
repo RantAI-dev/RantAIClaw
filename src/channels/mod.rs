@@ -1364,6 +1364,7 @@ fn acquire_channel_lock(channel: &str) -> ChannelLock {
     let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)
     else {
         return ChannelLock::Unavailable;
