@@ -1750,6 +1750,24 @@ impl TuiApp {
             return;
         }
 
+        // Single-runner guard: if a live daemon already owns the channels for
+        // this profile, don't start a competing runtime in the TUI. Two
+        // processes on one channel cause duplicate/contradictory replies
+        // (WhatsApp) or `409 Conflict` poll flapping (Telegram). Defer to the
+        // daemon; `rantaiclaw service restart` applies config changes.
+        if let Some(pid) = crate::profile::sentinel::active_daemon_pid(&self.profile.name) {
+            tracing::info!(
+                "channels are managed by the running daemon (PID {pid}); not starting a duplicate in the TUI. Use `rantaiclaw service restart` to apply changes."
+            );
+            if let Some(prev) = prev {
+                prev.shutdown.cancel();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(10), prev.handle).await;
+                });
+            }
+            return;
+        }
+
         let cfg = self.config.clone();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let task_token = shutdown.clone();

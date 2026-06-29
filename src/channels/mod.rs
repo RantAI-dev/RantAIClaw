@@ -1310,6 +1310,44 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     result.trim().to_string()
 }
 
+/// Outcome of trying to claim the per-channel single-runner lock.
+enum ChannelLock {
+    /// Lock held — keep the `File` alive for the listener's lifetime.
+    Acquired(std::fs::File),
+    /// Another live process already runs this channel — skip the listener.
+    HeldByOther,
+    /// Lock infrastructure unavailable (no data dir / IO error) — fail open
+    /// and run anyway; the guard is best-effort, not a hard gate.
+    Unavailable,
+}
+
+/// Claim an exclusive advisory lock for `channel` under the shared data dir
+/// (`<data>/locks/channel-<name>.lock`). The lock is global (the WhatsApp
+/// session and Telegram bot token are shared resources), so only one process
+/// runs a given channel at a time. Released automatically on drop / exit.
+fn acquire_channel_lock(channel: &str) -> ChannelLock {
+    use fs2::FileExt;
+    let Some(dirs) = directories::ProjectDirs::from("", "", "rantaiclaw") else {
+        return ChannelLock::Unavailable;
+    };
+    let lock_dir = dirs.data_dir().join("locks");
+    if std::fs::create_dir_all(&lock_dir).is_err() {
+        return ChannelLock::Unavailable;
+    }
+    let lock_path = lock_dir.join(format!("channel-{channel}.lock"));
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+    else {
+        return ChannelLock::Unavailable;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => ChannelLock::Acquired(file),
+        Err(_) => ChannelLock::HeldByOther,
+    }
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
@@ -1342,6 +1380,30 @@ fn spawn_supervised_listener_with_health_interval(
     };
 
     tokio::spawn(async move {
+        // Single-runner guard: one OS process per channel. Hold an advisory
+        // flock for the listener's lifetime. If another live process already
+        // holds it (e.g. a daemon while a TUI also auto-starts channels), skip
+        // this listener — running both causes duplicate/contradictory replies
+        // (WhatsApp) or `409 Conflict` poll flapping (Telegram). Lock releases
+        // on drop / process exit, so a crashed holder never blocks restart.
+        let _channel_lock = match acquire_channel_lock(ch.name()) {
+            ChannelLock::Acquired(lock) => Some(lock),
+            ChannelLock::Unavailable => {
+                tracing::debug!(
+                    "channel {}: lock unavailable; running without single-runner guard",
+                    ch.name()
+                );
+                None
+            }
+            ChannelLock::HeldByOther => {
+                tracing::warn!(
+                    "channel {} already running in another process; skipping this listener",
+                    ch.name()
+                );
+                return;
+            }
+        };
+
         let component = format!("channel:{}", ch.name());
         let mut backoff = initial_backoff_secs.max(1);
         let max_backoff = max_backoff_secs.max(backoff);
