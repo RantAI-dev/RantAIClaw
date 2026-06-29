@@ -1,6 +1,37 @@
 use rantaiclaw::kb::intelligence::extract::pattern::extract_pattern_entities;
 use rantaiclaw::kb::intelligence::types::{EntityType, ExtractSource, RelationType};
 
+#[tokio::test]
+async fn llm_extractor_parses_entities_and_relations_from_chat() {
+    use rantaiclaw::kb::intelligence::extract::llm::CombinedLlmExtractor;
+    use rantaiclaw::kb::intelligence::extract::EntityRelationExtractor;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let content = r#"{"entities":[{"name":"NQRust","type":"Product","confidence":0.9}],
+        "relations":[{"source":"NQRust","target":"NexusQuantum","type":"PartOf","confidence":0.8}]}"#;
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices":[{"message":{"content": content}}]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ext = CombinedLlmExtractor::new(
+        "test-model".into(),
+        format!("{}/chat", server.uri()),
+        "test-key".into(),
+    );
+    let out = ext
+        .extract(&["NQRust is part of NexusQuantum."])
+        .await
+        .unwrap();
+    assert_eq!(out.entities.len(), 1);
+    assert_eq!(out.entities[0].0, "NQRust");
+    assert_eq!(out.relations.len(), 1);
+}
+
 #[test]
 fn entity_type_serde_roundtrips_and_falls_back() {
     assert_eq!(
