@@ -1148,6 +1148,32 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+/// Shown when the model finishes a turn (often after tool calls) without any
+/// final answer text, so the user never receives an empty or annotation-only
+/// bubble.
+const CHANNEL_EMPTY_REPLY_FALLBACK: &str =
+    "I worked on that but don't have a final answer to show — want me to try again?";
+
+/// Make a reply safe to deliver to a human: strip a leading internal
+/// `[Used tools: …]` annotation (that belongs in history, not the chat) and
+/// substitute a graceful message when nothing meaningful remains. The tool
+/// summary is still recorded separately in conversation history.
+fn clean_delivered_reply(text: &str) -> String {
+    let mut s = text.trim_start();
+    if s.starts_with("[Used tools:") {
+        s = match s.find('\n') {
+            Some(nl) => s[nl + 1..].trim_start(),
+            None => "",
+        };
+    }
+    let s = s.trim();
+    if s.is_empty() {
+        CHANNEL_EMPTY_REPLY_FALLBACK.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -1310,6 +1336,45 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     result.trim().to_string()
 }
 
+/// Outcome of trying to claim the per-channel single-runner lock.
+enum ChannelLock {
+    /// Lock held — keep the `File` alive for the listener's lifetime.
+    Acquired(std::fs::File),
+    /// Another live process already runs this channel — skip the listener.
+    HeldByOther,
+    /// Lock infrastructure unavailable (no data dir / IO error) — fail open
+    /// and run anyway; the guard is best-effort, not a hard gate.
+    Unavailable,
+}
+
+/// Claim an exclusive advisory lock for `channel` under the shared data dir
+/// (`<data>/locks/channel-<name>.lock`). The lock is global (the WhatsApp
+/// session and Telegram bot token are shared resources), so only one process
+/// runs a given channel at a time. Released automatically on drop / exit.
+fn acquire_channel_lock(channel: &str) -> ChannelLock {
+    use fs2::FileExt;
+    let Some(dirs) = directories::ProjectDirs::from("", "", "rantaiclaw") else {
+        return ChannelLock::Unavailable;
+    };
+    let lock_dir = dirs.data_dir().join("locks");
+    if std::fs::create_dir_all(&lock_dir).is_err() {
+        return ChannelLock::Unavailable;
+    }
+    let lock_path = lock_dir.join(format!("channel-{channel}.lock"));
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    else {
+        return ChannelLock::Unavailable;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => ChannelLock::Acquired(file),
+        Err(_) => ChannelLock::HeldByOther,
+    }
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
@@ -1342,6 +1407,30 @@ fn spawn_supervised_listener_with_health_interval(
     };
 
     tokio::spawn(async move {
+        // Single-runner guard: one OS process per channel. Hold an advisory
+        // flock for the listener's lifetime. If another live process already
+        // holds it (e.g. a daemon while a TUI also auto-starts channels), skip
+        // this listener — running both causes duplicate/contradictory replies
+        // (WhatsApp) or `409 Conflict` poll flapping (Telegram). Lock releases
+        // on drop / process exit, so a crashed holder never blocks restart.
+        let _channel_lock = match acquire_channel_lock(ch.name()) {
+            ChannelLock::Acquired(lock) => Some(lock),
+            ChannelLock::Unavailable => {
+                tracing::debug!(
+                    "channel {}: lock unavailable; running without single-runner guard",
+                    ch.name()
+                );
+                None
+            }
+            ChannelLock::HeldByOther => {
+                tracing::warn!(
+                    "channel {} already running in another process; skipping this listener",
+                    ch.name()
+                );
+                return;
+            }
+        };
+
         let component = format!("channel:{}", ch.name());
         let mut backoff = initial_backoff_secs.max(1);
         let max_backoff = max_backoff_secs.max(backoff);
@@ -1746,6 +1835,11 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+            // Deliver the model's answer only: history keeps the tool summary,
+            // but the user must never receive a bare `[Used tools: …]` line or an
+            // empty bubble (e.g. when the model ends a turn after tool calls
+            // without final text).
+            let delivered_response = clean_delivered_reply(&delivered_response);
             tracing::info!(
                 ms = started_at.elapsed().as_millis() as u64,
                 "channel reply: {}",
@@ -6219,6 +6313,31 @@ Mon Feb 20
 
         let summary = extract_tool_context_summary(&history, 1);
         assert_eq!(summary, "[Used tools: fresh_tool]");
+    }
+
+    #[test]
+    fn clean_delivered_reply_strips_leading_tool_annotation() {
+        let out = clean_delivered_reply("[Used tools: cron_list]\nAll set.");
+        assert_eq!(out, "All set.");
+    }
+
+    #[test]
+    fn clean_delivered_reply_annotation_only_becomes_fallback() {
+        let out = clean_delivered_reply("[Used tools: cron_list, manage_permissions]");
+        assert_eq!(out, CHANNEL_EMPTY_REPLY_FALLBACK);
+    }
+
+    #[test]
+    fn clean_delivered_reply_empty_becomes_fallback() {
+        assert_eq!(clean_delivered_reply("   "), CHANNEL_EMPTY_REPLY_FALLBACK);
+    }
+
+    #[test]
+    fn clean_delivered_reply_passes_through_normal_text() {
+        assert_eq!(
+            clean_delivered_reply("Here is your answer."),
+            "Here is your answer."
+        );
     }
 
     #[test]

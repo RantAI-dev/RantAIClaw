@@ -285,10 +285,7 @@ impl WhatsAppWebChannel {
     /// (PN) thread instead. Falls back to the original JID for groups,
     /// broadcasts, and unmapped LIDs so nothing regresses.
     #[cfg(feature = "whatsapp-web")]
-    async fn resolve_reply_target(
-        client: &wa_rs::Client,
-        chat: &wa_rs_binary::jid::Jid,
-    ) -> String {
+    async fn resolve_reply_target(client: &wa_rs::Client, chat: &wa_rs_binary::jid::Jid) -> String {
         use wa_rs_binary::jid::{JidExt as _, DEFAULT_USER_SERVER, HIDDEN_USER_SERVER};
         if chat.server() == HIDDEN_USER_SERVER {
             if let Some(pn) = client.get_phone_number_from_lid(chat.user()).await {

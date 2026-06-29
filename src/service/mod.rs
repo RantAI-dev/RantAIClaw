@@ -89,6 +89,132 @@ fn windows_task_name() -> &'static str {
     WINDOWS_TASK_NAME
 }
 
+/// How `apply_channel_config` should make the daemon reflect new config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyAction {
+    /// A service unit already exists — restart it (start-or-restart).
+    Restart,
+    /// No service yet — install the unit, then start it.
+    InstallThenStart,
+}
+
+/// What `service start` should do given whether the service is already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartAction {
+    /// Not running — plain start.
+    Start,
+    /// Already running — restart so config changes take effect (avoids the
+    /// silent no-op of `systemctl start` on an active unit).
+    RestartToApply,
+}
+
+/// Decide how to apply current config: restart a present service, else install+start.
+fn decide_apply_action(installed: bool) -> ApplyAction {
+    if installed {
+        ApplyAction::Restart
+    } else {
+        ApplyAction::InstallThenStart
+    }
+}
+
+/// Decide what `service start` should do: restart a running service to pick up
+/// config changes, else a plain start.
+fn decide_start_action(running: bool) -> StartAction {
+    if running {
+        StartAction::RestartToApply
+    } else {
+        StartAction::Start
+    }
+}
+
+/// True when a service unit/plist/scheduled-task for rantaiclaw exists on disk.
+fn is_service_installed(config: &Config, init_system: InitSystem) -> bool {
+    if cfg!(target_os = "macos") {
+        macos_service_file().map(|p| p.exists()).unwrap_or(false)
+    } else if cfg!(target_os = "linux") {
+        match init_system.resolve() {
+            Ok(InitSystem::Systemd) => linux_service_file(config)
+                .map(|p| p.exists())
+                .unwrap_or(false),
+            Ok(InitSystem::Openrc) => std::path::Path::new("/etc/init.d/rantaiclaw").exists(),
+            _ => false,
+        }
+    } else if cfg!(target_os = "windows") {
+        run_capture(Command::new("schtasks").args(["/Query", "/TN", windows_task_name()])).is_ok()
+    } else {
+        false
+    }
+}
+
+/// True when the service is currently active/running.
+fn is_service_running(config: &Config, init_system: InitSystem) -> bool {
+    let _ = config;
+    if cfg!(target_os = "macos") {
+        run_capture(Command::new("launchctl").args(["list"]))
+            .map(|o| o.contains(SERVICE_LABEL))
+            .unwrap_or(false)
+    } else if cfg!(target_os = "linux") {
+        match init_system.resolve() {
+            Ok(InitSystem::Systemd) => run_capture(Command::new("systemctl").args([
+                "--user",
+                "is-active",
+                "rantaiclaw.service",
+            ]))
+            .map(|o| o.trim() == "active")
+            .unwrap_or(false),
+            Ok(InitSystem::Openrc) => {
+                run_capture(Command::new("rc-service").args(["rantaiclaw", "status"]))
+                    .map(|o| o.contains("started"))
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    } else if cfg!(target_os = "windows") {
+        run_capture(Command::new("schtasks").args([
+            "/Query",
+            "/TN",
+            windows_task_name(),
+            "/FO",
+            "LIST",
+        ]))
+        .map(|o| o.contains("Running"))
+        .unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+/// Make the running daemon reflect the current config after a channel change:
+/// restart if the service exists, else install + start. Returns a short human
+/// message describing what happened (caller decides how to surface it — UI event
+/// or CLI print). Quiet by design (no `println!`) so it is safe to call from the
+/// TUI setup overlay, where stray stdout corrupts the alt-screen.
+///
+/// Auto-apply targets the common systemd user daemon. On other init systems /
+/// platforms it returns a manual hint rather than guessing.
+pub fn apply_channel_config(config: &Config, init_system: InitSystem) -> Result<String> {
+    let resolved = init_system.resolve().unwrap_or(InitSystem::Auto);
+    if !cfg!(target_os = "linux") || resolved != InitSystem::Systemd {
+        return Ok("run `rantaiclaw service restart` to apply the channel change".to_string());
+    }
+    match decide_apply_action(is_service_installed(config, init_system)) {
+        ApplyAction::Restart => {
+            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+            run_checked(Command::new("systemctl").args([
+                "--user",
+                "restart",
+                "rantaiclaw.service",
+            ]))?;
+            Ok("daemon restarted to apply channel changes".to_string())
+        }
+        ApplyAction::InstallThenStart => {
+            install(config, init_system)?;
+            run_checked(Command::new("systemctl").args(["--user", "start", "rantaiclaw.service"]))?;
+            Ok("installed + started daemon service".to_string())
+        }
+    }
+}
+
 pub fn handle_command(
     command: &crate::ServiceCommands,
     config: &Config,
@@ -117,7 +243,19 @@ fn install(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
+/// `service start` entrypoint: when the unit is already active, restart it so
+/// edited config takes effect (instead of `systemctl start`'s silent no-op).
 fn start(config: &Config, init_system: InitSystem) -> Result<()> {
+    if decide_start_action(is_service_running(config, init_system)) == StartAction::RestartToApply {
+        println!("already running → restarting to apply latest config");
+        return restart(config, init_system);
+    }
+    start_inner(config, init_system)
+}
+
+/// Perform the actual platform start (no running-state check). Used by `start`,
+/// `restart` (macOS/Windows), and `apply_channel_config`.
+fn start_inner(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "macos") {
         let plist = macos_service_file()?;
         run_checked(Command::new("launchctl").arg("load").arg("-w").arg(&plist))?;
@@ -201,7 +339,7 @@ fn stop_linux(init_system: InitSystem) -> Result<()> {
 fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "macos") {
         stop(config, init_system)?;
-        start(config, init_system)?;
+        start_inner(config, init_system)?;
         println!("✅ Service restarted");
         return Ok(());
     }
@@ -213,7 +351,7 @@ fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
 
     if cfg!(target_os = "windows") {
         stop(config, init_system)?;
-        start(config, init_system)?;
+        start_inner(config, init_system)?;
         println!("✅ Service restarted");
         return Ok(());
     }
@@ -1272,5 +1410,25 @@ mod tests {
                 "rantaiclaw".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn decide_apply_action_restarts_when_installed() {
+        assert_eq!(decide_apply_action(true), ApplyAction::Restart);
+    }
+
+    #[test]
+    fn decide_apply_action_installs_when_missing() {
+        assert_eq!(decide_apply_action(false), ApplyAction::InstallThenStart);
+    }
+
+    #[test]
+    fn decide_start_action_restarts_when_running() {
+        assert_eq!(decide_start_action(true), StartAction::RestartToApply);
+    }
+
+    #[test]
+    fn decide_start_action_starts_when_stopped() {
+        assert_eq!(decide_start_action(false), StartAction::Start);
     }
 }

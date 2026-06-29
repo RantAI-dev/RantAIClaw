@@ -89,6 +89,31 @@ pub fn is_daemon_active(profile: &str) -> bool {
     sentinel_path(profile).exists()
 }
 
+/// Whether `pid` is a live process (advisory). Unix: `kill(pid, 0)` succeeds, or
+/// fails with `EPERM` (alive but owned by another user). Non-unix: best-effort
+/// `true` (treat the sentinel's presence as authoritative).
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
+/// PID of the *live* daemon for `profile`, or `None` when there is no sentinel
+/// or it is stale (the recorded PID is dead). Use this — not `is_daemon_active`
+/// — when deciding whether another process already owns the channels, so a
+/// crashed daemon's leftover sentinel does not wrongly suppress startup.
+pub fn active_daemon_pid(profile: &str) -> Option<u32> {
+    match read_sentinel(profile) {
+        Ok(Some(s)) if pid_is_alive(s.pid) => Some(s.pid),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +185,50 @@ mod tests {
             super::super::ProfileManager::ensure("alpha").unwrap();
             assert!(read_sentinel("alpha").unwrap().is_none());
             assert!(!is_daemon_active("alpha"));
+        });
+    }
+
+    #[test]
+    fn active_daemon_pid_ignores_dead_pid() {
+        with_home(|| {
+            super::super::ProfileManager::ensure("alpha").unwrap();
+            // 2^31-2 is effectively never a live PID.
+            write_sentinel(
+                "alpha",
+                &DaemonSentinel {
+                    pid: 2_147_483_646,
+                    unit: None,
+                    started_at: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(active_daemon_pid("alpha"), None);
+        });
+    }
+
+    #[test]
+    fn active_daemon_pid_reports_live_self() {
+        with_home(|| {
+            super::super::ProfileManager::ensure("alpha").unwrap();
+            let me = std::process::id();
+            write_sentinel(
+                "alpha",
+                &DaemonSentinel {
+                    pid: me,
+                    unit: None,
+                    started_at: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(active_daemon_pid("alpha"), Some(me));
+        });
+    }
+
+    #[test]
+    fn active_daemon_pid_none_when_absent() {
+        with_home(|| {
+            super::super::ProfileManager::ensure("alpha").unwrap();
+            assert_eq!(active_daemon_pid("alpha"), None);
         });
     }
 }
