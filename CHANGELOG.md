@@ -5,6 +5,30 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.92-alpha] — 2026-06-29
+
+### Added
+
+- **Channel config applies immediately.** Finishing WhatsApp setup now
+  (re)starts the daemon automatically, and `rantaiclaw service start` restarts an
+  already-running service instead of a silent no-op — so a channel/config change
+  takes effect without a manual restart. New `service::apply_channel_config`
+  (restart if installed, else install + start; quiet so it is safe in the TUI
+  setup overlay).
+
+### Fixed
+
+- **One process per channel (single-runner).** A TUI now defers channel startup
+  to a live daemon (via the `.daemon_active` sentinel), and every channel
+  listener holds an advisory per-channel lock. Prevents two processes (daemon +
+  TUI) from running the same channel — the cause of duplicate/contradictory
+  WhatsApp replies, `Telegram getUpdates 409 Conflict` flapping, and gateway
+  `:3000` "address already in use" spam.
+- **Replies are answer-only.** The user-facing message never contains the
+  internal `[Used tools: …]` annotation (kept in history) and is never empty —
+  a graceful fallback is sent when the model ends a turn after tool calls with
+  no final text.
+
 ## [0.6.91-alpha] — 2026-06-29
 
 ### Fixed
