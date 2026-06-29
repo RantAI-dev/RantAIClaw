@@ -5,6 +5,17 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.91-alpha] — 2026-06-29
+
+### Fixed
+
+- **WhatsApp Web now answers LID-addressed chats.** WhatsApp delivers many
+  direct chats via a privacy LID (`<id>@lid`, not a phone number); replies were
+  sent to the bare LID JID, which lands in a hidden thread the recipient never
+  sees — the bot appeared to "type but never reply". Replies and the typing
+  indicator now resolve the LID to the phone-number thread via wa-rs's learned
+  LID↔PN mapping, falling back to the original JID for groups and unmapped LIDs.
+
 ## [0.6.90-alpha] — 2026-06-26
 
 ### Fixed
