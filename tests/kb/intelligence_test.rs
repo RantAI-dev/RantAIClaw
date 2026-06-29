@@ -145,3 +145,39 @@ async fn upsert_entity_merges_by_canonical_key_across_documents() {
         "orphan entity GC'd"
     );
 }
+
+#[tokio::test]
+async fn orchestration_merges_same_entity_across_two_documents() {
+    use async_trait::async_trait;
+    use rantaiclaw::kb::intelligence::extract::{EntityRelationExtractor, Extracted};
+    use rantaiclaw::kb::intelligence::extract_document_intelligence;
+    use rantaiclaw::kb::intelligence::types::EntityType;
+    use rantaiclaw::kb::store::{sqlite::SqliteStore, IntelligenceStore};
+    use tempfile::TempDir;
+
+    struct CannedExtractor;
+    #[async_trait]
+    impl EntityRelationExtractor for CannedExtractor {
+        async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
+            Ok(Extracted {
+                entities: vec![("NQRust".into(), EntityType::Product, 0.9)],
+                relations: vec![],
+            })
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let ext = CannedExtractor;
+    extract_document_intelligence(&store, &ext, "d1", &["NQRust doc one"], "exact")
+        .await
+        .unwrap();
+    extract_document_intelligence(&store, &ext, "d2", &["NQRust doc two"], "exact")
+        .await
+        .unwrap();
+    let g = store.graph(None, 100).await.unwrap();
+    assert_eq!(g.nodes.len(), 1, "one global node across two docs");
+    assert_eq!(g.nodes[0].doc_count, 2);
+}
