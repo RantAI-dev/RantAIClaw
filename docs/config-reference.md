@@ -605,6 +605,19 @@ Opt-in second-stage ranker over the top-`KB_RERANK_INITIAL_K` candidates.
 | `KB_OPENROUTER_CHAT_URL` | `https://openrouter.ai/api/v1/chat/completions` | Chat-completions endpoint shared by query expansion, contextual retrieval, and standalone-query rewriting |
 | `OPENROUTER_API_KEY` | unset | Fallback bearer for any KB endpoint whose per-endpoint key is empty |
 
+### Document Intelligence
+
+Opt-in entity + relation extraction and cross-document knowledge graph. Off by default; enabling it does not affect ingest or retrieval behavior.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `KB_INTELLIGENCE_ENABLED` | `false` | Enable entity/relation extraction at ingest |
+| `KB_INTELLIGENCE_MODEL` | `openai/gpt-4.1-nano` | Extraction model; routed through `KB_OPENROUTER_CHAT_URL` |
+| `KB_INTELLIGENCE_RESOLUTION` | `exact` | Entity merge strategy: `exact` (normalized name+type) or `embedding` (future) |
+| `KB_GRAPH_MAX_NODES` | `200` | Node cap for the whole-KB graph response (top-N by degree) |
+
+API key for extraction: uses `KB_EMBEDDING_API_KEY` if set, otherwise falls back to `OPENROUTER_API_KEY` — the same resolution order as the embedding endpoint. See [kb.md](kb.md#document-intelligence) for endpoint and CLI reference.
+
 Notes:
 
 - `KB_RERANK_ENABLED` parses **exactly** the string `"true"` as enabled. All other values (including `"1"`, `"yes"`, `"on"`) are treated as disabled.
