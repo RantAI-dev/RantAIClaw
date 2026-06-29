@@ -32,3 +32,13 @@ fn pattern_extractor_finds_high_precision_entities() {
     // No email/url in this one.
     assert!(extract_pattern_entities("plain prose with no markers").is_empty());
 }
+
+#[test]
+fn canonical_key_merges_same_entity_across_casing_and_whitespace() {
+    use rantaiclaw::kb::intelligence::resolve::canonical_key;
+    let a = canonical_key("NQRust", &EntityType::Product);
+    let b = canonical_key("  nqrust ", &EntityType::Product);
+    assert_eq!(a, b, "same name+type must share one canonical key");
+    // Different type → different node.
+    assert_ne!(a, canonical_key("NQRust", &EntityType::Organization));
+}
