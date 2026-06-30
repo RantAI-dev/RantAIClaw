@@ -340,11 +340,23 @@ fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result
 
     if dir.join(".git").is_dir() {
         println!("↻ Updating existing console at {}", dir.display());
+        // This checkout is managed by rantaiclaw, not meant for hand edits. The
+        // JS runtime (`bun`/`npm`) rewrites the lockfile during install, leaving
+        // the tree dirty; discard that churn first so the fast-forward never
+        // aborts on "you have unstaged changes".
         run(Command::new("git")
             .arg("-C")
             .arg(&dir)
-            .arg("pull")
-            .arg("--ff-only"))?;
+            .args(["checkout", "--", "."]))?;
+        // `-c pull.rebase=false` neutralizes a user's global `pull.rebase=true`,
+        // which would otherwise turn `--ff-only` into a rebase that refuses to
+        // run with a dirty tree.
+        run(Command::new("git").arg("-C").arg(&dir).args([
+            "-c",
+            "pull.rebase=false",
+            "pull",
+            "--ff-only",
+        ]))?;
     } else {
         let non_empty = dir
             .read_dir()
