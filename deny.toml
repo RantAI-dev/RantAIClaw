@@ -38,6 +38,10 @@ ignore = [
     # proc-macro-error2 v2.0.1 via matrix-sdk → aquamarine (doc-comment macro) —
     # build-time only, no runtime surface, no safe upgrade published upstream.
     "RUSTSEC-2026-0173",
+    # ttf-parser v0.25 via lopdf 0.42 → pdf-extract (KB PDF text extraction) —
+    # font parser flagged unmaintained; parse-only path over operator-supplied
+    # documents, no fixed release (lopdf 0.42 is current). Revisit on a lopdf bump.
+    "RUSTSEC-2026-0192",
 ]
 
 [licenses]
