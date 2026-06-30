@@ -194,7 +194,7 @@ Entity and relation extraction over ingested documents, building a cross-documen
 
 When enabled, each ingest run extracts named entities (people, organizations, concepts, locations, etc.) and the typed relations between them from the document's text. Entities from different documents are merged into a shared global node when they share the same normalized name and type (exact resolution by default). The result is a cross-document knowledge graph stored in `kb.db` alongside the chunk and embedding tables.
 
-This is standalone extraction and graph storage. Graph-aware retrieval (GraphRAG) is not part of this feature.
+Extraction and graph storage are standalone and always available once enabled. Graph-aware retrieval (GraphRAG) — feeding the graph back into search — is a separate, independently opt-in layer; see [GraphRAG](#graphrag-graph-augmented-retrieval) below.
 
 ### Enable it
 
@@ -219,6 +219,21 @@ The extractor calls `KB_OPENROUTER_CHAT_URL` (the shared KB chat-completions end
 | `KB_INTELLIGENCE_MODEL` | `openai/gpt-4.1-nano` | Extraction model; routed through `KB_OPENROUTER_CHAT_URL` |
 | `KB_INTELLIGENCE_RESOLUTION` | `exact` | Entity merge strategy: `exact` (normalized name+type), `embedding` (fuzzy — future option) |
 | `KB_GRAPH_MAX_NODES` | `200` | Cap on nodes returned by the whole-KB graph endpoint (top-N by degree) |
+| `KB_GRAPHRAG_ENABLED` | `false` | Enable GraphRAG retrieval augmentation (see below) |
+| `KB_GRAPHRAG_MAX_NEIGHBORS` | `20` | Cap on 1-hop neighbour entities expanded per query during GraphRAG |
+
+### GraphRAG (graph-augmented retrieval)
+
+GraphRAG feeds the populated knowledge graph back into retrieval so the graph improves answers, not just visualisations. It is opt-in and independent of extraction: set `KB_GRAPHRAG_ENABLED=true` (off by default). It has no effect unless the graph is already populated (i.e. you ran ingest with `KB_INTELLIGENCE_ENABLED=true`).
+
+How a query is augmented:
+
+1. **Seed match** — entities whose name (≥3 chars) appears as a case-insensitive substring of the query become seeds. No LLM call; pure name matching.
+2. **1-hop expansion** — the immediate neighbours of each seed in the relation graph are added, capped at `KB_GRAPHRAG_MAX_NEIGHBORS` (default 20).
+3. **Candidate chunks** — the chunks that mention any seed-or-neighbour entity become extra retrieval candidates, ordered by how many matched entities each chunk mentions.
+4. **Merge** — those candidates join the existing **RRF fusion** (k=60) as an additional ranked list, alongside the vector and BM25 arms. They never replace the other arms, and a chunk already found by vector/BM25 keeps its original metadata and score.
+
+The effect is recall: a chunk that is relevant only because it is *graph-connected* to something named in the query (e.g. a product the named organisation makes) can surface even when its text is not a direct vector/keyword match. GraphRAG augments the path the agent already uses — it shells out to `rantaiclaw kb search`, and the HTTP `POST /api/v1/kb/search` endpoint — so enabling it improves chat answers without any other change. Expansion is fail-soft: a graph error degrades to plain vector+BM25 retrieval, never an error.
 
 ### HTTP endpoints
 
