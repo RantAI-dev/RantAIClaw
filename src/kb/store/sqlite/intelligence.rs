@@ -49,13 +49,16 @@ impl IntelligenceStore for SqliteStore {
         let e = e.clone();
         tokio::task::spawn_blocking(move || -> KbResult<String> {
             let conn = conn.blocking_lock();
-            // ON CONFLICT(canonical_key) DO NOTHING keeps the first-seen node;
+            // ON CONFLICT(canonical_key) keeps the first-seen node identity
+            // (id/name/type) but refreshes confidence to the MAX across mentions,
+            // so a later, higher-confidence extraction (e.g. a re-extract after a
+            // prompt fix) lifts a stale value instead of being silently dropped.
             // rusqlite RETURNING support is version-dependent, so resolve the id
             // with a follow-up SELECT.
             conn.execute(
                 "INSERT INTO entity (id, canonical_key, name, type, confidence, metadata, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-                 ON CONFLICT(canonical_key) DO NOTHING",
+                 ON CONFLICT(canonical_key) DO UPDATE SET confidence = max(confidence, excluded.confidence)",
                 params![
                     e.id,
                     e.canonical_key,

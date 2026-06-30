@@ -193,6 +193,22 @@ impl SqliteStore {
                     drop(del_vec);
                     tx.execute("DELETE FROM chunk WHERE document_id = ?1", params![id])?;
                     tx.execute("DELETE FROM document WHERE id = ?1", params![id])?;
+                    // Also clear this document's knowledge-graph rows, then GC any
+                    // entity left with zero mentions — otherwise a hard delete
+                    // orphans entity/mention/relation rows (mirrors
+                    // `delete_document_intelligence`).
+                    tx.execute(
+                        "DELETE FROM entity_mention WHERE document_id = ?1",
+                        params![id],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM entity_relation WHERE document_id = ?1",
+                        params![id],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM entity WHERE id NOT IN (SELECT entity_id FROM entity_mention)",
+                        [],
+                    )?;
                 }
                 tx.commit()?;
             }
