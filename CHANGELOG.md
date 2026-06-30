@@ -5,6 +5,36 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.95-alpha] — 2026-06-30
+
+### Added
+
+- **KB GraphRAG — graph-augmented retrieval (off by default).** The SP-2
+  knowledge graph now improves answers, not just visualisations. When
+  `KB_GRAPHRAG_ENABLED=true`, retrieval matches query terms to graph entities
+  (case-insensitive name match, ≥3 chars — no LLM), expands one hop along
+  relations (capped by `KB_GRAPHRAG_MAX_NEIGHBORS`, default `20`), and feeds the
+  chunks that mention those entities into the existing **RRF fusion** as a third
+  ranked list alongside the vector and BM25 arms. Graph candidates never replace
+  the other arms, and a chunk already found by vector/BM25 keeps its score and
+  metadata. The handle is attached at both retrieval build sites — the CLI
+  `kb search` path (which the agent shells out to) and the `POST /api/v1/kb/search`
+  HTTP endpoint — so enabling the flag improves chat answers with no other change.
+  New `IntelligenceStore::graph_expand_chunks`. Fail-soft: a graph error degrades
+  to plain vector+BM25 retrieval. When disabled, retrieval is bit-for-bit
+  unchanged. Env-only config, no schema drift. (#115)
+
+### Fixed
+
+- **Document Intelligence confidence no longer collapses to 0.** The extractor
+  prompt's structural example used `"confidence":0.0`, which the model echoed
+  back verbatim — every entity/relation surfaced as 0% in the graph UI. The
+  prompt now uses realistic non-zero examples and an explicit "never 0"
+  instruction, and parsed confidences are sanitised (non-positive/NaN → `0.5`,
+  clamped to `(0, 1]`) so a single misbehaving response can never resurface as
+  0%. Re-extract existing documents after upgrading to refill their confidence.
+  (#114)
+
 ## [0.6.94-alpha] — 2026-06-30
 
 ### Added
