@@ -5,6 +5,30 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.94-alpha] — 2026-06-30
+
+### Added
+
+- **KB cross-document Document Intelligence (off by default).** A new
+  `src/kb/intelligence/` subsystem extracts entities + relations from ingested
+  documents (one LLM call per chunk, fail-soft, plus a pure-Rust regex pass for
+  emails/URLs) and resolves the *same* entity across documents into a single
+  global node by canonical key — a real cross-document knowledge graph, beyond
+  the per-document scoping of the TS parent. Entities, mentions and relations are
+  stored in three new sqlite tables (additive `kb.db` migration, schema_version
+  1→2) behind a focused `IntelligenceStore` trait. New endpoints
+  `GET /api/v1/kb/documents/{id}/intelligence`, `GET /api/v1/kb/graph`,
+  `POST /api/v1/kb/documents/{id}/re-extract`, and CLI `kb intelligence` /
+  `kb graph` (TOON). When `KB_INTELLIGENCE_ENABLED=true`, extraction runs as a
+  fire-and-forget task at ingest, so ingest latency and reliability are
+  unaffected. Configured via env only — `KB_INTELLIGENCE_ENABLED` (default
+  `false`), `KB_INTELLIGENCE_MODEL` (default `openai/gpt-4.1-nano`),
+  `KB_INTELLIGENCE_RESOLUTION` (default `exact`), `KB_GRAPH_MAX_NODES` (default
+  `200`) — so the config schema fingerprint is unchanged. Graph-aware retrieval
+  (GraphRAG) and embedding-based fuzzy resolution are deferred. The web console
+  ships a Knowledge Graph explorer + per-document intelligence drawer in the
+  separate `claw-ui` repo.
+
 ## [0.6.93-alpha] — 2026-06-29
 
 ### Fixed
