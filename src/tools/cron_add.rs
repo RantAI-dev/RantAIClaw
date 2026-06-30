@@ -152,6 +152,20 @@ impl Tool for CronAddTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
+        let delivery = match args.get("delivery") {
+            Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Invalid delivery config: {e}")),
+                    });
+                }
+            },
+            None => None,
+        };
+
         let result = match job_type {
             JobType::Shell => {
                 let command = match args.get("command").and_then(serde_json::Value::as_str) {
@@ -177,7 +191,7 @@ impl Tool for CronAddTool {
                     return Ok(blocked);
                 }
 
-                cron::add_shell_job(&self.config, name, schedule, command)
+                cron::add_shell_job_with_delivery(&self.config, name, schedule, command, delivery)
             }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
@@ -209,20 +223,6 @@ impl Tool for CronAddTool {
                     .get("model")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
-
-                let delivery = match args.get("delivery") {
-                    Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
-                        Ok(cfg) => Some(cfg),
-                        Err(e) => {
-                            return Ok(ToolResult {
-                                success: false,
-                                output: String::new(),
-                                error: Some(format!("Invalid delivery config: {e}")),
-                            });
-                        }
-                    },
-                    None => None,
-                };
 
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);

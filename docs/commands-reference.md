@@ -105,18 +105,39 @@ Single-topic examples:
 ### `cron`
 
 - `rantaiclaw cron list`
-- `rantaiclaw cron add <expr> [--tz <IANA_TZ>] <command>`
-- `rantaiclaw cron add-at <rfc3339_timestamp> <command>`
-- `rantaiclaw cron add-every <every_ms> <command>`
-- `rantaiclaw cron once <delay> <command>`
+- `rantaiclaw cron add <expr> [--tz <IANA_TZ>] <command> [DELIVERY]`
+- `rantaiclaw cron add-at <rfc3339_timestamp> <command> [DELIVERY]`
+- `rantaiclaw cron add-every <every_ms> <command> [DELIVERY]`
+- `rantaiclaw cron once <delay> <command> [DELIVERY]`
 - `rantaiclaw cron remove <id>`
 - `rantaiclaw cron pause <id>`
 - `rantaiclaw cron resume <id>`
+
+Delivery flags (`[DELIVERY]`, optional — push the job's output somewhere when it fires):
+
+- `--announce --channel <name> --to <target>` — send output to a channel
+  (`whatsapp`, `telegram`, `discord`, `slack`, `mattermost`, `signal`,
+  `dingtalk`, `qq`, `nextcloud_talk`, …). Delivery reuses the daemon's live
+  channel session, so stateful channels like WhatsApp web work without
+  re-pairing. `--to` is the recipient (E.164 phone for WhatsApp, chat id for
+  Telegram, etc.).
+- `--webhook <url>` — POST the job output as JSON (`{job_id, name, output,
+  fired_at}`) to `<url>`. Mutually exclusive with `--announce`.
+
+Examples:
+
+- `rantaiclaw cron add '0 7 * * *' 'Good morning' --announce --channel whatsapp --to +15551234567`
+- `rantaiclaw cron add-every 3600000 'hourly ping' --webhook https://example.com/hook`
 
 Notes:
 
 - Mutating schedule/cron actions require `cron.enabled = true`.
 - Shell command payloads for schedule creation (`create` / `add` / `once`) are validated by security command policy before job persistence.
+- Channel delivery requires the daemon (`rantaiclaw daemon`) to be running so the
+  scheduler can reach the live channel sessions; stateless channels
+  (telegram/discord/slack/mattermost) also deliver from a standalone scheduler
+  when configured. The agent `cron_add` tool accepts the same delivery via its
+  `delivery` object (`{mode, channel, to}`).
 
 ### `models`
 

@@ -33,12 +33,23 @@ pub fn add_shell_job(
     schedule: Schedule,
     command: &str,
 ) -> Result<CronJob> {
+    add_shell_job_with_delivery(config, name, schedule, command, None)
+}
+
+pub fn add_shell_job_with_delivery(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
     let id = Uuid::new_v4().to_string();
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
+    let delivery = delivery.unwrap_or_default();
 
     with_connection(config, |conn| {
         conn.execute(
@@ -52,7 +63,7 @@ pub fn add_shell_job(
                 command,
                 schedule_json,
                 name,
-                serde_json::to_string(&DeliveryConfig::default())?,
+                serde_json::to_string(&delivery)?,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
             ],

@@ -27,6 +27,7 @@ pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
 pub mod linq;
+pub mod live_registry;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
@@ -3437,6 +3438,10 @@ pub async fn start_channels_with_cancellation(
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+    // Publish the live channel instances so the in-process cron scheduler can
+    // deliver scheduled output through an already-connected session (e.g. the
+    // WhatsApp web socket) instead of constructing a fresh, unauthenticated one.
+    live_registry::publish_live_channels(Arc::clone(&channels_by_name));
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     tracing::info!("In-flight message limit: {max_in_flight_messages}");
@@ -3551,6 +3556,10 @@ pub async fn start_channels_with_cancellation(
     for h in handles {
         let _ = h.await;
     }
+
+    // Channels have stopped; drop the live instances so the scheduler stops
+    // routing announce delivery to dead sessions.
+    live_registry::clear_live_channels();
 
     Ok(())
 }

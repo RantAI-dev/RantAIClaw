@@ -977,6 +977,18 @@ enum CronCommands {
         tz: Option<String>,
         /// Command to run
         command: String,
+        /// Deliver job output to a channel (announce mode)
+        #[arg(long)]
+        announce: bool,
+        /// Channel to announce to (e.g. whatsapp, telegram, discord, slack)
+        #[arg(long)]
+        channel: Option<String>,
+        /// Recipient/target (e.g. +15551234567 or a chat id)
+        #[arg(long)]
+        to: Option<String>,
+        /// POST job output to this webhook URL (webhook mode)
+        #[arg(long)]
+        webhook: Option<String>,
     },
     /// Add a one-shot scheduled task at an RFC3339 timestamp
     AddAt {
@@ -984,6 +996,18 @@ enum CronCommands {
         at: String,
         /// Command to run
         command: String,
+        /// Deliver job output to a channel (announce mode)
+        #[arg(long)]
+        announce: bool,
+        /// Channel to announce to (e.g. whatsapp, telegram, discord, slack)
+        #[arg(long)]
+        channel: Option<String>,
+        /// Recipient/target (e.g. +15551234567 or a chat id)
+        #[arg(long)]
+        to: Option<String>,
+        /// POST job output to this webhook URL (webhook mode)
+        #[arg(long)]
+        webhook: Option<String>,
     },
     /// Add a fixed-interval scheduled task
     AddEvery {
@@ -991,6 +1015,18 @@ enum CronCommands {
         every_ms: u64,
         /// Command to run
         command: String,
+        /// Deliver job output to a channel (announce mode)
+        #[arg(long)]
+        announce: bool,
+        /// Channel to announce to (e.g. whatsapp, telegram, discord, slack)
+        #[arg(long)]
+        channel: Option<String>,
+        /// Recipient/target (e.g. +15551234567 or a chat id)
+        #[arg(long)]
+        to: Option<String>,
+        /// POST job output to this webhook URL (webhook mode)
+        #[arg(long)]
+        webhook: Option<String>,
     },
     /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
     Once {
@@ -998,6 +1034,18 @@ enum CronCommands {
         delay: String,
         /// Command to run
         command: String,
+        /// Deliver job output to a channel (announce mode)
+        #[arg(long)]
+        announce: bool,
+        /// Channel to announce to (e.g. whatsapp, telegram, discord, slack)
+        #[arg(long)]
+        channel: Option<String>,
+        /// Recipient/target (e.g. +15551234567 or a chat id)
+        #[arg(long)]
+        to: Option<String>,
+        /// POST job output to this webhook URL (webhook mode)
+        #[arg(long)]
+        webhook: Option<String>,
     },
     /// Remove a scheduled task
     Remove {

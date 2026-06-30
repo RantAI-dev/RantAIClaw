@@ -5,6 +5,22 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Cron jobs can now deliver to every configured channel (OpenClaw/Hermes
+  parity), including WhatsApp.** Scheduled jobs with `delivery.mode = "announce"`
+  route their output through the daemon's *live* channel sessions, so WhatsApp
+  web (and any stateful channel) delivers without re-pairing — not just the four
+  previously hard-coded channels (telegram/discord/slack/mattermost). A new
+  `delivery.mode = "webhook"` POSTs job output as JSON (`{job_id, name, output,
+  fired_at}`) to a URL. New `cron add`/`add-at`/`add-every`/`once` flags:
+  `--announce --channel <name> --to <target>` and `--webhook <url>`; shell jobs
+  can now carry delivery too (previously agent-only). Internally backed by a
+  process-global live-channel registry shared between the channel supervisor and
+  the cron scheduler (`src/channels/live_registry.rs`). No config schema change.
+
 ## [0.6.97-alpha] — 2026-06-30
 
 ### Fixed

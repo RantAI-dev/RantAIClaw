@@ -14,10 +14,62 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_shell_job, due_jobs, get_job, list_jobs, list_runs,
-    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_agent_job, add_job, add_shell_job, add_shell_job_with_delivery, due_jobs, get_job,
+    list_jobs, list_runs, record_last_run, record_run, remove_job, reschedule_after_run,
+    update_job,
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
+
+/// Build a [`DeliveryConfig`] from `cron add` CLI delivery flags.
+///
+/// `--announce --channel X --to Y` → announce mode; `--webhook URL` → webhook
+/// mode; neither → no delivery. The two modes are mutually exclusive.
+fn delivery_from_flags(
+    announce: bool,
+    channel: Option<String>,
+    to: Option<String>,
+    webhook: Option<String>,
+) -> Result<Option<DeliveryConfig>> {
+    match (announce, webhook) {
+        (false, None) => Ok(None),
+        (true, Some(_)) => bail!("--announce and --webhook are mutually exclusive"),
+        (false, Some(url)) => Ok(Some(DeliveryConfig {
+            mode: "webhook".to_string(),
+            channel: None,
+            to: Some(url),
+            best_effort: true,
+        })),
+        (true, None) => {
+            let channel =
+                channel.ok_or_else(|| anyhow::anyhow!("--announce requires --channel"))?;
+            let to = to.ok_or_else(|| anyhow::anyhow!("--announce requires --to"))?;
+            Ok(Some(DeliveryConfig {
+                mode: "announce".to_string(),
+                channel: Some(channel),
+                to: Some(to),
+                best_effort: true,
+            }))
+        }
+    }
+}
+
+/// Print a one-line delivery summary for a freshly created job, if configured.
+fn print_delivery(job: &CronJob) {
+    let d = &job.delivery;
+    if d.mode.is_empty() || d.mode.eq_ignore_ascii_case("none") {
+        return;
+    }
+    if d.mode.eq_ignore_ascii_case("webhook") {
+        println!("  Deliver: webhook → {}", d.to.as_deref().unwrap_or("-"));
+    } else {
+        println!(
+            "  Deliver: {} → {} ({})",
+            d.mode,
+            d.channel.as_deref().unwrap_or("-"),
+            d.to.as_deref().unwrap_or("-")
+        );
+    }
+}
 
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
@@ -58,43 +110,79 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             expression,
             tz,
             command,
+            announce,
+            channel,
+            to,
+            webhook,
         } => {
+            let delivery = delivery_from_flags(announce, channel, to, webhook)?;
             let schedule = Schedule::Cron {
                 expr: expression,
                 tz,
             };
-            let job = add_shell_job(config, None, schedule, &command)?;
+            let job = add_shell_job_with_delivery(config, None, schedule, &command, delivery)?;
             println!("✅ Added cron job {}", job.id);
             println!("  Expr: {}", job.expression);
             println!("  Next: {}", job.next_run.to_rfc3339());
             println!("  Cmd : {}", job.command);
+            print_delivery(&job);
             Ok(())
         }
-        crate::CronCommands::AddAt { at, command } => {
+        crate::CronCommands::AddAt {
+            at,
+            command,
+            announce,
+            channel,
+            to,
+            webhook,
+        } => {
+            let delivery = delivery_from_flags(announce, channel, to, webhook)?;
             let at = chrono::DateTime::parse_from_rfc3339(&at)
                 .map_err(|e| anyhow::anyhow!("Invalid RFC3339 timestamp for --at: {e}"))?
                 .with_timezone(&chrono::Utc);
             let schedule = Schedule::At { at };
-            let job = add_shell_job(config, None, schedule, &command)?;
+            let job = add_shell_job_with_delivery(config, None, schedule, &command, delivery)?;
             println!("✅ Added one-shot cron job {}", job.id);
             println!("  At  : {}", job.next_run.to_rfc3339());
             println!("  Cmd : {}", job.command);
+            print_delivery(&job);
             Ok(())
         }
-        crate::CronCommands::AddEvery { every_ms, command } => {
+        crate::CronCommands::AddEvery {
+            every_ms,
+            command,
+            announce,
+            channel,
+            to,
+            webhook,
+        } => {
+            let delivery = delivery_from_flags(announce, channel, to, webhook)?;
             let schedule = Schedule::Every { every_ms };
-            let job = add_shell_job(config, None, schedule, &command)?;
+            let job = add_shell_job_with_delivery(config, None, schedule, &command, delivery)?;
             println!("✅ Added interval cron job {}", job.id);
             println!("  Every(ms): {every_ms}");
             println!("  Next     : {}", job.next_run.to_rfc3339());
             println!("  Cmd      : {}", job.command);
+            print_delivery(&job);
             Ok(())
         }
-        crate::CronCommands::Once { delay, command } => {
-            let job = add_once(config, &delay, &command)?;
+        crate::CronCommands::Once {
+            delay,
+            command,
+            announce,
+            channel,
+            to,
+            webhook,
+        } => {
+            let delivery = delivery_from_flags(announce, channel, to, webhook)?;
+            let duration = parse_delay(&delay)?;
+            let at = chrono::Utc::now() + duration;
+            let schedule = Schedule::At { at };
+            let job = add_shell_job_with_delivery(config, None, schedule, &command, delivery)?;
             println!("✅ Added one-shot cron job {}", job.id);
             println!("  At  : {}", job.next_run.to_rfc3339());
             println!("  Cmd : {}", job.command);
+            print_delivery(&job);
             Ok(())
         }
         crate::CronCommands::Update {
@@ -412,5 +500,48 @@ mod tests {
 
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         assert!(security.is_command_allowed("echo safe"));
+    }
+
+    #[test]
+    fn delivery_flags_none_yields_no_delivery() {
+        assert!(delivery_from_flags(false, None, None, None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn delivery_flags_announce_builds_announce_config() {
+        let cfg = delivery_from_flags(true, Some("whatsapp".into()), Some("+62".into()), None)
+            .unwrap()
+            .expect("announce should produce a delivery config");
+        assert_eq!(cfg.mode, "announce");
+        assert_eq!(cfg.channel.as_deref(), Some("whatsapp"));
+        assert_eq!(cfg.to.as_deref(), Some("+62"));
+    }
+
+    #[test]
+    fn delivery_flags_announce_requires_channel_and_to() {
+        assert!(delivery_from_flags(true, None, Some("+62".into()), None).is_err());
+        assert!(delivery_from_flags(true, Some("whatsapp".into()), None, None).is_err());
+    }
+
+    #[test]
+    fn delivery_flags_webhook_builds_webhook_config() {
+        let cfg = delivery_from_flags(false, None, None, Some("https://h/x".into()))
+            .unwrap()
+            .expect("webhook should produce a delivery config");
+        assert_eq!(cfg.mode, "webhook");
+        assert_eq!(cfg.to.as_deref(), Some("https://h/x"));
+    }
+
+    #[test]
+    fn delivery_flags_announce_and_webhook_conflict() {
+        assert!(delivery_from_flags(
+            true,
+            Some("whatsapp".into()),
+            Some("+62".into()),
+            Some("https://h".into()),
+        )
+        .is_err());
     }
 }

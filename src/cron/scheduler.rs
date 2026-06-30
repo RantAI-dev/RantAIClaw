@@ -4,7 +4,7 @@ use crate::channels::{
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    update_job, CronJob, CronJobPatch, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -281,81 +281,152 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 }
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
-    let delivery: &DeliveryConfig = &job.delivery;
-    if !delivery.mode.eq_ignore_ascii_case("announce") {
+    deliver_with_resolver(config, job, output, |name| {
+        crate::channels::live_registry::live_channel(name)
+    })
+    .await
+}
+
+/// Core delivery routing, parameterized by a channel resolver so it can be
+/// unit-tested without the process-global registry or a live network.
+///
+/// `mode` parity with OpenClaw: `none` (default, no-op), `announce` (push job
+/// output to a channel), `webhook` (POST job output to a URL).
+async fn deliver_with_resolver<R>(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+    resolve_live: R,
+) -> Result<()>
+where
+    R: Fn(&str) -> Option<Arc<dyn Channel>>,
+{
+    let delivery = &job.delivery;
+    let mode = delivery.mode.trim();
+
+    // Default / explicit no-op.
+    if mode.is_empty() || mode.eq_ignore_ascii_case("none") {
         return Ok(());
     }
 
-    let channel = delivery
-        .channel
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
-    let target = delivery
-        .to
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+    // Webhook: POST the output to a URL.
+    if mode.eq_ignore_ascii_case("webhook") {
+        let url = delivery.to.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("delivery.to (webhook URL) is required for webhook mode")
+        })?;
+        return deliver_webhook(url, job, output).await;
+    }
 
-    match channel.to_ascii_lowercase().as_str() {
+    // Announce: push the output to a channel.
+    if mode.eq_ignore_ascii_case("announce") {
+        let channel = delivery
+            .channel
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
+        let target = delivery
+            .to
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+
+        // Prefer the live, already-connected session. This is the only path
+        // that works for stateful channels (e.g. whatsapp web), and it reuses
+        // the warm connection for stateless ones too.
+        if let Some(ch) = resolve_live(channel) {
+            ch.send(&SendMessage::new(output, target)).await?;
+            return Ok(());
+        }
+
+        // Fall back to a freshly constructed stateless channel from config
+        // (e.g. a scheduler-only process with no in-process channel supervisor).
+        if let Some(ch) = build_stateless_channel(config, channel)? {
+            ch.send(&SendMessage::new(output, target)).await?;
+            return Ok(());
+        }
+
+        anyhow::bail!("delivery channel '{channel}' is not running and has no stateless fallback");
+    }
+
+    anyhow::bail!("unsupported delivery mode: {mode}")
+}
+
+/// Construct a *stateless* (HTTP) channel from config for delivery when no live
+/// session is registered (e.g. a scheduler-only process). Returns `Ok(None)`
+/// for channel names that have no stateless construction (e.g. whatsapp web,
+/// which requires the daemon's live session).
+fn build_stateless_channel(config: &Config, name: &str) -> Result<Option<Arc<dyn Channel>>> {
+    let cc = &config.channels_config;
+    let channel: Arc<dyn Channel> = match name.to_ascii_lowercase().as_str() {
         "telegram" => {
-            let tg = config
-                .channels_config
+            let tg = cc
                 .telegram
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
-            let channel = TelegramChannel::new(
+            Arc::new(TelegramChannel::new(
                 tg.bot_token.clone(),
                 tg.allowed_users.clone(),
                 tg.mention_only,
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
+            ))
         }
         "discord" => {
-            let dc = config
-                .channels_config
+            let dc = cc
                 .discord
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
-            let channel = DiscordChannel::new(
+            Arc::new(DiscordChannel::new(
                 dc.bot_token.clone(),
                 dc.guild_id.clone(),
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
+            ))
         }
         "slack" => {
-            let sl = config
-                .channels_config
+            let sl = cc
                 .slack
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
-            let channel = SlackChannel::new(
+            Arc::new(SlackChannel::new(
                 sl.bot_token.clone(),
                 sl.channel_id.clone(),
                 sl.allowed_users.clone(),
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
+            ))
         }
         "mattermost" => {
-            let mm = config
-                .channels_config
+            let mm = cc
                 .mattermost
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
-            let channel = MattermostChannel::new(
+            Arc::new(MattermostChannel::new(
                 mm.url.clone(),
                 mm.bot_token.clone(),
                 mm.channel_id.clone(),
                 mm.allowed_users.clone(),
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
+            ))
         }
-        other => anyhow::bail!("unsupported delivery channel: {other}"),
-    }
+        _ => return Ok(None),
+    };
+    Ok(Some(channel))
+}
 
+/// POST the job output to a webhook URL (`delivery.mode = "webhook"`).
+async fn deliver_webhook(url: &str, job: &CronJob, output: &str) -> Result<()> {
+    let payload = serde_json::json!({
+        "job_id": job.id,
+        "name": job.name,
+        "output": output,
+        "fired_at": Utc::now().to_rfc3339(),
+    });
+    let resp = reqwest::Client::new()
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("webhook POST failed: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("webhook delivery returned HTTP {}", resp.status());
+    }
     Ok(())
 }
 
@@ -517,6 +588,46 @@ mod tests {
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
+
+    use crate::channels::traits::ChannelMessage;
+    use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
+
+    /// Records every message sent through it, for delivery-routing assertions.
+    struct RecordingChannel {
+        name: String,
+        sent: Arc<std::sync::Mutex<Vec<SendMessage>>>,
+    }
+
+    #[async_trait]
+    impl Channel for RecordingChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(message.clone());
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn announce_to(channel: &str, to: &str) -> DeliveryConfig {
+        DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some(channel.into()),
+            to: Some(to.into()),
+            best_effort: true,
+        }
+    }
 
     async fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
@@ -861,6 +972,191 @@ mod tests {
             best_effort: true,
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
-        assert!(err.to_string().contains("unsupported delivery channel"));
+        assert!(
+            err.to_string().contains("not running"),
+            "unknown/unavailable channel should report not-running, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn announce_delivers_to_live_channel() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("noop");
+        job.delivery = announce_to("whatsapp", "+6285228485826");
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ch: Arc<dyn Channel> = Arc::new(RecordingChannel {
+            name: "whatsapp".into(),
+            sent: Arc::clone(&sent),
+        });
+        let resolver = |name: &str| {
+            if name == "whatsapp" {
+                Some(Arc::clone(&ch))
+            } else {
+                None
+            }
+        };
+
+        deliver_with_resolver(&config, &job, "scheduled hello", resolver)
+            .await
+            .unwrap();
+
+        let msgs = sent.lock().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "scheduled hello");
+        assert_eq!(msgs[0].recipient, "+6285228485826");
+    }
+
+    #[tokio::test]
+    async fn announce_to_unavailable_channel_errors() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("noop");
+        job.delivery = announce_to("whatsapp", "+6285228485826");
+
+        // No live session, and whatsapp has no stateless fallback.
+        let err = deliver_with_resolver(&config, &job, "x", |_| None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not running"),
+            "expected 'not running', got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn none_mode_does_not_consult_resolver() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = test_job("noop"); // default delivery mode = "none"
+
+        let consulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&consulted);
+        let resolver = move |_: &str| -> Option<Arc<dyn Channel>> {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+
+        deliver_with_resolver(&config, &job, "x", resolver)
+            .await
+            .unwrap();
+        assert!(
+            !consulted.load(std::sync::atomic::Ordering::SeqCst),
+            "none mode must not consult the channel resolver"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_mode_errors() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("noop");
+        job.delivery = DeliveryConfig {
+            mode: "carrier-pigeon".into(),
+            channel: None,
+            to: None,
+            best_effort: true,
+        };
+        let err = deliver_with_resolver(&config, &job, "x", |_| None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported delivery mode"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_mode_posts_output() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut acc = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                if String::from_utf8_lossy(&acc).contains("scheduled-webhook-body") {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    return true;
+                }
+            }
+            false
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("noop");
+        job.delivery = DeliveryConfig {
+            mode: "webhook".into(),
+            channel: None,
+            to: Some(format!("http://{addr}/hook")),
+            best_effort: true,
+        };
+
+        deliver_with_resolver(&config, &job, "scheduled-webhook-body", |_| None)
+            .await
+            .unwrap();
+
+        assert!(
+            server.await.unwrap(),
+            "webhook server should have received the job output"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_non_success_status_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("noop");
+        job.delivery = DeliveryConfig {
+            mode: "webhook".into(),
+            channel: None,
+            to: Some(format!("http://{addr}/hook")),
+            best_effort: true,
+        };
+
+        let err = deliver_with_resolver(&config, &job, "x", |_| None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("500") || err.to_string().contains("webhook"),
+            "got: {err}"
+        );
+        let _ = server.await;
+    }
+
+    #[test]
+    fn build_stateless_errors_for_known_type_when_absent() {
+        let config = Config::default();
+        // telegram is a known stateless type but not configured in defaults.
+        // `.err()` drops the `Ok(Option<Arc<dyn Channel>>)` (not Debug) value.
+        let err = build_stateless_channel(&config, "telegram")
+            .err()
+            .expect("expected an error when telegram is unconfigured");
+        assert!(err.to_string().contains("not configured"), "got: {err}");
     }
 }
