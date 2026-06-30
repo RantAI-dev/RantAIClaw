@@ -132,6 +132,10 @@ fn bench_cfg() -> KbConfig {
         query_embed_cache_size: 256,
         query_embed_cache_ttl_ms: 5 * 60 * 1_000,
         openrouter_chat_url: "bench://fake".into(),
+        intelligence_enabled: false,
+        intelligence_model: "openai/gpt-4.1-nano".into(),
+        intelligence_resolution: "exact".into(),
+        graph_max_nodes: 200,
     }
 }
 

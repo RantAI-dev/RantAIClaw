@@ -149,6 +149,8 @@ The CLI is the "axi-cli" surface: idempotent, never interactive, defaults to TOO
 | `kb delete <id>` | Soft-delete a document (sets `deleted_at`). `--hard` for permanent |
 | `kb drift` | Report chunks embedded with a stale model. `--json` |
 | `kb re-embed` | Re-embed chunks. `--include-current`, `--dry-run`, `--batch-size`, `--json` |
+| `kb intelligence <document_id>` | Per-document extracted entities + relations. `--json` |
+| `kb graph` | Cross-document knowledge graph. `--group`, `--limit`, `--json` |
 
 Exit codes:
 
@@ -183,6 +185,124 @@ Init behavior: the KB context (config, store, embedder, optional reranker) is bu
 When `--features kb` is enabled **and** a `kb.db` exists at the resolved path, rantaiclaw's agent loop auto-injects an axi-ambient context block into the system prompt that informs the model it can shell out via `rantaiclaw kb search "<query>"` to consult the KB.
 
 No MCP server, tool registration, or schema declaration is required — the agent uses its existing `shell` capability with the standard policy + autonomy gates. If the autonomy preset doesn't permit `rantaiclaw` in the shell allowlist, the agent simply can't reach the KB. Operators can either add `rantaiclaw` to `[autonomy].allowed_commands` or implement a dedicated tool.
+
+## Document Intelligence
+
+Entity and relation extraction over ingested documents, building a cross-document knowledge graph. This is opt-in and off by default — it does not affect ingest, retrieval, or any existing KB behavior unless enabled.
+
+### What it is
+
+When enabled, each ingest run extracts named entities (people, organizations, concepts, locations, etc.) and the typed relations between them from the document's text. Entities from different documents are merged into a shared global node when they share the same normalized name and type (exact resolution by default). The result is a cross-document knowledge graph stored in `kb.db` alongside the chunk and embedding tables.
+
+This is standalone extraction and graph storage. Graph-aware retrieval (GraphRAG) is not part of this feature.
+
+### Enable it
+
+Set `KB_INTELLIGENCE_ENABLED=true`. Off by default.
+
+When enabled, extraction runs automatically after each ingest:
+
+- **HTTP ingest** (`POST /api/v1/kb/documents`): extraction runs as a fire-and-forget background task — it never blocks or fails the ingest response.
+- **CLI ingest** (`rantaiclaw kb ingest …`): extraction runs inline after ingest completes.
+
+An ingest succeeds regardless of whether extraction succeeds.
+
+### API key for extraction
+
+The extractor calls `KB_OPENROUTER_CHAT_URL` (the shared KB chat-completions endpoint, default `https://openrouter.ai/api/v1/chat/completions`). For authentication it uses `KB_EMBEDDING_API_KEY` if set, otherwise falls back to `OPENROUTER_API_KEY`. Set one of those for extraction to work; the fallback order mirrors the embedding endpoint.
+
+### Configuration
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `KB_INTELLIGENCE_ENABLED` | `false` | Enable entity/relation extraction at ingest |
+| `KB_INTELLIGENCE_MODEL` | `openai/gpt-4.1-nano` | Extraction model; routed through `KB_OPENROUTER_CHAT_URL` |
+| `KB_INTELLIGENCE_RESOLUTION` | `exact` | Entity merge strategy: `exact` (normalized name+type), `embedding` (fuzzy — future option) |
+| `KB_GRAPH_MAX_NODES` | `200` | Cap on nodes returned by the whole-KB graph endpoint (top-N by degree) |
+
+### HTTP endpoints
+
+All intelligence routes are under `/api/v1/kb/` and follow the same auth rules as the rest of the KB API.
+
+**Per-document intelligence:**
+
+```
+GET /api/v1/kb/documents/{id}/intelligence
+```
+
+Returns entities and relations extracted from one document, plus type-level stats.
+
+Response shape:
+
+```json
+{
+  "entities": [
+    { "id": "…", "name": "…", "entity_type": "ORG", "confidence": 0.92 }
+  ],
+  "relations": [
+    { "id": "…", "source": "…", "target": "…", "relation_type": "GOVERNS", "confidence": 0.85 }
+  ],
+  "stats": {
+    "total_entities": 12,
+    "total_relations": 8,
+    "entity_types": { "PERSON": 4, "ORG": 3 },
+    "relation_types": { "GOVERNS": 5, "MENTIONS": 3 }
+  }
+}
+```
+
+**Whole-KB knowledge graph:**
+
+```
+GET /api/v1/kb/graph?group=<g>&limit=<n>
+```
+
+Returns the merged cross-document graph, optionally filtered to one group and capped to `limit` nodes (top-N by degree; default cap from `KB_GRAPH_MAX_NODES`). `group` is optional.
+
+Response shape:
+
+```json
+{
+  "nodes": [
+    { "id": "…", "name": "…", "entity_type": "ORG", "degree": 7, "doc_count": 3 }
+  ],
+  "edges": [
+    { "source": "…", "target": "…", "relation_type": "GOVERNS" }
+  ],
+  "stats": { "total_nodes": 42, "total_edges": 61 }
+}
+```
+
+**Re-extract one document:**
+
+```
+POST /api/v1/kb/documents/{id}/re-extract
+```
+
+Re-runs extraction for one document (replaces any previously extracted entities/relations for that document) and returns the extraction summary.
+
+### CLI
+
+```bash
+rantaiclaw kb intelligence <document_id>          # per-document entities + relations (TOON)
+rantaiclaw kb intelligence <document_id> --json   # JSON output
+rantaiclaw kb graph                               # whole-KB graph (TOON)
+rantaiclaw kb graph --group <group_id>            # scoped to one group
+rantaiclaw kb graph --limit <n>                   # override node cap
+rantaiclaw kb graph --json                        # JSON output
+```
+
+TOON format follows the same `key[n]{fields}:` convention as the rest of the KB CLI:
+
+```
+entities[12]{id,name,entity_type,confidence}:
+  ent_01,Acme Corp,ORG,0.92
+  ent_02,Billing Policy,CONCEPT,0.88
+  ...
+relations[8]{id,source,target,relation_type,confidence}:
+  rel_01,ent_01,ent_02,GOVERNS,0.85
+  ...
+```
 
 ## Limitations
 

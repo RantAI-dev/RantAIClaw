@@ -11,6 +11,7 @@ pub mod embed;
 pub mod error;
 pub mod extract;
 pub mod file;
+pub mod intelligence;
 pub mod maintenance;
 pub mod rerank;
 pub mod retrieve;

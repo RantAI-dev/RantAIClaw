@@ -20,7 +20,7 @@ type SqliteEntryPoint = unsafe extern "C" fn(
 ) -> c_int;
 
 /// Schema version — bump and add a migration branch when fields change.
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 /// Register the sqlite-vec extension as an auto-extension once per process.
 ///
@@ -164,6 +164,28 @@ pub(crate) fn migrate(conn: &Connection, embedding_dim: usize) -> KbResult<()> {
             INSERT INTO chunk_fts(chunk_fts, rowid, content) VALUES('delete', old.rowid, old.content);
             INSERT INTO chunk_fts(rowid, content) VALUES (new.rowid, new.content);
         END;
+
+        -- Cross-document knowledge graph (SP-2 KB Document Intelligence).
+        -- Entities are deduplicated by canonical_key; mentions/relations link
+        -- entities to their source documents.
+        CREATE TABLE IF NOT EXISTS entity (
+            id TEXT PRIMARY KEY, canonical_key TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL, type TEXT NOT NULL, confidence REAL NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{{}}', created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS entity_mention (
+            id TEXT PRIMARY KEY,
+            entity_id TEXT NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+            document_id TEXT NOT NULL, chunk_index INTEGER, context TEXT, source TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS entity_relation (
+            id TEXT PRIMARY KEY,
+            source_entity_id TEXT NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+            target_entity_id TEXT NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+            relation_type TEXT NOT NULL, confidence REAL NOT NULL,
+            document_id TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{{}}', created_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_mention_doc ON entity_mention(document_id);
+        CREATE INDEX IF NOT EXISTS idx_mention_entity ON entity_mention(entity_id);
+        CREATE INDEX IF NOT EXISTS idx_relation_doc ON entity_relation(document_id);
+        CREATE INDEX IF NOT EXISTS idx_relation_src ON entity_relation(source_entity_id);
     "#,
         dim = embedding_dim
     ))?;

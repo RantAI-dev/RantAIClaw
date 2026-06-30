@@ -96,6 +96,10 @@ fn cfg_with_model(model: &str) -> KbConfig {
         query_embed_cache_size: 8,
         query_embed_cache_ttl_ms: 60_000,
         openrouter_chat_url: "http://localhost".into(),
+        intelligence_enabled: false,
+        intelligence_model: "openai/gpt-4.1-nano".into(),
+        intelligence_resolution: "exact".into(),
+        graph_max_nodes: 200,
     }
 }
 

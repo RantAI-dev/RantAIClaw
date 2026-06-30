@@ -17,6 +17,7 @@ mod kb {
     pub mod embed_test;
     pub mod extract_test;
     pub mod file_test;
+    pub mod intelligence_test;
     pub mod maintenance_test;
     pub mod parity_helpers;
     pub mod parity_test;
