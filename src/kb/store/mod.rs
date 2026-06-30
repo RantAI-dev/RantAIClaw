@@ -196,6 +196,19 @@ pub trait IntelligenceStore: Send + Sync {
     /// Remove a document's mentions and relations, then GC any entity left with
     /// zero mentions (orphan cleanup).
     async fn delete_document_intelligence(&self, document_id: &str) -> KbResult<()>;
+    /// GraphRAG expansion. Find entities whose name (≥3 chars) appears in
+    /// `query` (case-insensitive substring = "seeds"), expand one hop along
+    /// relations (the other endpoint; capped at `max_neighbors`), then return up
+    /// to `limit` chunks that mention any seed-or-neighbour entity — as
+    /// retrieval candidates for the RRF fusion. Ordered by how many matched
+    /// entities each chunk mentions (desc). Returns an empty vec when no entity
+    /// name matches the query.
+    async fn graph_expand_chunks(
+        &self,
+        query: &str,
+        max_neighbors: usize,
+        limit: usize,
+    ) -> KbResult<Vec<SearchResult>>;
 }
 
 /// Persist a document then its chunks, rolling the document row back if chunk
