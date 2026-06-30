@@ -5,6 +5,20 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.96-alpha] — 2026-06-30
+
+### Fixed
+
+- **`rantaiclaw ui install` no longer aborts on a dirty managed checkout.** The
+  console install prefers `bun`, and `bun install` rewrites the tracked
+  `bun.lock` on every run, leaving `~/.rantaiclaw/ui` dirty; a bare
+  `git pull --ff-only` then failed — and a user's global `pull.rebase = true`
+  turned `--ff-only` into a rebase that aborts with "you have unstaged changes".
+  The update path now discards local churn (`git checkout -- .`) and pins
+  `pull.rebase=false` before the fast-forward, since the checkout is
+  tool-managed (not for hand edits). Still `--ff-only`, so genuinely diverged
+  history errors loudly. (#117)
+
 ## [0.6.95-alpha] — 2026-06-30
 
 ### Added
