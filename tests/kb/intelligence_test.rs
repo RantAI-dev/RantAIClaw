@@ -393,3 +393,144 @@ async fn graph_expand_chunks_surfaces_neighbor_only_chunks() {
         "no entity match must yield no graph chunks: {none:?}"
     );
 }
+
+#[tokio::test]
+async fn upsert_entity_refreshes_confidence_to_max_on_conflict() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention};
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use tempfile::TempDir;
+
+    fn ent(conf: f32) -> Entity {
+        Entity {
+            id: "e1".into(),
+            canonical_key: "nqrust:Product".into(),
+            name: "NQRust".into(),
+            entity_type: EntityType::Product,
+            confidence: conf,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    // A first extraction stored a stale 0.0 (mimics the pre-fix binary).
+    let id = store.upsert_entity(&ent(0.0)).await.unwrap();
+    // A re-extract with real confidence must LIFT it, not be silently dropped.
+    store.upsert_entity(&ent(0.95)).await.unwrap();
+    // A later lower value must NOT lower it (max wins).
+    store.upsert_entity(&ent(0.5)).await.unwrap();
+
+    store
+        .add_mention(&EntityMention {
+            id: "m1".into(),
+            entity_id: id,
+            document_id: "d1".into(),
+            chunk_index: Some(0),
+            context: None,
+            source: ExtractSource::Llm,
+        })
+        .await
+        .unwrap();
+
+    let (entities, _) = store.intelligence_for_document("d1").await.unwrap();
+    assert_eq!(entities.len(), 1);
+    assert!(
+        (entities[0].confidence - 0.95).abs() < 1e-6,
+        "confidence must refresh to the max (0.95), got {}",
+        entities[0].confidence
+    );
+}
+
+#[tokio::test]
+async fn hard_delete_clears_intelligence_soft_delete_keeps_it() {
+    use chrono::Utc;
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention};
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::{IntelligenceStore, KbStore};
+    use rantaiclaw::kb::{Document, DocumentId};
+    use tempfile::TempDir;
+
+    fn doc(id: &str) -> Document {
+        Document {
+            id: DocumentId(id.into()),
+            title: "T".into(),
+            content: "c".into(),
+            categories: vec![],
+            subcategory: None,
+            metadata: serde_json::json!({}),
+            s3_key: None,
+            file_type: None,
+            mime_type: None,
+            file_size: None,
+            organization_id: None,
+            created_by: None,
+            session_id: None,
+            artifact_type: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            deleted_at: None,
+            retention_days: None,
+            retrieval_count: 0,
+            last_retrieved_at: None,
+        }
+    }
+    async fn seed_entity(store: &SqliteStore, doc_id: &str) {
+        let id = store
+            .upsert_entity(&Entity {
+                id: "e".into(),
+                canonical_key: "x:Product".into(),
+                name: "X".into(),
+                entity_type: EntityType::Product,
+                confidence: 0.9,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        store
+            .add_mention(&EntityMention {
+                id: "m".into(),
+                entity_id: id,
+                document_id: doc_id.into(),
+                chunk_index: Some(0),
+                context: None,
+                source: ExtractSource::Llm,
+            })
+            .await
+            .unwrap();
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    // Hard delete must clear the doc's graph rows + GC the orphaned entity.
+    store.create_document(&doc("d_hard")).await.unwrap();
+    seed_entity(&store, "d_hard").await;
+    assert_eq!(store.graph(None, 100).await.unwrap().nodes.len(), 1);
+    store
+        .delete_document(&DocumentId("d_hard".into()), false)
+        .await
+        .unwrap();
+    assert!(
+        store.graph(None, 100).await.unwrap().nodes.is_empty(),
+        "hard delete must clear the document's intelligence"
+    );
+
+    // Soft delete must KEEP intelligence (the doc is recoverable).
+    store.create_document(&doc("d_soft")).await.unwrap();
+    seed_entity(&store, "d_soft").await;
+    store
+        .delete_document(&DocumentId("d_soft".into()), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.graph(None, 100).await.unwrap().nodes.len(),
+        1,
+        "soft delete must preserve the document's intelligence"
+    );
+}
