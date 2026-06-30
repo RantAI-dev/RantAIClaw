@@ -87,6 +87,23 @@ fn default_confidence() -> f32 {
     1.0
 }
 
+/// Confidence assigned when the model returns a non-positive score (0, negative, or a
+/// `NaN`). The prompt instructs the model never to emit 0, but we sanitise defensively
+/// so a single misbehaving response never surfaces as "0%" in the graph UI.
+const UNSPECIFIED_CONFIDENCE: f32 = 0.5;
+
+/// Clamp a model-reported confidence into the usable `(0, 1]` range. Non-positive or
+/// non-finite values collapse to [`UNSPECIFIED_CONFIDENCE`]; values above 1 clamp to 1.
+fn sanitize_confidence(raw: f32) -> f32 {
+    if !raw.is_finite() || raw <= 0.0 {
+        UNSPECIFIED_CONFIDENCE
+    } else if raw > 1.0 {
+        1.0
+    } else {
+        raw
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Prompt builder
 // ---------------------------------------------------------------------------
@@ -95,8 +112,11 @@ fn build_prompt(chunk: &str) -> String {
     format!(
         "You are an entity and relation extractor. Given the text below, extract all entities \
 and relations. Output ONLY a JSON object with exactly this structure:\n\
-{{\"entities\":[{{\"name\":\"...\",\"type\":\"...\",\"confidence\":0.0}}],\
-\"relations\":[{{\"source\":\"...\",\"target\":\"...\",\"type\":\"...\",\"confidence\":0.0}}]}}\n\n\
+{{\"entities\":[{{\"name\":\"...\",\"type\":\"...\",\"confidence\":0.95}}],\
+\"relations\":[{{\"source\":\"...\",\"target\":\"...\",\"type\":\"...\",\"confidence\":0.9}}]}}\n\n\
+`confidence` is your certainty for that item: a number strictly between 0 and 1. Use a high \
+value (0.9-1.0) for facts clearly stated in the text and a lower value when inferred. \
+NEVER output 0 — every extracted item must carry a real, non-zero confidence.\n\n\
 Valid entity types: Person, Organization, Location, Product, Technology, Concept, Event, \
 Date, Email, Url, Phone, Money, Function, Api, Error, File.\n\
 Valid relation types: WorksFor, PartOf, LocatedIn, Implements, Calls, DependsOn, Uses, \
@@ -180,7 +200,7 @@ impl EntityRelationExtractor for CombinedLlmExtractor {
                 out.entities.push((
                     ent.name,
                     EntityType::from_str_lenient(&ent.entity_type),
-                    ent.confidence,
+                    sanitize_confidence(ent.confidence),
                 ));
             }
 
@@ -189,11 +209,48 @@ impl EntityRelationExtractor for CombinedLlmExtractor {
                     rel.source,
                     rel.target,
                     RelationType::from_str_lenient(&rel.relation_type),
-                    rel.confidence,
+                    sanitize_confidence(rel.confidence),
                 ));
             }
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_prompt, sanitize_confidence, UNSPECIFIED_CONFIDENCE};
+
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn prompt_does_not_seed_zero_confidence_and_forbids_it() {
+        let p = build_prompt("hello world");
+        // The structural example must not seed a 0 the model can echo back verbatim.
+        assert!(
+            !p.contains("\"confidence\":0.0"),
+            "prompt still contains a 0.0 confidence example: {p}"
+        );
+        // A realistic non-zero example and an explicit non-zero instruction are present.
+        assert!(p.contains("0.95"), "prompt lost its non-zero example");
+        assert!(
+            p.contains("NEVER output 0"),
+            "prompt lost the never-zero instruction"
+        );
+    }
+
+    #[test]
+    fn sanitize_confidence_floors_non_positive_and_clamps_high() {
+        assert!(approx(sanitize_confidence(0.0), UNSPECIFIED_CONFIDENCE));
+        assert!(approx(sanitize_confidence(-0.3), UNSPECIFIED_CONFIDENCE));
+        assert!(approx(
+            sanitize_confidence(f32::NAN),
+            UNSPECIFIED_CONFIDENCE
+        ));
+        assert!(approx(sanitize_confidence(0.9), 0.9));
+        assert!(approx(sanitize_confidence(1.5), 1.0));
     }
 }
