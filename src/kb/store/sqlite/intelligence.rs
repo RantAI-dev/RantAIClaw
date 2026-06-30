@@ -13,7 +13,7 @@ use rusqlite::{params, Row};
 use super::SqliteStore;
 use crate::kb::intelligence::types::{Entity, EntityMention, EntityType, Relation, RelationType};
 use crate::kb::store::{Graph, GraphEdge, GraphNode, IntelligenceStore};
-use crate::kb::{KbError, KbResult};
+use crate::kb::{ChunkId, ChunkMetadata, DocumentId, KbError, KbResult, SearchResult};
 
 fn map_entity(row: &Row<'_>) -> KbResult<Entity> {
     let metadata_json: String = row.get("metadata")?;
@@ -271,6 +271,125 @@ impl IntelligenceStore for SqliteStore {
             )?;
             tx.commit()?;
             Ok(())
+        })
+        .await
+        .map_err(|e| KbError::Other(format!("join: {e}")))?
+    }
+
+    async fn graph_expand_chunks(
+        &self,
+        query: &str,
+        max_neighbors: usize,
+        limit: usize,
+    ) -> KbResult<Vec<SearchResult>> {
+        let conn = self.conn.clone();
+        let query = query.to_string();
+        let max_neighbors = max_neighbors as i64;
+        tokio::task::spawn_blocking(move || -> KbResult<Vec<SearchResult>> {
+            let conn = conn.blocking_lock();
+
+            // 1) Seeds: entities whose name (>= 3 chars, to avoid noise) appears
+            //    as a case-insensitive substring of the query. `instr` returns a
+            //    1-based position, or 0 when not found.
+            let mut seed_ids: Vec<String> = Vec::new();
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM entity
+                     WHERE length(name) >= 3 AND instr(lower(?1), lower(name)) > 0",
+                )?;
+                let mut rows = stmt.query(params![query])?;
+                while let Some(row) = rows.next()? {
+                    seed_ids.push(row.get(0)?);
+                }
+            }
+            if seed_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            // 2) One-hop neighbours: the other endpoint of any relation touching
+            //    a seed, capped at `max_neighbors`. Seeds are always included.
+            let seed_set: std::collections::HashSet<String> = seed_ids.iter().cloned().collect();
+            let mut entity_ids = seed_set.clone();
+            {
+                let ph = vec!["?"; seed_ids.len()].join(",");
+                let sql = format!(
+                    "SELECT source_entity_id, target_entity_id FROM entity_relation
+                     WHERE source_entity_id IN ({ph}) OR target_entity_id IN ({ph})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                // Seeds bound twice — once per IN clause.
+                let bind = seed_ids.iter().chain(seed_ids.iter());
+                let mut rows = stmt.query(rusqlite::params_from_iter(bind))?;
+                let mut added: i64 = 0;
+                while let Some(row) = rows.next()? {
+                    if added >= max_neighbors {
+                        break;
+                    }
+                    let src: String = row.get(0)?;
+                    let tgt: String = row.get(1)?;
+                    for cand in [src, tgt] {
+                        if !seed_set.contains(&cand) && entity_ids.insert(cand) {
+                            added += 1;
+                            if added >= max_neighbors {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3) Chunks mentioning any seed/neighbour entity → SearchResult,
+            //    ordered by how many matched entities each chunk mentions.
+            //    `limit` is an internal usize (not user input), so it is inlined.
+            let entity_vec: Vec<String> = entity_ids.into_iter().collect();
+            let ph = vec!["?"; entity_vec.len()].join(",");
+            let sql = format!(
+                "SELECT c.id, c.document_id, c.content, c.metadata_json,
+                        c.contextual_prefix, d.title, d.categories_json, d.subcategory,
+                        COUNT(*) AS hits
+                 FROM chunk c
+                 JOIN entity_mention m
+                       ON m.document_id = c.document_id AND m.chunk_index = c.chunk_index
+                 JOIN document d ON d.id = c.document_id
+                 WHERE m.entity_id IN ({ph}) AND d.deleted_at IS NULL
+                 GROUP BY c.id
+                 ORDER BY hits DESC, c.id ASC
+                 LIMIT {limit}"
+            );
+            let mut results: Vec<SearchResult> = Vec::new();
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(entity_vec.iter()))?;
+            while let Some(r) = rows.next()? {
+                let chunk_id: String = r.get("id")?;
+                let document_id: String = r.get("document_id")?;
+                let categories_json: String = r.get("categories_json")?;
+                let categories: Vec<String> =
+                    serde_json::from_str(&categories_json).unwrap_or_default();
+                let metadata_json: String = r.get("metadata_json")?;
+                let metadata: ChunkMetadata =
+                    serde_json::from_str(&metadata_json).unwrap_or_else(|_| ChunkMetadata {
+                        document_title: r.get("title").unwrap_or_default(),
+                        category: categories.first().cloned().unwrap_or_default(),
+                        subcategory: r.get("subcategory").ok(),
+                        section: None,
+                        chunk_index: 0,
+                        contextual_prefix: r.get("contextual_prefix").ok().flatten(),
+                    });
+                results.push(SearchResult {
+                    id: ChunkId(chunk_id),
+                    document_id: DocumentId(document_id),
+                    document_title: r.get("title")?,
+                    content: r.get("content")?,
+                    categories,
+                    subcategory: r.get("subcategory")?,
+                    section: metadata.section.clone(),
+                    // Graph-sourced candidates rank via RRF position, not cosine
+                    // similarity, so there is no meaningful score here.
+                    similarity: 0.0,
+                    contextual_prefix: metadata.contextual_prefix.clone(),
+                });
+            }
+            Ok(results)
         })
         .await
         .map_err(|e| KbError::Other(format!("join: {e}")))?

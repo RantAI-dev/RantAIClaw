@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::kb::embed::EmbeddingProvider;
 use crate::kb::rerank::{Candidate, Reranker};
-use crate::kb::store::{KbStore, SearchFilter};
+use crate::kb::store::{IntelligenceStore, KbStore, SearchFilter};
 use crate::kb::{ChunkId, DocumentId, KbConfig, KbResult, SearchResult};
 
 /// Per-call retrieval overrides. Fields are `Option` so the orchestrator can
@@ -80,6 +80,11 @@ pub struct Retriever {
     /// activates the "top-fetch_limit → top-max_chunks" reorder when the
     /// fused set is larger than `max_chunks`.
     pub reranker: Option<Arc<dyn Reranker>>,
+    /// Optional intelligence-graph handle for GraphRAG expansion. `None` (or
+    /// `cfg.graphrag_enabled == false`) skips the graph arm entirely. Kept
+    /// separate from `store` because `Arc<dyn KbStore>` can't be upcast to
+    /// `Arc<dyn IntelligenceStore>` (they are distinct trait objects).
+    pub intel: Option<Arc<dyn IntelligenceStore>>,
 }
 
 impl Retriever {
@@ -93,6 +98,7 @@ impl Retriever {
             store,
             embedder,
             reranker: None,
+            intel: None,
         }
     }
 
@@ -101,6 +107,15 @@ impl Retriever {
     #[must_use]
     pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Attach an intelligence-graph handle for GraphRAG. Builder-style, mirrors
+    /// [`with_reranker`]. The graph arm only fires when this is set AND
+    /// `cfg.graphrag_enabled` is true.
+    #[must_use]
+    pub fn with_intelligence(mut self, intel: Arc<dyn IntelligenceStore>) -> Self {
+        self.intel = Some(intel);
         self
     }
 
@@ -144,6 +159,29 @@ impl Retriever {
         // whole retrieval.
         let bm25_chunks = bm25_chunks.unwrap_or_default();
 
+        // GraphRAG arm — opt-in, fail-soft. Expands the query through the entity
+        // graph (matched entities → 1-hop neighbours → their chunks) and feeds
+        // the results in as extra RRF candidates; never replaces vector/BM25.
+        // Empty when disabled, no intel handle attached, or no entity name
+        // matches the query — in which case retrieval is bit-for-bit unchanged.
+        let graph_chunks: Vec<SearchResult> = if self.cfg.graphrag_enabled {
+            match &self.intel {
+                Some(intel) => match intel
+                    .graph_expand_chunks(query, self.cfg.graphrag_max_neighbors, fetch_limit)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(target: "kb::retrieve", error = %e, "graphrag expansion failed (fail-soft)");
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
         // Build chunk pool: vector wins metadata ties. BM25-only hits get
         // synthesized SearchResult records with empty title/categories so
         // they're addressable but visually distinguishable in the output.
@@ -164,16 +202,33 @@ impl Retriever {
                 contextual_prefix: None,
             });
         }
+        // Graph-sourced chunks join the pool only if not already present, so a
+        // chunk that vector/BM25 also found keeps its richer metadata + score.
+        for g in &graph_chunks {
+            pool.entry(g.id.clone()).or_insert_with(|| g.clone());
+        }
 
-        // RRF only when BM25 actually produced hits — otherwise just rank by
-        // vector similarity directly.
-        let fused_ids: Vec<ChunkId> = if self.cfg.hybrid_bm25_enabled && !bm25_chunks.is_empty() {
+        // RRF when any lexical/graph arm produced hits — otherwise just rank by
+        // vector similarity directly. BM25 and graph each join as their own
+        // ranked list (empty list = no contribution), so disabling either one
+        // leaves the other arms' fusion unchanged.
+        let use_bm25 = self.cfg.hybrid_bm25_enabled && !bm25_chunks.is_empty();
+        let use_graph = !graph_chunks.is_empty();
+        let fused_ids: Vec<ChunkId> = if use_bm25 || use_graph {
             let v_list: Vec<(String, ())> =
                 vector_chunks.iter().map(|c| (c.id.0.clone(), ())).collect();
-            let b_list: Vec<(String, ())> =
-                bm25_chunks.iter().map(|c| (c.id.0.clone(), ())).collect();
+            let b_list: Vec<(String, ())> = if use_bm25 {
+                bm25_chunks.iter().map(|c| (c.id.0.clone(), ())).collect()
+            } else {
+                Vec::new()
+            };
+            let g_list: Vec<(String, ())> = if use_graph {
+                graph_chunks.iter().map(|c| (c.id.0.clone(), ())).collect()
+            } else {
+                Vec::new()
+            };
             let fused = reciprocal_rank_fusion(
-                &[v_list.as_slice(), b_list.as_slice()],
+                &[v_list.as_slice(), b_list.as_slice(), g_list.as_slice()],
                 RrfOptions {
                     k: 60,
                     limit: Some(fetch_limit),

@@ -220,3 +220,176 @@ async fn orchestration_merges_same_entity_across_two_documents() {
     assert_eq!(g.nodes.len(), 1, "one global node across two docs");
     assert_eq!(g.nodes[0].doc_count, 2);
 }
+
+#[tokio::test]
+async fn graph_expand_chunks_surfaces_neighbor_only_chunks() {
+    use chrono::Utc;
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, Relation};
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::{IntelligenceStore, KbStore};
+    use rantaiclaw::kb::{Chunk, ChunkMetadata, Document, DocumentId};
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    // One document, two chunks. Chunk 0 mentions Alice + TechCorp; chunk 1
+    // mentions only TechCorp.
+    let doc = Document {
+        id: DocumentId("d_graphrag".into()),
+        title: "GraphRAG Doc".into(),
+        content: "body".into(),
+        categories: vec!["FAQ".into()],
+        subcategory: None,
+        metadata: serde_json::json!({}),
+        s3_key: None,
+        file_type: None,
+        mime_type: None,
+        file_size: None,
+        organization_id: None,
+        created_by: None,
+        session_id: None,
+        artifact_type: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        deleted_at: None,
+        retention_days: None,
+        retrieval_count: 0,
+        last_retrieved_at: None,
+    };
+    store.create_document(&doc).await.unwrap();
+    let chunks = vec![
+        Chunk {
+            content: "Alice works at TechCorp.".into(),
+            metadata: ChunkMetadata {
+                document_title: doc.title.clone(),
+                category: "FAQ".into(),
+                subcategory: None,
+                section: None,
+                chunk_index: 0,
+                contextual_prefix: None,
+            },
+        },
+        Chunk {
+            content: "TechCorp builds embedded systems.".into(),
+            metadata: ChunkMetadata {
+                document_title: doc.title.clone(),
+                category: "FAQ".into(),
+                subcategory: None,
+                section: None,
+                chunk_index: 1,
+                contextual_prefix: None,
+            },
+        },
+    ];
+    store
+        .store_chunks(
+            &doc.id,
+            &chunks,
+            &[vec![1.0; 4], vec![1.0; 4]],
+            "test_model",
+        )
+        .await
+        .unwrap();
+
+    let alice = store
+        .upsert_entity(&Entity {
+            id: "e_alice".into(),
+            canonical_key: "alice:Person".into(),
+            name: "Alice".into(),
+            entity_type: EntityType::Person,
+            confidence: 0.9,
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let corp = store
+        .upsert_entity(&Entity {
+            id: "e_corp".into(),
+            canonical_key: "techcorp:Organization".into(),
+            name: "TechCorp".into(),
+            entity_type: EntityType::Organization,
+            confidence: 0.95,
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    // Alice mentioned in chunk 0; TechCorp in chunks 0 and 1.
+    store
+        .add_mention(&EntityMention {
+            id: "m1".into(),
+            entity_id: alice.clone(),
+            document_id: "d_graphrag".into(),
+            chunk_index: Some(0),
+            context: None,
+            source: ExtractSource::Llm,
+        })
+        .await
+        .unwrap();
+    store
+        .add_mention(&EntityMention {
+            id: "m2".into(),
+            entity_id: corp.clone(),
+            document_id: "d_graphrag".into(),
+            chunk_index: Some(0),
+            context: None,
+            source: ExtractSource::Llm,
+        })
+        .await
+        .unwrap();
+    store
+        .add_mention(&EntityMention {
+            id: "m3".into(),
+            entity_id: corp.clone(),
+            document_id: "d_graphrag".into(),
+            chunk_index: Some(1),
+            context: None,
+            source: ExtractSource::Llm,
+        })
+        .await
+        .unwrap();
+    // Alice —WorksFor→ TechCorp: the 1-hop edge graph expansion follows.
+    store
+        .add_relation(&Relation {
+            id: "r1".into(),
+            source_entity_id: alice.clone(),
+            target_entity_id: corp.clone(),
+            relation_type: RelationType::WorksFor,
+            confidence: 0.85,
+            document_id: "d_graphrag".into(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+    // Query names only "Alice" → seed Alice → 1-hop neighbour TechCorp.
+    let got = store
+        .graph_expand_chunks("What is Alice's role?", 10, 10)
+        .await
+        .unwrap();
+    let contents: Vec<String> = got.iter().map(|c| c.content.clone()).collect();
+    assert!(
+        contents
+            .iter()
+            .any(|c| c.contains("Alice works at TechCorp")),
+        "seed-entity chunk missing: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .any(|c| c.contains("TechCorp builds embedded systems")),
+        "neighbour-only chunk (reachable only via the Alice->TechCorp edge) missing: {contents:?}"
+    );
+
+    // A query naming no entity expands to nothing.
+    let none = store
+        .graph_expand_chunks("totally unrelated zzz", 10, 10)
+        .await
+        .unwrap();
+    assert!(
+        none.is_empty(),
+        "no entity match must yield no graph chunks: {none:?}"
+    );
+}

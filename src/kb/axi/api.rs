@@ -679,7 +679,8 @@ async fn search(
         ctx.cfg.clone(),
         Arc::clone(&ctx.store),
         Arc::clone(&ctx.embedder),
-    );
+    )
+    .with_intelligence(Arc::clone(&ctx.intel));
     if let Some(r) = ctx.reranker.as_ref() {
         retriever = retriever.with_reranker(Arc::clone(r));
     }

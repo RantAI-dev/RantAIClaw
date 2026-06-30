@@ -168,7 +168,13 @@ impl KbCommand {
                 groups,
                 category,
                 json,
-            } => cmd_search(&cfg, store, query, top, groups, category, json).await,
+            } => {
+                // Attach the intelligence handle so GraphRAG can augment search
+                // when `KB_GRAPHRAG_ENABLED`. This is the path the agent uses
+                // (it shells out to `rantaiclaw kb search`).
+                let intel: Arc<dyn IntelligenceStore> = concrete;
+                cmd_search(&cfg, store, intel, query, top, groups, category, json).await
+            }
             Self::Ingest {
                 path,
                 title,
@@ -210,6 +216,7 @@ impl KbCommand {
 async fn cmd_search(
     cfg: &KbConfig,
     store: Arc<dyn KbStore>,
+    intel: Arc<dyn IntelligenceStore>,
     query: String,
     top: usize,
     groups: Vec<String>,
@@ -219,7 +226,7 @@ async fn cmd_search(
     let embedder = embed::make_provider(cfg)?;
     let reranker = rerank::make_reranker(cfg).map(Arc::from);
 
-    let mut retriever = Retriever::new(cfg.clone(), store, embedder);
+    let mut retriever = Retriever::new(cfg.clone(), store, embedder).with_intelligence(intel);
     if let Some(r) = reranker {
         retriever = retriever.with_reranker(r);
     }

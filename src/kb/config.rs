@@ -52,6 +52,14 @@ pub struct KbConfig {
     /// Maximum nodes retained in the in-memory knowledge graph.
     /// Reads `KB_GRAPH_MAX_NODES`; defaults to `200`.
     pub graph_max_nodes: usize,
+    /// Enable GraphRAG: augment retrieval with chunks reached via the entity
+    /// graph (query → matched entities → 1-hop neighbours → their chunks),
+    /// merged into the existing RRF fusion. Reads `KB_GRAPHRAG_ENABLED`; off by
+    /// default. Requires the intelligence graph to be populated to have effect.
+    pub graphrag_enabled: bool,
+    /// Cap on 1-hop neighbour entities expanded per query during GraphRAG.
+    /// Reads `KB_GRAPHRAG_MAX_NEIGHBORS`; defaults to `20`.
+    pub graphrag_max_neighbors: usize,
 }
 
 impl KbConfig {
@@ -107,6 +115,10 @@ impl KbConfig {
             intelligence_resolution: env::var("KB_INTELLIGENCE_RESOLUTION")
                 .unwrap_or_else(|_| "exact".into()),
             graph_max_nodes: parse_env("KB_GRAPH_MAX_NODES", 200)?,
+            graphrag_enabled: env::var("KB_GRAPHRAG_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            graphrag_max_neighbors: parse_env::<usize>("KB_GRAPHRAG_MAX_NEIGHBORS", 20)?,
         })
     }
 

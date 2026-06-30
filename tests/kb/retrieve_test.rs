@@ -19,9 +19,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rantaiclaw::kb::embed::EmbeddingProvider;
+use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, Relation};
 use rantaiclaw::kb::retrieve::rrf::{reciprocal_rank_fusion, RrfOptions};
 use rantaiclaw::kb::retrieve::{RetrieveOptions, Retriever};
-use rantaiclaw::kb::store::{Bm25Hit, KbStore, SearchFilter};
+use rantaiclaw::kb::store::{Bm25Hit, Graph, IntelligenceStore, KbStore, SearchFilter};
 use rantaiclaw::kb::{
     Chunk, ChunkId, Document, DocumentId, KbConfig, KbGroup, KbGroupSummary, KbResult, SearchResult,
 };
@@ -150,6 +151,8 @@ fn test_cfg() -> KbConfig {
         intelligence_model: "openai/gpt-4.1-nano".into(),
         intelligence_resolution: "exact".into(),
         graph_max_nodes: 200,
+        graphrag_enabled: false,
+        graphrag_max_neighbors: 20,
     }
 }
 
@@ -362,6 +365,46 @@ fn make_retriever(cfg: KbConfig, store: Arc<FakeStore>) -> (Retriever, Arc<FakeS
     (r, store)
 }
 
+/// Fake IntelligenceStore — returns pre-canned graph-expanded chunks from
+/// `graph_expand_chunks`. Only that method is exercised by the retriever; the
+/// rest panic if reached so a mis-wire surfaces loudly.
+struct FakeIntel {
+    graph_chunks: Vec<SearchResult>,
+}
+
+#[async_trait]
+impl IntelligenceStore for FakeIntel {
+    async fn upsert_entity(&self, _e: &Entity) -> KbResult<String> {
+        unimplemented!("FakeIntel only exercises graph_expand_chunks")
+    }
+    async fn add_mention(&self, _m: &EntityMention) -> KbResult<()> {
+        unimplemented!("FakeIntel only exercises graph_expand_chunks")
+    }
+    async fn add_relation(&self, _r: &Relation) -> KbResult<()> {
+        unimplemented!("FakeIntel only exercises graph_expand_chunks")
+    }
+    async fn intelligence_for_document(
+        &self,
+        _document_id: &str,
+    ) -> KbResult<(Vec<Entity>, Vec<Relation>)> {
+        unimplemented!("FakeIntel only exercises graph_expand_chunks")
+    }
+    async fn graph(&self, _group_id: Option<&str>, _limit: usize) -> KbResult<Graph> {
+        unimplemented!("FakeIntel only exercises graph_expand_chunks")
+    }
+    async fn delete_document_intelligence(&self, _document_id: &str) -> KbResult<()> {
+        unimplemented!("FakeIntel only exercises graph_expand_chunks")
+    }
+    async fn graph_expand_chunks(
+        &self,
+        _query: &str,
+        _max_neighbors: usize,
+        _limit: usize,
+    ) -> KbResult<Vec<SearchResult>> {
+        Ok(self.graph_chunks.clone())
+    }
+}
+
 // ---- Task 7.2 tests ---------------------------------------------------
 
 #[tokio::test]
@@ -415,6 +458,63 @@ async fn hybrid_mode_interleaves_via_rrf() {
         result.chunks.iter().map(|c| c.id.0.as_str()).collect();
     assert!(ids.contains("c1"), "vector hit present");
     assert!(ids.contains("c3"), "bm25-only hit surfaced via RRF");
+}
+
+#[tokio::test]
+async fn graphrag_arm_surfaces_graph_only_chunk_when_enabled() {
+    // Vector + BM25 never return "cg" — only the graph arm does. With GraphRAG
+    // on, it must still reach the final result via the RRF graph list.
+    let vector_hits = vec![search_result("c1", "d1", "Doc A", 0.95)];
+    let graph_chunk = search_result("cg", "d2", "Doc B", 0.0);
+
+    let mut cfg = test_cfg();
+    cfg.graphrag_enabled = true;
+    let store = Arc::new(FakeStore::new(vector_hits, Vec::new()));
+    let (retriever, _) = make_retriever(cfg, store);
+    let retriever = retriever.with_intelligence(Arc::new(FakeIntel {
+        graph_chunks: vec![graph_chunk],
+    }));
+
+    let result = retriever
+        .retrieve("anything", RetrieveOptions::default())
+        .await
+        .expect("retrieve ok");
+    let ids: std::collections::HashSet<&str> =
+        result.chunks.iter().map(|c| c.id.0.as_str()).collect();
+    assert!(ids.contains("c1"), "vector hit present");
+    assert!(
+        ids.contains("cg"),
+        "graph-only chunk must surface via the RRF graph arm: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn graphrag_arm_silent_when_disabled() {
+    // Same canned graph chunk, but graphrag_enabled = false → arm never fires,
+    // so retrieval is identical to plain vector search (no "cg").
+    let vector_hits = vec![search_result("c1", "d1", "Doc A", 0.95)];
+    let graph_chunk = search_result("cg", "d2", "Doc B", 0.0);
+
+    let mut cfg = test_cfg();
+    cfg.graphrag_enabled = false;
+    cfg.hybrid_bm25_enabled = false;
+    let store = Arc::new(FakeStore::new(vector_hits, Vec::new()));
+    let (retriever, _) = make_retriever(cfg, store);
+    let retriever = retriever.with_intelligence(Arc::new(FakeIntel {
+        graph_chunks: vec![graph_chunk],
+    }));
+
+    let result = retriever
+        .retrieve("anything", RetrieveOptions::default())
+        .await
+        .expect("retrieve ok");
+    let ids: std::collections::HashSet<&str> =
+        result.chunks.iter().map(|c| c.id.0.as_str()).collect();
+    assert!(ids.contains("c1"), "vector hit present");
+    assert!(
+        !ids.contains("cg"),
+        "graph chunk must NOT appear when graphrag disabled: {ids:?}"
+    );
 }
 
 #[tokio::test]

@@ -100,6 +100,8 @@ fn cfg_with_model(model: &str) -> KbConfig {
         intelligence_model: "openai/gpt-4.1-nano".into(),
         intelligence_resolution: "exact".into(),
         graph_max_nodes: 200,
+        graphrag_enabled: false,
+        graphrag_max_neighbors: 20,
     }
 }
 
