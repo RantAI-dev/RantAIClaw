@@ -32,6 +32,45 @@ async fn llm_extractor_parses_entities_and_relations_from_chat() {
     assert_eq!(out.relations.len(), 1);
 }
 
+#[tokio::test]
+async fn llm_extractor_sanitizes_zero_confidence_to_nonzero() {
+    use rantaiclaw::kb::intelligence::extract::llm::CombinedLlmExtractor;
+    use rantaiclaw::kb::intelligence::extract::EntityRelationExtractor;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    // Regression: a model that echoes a 0.0 confidence must NOT surface as 0% in the graph.
+    let content = r#"{"entities":[{"name":"NQRust","type":"Product","confidence":0.0}],
+        "relations":[{"source":"NQRust","target":"NexusQuantum","type":"PartOf","confidence":0.0}]}"#;
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices":[{"message":{"content": content}}]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ext = CombinedLlmExtractor::new(
+        "test-model".into(),
+        format!("{}/chat", server.uri()),
+        "test-key".into(),
+    );
+    let out = ext
+        .extract(&["NQRust is part of NexusQuantum."])
+        .await
+        .unwrap();
+    assert_eq!(out.entities.len(), 1);
+    assert!(
+        out.entities[0].2 > 0.0,
+        "entity confidence must be sanitised above 0"
+    );
+    assert_eq!(out.relations.len(), 1);
+    assert!(
+        out.relations[0].3 > 0.0,
+        "relation confidence must be sanitised above 0"
+    );
+}
+
 #[test]
 fn entity_type_serde_roundtrips_and_falls_back() {
     assert_eq!(
