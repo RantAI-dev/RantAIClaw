@@ -5,6 +5,23 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.97-alpha] — 2026-06-30
+
+### Fixed
+
+- **Re-extraction now refreshes entity confidence; hard delete cleans up the
+  graph.** `upsert_entity` used `ON CONFLICT(canonical_key) DO NOTHING`, so a
+  re-extract (e.g. after the confidence-prompt fix) could never lift a stale
+  value — cross-document entities created by an older binary stayed at 0%
+  because they are never garbage-collected. It now does
+  `DO UPDATE SET confidence = max(confidence, excluded.confidence)`, keeping
+  first-seen identity but lifting confidence to the highest across mentions.
+  Separately, a **hard** `delete_document` now clears the document's
+  `entity_mention` / `entity_relation` rows and GCs orphaned entities in the
+  same transaction (previously it left them behind); **soft** delete still
+  preserves intelligence since the document is recoverable. Re-extract after
+  upgrading to refresh existing confidences. (#119)
+
 ## [0.6.96-alpha] — 2026-06-30
 
 ### Fixed
