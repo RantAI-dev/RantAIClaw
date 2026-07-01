@@ -2341,6 +2341,15 @@ pub(crate) fn announce_daemon_reload() {
     }
 }
 
+/// Reload a running managed daemon service (systemd / launchd / OpenRC) after a
+/// config change, for non-CLI callers (the gateway) that must not print to
+/// stdout. Returns `Ok(true)` if a managed service was restarted, `Ok(false)`
+/// when none is installed. Mirrors what [`announce_daemon_reload`] does for the
+/// CLI, minus the console output — callers log the outcome themselves.
+pub(crate) fn reload_managed_daemon() -> Result<bool> {
+    maybe_restart_managed_daemon_service()
+}
+
 fn maybe_restart_managed_daemon_service() -> Result<bool> {
     if cfg!(target_os = "macos") {
         let home = directories::UserDirs::new()

@@ -3675,6 +3675,17 @@ impl Config {
                 decrypt_optional_secret(&store, &mut wrapped, "config.provider_api_keys.*")?;
                 *key = wrapped.unwrap_or_default();
             }
+            // Decrypt the Telegram bot token symmetrically with `save()` so the
+            // running channel receives the plaintext token.
+            if let Some(tg) = config.channels_config.telegram.as_mut() {
+                let mut wrapped = Some(std::mem::take(&mut tg.bot_token));
+                decrypt_optional_secret(
+                    &store,
+                    &mut wrapped,
+                    "config.channels_config.telegram.bot_token",
+                )?;
+                tg.bot_token = wrapped.unwrap_or_default();
+            }
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -4113,6 +4124,19 @@ impl Config {
             let mut wrapped = Some(std::mem::take(key));
             encrypt_optional_secret(&store, &mut wrapped, "config.provider_api_keys.*")?;
             *key = wrapped.unwrap_or_default();
+        }
+
+        // Channel bot tokens are secrets too. `bot_token` is a plain `String`, so
+        // wrap it in an `Option` to reuse the same encrypt helper (mirrors the
+        // `provider_api_keys` handling above).
+        if let Some(tg) = config_to_save.channels_config.telegram.as_mut() {
+            let mut wrapped = Some(std::mem::take(&mut tg.bot_token));
+            encrypt_optional_secret(
+                &store,
+                &mut wrapped,
+                "config.channels_config.telegram.bot_token",
+            )?;
+            tg.bot_token = wrapped.unwrap_or_default();
         }
 
         let toml_str =
@@ -4805,6 +4829,48 @@ tool_dispatcher = "xml"
             store.decrypt(storage_db_url).unwrap(),
             "postgres://user:pw@host/db"
         );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn config_save_encrypts_telegram_bot_token() {
+        // The Telegram bot token is a channel secret and must be encrypted at rest
+        // just like `api_key` — the allowlist is not a secret and stays plaintext.
+        let dir =
+            std::env::temp_dir().join(format!("rantaiclaw_test_tg_token_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.channels_config.telegram = Some(
+            serde_json::from_value(serde_json::json!({
+                "bot_token": "123456789:secret-bot-token-value",
+                "allowed_users": ["alice"],
+            }))
+            .unwrap(),
+        );
+
+        config.save().await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        let stored: Config = toml::from_str(&contents).unwrap();
+        let store = crate::security::SecretStore::new(&dir, true);
+
+        let tg = stored.channels_config.telegram.as_ref().unwrap();
+        assert!(
+            crate::security::SecretStore::is_encrypted(&tg.bot_token),
+            "bot_token must be encrypted at rest"
+        );
+        assert_eq!(
+            store.decrypt(&tg.bot_token).unwrap(),
+            "123456789:secret-bot-token-value"
+        );
+        // The allowlist is not a secret — it must stay readable.
+        assert_eq!(tg.allowed_users, vec!["alice".to_string()]);
 
         let _ = fs::remove_dir_all(&dir).await;
     }

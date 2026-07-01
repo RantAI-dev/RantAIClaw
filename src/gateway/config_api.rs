@@ -37,7 +37,7 @@ pub fn router() -> Router<AppState> {
             "/api/v1/config/mcp_servers/{name}",
             post(add_mcp_server).delete(remove_mcp_server),
         )
-        // Experimental: connect/disconnect a messaging channel from the console.
+        // Connect / update (allowlist) / disconnect a Telegram channel from the console.
         .route(
             "/api/v1/channels/telegram",
             post(connect_telegram).delete(disconnect_telegram),
@@ -308,11 +308,107 @@ async fn remove_mcp_server(
 #[derive(Deserialize)]
 struct TelegramConnectBody {
     /// Bot API token from @BotFather. Validated live (`getMe`) before persisting.
+    /// Optional: omit (or send empty) to update `allowed_users` on an
+    /// already-connected channel without re-entering the token.
+    #[serde(default)]
     bot_token: String,
     /// Telegram user ids/usernames allowed to talk to the bot. Empty = deny all
     /// (the channel stays secure until owners are added).
     #[serde(default)]
     allowed_users: Vec<String>,
+}
+
+/// What to do with the Telegram bot token on a connect / allowlist-update request.
+#[derive(Debug)]
+enum TokenPlan {
+    /// A new, shape-valid token was supplied — the caller must live-validate it
+    /// (`getMe`) before persisting.
+    Validate(String),
+    /// No token supplied but one is already configured — keep the saved token so
+    /// an operator can update the allowlist without re-entering it.
+    KeepExisting,
+}
+
+/// Decide how to treat the token on a `POST /channels/telegram` request: a
+/// supplied token is shape-checked (and must then be live-validated by the
+/// caller); an omitted token keeps the existing one (allowlist-only update), or
+/// errors when nothing is configured yet.
+fn plan_telegram_token(
+    existing: Option<&TelegramConfig>,
+    provided: &str,
+) -> Result<TokenPlan, ApiError> {
+    let token = provided.trim();
+    if token.is_empty() {
+        return if existing.is_some() {
+            Ok(TokenPlan::KeepExisting)
+        } else {
+            Err(err_400(
+                "bot_token is required to connect a new Telegram channel",
+            ))
+        };
+    }
+    if !is_valid_telegram_token(token) {
+        return Err(err_400(
+            "bot_token is not a valid Telegram token (expected `<digits>:<token>`)",
+        ));
+    }
+    Ok(TokenPlan::Validate(token.to_string()))
+}
+
+/// Build the `TelegramConfig` to persist from the existing one (if any) plus
+/// this request's changes. A `new_token` (already validated) replaces the token;
+/// omitting it keeps the saved token for an allowlist-only update. Unrelated
+/// options (stream mode, mention-only, …) are always preserved.
+fn apply_telegram_update(
+    existing: Option<TelegramConfig>,
+    new_token: Option<&str>,
+    allowed_users: Vec<String>,
+) -> Result<TelegramConfig, ApiError> {
+    // Start from the existing config so options survive; otherwise a minimal one
+    // whose optional fields inherit their configured defaults via serde.
+    let mut tg = match existing {
+        Some(tg) => tg,
+        None => serde_json::from_value(json!({ "bot_token": "", "allowed_users": [] }))
+            .map_err(err_500)?,
+    };
+    if let Some(token) = new_token {
+        tg.bot_token = token.to_string();
+    }
+    tg.allowed_users = allowed_users;
+    Ok(tg)
+}
+
+/// After a channel config change, ask a running managed daemon to reload so the
+/// channels runtime picks up the new / removed channel. The channels supervisor
+/// captures its channel set (and each channel's allowlist) at startup and is not
+/// hot-reloaded from disk by the gateway, so a connect / allowlist edit / disconnect
+/// only takes effect once the runtime restarts.
+///
+/// Spawned detached with a short delay so the HTTP response flushes before a
+/// systemd restart bounces this process — a `restart` job is owned by the service
+/// manager, so it completes even though this process is replaced. No-op
+/// (`Ok(false)`) when the runtime isn't a managed service; the operator restarts
+/// `rantaiclaw daemon` manually in that case.
+fn schedule_daemon_reload() {
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        match tokio::task::spawn_blocking(crate::channels::reload_managed_daemon).await {
+            Ok(Ok(true)) => {
+                tracing::info!(target: "gateway", "channel change: reloaded managed daemon service")
+            }
+            Ok(Ok(false)) => tracing::info!(
+                target: "gateway",
+                "channel change saved; no managed daemon service to reload (restart `rantaiclaw daemon` to apply)"
+            ),
+            Ok(Err(e)) => tracing::warn!(
+                target: "gateway",
+                "channel change saved but managed daemon reload failed: {e}"
+            ),
+            Err(e) => {
+                tracing::warn!(target: "gateway", "managed daemon reload task failed to join: {e}")
+            }
+        }
+    });
 }
 
 /// Connect a Telegram channel from the console: validate the token against
@@ -331,46 +427,47 @@ async fn connect_telegram(
     Json(body): Json<TelegramConnectBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let token = body.bot_token.trim().to_string();
-    if token.is_empty() {
-        return Err(err_400("bot_token must not be empty"));
-    }
-    // The token is interpolated into the Telegram API URL path
-    // (`/bot{token}/getMe`), so enforce the real bot-token shape
-    // (`<digits>:<alphanumeric/_-/>`) up front — this both rejects garbage early
-    // and prevents URL-significant characters (`/ ? # @` or whitespace) from
-    // manipulating the request path.
-    if !is_valid_telegram_token(&token) {
-        return Err(err_400(
-            "bot_token is not a valid Telegram token (expected `<digits>:<token>`)",
-        ));
-    }
 
-    // Validate the token live BEFORE persisting — fail closed so we never save a
-    // credential that doesn't work. Uses a side-effect-free `getMe` probe (not a
-    // full TelegramChannel, which would set up pairing + print a code).
-    let bot_username = crate::channels::telegram::validate_bot_token(&token)
-        .await
-        .map_err(|e| {
-            // `e` does not contain the token. We can't always tell a bad token
-            // from an unreachable Telegram, so the message covers both.
-            err_400(format!(
-                "could not validate the bot token with Telegram (invalid token, or Telegram unreachable): {e}"
-            ))
-        })?;
+    // Snapshot just the current Telegram config (short-lived lock) to decide
+    // whether this is a fresh connect, a token replacement, or an allowlist-only
+    // update. The token shape is enforced here so no URL-significant character can
+    // reach the interpolated `getMe` request path.
+    let existing = state.config.lock().channels_config.telegram.clone();
+    let plan = plan_telegram_token(existing.as_ref(), &body.bot_token)?;
 
-    // Build TelegramConfig via serde so the optional fields inherit their
-    // configured defaults (stream mode, draft interval, …) without duplicating
-    // them here.
-    let tg: TelegramConfig = serde_json::from_value(json!({
-        "bot_token": token,
-        "allowed_users": body.allowed_users,
-    }))
-    .map_err(err_500)?;
+    // Only a newly supplied token needs the live `getMe` probe (fail closed so we
+    // never save a credential that doesn't work). An allowlist-only update keeps
+    // the already-validated saved token and skips the network call. The probe is
+    // side-effect-free (not a full TelegramChannel, which would set up pairing +
+    // print a code).
+    let (new_token, bot_username) = match plan {
+        TokenPlan::Validate(token) => {
+            let username = crate::channels::telegram::validate_bot_token(&token)
+                .await
+                .map_err(|e| {
+                    // `e` does not contain the token. We can't always tell a bad
+                    // token from an unreachable Telegram, so the message covers both.
+                    err_400(format!(
+                        "could not validate the bot token with Telegram (invalid token, or Telegram unreachable): {e}"
+                    ))
+                })?;
+            (Some(token), Some(username))
+        }
+        TokenPlan::KeepExisting => (None, None),
+    };
 
+    let tg = apply_telegram_update(existing, new_token.as_deref(), body.allowed_users.clone())?;
+
+    // Clone the full config only now (after the await) to keep the window where a
+    // concurrent config write could be clobbered as small as possible.
     let mut cfg = state.config.lock().clone();
     cfg.channels_config.telegram = Some(tg);
     persist_and_swap(&state, cfg).await?;
+
+    // The running channels runtime doesn't hot-reload channel config from disk,
+    // so ask a managed daemon to restart and pick up the change (detached, after
+    // the response flushes).
+    schedule_daemon_reload();
 
     let warning = if body.allowed_users.is_empty() {
         Some("allowed_users is empty — the bot will deny ALL senders until you add Telegram user ids/usernames.")
@@ -384,9 +481,8 @@ async fn connect_telegram(
         "channel": "telegram",
         "bot_username": bot_username,
         "allowed_users": body.allowed_users.len(),
-        "experimental": true,
         "warning": warning,
-        "note": "Validated + saved. The channel starts receiving messages when the channels runtime (`rantaiclaw channels`) (re)starts.",
+        "note": "Saved. Reloading the runtime to apply — automatic if RantaiClaw runs as a managed service, otherwise restart `rantaiclaw daemon`.",
     })))
 }
 
@@ -416,6 +512,12 @@ async fn disconnect_telegram(
     let was_configured = cfg.channels_config.telegram.is_some();
     cfg.channels_config.telegram = None;
     persist_and_swap(&state, cfg).await?;
+
+    // Only bounce the runtime if we actually removed a running channel.
+    if was_configured {
+        schedule_daemon_reload();
+    }
+
     Ok(Json(
         json!({ "disconnected": was_configured, "channel": "telegram" }),
     ))
@@ -589,6 +691,102 @@ mod tests {
             cfg.resolve_key_for_provider("minimax").as_deref(),
             Some("minimax-key")
         );
+    }
+
+    fn tg_config(token: &str, allowed: &[&str]) -> TelegramConfig {
+        serde_json::from_value(json!({
+            "bot_token": token,
+            "allowed_users": allowed.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        }))
+        .expect("valid TelegramConfig")
+    }
+
+    fn tg_config_mention(token: &str, allowed: &[&str], mention_only: bool) -> TelegramConfig {
+        serde_json::from_value(json!({
+            "bot_token": token,
+            "allowed_users": allowed.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "mention_only": mention_only,
+        }))
+        .expect("valid TelegramConfig")
+    }
+
+    #[test]
+    fn apply_update_keeps_token_and_options_on_allowlist_only_change() {
+        // Allowlist-only update (no new token): the saved token AND unrelated
+        // options (mention_only) must survive; only allowed_users changes.
+        let existing =
+            tg_config_mention("123456789:AAaa_bb-cc11223344556677889900", &["alice"], true);
+        let updated =
+            apply_telegram_update(Some(existing), None, vec!["bob".to_string()]).expect("update");
+        assert_eq!(
+            updated.bot_token,
+            "123456789:AAaa_bb-cc11223344556677889900"
+        );
+        assert!(updated.mention_only, "unrelated options must be preserved");
+        assert_eq!(updated.allowed_users, vec!["bob".to_string()]);
+    }
+
+    #[test]
+    fn apply_update_builds_a_fresh_channel_from_a_new_token() {
+        let updated = apply_telegram_update(
+            None,
+            Some("123456789:BBbb_cc-dd11223344556677889900"),
+            vec!["alice".to_string()],
+        )
+        .expect("new channel");
+        assert_eq!(
+            updated.bot_token,
+            "123456789:BBbb_cc-dd11223344556677889900"
+        );
+        assert_eq!(updated.allowed_users, vec!["alice".to_string()]);
+    }
+
+    #[test]
+    fn apply_update_replaces_token_but_preserves_options() {
+        let existing = tg_config_mention("111:oldoldoldoldoldoldoldold", &["alice"], true);
+        let updated = apply_telegram_update(
+            Some(existing),
+            Some("222:newnewnewnewnewnewnewnew"),
+            vec!["alice".to_string()],
+        )
+        .expect("replace token");
+        assert_eq!(updated.bot_token, "222:newnewnewnewnewnewnewnew");
+        assert!(
+            updated.mention_only,
+            "options preserved when token replaced"
+        );
+    }
+
+    #[test]
+    fn plan_keeps_existing_token_for_allowlist_only_update() {
+        // Telegram already configured; caller omits the token → keep the saved
+        // one so an operator can edit the allowlist without re-entering it.
+        let existing = tg_config("123456789:AAaa_bb-cc11223344556677889900", &["alice"]);
+        let plan = plan_telegram_token(Some(&existing), "").expect("keep existing");
+        assert!(matches!(plan, TokenPlan::KeepExisting));
+    }
+
+    #[test]
+    fn plan_requires_token_to_connect_a_new_channel() {
+        // No token and nothing configured yet → cannot connect.
+        let err = plan_telegram_token(None, "").expect_err("must require a token");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn plan_validates_a_newly_supplied_token() {
+        let token = format!("123456789:{}", "A".repeat(35));
+        let plan = plan_telegram_token(None, &token).expect("valid new token");
+        match plan {
+            TokenPlan::Validate(t) => assert_eq!(t, token),
+            TokenPlan::KeepExisting => panic!("expected the new token to be validated"),
+        }
+    }
+
+    #[test]
+    fn plan_rejects_a_malformed_new_token() {
+        let err = plan_telegram_token(None, "not-a-token").expect_err("bad shape");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[test]
