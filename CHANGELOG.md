@@ -5,6 +5,19 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.98-alpha] — 2026-07-01
+
+### Added
+
+- **Manage a Telegram channel from the web console.** `POST /api/v1/channels/telegram`
+  now fully manages Telegram rather than only connecting experimentally:
+  `bot_token` is optional, so you can update `allowed_users` without re-entering
+  it; connect / update / disconnect trigger a managed-daemon reload so the change
+  applies without a manual restart; and the bot token is now **encrypted at rest**
+  in `config.toml`, like `api_key`. The console's Channels panel gains a full
+  Telegram card (connect, editable allowlist, disconnect) and lists the remaining
+  channels as "under development". (#121)
+
 ## [0.6.97-alpha] — 2026-06-30
 
 ### Fixed
