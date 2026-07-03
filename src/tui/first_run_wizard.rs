@@ -1117,15 +1117,26 @@ fn is_channel_name(name: &str) -> bool {
 }
 
 fn is_integration_name(name: &str) -> bool {
-    INTEGRATION_OPTIONS.iter().any(|(k, _)| *k == name)
+    integration_options().iter().any(|(k, _)| k == name)
 }
 
 /// Integration option list — `(name, description)` pairs.
+///
+/// `knowledge` is only present when the `kb` feature is compiled (its
+/// provisioner is kb-gated); offering it without `kb` would surface an
+/// option whose provisioner is missing.
 pub fn integration_options() -> Vec<(String, String)> {
-    INTEGRATION_OPTIONS
+    #[allow(unused_mut)]
+    let mut opts: Vec<(String, String)> = INTEGRATION_OPTIONS
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect()
+        .collect();
+    #[cfg(feature = "kb")]
+    opts.push((
+        "knowledge".to_string(),
+        "Knowledge Base (document search + optional OCR)".to_string(),
+    ));
+    opts
 }
 
 /// Channel option list — pulled live from the provisioner registry,
@@ -1155,6 +1166,13 @@ mod tests {
             name: "test".into(),
             root: PathBuf::from("/tmp/rantaiclaw-test"),
         }
+    }
+
+    #[cfg(feature = "kb")]
+    #[test]
+    fn integration_options_includes_knowledge_with_kb() {
+        assert!(integration_options().iter().any(|(k, _)| k == "knowledge"));
+        assert!(is_integration_name("knowledge"));
     }
 
     #[test]
