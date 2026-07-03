@@ -109,11 +109,7 @@ impl SetupSection for KnowledgeSection {
         // ── Vision / OCR key (optional) ──────────────────────────────
         let vision_choice = Select::with_theme(&theme)
             .with_prompt("OCR / vision key (for scanned documents)")
-            .items(&[
-                "Use the embedding key",
-                "Enter a different key",
-                "Skip OCR",
-            ])
+            .items(&["Use the embedding key", "Enter a different key", "Skip OCR"])
             .default(0)
             .interact()?;
         ctx.config.knowledge.vision_api_key = match vision_choice {

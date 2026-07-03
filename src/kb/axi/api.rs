@@ -160,9 +160,9 @@ async fn ensure_kb_ctx(state: &crate::gateway::AppState) -> Result<Arc<KbContext
         if cached.path == path {
             return match &cached.ctx {
                 Ok(ctx) => Ok(Arc::clone(ctx)),
-                Err(msg) if msg.starts_with("kb_not_configured") => {
-                    Err(ApiError::service_unavailable("kb_not_configured", msg.clone()))
-                }
+                Err(msg) if msg.starts_with("kb_not_configured") => Err(
+                    ApiError::service_unavailable("kb_not_configured", msg.clone()),
+                ),
                 Err(msg) => Err(ApiError::service_unavailable("kb_unavailable", msg.clone())),
             };
         }
@@ -200,7 +200,8 @@ async fn build_ctx(
     // provider auth failure downstream.
     if KbConfig::resolve_key(&cfg.embedding_api_key).is_empty() {
         return Err("kb_not_configured: no embedding API key. Add one via \
-                    `rantaiclaw setup knowledge` or set KB_EMBEDDING_API_KEY.".into());
+                    `rantaiclaw setup knowledge` or set KB_EMBEDDING_API_KEY."
+            .into());
     }
     let store = SqliteStore::open(path, cfg.embedding_dim)
         .await

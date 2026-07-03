@@ -127,10 +127,7 @@ impl KbConfig {
     /// keys flow from config like `api_key`. All non-key fields still come from
     /// env. Empty/None leaves whatever `from_env` read, and the `resolve_key`
     /// chain still applies its final `OPENROUTER_API_KEY` fallback downstream.
-    pub fn from_env_with_keys(
-        embedding: Option<&str>,
-        vision: Option<&str>,
-    ) -> KbResult<Self> {
+    pub fn from_env_with_keys(embedding: Option<&str>, vision: Option<&str>) -> KbResult<Self> {
         let mut cfg = Self::from_env()?;
         if let Some(k) = embedding.filter(|s| !s.is_empty()) {
             cfg.embedding_api_key = k.to_string();

@@ -4,8 +4,8 @@ use crate::config::schema::{
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, KnowledgeConfig, LarkConfig, MatrixConfig, MemoryConfig,
-    ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
+    WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{

@@ -664,7 +664,10 @@ struct KnowledgeBody {
 /// Effective source of a resolved key, reported without revealing it.
 #[cfg(feature = "kb")]
 fn knowledge_source(env_var: &str, cfg_val: &Option<String>) -> &'static str {
-    if std::env::var(env_var).map(|v| !v.is_empty()).unwrap_or(false) {
+    if std::env::var(env_var)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
         "env"
     } else if cfg_val.as_deref().map(|v| !v.is_empty()).unwrap_or(false) {
         "config"
@@ -704,11 +707,19 @@ async fn set_knowledge(
     let mut cfg = state.config.lock().clone();
     if let Some(k) = body.embedding_api_key {
         let k = k.trim();
-        cfg.knowledge.embedding_api_key = if k.is_empty() { None } else { Some(k.to_string()) };
+        cfg.knowledge.embedding_api_key = if k.is_empty() {
+            None
+        } else {
+            Some(k.to_string())
+        };
     }
     if let Some(k) = body.vision_api_key {
         let k = k.trim();
-        cfg.knowledge.vision_api_key = if k.is_empty() { None } else { Some(k.to_string()) };
+        cfg.knowledge.vision_api_key = if k.is_empty() {
+            None
+        } else {
+            Some(k.to_string())
+        };
     }
     persist_and_swap(&state, cfg).await?;
     // New credentials invalidate any cached KB embedding/extraction context.
