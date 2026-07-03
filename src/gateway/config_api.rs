@@ -28,6 +28,7 @@ use crate::security::AutonomyLevel;
 /// Build the `/api/v1/config*` router. Merged alongside `api_v1::router()` so
 /// it shares the small-body limit + timeout middleware.
 pub fn router() -> Router<AppState> {
+    #[cfg_attr(not(feature = "kb"), allow(unused_mut))]
     let mut router = Router::new()
         .route("/api/v1/config", get(get_config))
         .route("/api/v1/config/model", put(set_model))

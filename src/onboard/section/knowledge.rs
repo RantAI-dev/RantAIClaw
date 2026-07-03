@@ -2,7 +2,7 @@
 //! optional OCR/vision key) into `config.knowledge` so the agent can search
 //! documents the user ingests.
 //!
-//! Spec: `docs/superpowers/specs/2026-04-27-onboarding-depth-v2-design.md`,
+//! Spec: `docs/superpowers/specs/2026-07-03-knowledge-base-onboarding-design.md`,
 //! §"5. Section catalog" (Knowledge Base) — feature-gated on `kb`.
 //!
 //! On `run`:

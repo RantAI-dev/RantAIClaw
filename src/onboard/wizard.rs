@@ -128,6 +128,7 @@ fn canonical_sections() -> Vec<Box<dyn SetupSection>> {
     // Wave 4A inserts `approvals` between `provider` and `channels`. The
     // approval-gate runtime gates every tool call, so the user must have
     // a policy chosen before any channel triggers a tool execution.
+    #[cfg_attr(not(feature = "kb"), allow(unused_mut))]
     let mut sections: Vec<Box<dyn SetupSection>> = vec![
         Box::new(ProviderSection),
         Box::new(ApprovalsSection),
