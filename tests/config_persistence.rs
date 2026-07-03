@@ -276,3 +276,13 @@ async fn knowledge_keys_encrypt_at_rest_and_decrypt_on_load() {
     assert_eq!(reloaded.knowledge.embedding_api_key.as_deref(), Some("sk-embed-plain"));
     std::env::remove_var("RANTAICLAW_CONFIG_DIR");
 }
+
+#[test]
+fn kb_env_vars_override_config_knowledge_at_load() {
+    let mut cfg = rantaiclaw::config::Config::default();
+    cfg.knowledge.embedding_api_key = Some("from-file".into());
+    std::env::set_var("KB_EMBEDDING_API_KEY", "from-env");
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.knowledge.embedding_api_key.as_deref(), Some("from-env"));
+    std::env::remove_var("KB_EMBEDDING_API_KEY");
+}

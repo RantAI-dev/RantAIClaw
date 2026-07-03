@@ -3838,6 +3838,18 @@ impl Config {
                 self.api_key = Some(key);
             }
         }
+        // KB keys: env folds onto config.knowledge at load (env wins),
+        // matching api_key precedence. Downstream reads config.knowledge only.
+        if let Ok(k) = std::env::var("KB_EMBEDDING_API_KEY") {
+            if !k.is_empty() {
+                self.knowledge.embedding_api_key = Some(k);
+            }
+        }
+        if let Ok(k) = std::env::var("KB_EXTRACT_VISION_API_KEY") {
+            if !k.is_empty() {
+                self.knowledge.vision_api_key = Some(k);
+            }
+        }
         // API Key: GLM_API_KEY overrides when provider is a GLM/Zhipu variant.
         if self.default_provider.as_deref().is_some_and(is_glm_alias) {
             if let Ok(key) = std::env::var("GLM_API_KEY") {
