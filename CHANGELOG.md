@@ -5,6 +5,18 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.99-alpha] — 2026-07-03
+
+### Fixed
+
+- **Setup banner now shows the RantaiClaw wordmark.** The `rantaiclaw onboard`
+  quick-setup and interactive wizard rendered a stale ASCII wordmark; the banner
+  now displays RANTAICLAW, sourced from the shared onboarding banner asset
+  (borders and tagline unchanged).
+- **Firmware sketch headers rebranded to RantaiClaw.** The Arduino Uno and Uno-Q
+  bridge sketch header comments now read RantaiClaw (comments only; no functional
+  change).
+
 ## [0.6.98-alpha] — 2026-07-01
 
 ### Added
