@@ -21,6 +21,8 @@ use crate::profile::Profile;
 
 pub mod approvals;
 pub mod channels;
+#[cfg(feature = "kb")]
+pub mod knowledge;
 pub mod mcp;
 pub mod persona;
 pub mod provider;
