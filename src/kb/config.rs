@@ -122,6 +122,25 @@ impl KbConfig {
         })
     }
 
+    /// Like [`from_env`], but the two credential fields are taken from the
+    /// caller (the resolved `config.knowledge` values) when non-empty, so KB
+    /// keys flow from config like `api_key`. All non-key fields still come from
+    /// env. Empty/None leaves whatever `from_env` read, and the `resolve_key`
+    /// chain still applies its final `OPENROUTER_API_KEY` fallback downstream.
+    pub fn from_env_with_keys(
+        embedding: Option<&str>,
+        vision: Option<&str>,
+    ) -> KbResult<Self> {
+        let mut cfg = Self::from_env()?;
+        if let Some(k) = embedding.filter(|s| !s.is_empty()) {
+            cfg.embedding_api_key = k.to_string();
+        }
+        if let Some(k) = vision.filter(|s| !s.is_empty()) {
+            cfg.extract_vision_api_key = k.to_string();
+        }
+        Ok(cfg)
+    }
+
     /// Resolve an endpoint API key — falls back to `OPENROUTER_API_KEY` when the
     /// per-endpoint override is empty. Mirrors `resolveApiKey` in TS config.ts.
     pub fn resolve_key(override_key: &str) -> String {
@@ -161,5 +180,20 @@ where
             ))
         }),
         _ => Ok(fallback),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_env_with_keys_overrides_key_fields_only() {
+        std::env::remove_var("KB_EMBEDDING_API_KEY");
+        std::env::remove_var("KB_EXTRACT_VISION_API_KEY");
+        let cfg = KbConfig::from_env_with_keys(Some("cfg-embed"), None).unwrap();
+        assert_eq!(cfg.embedding_api_key, "cfg-embed");
+        assert_eq!(cfg.extract_vision_api_key, ""); // None + no env → empty (resolver fallback applies later)
+        assert_eq!(cfg.embedding_model, "qwen/qwen3-embedding-8b"); // non-key field still from env default
     }
 }
