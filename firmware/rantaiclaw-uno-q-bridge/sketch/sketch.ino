@@ -1,4 +1,4 @@
-// ZeroClaw Bridge — full MCU peripheral control for Arduino UNO Q
+// RantaiClaw Bridge — full MCU peripheral control for Arduino UNO Q
 // SPDX-License-Identifier: MPL-2.0
 //
 // Exposes GPIO, ADC, PWM, I2C, SPI, CAN (stub), LED matrix, and RGB LED
