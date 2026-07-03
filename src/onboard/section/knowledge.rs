@@ -76,7 +76,7 @@ impl SetupSection for KnowledgeSection {
         let embedding_key: Option<String> = if main_key_reusable {
             let choice = Select::with_theme(&theme)
                 .with_prompt("Embedding key")
-                .items(&[
+                .items([
                     "Use the main provider key",
                     "Enter a key",
                     "Skip (leave disabled)",
@@ -91,7 +91,7 @@ impl SetupSection for KnowledgeSection {
         } else {
             let choice = Select::with_theme(&theme)
                 .with_prompt("Embedding key")
-                .items(&["Enter a key", "Skip (leave disabled)"])
+                .items(["Enter a key", "Skip (leave disabled)"])
                 .default(0)
                 .interact()?;
             match choice {
@@ -109,7 +109,7 @@ impl SetupSection for KnowledgeSection {
         // ── Vision / OCR key (optional) ──────────────────────────────
         let vision_choice = Select::with_theme(&theme)
             .with_prompt("OCR / vision key (for scanned documents)")
-            .items(&["Use the embedding key", "Enter a different key", "Skip OCR"])
+            .items(["Use the embedding key", "Enter a different key", "Skip OCR"])
             .default(0)
             .interact()?;
         ctx.config.knowledge.vision_api_key = match vision_choice {

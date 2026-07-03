@@ -663,13 +663,13 @@ struct KnowledgeBody {
 
 /// Effective source of a resolved key, reported without revealing it.
 #[cfg(feature = "kb")]
-fn knowledge_source(env_var: &str, cfg_val: &Option<String>) -> &'static str {
+fn knowledge_source(env_var: &str, cfg_val: Option<&str>) -> &'static str {
     if std::env::var(env_var)
         .map(|v| !v.is_empty())
         .unwrap_or(false)
     {
         "env"
-    } else if cfg_val.as_deref().map(|v| !v.is_empty()).unwrap_or(false) {
+    } else if cfg_val.map(|v| !v.is_empty()).unwrap_or(false) {
         "config"
     } else {
         "none"
@@ -684,8 +684,14 @@ async fn get_knowledge(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let cfg = state.config.lock().clone();
-    let emb_src = knowledge_source("KB_EMBEDDING_API_KEY", &cfg.knowledge.embedding_api_key);
-    let vis_src = knowledge_source("KB_EXTRACT_VISION_API_KEY", &cfg.knowledge.vision_api_key);
+    let emb_src = knowledge_source(
+        "KB_EMBEDDING_API_KEY",
+        cfg.knowledge.embedding_api_key.as_deref(),
+    );
+    let vis_src = knowledge_source(
+        "KB_EXTRACT_VISION_API_KEY",
+        cfg.knowledge.vision_api_key.as_deref(),
+    );
     Ok(Json(json!({
         "embedding_configured": emb_src != "none",
         "vision_configured": vis_src != "none",
