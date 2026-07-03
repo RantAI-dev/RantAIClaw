@@ -160,6 +160,9 @@ async fn ensure_kb_ctx(state: &crate::gateway::AppState) -> Result<Arc<KbContext
         if cached.path == path {
             return match &cached.ctx {
                 Ok(ctx) => Ok(Arc::clone(ctx)),
+                Err(msg) if msg.starts_with("kb_not_configured") => {
+                    Err(ApiError::service_unavailable("kb_not_configured", msg.clone()))
+                }
                 Err(msg) => Err(ApiError::service_unavailable("kb_unavailable", msg.clone())),
             };
         }
@@ -172,6 +175,9 @@ async fn ensure_kb_ctx(state: &crate::gateway::AppState) -> Result<Arc<KbContext
     *guard = Some(CachedCtx { path, ctx: outcome });
     match snapshot {
         Ok(ctx) => Ok(ctx),
+        Err(msg) if msg.starts_with("kb_not_configured") => {
+            Err(ApiError::service_unavailable("kb_not_configured", msg))
+        }
         Err(msg) => Err(ApiError::service_unavailable("kb_unavailable", msg)),
     }
 }
@@ -189,6 +195,13 @@ async fn build_ctx(
 ) -> Result<Arc<KbContext>, String> {
     let cfg = KbConfig::from_env_with_keys(embedding_key.as_deref(), vision_key.as_deref())
         .map_err(|e| format!("kb config: {e}"))?;
+    // If neither config nor env nor the OPENROUTER fallback yields an embedding
+    // key, surface an actionable "not configured" error instead of a raw
+    // provider auth failure downstream.
+    if KbConfig::resolve_key(&cfg.embedding_api_key).is_empty() {
+        return Err("kb_not_configured: no embedding API key. Add one via \
+                    `rantaiclaw setup knowledge` or set KB_EMBEDDING_API_KEY.".into());
+    }
     let store = SqliteStore::open(path, cfg.embedding_dim)
         .await
         .map_err(|e| format!("sqlite open ({}): {e}", path.display()))?;
@@ -1455,6 +1468,12 @@ mod tests {
         clear_kb_ctx().await;
         let guard = KB_CTX.lock().await;
         assert!(guard.is_none());
+    }
+
+    #[test]
+    fn resolve_key_empty_when_no_key_and_no_openrouter_env() {
+        std::env::remove_var("OPENROUTER_API_KEY");
+        assert!(crate::kb::config::KbConfig::resolve_key("").is_empty());
     }
 
     #[test]
