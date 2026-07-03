@@ -1861,6 +1861,20 @@ impl TuiApp {
                 "config.agents.*.api_key",
             )?;
         }
+        // Knowledge Base keys are encrypted at rest like `api_key`; decrypt
+        // them here too so a wizard/`/setup knowledge` run leaves the running
+        // agent with usable KB credentials instead of a raw `enc2:` blob
+        // (mirrors the decrypt pass in `Config::load_or_init`).
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.knowledge.embedding_api_key,
+            "config.knowledge.embedding_api_key",
+        )?;
+        crate::config::schema::decrypt_optional_secret(
+            &store,
+            &mut config.knowledge.vision_api_key,
+            "config.knowledge.vision_api_key",
+        )?;
         config.apply_env_overrides();
         // Refresh the status-bar model label so the running TUI shows
         // the freshly-saved provider/model. Without this, a wizard run
