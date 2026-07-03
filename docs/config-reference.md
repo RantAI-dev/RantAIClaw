@@ -541,7 +541,43 @@ Notes:
 
 ## KB (Knowledge Base)
 
-The KB subsystem is gated behind the `kb` Cargo feature and is **off in the default build**. All KB settings are env-driven (no `[kb]` TOML section today). For the full user guide see [kb.md](kb.md).
+The KB subsystem is gated behind the `kb` Cargo feature (enabled in the default build). API credentials live in the `[knowledge]` config section (encrypted at rest, like `api_key`); the remaining KB tuning knobs are env-driven (no `[kb]` TOML section today). For the full user guide see [kb.md](kb.md).
+
+### Credentials (`[knowledge]`)
+
+| Key | Default | Purpose |
+|---|---|---|
+| `embedding_api_key` | unset | Bearer for KB document embedding (search/ingest) |
+| `vision_api_key` | unset | Bearer for OCR/vision extraction of PDFs and images; falls back to `embedding_api_key` when unset |
+
+Both keys are stored encrypted when `secrets.encrypt = true`, and the schema section is always present (not feature-gated) so config stays stable across feature sets.
+
+Precedence (same model as top-level `api_key` — env folds onto config at load, env wins):
+
+1. env `KB_EMBEDDING_API_KEY` → `[knowledge].embedding_api_key`; env `KB_EXTRACT_VISION_API_KEY` → `[knowledge].vision_api_key`
+2. the `[knowledge]` values in `config.toml`
+3. `OPENROUTER_API_KEY` as the final fallback for both
+
+So the resolution order for each key is: `KB_*` env > `[knowledge]` config > `OPENROUTER_API_KEY`.
+
+Set the keys in any of three ways:
+
+- run the setup wizard section `rantaiclaw setup knowledge` (also covered by full `rantaiclaw setup` / `rantaiclaw onboard`)
+- edit `config.toml` directly
+- use the gateway config API (below)
+
+Without a usable embedding key, KB search fails gracefully with an actionable message pointing you to `rantaiclaw setup knowledge` or `KB_EMBEDDING_API_KEY`.
+
+```toml
+[knowledge]
+embedding_api_key = "sk-..."
+vision_api_key = "sk-..."   # optional; omit to reuse the embedding key for OCR
+```
+
+Gateway config API (for the management console; key values are never returned):
+
+- `GET /api/v1/config/knowledge` → `{ embedding_configured, vision_configured, source }` — presence booleans plus a `source` string.
+- `PUT /api/v1/config/knowledge` with body `{ embedding_api_key?, vision_api_key? }` — sets the keys (stored encrypted); an empty string clears a key. Applying a change invalidates the KB cache and reloads the managed daemon.
 
 ### Storage
 

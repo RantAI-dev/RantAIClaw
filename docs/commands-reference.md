@@ -56,11 +56,12 @@ Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker ·
 - `rantaiclaw setup --non-interactive`
 - `rantaiclaw setup whatsapp-web --non-interactive`
 
-`setup` walks every wired section (provider, channels, persona, skills, mcp) skipping any that are already configured. Pass `--force` to re-run already-configured sections. Pass `--non-interactive` (or run in non-TTY context) to emit each section's headless hint and exit rather than prompting.
+`setup` walks every wired section (provider, channels, persona, skills, mcp, and — when built with the default `kb` feature — knowledge) skipping any that are already configured. Pass `--force` to re-run already-configured sections. Pass `--non-interactive` (or run in non-TTY context) to emit each section's headless hint and exit rather than prompting.
 
 Single-topic examples:
 - `rantaiclaw setup provider` — re-run provider section only
 - `rantaiclaw setup channels` — re-run channels section only
+- `rantaiclaw setup knowledge` — set the Knowledge Base API keys (`[knowledge].embedding_api_key` / `vision_api_key`, encrypted at rest; vision falls back to the embedding key). Env `KB_EMBEDDING_API_KEY` / `KB_EXTRACT_VISION_API_KEY` override config at load, with `OPENROUTER_API_KEY` as the final fallback. See [config-reference.md](config-reference.md) for the gateway `GET`/`PUT /api/v1/config/knowledge` endpoints.
 - `rantaiclaw setup whatsapp-web --non-interactive` — headless WhatsApp Web QR pairing (120s timeout)
 
 `onboard` is a legacy alias for `setup`; its behaviour is unchanged.
