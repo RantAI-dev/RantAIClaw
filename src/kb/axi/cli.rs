@@ -151,8 +151,12 @@ impl KbCommand {
     /// - `Ok(0)` — success.
     /// - `Ok(1)` — operational failure already reported on stdout.
     /// - `Err(KbError)` — internal failure; caller decides how to render.
-    pub async fn run(self) -> KbResult<i32> {
-        let cfg = KbConfig::from_env()?;
+    pub async fn run(
+        self,
+        embedding_api_key: Option<&str>,
+        vision_api_key: Option<&str>,
+    ) -> KbResult<i32> {
+        let cfg = KbConfig::from_env_with_keys(embedding_api_key, vision_api_key)?;
         // Build the concrete store once, then alias it through both trait
         // views. `SqliteStore` implements `KbStore` and `IntelligenceStore`;
         // `Arc<dyn KbStore>` can't be upcast to `Arc<dyn IntelligenceStore>`,
