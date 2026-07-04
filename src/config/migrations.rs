@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 9;
+pub const CURRENT_VERSION: u32 = 10;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -172,8 +172,16 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; default-value change only)
     }
 
-    // Future migrations (v10, v11, …) inserted here in order.
-    // if from < 10 { migrate_v10(raw)?; }
+    // v9 → v10: additive only — new optional `[knowledge]` config section
+    // (embedding_api_key, vision_api_key), defaulted by serde. No data
+    // transformation; this arm burns a version slot so the schema_drift
+    // fingerprint (which embeds defaults + structure) is accepted.
+    if from < 10 {
+        // (no transformation; additive field only)
+    }
+
+    // Future migrations (v11, v12, …) inserted here in order.
+    // if from < 11 { migrate_v11(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -323,6 +331,21 @@ mod tests {
         assert!(
             cc.get("guest_allowed_tools").is_none() && cc.get("guest_allowed_commands").is_none(),
             "migration must not inject guest fields; serde defaults handle them"
+        );
+    }
+
+    #[test]
+    fn v9_to_v10_is_additive_noop() {
+        // v9 → v10 only added the optional `[knowledge]` config section
+        // (additive, serde-defaulted). A v9 config migrates to v10 (current)
+        // without the migration injecting a `knowledge` table.
+        let mut v = parse("schema_version = 9\n");
+        let changed = migrate(&mut v).unwrap();
+        assert!(changed, "v9 config should be migrated to v10");
+        assert_eq!(version_of(&v), Some(10));
+        assert!(
+            v.get("knowledge").is_none(),
+            "migration must not inject knowledge; serde default handles it"
         );
     }
 

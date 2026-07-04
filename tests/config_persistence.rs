@@ -48,8 +48,8 @@ fn config_default_temperature_positive() {
 fn agent_config_default_max_tool_iterations() {
     let agent = AgentConfig::default();
     assert_eq!(
-        agent.max_tool_iterations, 10,
-        "default max_tool_iterations should be 10"
+        agent.max_tool_iterations, 50,
+        "default max_tool_iterations should be 50"
     );
 }
 
@@ -205,7 +205,7 @@ default_temperature = 0.7
     let parsed: Config = toml::from_str(minimal_toml).expect("minimal TOML should parse");
 
     // Agent config should use defaults
-    assert_eq!(parsed.agent.max_tool_iterations, 10);
+    assert_eq!(parsed.agent.max_tool_iterations, 50);
     assert_eq!(parsed.agent.max_history_messages, 50);
     assert!(!parsed.agent.compact_context);
 }
@@ -252,4 +252,42 @@ fn nested_workspace_dir_creation() {
 
     fs::create_dir_all(&nested_dir).expect("nested dir creation should succeed");
     assert!(nested_dir.exists(), "nested workspace dir should exist");
+}
+
+#[test]
+fn knowledge_section_defaults_to_none_and_survives_missing() {
+    let minimal = "default_temperature = 0.7\n";
+    let parsed: rantaiclaw::config::Config = toml::from_str(minimal).expect("minimal TOML parses");
+    assert_eq!(parsed.knowledge.embedding_api_key, None);
+    assert_eq!(parsed.knowledge.vision_api_key, None);
+}
+
+#[tokio::test]
+async fn knowledge_keys_encrypt_at_rest_and_decrypt_on_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
+    let mut cfg = rantaiclaw::config::Config::load_or_init().await.unwrap();
+    cfg.knowledge.embedding_api_key = Some("sk-embed-plain".into());
+    cfg.save().await.unwrap();
+    let raw = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+    assert!(
+        !raw.contains("sk-embed-plain"),
+        "key must not be plaintext on disk"
+    );
+    let reloaded = rantaiclaw::config::Config::load_or_init().await.unwrap();
+    assert_eq!(
+        reloaded.knowledge.embedding_api_key.as_deref(),
+        Some("sk-embed-plain")
+    );
+    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+}
+
+#[test]
+fn kb_env_vars_override_config_knowledge_at_load() {
+    let mut cfg = rantaiclaw::config::Config::default();
+    cfg.knowledge.embedding_api_key = Some("from-file".into());
+    std::env::set_var("KB_EMBEDDING_API_KEY", "from-env");
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.knowledge.embedding_api_key.as_deref(), Some("from-env"));
+    std::env::remove_var("KB_EMBEDDING_API_KEY");
 }

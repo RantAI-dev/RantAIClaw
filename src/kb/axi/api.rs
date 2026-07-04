@@ -144,13 +144,25 @@ struct CachedCtx {
 /// hit branch after the first request and never touch the lock body.
 static KB_CTX: tokio::sync::Mutex<Option<CachedCtx>> = tokio::sync::Mutex::const_new(None);
 
-async fn ensure_kb_ctx() -> Result<Arc<KbContext>, ApiError> {
+async fn ensure_kb_ctx(state: &crate::gateway::AppState) -> Result<Arc<KbContext>, ApiError> {
     let path = super::cli::resolve_kb_db_path();
+    // parking_lot guard is !Send — clone keys inside a scoped block, drop the
+    // guard before the async build below.
+    let (emb, vis) = {
+        let c = state.config.lock();
+        (
+            c.knowledge.embedding_api_key.clone(),
+            c.knowledge.vision_api_key.clone(),
+        )
+    };
     let mut guard = KB_CTX.lock().await;
     if let Some(cached) = guard.as_ref() {
         if cached.path == path {
             return match &cached.ctx {
                 Ok(ctx) => Ok(Arc::clone(ctx)),
+                Err(msg) if msg.starts_with("kb_not_configured") => Err(
+                    ApiError::service_unavailable("kb_not_configured", msg.clone()),
+                ),
                 Err(msg) => Err(ApiError::service_unavailable("kb_unavailable", msg.clone())),
             };
         }
@@ -158,17 +170,39 @@ async fn ensure_kb_ctx() -> Result<Arc<KbContext>, ApiError> {
     // Rebuild. Failures cache as `Err` so we don't hammer the embed/auth
     // endpoint on every retry; operators fix the env and bounce the
     // gateway, which clears the static.
-    let outcome = build_ctx(&path).await;
+    let outcome = build_ctx(&path, emb, vis).await;
     let snapshot = outcome.clone();
     *guard = Some(CachedCtx { path, ctx: outcome });
     match snapshot {
         Ok(ctx) => Ok(ctx),
+        Err(msg) if msg.starts_with("kb_not_configured") => {
+            Err(ApiError::service_unavailable("kb_not_configured", msg))
+        }
         Err(msg) => Err(ApiError::service_unavailable("kb_unavailable", msg)),
     }
 }
 
-async fn build_ctx(path: &std::path::Path) -> Result<Arc<KbContext>, String> {
-    let cfg = KbConfig::from_env().map_err(|e| format!("kb config: {e}"))?;
+/// Drop the cached KB context so the next `ensure_kb_ctx` rebuilds it with the
+/// current config (used after a `PUT /api/v1/config/knowledge` key change).
+pub async fn clear_kb_ctx() {
+    *KB_CTX.lock().await = None;
+}
+
+async fn build_ctx(
+    path: &std::path::Path,
+    embedding_key: Option<String>,
+    vision_key: Option<String>,
+) -> Result<Arc<KbContext>, String> {
+    let cfg = KbConfig::from_env_with_keys(embedding_key.as_deref(), vision_key.as_deref())
+        .map_err(|e| format!("kb config: {e}"))?;
+    // If neither config nor env nor the OPENROUTER fallback yields an embedding
+    // key, surface an actionable "not configured" error instead of a raw
+    // provider auth failure downstream.
+    if KbConfig::resolve_key(&cfg.embedding_api_key).is_empty() {
+        return Err("kb_not_configured: no embedding API key. Add one via \
+                    `rantaiclaw setup knowledge` or set KB_EMBEDDING_API_KEY."
+            .into());
+    }
     let store = SqliteStore::open(path, cfg.embedding_dim)
         .await
         .map_err(|e| format!("sqlite open ({}): {e}", path.display()))?;
@@ -673,7 +707,7 @@ async fn search(
     if body.query.trim().is_empty() {
         return Err(ApiError::bad_request("query must not be empty".into()).into());
     }
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
 
     let mut retriever = Retriever::new(
         ctx.cfg.clone(),
@@ -755,7 +789,7 @@ async fn list(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<DocumentSummary>>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let docs = ctx
         .store
         .list_documents(q.organization.as_deref())
@@ -770,7 +804,7 @@ async fn get_doc(
     Path(id): Path<String>,
 ) -> Result<Json<Document>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let doc = ctx
         .store
         .get_document(&DocumentId(id.clone()))
@@ -789,7 +823,7 @@ async fn delete_doc(
     Query(q): Query<DeleteQuery>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let hard = q.hard.unwrap_or(false);
     let soft = !hard;
     ctx.store
@@ -807,7 +841,7 @@ async fn drift(
     headers: HeaderMap,
 ) -> Result<Json<DriftResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let report = check_drift(&ctx.cfg, &ctx.store)
         .await
         .map_err(ApiError::from)?;
@@ -820,7 +854,7 @@ async fn re_embed(
     Json(body): Json<ReEmbedRequest>,
 ) -> Result<Json<ReEmbedResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let batch_size = body.batch_size.unwrap_or(100).max(1);
     let report = run_bulk_re_embed(
         &ctx.cfg,
@@ -847,7 +881,7 @@ async fn get_intelligence(
     Path(id): Path<String>,
 ) -> Result<Json<IntelligenceResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let (entities, relations) = ctx
         .intel
         .intelligence_for_document(&id)
@@ -862,7 +896,7 @@ async fn get_graph(
     Query(q): Query<GraphQuery>,
 ) -> Result<Json<GraphResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let limit = q.limit.unwrap_or(ctx.cfg.graph_max_nodes);
     let graph = ctx
         .intel
@@ -878,7 +912,7 @@ async fn re_extract_document(
     Path(id): Path<String>,
 ) -> Result<Json<ReExtractResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
 
     // Load the stored document content and re-chunk it so extraction sees the
     // same chunk boundaries as ingest.
@@ -962,7 +996,7 @@ async fn list_groups(
     headers: HeaderMap,
 ) -> Result<Json<Vec<KbGroupSummary>>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let groups = ctx.store.list_groups().await.map_err(ApiError::from)?;
     Ok(Json(groups))
 }
@@ -976,7 +1010,7 @@ async fn create_group(
     if body.name.trim().is_empty() {
         return Err(ApiError::bad_request("name must not be empty".into()).into());
     }
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let group = ctx
         .store
         .create_group(
@@ -995,7 +1029,7 @@ async fn get_group(
     Path(id): Path<String>,
 ) -> Result<Json<KbGroup>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     match ctx.store.get_group(&id).await.map_err(ApiError::from)? {
         Some(g) => Ok(Json(g)),
         None => Err(ApiError::not_found(format!("group {id} not found")).into()),
@@ -1014,7 +1048,7 @@ async fn update_group(
             return Err(ApiError::bad_request("name must not be empty".into()).into());
         }
     }
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     ctx.store
         .update_group(
             &id,
@@ -1037,7 +1071,7 @@ async fn delete_group(
     Path(id): Path<String>,
 ) -> Result<Json<DeleteGroupResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let deleted = ctx.store.delete_group(&id).await.map_err(ApiError::from)?;
     Ok(Json(DeleteGroupResponse { id, deleted }))
 }
@@ -1048,7 +1082,7 @@ async fn list_group_documents(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<DocumentSummary>>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let docs = ctx
         .store
         .list_group_documents(&id)
@@ -1067,7 +1101,7 @@ async fn add_group_document(
     if body.document_id.trim().is_empty() {
         return Err(ApiError::bad_request("document_id must not be empty".into()).into());
     }
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     ctx.store
         .add_document_to_group(body.document_id.trim(), &id)
         .await
@@ -1081,7 +1115,7 @@ async fn remove_group_document(
     Path((id, doc_id)): Path<(String, String)>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let ok = ctx
         .store
         .remove_document_from_group(&doc_id, &id)
@@ -1112,7 +1146,7 @@ async fn ingest(
     mut multipart: Multipart,
 ) -> Result<Json<IngestResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let ctx = ensure_kb_ctx().await?;
+    let ctx = ensure_kb_ctx(&state).await?;
     let started = std::time::Instant::now();
 
     let mut file_bytes: Option<Vec<u8>> = None;
@@ -1429,6 +1463,19 @@ fn sanitize_filename(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clear_kb_ctx_resets_cache() {
+        clear_kb_ctx().await;
+        let guard = KB_CTX.lock().await;
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn resolve_key_empty_when_no_key_and_no_openrouter_env() {
+        std::env::remove_var("OPENROUTER_API_KEY");
+        assert!(crate::kb::config::KbConfig::resolve_key("").is_empty());
+    }
 
     #[test]
     fn split_csv_drops_empty_and_trims() {

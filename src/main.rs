@@ -2056,7 +2056,13 @@ async fn main() -> Result<()> {
         // internal `KbError` is rendered as a TOON error block to stdout, NOT
         // stderr — AXI principle 6 says agents grep one stream.
         #[cfg(feature = "kb")]
-        Some(Commands::Kb { cmd }) => match cmd.run().await {
+        Some(Commands::Kb { cmd }) => match cmd
+            .run(
+                config.knowledge.embedding_api_key.as_deref(),
+                config.knowledge.vision_api_key.as_deref(),
+            )
+            .await
+        {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 println!("error[1]{{code,message}}:\n  internal,{e}");

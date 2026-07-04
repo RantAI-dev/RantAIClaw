@@ -161,6 +161,10 @@ pub struct Config {
     #[serde(default)]
     pub composio: ComposioConfig,
 
+    /// Knowledge Base credentials (see `KnowledgeConfig`).
+    #[serde(default)]
+    pub knowledge: KnowledgeConfig,
+
     /// Secrets encryption configuration (`[secrets]`).
     #[serde(default)]
     pub secrets: SecretsConfig,
@@ -992,6 +996,21 @@ impl Default for ComposioConfig {
             entity_id: default_entity_id(),
         }
     }
+}
+
+// ── Knowledge Base (encrypted credentials) ──────────────────────
+
+/// Knowledge Base credentials (`[knowledge]`). Keys are encrypted at rest, like
+/// `api_key`. Env vars `KB_EMBEDDING_API_KEY` / `KB_EXTRACT_VISION_API_KEY`
+/// override these at load (see `apply_env_overrides`), matching api_key
+/// precedence (env wins). Not feature-gated — always present so the schema is
+/// stable across feature sets.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct KnowledgeConfig {
+    #[serde(default)]
+    pub embedding_api_key: Option<String>,
+    #[serde(default)]
+    pub vision_api_key: Option<String>,
 }
 
 // ── Secrets (encrypted credential store) ────────────────────────
@@ -3191,6 +3210,7 @@ impl Default for Config {
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
+            knowledge: KnowledgeConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -3645,6 +3665,16 @@ impl Config {
             decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
             decrypt_optional_secret(
                 &store,
+                &mut config.knowledge.embedding_api_key,
+                "config.knowledge.embedding_api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.knowledge.vision_api_key,
+                "config.knowledge.vision_api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
                 &mut config.composio.api_key,
                 "config.composio.api_key",
             )?;
@@ -3806,6 +3836,18 @@ impl Config {
         if let Ok(key) = std::env::var("RANTAICLAW_API_KEY").or_else(|_| std::env::var("API_KEY")) {
             if !key.is_empty() {
                 self.api_key = Some(key);
+            }
+        }
+        // KB keys: env folds onto config.knowledge at load (env wins),
+        // matching api_key precedence. Downstream reads config.knowledge only.
+        if let Ok(k) = std::env::var("KB_EMBEDDING_API_KEY") {
+            if !k.is_empty() {
+                self.knowledge.embedding_api_key = Some(k);
+            }
+        }
+        if let Ok(k) = std::env::var("KB_EXTRACT_VISION_API_KEY") {
+            if !k.is_empty() {
+                self.knowledge.vision_api_key = Some(k);
             }
         }
         // API Key: GLM_API_KEY overrides when provider is a GLM/Zhipu variant.
@@ -4092,6 +4134,16 @@ impl Config {
         let store = crate::security::SecretStore::new(rantaiclaw_dir, self.secrets.encrypt);
 
         encrypt_optional_secret(&store, &mut config_to_save.api_key, "config.api_key")?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.knowledge.embedding_api_key,
+            "config.knowledge.embedding_api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.knowledge.vision_api_key,
+            "config.knowledge.vision_api_key",
+        )?;
         encrypt_optional_secret(
             &store,
             &mut config_to_save.composio.api_key,
@@ -4536,6 +4588,7 @@ default_temperature = 0.7
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
+            knowledge: KnowledgeConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -4712,6 +4765,7 @@ tool_dispatcher = "xml"
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
             composio: ComposioConfig::default(),
+            knowledge: KnowledgeConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),

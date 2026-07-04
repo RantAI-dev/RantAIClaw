@@ -9,6 +9,8 @@ pub fn provisioner_for(name: &str) -> Option<Box<dyn TuiProvisioner>> {
         "provider" => Some(Box::new(super::provider::ProviderProvisioner::new())),
         "approvals" => Some(Box::new(super::approvals::ApprovalsProvisioner::new())),
         "mcp" => Some(Box::new(super::mcp::McpProvisioner::new())),
+        #[cfg(feature = "kb")]
+        "knowledge" => Some(Box::new(super::knowledge::KnowledgeProvisioner::new())),
         "skills" => Some(Box::new(super::skills::SkillsProvisioner::new())),
         // Channels
         "telegram" => Some(Box::new(
@@ -112,6 +114,11 @@ pub fn available() -> Vec<(&'static str, &'static str)> {
     list.push((
         super::skills::SKILLS_NAME,
         super::skills::SkillsProvisioner::new().description(),
+    ));
+    #[cfg(feature = "kb")]
+    list.push((
+        super::knowledge::KNOWLEDGE_NAME,
+        super::knowledge::KnowledgeProvisioner::new().description(),
     ));
     // Channels
     list.push((
@@ -262,6 +269,12 @@ pub fn test_responses_for(name: &str) -> Vec<ProvisionResponse> {
             ProvisionResponse::Selection(vec![0]),
         ],
         "skills" => vec![ProvisionResponse::Selection(vec![0])],
+        #[cfg(feature = "kb")]
+        "knowledge" => vec![
+            ProvisionResponse::Selection(vec![0]),  // enable
+            ProvisionResponse::Selection(vec![0]),  // emb_src → enter (no main key in default cfg)
+            ProvisionResponse::Text(String::new()), // emb_key empty → disabled → Done
+        ],
         "telegram" => vec![
             ProvisionResponse::Text(String::new()),
             ProvisionResponse::Selection(vec![0]),

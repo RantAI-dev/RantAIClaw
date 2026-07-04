@@ -28,7 +28,8 @@ use crate::security::AutonomyLevel;
 /// Build the `/api/v1/config*` router. Merged alongside `api_v1::router()` so
 /// it shares the small-body limit + timeout middleware.
 pub fn router() -> Router<AppState> {
-    Router::new()
+    #[cfg_attr(not(feature = "kb"), allow(unused_mut))]
+    let mut router = Router::new()
         .route("/api/v1/config", get(get_config))
         .route("/api/v1/config/model", put(set_model))
         .route("/api/v1/config/autonomy", put(set_autonomy))
@@ -41,7 +42,16 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/channels/telegram",
             post(connect_telegram).delete(disconnect_telegram),
-        )
+        );
+    // Knowledge Base credential status/setter — only when the KB feature is built.
+    #[cfg(feature = "kb")]
+    {
+        router = router.route(
+            "/api/v1/config/knowledge",
+            get(get_knowledge).put(set_knowledge),
+        );
+    }
+    router
 }
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -95,9 +105,16 @@ async fn get_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let mut cfg = state.config.lock().clone();
-    // Redact exactly the fields Config::save() treats as secrets — never expose
-    // raw provider keys over the API. This is a response-only copy; the
+    // Never expose raw secrets over the API. This is a response-only copy; the
     // in-memory + on-disk config keep their real values.
+    redact_config_secrets(&mut cfg);
+    let val = serde_json::to_value(&cfg).map_err(err_500)?;
+    Ok(Json(val))
+}
+
+/// Clear every secret field before a Config is serialized into an API response.
+/// Keep in sync with the encrypt/decrypt lists in config::schema.
+fn redact_config_secrets(cfg: &mut crate::config::Config) {
     cfg.api_key = None;
     cfg.composio.api_key = None;
     cfg.browser.computer_use.api_key = None;
@@ -107,12 +124,13 @@ async fn get_config(
         agent.api_key = None;
     }
     // Channel credentials are secrets too — never return a live bot token over
-    // the API (the connect flow already avoids echoing it). Clear before serialising.
+    // the API (the connect flow already avoids echoing it).
     if let Some(tg) = cfg.channels_config.telegram.as_mut() {
         tg.bot_token.clear();
     }
-    let val = serde_json::to_value(&cfg).map_err(err_500)?;
-    Ok(Json(val))
+    // Knowledge Base keys are encrypted at rest like `api_key`; redact them too.
+    cfg.knowledge.embedding_api_key = None;
+    cfg.knowledge.vision_api_key = None;
 }
 
 // ── PUT /config/model ────────────────────────────────────────────────────────
@@ -633,10 +651,111 @@ async fn set_secrets(
     Ok(Json(json!({ "ok": true, "api_key_present": present })))
 }
 
+// ── GET/PUT /config/knowledge (Knowledge Base credentials) ───────────────────
+
+#[cfg(feature = "kb")]
+#[derive(serde::Deserialize)]
+struct KnowledgeBody {
+    #[serde(default)]
+    embedding_api_key: Option<String>,
+    #[serde(default)]
+    vision_api_key: Option<String>,
+}
+
+/// Effective source of a resolved key, reported without revealing it.
+#[cfg(feature = "kb")]
+fn knowledge_source(env_var: &str, cfg_val: Option<&str>) -> &'static str {
+    if std::env::var(env_var)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        "env"
+    } else if cfg_val.map(|v| !v.is_empty()).unwrap_or(false) {
+        "config"
+    } else {
+        "none"
+    }
+}
+
+/// `GET /config/knowledge` — presence + source only; a key value is never returned.
+#[cfg(feature = "kb")]
+async fn get_knowledge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let cfg = state.config.lock().clone();
+    let emb_src = knowledge_source(
+        "KB_EMBEDDING_API_KEY",
+        cfg.knowledge.embedding_api_key.as_deref(),
+    );
+    let vis_src = knowledge_source(
+        "KB_EXTRACT_VISION_API_KEY",
+        cfg.knowledge.vision_api_key.as_deref(),
+    );
+    Ok(Json(json!({
+        "embedding_configured": emb_src != "none",
+        "vision_configured": vis_src != "none",
+        "source": emb_src,
+    })))
+}
+
+/// `PUT /config/knowledge {embedding_api_key?, vision_api_key?}` — set/clear the KB
+/// keys (persisted encrypted at rest), flush the KB cache, and reload the daemon.
+/// An omitted field leaves the existing value untouched; an empty string clears it.
+/// Returns presence booleans only, never the key.
+#[cfg(feature = "kb")]
+async fn set_knowledge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<KnowledgeBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let mut cfg = state.config.lock().clone();
+    if let Some(k) = body.embedding_api_key {
+        let k = k.trim();
+        cfg.knowledge.embedding_api_key = if k.is_empty() {
+            None
+        } else {
+            Some(k.to_string())
+        };
+    }
+    if let Some(k) = body.vision_api_key {
+        let k = k.trim();
+        cfg.knowledge.vision_api_key = if k.is_empty() {
+            None
+        } else {
+            Some(k.to_string())
+        };
+    }
+    persist_and_swap(&state, cfg).await?;
+    // New credentials invalidate any cached KB embedding/extraction context.
+    crate::kb::axi::clear_kb_ctx().await;
+    schedule_daemon_reload();
+    let cfg = state.config.lock().clone();
+    Ok(Json(json!({
+        "embedding_configured": cfg.knowledge.embedding_api_key.is_some(),
+        "vision_configured": cfg.knowledge.vision_api_key.is_some(),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn redact_config_secrets_clears_knowledge_keys() {
+        let mut cfg = Config::default();
+        cfg.knowledge.embedding_api_key = Some("sk-embed-secret".into());
+        cfg.knowledge.vision_api_key = Some("sk-vision-secret".into());
+        redact_config_secrets(&mut cfg);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("sk-embed-secret"));
+        assert!(!json.contains("sk-vision-secret"));
+        assert_eq!(cfg.knowledge.embedding_api_key, None);
+        assert_eq!(cfg.knowledge.vision_api_key, None);
+    }
 
     #[test]
     fn apply_secrets_mirrors_key_into_per_provider_store() {

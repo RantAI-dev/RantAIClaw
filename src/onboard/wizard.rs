@@ -3,8 +3,9 @@ use crate::config::schema::{
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    HeartbeatConfig, IMessageConfig, KnowledgeConfig, LarkConfig, MatrixConfig, MemoryConfig,
+    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
+    WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -127,14 +128,20 @@ fn canonical_sections() -> Vec<Box<dyn SetupSection>> {
     // Wave 4A inserts `approvals` between `provider` and `channels`. The
     // approval-gate runtime gates every tool call, so the user must have
     // a policy chosen before any channel triggers a tool execution.
-    vec![
+    #[cfg_attr(not(feature = "kb"), allow(unused_mut))]
+    let mut sections: Vec<Box<dyn SetupSection>> = vec![
         Box::new(ProviderSection),
         Box::new(ApprovalsSection),
         Box::new(ChannelsSection),
         Box::new(PersonaSection),
         Box::new(SkillsSection),
         Box::new(McpSection),
-    ]
+    ];
+    #[cfg(feature = "kb")]
+    sections.push(Box::new(
+        crate::onboard::section::knowledge::KnowledgeSection,
+    ));
+    sections
 }
 
 /// Per-section outcome returned by `run_setup`. Used by tests + the CLI
@@ -339,6 +346,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         tunnel: tunnel_config,
         gateway: crate::config::GatewayConfig::default(),
         composio: composio_config,
+        knowledge: KnowledgeConfig::default(),
         secrets: secrets_config,
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
@@ -600,6 +608,7 @@ async fn run_quick_setup_with_home(
         tunnel: crate::config::TunnelConfig::default(),
         gateway: crate::config::GatewayConfig::default(),
         composio: ComposioConfig::default(),
+        knowledge: KnowledgeConfig::default(),
         secrets: SecretsConfig::default(),
         browser: BrowserConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
