@@ -5,6 +5,28 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0-alpha] — 2026-07-04
+
+### Added
+
+- **Configure the Knowledge Base from setup, onboard, and the gateway.** KB API
+  keys (embedding + optional OCR/vision) now live in a `[knowledge]` config
+  section, encrypted at rest like `api_key`. Set them via the `rantaiclaw setup
+  knowledge` wizard section, the interactive first-run wizard's Integrations
+  step (so bare `rantaiclaw setup` / `onboard` offers KB), or the gateway
+  `GET`/`PUT /api/v1/config/knowledge` endpoints (presence-only responses, keys
+  never returned). Env `KB_EMBEDDING_API_KEY` / `KB_EXTRACT_VISION_API_KEY`
+  still override config at load; `OPENROUTER_API_KEY` remains the final
+  fallback. Previously KB keys were environment-variable-only. Schema bumped to
+  v10 (additive). A missing key now surfaces a clear `kb_not_configured` message
+  instead of a raw failure.
+
+### Fixed
+
+- `reload_config` now decrypts the `[knowledge]` keys (like `Config::load_or_init`),
+  so a wizard/`setup knowledge` run leaves the running agent with usable KB
+  credentials instead of a raw encrypted blob until restart.
+
 ## [0.6.99-alpha] — 2026-07-03
 
 ### Fixed
