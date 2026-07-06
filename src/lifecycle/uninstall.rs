@@ -416,47 +416,64 @@ fn self_delete_binary(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The exact marker the installer writes above its PATH line
+/// (see `scripts/bootstrap.sh`: `printf '\n# Added by RantaiClaw installer\n%s\n'`).
+const INSTALLER_MARKER: &str = "# Added by RantaiClaw installer";
+
 fn clean_shell_rc_amendments() -> Result<()> {
     let home = paths::home_dir();
-    let candidates = [".bashrc", ".zshrc", ".profile", ".config/fish/config.fish"];
-    let marker = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // The rc files the installer's `detect_shell_rc` may target.
+    let candidates = [
+        ".bashrc",
+        ".bash_profile",
+        ".zshrc",
+        ".profile",
+        ".config/fish/config.fish",
+    ];
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut touched: Vec<PathBuf> = vec![];
 
     for rel in &candidates {
         let path = home.join(rel);
-        if !path.exists() {
-            continue;
-        }
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(_) => continue,
         };
+
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
         let mut changed = false;
-        let new = content
-            .lines()
-            .map(|line| {
-                if line.contains("rantaiclaw") && !line.trim_start().starts_with('#') {
+        // Comment out ONLY the single PATH line the installer wrote directly
+        // beneath its marker. We deliberately do not touch arbitrary lines that
+        // merely mention "rantaiclaw" — those may be the user's own aliases or
+        // config, and clobbering them is destructive over-reach.
+        for i in 0..lines.len() {
+            if lines[i].trim() != INSTALLER_MARKER {
+                continue;
+            }
+            if let Some(next) = lines.get(i + 1) {
+                let trimmed = next.trim_start();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    lines[i + 1] = format!(
+                        "# rantaiclaw: removed by uninstall on {date}: {}",
+                        lines[i + 1]
+                    );
                     changed = true;
-                    format!("# rantaiclaw: removed by uninstall on {marker}: {line}")
-                } else {
-                    line.to_string()
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+            }
+        }
+
         if changed {
-            // Preserve trailing newline.
-            let mut new = new;
-            if content.ends_with('\n') && !new.ends_with('\n') {
+            let mut new = lines.join("\n");
+            if content.ends_with('\n') {
                 new.push('\n');
             }
-            fs::write(&path, new).with_context(|| format!("write {}", path.display()))?;
+            fs::write(&path, &new).with_context(|| format!("write {}", path.display()))?;
             touched.push(path);
         }
     }
 
     if !touched.is_empty() {
-        println!("  commented out PATH amendments in:");
+        println!("  commented out installer PATH amendment in:");
         for p in touched {
             println!("    {}", p.display());
         }
@@ -637,6 +654,63 @@ mod tests {
                 !paths::profile_dir("default").exists(),
                 "profiles still removed"
             );
+        });
+    }
+
+    #[test]
+    fn shell_rc_only_touches_installer_marker_block() {
+        with_home(|| {
+            let bashrc = paths::home_dir().join(".bashrc");
+            fs::write(
+                &bashrc,
+                // A user's own alias that mentions rantaiclaw (must survive),
+                // an unrelated PATH line (must survive), then the installer's
+                // marker block exactly as bootstrap.sh writes it.
+                "alias rc='rantaiclaw chat'\n\
+                 export PATH=\"$HOME/.local/bin:$PATH\"\n\
+                 \n\
+                 # Added by RantaiClaw installer\n\
+                 export PATH=\"$HOME/.cargo/bin:$PATH\"\n",
+            )
+            .unwrap();
+
+            clean_shell_rc_amendments().unwrap();
+            let after = fs::read_to_string(&bashrc).unwrap();
+
+            // The installer's PATH line (right after the marker) is commented.
+            assert!(
+                after.contains("# rantaiclaw: removed by uninstall on"),
+                "installer PATH line should be commented:\n{after}"
+            );
+            // The user's own rantaiclaw alias is untouched — no over-reach.
+            assert!(
+                after.contains("alias rc='rantaiclaw chat'"),
+                "user alias must survive:\n{after}"
+            );
+            // The unrelated PATH line is untouched.
+            assert!(after.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
+            // The marker breadcrumb stays.
+            assert!(after.contains("# Added by RantaiClaw installer"));
+        });
+    }
+
+    #[test]
+    fn shell_rc_marker_cleanup_is_idempotent() {
+        with_home(|| {
+            let bashrc = paths::home_dir().join(".bashrc");
+            fs::write(
+                &bashrc,
+                "# Added by RantaiClaw installer\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\n",
+            )
+            .unwrap();
+
+            clean_shell_rc_amendments().unwrap();
+            let first = fs::read_to_string(&bashrc).unwrap();
+            clean_shell_rc_amendments().unwrap();
+            let second = fs::read_to_string(&bashrc).unwrap();
+            assert_eq!(first, second, "second run must not re-comment");
+            // Exactly one removal breadcrumb.
+            assert_eq!(second.matches("removed by uninstall on").count(), 1);
         });
     }
 
