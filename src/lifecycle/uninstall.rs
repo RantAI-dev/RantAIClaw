@@ -100,7 +100,7 @@ pub fn run(opts: UninstallOpts) -> Result<()> {
         let _ = clean_shell_rc_amendments();
     }
 
-    print_summary(&scope, &opts);
+    print_summary(&scope, &opts, &info);
     Ok(())
 }
 
@@ -464,7 +464,7 @@ fn clean_shell_rc_amendments() -> Result<()> {
     Ok(())
 }
 
-fn print_summary(scope: &Scope, opts: &UninstallOpts) {
+fn print_summary(scope: &Scope, opts: &UninstallOpts, info: &BinaryInfo) {
     println!();
     println!("✓ uninstall complete");
     if !opts.all && !opts.purge {
@@ -486,6 +486,35 @@ fn print_summary(scope: &Scope, opts: &UninstallOpts) {
             "  preserved {} (re-install will reuse it to decrypt prior secrets)",
             paths::rantaiclaw_root().join(".secret_key").display()
         );
+    }
+
+    // A full uninstall wipes data but the binary self-recreates a fresh
+    // ~/.rantaiclaw on next launch — so without this note it looks like the
+    // uninstall "did nothing". State plainly that the binary remains and how
+    // to remove it. (--purge removes a plain Binary; cargo/workspace installs
+    // are deferred, so the binary is still present in those cases.)
+    let binary_removed = opts.purge && matches!(info.kind, InstallKind::Binary);
+    if !binary_removed {
+        println!();
+        println!(
+            "  note: the rantaiclaw binary is still installed at {}",
+            info.path.display()
+        );
+        println!("  running `rantaiclaw` again will recreate a fresh ~/.rantaiclaw");
+        match info.kind {
+            InstallKind::Binary => {
+                println!("  to remove it:  rm -f {}", info.path.display());
+            }
+            InstallKind::Cargo => {
+                println!("  to remove it:  cargo uninstall rantaiclaw");
+            }
+            InstallKind::Workspace => {
+                println!(
+                    "  (local workspace build at {} — recreated by `cargo build`)",
+                    info.path.display()
+                );
+            }
+        }
     }
 }
 
