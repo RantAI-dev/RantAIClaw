@@ -210,6 +210,14 @@ fn confirm(scope: &Scope) -> bool {
 }
 
 fn try_uninstall_daemon() {
+    // Guard against re-entering a test harness: under `cargo test`,
+    // `current_exe()` is the test binary, and spawning it with
+    // `service uninstall` makes libtest re-run every test matching "uninstall"
+    // — each of which spawns again: an unbounded fork bomb. The real binary is
+    // never built with cfg(test), so production behavior is unchanged.
+    if cfg!(test) {
+        return;
+    }
     // Best-effort: the daemon may not be installed at all. A failure here
     // shouldn't block the rest of the uninstall.
     let exe = match std::env::current_exe() {
