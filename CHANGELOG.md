@@ -5,6 +5,36 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1-alpha] — 2026-07-06
+
+### Fixed
+
+- **`uninstall` stops a running daemon before wiping its data.** A daemon bound
+  to a profile rewrote its dir every few seconds, so `uninstall` looked like it
+  did nothing — the profile reappeared immediately. It now reads each target
+  profile's `.daemon_active` sentinel and signals live foreground daemons
+  (SIGTERM→SIGKILL, with the PID confirmed to be a rantaiclaw daemon via
+  `/proc/<pid>/cmdline` before any signal) before removing data; service-managed
+  units are still torn down via `service uninstall`.
+- **`uninstall --purge` removes a bootstrap-copied `~/.cargo/bin` binary.** A
+  binary the installer *copied* into `~/.cargo/bin` was misclassified as a cargo
+  install, so `--purge` refused it and advised `cargo uninstall rantaiclaw` —
+  which fails with "did not match any packages". `classify` now confirms cargo
+  actually records the binary (via `.crates2.json`/`.crates.toml`) before
+  deferring; untracked binaries are removed directly. Genuine cargo installs
+  still defer.
+- **Shell-rc cleanup only touches the installer's own PATH block.** It matched
+  any line containing "rantaiclaw" — missing the installer's real amendment
+  (whose PATH export has no "rantaiclaw" in it) while clobbering the user's own
+  aliases/config. It now comments out only the single PATH line directly beneath
+  the `# Added by RantaiClaw installer` marker, and is idempotent.
+- **`uninstall` now reports the still-installed binary + how to remove it**, so a
+  data-only uninstall no longer reads as a no-op (the binary self-recreates a
+  fresh `~/.rantaiclaw` on next launch).
+- Fixed a test-only daemon-teardown fork bomb: under `cargo test`,
+  `current_exe service uninstall` re-ran every test matching "uninstall", each
+  spawning again. Guarded with `cfg!(test)`; production behaviour is unchanged.
+
 ## [0.7.0-alpha] — 2026-07-04
 
 ### Added

@@ -40,10 +40,16 @@ impl BinaryInfo {
 }
 
 fn classify(path: &Path) -> InstallKind {
+    classify_with(path, cargo_tracks_binary)
+}
+
+/// Path-based classification with an injectable cargo-ownership check so the
+/// logic is deterministically unit-testable without touching the real cargo
+/// registry.
+fn classify_with(path: &Path, cargo_tracks: impl Fn(&Path) -> bool) -> InstallKind {
     let s = path.to_string_lossy();
-    if s.contains("/.cargo/bin/") || s.contains("\\.cargo\\bin\\") {
-        return InstallKind::Cargo;
-    }
+    // Workspace builds win first: a binary under target/{debug,release} is a
+    // build artifact regardless of any other path segment.
     if s.contains("/target/debug/")
         || s.contains("/target/release/")
         || s.contains("\\target\\debug\\")
@@ -51,7 +57,81 @@ fn classify(path: &Path) -> InstallKind {
     {
         return InstallKind::Workspace;
     }
+    if s.contains("/.cargo/bin/") || s.contains("\\.cargo\\bin\\") {
+        // Living in ~/.cargo/bin is NOT sufficient to call this a cargo
+        // install. Installer scripts (see scripts/bootstrap.sh) also *copy*
+        // prebuilt binaries there because it's a common PATH dir — and for
+        // those, `cargo uninstall` fails with "did not match any packages".
+        // Only defer to cargo when cargo's own registry records the binary.
+        return if cargo_tracks(path) {
+            InstallKind::Cargo
+        } else {
+            InstallKind::Binary
+        };
+    }
     InstallKind::Binary
+}
+
+/// True when cargo's install registry records a binary with this file name.
+///
+/// Cargo tracks installs in `$CARGO_HOME/.crates2.json` (modern) and
+/// `$CARGO_HOME/.crates.toml` (legacy v1). If neither lists the binary,
+/// `cargo uninstall` cannot remove it, so the file must be treated as a plain
+/// binary the caller can delete directly.
+fn cargo_tracks_binary(path: &Path) -> bool {
+    let Some(bin) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let home = cargo_home();
+    crates2_lists_bin(&home.join(".crates2.json"), bin)
+        || crates_v1_lists_bin(&home.join(".crates.toml"), bin)
+}
+
+/// `$CARGO_HOME`, falling back to `~/.cargo`.
+fn cargo_home() -> PathBuf {
+    if let Some(h) = std::env::var_os("CARGO_HOME") {
+        return PathBuf::from(h);
+    }
+    crate::profile::paths::home_dir().join(".cargo")
+}
+
+/// Does `.crates2.json` record an install whose `bins` array contains `bin`?
+fn crates2_lists_bin(path: &Path, bin: &str) -> bool {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    json.get("installs")
+        .and_then(|v| v.as_object())
+        .is_some_and(|installs| {
+            installs.values().any(|entry| {
+                entry
+                    .get("bins")
+                    .and_then(|b| b.as_array())
+                    .is_some_and(|bins| bins.iter().any(|x| x.as_str() == Some(bin)))
+            })
+        })
+}
+
+/// Does legacy `.crates.toml` (`[v1]` table of pkgid -> [bins]) list `bin`?
+fn crates_v1_lists_bin(path: &Path, bin: &str) -> bool {
+    // Typed deserialize (the same path `profile::sentinel` uses) rather than
+    // `toml::Value` traversal — the latter's shape shifted across toml crate
+    // versions; this stays correct regardless.
+    #[derive(serde::Deserialize)]
+    struct CratesToml {
+        #[serde(default)]
+        v1: std::collections::HashMap<String, Vec<String>>,
+    }
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(parsed) = toml::from_str::<CratesToml>(&body) else {
+        return false;
+    };
+    parsed.v1.values().any(|bins| bins.iter().any(|b| b == bin))
 }
 
 /// Refuse self-modifying ops on cargo/workspace installs. Returns the binary
@@ -76,9 +156,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_cargo() {
+    fn classify_cargo_bin_is_cargo_only_when_tracked() {
+        // A binary under ~/.cargo/bin that cargo actually installed.
         let p = PathBuf::from("/home/u/.cargo/bin/rantaiclaw");
-        assert_eq!(classify(&p), InstallKind::Cargo);
+        assert_eq!(classify_with(&p, |_| true), InstallKind::Cargo);
+    }
+
+    #[test]
+    fn classify_cargo_bin_copied_by_installer_is_plain_binary() {
+        // Same path, but cargo has no registry entry — a bootstrap-copied
+        // binary. `cargo uninstall` would fail, so it must be removable as a
+        // plain Binary. Regression guard for the uninstall dead-end.
+        let p = PathBuf::from("/home/u/.cargo/bin/rantaiclaw");
+        assert_eq!(classify_with(&p, |_| false), InstallKind::Binary);
+    }
+
+    #[test]
+    fn classify_cargo_workspace_wins_over_cargo_bin() {
+        // Defense-in-depth: a target/ path is a Workspace build even if the
+        // ownership probe would say "tracked".
+        let p = PathBuf::from("/repo/target/release/rantaiclaw");
+        assert_eq!(classify_with(&p, |_| true), InstallKind::Workspace);
+    }
+
+    #[test]
+    fn crates2_detects_and_rejects_bins() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(".crates2.json");
+        std::fs::write(
+            &f,
+            r#"{"installs":{"rantaiclaw 0.6.0 (path+file:///x)":{"bins":["rantaiclaw"]}}}"#,
+        )
+        .unwrap();
+        assert!(crates2_lists_bin(&f, "rantaiclaw"));
+        assert!(!crates2_lists_bin(&f, "somethingelse"));
+        // Missing file -> not tracked, never panics.
+        assert!(!crates2_lists_bin(
+            &dir.path().join("nope.json"),
+            "rantaiclaw"
+        ));
+    }
+
+    #[test]
+    fn crates_v1_detects_and_rejects_bins() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(".crates.toml");
+        std::fs::write(
+            &f,
+            "[v1]\n\"rantaiclaw 0.6.0 (path+file:///x)\" = [\"rantaiclaw\"]\n",
+        )
+        .unwrap();
+        assert!(crates_v1_lists_bin(&f, "rantaiclaw"));
+        assert!(!crates_v1_lists_bin(&f, "somethingelse"));
+        assert!(!crates_v1_lists_bin(
+            &dir.path().join("nope.toml"),
+            "rantaiclaw"
+        ));
     }
 
     #[test]
