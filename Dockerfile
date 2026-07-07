@@ -16,9 +16,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
+# Keep this list in sync with every [[bench]] target in Cargo.toml — a
+# declared bench without a stub fails the dependency-cache build below
+# ("can't find `<name>` bench").
 RUN mkdir -p src benches crates/robot-kit/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
+    && echo "fn main() {}" > benches/kb_retrieval.rs \
     && echo "pub fn placeholder() {}" > crates/robot-kit/src/lib.rs
 RUN --mount=type=cache,id=rantaiclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rantaiclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
