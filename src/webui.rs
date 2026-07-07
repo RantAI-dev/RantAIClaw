@@ -217,9 +217,7 @@ fn split_host_port(url: &str) -> (String, u16) {
 
 /// Spawn a detached background process (own session, stdio → `log`), returning its PID.
 fn spawn_detached(cmd: &mut Command, log: &Path) -> Result<u32> {
-    // Truncate (don't append): a fresh log per launch means `read_pairing_code` can't pick up a
-    // STALE pairing code from a previous/aborted run — which made auto-pair POST a dead code and
-    // fail with 404, leaving the console without a token ("gateway offline").
+    // Truncate (don't append) so each launch starts with a clean gateway log.
     let out = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -247,28 +245,25 @@ fn spawn_detached(cmd: &mut Command, log: &Path) -> Result<u32> {
     Ok(child.id())
 }
 
-/// Read the gateway's one-time pairing code from its log (`X-Pairing-Code: NNNNNN`).
-fn read_pairing_code(log: &Path) -> Option<String> {
-    for _ in 0..15 {
-        if let Ok(txt) = std::fs::read_to_string(log) {
-            // Take the LAST code in the log (most recent gateway start), not the first — extra
-            // safety on top of the per-launch truncation in `spawn_detached`.
-            let latest = txt.lines().rev().find_map(|line| {
-                let idx = line.find("X-Pairing-Code:")?;
-                let code: String = line[idx + "X-Pairing-Code:".len()..]
-                    .trim()
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect();
-                (!code.is_empty()).then_some(code)
-            });
-            if latest.is_some() {
-                return latest;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(400));
-    }
-    None
+/// Obtain a bearer token by minting a short-lived, single-use on-demand
+/// "gateway" pairing code and exchanging it via `POST /pair`.
+///
+/// Unlike reading the one-time startup code from the gateway log, this works
+/// against a gateway we did **not** start (a running daemon, whose startup code
+/// we never see) and even once the gateway already holds tokens — the store
+/// code is independent of the startup code, so a fresh install or a lost
+/// `.env.local` can still pair without restarting the daemon. Returns `None`
+/// when the profile can't be resolved, the store write fails, or `/pair`
+/// rejects the code.
+fn mint_and_pair(gateway_url: &str) -> Option<String> {
+    let root = crate::profile::ProfileManager::active().ok()?.root;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let code =
+        crate::security::pairing_store::mint(&root, "gateway", 120, Some(1), false, now).ok()?;
+    pair_token(gateway_url, &code)
 }
 
 /// Exchange a pairing code for a bearer token via `POST /pair` (uses `curl`).
@@ -477,17 +472,26 @@ fn start(
                 gw_log.display()
             );
         }
-        // Pair automatically: we started it, so its one-time code is in our log.
-        if token.is_empty() && config.gateway.require_pairing {
-            if let Some(code) = read_pairing_code(&gw_log) {
-                if let Some(t) = pair_token(&gateway, &code) {
-                    token = t;
-                    println!("✓ paired with the gateway");
-                }
+    }
+
+    // 2. Pair if we don't already have a token — regardless of who started the
+    //    gateway. Auto-pair used to run only when *we* spawned the gateway (its
+    //    one-time code was in our log); against an already-running daemon it was
+    //    skipped, so the console launched token-less and the gateway answered
+    //    401 "requires pairing". Minting an on-demand "gateway" code and
+    //    exchanging it via POST /pair works in both cases — and even once the
+    //    daemon already holds tokens (a lost `.env.local`) — so no restart is
+    //    ever needed. `require_pairing` stays authoritative.
+    if token.is_empty() && config.gateway.require_pairing {
+        match mint_and_pair(&gateway) {
+            Some(t) => {
+                token = t;
+                println!("✓ paired with the gateway");
             }
-            if token.is_empty() {
+            None => {
                 println!(
-                    "  ⚠ couldn't auto-pair — see {} for the code, then: rantaiclaw ui start --token <token>",
+                    "  ⚠ couldn't auto-pair with the gateway — the console will prompt for a \
+                     pairing code (gateway log: {})",
                     gw_log.display()
                 );
             }
