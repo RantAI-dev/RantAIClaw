@@ -5,6 +5,22 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3-alpha] — 2026-07-07
+
+### Fixed
+
+- **The web console self-heals a stale gateway token.** `ui start` reused the
+  token remembered in `.env.local` without checking it still works; a token
+  issued by a previous gateway instance (an update or restart that reset
+  `paired_tokens`) was rejected with 401 on every request, so the console
+  showed *"Gateway Offline"* until `.env.local` was cleared by hand. `ui start`
+  now probes an authed endpoint with the stored token and, only on an explicit
+  401/403, drops it and re-pairs via the on-demand pairing path — fresh
+  installs, updates, gateway restarts, and switching between `rantaiclaw ui
+  start` and wrapper launchers (e.g. Copilot's `copilot-web`) all recover with
+  no manual steps. Transient probe failures keep the token (fail-safe), and a
+  valid token is never re-paired.
+
 ## [0.7.2-alpha] — 2026-07-07
 
 ### Security
