@@ -54,7 +54,7 @@ fn chat_body(raw: &str) -> serde_json::Value {
 async fn llm_rerank_returns_all_when_fewer_candidates_than_final_k() {
     // No HTTP path hit — short-circuits before fetch. We still need the env
     // key to be present, since the key check happens first.
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: serialized via ENV_LOCK and removed by EnvGuard on drop.
     unsafe {
         std::env::set_var("OPENROUTER_API_KEY", "test-key");
@@ -76,7 +76,7 @@ async fn llm_rerank_returns_all_when_fewer_candidates_than_final_k() {
 
 #[tokio::test]
 async fn llm_rerank_parses_index_array() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         std::env::set_var("OPENROUTER_API_KEY", "test-key");
     }
@@ -105,7 +105,7 @@ async fn llm_rerank_parses_index_array() {
 
 #[tokio::test]
 async fn llm_rerank_handles_malformed_response() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         std::env::set_var("OPENROUTER_API_KEY", "test-key");
     }
@@ -130,7 +130,7 @@ async fn llm_rerank_handles_malformed_response() {
 
 #[tokio::test]
 async fn llm_rerank_skips_out_of_range_indices() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         std::env::set_var("OPENROUTER_API_KEY", "test-key");
     }
@@ -156,7 +156,7 @@ async fn llm_rerank_skips_out_of_range_indices() {
 
 #[tokio::test]
 async fn llm_rerank_returns_error_on_missing_api_key() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: serialized via ENV_LOCK.
     unsafe {
         std::env::remove_var("OPENROUTER_API_KEY");
@@ -177,7 +177,7 @@ async fn llm_rerank_returns_error_on_missing_api_key() {
 
 #[tokio::test]
 async fn llm_rerank_returns_error_on_4xx() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         std::env::set_var("OPENROUTER_API_KEY", "test-key");
     }

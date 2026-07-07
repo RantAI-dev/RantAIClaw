@@ -72,7 +72,7 @@ fn defaults_match_ts_kb() {
 
 #[test]
 fn env_overrides_apply() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _env = EnvGuard(vec![
         "KB_EMBEDDING_MODEL",
         "KB_EMBEDDING_DIM",
@@ -92,7 +92,7 @@ fn env_overrides_apply() {
 
 #[test]
 fn invalid_int_returns_error() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _env = EnvGuard(vec!["KB_EMBEDDING_DIM"]);
     unsafe {
         std::env::set_var("KB_EMBEDDING_DIM", "not-a-number");
