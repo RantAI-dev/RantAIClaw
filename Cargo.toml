@@ -218,7 +218,7 @@ indexmap = "2"
 
 # KB office support — feature `kb-office`. Pinned now so the feature flag
 # resolves cleanly; actual code that uses these lands in later phases.
-calamine = { version = "0.30", optional = true }
+calamine = { version = "0.36", optional = true }
 docx-rs = { version = "0.4", optional = true }
 
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
