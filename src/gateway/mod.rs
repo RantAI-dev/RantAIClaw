@@ -668,6 +668,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         ))),
     };
 
+    // Hot-reload: reflect on-disk config edits (e.g. a provider changed in the
+    // TUI, another process) in the running gateway + the web console it serves,
+    // without a restart. Best-effort — a watcher failure just disables it.
+    spawn_config_reloader(state.config.clone(), config.config_path.clone());
+
     // Build router with middleware
     let app = Router::new()
         .route("/health", get(handle_health))
@@ -876,6 +881,35 @@ fn try_consume_gateway_store_code(state: &AppState, code: &str) -> Option<String
             None
         }
     }
+}
+
+/// Watch `config.toml` and swap the running `Config` when it changes on disk,
+/// so a provider/model edit made elsewhere (the TUI, a direct edit) is reflected
+/// by the gateway and the web console without a restart. Reloads via
+/// `Config::load_or_init` for the exact same decrypt pass used at startup
+/// (including `provider_api_keys`). Best-effort: a watcher-setup failure logs
+/// and disables hot-reload; a failed reload keeps the current config.
+fn spawn_config_reloader(config: Arc<Mutex<Config>>, config_path: std::path::PathBuf) {
+    tokio::spawn(async move {
+        let mut watcher = match crate::config::watcher::ConfigWatcher::watch(&config_path) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(target: "gateway", "config hot-reload disabled: {e:#}");
+                return;
+            }
+        };
+        while watcher.reload_rx.recv().await.is_some() {
+            match Config::load_or_init().await {
+                Ok(fresh) => {
+                    *config.lock() = fresh;
+                    tracing::info!(target: "gateway", "config.toml changed — reloaded running config");
+                }
+                Err(e) => {
+                    tracing::warn!(target: "gateway", "config reload failed, keeping current: {e:#}");
+                }
+            }
+        }
+    });
 }
 
 async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {

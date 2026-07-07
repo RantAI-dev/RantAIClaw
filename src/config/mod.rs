@@ -1,5 +1,6 @@
 pub mod migrations;
 pub mod schema;
+pub mod watcher;
 
 #[allow(unused_imports)]
 pub use schema::{

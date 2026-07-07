@@ -185,7 +185,7 @@ pub struct TuiApp {
     /// the TUI drains it each frame and runs the same `reload_config`
     /// pipeline that wizard close uses, so the agent picks up the
     /// change on the next turn without a restart.
-    pub config_watcher: Option<crate::tui::config_watcher::ConfigWatcher>,
+    pub config_watcher: Option<crate::config::watcher::ConfigWatcher>,
     /// Handle to the background channel runtime (Telegram/Discord/Slack/…
     /// listeners) spawned alongside the TUI. Held so a mid-session channel
     /// or skill change can cancel and respawn the runtime in place via
@@ -5557,7 +5557,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // config trigger a reload, mirroring the wizard-close path. This
     // is what makes `[mcp_servers.foo]` added by hand take effect
     // without restarting rantaiclaw.
-    match crate::tui::config_watcher::ConfigWatcher::watch(&app_config.config_path) {
+    match crate::config::watcher::ConfigWatcher::watch(&app_config.config_path) {
         Ok(watcher) => {
             app.config_watcher = Some(watcher);
         }
