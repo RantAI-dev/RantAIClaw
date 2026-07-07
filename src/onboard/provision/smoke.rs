@@ -145,6 +145,15 @@ fn assert_no_panic(events: &[ProvisionEvent]) {
 #[tokio::test]
 async fn smoke_all_registered_provisioners() {
     for (name, desc) in available() {
+        // whatsapp-web cannot be smoked headless: its provision flow IS a live
+        // WhatsApp Web pairing (real network handshake, then it waits for a QR
+        // scan that never comes), so it hits the 10s abort with no terminal
+        // event. The per-provisioner smoke modules below deliberately omit it
+        // for the same reason. On loaded runners the connect happened to fail
+        // fast (Failed = terminal), which is why this only flakes on quiet runs.
+        if name == "whatsapp-web" {
+            continue;
+        }
         let responses = super::registry::test_responses_for(name);
         let result = run_provisioner_headless(name, responses).await;
         match result {
