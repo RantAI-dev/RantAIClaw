@@ -192,8 +192,19 @@ where
 
     std::env::set_var("KB_DB_PATH", &db);
     std::env::set_var("KB_EMBEDDING_DIM", "4");
-    std::env::set_var("KB_EMBEDDING_API_KEY", "");
-    std::env::set_var("OPENROUTER_API_KEY", "");
+    // A NON-EMPTY embedding key is required: `build_ctx` fails fast with
+    // `kb_not_configured` (→ HTTP 503) when no key resolves, and that key
+    // otherwise comes from the ambient `OPENROUTER_API_KEY` — which other kb
+    // tests (rerank/retrieve) set to "test-key" and don't always restore, so
+    // leaving it empty here made the harness's 200-vs-503 outcome depend on
+    // test order. The value is never sent anywhere: these handlers exercise
+    // list/get/delete paths that don't call the embedder.
+    std::env::set_var("KB_EMBEDDING_API_KEY", "test-embedding-key");
+    std::env::remove_var("OPENROUTER_API_KEY");
+
+    // Drop any KB context a prior test cached (it is keyed on the db path, but
+    // a cached `Err` from an earlier no-key run must not leak into this one).
+    api::clear_kb_ctx().await;
 
     // Pre-create the store so the schema matches the env dim before any
     // handler opens its own connection.
