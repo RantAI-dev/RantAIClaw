@@ -54,16 +54,22 @@ fn with_home<F: FnOnce()>(f: F) {
 #[test]
 fn setup_runs_all_sections_in_canonical_order() {
     let order = wizard::canonical_section_order();
+    // `knowledge` is appended when the `kb` feature is on (the default build,
+    // incl. CI's `--workspace`); keep the expectation feature-aware so the
+    // test tracks `canonical_sections()` under either build.
+    let mut expected = vec![
+        "provider",
+        "approvals",
+        "channels",
+        "persona",
+        "skills",
+        "mcp",
+    ];
+    if cfg!(feature = "kb") {
+        expected.push("knowledge");
+    }
     assert_eq!(
-        order,
-        vec![
-            "provider",
-            "approvals",
-            "channels",
-            "persona",
-            "skills",
-            "mcp"
-        ],
+        order, expected,
         "canonical section order changed — update spec + tests together",
     );
 }
@@ -211,10 +217,14 @@ fn onboard_alias_dispatches_to_setup_with_no_topic() {
         let mut config = Config::default();
         let report = wizard::run_setup(&profile, &mut config, None, false, true)
             .expect("legacy-equivalent dispatch should succeed");
-        // No topic + non-interactive ⇒ every section visited at least once
-        // (some skipped, but never fewer than 6 outcomes total — Wave 4A
-        // added `approvals` between provider and channels).
-        assert_eq!(report.visited.len() + report.skipped.len(), 6);
+        // No topic + non-interactive ⇒ every section produces an outcome
+        // (visited or skipped). 6 core sections + `knowledge` when the `kb`
+        // feature is on (the default/CI build).
+        let expected_sections = if cfg!(feature = "kb") { 7 } else { 6 };
+        assert_eq!(
+            report.visited.len() + report.skipped.len(),
+            expected_sections
+        );
     });
 }
 
@@ -222,8 +232,10 @@ fn onboard_alias_dispatches_to_setup_with_no_topic() {
 
 #[test]
 fn welcome_banner_snapshot() {
-    let banner =
-        console::strip_ansi_codes(&rantaiclaw::onboard::ui::render_welcome_banner()).into_owned();
+    // The banner embeds `env!("CARGO_PKG_VERSION")`; redact it so the snapshot
+    // doesn't drift on every release bump (it had been pinned to v0.5.0).
+    let banner = console::strip_ansi_codes(&rantaiclaw::onboard::ui::render_welcome_banner())
+        .replace(env!("CARGO_PKG_VERSION"), "X.Y.Z");
     insta::assert_snapshot!("setup_welcome_banner", banner);
 }
 
