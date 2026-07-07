@@ -290,6 +290,34 @@ fn pair_token(gateway_url: &str, code: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// True ONLY when the gateway explicitly rejects `token` (HTTP 401/403) on an
+/// authenticated endpoint. A transport error, missing `curl`, timeout, or any
+/// other status returns false — a possibly-valid token must never be discarded
+/// on a transient failure (fail-safe: worst case we keep today's behavior).
+fn token_rejected(gateway_url: &str, token: &str) -> bool {
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-m",
+            "5",
+            &format!("{gateway_url}/api/v1/config"),
+            "-H",
+            &format!("Authorization: Bearer {token}"),
+        ])
+        .output();
+    match out {
+        // curl exits 0 even on 401 (no -f) — nonzero means transport failure.
+        Ok(o) if o.status.success() => {
+            matches!(String::from_utf8_lossy(&o.stdout).trim(), "401" | "403")
+        }
+        _ => false,
+    }
+}
+
 /// Path of the run-state file recording the background gateway/UI PIDs.
 fn run_file(dir: &Path) -> PathBuf {
     dir.join(".run")
@@ -474,14 +502,26 @@ fn start(
         }
     }
 
-    // 2. Pair if we don't already have a token — regardless of who started the
-    //    gateway. Auto-pair used to run only when *we* spawned the gateway (its
-    //    one-time code was in our log); against an already-running daemon it was
-    //    skipped, so the console launched token-less and the gateway answered
-    //    401 "requires pairing". Minting an on-demand "gateway" code and
-    //    exchanging it via POST /pair works in both cases — and even once the
-    //    daemon already holds tokens (a lost `.env.local`) — so no restart is
-    //    ever needed. `require_pairing` stays authoritative.
+    // 2. Self-heal a stale token. A token remembered in `.env.local` may have
+    //    been issued by a *previous* gateway instance (an update/restart that
+    //    reset `paired_tokens`, or another profile's gateway on the same port);
+    //    reusing it blindly launches the console into 401s ("Gateway Offline").
+    //    Probe an authed endpoint and drop the token ONLY on an explicit
+    //    401/403 — transient probe failures keep it, so a flaky check can
+    //    never make things worse than today's behavior.
+    if !token.is_empty() && config.gateway.require_pairing && token_rejected(&gateway, &token) {
+        println!("  ⚠ stored gateway token was rejected — re-pairing…");
+        token.clear();
+    }
+
+    // 3. Pair if we don't (or no longer) have a token — regardless of who
+    //    started the gateway. Auto-pair used to run only when *we* spawned the
+    //    gateway (its one-time code was in our log); against an already-running
+    //    daemon it was skipped, so the console launched token-less and the
+    //    gateway answered 401 "requires pairing". Minting an on-demand
+    //    "gateway" code and exchanging it via POST /pair works in both cases —
+    //    and even once the daemon already holds tokens (a lost `.env.local`) —
+    //    so no restart is ever needed. `require_pairing` stays authoritative.
     if token.is_empty() && config.gateway.require_pairing {
         match mint_and_pair(&gateway) {
             Some(t) => {
