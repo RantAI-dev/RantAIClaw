@@ -162,10 +162,20 @@ mod tests {
         ctx
     }
 
+    /// Restore the pre-test HOME instead of unsetting it — `remove_var` strips
+    /// HOME from the whole test process and breaks every later env-reading test.
+    fn restore_home(prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     #[test]
     fn default_shows_a_code() {
         let _g = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
         let mut ctx = test_context();
 
@@ -179,13 +189,14 @@ mod tests {
             other => panic!("expected Message, got {other:?}"),
         }
 
-        std::env::remove_var("HOME");
+        restore_home(prev_home);
     }
 
     #[test]
     fn no_owner_flag_is_chat_only() {
         let _g = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
         let mut ctx = test_context();
 
@@ -200,7 +211,7 @@ mod tests {
             other => panic!("expected Message, got {other:?}"),
         }
 
-        std::env::remove_var("HOME");
+        restore_home(prev_home);
     }
 
     #[test]

@@ -201,10 +201,20 @@ mod tests {
     /// mutex, held across awaits) because it mutates a process-global env var.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Restore the pre-test HOME instead of unsetting it — `remove_var` strips
+    /// HOME from the whole test process and breaks every later env-reading test.
+    fn restore_home(prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     #[tokio::test]
     async fn mint_returns_code_in_output() {
         let _g = ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
         let tool = IssuePairingCodeTool::new();
@@ -224,13 +234,14 @@ mod tests {
         assert!(res.output.contains("/bind"), "{}", res.output);
         assert!(res.output.contains("telegram"), "{}", res.output);
 
-        std::env::remove_var("HOME");
+        restore_home(prev_home);
     }
 
     #[tokio::test]
     async fn no_owner_flag_omits_claim_owner_line() {
         let _g = ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
         let tool = IssuePairingCodeTool::new();
@@ -247,13 +258,14 @@ mod tests {
             res.output
         );
 
-        std::env::remove_var("HOME");
+        restore_home(prev_home);
     }
 
     #[tokio::test]
     async fn missing_channel_is_rejected() {
         let _g = ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
         let tool = IssuePairingCodeTool::new();
@@ -261,6 +273,6 @@ mod tests {
         assert!(!res.success);
         assert!(res.error.unwrap_or_default().contains("missing `channel`"));
 
-        std::env::remove_var("HOME");
+        restore_home(prev_home);
     }
 }

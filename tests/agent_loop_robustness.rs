@@ -11,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use rantaiclaw::agent::agent::Agent;
 use rantaiclaw::agent::dispatcher::NativeToolDispatcher;
-use rantaiclaw::config::MemoryConfig;
+use rantaiclaw::config::{AgentConfig, MemoryConfig};
 use rantaiclaw::memory;
 use rantaiclaw::memory::Memory;
 use rantaiclaw::observability::{NoopObserver, Observer};
@@ -309,14 +309,19 @@ async fn agent_handles_mixed_tool_success_and_failure() {
 // TG4.3: Iteration limit enforcement (#777)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent should not exceed max_tool_iterations (default=10) even with
-/// a provider that keeps returning tool calls
+/// Agent should not exceed `max_tool_iterations` even with a provider that
+/// keeps returning tool calls. The limit is read from `AgentConfig::default()`
+/// (25 since v0.6.50) rather than hardcoded, so a future default bump doesn't
+/// silently invalidate the test.
 #[tokio::test]
 async fn agent_respects_max_tool_iterations() {
+    let limit = AgentConfig::default().max_tool_iterations;
+
     let (counting_tool, count) = CountingTool::new();
 
-    // Create 20 tool call responses - more than the default limit of 10
-    let mut responses: Vec<ChatResponse> = (0..20)
+    // Offer MORE tool-call responses than the limit so it is the cap — not a
+    // short response list — that stops the loop.
+    let mut responses: Vec<ChatResponse> = (0..limit + 5)
         .map(|i| {
             tool_response(vec![ToolCall {
                 id: format!("tc_{i}"),
@@ -338,8 +343,8 @@ async fn agent_respects_max_tool_iterations() {
 
     let invocations = *count.lock().unwrap();
     assert!(
-        invocations <= 10,
-        "tool invocations ({invocations}) should not exceed default max_tool_iterations (10)"
+        invocations <= limit,
+        "tool invocations ({invocations}) should not exceed max_tool_iterations ({limit})"
     );
 }
 

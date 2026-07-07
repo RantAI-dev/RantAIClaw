@@ -1941,8 +1941,10 @@ mod tests {
         assert!(create_provider("gemini", Some("test-key")).is_ok());
         assert!(create_provider("google", Some("test-key")).is_ok());
         assert!(create_provider("google-gemini", Some("test-key")).is_ok());
-        // Should also work without key (will try CLI auth)
-        assert!(create_provider("gemini", None).is_ok());
+        // The rig-native gemini client requires an API key at construction
+        // ("gemini: GEMINI_API_KEY required") — the legacy CLI-auth fallback
+        // this assertion used to cover no longer exists.
+        assert!(create_provider("gemini", None).is_err());
     }
 
     // ── OpenAI-compatible providers ──────────────────────────

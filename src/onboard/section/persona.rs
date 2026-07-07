@@ -82,6 +82,7 @@ mod tests {
     #[test]
     fn is_already_configured_flips_after_write() {
         let tmp = TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("RANTAICLAW_PROFILE");
         let profile = ProfileManager::ensure("rt-iac-section").unwrap();
@@ -94,6 +95,13 @@ mod tests {
         persona::write_persona_toml(&profile, &persona).unwrap();
 
         assert!(section.is_already_configured(&profile, &config));
+
+        // Restore the pre-test HOME — leaving it pointed at the (deleted)
+        // tempdir contaminates every later test that resolves paths via HOME.
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
