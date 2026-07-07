@@ -116,6 +116,9 @@ async fn get_config(
 /// Keep in sync with the encrypt/decrypt lists in config::schema.
 fn redact_config_secrets(cfg: &mut crate::config::Config) {
     cfg.api_key = None;
+    // Per-provider keys are the same credential class as `api_key` and are
+    // decrypted in memory — clear the whole map so none leak in the response.
+    cfg.provider_api_keys.clear();
     cfg.composio.api_key = None;
     cfg.browser.computer_use.api_key = None;
     cfg.web_search.brave_api_key = None;
@@ -755,6 +758,22 @@ mod tests {
         assert!(!json.contains("sk-vision-secret"));
         assert_eq!(cfg.knowledge.embedding_api_key, None);
         assert_eq!(cfg.knowledge.vision_api_key, None);
+    }
+
+    #[test]
+    fn redact_config_secrets_clears_per_provider_keys() {
+        // `provider_api_keys` is decrypted in memory and serialized; it must not
+        // survive redaction into a `GET /config` response.
+        let mut cfg = Config::default();
+        cfg.provider_api_keys
+            .insert("openai".into(), "sk-openai-secret".into());
+        cfg.provider_api_keys
+            .insert("minimax".into(), "mm-secret".into());
+        redact_config_secrets(&mut cfg);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("sk-openai-secret"), "leaked in:\n{json}");
+        assert!(!json.contains("mm-secret"), "leaked in:\n{json}");
+        assert!(cfg.provider_api_keys.is_empty());
     }
 
     #[test]
