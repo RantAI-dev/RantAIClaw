@@ -4,15 +4,11 @@
 //! `src/skills/watcher.rs` uses, so editor saves and `cat >> config.toml`
 //! both arrive as a single tick.
 //!
-//! The receiver is drained each render frame by `TuiApp`; on tick it
-//! calls `reload_config`, which already handles the full reload
-//! pipeline (decrypt secrets, push `TurnRequest::Reload` to the agent
-//! actor, refresh status-bar / `/model` picker / `/channels` snapshot).
-//!
-//! This is what closes the "user edited config.toml directly — agent
-//! still uses old provider/MCP servers" gap. Wizard-driven reload was
-//! already wired (`reload_config` is called when the setup overlay
-//! closes); this watcher is the missing direct-edit half.
+//! Consumers drain `reload_rx` and reload the running config on each tick:
+//! the TUI (`TuiApp::reload_config`, per-frame) and the gateway
+//! (`run_gateway` swaps its shared `Config` so the web console reflects the
+//! change). This closes the "edited config.toml directly — running process
+//! still uses the old provider / MCP servers" gap on both surfaces.
 
 use std::path::Path;
 use std::time::Duration;
