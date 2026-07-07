@@ -204,13 +204,16 @@ fn migrate_help_shows_from_flag_with_openclaw_zeroclaw_auto() {
 }
 
 #[test]
-fn version_reports_v0_5_0() {
+fn version_reports_package_version() {
     let _guard = CMD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = TempDir::new().expect("tempdir");
 
+    // Assert against the crate version rather than a hardcoded string so the
+    // test tracks every release bump (it was pinned to 0.5.0 and had been red
+    // since the 0.6.x line).
     cmd(&home)
         .args(["--version"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.5.0"));
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
