@@ -5,6 +5,35 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2-alpha] — 2026-07-07
+
+### Security
+
+- **`GET /api/v1/config` no longer leaks per-provider API keys.** The endpoint
+  cleared every other at-rest secret but missed `config.provider_api_keys` (a
+  per-provider key map, decrypted in memory), so its "redacted" response
+  returned every provider key in plaintext to any authenticated client — and
+  into the web console's browser response. `provider_api_keys` is now redacted
+  like the rest. Key *presence* is still available via `GET /api/v1/secrets`.
+
+### Fixed
+
+- **The web console reflects a provider (or any config) changed in the TUI
+  without a daemon restart.** The gateway served `GET /api/v1/config` from the
+  config it loaded at startup and never watched `config.toml`, so a TUI edit
+  didn't reach the console until a restart. The gateway now hot-reloads its
+  running config when `config.toml` changes (same decrypt pass as startup). The
+  `config.toml` watcher moved from `tui/` to `config/` so both surfaces share it.
+- **The web console now pairs against an already-running gateway.** `rantaiclaw
+  ui start` only auto-paired when it spawned the gateway itself (reading the
+  one-time code from its own log); against a running daemon it skipped pairing,
+  wrote an empty token, and the console got 401 *"Gateway requires pairing…"* —
+  the common fresh-install case. It now mints a short-lived on-demand `gateway`
+  pairing code and exchanges it via `POST /pair` (which the gateway already
+  honours from the store), so it pairs whether or not it started the gateway,
+  and can re-pair after a lost `.env.local` without a restart. `require_pairing`
+  stays authoritative.
+
 ## [0.7.1-alpha] — 2026-07-06
 
 ### Fixed
