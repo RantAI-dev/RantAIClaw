@@ -44,10 +44,13 @@ jobs:
             - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
               with:
                   token: ${{ secrets.GITHUB_TOKEN }}
-                  # russh SSH stack (opt-in remote-install tools); mirrors deny.toml.
+                  # Mirrors deny.toml. russh SSH stack (opt-in remote-install tools):
                   # rsa Marvin sidechannel + russh/russh-cryptovec allocation advisories,
                   # no upstream fix for the 2026 set — revisit on a russh bump.
-                  ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0153,RUSTSEC-2026-0154,RUSTSEC-2026-0159
+                  # quick-xml DoS advisories via docx-rs (opt-in kb-office DOCX
+                  # ingestion; latest docx-rs still requires quick-xml ^0.36, no
+                  # fixed upstream) — revisit on a docx-rs quick-xml >= 0.41 bump.
+                  ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0153,RUSTSEC-2026-0154,RUSTSEC-2026-0159,RUSTSEC-2026-0194,RUSTSEC-2026-0195
 
     deny:
         name: License & Supply Chain
