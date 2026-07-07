@@ -29,24 +29,21 @@ fn curated_lists_have_no_overlapping_slugs() {
             s.slug
         );
     }
-    // Sanity floor — if either list shrinks below the spec, the test
-    // catches the regression. Spec §"Section 5 — mcp (NEW)" calls for
-    // 3 zero-auth + 6 authed.
-    assert_eq!(NO_AUTH.len(), 3, "expected 3 zero-auth servers");
-    assert_eq!(AUTHED.len(), 6, "expected 6 authed servers");
+    // Sanity floor — if either list shrinks unexpectedly, this catches the
+    // regression. The spec originally called for 3 zero-auth + 6 authed, but
+    // `filesystem` (zero-auth) was dropped in v0.6.51 and Google Calendar +
+    // Gmail (authed) were removed 2026-05-14 when their npm packages 404'd —
+    // see the removal notes in `src/mcp/curated.rs`. Current floor: 2 + 4.
+    assert_eq!(NO_AUTH.len(), 2, "expected 2 zero-auth servers");
+    assert_eq!(AUTHED.len(), 4, "expected 4 authed servers");
 }
 
 #[test]
 fn curated_authed_covers_required_providers() {
-    // Spec: Notion, Google Drive, Slack, Google Calendar, Gmail, GitHub.
-    let must = [
-        "notion",
-        "google-drive",
-        "slack",
-        "google-calendar",
-        "gmail",
-        "github",
-    ];
+    // Currently curated authed servers. Google Calendar + Gmail were removed
+    // 2026-05-14 (npm packages 404, no official replacement) — their
+    // `OAuthProvider` variants are kept but they're no longer curated.
+    let must = ["notion", "google-drive", "slack", "github"];
     let actual: HashSet<&str> = AUTHED.iter().map(|s| s.slug).collect();
     for slug in must {
         assert!(actual.contains(slug), "missing curated server: {slug}");
