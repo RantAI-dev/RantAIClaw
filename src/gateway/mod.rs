@@ -2411,6 +2411,7 @@ mod tests {
     fn gateway_store_minted_code_is_consumed_and_issues_token() {
         let _g = HOME_ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
 
         // Resolve the same profile root the handler will, and mint a "gateway"
@@ -2438,7 +2439,13 @@ mod tests {
             "issued token must authenticate against the guard"
         );
 
-        std::env::remove_var("HOME");
+        // Restore the original HOME rather than unsetting it — removing it
+        // strips HOME from the whole test process, and every later test that
+        // reads the environment (e.g. shell_preserves_path_and_home) fails.
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
