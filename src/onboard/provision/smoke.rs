@@ -6,12 +6,12 @@
 //! blocking forever or panicking.
 //!
 //! Run with:
-//! ```
+//! ```text
 //! cargo test --lib onboard::provision::smoke
 //! ```
 //!
 //! Or for a single provisioner:
-//! ```
+//! ```text
 //! cargo test --lib onboard::provision::smoke::telegram
 //! ```
 
