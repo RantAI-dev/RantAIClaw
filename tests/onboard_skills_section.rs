@@ -275,9 +275,13 @@ async fn clawhub_list_top_uses_stars_sort_and_caches() {
 }
 
 /// Mock that responds to the *three* endpoints `install_one` walks:
-///   - `/skills/<slug>`                       → metadata with latestVersion.version
-///   - `/skills/<slug>/versions/<v>`          → manifest with files[*]
-///   - `/skills/<slug>/versions/<v>/files/<p>` → raw file body
+///   - `/skills/<slug>`                        → metadata with latestVersion.version
+///   - `/skills/<slug>/versions/<v>`           → manifest with files[*]
+///   - `/skills/<slug>/file?version=<v>&path=<p>` → raw file body
+///
+/// The file endpoint is the singular `/file?version=&path=` query form the
+/// installer switched to (the plural `/versions/:v/files/:path` shape 404s
+/// upstream — see the note in `skills::clawhub::install_one`).
 ///
 /// Returns base url + a thread-shared state struct so tests can introspect
 /// what got requested.
@@ -320,38 +324,38 @@ async fn spawn_mock_clawhub_full(
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 st.paths.lock().unwrap().push(path.clone());
 
-                let (status, ctype, body): (&str, &str, Vec<u8>) =
-                    if path.contains("/files/SKILL.md") {
-                        ("200 OK", "text/markdown", payload.0.clone())
-                    } else if path.contains("/versions/") {
-                        let manifest = serde_json::json!({
-                            "version": {
-                                "version": "1.0.0",
-                                "files": [{
-                                    "path": "SKILL.md",
-                                    "size": payload.0.len(),
-                                    "sha256": payload.1,
-                                    "contentType": "text/markdown",
-                                }]
-                            }
-                        });
-                        (
-                            "200 OK",
-                            "application/json",
-                            manifest.to_string().into_bytes(),
-                        )
-                    } else {
-                        // /skills/<slug> detail
-                        let detail = serde_json::json!({
-                            "skill": {"slug": "demo"},
-                            "latestVersion": {"version": "1.0.0"}
-                        });
-                        (
-                            "200 OK",
-                            "application/json",
-                            detail.to_string().into_bytes(),
-                        )
-                    };
+                let (status, ctype, body): (&str, &str, Vec<u8>) = if path.contains("/file?") {
+                    // Singular file endpoint: `/skills/<slug>/file?version=&path=`.
+                    ("200 OK", "text/markdown", payload.0.clone())
+                } else if path.contains("/versions/") {
+                    let manifest = serde_json::json!({
+                        "version": {
+                            "version": "1.0.0",
+                            "files": [{
+                                "path": "SKILL.md",
+                                "size": payload.0.len(),
+                                "sha256": payload.1,
+                                "contentType": "text/markdown",
+                            }]
+                        }
+                    });
+                    (
+                        "200 OK",
+                        "application/json",
+                        manifest.to_string().into_bytes(),
+                    )
+                } else {
+                    // /skills/<slug> detail
+                    let detail = serde_json::json!({
+                        "skill": {"slug": "demo"},
+                        "latestVersion": {"version": "1.0.0"}
+                    });
+                    (
+                        "200 OK",
+                        "application/json",
+                        detail.to_string().into_bytes(),
+                    )
+                };
 
                 let header = format!(
                     "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
