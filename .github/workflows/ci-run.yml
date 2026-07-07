@@ -85,7 +85,15 @@ jobs:
               # test --locked` is the known-good invocation from prior to
               # the v0.6.40-alpha CI overhaul and is what the v0.6.40-alpha
               # release was actually verified against.
-              run: cargo test --locked --workspace
+              #
+              # `--test-threads=1`: many unit tests mutate process-global env
+              # (HOME, RANTAICLAW_CONFIG_DIR) behind per-file locks that don't
+              # serialize across modules, so the parallel run failed ~10 tests
+              # on every main push (store_minted_*_code_claims_owner,
+              # shell_preserves_path_and_home). The lib suite's parallel wall
+              # time was ~5s, so running serially costs well under the job cap.
+              # Cross-module env-lock hygiene is the follow-up that lifts this.
+              run: cargo test --locked --workspace -- --test-threads=1
 
     features:
         name: Features (${{ matrix.name }})
