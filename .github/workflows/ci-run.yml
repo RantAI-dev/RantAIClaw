@@ -79,6 +79,20 @@ jobs:
               with:
                   toolchain: 1.92.0
             - uses: Swatinem/rust-cache@v2
+            - name: Free up runner disk space
+              # `cargo test --locked --workspace` links ~32 debug test binaries,
+              # each carrying the full rantaiclaw lib + heavy deps (matrix-sdk,
+              # russh, aws-lc, …). Their combined `target/` has intermittently
+              # exhausted the ubuntu-latest disk ("No space left on device",
+              # plus an ld SIGBUS on a full disk), failing the Test job on some
+              # main pushes. Reclaim the preinstalled toolchains we don't use
+              # (~25 GB) so the build has ample headroom.
+              run: |
+                  df -h /
+                  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+                  sudo docker image prune --all --force || true
+                  df -h /
             - name: Run tests
               # `cargo nextest` was tried first but the runner consistently
               # SIGTERM'd or hit the 30-min cap on this codebase. `cargo
