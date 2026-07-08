@@ -587,7 +587,13 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let unit = format!(
-        "[Unit]\nDescription=RantaiClaw daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        // KillSignal=SIGTERM (explicit) + KillMode=mixed: send SIGTERM only to
+        // the main daemon so it runs its own graceful shutdown (drain, stop
+        // auto-managed containers, clear the sentinel), and only SIGKILL any
+        // cgroup stragglers after the timeout. TimeoutStopSec=30 leaves room
+        // for `docker stop` (default ~10s grace) on one or two auto-launch
+        // services before systemd force-kills.
+        "[Unit]\nDescription=RantaiClaw daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\nKillSignal=SIGTERM\nKillMode=mixed\nTimeoutStopSec=30\n\n[Install]\nWantedBy=default.target\n",
         exe.display()
     );
 

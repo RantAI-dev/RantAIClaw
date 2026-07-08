@@ -116,7 +116,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("   Components: gateway, channels, heartbeat, scheduler");
     println!("   Ctrl+C to stop");
 
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await;
+    println!("⏻ shutting down — stopping components and cleaning up…");
     crate::health::mark_component_error("daemon", "shutdown requested");
 
     for handle in &handles {
@@ -139,6 +140,39 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Block until the daemon receives a shutdown signal — Ctrl+C (SIGINT) or, on
+/// Unix, SIGTERM (what `systemctl stop` / `launchctl stop` and a plain `kill`
+/// send). Handling SIGTERM is the point: without this arm the daemon took the
+/// default "terminate immediately" disposition on every service stop/restart/
+/// reboot, so it never ran the graceful path below (component abort →
+/// `services::stop_all` → `clear_sentinel`), leaking auto-managed containers
+/// and leaving a stale sentinel.
+///
+/// Infallible on purpose: if the SIGTERM handler can't be installed we log and
+/// fall back to Ctrl+C only, rather than refusing to start the daemon.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("SIGTERM handler unavailable ({e}); Ctrl+C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
