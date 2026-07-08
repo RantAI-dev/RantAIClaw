@@ -1705,7 +1705,16 @@ async fn main() -> Result<()> {
             } else {
                 info!("🚀 Starting RantaiClaw Gateway on {host}:{port}");
             }
-            gateway::run_gateway(&host, port, config).await
+            // The standalone `gateway` command keeps today's behavior (runs
+            // until the process is signalled); pass a token that is never
+            // cancelled. Graceful drain here is a separate follow-up.
+            gateway::run_gateway(
+                &host,
+                port,
+                config,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
         }
 
         Some(Commands::Daemon { port, host }) => {
