@@ -335,7 +335,9 @@ async fn agent_chat_sync(
         .unwrap_or_else(|| "unknown".to_string());
 
     let started = std::time::Instant::now();
-    let mut agent = crate::agent::Agent::from_config(&config)
+    // Use the gateway's shared observer so this request's metrics land in the
+    // same registry `/metrics` exposes (not a throwaway per-request one).
+    let mut agent = crate::agent::Agent::from_config_with_observer(&config, state.observer.clone())
         .await
         .map_err(err_500)?;
     // Continue an existing conversation: re-feed prior turns so the model
@@ -398,9 +400,11 @@ async fn agent_chat_stream(
     // tool-gating is on (default — unless `autonomous_tools`).
     let web_approvals = state.web_approvals.clone();
     let gate_tools = !config.channels_config.autonomous_tools;
+    // Share the gateway observer so streamed-chat metrics reach `/metrics`.
+    let observer = state.observer.clone();
 
     tokio::spawn(async move {
-        match crate::agent::Agent::from_config(&config).await {
+        match crate::agent::Agent::from_config_with_observer(&config, observer).await {
             Ok(mut agent) => {
                 // Gate non-read-only tools through an in-browser modal: the
                 // agent pauses, emits `AgentEvent::ApprovalRequest` over this
