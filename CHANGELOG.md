@@ -5,6 +5,26 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5-alpha] — 2026-07-08
+
+### Added
+
+- **`GET /readyz` readiness endpoint.** Returns 200 when every supervised
+  component is healthy and 503 (with the offending component names) when any
+  is in the `error` state, so a Kubernetes/compose readiness probe can pull a
+  crash-looping instance out of rotation. `/health` is unchanged (liveness).
+
+### Fixed
+
+- **Agent-chat API metrics now reach `/metrics`.** `POST /api/v1/agent/chat`
+  (sync and streaming) built its agent with a throwaway per-request observer,
+  so its metrics were never scraped. It now uses the gateway's shared observer.
+
+### Internal
+
+- Added deterministic tests for the self-update integrity gates
+  (`compute_sha256`, `verify_sha256`, `verify_installed_binary`).
+
 ## [0.7.4-alpha] — 2026-07-08
 
 ### Changed
