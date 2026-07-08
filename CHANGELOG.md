@@ -5,6 +5,29 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4-alpha] — 2026-07-08
+
+### Changed
+
+- **The daemon now shuts down gracefully on `SIGTERM`, not just Ctrl+C.**
+  `systemctl stop` / `launchctl stop` / a plain `kill` send `SIGTERM`, which
+  the daemon previously took as an immediate terminate — skipping its cleanup
+  and leaking auto-managed containers (e.g. SearXNG) plus a stale daemon
+  sentinel that confused `profile use`/handoff. It now runs the full graceful
+  path on either signal, and the generated systemd unit sets
+  `KillSignal=SIGTERM` + `KillMode=mixed` + `TimeoutStopSec=30` to bound the
+  stop.
+- **The gateway drains in-flight HTTP requests on shutdown.** On stop, the
+  gateway stops accepting new connections and lets in-flight requests (webhook
+  processing, API calls, streaming chats) finish — bounded to 8s — instead of
+  the connection being severed mid-request.
+
+### Security
+
+- Bumped `calamine` 0.30 → 0.36 (quick-xml → 0.41), removing the vulnerable
+  parser (RUSTSEC-2026-0194/0195, DoS-class) from the `kb-office` xlsx path,
+  and `crossbeam-epoch` → 0.9.20 (RUSTSEC-2026-0204).
+
 ## [0.7.3-alpha] — 2026-07-07
 
 ### Fixed
