@@ -1315,4 +1315,94 @@ mod tests {
         assert_eq!(strip_v_prefix("v0.6.2-alpha"), "0.6.2-alpha");
         assert_eq!(strip_v_prefix("0.6.2-alpha"), "0.6.2-alpha");
     }
+
+    // ── Integrity gate: checksum verification ──────────────────────────────
+
+    #[test]
+    fn compute_sha256_matches_known_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("blob");
+        fs::write(&p, b"abc").unwrap();
+        // Well-known SHA-256 test vector for the bytes "abc".
+        assert_eq!(
+            compute_sha256(&p).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn verify_sha256_accepts_the_matching_sum() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("rantaiclaw.tar.gz");
+        fs::write(&archive, b"the release bytes").unwrap();
+        let sum = compute_sha256(&archive).unwrap();
+        let sums = dir.path().join("SHA256SUMS");
+        fs::write(&sums, format!("{sum}  rantaiclaw.tar.gz\n")).unwrap();
+
+        verify_sha256(&archive, &sums, "rantaiclaw.tar.gz").expect("matching sum must verify");
+    }
+
+    #[test]
+    fn verify_sha256_rejects_a_tampered_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("rantaiclaw.tar.gz");
+        fs::write(&archive, b"tampered bytes").unwrap();
+        let sums = dir.path().join("SHA256SUMS");
+        // A digest that does not match the archive's real content.
+        fs::write(
+            &sums,
+            "0000000000000000000000000000000000000000000000000000000000000000  rantaiclaw.tar.gz\n",
+        )
+        .unwrap();
+
+        let err = verify_sha256(&archive, &sums, "rantaiclaw.tar.gz").unwrap_err();
+        assert!(
+            err.to_string().contains("SHA256 mismatch"),
+            "expected a mismatch error, got: {err}"
+        );
+    }
+
+    // ── Post-swap check: the new binary reports the expected version ───────
+
+    #[cfg(unix)]
+    fn write_version_stub(path: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_installed_binary_accepts_matching_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("rantaiclaw-stub");
+        write_version_stub(&bin, "#!/bin/sh\necho '0.7.5-alpha'\n");
+        verify_installed_binary(&bin, "0.7.5-alpha").expect("matching version must verify");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_installed_binary_rejects_version_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("rantaiclaw-stub");
+        write_version_stub(&bin, "#!/bin/sh\necho '0.0.1-wrong'\n");
+        let err = verify_installed_binary(&bin, "0.7.5-alpha").unwrap_err();
+        assert!(
+            err.to_string().contains("version mismatch"),
+            "expected a version-mismatch error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_installed_binary_rejects_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("rantaiclaw-stub");
+        write_version_stub(&bin, "#!/bin/sh\necho boom >&2\nexit 3\n");
+        let err = verify_installed_binary(&bin, "0.7.5-alpha").unwrap_err();
+        assert!(
+            err.to_string().contains("exited"),
+            "expected a nonzero-exit error, got: {err}"
+        );
+    }
 }
