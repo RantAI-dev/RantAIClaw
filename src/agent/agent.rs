@@ -359,9 +359,21 @@ impl Agent {
         Ok(())
     }
 
+    /// Build an agent from config with a fresh observer derived from
+    /// `config.observability`. Most callers (CLI, channels) want this.
     pub async fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
+        Self::from_config_with_observer(config, observer).await
+    }
+
+    /// Build an agent from config but with a caller-supplied observer. The
+    /// gateway passes its shared observer so per-request metrics land in the
+    /// same registry `/metrics` exposes, instead of a throwaway per-agent one.
+    pub async fn from_config_with_observer(
+        config: &Config,
+        observer: Arc<dyn Observer>,
+    ) -> Result<Self> {
         let runtime: Arc<dyn runtime::RuntimeAdapter> =
             Arc::from(runtime::create_runtime(&config.runtime)?);
         let policy_dir = crate::profile::ProfileManager::active()
@@ -1038,6 +1050,26 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use parking_lot::Mutex;
+
+    /// The gateway shares one observer across requests so metrics reach a
+    /// single `/metrics` registry. Verify the injected observer is the exact
+    /// Arc the agent ends up holding (not a throwaway one built internally).
+    #[tokio::test]
+    async fn from_config_with_observer_holds_the_injected_observer() {
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = std::env::temp_dir();
+        config.memory.backend = "none".into();
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::from_config_with_observer(&config, observer.clone())
+            .await
+            .expect("from_config_with_observer should build");
+
+        assert!(
+            Arc::ptr_eq(&observer, &agent.observer),
+            "agent must reuse the injected observer, not build its own"
+        );
+    }
 
     struct MockProvider {
         responses: Mutex<Vec<crate::providers::ChatResponse>>,
