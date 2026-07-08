@@ -350,7 +350,12 @@ pub struct AppState {
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
-pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
+pub async fn run_gateway(
+    host: &str,
+    port: u16,
+    config: Config,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<()> {
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
@@ -725,11 +730,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let app = app.with_state(state);
 
-    // Run the server
+    // Run the server. `with_graceful_shutdown` lets in-flight requests finish
+    // (and stops accepting new connections) when `shutdown` is cancelled,
+    // instead of the connection being dropped when the daemon aborts the task.
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move { shutdown.cancelled().await })
     .await?;
 
     Ok(())

@@ -7,8 +7,14 @@ use std::future::Future;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
+
+/// How long to let the gateway finish in-flight HTTP requests after a shutdown
+/// signal before it is force-aborted. Well under systemd's `TimeoutStopSec=30`
+/// so the whole stop (drain + `stop_all`) stays inside the unit's window.
+const GATEWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
@@ -47,22 +53,33 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 .await;
     }
 
+    // Shared shutdown signal. Cancelled once on stop so the gateway can drain
+    // in-flight HTTP requests (via axum `with_graceful_shutdown`) instead of
+    // being dropped mid-request, and so supervisors don't restart a component
+    // that exited *because* of the shutdown.
+    let shutdown = CancellationToken::new();
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
-    {
+    // The gateway is held separately so we can await its drain before aborting
+    // the rest; it is the only component with in-flight request state to save.
+    let mut gateway_handle = {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
-        handles.push(spawn_component_supervisor(
+        let gateway_shutdown = shutdown.clone();
+        spawn_component_supervisor(
             "gateway",
             initial_backoff,
             max_backoff,
+            shutdown.clone(),
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { crate::gateway::run_gateway(&host, port, cfg).await }
+                let sd = gateway_shutdown.clone();
+                async move { crate::gateway::run_gateway(&host, port, cfg, sd).await }
             },
-        ));
-    }
+        )
+    };
 
     {
         if has_supervised_channels(&config) {
@@ -71,6 +88,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 "channels",
                 initial_backoff,
                 max_backoff,
+                shutdown.clone(),
                 move || {
                     let cfg = channels_cfg.clone();
                     async move { crate::channels::start_channels(cfg).await }
@@ -88,6 +106,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             "heartbeat",
             initial_backoff,
             max_backoff,
+            shutdown.clone(),
             move || {
                 let cfg = heartbeat_cfg.clone();
                 Box::pin(run_heartbeat_worker(cfg))
@@ -101,6 +120,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             "scheduler",
             initial_backoff,
             max_backoff,
+            shutdown.clone(),
             move || {
                 let cfg = scheduler_cfg.clone();
                 async move { crate::cron::scheduler::run(cfg).await }
@@ -117,9 +137,25 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("   Ctrl+C to stop");
 
     shutdown_signal().await;
-    println!("⏻ shutting down — stopping components and cleaning up…");
+    println!("⏻ shutting down — draining in-flight requests, then cleaning up…");
     crate::health::mark_component_error("daemon", "shutdown requested");
 
+    // Signal graceful shutdown: the gateway stops accepting new connections and
+    // finishes in-flight requests; supervisors won't restart on the resulting
+    // clean exit.
+    shutdown.cancel();
+
+    // Give the gateway a bounded window to drain. On timeout, force it.
+    if tokio::time::timeout(GATEWAY_DRAIN_TIMEOUT, &mut gateway_handle)
+        .await
+        .is_err()
+    {
+        gateway_handle.abort();
+        let _ = gateway_handle.await;
+    }
+
+    // The remaining components (channels/heartbeat/scheduler) have no in-flight
+    // request state to save, so abort them directly.
     for handle in &handles {
         handle.abort();
     }
@@ -210,6 +246,7 @@ fn spawn_component_supervisor<F, Fut>(
     name: &'static str,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    shutdown: CancellationToken,
     mut run_component: F,
 ) -> JoinHandle<()>
 where
@@ -222,7 +259,13 @@ where
 
         loop {
             crate::health::mark_component_ok(name);
-            match run_component().await {
+            let outcome = run_component().await;
+            // The component exited because we're shutting down (e.g. the gateway
+            // finished its graceful drain) — stop, don't restart it.
+            if shutdown.is_cancelled() {
+                break;
+            }
+            match outcome {
                 Ok(()) => {
                     crate::health::mark_component_error(name, "component exited unexpectedly");
                     tracing::warn!("Daemon component '{name}' exited unexpectedly");
@@ -343,9 +386,13 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_error_and_restart_on_failure() {
-        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, || async {
-            anyhow::bail!("boom")
-        });
+        let handle = spawn_component_supervisor(
+            "daemon-test-fail",
+            1,
+            1,
+            CancellationToken::new(),
+            || async { anyhow::bail!("boom") },
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
@@ -363,7 +410,13 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_unexpected_exit_as_error() {
-        let handle = spawn_component_supervisor("daemon-test-exit", 1, 1, || async { Ok(()) });
+        let handle = spawn_component_supervisor(
+            "daemon-test-exit",
+            1,
+            1,
+            CancellationToken::new(),
+            || async { Ok(()) },
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
