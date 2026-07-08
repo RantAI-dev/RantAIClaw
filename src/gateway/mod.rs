@@ -609,7 +609,8 @@ pub async fn run_gateway(
     if nextcloud_talk_channel.is_some() {
         println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
     }
-    println!("  GET  /health    — health check");
+    println!("  GET  /health    — liveness check");
+    println!("  GET  /readyz    — readiness check (503 if a component is down)");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
         println!();
@@ -681,6 +682,7 @@ pub async fn run_gateway(
     // Build router with middleware
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/readyz", get(handle_readyz))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
@@ -747,7 +749,8 @@ pub async fn run_gateway(
 // AXUM HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// GET /health — always public (no secrets leaked)
+/// GET /health — liveness. Always 200 if the gateway is serving (that is the
+/// signal). Public, no secrets leaked. Use `/readyz` for readiness.
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
@@ -755,6 +758,27 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
+}
+
+/// GET /readyz — readiness. 200 when every supervised component is healthy,
+/// 503 (with the offending component names) when any is in the `error` state,
+/// so an orchestrator can pull a crash-looping instance out of rotation.
+/// Public, no secrets leaked.
+async fn handle_readyz() -> impl IntoResponse {
+    let snap = crate::health::snapshot();
+    let unhealthy = snap.unhealthy_components();
+    let ready = unhealthy.is_empty();
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = serde_json::json!({
+        "status": if ready { "ready" } else { "unready" },
+        "unhealthy_components": unhealthy,
+        "runtime": serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({})),
+    });
+    (code, Json(body))
 }
 
 /// Prometheus content type for text exposition format.

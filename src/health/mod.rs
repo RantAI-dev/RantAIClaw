@@ -22,6 +22,25 @@ pub struct HealthSnapshot {
     pub components: BTreeMap<String, ComponentHealth>,
 }
 
+impl HealthSnapshot {
+    /// Names of components currently in the `error` state (failed and awaiting
+    /// restart). Drives the `/readyz` readiness verdict so an orchestrator can
+    /// take a crash-looping instance out of rotation. A `starting` component is
+    /// not counted — it is initializing, not broken.
+    pub fn unhealthy_components(&self) -> Vec<String> {
+        self.components
+            .iter()
+            .filter(|(_, c)| c.status == "error")
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// True when no supervised component is in the `error` state.
+    pub fn is_ready(&self) -> bool {
+        self.unhealthy_components().is_empty()
+    }
+}
+
 struct HealthRegistry {
     started_at: Instant,
     components: Mutex<BTreeMap<String, ComponentHealth>>,
@@ -180,5 +199,51 @@ mod tests {
         assert!(component_json["updated_at"].as_str().is_some());
         assert!(component_json["last_ok"].as_str().is_some());
         assert!(json["uptime_seconds"].as_u64().is_some());
+    }
+
+    // Readiness is a pure function of a snapshot — build snapshots directly so
+    // these tests don't touch the process-global registry.
+    fn component(status: &str) -> ComponentHealth {
+        ComponentHealth {
+            status: status.into(),
+            updated_at: "t".into(),
+            last_ok: None,
+            last_error: None,
+            restart_count: 0,
+        }
+    }
+
+    fn snapshot_with(entries: &[(&str, &str)]) -> HealthSnapshot {
+        HealthSnapshot {
+            pid: 1,
+            updated_at: "t".into(),
+            uptime_seconds: 0,
+            components: entries
+                .iter()
+                .map(|(name, status)| ((*name).to_string(), component(status)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn readiness_ready_when_all_ok_or_starting() {
+        let snap = snapshot_with(&[("gateway", "ok"), ("channels", "starting")]);
+        assert!(snap.is_ready());
+        assert!(snap.unhealthy_components().is_empty());
+    }
+
+    #[test]
+    fn readiness_not_ready_lists_errored_components() {
+        let snap = snapshot_with(&[("gateway", "ok"), ("channels", "error"), ("cron", "error")]);
+        assert!(!snap.is_ready());
+        assert_eq!(
+            snap.unhealthy_components(),
+            vec!["channels".to_string(), "cron".to_string()]
+        );
+    }
+
+    #[test]
+    fn readiness_ready_when_no_components() {
+        assert!(snapshot_with(&[]).is_ready());
     }
 }
