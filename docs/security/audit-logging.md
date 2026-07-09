@@ -6,6 +6,7 @@
 > For current runtime behavior, see [config-reference.md](../reference/config.md), [operations-runbook.md](../operations/runbook.md), and [troubleshooting.md](../start/troubleshooting.md).
 
 ## Problem
+
 RantaiClaw logs actions but lacks tamper-evident audit trails for:
 - Who executed what command
 - When and from which channel

@@ -49,6 +49,7 @@ RantaiClaw already has **excellent application-layer security**:
 ## Implementation Roadmap
 
 ### Phase 1: Quick Wins (1-2 weeks)
+
 **Goal**: Address critical gaps with minimal complexity
 
 | Task | File | Effort | Impact |
@@ -67,6 +68,7 @@ RantaiClaw already has **excellent application-layer security**:
 ---
 
 ### Phase 2: Platform Integration (2-3 weeks)
+
 **Goal**: Deep OS integration for production-grade isolation
 
 | Task | Effort | Impact |
@@ -86,6 +88,7 @@ RantaiClaw already has **excellent application-layer security**:
 ---
 
 ### Phase 3: Production Hardening (1-2 weeks)
+
 **Goal**: Enterprise security features
 
 | Task | Effort | Impact |

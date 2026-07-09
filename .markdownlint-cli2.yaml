@@ -14,3 +14,7 @@ config:
 
 ignores:
   - "target/**"
+  # Immutable historical snapshots (see CLAUDE.md 4.1) — not held to current style.
+  - "docs/project/archive/**"
+  # Large imported task/spec doc — kept verbatim, not authored product prose.
+  - "docs/tui/TUI-interactive.md"
