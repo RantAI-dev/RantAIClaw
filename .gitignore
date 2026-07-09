@@ -9,6 +9,10 @@ __pycache__/
 *.pyc
 docker-compose.override.yml
 
+# Local scratch logs & temp probe files (never source)
+*.log
+.tmp*
+
 # Environment files (may contain secrets)
 .env
 
@@ -35,8 +39,9 @@ credentials.json
 memory/
 state/
 
-# Agent implementation plans (scratchpad — not product docs)
+# Agent implementation plans & specs (scratchpad — not product docs)
 docs/superpowers/plans/
+docs/superpowers/specs/
 
 # Local product experiments live as separate repos and are not pushed here.
 product/

@@ -18,10 +18,10 @@
 <p align="center">
   <a href="#install"><strong>Install</strong></a> ·
   <a href="https://clawhub.ai">ClawHub Skills</a> ·
-  <a href="docs/config-reference.md">Config</a> ·
-  <a href="docs/channels-reference.md">Channels</a> ·
-  <a href="docs/providers-reference.md">Providers</a> ·
-  <a href="docs/troubleshooting.md">Troubleshooting</a> ·
+  <a href="docs/reference/config.md">Config</a> ·
+  <a href="docs/reference/channels.md">Channels</a> ·
+  <a href="docs/reference/providers.md">Providers</a> ·
+  <a href="docs/start/troubleshooting.md">Troubleshooting</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
@@ -58,7 +58,7 @@ Both installers detect your arch, download the matching prebuilt binary, verify 
 | Manual | [Pick a release archive](https://github.com/RantAI-dev/RantAIClaw/releases/latest), verify against `SHA256SUMS`, extract, move into `PATH` |
 | Homebrew *(planned)* | `brew install rantaiclaw` |
 
-> **Step-by-step per-platform tutorial** (macOS Gatekeeper, Linux distro notes, Windows PowerShell, Raspberry Pi, Docker compose, cosign verify) is published with every release — see the latest [release notes](https://github.com/RantAI-dev/RantAIClaw/releases/latest). Long-form reference: [`docs/install.md`](docs/install.md) · [Troubleshooting](docs/troubleshooting.md).
+> **Step-by-step per-platform tutorial** (macOS Gatekeeper, Linux distro notes, Windows PowerShell, Raspberry Pi, Docker compose, cosign verify) is published with every release — see the latest [release notes](https://github.com/RantAI-dev/RantAIClaw/releases/latest). Long-form reference: [`docs/start/install.md`](docs/start/install.md) · [Troubleshooting](docs/start/troubleshooting.md).
 
 ### First run
 
@@ -272,7 +272,7 @@ rantaiclaw config get|set      # Inspect/update runtime config
 rantaiclaw --help              # All commands
 ```
 
-📖 **[Full install reference →](docs/install.md)** · **[Troubleshooting →](docs/troubleshooting.md)** · **[Releases →](https://github.com/RantAI-dev/RantAIClaw/releases)**
+📖 **[Full install reference →](docs/start/install.md)** · **[Troubleshooting →](docs/start/troubleshooting.md)** · **[Releases →](https://github.com/RantAI-dev/RantAIClaw/releases)**
 
 ---
 
@@ -321,7 +321,7 @@ port = 8080
 allow_public_bind = true
 ```
 
-See [Config Reference](docs/config-reference.md) for all options.
+See [Config Reference](docs/reference/config.md) for all options.
 
 ---
 

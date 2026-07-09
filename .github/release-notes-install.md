@@ -155,4 +155,4 @@ rantaiclaw doctor    # validate the install
 rantaiclaw chat      # launch the TUI and start chatting
 ```
 
-📖 Full reference: [README](https://github.com/RantAI-dev/RantAIClaw#install) · [`docs/install.md`](https://github.com/RantAI-dev/RantAIClaw/blob/main/docs/install.md) · [Troubleshooting](https://github.com/RantAI-dev/RantAIClaw/blob/main/docs/troubleshooting.md)
+📖 Full reference: [README](https://github.com/RantAI-dev/RantAIClaw#install) · [`docs/start/install.md`](https://github.com/RantAI-dev/RantAIClaw/blob/main/docs/start/install.md) · [Troubleshooting](https://github.com/RantAI-dev/RantAIClaw/blob/main/docs/start/troubleshooting.md)

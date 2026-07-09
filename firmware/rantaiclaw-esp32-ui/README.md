@@ -103,4 +103,4 @@ MIT - See root `LICENSE`
 
 - [Slint ESP32 Documentation](https://slint.dev/esp32)
 - [ESP-IDF Rust Book](https://esp-rs.github.io/book/)
-- [RantaiClaw Hardware Design](../../docs/hardware-peripherals-design.md)
+- [RantaiClaw Hardware Design](../../docs/hardware/peripherals-design.md)

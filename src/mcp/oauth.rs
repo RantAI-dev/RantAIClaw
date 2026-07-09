@@ -52,7 +52,7 @@ pub async fn run_oauth(provider: OAuthProvider, scopes: &[&str]) -> Result<Strin
     let cfg = ProviderConfig::for_provider(provider);
     let client_id = std::env::var(cfg.client_id_env).map_err(|_| {
         anyhow!(
-            "missing {}; set it (and {}) before running OAuth — see docs/install.md",
+            "missing {}; set it (and {}) before running OAuth — see docs/start/install.md",
             cfg.client_id_env,
             cfg.client_secret_env
         )

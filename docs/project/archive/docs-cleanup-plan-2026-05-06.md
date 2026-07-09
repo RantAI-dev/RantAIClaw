@@ -220,7 +220,7 @@ This shape gives readers — including AI agents reviewing the codebase — a de
 ## Risks
 
 1. **Loss of design history** — the `docs/superpowers/` plans are detailed. Mitigation: they remain in git history (`git log -- docs/superpowers/`) and the *outcome* of each plan is in the corresponding ClickUp release task description + CHANGELOG.md.
-2. **Broken inbound links** — anyone who linked to a `docs/foo.md` URL externally will hit a 404 after moves. Mitigation: keep redirect stubs at the old paths for one release cycle (`docs/install.md` → 1-line "moved to start/install.md").
+2. **Broken inbound links** — anyone who linked to a `docs/foo.md` URL externally will hit a 404 after moves. Mitigation: keep redirect stubs at the old paths for one release cycle (`docs/start/install.md` → 1-line "moved to start/install.md").
 3. **CLAUDE.md §4.1 doc governance contract** — references multilingual parity that doesn't exist today. Either implement (heavy) or amend the contract to match reality. Recommend: amend.
 
 ## Execution order

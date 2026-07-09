@@ -57,7 +57,7 @@ Lines 100, 118, 124, 130, 136, 287, 293, 492… 665 — entries like Webchat, Za
 
 `Cargo.toml:169` lists `probe-rs = { version = "0.31", optional = true }` with comment "adds ~50 deps." A full on-chip debugging framework (USB HID, CMSIS-DAP, OpenOCD-level device trees, USB stack). Even gated, it advertises a 50-dep optional surface that distracts from the lightweight thesis.
 
-**Recommendation:** remove from `Cargo.toml`. Reimplement `hardware_memory_read` tool as a thin shell wrapper invoking external `probe-rs` CLI. Document in `docs/hardware-peripherals-design.md` that users install probe-rs separately. **Blast radius:** Medium (touches `src/peripherals/nucleo_flash.rs` + `src/tools/hardware_memory_read.rs`). **Effort:** S.
+**Recommendation:** remove from `Cargo.toml`. Reimplement `hardware_memory_read` tool as a thin shell wrapper invoking external `probe-rs` CLI. Document in `docs/hardware/peripherals-design.md` that users install probe-rs separately. **Blast radius:** Medium (touches `src/peripherals/nucleo_flash.rs` + `src/tools/hardware_memory_read.rs`). **Effort:** S.
 
 ### 7. `schemars` always compiled, only used by one CLI subcommand
 

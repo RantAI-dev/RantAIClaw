@@ -22,49 +22,49 @@
 
 ## 2) Getting started
 
-- [install.md](install.md) (will merge with [one-click-bootstrap.md](one-click-bootstrap.md) into `start/install.md`)
-- [troubleshooting.md](troubleshooting.md)
+- [start/install.md](start/install.md) (will merge with [start/one-click-bootstrap.md](start/one-click-bootstrap.md) into `start/install.md`)
+- [start/troubleshooting.md](start/troubleshooting.md)
 
 ## 3) Reference (runtime contracts)
 
-- [commands-reference.md](commands-reference.md)
-- [config-reference.md](config-reference.md)
-- [providers-reference.md](providers-reference.md)
-- [channels-reference.md](channels-reference.md)
-- [custom-providers.md](custom-providers.md)
-- [kb.md](kb.md) — Knowledge Base (feature-gated)
-- [kb-bench.md](kb-bench.md) — KB retrieval latency baseline
-- [kb-tuning.md](kb-tuning.md) — KB retrieval quality knobs
+- [reference/commands.md](reference/commands.md)
+- [reference/config.md](reference/config.md)
+- [reference/providers.md](reference/providers.md)
+- [reference/channels.md](reference/channels.md)
+- [reference/custom-providers.md](reference/custom-providers.md)
+- [reference/kb.md](reference/kb.md) — Knowledge Base (feature-gated)
+- [reference/kb-bench.md](reference/kb-bench.md) — KB retrieval latency baseline
+- [reference/kb-tuning.md](reference/kb-tuning.md) — KB retrieval quality knobs
 
 ## 4) Operations & deployment
 
-- [operations-runbook.md](operations-runbook.md)
-- [network-deployment.md](network-deployment.md)
-- [proxy-agent-playbook.md](proxy-agent-playbook.md)
-- [resource-limits.md](resource-limits.md)
-- [release-process.md](release-process.md)
-- [matrix-e2ee-guide.md](matrix-e2ee-guide.md)
-- [mattermost-setup.md](mattermost-setup.md)
-- [nextcloud-talk-setup.md](nextcloud-talk-setup.md)
-- [zai-glm-setup.md](zai-glm-setup.md)
-- [langgraph-integration.md](langgraph-integration.md)
+- [operations/runbook.md](operations/runbook.md)
+- [operations/network-deployment.md](operations/network-deployment.md)
+- [operations/proxy-agent-playbook.md](operations/proxy-agent-playbook.md)
+- [operations/resource-limits.md](operations/resource-limits.md)
+- [contributing/release-process.md](contributing/release-process.md)
+- [reference/matrix-e2ee-guide.md](reference/matrix-e2ee-guide.md)
+- [reference/mattermost-setup.md](reference/mattermost-setup.md)
+- [reference/nextcloud-talk-setup.md](reference/nextcloud-talk-setup.md)
+- [reference/zai-glm-setup.md](reference/zai-glm-setup.md)
+- [reference/langgraph-integration.md](reference/langgraph-integration.md)
 
 ## 5) Security
 
-- [agnostic-security.md](agnostic-security.md)
-- [frictionless-security.md](frictionless-security.md)
-- [sandboxing.md](sandboxing.md)
-- [audit-logging.md](audit-logging.md)
+- [security/agnostic-security.md](security/agnostic-security.md)
+- [security/frictionless-security.md](security/frictionless-security.md)
+- [security/sandboxing.md](security/sandboxing.md)
+- [security/audit-logging.md](security/audit-logging.md)
 - [security/http-request-ssrf-threat-model.md](security/http-request-ssrf-threat-model.md)
 - [security/shell-execution-security-note.md](security/shell-execution-security-note.md)
 - Roadmap: tracked in the ClickUp v0.6.0 release task · pointer in [pillar 3](pillars/3-tools-approvals.md)
 
 ## 6) Hardware (niche but supported)
 
-- [hardware-peripherals-design.md](hardware-peripherals-design.md)
-- [adding-boards-and-tools.md](adding-boards-and-tools.md)
-- [arduino-uno-q-setup.md](arduino-uno-q-setup.md)
-- [nucleo-setup.md](nucleo-setup.md)
+- [hardware/peripherals-design.md](hardware/peripherals-design.md)
+- [hardware/adding-boards-and-tools.md](hardware/adding-boards-and-tools.md)
+- [hardware/arduino-uno-q-setup.md](hardware/arduino-uno-q-setup.md)
+- [hardware/nucleo-setup.md](hardware/nucleo-setup.md)
 - [datasheets/arduino-uno-q.md](datasheets/arduino-uno-q.md)
 - [datasheets/arduino-uno.md](datasheets/arduino-uno.md)
 - [datasheets/nucleo-f401re.md](datasheets/nucleo-f401re.md)
@@ -73,10 +73,10 @@
 ## 7) Contributing & CI
 
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
-- [pr-workflow.md](pr-workflow.md)
-- [reviewer-playbook.md](reviewer-playbook.md)
-- [ci-map.md](ci-map.md)
-- [actions-source-policy.md](actions-source-policy.md)
+- [contributing/pr-workflow.md](contributing/pr-workflow.md)
+- [contributing/reviewer-playbook.md](contributing/reviewer-playbook.md)
+- [contributing/ci-map.md](contributing/ci-map.md)
+- [contributing/actions-source-policy.md](contributing/actions-source-policy.md)
 
 ## 8) Project — conventions + archived snapshots
 

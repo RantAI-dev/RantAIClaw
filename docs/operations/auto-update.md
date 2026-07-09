@@ -202,8 +202,8 @@ What Hermes has over us:
 
 ## Related
 
-- [`docs/commands-reference.md`](../commands-reference.md) — `update`
+- [`docs/reference/commands.md`](../reference/commands.md) — `update`
   / `rollback` flags
-- [`docs/operations-runbook.md`](../operations-runbook.md) — production
+- [`docs/operations/runbook.md`](runbook.md) — production
   operations checklist
 - `~/.rantaiclaw/.update-snapshots/` — snapshot directory layout

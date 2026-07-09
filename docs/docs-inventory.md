@@ -31,7 +31,7 @@ Last reviewed: **February 18, 2026**.
 
 | Doc | Type | Audience |
 |---|---|---|
-| `docs/getting-started/README.md` | Current Guide | new users |
+| `docs/start/README.md` | Current Guide | new users |
 | `docs/reference/README.md` | Current Guide | users/operators |
 | `docs/operations/README.md` | Current Guide | operators |
 | `docs/security/README.md` | Current Guide | operators/contributors |
@@ -43,23 +43,23 @@ Last reviewed: **February 18, 2026**.
 
 | Doc | Type | Audience |
 |---|---|---|
-| `docs/one-click-bootstrap.md` | Current Guide | users/operators |
-| `docs/commands-reference.md` | Current Reference | users/operators |
-| `docs/providers-reference.md` | Current Reference | users/operators |
-| `docs/channels-reference.md` | Current Reference | users/operators |
-| `docs/nextcloud-talk-setup.md` | Current Guide | operators |
-| `docs/config-reference.md` | Current Reference | operators |
-| `docs/custom-providers.md` | Current Integration Guide | integration developers |
-| `docs/zai-glm-setup.md` | Current Provider Setup Guide | users/operators |
-| `docs/langgraph-integration.md` | Current Integration Guide | integration developers |
-| `docs/operations-runbook.md` | Current Guide | operators |
-| `docs/troubleshooting.md` | Current Guide | users/operators |
-| `docs/network-deployment.md` | Current Guide | operators |
-| `docs/mattermost-setup.md` | Current Guide | operators |
-| `docs/adding-boards-and-tools.md` | Current Guide | hardware builders |
-| `docs/arduino-uno-q-setup.md` | Current Guide | hardware builders |
-| `docs/nucleo-setup.md` | Current Guide | hardware builders |
-| `docs/hardware-peripherals-design.md` | Current Design Spec | hardware contributors |
+| `docs/start/one-click-bootstrap.md` | Current Guide | users/operators |
+| `docs/reference/commands.md` | Current Reference | users/operators |
+| `docs/reference/providers.md` | Current Reference | users/operators |
+| `docs/reference/channels.md` | Current Reference | users/operators |
+| `docs/reference/nextcloud-talk-setup.md` | Current Guide | operators |
+| `docs/reference/config.md` | Current Reference | operators |
+| `docs/reference/custom-providers.md` | Current Integration Guide | integration developers |
+| `docs/reference/zai-glm-setup.md` | Current Provider Setup Guide | users/operators |
+| `docs/reference/langgraph-integration.md` | Current Integration Guide | integration developers |
+| `docs/operations/runbook.md` | Current Guide | operators |
+| `docs/start/troubleshooting.md` | Current Guide | users/operators |
+| `docs/operations/network-deployment.md` | Current Guide | operators |
+| `docs/reference/mattermost-setup.md` | Current Guide | operators |
+| `docs/hardware/adding-boards-and-tools.md` | Current Guide | hardware builders |
+| `docs/hardware/arduino-uno-q-setup.md` | Current Guide | hardware builders |
+| `docs/hardware/nucleo-setup.md` | Current Guide | hardware builders |
+| `docs/hardware/peripherals-design.md` | Current Design Spec | hardware contributors |
 | `docs/datasheets/nucleo-f401re.md` | Current Hardware Reference | hardware builders |
 | `docs/datasheets/arduino-uno.md` | Current Hardware Reference | hardware builders |
 | `docs/datasheets/esp32.md` | Current Hardware Reference | hardware builders |
@@ -68,10 +68,10 @@ Last reviewed: **February 18, 2026**.
 
 | Doc | Type |
 |---|---|
-| `docs/pr-workflow.md` | Policy |
-| `docs/reviewer-playbook.md` | Process |
-| `docs/ci-map.md` | Process |
-| `docs/actions-source-policy.md` | Policy |
+| `docs/contributing/pr-workflow.md` | Policy |
+| `docs/contributing/reviewer-playbook.md` | Process |
+| `docs/contributing/ci-map.md` | Process |
+| `docs/contributing/actions-source-policy.md` | Policy |
 
 ## Proposal / Roadmap Docs
 
@@ -79,12 +79,12 @@ These are valuable context, but **not strict runtime contracts**.
 
 | Doc | Type |
 |---|---|
-| `docs/sandboxing.md` | Proposal |
-| `docs/resource-limits.md` | Proposal |
-| `docs/audit-logging.md` | Proposal |
-| `docs/agnostic-security.md` | Proposal |
-| `docs/frictionless-security.md` | Proposal |
-| `docs/security-roadmap.md` | Roadmap |
+| `docs/security/sandboxing.md` | Proposal |
+| `docs/operations/resource-limits.md` | Proposal |
+| `docs/security/audit-logging.md` | Proposal |
+| `docs/security/agnostic-security.md` | Proposal |
+| `docs/security/frictionless-security.md` | Proposal |
+| `docs/security/security-roadmap.md` | Roadmap |
 
 ## Snapshot Docs
 

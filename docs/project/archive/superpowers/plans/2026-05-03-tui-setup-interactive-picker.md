@@ -944,12 +944,12 @@ git commit -m "refactor(tui): collapse open_setup_overlay to required name; drop
 ## Task 7: Docs + Phase 2 spec
 
 **Files:**
-- Modify: `docs/commands-reference.md`
+- Modify: `docs/reference/commands.md`
 - Create: `docs/superpowers/specs/2026-05-03-tui-setup-phase2-port-roadmap.md`
 
 - [ ] **Step 1: Update `/setup` docs**
 
-In `docs/commands-reference.md`, the `/setup` entry should describe:
+In `docs/reference/commands.md`, the `/setup` entry should describe:
 - Interactive picker (search + Up/Down + Enter + Esc).
 - Top-level shows **categories** (Persona, Channels — and more as sections are ported in follow-up plans).
 - Channels sub-picker lists channel types with in-TUI support (whatsapp-web behind `--features whatsapp-web`).
