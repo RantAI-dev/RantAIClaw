@@ -680,9 +680,7 @@ impl TuiApp {
         // app behind it stays frozen; no need to guard each normal-key branch.
         if self.login_gate.is_some() {
             match key.code {
-                KeyCode::Char('c') | KeyCode::Char('d')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.state = AppState::Quitting;
                     return Ok(EventResult::Quit);
                 }

@@ -93,6 +93,7 @@ pub fn provisioner_for(name: &str) -> Option<Box<dyn TuiProvisioner>> {
     }
 }
 
+#[allow(clippy::vec_init_then_push)] // sequential builder over many (some cfg-gated) provisioners
 pub fn available() -> Vec<(&'static str, &'static str)> {
     let mut list = Vec::new();
     // Core
