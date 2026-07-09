@@ -18,7 +18,7 @@ The first thing a user sees. RantaiClaw's setup story is **fullscreen TUI wizard
 |---|---|---|---|
 | First-run UX | Fullscreen TUI wizard, alt-screen | Shell prompts | TBD |
 | Headless mode | `--non-interactive` (CI-safe) | Partial | TBD |
-| Re-runnable per section | ✅ 6 sections | Partial | TBD |
+| Re-runnable per section | ✅ 7 sections | Partial | TBD |
 | Policy-aware (Manual / Smart / Strict / Off presets) | ✅ | ❌ | TBD |
 | Diagnostic suite | `doctor` (text/json/brief) | Partial | TBD |
 | Setup time, fresh box → working agent | < 5 min | ~5-15 min | TBD |
@@ -31,7 +31,7 @@ The first thing a user sees. RantaiClaw's setup story is **fullscreen TUI wizard
 | Wizard interactive flow | Implemented · needs UX validation |
 | Wizard non-interactive | Implemented · stable |
 | `setup` section drilldown | Implemented · needs validation |
-| `setup` provisioners (provider / approvals / channels / persona / skills / mcp) | Implemented |
+| `setup` sections (provider / approvals / channels / persona / skills / mcp / login) | Implemented |
 | `doctor` text / json / brief | Implemented · stable |
 | Hot-reload after wizard | Implemented · needs validation |
 | OpenClaw / ZeroClaw migration | Implemented · needs validation |
@@ -41,28 +41,28 @@ The first thing a user sees. RantaiClaw's setup story is **fullscreen TUI wizard
 
 ```
 rantaiclaw setup
-  → src/onboard/wizard.rs        (interactive)
-  → src/onboard/quick_setup.rs   (headless; planned split)
-  → src/onboard/provisioners/    (one per section)
+  → src/onboard/wizard.rs        (canonical_section_order + run_setup; interactive + headless)
+  → src/onboard/section/         (one SetupSection per section)
       ├── provider.rs
       ├── approvals.rs
       ├── channels.rs
       ├── persona.rs
       ├── skills.rs
-      └── mcp.rs
+      ├── mcp.rs
+      └── login.rs
   → writes <profile>/config.toml + autonomy.toml + persona.toml + SYSTEM.md
 ```
 
 ## Trait extension point
 
-- `TuiProvisioner` — `src/onboard/provisioners/traits.rs` — implement to add a new setup section
+- `SetupSection` — `src/onboard/section/mod.rs` — implement + register in `canonical_sections()` to add a new setup section
 - `Provider` / `Channel` / `Tool` factories — see Pillar 2/3/5
 
 ## CLI / config
 
 ```bash
 rantaiclaw setup                  # interactive wizard
-rantaiclaw setup full             # all 6 sections
+rantaiclaw setup full             # all 7 sections
 rantaiclaw setup provider         # one section
 rantaiclaw setup --non-interactive  # CI / scripted bootstrap
 rantaiclaw doctor                 # full diagnostic
