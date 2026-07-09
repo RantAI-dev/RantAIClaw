@@ -6,6 +6,7 @@
 > For current runtime behavior, see [config-reference.md](../reference/config.md), [operations-runbook.md](../operations/runbook.md), and [troubleshooting.md](../start/troubleshooting.md).
 
 ## Core Principle
+>
 > **"Security features should be like airbags — present, protective, and invisible until needed."**
 
 ## Design: Silent Auto-Detection
@@ -265,6 +266,7 @@ impl Default for SandboxBackend {
 ## User Experience Comparison
 
 ### Before (Current)
+
 ```bash
 $ rantaiclaw onboard
 [1/9] Workspace Setup...
@@ -275,6 +277,7 @@ $ rantaiclaw onboard
 ```
 
 ### After (With Frictionless Security)
+
 ```bash
 $ rantaiclaw onboard
 [1/9] Workspace Setup...
@@ -286,6 +289,7 @@ $ rantaiclaw onboard
 ```
 
 ### Advanced User (Explicit Control)
+
 ```bash
 $ rantaiclaw onboard --security-level paranoid
 [1/9] Workspace Setup...

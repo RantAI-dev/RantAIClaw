@@ -6,6 +6,7 @@
 > For current runtime behavior, see [config-reference.md](../reference/config.md), [operations-runbook.md](runbook.md), and [troubleshooting.md](../start/troubleshooting.md).
 
 ## Problem
+
 RantaiClaw has rate limiting (20 actions/hour) but no resource caps. A runaway agent could:
 - Exhaust available memory
 - Spin CPU at 100%
@@ -16,6 +17,7 @@ RantaiClaw has rate limiting (20 actions/hour) but no resource caps. A runaway a
 ## Proposed Solutions
 
 ### Option 1: cgroups v2 (Linux, Recommended)
+
 Automatically create a cgroup for rantaiclaw with limits.
 
 ```bash
@@ -29,6 +31,7 @@ TasksMax=100
 ```
 
 ### Option 2: tokio::task::deadlock detection
+
 Prevent task starvation.
 
 ```rust
@@ -48,6 +51,7 @@ where
 ```
 
 ### Option 3: Memory monitoring
+
 Track heap usage and kill if over limit.
 
 ```rust

@@ -5,7 +5,8 @@
 > This document describes proposed approaches and may include hypothetical commands or config.
 > For current runtime behavior, see [config-reference.md](../reference/config.md), [operations-runbook.md](../operations/runbook.md), and [troubleshooting.md](../start/troubleshooting.md).
 
-## Core Question: Will security features break...
+## Core Question: Will security features break
+
 1. ❓ Fast cross-compilation builds?
 2. ❓ Pluggable architecture (swap anything)?
 3. ❓ Hardware agnosticism (ARM, x86, RISC-V)?
@@ -295,6 +296,7 @@ backend = "docker"
 ## 6. Dependency Impact: Minimal New Deps
 
 ### Current Dependencies (for context)
+
 ```
 reqwest, tokio, serde, anyhow, uuid, chrono, rusqlite,
 axum, tracing, opentelemetry, ...

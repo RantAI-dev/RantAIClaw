@@ -6,11 +6,13 @@
 > For current runtime behavior, see [config-reference.md](../reference/config.md), [operations-runbook.md](../operations/runbook.md), and [troubleshooting.md](../start/troubleshooting.md).
 
 ## Problem
+
 RantaiClaw currently has application-layer security (allowlists, path blocking, command injection protection) but lacks OS-level containment. If an attacker is on the allowlist, they can run any allowed command with rantaiclaw's user permissions.
 
 ## Proposed Solutions
 
 ### Option 1: Firejail Integration (Recommended for Linux)
+
 Firejail provides user-space sandboxing with minimal overhead.
 
 ```rust
@@ -73,6 +75,7 @@ sandbox_backend = "firejail"  # or "none", "bubblewrap", "docker"
 ---
 
 ### Option 2: Bubblewrap (Portable, no root required)
+
 Bubblewrap uses user namespaces to create containers.
 
 ```bash
@@ -93,6 +96,7 @@ bwrap --ro-bind /usr /usr \
 ---
 
 ### Option 3: Docker-in-Docker (Heavyweight but complete isolation)
+
 Run agent tools inside ephemeral containers.
 
 ```rust
@@ -123,6 +127,7 @@ impl DockerSandbox {
 ---
 
 ### Option 4: Landlock (Linux Kernel LSM, Rust native)
+
 Landlock provides file system access control without containers.
 
 ```rust
