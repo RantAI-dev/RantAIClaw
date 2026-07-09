@@ -32,6 +32,7 @@ use super::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/version", get(version))
+        .route("/api/v1/auth/info", get(auth_info))
         .route("/api/v1/status", get(status))
         .route("/api/v1/doctor", get(doctor))
         .route("/api/v1/agent/chat", post(agent_chat))
@@ -65,6 +66,19 @@ pub fn router() -> Router<AppState> {
 // Auth helper
 // ────────────────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Serialize)]
+struct AuthInfo {
+    login_required: bool,
+}
+
+/// GET /api/v1/auth/info — PUBLIC (no `check_auth`). Tells the console whether a
+/// username+password login is required. Deliberately does NOT expose the
+/// username (no enumeration leak); the user types it on the login form.
+async fn auth_info(State(state): State<AppState>) -> Json<AuthInfo> {
+    let login_required = state.config.lock().gateway.login.password_hash.is_some();
+    Json(AuthInfo { login_required })
+}
+
 fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<ErrorBody>)> {
     if !state.pairing.require_pairing() {
         return Ok(());
@@ -72,12 +86,9 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, 
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .or_else(|| {
-            headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("bearer "))
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
         });
     match token {
         Some(t) if state.pairing.is_authenticated(t) => Ok(()),
@@ -1249,6 +1260,9 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.default_provider = Some("test-sse".to_string());
         config.default_model = Some("test-model".to_string());
+        // Local-dev fixture: pairing off. Keep config + guard consistent so the
+        // console auth decision (read from live config) matches the guard.
+        config.gateway.require_pairing = false;
         AppState {
             config: Arc::new(Mutex::new(config)),
             provider: Arc::new(MockProvider),

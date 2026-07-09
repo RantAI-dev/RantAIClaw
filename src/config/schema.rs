@@ -858,6 +858,20 @@ impl Default for PeripheralBoardConfig {
 
 // ── Gateway security ─────────────────────────────────────────────
 
+/// Optional single-operator login for the web console + TUI. Enabled by the
+/// presence of `password_hash` (an argon2 PHC string). The username is not
+/// secret and is never served by a public endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq)]
+pub struct GatewayLoginConfig {
+    /// Operator username, verified on login. Not secret.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Argon2 PHC-string hash of the password (salt embedded). One-way; stored
+    /// verbatim (NOT routed through the reversible secret-encryption pass).
+    #[serde(default)]
+    pub password_hash: Option<String>,
+}
+
 /// Gateway server configuration (`[gateway]` section).
 ///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
@@ -909,6 +923,10 @@ pub struct GatewayConfig {
     /// Increase for workloads with long-running tool calls (package installs, etc.)
     #[serde(default = "default_gateway_request_timeout_secs")]
     pub request_timeout_secs: u64,
+
+    /// Optional web console + TUI login credential (single operator).
+    #[serde(default)]
+    pub login: GatewayLoginConfig,
 }
 
 fn default_gateway_port() -> u16 {
@@ -962,6 +980,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             request_timeout_secs: default_gateway_request_timeout_secs(),
+            login: GatewayLoginConfig::default(),
         }
     }
 }
@@ -4315,6 +4334,24 @@ mod tests {
     use tokio_stream::StreamExt;
 
     #[tokio::test]
+    async fn gateway_login_defaults_to_disabled() {
+        let g = GatewayConfig::default();
+        assert!(g.login.username.is_none());
+        assert!(g.login.password_hash.is_none());
+    }
+
+    #[tokio::test]
+    async fn gateway_login_round_trips_through_toml() {
+        let mut g = GatewayConfig::default();
+        g.login.username = Some("op".into());
+        g.login.password_hash = Some("$argon2id$v=19$m=1,t=1,p=1$abc$def".into());
+        let s = toml::to_string(&g).unwrap();
+        let back: GatewayConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.login.username.as_deref(), Some("op"));
+        assert_eq!(back.login.password_hash, g.login.password_hash);
+    }
+
+    #[tokio::test]
     async fn resolve_key_for_provider_is_provider_aware() {
         let mut cfg = Config::default();
         cfg.default_provider = Some("minimax".into());
@@ -5496,6 +5533,7 @@ channel_id = "C123"
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
             request_timeout_secs: 120,
+            login: GatewayLoginConfig::default(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();

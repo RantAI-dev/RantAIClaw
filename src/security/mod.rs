@@ -27,6 +27,7 @@ pub mod docker;
 pub mod firejail;
 #[cfg(target_os = "linux")]
 pub mod landlock;
+pub mod login;
 pub mod pairing;
 pub mod pairing_store;
 pub mod pending;

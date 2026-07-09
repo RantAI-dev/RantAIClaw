@@ -3,7 +3,7 @@
 use super::super::traits::{
     ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
 };
-use crate::config::schema::GatewayConfig;
+use crate::config::schema::{GatewayConfig, GatewayLoginConfig};
 use crate::config::Config;
 use crate::profile::Profile;
 use anyhow::Result;
@@ -168,6 +168,7 @@ impl TuiProvisioner for GatewayProvisioner {
             idempotency_ttl_secs: 3600,
             idempotency_max_keys: 10000,
             request_timeout_secs: 300,
+            login: GatewayLoginConfig::default(),
         };
 
         send(

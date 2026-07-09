@@ -212,6 +212,39 @@ mod provider {
     }
 }
 
+mod login {
+    use super::*;
+
+    #[tokio::test]
+    async fn login_completes() {
+        let events = run_provisioner_headless(
+            "login",
+            vec![
+                ProvisionResponse::Selection(vec![0]),             // enable
+                ProvisionResponse::Text("rantaiclaw_user".into()), // username
+                ProvisionResponse::Text("smoke-pass".into()),      // password
+                ProvisionResponse::Text("smoke-pass".into()),      // confirm (matches)
+            ],
+        )
+        .await
+        .unwrap();
+        assert_no_panic(&events);
+        assert_terminal_event(&events, "login");
+    }
+
+    #[tokio::test]
+    async fn login_skip_leaves_disabled() {
+        let events = run_provisioner_headless(
+            "login",
+            vec![ProvisionResponse::Selection(vec![1])], // skip / disable
+        )
+        .await
+        .unwrap();
+        assert_no_panic(&events);
+        assert_terminal_event(&events, "login");
+    }
+}
+
 mod approvals {
     use super::*;
 

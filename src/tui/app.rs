@@ -232,6 +232,10 @@ pub struct TuiApp {
     /// instead of the normal chat UI. Provisioner steps use the
     /// existing `setup_overlay` mechanism.
     pub first_run_wizard: Option<super::FirstRunWizard>,
+    /// Console login gate — when set, owns the screen and absorbs all input
+    /// until the operator's password verifies (armed when `config.gateway.login`
+    /// has a password hash).
+    pub login_gate: Option<super::LoginGateState>,
     /// Broadcast receiver for pending-approval notifications from the
     /// shared `PendingApprovals` registry on `SecurityPolicy`. Drained
     /// each frame; new requests surface as system messages instructing
@@ -418,6 +422,7 @@ impl TuiApp {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            login_gate: None,
             pending_approvals_rx: None,
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
@@ -669,6 +674,48 @@ impl TuiApp {
         // next key — late-arriving results land in the picker before the
         // user's next action so they always see the freshest state.
         self.drain_clawhub_search_results();
+
+        // Console login gate — owns the screen until the password verifies.
+        // Intercept here (before every other handler) and return early so the
+        // app behind it stays frozen; no need to guard each normal-key branch.
+        if self.login_gate.is_some() {
+            match key.code {
+                KeyCode::Char('c') | KeyCode::Char('d')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.state = AppState::Quitting;
+                    return Ok(EventResult::Quit);
+                }
+                KeyCode::Enter => {
+                    let hash = self.config.gateway.login.password_hash.clone();
+                    let ok = match (self.login_gate.as_ref(), hash.as_deref()) {
+                        (Some(gate), Some(h)) => gate.check(h),
+                        // Credential gone (login disabled mid-session) → let through.
+                        _ => true,
+                    };
+                    if ok {
+                        self.login_gate = None;
+                    } else if let Some(gate) = self.login_gate.as_mut() {
+                        gate.input.clear();
+                        gate.error = Some("Incorrect password".to_string());
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(gate) = self.login_gate.as_mut() {
+                        gate.input.pop();
+                    }
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    if let Some(gate) = self.login_gate.as_mut() {
+                        gate.input.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return Ok(EventResult::Continue);
+        }
 
         // Inline pending-approval prompt: when an approval is open and
         // the user hits Y/N/A/Esc, resolve it without going through
@@ -3400,6 +3447,12 @@ impl TuiApp {
                 wizard.render_fullscreen(frame, area);
             }
 
+            // Console login gate — rendered last so it sits above every other
+            // surface (including the first-run wizard) until the password verifies.
+            if let Some(gate) = self.login_gate.as_ref() {
+                gate.render_fullscreen(frame, area);
+            }
+
             // Slash-command dropdown — anchored just above the input box,
             // clamped to stay strictly inside the inline viewport.
             if autocomplete.is_visible() {
@@ -5532,6 +5585,15 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         app.first_run_wizard = Some(crate::tui::FirstRunWizard::new(profile.clone()));
     }
 
+    // Console login gate — when enabled, must be passed before the app is usable.
+    // It renders over everything and intercepts all input at the top of the key
+    // handler, so it takes precedence over the first-run wizard.
+    if app_config.gateway.login.password_hash.is_some() {
+        app.login_gate = Some(crate::tui::LoginGateState::new(
+            app_config.gateway.login.username.clone(),
+        ));
+    }
+
     // Idempotent first-run skill seeding: if the workspace skills dir
     // is empty, drop the 5-skill starter pack (web-search, summarizer,
     // research-assistant, scheduler-reminders, meeting-notes) so the
@@ -5928,6 +5990,7 @@ mod tests {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            login_gate: None,
             pending_approvals_rx: None,
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
@@ -6028,6 +6091,7 @@ mod submit_tests {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            login_gate: None,
             pending_approvals_rx: None,
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
@@ -6144,6 +6208,7 @@ mod ctrl_c_tests {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            login_gate: None,
             pending_approvals_rx: None,
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
@@ -6239,6 +6304,7 @@ mod drain_tests {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            login_gate: None,
             pending_approvals_rx: None,
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
@@ -6407,6 +6473,7 @@ mod retry_tests {
             editor_request: false,
             clear_terminal_request: false,
             first_run_wizard: None,
+            login_gate: None,
             pending_approvals_rx: None,
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,

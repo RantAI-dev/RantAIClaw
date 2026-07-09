@@ -685,6 +685,7 @@ pub async fn run_gateway(
         .route("/readyz", get(handle_readyz))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
+        .route("/login", post(handle_login))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
@@ -802,6 +803,77 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
         [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
         body,
     )
+}
+
+/// Body of `POST /login`.
+#[derive(serde::Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+/// POST /login — exchange username+password for a session bearer token when the
+/// optional console login is enabled. Returns 404 when it is not. Rate-limited
+/// like `/pair`, with a dedicated brute-force lockout (separate keyspace).
+#[axum::debug_handler]
+async fn handle_login(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<LoginRequest>,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_pair(&rate_key) {
+        let err = serde_json::json!({
+            "error": "Too many login requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+    if let Some(remaining) = state.pairing.login_lockout_remaining(&rate_key) {
+        let err = serde_json::json!({
+            "error": format!("Too many failed logins. Try again in {remaining}s."),
+            "retry_after": remaining,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    let (username, password_hash) = {
+        let c = state.config.lock();
+        (
+            c.gateway.login.username.clone(),
+            c.gateway.login.password_hash.clone(),
+        )
+    };
+    let Some(password_hash) = password_hash else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Console login is not enabled" })),
+        );
+    };
+
+    let username_ok = username
+        .as_deref()
+        .map(|u| crate::security::pairing::constant_time_eq(u, &body.username))
+        .unwrap_or(false);
+    let password_ok = crate::security::login::verify_password(&body.password, &password_hash);
+
+    if username_ok && password_ok {
+        // Verify-only: the console (claw-ui BFF) authenticates at its own edge and
+        // holds the gateway bearer token server-side; the gateway never hands a
+        // token to the browser. So `/login` just confirms the credential.
+        state.pairing.reset_login_failures(&rate_key);
+        tracing::info!("🔐 Console login verified");
+        (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+    } else {
+        state.pairing.record_login_failure(&rate_key);
+        tracing::warn!("🔐 Console login failed");
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Invalid username or password" })),
+        )
+    }
 }
 
 /// POST /pair — exchange one-time code for bearer token
@@ -2432,6 +2504,21 @@ mod tests {
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
             tools_registry: Arc::new(Vec::new()),
         }
+    }
+
+    // ── Console login: verify-only credential logic ──
+
+    #[test]
+    fn login_credential_logic_matches_handler() {
+        // Mirrors the verify-only check inside handle_login: username via
+        // constant_time_eq, password via argon2. No token is issued.
+        let hash = crate::security::login::hash_password("pw").unwrap();
+        assert!(crate::security::pairing::constant_time_eq("op", "op"));
+        assert!(crate::security::login::verify_password("pw", &hash));
+        assert!(!crate::security::pairing::constant_time_eq(
+            "op", "attacker"
+        ));
+        assert!(!crate::security::login::verify_password("wrong", &hash));
     }
 
     /// A "gateway" code minted into the on-disk store (as `rantaiclaw channels

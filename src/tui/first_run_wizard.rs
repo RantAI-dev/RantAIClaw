@@ -52,7 +52,7 @@ pub struct FirstRunWizard {
     pub history: Vec<WizardPhase>,
 }
 
-const REQUIRED_PROVISIONERS: &[&str] = &["provider", "approvals", "persona", "skills"];
+const REQUIRED_PROVISIONERS: &[&str] = &["provider", "approvals", "login", "persona", "skills"];
 const INTEGRATION_OPTIONS: &[(&str, &str)] = &[
     ("mcp", "MCP servers (curated tool plugins)"),
     ("web-search", "Web search backend"),
@@ -65,11 +65,12 @@ const INTEGRATION_OPTIONS: &[(&str, &str)] = &[
 const RAIL: &[(&str, &str)] = &[
     ("01", "Provider"),
     ("02", "Approvals"),
-    ("03", "Persona"),
-    ("04", "Skills"),
-    ("05", "Channels"),
-    ("06", "Integrations"),
-    ("07", "Complete"),
+    ("03", "Login"),
+    ("04", "Persona"),
+    ("05", "Skills"),
+    ("06", "Channels"),
+    ("07", "Integrations"),
+    ("08", "Complete"),
 ];
 
 const CHANNEL_PROVISIONER_NAMES: &[&str] = &[
@@ -303,15 +304,16 @@ impl FirstRunWizard {
             WizardPhase::RunningProvisioner { name } => match name.as_str() {
                 "provider" => Some(0),
                 "approvals" => Some(1),
-                "persona" => Some(2),
-                "skills" => Some(3),
-                n if is_channel_name(n) => Some(4),
-                n if is_integration_name(n) => Some(5),
+                "login" => Some(2),
+                "persona" => Some(3),
+                "skills" => Some(4),
+                n if is_channel_name(n) => Some(5),
+                n if is_integration_name(n) => Some(6),
                 _ => None,
             },
-            WizardPhase::PickChannels => Some(4),
-            WizardPhase::PickIntegrations => Some(5),
-            WizardPhase::Complete => Some(6),
+            WizardPhase::PickChannels => Some(5),
+            WizardPhase::PickIntegrations => Some(6),
+            WizardPhase::Complete => Some(7),
         }
     }
 
@@ -619,7 +621,7 @@ impl FirstRunWizard {
         // Subhead.
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("Four required steps,", Style::default().fg(sky)),
+                Span::styled("Five required steps,", Style::default().fg(sky)),
                 Span::styled("  two optional pickers,", Style::default().fg(muted)),
                 Span::styled(
                     "  one polished agent.",
@@ -643,11 +645,12 @@ impl FirstRunWizard {
         let body = vec![
             bullet("01", "Provider", "model + key", coral),
             bullet("02", "Approvals", "autonomy tier", coral),
-            bullet("03", "Persona", "agent name & template", coral),
-            bullet("04", "Skills", "bundled + ClawHub", coral),
-            bullet("05", "Channels", "telegram, discord, whatsapp, …", emerald),
-            bullet("06", "Integrations", "mcp, web-search, memory", emerald),
-            bullet("07", "Complete", "ship it", sky),
+            bullet("03", "Login", "console username + password", coral),
+            bullet("04", "Persona", "agent name & template", coral),
+            bullet("05", "Skills", "bundled + ClawHub", coral),
+            bullet("06", "Channels", "telegram, discord, whatsapp, …", emerald),
+            bullet("07", "Integrations", "mcp, web-search, memory", emerald),
+            bullet("08", "Complete", "ship it", sky),
         ];
         frame.render_widget(Paragraph::new(body), chunks[7]);
 
