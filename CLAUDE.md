@@ -148,7 +148,7 @@ Required:
 - `src/providers/` — model providers and resilient wrapper
 - `src/channels/` — Telegram/Discord/Slack/etc channels
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
-- `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware-peripherals-design.md`
+- `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware/peripherals-design.md`
 - `src/runtime/` — runtime adapters (currently native)
 - `docs/` — task-oriented documentation system (hubs, unified TOC, references, operations, security proposals, multilingual guides)
 - `.github/` — CI, templates, automation workflows
@@ -176,13 +176,13 @@ Collection trees (forthcoming Phase B — files currently still at `docs/` root)
 
 Runtime-contract references (must track behavior changes):
 
-- `docs/commands-reference.md`
-- `docs/providers-reference.md`
-- `docs/channels-reference.md`
-- `docs/config-reference.md`
-- `docs/operations-runbook.md`
-- `docs/troubleshooting.md`
-- `docs/one-click-bootstrap.md`
+- `docs/reference/commands.md`
+- `docs/reference/providers.md`
+- `docs/reference/channels.md`
+- `docs/reference/config.md`
+- `docs/operations/runbook.md`
+- `docs/start/troubleshooting.md`
+- `docs/start/one-click-bootstrap.md`
 
 Required docs governance rules:
 
@@ -290,14 +290,14 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Implement `Peripheral` in `src/peripherals/`.
 - Peripherals expose `tools()` — each tool delegates to the hardware (GPIO, sensors, etc.).
 - Register board type in config schema if needed.
-- See `docs/hardware-peripherals-design.md` for protocol and firmware notes.
+- See `docs/hardware/peripherals-design.md` for protocol and firmware notes.
 
 ### 7.5 Security / Runtime / Gateway Changes
 
 - Include threat/risk notes and rollback strategy.
 - Add/update tests or validation evidence for failure modes and boundaries.
 - Keep observability useful but non-sensitive.
-- For `.github/workflows/**` changes, include Actions allowlist impact in PR notes and update `docs/actions-source-policy.md` when sources change.
+- For `.github/workflows/**` changes, include Actions allowlist impact in PR notes and update `docs/contributing/actions-source-policy.md` when sources change.
 
 ### 7.6 Docs System / README / IA Changes
 
@@ -438,17 +438,17 @@ Reference docs:
 - `docs/README.md`
 - `docs/SUMMARY.md`
 - `docs/docs-inventory.md`
-- `docs/commands-reference.md`
-- `docs/providers-reference.md`
-- `docs/channels-reference.md`
-- `docs/config-reference.md`
-- `docs/operations-runbook.md`
-- `docs/troubleshooting.md`
-- `docs/one-click-bootstrap.md`
-- `docs/pr-workflow.md`
-- `docs/reviewer-playbook.md`
-- `docs/ci-map.md`
-- `docs/actions-source-policy.md`
+- `docs/reference/commands.md`
+- `docs/reference/providers.md`
+- `docs/reference/channels.md`
+- `docs/reference/config.md`
+- `docs/operations/runbook.md`
+- `docs/start/troubleshooting.md`
+- `docs/start/one-click-bootstrap.md`
+- `docs/contributing/pr-workflow.md`
+- `docs/contributing/reviewer-playbook.md`
+- `docs/contributing/ci-map.md`
+- `docs/contributing/actions-source-policy.md`
 
 ## 10) Anti-Patterns (Do Not)
 

@@ -10,12 +10,12 @@ A lightweight, complete, Rust-native AI agent runtime. Direct competitor to Open
 |---|---|
 | Install and run RantaiClaw quickly | [start/install.md](start/install.md) · or root [README](../README.md#quick-start) |
 | Understand what the product covers | [pillars/](pillars/) — one doc per surface |
-| Look up a CLI command | [reference/commands.md](commands-reference.md) |
-| Look up a config key | [reference/config.md](config-reference.md) |
-| See provider / model coverage | [reference/providers.md](providers-reference.md) |
-| See channel / transport coverage | [reference/channels.md](channels-reference.md) |
-| Run a production deployment | [operations/runbook.md](operations-runbook.md) |
-| Understand the security model | [security/model.md](security/model.md) (forthcoming · for now: [agnostic-security.md](agnostic-security.md) + [frictionless-security.md](frictionless-security.md)) |
+| Look up a CLI command | [reference/commands.md](reference/commands.md) |
+| Look up a config key | [reference/config.md](reference/config.md) |
+| See provider / model coverage | [reference/providers.md](reference/providers.md) |
+| See channel / transport coverage | [reference/channels.md](reference/channels.md) |
+| Run a production deployment | [operations/runbook.md](operations/runbook.md) |
+| Understand the security model | [security/model.md](security/model.md) (forthcoming · for now: [security/agnostic-security.md](security/agnostic-security.md) + [security/frictionless-security.md](security/frictionless-security.md)) |
 | Add a board / peripheral | [hardware/](hardware/) |
 | Contribute a PR | [contributing/](contributing/) |
 | See what's planned and shipped | [pillars/](pillars/) (per-pillar maturity table) · [ClickUp](https://app.clickup.com/t/86exe9tdq) |
@@ -38,45 +38,45 @@ Each pillar is one product surface. Every pillar doc has the same shape: ClickUp
 
 These tracks behavior. Every PR that affects a CLI flag or config key updates the corresponding doc.
 
-- [commands-reference.md](commands-reference.md)
-- [config-reference.md](config-reference.md)
-- [providers-reference.md](providers-reference.md)
-- [channels-reference.md](channels-reference.md)
-- [custom-providers.md](custom-providers.md)
+- [reference/commands.md](reference/commands.md)
+- [reference/config.md](reference/config.md)
+- [reference/providers.md](reference/providers.md)
+- [reference/channels.md](reference/channels.md)
+- [reference/custom-providers.md](reference/custom-providers.md)
 
 ## Operations
 
-- [operations-runbook.md](operations-runbook.md) — day-2 runtime operations
-- [troubleshooting.md](troubleshooting.md)
-- [network-deployment.md](network-deployment.md)
-- [proxy-agent-playbook.md](proxy-agent-playbook.md)
-- [resource-limits.md](resource-limits.md)
-- [release-process.md](release-process.md)
+- [operations/runbook.md](operations/runbook.md) — day-2 runtime operations
+- [start/troubleshooting.md](start/troubleshooting.md)
+- [operations/network-deployment.md](operations/network-deployment.md)
+- [operations/proxy-agent-playbook.md](operations/proxy-agent-playbook.md)
+- [operations/resource-limits.md](operations/resource-limits.md)
+- [contributing/release-process.md](contributing/release-process.md)
 
 ## Security
 
-- [agnostic-security.md](agnostic-security.md) (will merge into `security/model.md`)
-- [frictionless-security.md](frictionless-security.md) (will merge into `security/model.md`)
-- [sandboxing.md](sandboxing.md)
-- [audit-logging.md](audit-logging.md)
+- [security/agnostic-security.md](security/agnostic-security.md) (will merge into `security/model.md`)
+- [security/frictionless-security.md](security/frictionless-security.md) (will merge into `security/model.md`)
+- [security/sandboxing.md](security/sandboxing.md)
+- [security/audit-logging.md](security/audit-logging.md)
 - [security/http-request-ssrf-threat-model.md](security/http-request-ssrf-threat-model.md)
 - [security/shell-execution-security-note.md](security/shell-execution-security-note.md)
 - Roadmap: now tracked in ClickUp v0.6.0 release task (see [pillar 3](pillars/3-tools-approvals.md))
 
 ## Hardware (niche but supported)
 
-- [hardware-peripherals-design.md](hardware-peripherals-design.md)
-- [adding-boards-and-tools.md](adding-boards-and-tools.md)
-- [arduino-uno-q-setup.md](arduino-uno-q-setup.md)
-- [nucleo-setup.md](nucleo-setup.md)
+- [hardware/peripherals-design.md](hardware/peripherals-design.md)
+- [hardware/adding-boards-and-tools.md](hardware/adding-boards-and-tools.md)
+- [hardware/arduino-uno-q-setup.md](hardware/arduino-uno-q-setup.md)
+- [hardware/nucleo-setup.md](hardware/nucleo-setup.md)
 - [datasheets/](datasheets/)
 
 ## Contributing
 
-- [pr-workflow.md](pr-workflow.md)
-- [reviewer-playbook.md](reviewer-playbook.md)
-- [ci-map.md](ci-map.md)
-- [actions-source-policy.md](actions-source-policy.md)
+- [contributing/pr-workflow.md](contributing/pr-workflow.md)
+- [contributing/reviewer-playbook.md](contributing/reviewer-playbook.md)
+- [contributing/ci-map.md](contributing/ci-map.md)
+- [contributing/actions-source-policy.md](contributing/actions-source-policy.md)
 
 ## Project (conventions + archive)
 

@@ -221,7 +221,7 @@ let stream = stream.chain(futures::stream::once(async move {
 
 3. **Backwards-compat check**: same endpoint with no `Accept` header returns the old sync JSON shape — no client breakage.
 
-**Doc update:** add `docs/api-v1-streaming.md` (new) covering the SSE event schema. Update `docs/commands-reference.md` if it mentions `/api/v1/agent/chat` to note the new mode.
+**Doc update:** add `docs/reference/api-v1-streaming.md` (new) covering the SSE event schema. Update `docs/reference/commands.md` if it mentions `/api/v1/agent/chat` to note the new mode.
 
 **Done when:**
 - Unit test passes (`cargo test --target x86_64-unknown-linux-musl --lib gateway::api_v1::tests::sse_chat_emits_chunk_then_done`)

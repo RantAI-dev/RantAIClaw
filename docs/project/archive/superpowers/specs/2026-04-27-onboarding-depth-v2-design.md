@@ -61,7 +61,7 @@ Concrete file-level breakdown. New files marked **NEW**; existing files extended
 |---|---|---|
 | `scripts/bootstrap.sh` | EXT | Add `maybe_run_setup()` invoked at end. New flags: `--skip-setup`, `RANTAICLAW_SKIP_SETUP=1`. Detects TTY, redirects from `/dev/tty`. |
 | `scripts/install.sh` | EXT | Pass-through new flags. |
-| `docs/install.md` | EXT | Document auto-setup behavior + opt-out. |
+| `docs/start/install.md` | EXT | Document auto-setup behavior + opt-out. |
 
 ### Profile manager
 
@@ -744,7 +744,7 @@ Wave 4: Agents G, H, I (parallel)
 
 Wave 5: Agent J (Integration, solo)
   - tests/e2e_install_to_chat.sh
-  - docs/install.md (auto-setup section)
+  - docs/start/install.md (auto-setup section)
   - docs/onboarding.md (NEW)
   - README.md refresh
   - insta snapshots, coverage assertion
@@ -772,7 +772,7 @@ The PR `feat/onboarding-depth-v2 → main` is mergeable iff:
 - Compatibility tests in §9.2 pass.
 - Performance gates met on `test-benchmarks.yml`.
 - E2E `tests/e2e_install_to_chat.sh` succeeds against a v0.5.0-rc artifact built from branch tip.
-- README + `docs/install.md` + `docs/onboarding.md` updated.
+- README + `docs/start/install.md` + `docs/onboarding.md` updated.
 - `RELEASE_v0.5.0.md` drafted.
 
 ### 9.6 Traceability matrix
@@ -816,5 +816,5 @@ The PR `feat/onboarding-depth-v2 → main` is mergeable iff:
 
 - [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) — reference baseline for setup wizard depth and modular `hermes setup <topic>` UX.
 - [openclaw/openclaw](https://github.com/openclaw/openclaw) — reference baseline for `openclaw onboard --install-daemon` and pairing-based DM policy.
-- [docs/install.md](../../install.md) — current install flow (will be extended with auto-setup behavior).
+- [docs/start/install.md](../../install.md) — current install flow (will be extended with auto-setup behavior).
 - [docs/superpowers/specs/2026-04-25-installer-ux-upgrade-design.md](2026-04-25-installer-ux-upgrade-design.md) — preceding installer UX work that v0.5.0 builds on top of.

@@ -4,17 +4,17 @@ Structured reference index for commands, providers, channels, config, and integr
 
 ## Core References
 
-- Commands by workflow: [../commands-reference.md](../commands-reference.md)
-- Provider IDs / aliases / env vars: [../providers-reference.md](../providers-reference.md)
-- Channel setup + allowlists: [../channels-reference.md](../channels-reference.md)
-- Config defaults and keys: [../config-reference.md](../config-reference.md)
+- Commands by workflow: [commands.md](commands.md)
+- Provider IDs / aliases / env vars: [providers.md](providers.md)
+- Channel setup + allowlists: [channels.md](channels.md)
+- Config defaults and keys: [config.md](config.md)
 
 ## Provider & Integration Extensions
 
-- Custom provider endpoints: [../custom-providers.md](../custom-providers.md)
-- Z.AI / GLM provider onboarding: [../zai-glm-setup.md](../zai-glm-setup.md)
-- Nextcloud Talk bot integration: [../nextcloud-talk-setup.md](../nextcloud-talk-setup.md)
-- LangGraph-based integration patterns: [../langgraph-integration.md](../langgraph-integration.md)
+- Custom provider endpoints: [custom-providers.md](custom-providers.md)
+- Z.AI / GLM provider onboarding: [zai-glm-setup.md](zai-glm-setup.md)
+- Nextcloud Talk bot integration: [nextcloud-talk-setup.md](nextcloud-talk-setup.md)
+- LangGraph-based integration patterns: [langgraph-integration.md](langgraph-integration.md)
 
 ## Usage
 

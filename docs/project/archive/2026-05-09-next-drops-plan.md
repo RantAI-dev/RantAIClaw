@@ -320,7 +320,7 @@ async fn agent_chat(...) -> impl IntoResponse {
 - [ ] Session persistence happens on stream completion
 - [ ] Unit test for SSE plumbing
 - [ ] Live curl test against MiniMax shows incremental output
-- [ ] Doc update in `docs/commands-reference.md` or a new `docs/api-v1-streaming.md`
+- [ ] Doc update in `docs/reference/commands.md` or a new `docs/reference/api-v1-streaming.md`
 - [ ] `Cargo.toml` → `0.6.31-alpha`
 - [ ] Tarball + sha256 in `~/rantaiclaw-alpha-build/`
 - [ ] Tracker row RT-02 flipped to ✅

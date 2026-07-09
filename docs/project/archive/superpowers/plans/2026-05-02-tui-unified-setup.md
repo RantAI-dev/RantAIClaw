@@ -1256,15 +1256,15 @@ git commit -m "fix(channels): render WhatsApp Web QR to stderr; hard-fail withou
 ## Task 11: Docs + handoff
 
 **Files:**
-- Modify: `docs/commands-reference.md` — document new `rantaiclaw setup` behavior and `--non-interactive` flag semantics.
-- Modify: `docs/channels-reference.md` — note the new in-TUI WhatsApp Web pairing flow.
+- Modify: `docs/reference/commands.md` — document new `rantaiclaw setup` behavior and `--non-interactive` flag semantics.
+- Modify: `docs/reference/channels.md` — note the new in-TUI WhatsApp Web pairing flow.
 - Create: `docs/superpowers/specs/2026-05-02-tui-setup-followups.md` — list remaining sections (provider, telegram, discord, slack, persona, skills, mcp, approvals) as future migration plans, each one task-sized.
 
 - [ ] **Step 1: Update reference docs**
 
-`docs/commands-reference.md`: under `setup`, document three entry points (interactive default → TUI overlay; non-interactive → dialoguer wizard or headless provisioner; `setup <section>` → single section).
+`docs/reference/commands.md`: under `setup`, document three entry points (interactive default → TUI overlay; non-interactive → dialoguer wizard or headless provisioner; `setup <section>` → single section).
 
-`docs/channels-reference.md`: under WhatsApp Web, replace the "scan QR in WhatsApp > Linked Devices" hint with the new in-TUI flow + headless flag list.
+`docs/reference/channels.md`: under WhatsApp Web, replace the "scan QR in WhatsApp > Linked Devices" hint with the new in-TUI flow + headless flag list.
 
 - [ ] **Step 2: Write the follow-up spec**
 

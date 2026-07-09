@@ -13,9 +13,9 @@
 //! cargo bench --features kb --bench kb_retrieval
 //! ```
 //!
-//! Output is captured in `docs/kb-bench.md`. Compare against the TS
+//! Output is captured in `docs/reference/kb-bench.md`. Compare against the TS
 //! retriever by running `pnpm run bench:rag` from the parent repo (out
-//! of scope for this commit; see `docs/kb-bench.md` for the deferred
+//! of scope for this commit; see `docs/reference/kb-bench.md` for the deferred
 //! comparison plan).
 
 #![cfg(feature = "kb")]

@@ -6,13 +6,13 @@ If behavior changes affect CLI, config, provider, channel, runtime, tools, gatew
 
 Runtime-contract references:
 
-- `docs/commands-reference.md`
-- `docs/providers-reference.md`
-- `docs/channels-reference.md`
-- `docs/config-reference.md`
-- `docs/operations-runbook.md`
-- `docs/troubleshooting.md`
-- `docs/one-click-bootstrap.md`
+- `docs/reference/commands.md`
+- `docs/reference/providers.md`
+- `docs/reference/channels.md`
+- `docs/reference/config.md`
+- `docs/operations/runbook.md`
+- `docs/start/troubleshooting.md`
+- `docs/start/one-click-bootstrap.md`
 
 Navigation entry points:
 
