@@ -470,6 +470,20 @@ fn start(
         .or_else(|| existing_val("RANTAICLAW_TOKEN"))
         .unwrap_or_default();
 
+    // Cookie-signing secret for the console's session gate. Preserve an
+    // operator-set value; otherwise generate a real random one. This is critical:
+    // when console login is enabled, an empty/known secret would let anyone forge
+    // an `rc_session` cookie and bypass the gate. We never leave it to claw-ui's
+    // insecure built-in default. (The previous `.env.local` write also clobbered
+    // an existing secret — preserving it here fixes that too.)
+    let ui_secret = existing_val("RANTAICLAW_UI_SECRET")
+        .or_else(|| {
+            std::env::var("RANTAICLAW_UI_SECRET")
+                .ok()
+                .and_then(nonempty)
+        })
+        .unwrap_or_else(|| hex::encode(rand::random::<[u8; 32]>()));
+
     // Already serving on this port? Don't double-start.
     if port_open("127.0.0.1", port) {
         println!("✓ Web console already running → http://127.0.0.1:{port}");
@@ -539,7 +553,9 @@ fn start(
     }
 
     // Point the console at the gateway via `.env.local` (gateway URL + resolved token).
-    let env_local = format!("RANTAICLAW_GATEWAY_URL={gateway}\nRANTAICLAW_TOKEN={token}\n");
+    let env_local = format!(
+        "RANTAICLAW_GATEWAY_URL={gateway}\nRANTAICLAW_TOKEN={token}\nRANTAICLAW_UI_SECRET={ui_secret}\n"
+    );
     std::fs::write(&env_path, env_local)
         .with_context(|| format!("failed to write {}/.env.local", dir.display()))?;
 
