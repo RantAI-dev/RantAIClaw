@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 10;
+pub const CURRENT_VERSION: u32 = 11;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -180,8 +180,15 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive field only)
     }
 
-    // Future migrations (v11, v12, …) inserted here in order.
-    // if from < 11 { migrate_v11(raw)?; }
+    // v10 → v11: additive only — new optional `[gateway.login]` credential
+    // (username, password_hash), defaulted by serde. No data transformation;
+    // this arm burns a version slot so the schema_drift fingerprint is accepted.
+    if from < 11 {
+        // (no transformation; additive field only)
+    }
+
+    // Future migrations (v12, v13, …) inserted here in order.
+    // if from < 12 { migrate_v12(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -223,6 +230,14 @@ mod tests {
             "current-version config should not be transformed"
         );
         assert_eq!(version_of(&v), Some(CURRENT_VERSION as i64));
+    }
+
+    #[test]
+    fn v10_config_migrates_to_v11_without_data_change() {
+        let mut raw = parse("schema_version = 10\n[gateway]\nport = 3000\n");
+        let changed = migrate(&mut raw).unwrap();
+        assert!(changed);
+        assert_eq!(version_of(&raw), Some(11));
     }
 
     #[test]
@@ -341,8 +356,8 @@ mod tests {
         // without the migration injecting a `knowledge` table.
         let mut v = parse("schema_version = 9\n");
         let changed = migrate(&mut v).unwrap();
-        assert!(changed, "v9 config should be migrated to v10");
-        assert_eq!(version_of(&v), Some(10));
+        assert!(changed, "v9 config should be migrated to current");
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         assert!(
             v.get("knowledge").is_none(),
             "migration must not inject knowledge; serde default handles it"
