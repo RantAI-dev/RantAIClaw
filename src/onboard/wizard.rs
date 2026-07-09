@@ -111,7 +111,7 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
 // §"Setup orchestrator + sections" + §"Re-entry semantics".
 
 use crate::onboard::section::{
-    approvals::ApprovalsSection, channels::ChannelsSection, mcp::McpSection,
+    approvals::ApprovalsSection, channels::ChannelsSection, login::LoginSection, mcp::McpSection,
     persona::PersonaSection, provider::ProviderSection, skills::SkillsSection, SetupContext,
     SetupSection,
 };
@@ -136,6 +136,7 @@ fn canonical_sections() -> Vec<Box<dyn SetupSection>> {
         Box::new(PersonaSection),
         Box::new(SkillsSection),
         Box::new(McpSection),
+        Box::new(LoginSection),
     ];
     #[cfg(feature = "kb")]
     sections.push(Box::new(
@@ -281,35 +282,77 @@ fn print_setup_completion() {
 
 // ── Main wizard entry point ──────────────────────────────────────
 
+/// Interactive console-login setup for `onboard --interactive`. Mirrors the
+/// `LoginSection` / `LoginProvisioner`: an optional single-operator username +
+/// password gate for the web console and TUI. Returns a disabled config when
+/// declined or when the username/password is left empty.
+fn setup_login() -> Result<crate::config::GatewayLoginConfig> {
+    use dialoguer::{Confirm, Input, Password};
+
+    let enable = Confirm::new()
+        .with_prompt("Enable web console & TUI login (username + password)?")
+        .default(false)
+        .interact()?;
+    if !enable {
+        return Ok(crate::config::GatewayLoginConfig::default());
+    }
+
+    let username: String = Input::new()
+        .with_prompt("Console username")
+        .allow_empty(true)
+        .interact_text()?;
+    if username.trim().is_empty() {
+        println!("  Empty username — console login left disabled.");
+        return Ok(crate::config::GatewayLoginConfig::default());
+    }
+
+    let password = loop {
+        let p1 = Password::new().with_prompt("Console password").interact()?;
+        let p2 = Password::new().with_prompt("Confirm password").interact()?;
+        if !p1.trim().is_empty() && p1 == p2 {
+            break p1;
+        }
+        println!("  Passwords were empty or did not match — try again.");
+    };
+
+    Ok(crate::config::GatewayLoginConfig {
+        username: Some(username.trim().to_string()),
+        password_hash: Some(crate::security::login::hash_password(&password)?),
+    })
+}
+
 pub async fn run_wizard(force: bool) -> Result<Config> {
     ui::print_welcome_banner();
 
-    print_step(1, 9, "Workspace Setup");
+    print_step(1, 10, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace()?;
     ensure_onboard_overwrite_allowed(&config_path, force)?;
 
-    print_step(2, 9, "AI Provider & API Key");
+    print_step(2, 10, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
 
-    print_step(3, 9, "Channels (How You Talk to RantaiClaw)");
+    print_step(3, 10, "Channels (How You Talk to RantaiClaw)");
     let channels_config = setup_channels()?;
 
-    print_step(4, 9, "Tunnel (Expose to Internet)");
+    print_step(4, 10, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
 
-    print_step(5, 9, "Tool Mode & Security");
+    print_step(5, 10, "Tool Mode & Security");
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
-    print_step(6, 9, "Hardware (Physical World)");
+    print_step(6, 10, "Console Login (Web Console & TUI)");
+    let login_config = setup_login()?;
+
+    print_step(7, 10, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
 
-    print_step(7, 9, "Memory Configuration");
+    print_step(8, 10, "Memory Configuration");
     let memory_config = setup_memory()?;
 
-    print_step(8, 9, "Project Context (Personalize Your Agent)");
+    print_step(9, 10, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
 
-    print_step(9, 9, "Workspace Files");
+    print_step(10, 10, "Workspace Files");
     scaffold_workspace(&workspace_dir, &project_ctx)?;
 
     // ── Build config ──
@@ -344,7 +387,10 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         memory: memory_config, // User-selected memory backend
         storage: StorageConfig::default(),
         tunnel: tunnel_config,
-        gateway: crate::config::GatewayConfig::default(),
+        gateway: crate::config::GatewayConfig {
+            login: login_config,
+            ..Default::default()
+        },
         composio: composio_config,
         knowledge: KnowledgeConfig::default(),
         secrets: secrets_config,

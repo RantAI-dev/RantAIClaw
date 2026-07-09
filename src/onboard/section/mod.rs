@@ -23,6 +23,7 @@ pub mod approvals;
 pub mod channels;
 #[cfg(feature = "kb")]
 pub mod knowledge;
+pub mod login;
 pub mod mcp;
 pub mod persona;
 pub mod provider;

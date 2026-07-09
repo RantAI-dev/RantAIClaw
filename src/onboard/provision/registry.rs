@@ -9,6 +9,7 @@ pub fn provisioner_for(name: &str) -> Option<Box<dyn TuiProvisioner>> {
         "provider" => Some(Box::new(super::provider::ProviderProvisioner::new())),
         "approvals" => Some(Box::new(super::approvals::ApprovalsProvisioner::new())),
         "mcp" => Some(Box::new(super::mcp::McpProvisioner::new())),
+        "login" => Some(Box::new(super::login::LoginProvisioner::new())),
         #[cfg(feature = "kb")]
         "knowledge" => Some(Box::new(super::knowledge::KnowledgeProvisioner::new())),
         "skills" => Some(Box::new(super::skills::SkillsProvisioner::new())),
@@ -110,6 +111,10 @@ pub fn available() -> Vec<(&'static str, &'static str)> {
     list.push((
         super::mcp::MCP_NAME,
         super::mcp::McpProvisioner::new().description(),
+    ));
+    list.push((
+        super::login::LOGIN_NAME,
+        super::login::LoginProvisioner::new().description(),
     ));
     list.push((
         super::skills::SKILLS_NAME,
@@ -269,6 +274,12 @@ pub fn test_responses_for(name: &str) -> Vec<ProvisionResponse> {
             ProvisionResponse::Selection(vec![0]),
         ],
         "skills" => vec![ProvisionResponse::Selection(vec![0])],
+        "login" => vec![
+            ProvisionResponse::Selection(vec![0]),             // enable
+            ProvisionResponse::Text("rantaiclaw_user".into()), // username
+            ProvisionResponse::Text("smoke-pass".into()),      // password
+            ProvisionResponse::Text("smoke-pass".into()),      // confirm (matches)
+        ],
         #[cfg(feature = "kb")]
         "knowledge" => vec![
             ProvisionResponse::Selection(vec![0]),  // enable
