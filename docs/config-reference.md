@@ -286,6 +286,22 @@ Notes:
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
 
+### `[gateway.login]`
+
+Optional single-operator login for the web console (claw-ui) and the TUI. Set it
+up (or turn it off) with `rantaiclaw setup login`; do not hand-edit the hash.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `username` | _(unset)_ | operator username, verified on login (not secret) |
+| `password_hash` | _(unset)_ | argon2 PHC hash of the password; **its presence enables the login gate** |
+
+When enabled, the console and TUI require the password before use. `POST /login`
+(`{username, password}`) returns a bearer token that authenticates `/api/v1/*`,
+and `ui start` stops auto-injecting a token so the browser prompts for it.
+Enabling this requires a claw-ui build that ships the login page. When
+`password_hash` is unset, behavior is unchanged (pairing/auto-pair as before).
+
 ## `[autonomy]`
 
 | Key | Default | Purpose |
