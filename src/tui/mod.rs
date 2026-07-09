@@ -25,6 +25,7 @@ pub use commands::{CommandHandler, CommandRegistry, CommandResult};
 pub use first_run_wizard::FirstRunWizard;
 #[cfg(feature = "tui")]
 #[allow(unused_imports)]
+pub use widgets::LoginGateState;
 pub use widgets::SetupOverlayState;
 
 use std::path::PathBuf;
