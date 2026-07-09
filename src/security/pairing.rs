@@ -20,6 +20,10 @@ const MAX_PAIR_ATTEMPTS: u32 = 5;
 const PAIR_LOCKOUT_SECS: u64 = 300; // 5 minutes
 /// Maximum number of tracked client entries to bound memory usage.
 const MAX_TRACKED_CLIENTS: usize = 1024;
+/// Maximum failed login attempts before lockout.
+const MAX_LOGIN_ATTEMPTS: u32 = 5;
+/// Lockout duration after too many failed login attempts.
+const LOGIN_LOCKOUT_SECS: u64 = 300; // 5 minutes
 
 /// Manages pairing state for the gateway.
 ///
@@ -38,6 +42,10 @@ pub struct PairingGuard {
     /// Brute-force protection: per-client failed attempt counter + lockout time.
     #[allow(clippy::type_complexity)]
     failed_attempts: Arc<Mutex<HashMap<String, (u32, Option<Instant>)>>>,
+    /// Brute-force protection for `POST /login` — a separate keyspace from
+    /// pairing so a failed login never locks out `/pair` and vice-versa.
+    #[allow(clippy::type_complexity)]
+    login_failures: Arc<Mutex<HashMap<String, (u32, Option<Instant>)>>>,
 }
 
 impl PairingGuard {
@@ -70,6 +78,7 @@ impl PairingGuard {
             pairing_code: Arc::new(Mutex::new(code)),
             paired_tokens: Arc::new(Mutex::new(tokens)),
             failed_attempts: Arc::new(Mutex::new(HashMap::new())),
+            login_failures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -196,6 +205,48 @@ impl PairingGuard {
         let mut tokens = self.paired_tokens.lock();
         tokens.insert(hash_token(&token));
         token
+    }
+
+    /// Remaining login-lockout seconds for a client, or `None` if not locked out.
+    pub fn login_lockout_remaining(&self, client_id: &str) -> Option<u64> {
+        let attempts = self.login_failures.lock();
+        if let Some((count, Some(locked_at))) = attempts.get(client_id) {
+            if *count >= MAX_LOGIN_ATTEMPTS {
+                let elapsed = locked_at.elapsed().as_secs();
+                if elapsed < LOGIN_LOCKOUT_SECS {
+                    return Some(LOGIN_LOCKOUT_SECS - elapsed);
+                }
+            }
+        }
+        None
+    }
+
+    /// Record a failed login for a client (bounded map; locks out at
+    /// [`MAX_LOGIN_ATTEMPTS`]).
+    pub fn record_login_failure(&self, client_id: &str) {
+        let mut attempts = self.login_failures.lock();
+        if attempts.len() >= MAX_TRACKED_CLIENTS {
+            attempts.retain(|_, (_, locked_at)| {
+                locked_at
+                    .map(|t| t.elapsed().as_secs() < LOGIN_LOCKOUT_SECS)
+                    .unwrap_or(true)
+            });
+        }
+        let entry = attempts.entry(client_id.to_string()).or_insert((0, None));
+        if let Some(locked_at) = entry.1 {
+            if locked_at.elapsed().as_secs() >= LOGIN_LOCKOUT_SECS {
+                *entry = (0, None);
+            }
+        }
+        entry.0 += 1;
+        if entry.0 >= MAX_LOGIN_ATTEMPTS {
+            entry.1 = Some(Instant::now());
+        }
+    }
+
+    /// Clear a client's login failures after a successful login.
+    pub fn reset_login_failures(&self, client_id: &str) {
+        self.login_failures.lock().remove(client_id);
     }
 }
 
@@ -379,6 +430,23 @@ mod tests {
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
         assert!(!guard.is_authenticated("wrong"));
+    }
+
+    // ── Console login: dedicated brute-force lockout ──
+
+    #[test]
+    async fn login_lockout_is_independent_of_pairing_lockout() {
+        let guard = PairingGuard::new(true, &[]);
+        let client = "ip1";
+        assert!(guard.login_lockout_remaining(client).is_none());
+        for _ in 0..MAX_LOGIN_ATTEMPTS {
+            guard.record_login_failure(client);
+        }
+        assert!(guard.login_lockout_remaining(client).is_some());
+        // Pairing path for the same client is NOT locked (separate keyspace).
+        assert!(guard.try_pair("wrong", client).await.is_ok());
+        guard.reset_login_failures(client);
+        assert!(guard.login_lockout_remaining(client).is_none());
     }
 
     // ── Token hashing ────────────────────────────────────────
