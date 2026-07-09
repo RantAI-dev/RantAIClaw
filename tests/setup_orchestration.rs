@@ -64,6 +64,7 @@ fn setup_runs_all_sections_in_canonical_order() {
         "persona",
         "skills",
         "mcp",
+        "login",
     ];
     if cfg!(feature = "kb") {
         expected.push("knowledge");
@@ -176,6 +177,7 @@ fn setup_with_unknown_topic_errors_with_valid_topic_list() {
             "persona",
             "skills",
             "mcp",
+            "login",
         ] {
             assert!(msg.contains(s), "error should list valid topic {s}: {msg}",);
         }
@@ -218,9 +220,9 @@ fn onboard_alias_dispatches_to_setup_with_no_topic() {
         let report = wizard::run_setup(&profile, &mut config, None, false, true)
             .expect("legacy-equivalent dispatch should succeed");
         // No topic + non-interactive ⇒ every section produces an outcome
-        // (visited or skipped). 6 core sections + `knowledge` when the `kb`
+        // (visited or skipped). 7 core sections + `knowledge` when the `kb`
         // feature is on (the default/CI build).
-        let expected_sections = if cfg!(feature = "kb") { 7 } else { 6 };
+        let expected_sections = if cfg!(feature = "kb") { 8 } else { 7 };
         assert_eq!(
             report.visited.len() + report.skipped.len(),
             expected_sections
