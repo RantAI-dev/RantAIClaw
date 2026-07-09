@@ -5,6 +5,24 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Optional single-operator console/TUI login (username + password).** A new
+  `[gateway.login]` config section (`username`, argon2 `password_hash`) gates the
+  web console (claw-ui) and the TUI when a password is set — enable or disable it
+  with `rantaiclaw setup login`. `POST /login` verifies the credential and issues
+  the same bearer token that already guards `/api/v1/*`; the public
+  `GET /api/v1/auth/info` reports only `{ "login_required": bool }` (never the
+  username). Login-issued session tokens are in-memory, bounded, and revoked when
+  the credential changes or the gateway restarts. When login is enabled,
+  `rantaiclaw ui start` no longer auto-injects a token, so the browser prompts for
+  the password. Default-off: with no `password_hash`, behavior is unchanged.
+  - Requires a claw-ui build that ships the login page (posts to `/login`).
+  - Adds the `argon2` dependency (one-way password hashing).
+  - Bumps the config schema to **v11** (additive; no migration action needed).
+
 ## [0.7.5-alpha] — 2026-07-08
 
 ### Added
