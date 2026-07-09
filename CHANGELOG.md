@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6-alpha] — 2026-07-09
+
 ### Added
 
 - **Optional single-operator console/TUI login (username + password).** A new
@@ -15,13 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `rantaiclaw setup login`. `POST /login` verifies the credential and issues
   the same bearer token that already guards `/api/v1/*`; the public
   `GET /api/v1/auth/info` reports only `{ "login_required": bool }` (never the
-  username). Login-issued session tokens are in-memory, bounded, and revoked when
-  the credential changes or the gateway restarts. When login is enabled,
+  username). Verification is stateless — the gateway keeps no login session;
+  repeated failed attempts are rate-limited and locked out. When login is enabled,
   `rantaiclaw ui start` no longer auto-injects a token, so the browser prompts for
   the password. Default-off: with no `password_hash`, behavior is unchanged.
   - Requires a claw-ui build that ships the login page (posts to `/login`).
   - Adds the `argon2` dependency (one-way password hashing).
   - Bumps the config schema to **v11** (additive; no migration action needed).
+
+### Fixed
+
+- **Console-login build/test regressions caught post-merge.** Restored the
+  `#[cfg(feature = "tui")]` gate on the `SetupOverlayState` re-export (the new
+  login-gate import had displaced it, breaking `--no-default-features` /
+  hardware-only / browser-native builds), and updated the setup-orchestration
+  tests for the new `login` section (canonical order, section count, and the
+  valid `setup <topic>` list). Also satisfied the strict clippy delta gate.
 
 ## [0.7.5-alpha] — 2026-07-08
 
