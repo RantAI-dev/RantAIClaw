@@ -222,29 +222,91 @@ impl IntelligenceStore for SqliteStore {
                 }
             }
 
-            // Edges = relations whose BOTH endpoints are in the selected node set.
+            // Edges = relations whose BOTH endpoints are in the selected node
+            // set, deduplicated by (source, target, relation_type) with a
+            // `weight` counting how many relation rows collapsed into each.
             let node_ids: std::collections::HashSet<String> =
                 nodes.iter().map(|n| n.id.clone()).collect();
-            let mut edges = Vec::new();
+            let mut ew: std::collections::HashMap<(String, String, String), usize> =
+                std::collections::HashMap::new();
             {
                 let mut stmt = conn.prepare(
                     "SELECT source_entity_id, target_entity_id, relation_type FROM entity_relation",
                 )?;
                 let mut rows = stmt.query([])?;
                 while let Some(row) = rows.next()? {
-                    let source: String = row.get("source_entity_id")?;
-                    let target: String = row.get("target_entity_id")?;
-                    if node_ids.contains(&source) && node_ids.contains(&target) {
-                        edges.push(GraphEdge {
-                            source,
-                            target,
-                            relation_type: row.get("relation_type")?,
-                        });
+                    let (s, t): (String, String) =
+                        (row.get("source_entity_id")?, row.get("target_entity_id")?);
+                    if node_ids.contains(&s) && node_ids.contains(&t) {
+                        let r: String = row.get("relation_type")?;
+                        *ew.entry((s, t, r)).or_insert(0) += 1;
                     }
                 }
             }
+            let edges: Vec<GraphEdge> = ew
+                .into_iter()
+                .map(|((source, target, relation_type), weight)| GraphEdge {
+                    source,
+                    target,
+                    relation_type,
+                    weight,
+                })
+                .collect();
 
-            Ok(Graph { nodes, edges })
+            // degree = incident DEDUPED edges (overwrites the SQL
+            // COUNT(DISTINCT r.id) ordering key used for node selection above).
+            let mut degree: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for e in &edges {
+                *degree.entry(e.source.clone()).or_insert(0) += 1;
+                if e.target != e.source {
+                    *degree.entry(e.target.clone()).or_insert(0) += 1;
+                }
+            }
+            for n in &mut nodes {
+                n.degree = degree.get(&n.id).copied().unwrap_or(0);
+            }
+
+            // Scope-aware corpus counts (both honor `group`, so a group view
+            // is internally consistent). Computed scope-wide, i.e. before the
+            // top-N node cap applied above.
+            let (total_entities, total_relations) = match &group_id {
+                Some(g) => {
+                    let scoped = "SELECT entity_id FROM entity_mention WHERE document_id IN
+                                  (SELECT document_id FROM document_group WHERE group_id = ?1)";
+                    let te: i64 = conn.query_row(
+                        &format!("SELECT COUNT(DISTINCT entity_id) FROM ({scoped})"),
+                        params![g],
+                        |r| r.get(0),
+                    )?;
+                    let tr: i64 = conn.query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM (SELECT DISTINCT source_entity_id, target_entity_id, relation_type
+                             FROM entity_relation WHERE source_entity_id IN ({scoped}) AND target_entity_id IN ({scoped}))"
+                        ),
+                        params![g],
+                        |r| r.get(0),
+                    )?;
+                    (te as usize, tr as usize)
+                }
+                None => {
+                    let te: i64 =
+                        conn.query_row("SELECT COUNT(*) FROM entity", [], |r| r.get(0))?;
+                    let tr: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM (SELECT DISTINCT source_entity_id, target_entity_id, relation_type FROM entity_relation)",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    (te as usize, tr as usize)
+                }
+            };
+
+            Ok(Graph {
+                nodes,
+                edges,
+                total_entities,
+                total_relations,
+            })
         })
         .await
         .map_err(|e| KbError::Other(format!("join: {e}")))?

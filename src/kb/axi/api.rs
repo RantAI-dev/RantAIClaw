@@ -609,12 +609,18 @@ struct GraphEdgeJson {
     source: String,
     target: String,
     relation_type: String,
+    weight: usize,
 }
 
 #[derive(Debug, Serialize)]
 struct GraphStats {
     total_nodes: usize,
     total_edges: usize,
+    /// Scope-wide (group-scoped when `?group=` is set, else corpus-wide)
+    /// entity count, computed before the top-N node cap `total_nodes` reflects.
+    corpus_entities: usize,
+    /// Scope-wide distinct `(source, target, relation_type)` relation count.
+    corpus_relations: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -629,6 +635,8 @@ impl From<Graph> for GraphResponse {
         let stats = GraphStats {
             total_nodes: g.nodes.len(),
             total_edges: g.edges.len(),
+            corpus_entities: g.total_entities,
+            corpus_relations: g.total_relations,
         };
         Self {
             nodes: g
@@ -649,6 +657,7 @@ impl From<Graph> for GraphResponse {
                     source: e.source,
                     target: e.target,
                     relation_type: e.relation_type,
+                    weight: e.weight,
                 })
                 .collect(),
             stats,

@@ -575,6 +575,195 @@ async fn kb_graph_returns_nodes_edges_and_stats() {
 }
 
 #[tokio::test]
+async fn graph_dedupes_edges_weights_and_recomputes_degree() {
+    use rantaiclaw::kb::intelligence::types::{
+        Entity, EntityMention, EntityType, ExtractSource, Relation, RelationType,
+    };
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            for (id, key, name) in [("a", "k:A", "A"), ("b", "k:B", "B"), ("c", "k:C", "C")] {
+                store
+                    .upsert_entity(&Entity {
+                        id: id.into(),
+                        canonical_key: key.into(),
+                        name: name.into(),
+                        entity_type: EntityType::Product,
+                        confidence: 0.9,
+                        metadata: serde_json::json!({}),
+                    })
+                    .await
+                    .unwrap();
+                store
+                    .add_mention(&EntityMention {
+                        id: format!("m_{id}"),
+                        entity_id: id.into(),
+                        document_id: "doc1".into(),
+                        chunk_index: Some(0),
+                        context: None,
+                        source: ExtractSource::Llm,
+                    })
+                    .await
+                    .unwrap();
+            }
+            // A->B extracted from TWO docs (duplicate pair+type), B->C once.
+            for (rid, doc) in [("r1", "doc1"), ("r2", "doc2")] {
+                store
+                    .add_relation(&Relation {
+                        id: rid.into(),
+                        source_entity_id: "a".into(),
+                        target_entity_id: "b".into(),
+                        relation_type: RelationType::RelatedTo,
+                        confidence: 0.9,
+                        document_id: doc.into(),
+                        metadata: serde_json::json!({}),
+                    })
+                    .await
+                    .unwrap();
+            }
+            store
+                .add_relation(&Relation {
+                    id: "r3".into(),
+                    source_entity_id: "b".into(),
+                    target_entity_id: "c".into(),
+                    relation_type: RelationType::RelatedTo,
+                    confidence: 0.9,
+                    document_id: "doc2".into(),
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+        })
+    })
+    .await;
+
+    let body: Value = reqwest::get(format!("{}/api/v1/kb/graph?limit=100", h.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let edges = body["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 2, "A->B deduped + B->C");
+    let ab = edges
+        .iter()
+        .find(|e| e["source"] == "a" && e["target"] == "b")
+        .unwrap();
+    assert_eq!(ab["weight"], 2);
+    let deg = |n: &str| {
+        body["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == n)
+            .unwrap()["degree"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!((deg("a"), deg("b"), deg("c")), (1, 2, 1)); // NOT inflated by the duplicate
+    assert_eq!(body["stats"]["corpus_entities"], 3);
+    assert_eq!(body["stats"]["corpus_relations"], 2); // distinct (src,tgt,type)
+}
+
+#[tokio::test]
+async fn graph_corpus_entities_respects_group() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, EntityType, ExtractSource};
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    // `document_group.group_id` has an FK against `knowledge_base_group.id`,
+    // and `create_group` generates that id server-side — so the seed closure
+    // (which only returns `()`) stashes it here for the assertions below.
+    // `start_harness` awaits the closure to completion before returning, so
+    // this is populated by the time we read it.
+    let group_id_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let group_id_cell2 = group_id_cell.clone();
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            // A document that belongs to a freshly created group.
+            let group = store
+                .create_group("Group G", None, None)
+                .await
+                .expect("create group");
+            *group_id_cell2.lock() = Some(group.id.clone());
+            store
+                .create_document(&sample_doc("rantaiclaw_doc_group", "Group Doc"))
+                .await
+                .expect("seed doc");
+            store
+                .add_document_to_group("rantaiclaw_doc_group", &group.id)
+                .await
+                .expect("link doc to group");
+
+            // Three entities; only "a" and "b" are mentioned from the
+            // in-group document. "c" is mentioned from an out-of-group doc.
+            for (id, key, name) in [("a", "k:A", "A"), ("b", "k:B", "B"), ("c", "k:C", "C")] {
+                store
+                    .upsert_entity(&Entity {
+                        id: id.into(),
+                        canonical_key: key.into(),
+                        name: name.into(),
+                        entity_type: EntityType::Product,
+                        confidence: 0.9,
+                        metadata: serde_json::json!({}),
+                    })
+                    .await
+                    .expect("seed entity");
+            }
+            for id in ["a", "b"] {
+                store
+                    .add_mention(&EntityMention {
+                        id: format!("m_{id}"),
+                        entity_id: id.into(),
+                        document_id: "rantaiclaw_doc_group".into(),
+                        chunk_index: Some(0),
+                        context: None,
+                        source: ExtractSource::Llm,
+                    })
+                    .await
+                    .expect("seed mention");
+            }
+            store
+                .add_mention(&EntityMention {
+                    id: "m_c".into(),
+                    entity_id: "c".into(),
+                    document_id: "rantaiclaw_doc_other".into(),
+                    chunk_index: Some(0),
+                    context: None,
+                    source: ExtractSource::Llm,
+                })
+                .await
+                .expect("seed mention");
+        })
+    })
+    .await;
+
+    let group_id = group_id_cell.lock().clone().expect("group id captured");
+    let grouped: Value = reqwest::get(format!(
+        "{}/api/v1/kb/graph?group={group_id}&limit=100",
+        h.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(grouped["stats"]["corpus_entities"], 2, "grouped: {grouped}");
+
+    let ungrouped: Value = reqwest::get(format!("{}/api/v1/kb/graph?limit=100", h.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        ungrouped["stats"]["corpus_entities"], 3,
+        "ungrouped: {ungrouped}"
+    );
+}
+
+#[tokio::test]
 async fn kb_ingest_missing_file_field_returns_400() {
     let h = start_harness(|_store| Box::pin(async move {})).await;
 
