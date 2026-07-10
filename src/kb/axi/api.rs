@@ -633,6 +633,10 @@ struct GraphStats {
     corpus_entities: usize,
     /// Scope-wide distinct `(source, target, relation_type)` relation count.
     corpus_relations: usize,
+    /// True when the returned node set was capped below the scope-wide
+    /// `corpus_entities` total (`total_nodes < corpus_entities`) — i.e. the
+    /// graph is a truncated view the client should signal as "showing N of M".
+    truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -649,6 +653,7 @@ impl From<Graph> for GraphResponse {
             total_edges: g.edges.len(),
             corpus_entities: g.total_entities,
             corpus_relations: g.total_relations,
+            truncated: g.total_entities > g.nodes.len(),
         };
         Self {
             nodes: g

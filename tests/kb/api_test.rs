@@ -618,6 +618,68 @@ async fn graph_limit_is_clamped_to_hard_cap() {
 }
 
 #[tokio::test]
+async fn graph_stats_truncated_flag_reflects_cap() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, EntityType, ExtractSource};
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            for (id, key, name) in [("t1", "trunc:A", "A"), ("t2", "trunc:B", "B")] {
+                store
+                    .upsert_entity(&Entity {
+                        id: id.into(),
+                        canonical_key: key.into(),
+                        name: name.into(),
+                        entity_type: EntityType::Product,
+                        confidence: 0.9,
+                        metadata: serde_json::json!({}),
+                    })
+                    .await
+                    .expect("seed entity");
+                store
+                    .add_mention(&EntityMention {
+                        id: format!("m_{id}"),
+                        entity_id: id.into(),
+                        document_id: "rantaiclaw_doc_trunc".into(),
+                        chunk_index: Some(0),
+                        context: None,
+                        source: ExtractSource::Llm,
+                    })
+                    .await
+                    .expect("seed mention");
+            }
+        })
+    })
+    .await;
+
+    // limit below the corpus (2 entities) → truncated flag set, nodes capped at 1.
+    let body: Value = reqwest::get(format!("{}/api/v1/kb/graph?limit=1", h.base_url))
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        body["stats"]["truncated"], true,
+        "expected truncated: {body}"
+    );
+    assert_eq!(body["stats"]["corpus_entities"], 2);
+    assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
+
+    // limit above the corpus → not truncated.
+    let body2: Value = reqwest::get(format!("{}/api/v1/kb/graph?limit=10", h.base_url))
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        body2["stats"]["truncated"], false,
+        "expected not truncated: {body2}"
+    );
+}
+
+#[tokio::test]
 async fn graph_dedupes_edges_weights_and_recomputes_degree() {
     use rantaiclaw::kb::intelligence::types::{
         Entity, EntityMention, EntityType, ExtractSource, Relation, RelationType,
