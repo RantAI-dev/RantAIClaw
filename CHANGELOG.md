@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Default gateway port is now `9393`** (was `3000`, which collides with other
+  local dev servers such as Next.js/Vite). Configs written by rantaiclaw are
+  unchanged — they serialize `port` explicitly and keep their value; only fresh
+  configs (or hand-written configs omitting `[gateway] port`) pick up the new
+  default. Bumps the config schema to **v12** (no migration action needed).
+  Docker/compose images keep an explicit `3000` (container-isolated) and are
+  unaffected.
+
 ## [0.7.6-alpha] — 2026-07-09
 
 ### Added

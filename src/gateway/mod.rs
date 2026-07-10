@@ -313,6 +313,9 @@ fn load_webhook_routes(config_dir: &std::path::Path) -> Vec<WebhookRoute> {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Mutex<Config>>,
+    /// Fingerprint of the config file currently loaded (refreshed on hot-reload).
+    /// Published on `/api/v1/version` so clients can detect a stale gateway.
+    pub config_fingerprint: Arc<Mutex<String>>,
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub temperature: f64,
@@ -646,6 +649,9 @@ pub async fn run_gateway(
 
     let state = AppState {
         config: config_state,
+        config_fingerprint: Arc::new(Mutex::new(crate::config::fingerprint::fingerprint_file(
+            &config.config_path,
+        ))),
         provider,
         model,
         temperature,
@@ -677,7 +683,11 @@ pub async fn run_gateway(
     // Hot-reload: reflect on-disk config edits (e.g. a provider changed in the
     // TUI, another process) in the running gateway + the web console it serves,
     // without a restart. Best-effort — a watcher failure just disables it.
-    spawn_config_reloader(state.config.clone(), config.config_path.clone());
+    spawn_config_reloader(
+        state.config.clone(),
+        state.config_fingerprint.clone(),
+        config.config_path.clone(),
+    );
 
     // Build router with middleware
     let app = Router::new()
@@ -993,7 +1003,11 @@ fn try_consume_gateway_store_code(state: &AppState, code: &str) -> Option<String
 /// `Config::load_or_init` for the exact same decrypt pass used at startup
 /// (including `provider_api_keys`). Best-effort: a watcher-setup failure logs
 /// and disables hot-reload; a failed reload keeps the current config.
-fn spawn_config_reloader(config: Arc<Mutex<Config>>, config_path: std::path::PathBuf) {
+fn spawn_config_reloader(
+    config: Arc<Mutex<Config>>,
+    config_fingerprint: Arc<Mutex<String>>,
+    config_path: std::path::PathBuf,
+) {
     tokio::spawn(async move {
         let mut watcher = match crate::config::watcher::ConfigWatcher::watch(&config_path) {
             Ok(w) => w,
@@ -1006,6 +1020,8 @@ fn spawn_config_reloader(config: Arc<Mutex<Config>>, config_path: std::path::Pat
             match Config::load_or_init().await {
                 Ok(fresh) => {
                     *config.lock() = fresh;
+                    *config_fingerprint.lock() =
+                        crate::config::fingerprint::fingerprint_file(&config_path);
                     tracing::info!(target: "gateway", "config.toml changed — reloaded running config");
                 }
                 Err(e) => {
@@ -2225,6 +2241,7 @@ mod tests {
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -2274,6 +2291,7 @@ mod tests {
         let observer: Arc<dyn crate::observability::Observer> = prom;
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -2482,6 +2500,7 @@ mod tests {
     fn store_pairing_test_state(config: Config) -> AppState {
         AppState {
             config: Arc::new(Mutex::new(config)),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -2734,6 +2753,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2798,6 +2818,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2874,6 +2895,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2922,6 +2944,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -2975,6 +2998,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -3033,6 +3057,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -3087,6 +3112,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,

@@ -61,14 +61,14 @@ allowed_users = []
 
 [gateway]
 host = "127.0.0.1"
-port = 3000
+port = 9393
 allow_public_bind = false
 ```
 
 ### 2.4 Run Daemon (Local Only)
 
 ```bash
-rantaiclaw daemon --host 127.0.0.1 --port 3000
+rantaiclaw daemon --host 127.0.0.1 --port 9393
 ```
 
 - Gateway binds to `127.0.0.1` — not reachable from other machines
@@ -86,12 +86,12 @@ To allow other devices on your LAN to hit the gateway (e.g. for pairing or webho
 ```toml
 [gateway]
 host = "0.0.0.0"
-port = 3000
+port = 9393
 allow_public_bind = true
 ```
 
 ```bash
-rantaiclaw daemon --host 0.0.0.0 --port 3000
+rantaiclaw daemon --host 0.0.0.0 --port 9393
 ```
 
 **Security:** `allow_public_bind = true` exposes the gateway to your local network. Only use on trusted LANs.
@@ -102,7 +102,7 @@ If you need a **public URL** (e.g. WhatsApp webhook, external clients):
 
 1. Run gateway on localhost:
    ```bash
-   rantaiclaw daemon --host 127.0.0.1 --port 3000
+   rantaiclaw daemon --host 127.0.0.1 --port 9393
    ```
 
 2. Start a tunnel:
@@ -179,13 +179,13 @@ provider = "ngrok"
 
 Or run ngrok manually:
 ```bash
-ngrok http 3000
+ngrok http 9393
 # Use the HTTPS URL for your webhook
 ```
 
 ### 5.3 Cloudflare Tunnel
 
-Configure Cloudflare Tunnel to forward to `127.0.0.1:3000`, then set your webhook URL to the tunnel's public hostname.
+Configure Cloudflare Tunnel to forward to `127.0.0.1:9393`, then set your webhook URL to the tunnel's public hostname.
 
 ---
 
@@ -193,7 +193,7 @@ Configure Cloudflare Tunnel to forward to `127.0.0.1:3000`, then set your webhoo
 
 - [ ] Build with `--features hardware` (and `peripheral-rpi` if using native GPIO)
 - [ ] Configure `[peripherals]` and `[channels_config.telegram]`
-- [ ] Run `rantaiclaw daemon --host 127.0.0.1 --port 3000` (Telegram works without 0.0.0.0)
+- [ ] Run `rantaiclaw daemon --host 127.0.0.1 --port 9393` (Telegram works without 0.0.0.0)
 - [ ] For LAN access: `--host 0.0.0.0` + `allow_public_bind = true` in config
 - [ ] For webhooks: use Tailscale, ngrok, or Cloudflare tunnel
 

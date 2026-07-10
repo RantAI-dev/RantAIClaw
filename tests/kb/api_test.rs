@@ -131,6 +131,7 @@ struct Harness {
 fn build_state(require_pairing: bool, tokens: &[String]) -> AppState {
     AppState {
         config: Arc::new(Mutex::new(Config::default())),
+        config_fingerprint: Arc::new(Mutex::new("test".to_string())),
         provider: Arc::new(MockProvider),
         model: "test-model".into(),
         temperature: 0.0,

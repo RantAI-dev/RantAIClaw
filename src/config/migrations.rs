@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 11;
+pub const CURRENT_VERSION: u32 = 12;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -187,8 +187,18 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive field only)
     }
 
-    // Future migrations (v12, v13, …) inserted here in order.
-    // if from < 12 { migrate_v12(raw)?; }
+    // v11 → v12: default-value change only — `[gateway].port` default 3000 →
+    // 9393 (avoids the crowded 3000 that collides with other local dev servers).
+    // Configs written by rantaiclaw serialize `port` explicitly and keep their
+    // value; only fresh/omitting configs pick up the new default. This arm burns
+    // a version slot so the schema_drift fingerprint (which embeds default values)
+    // is accepted with intent (mirrors v8 → v9).
+    if from < 12 {
+        // (no transformation; default-value change only)
+    }
+
+    // Future migrations (v13, v14, …) inserted here in order.
+    // if from < 13 { migrate_v13(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -237,7 +247,22 @@ mod tests {
         let mut raw = parse("schema_version = 10\n[gateway]\nport = 3000\n");
         let changed = migrate(&mut raw).unwrap();
         assert!(changed);
-        assert_eq!(version_of(&raw), Some(11));
+        assert_eq!(version_of(&raw), Some(12));
+    }
+
+    #[test]
+    fn v11_to_v12_is_default_only_noop_preserving_port() {
+        let mut raw = parse("schema_version = 11\n[gateway]\nport = 3000\n");
+        let changed = migrate(&mut raw).unwrap();
+        assert!(changed, "stamps the new version");
+        assert_eq!(version_of(&raw), Some(12));
+        // an explicit port is preserved (not rewritten to the new default)
+        assert_eq!(
+            raw.get("gateway")
+                .and_then(|g| g.get("port"))
+                .and_then(|p| p.as_integer()),
+            Some(3000)
+        );
     }
 
     #[test]

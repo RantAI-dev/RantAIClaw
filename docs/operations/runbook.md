@@ -70,7 +70,7 @@ the shared `sessions.db`. API-created sessions use `source = "api"`.
 Fast check:
 
 ```bash
-curl -s http://127.0.0.1:3000/api/v1/sessions | jq .
+curl -s http://127.0.0.1:9393/api/v1/sessions | jq .
 ```
 
 If gateway pairing is required, include `Authorization: Bearer <token>`.
