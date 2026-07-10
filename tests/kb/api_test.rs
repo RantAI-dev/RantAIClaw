@@ -680,6 +680,31 @@ async fn graph_stats_truncated_flag_reflects_cap() {
 }
 
 #[tokio::test]
+async fn graph_exposes_capability() {
+    // Default config: intelligence extraction is disabled and the model name
+    // (e.g. "openai/gpt-4.1-nano") always contains a "/".
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+
+    let body: Value = reqwest::get(format!("{}/api/v1/kb/graph", h.base_url))
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        body["capability"]["intelligence_enabled"], false,
+        "capability: {body}"
+    );
+    assert!(
+        body["capability"]["extraction_model"]
+            .as_str()
+            .unwrap()
+            .contains('/'),
+        "extraction_model: {body}"
+    );
+}
+
+#[tokio::test]
 async fn graph_dedupes_edges_weights_and_recomputes_degree() {
     use rantaiclaw::kb::intelligence::types::{
         Entity, EntityMention, EntityType, ExtractSource, Relation, RelationType,

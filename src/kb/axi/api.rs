@@ -570,11 +570,30 @@ struct IntelligenceStats {
     relation_types: std::collections::BTreeMap<String, usize>,
 }
 
+/// Capability/status the console needs to render honest empty vs disabled
+/// states: whether intelligence extraction is enabled, and the model it uses.
+/// The model name is not a secret.
+#[derive(Debug, Serialize, Default)]
+struct Capability {
+    intelligence_enabled: bool,
+    extraction_model: String,
+}
+
+impl Capability {
+    fn from_cfg(cfg: &KbConfig) -> Self {
+        Self {
+            intelligence_enabled: cfg.intelligence_enabled,
+            extraction_model: cfg.intelligence_model.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct IntelligenceResponse {
     entities: Vec<EntityJson>,
     relations: Vec<RelationJson>,
     stats: IntelligenceStats,
+    capability: Capability,
 }
 
 impl IntelligenceResponse {
@@ -602,6 +621,7 @@ impl IntelligenceResponse {
                 entity_types,
                 relation_types,
             },
+            capability: Capability::default(),
         }
     }
 }
@@ -644,6 +664,7 @@ struct GraphResponse {
     nodes: Vec<GraphNodeJson>,
     edges: Vec<GraphEdgeJson>,
     stats: GraphStats,
+    capability: Capability,
 }
 
 impl From<Graph> for GraphResponse {
@@ -678,6 +699,7 @@ impl From<Graph> for GraphResponse {
                 })
                 .collect(),
             stats,
+            capability: Capability::default(),
         }
     }
 }
@@ -913,7 +935,9 @@ async fn get_intelligence(
         .intelligence_for_document(&id)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(IntelligenceResponse::build(&entities, &relations)))
+    let mut resp = IntelligenceResponse::build(&entities, &relations);
+    resp.capability = Capability::from_cfg(&ctx.cfg);
+    Ok(Json(resp))
 }
 
 async fn get_graph(
@@ -929,7 +953,9 @@ async fn get_graph(
         .graph(q.group.as_deref(), limit)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(GraphResponse::from(graph)))
+    let mut resp = GraphResponse::from(graph);
+    resp.capability = Capability::from_cfg(&ctx.cfg);
+    Ok(Json(resp))
 }
 
 async fn re_extract_document(
