@@ -1,3 +1,4 @@
+pub mod fingerprint;
 pub mod migrations;
 pub mod schema;
 pub mod watcher;

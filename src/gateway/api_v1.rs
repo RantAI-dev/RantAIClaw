@@ -173,10 +173,11 @@ fn load_session_history(session_id: Option<&str>) -> Vec<(String, String)> {
 // version + status + doctor
 // ────────────────────────────────────────────────────────────────────────────
 
-async fn version() -> impl IntoResponse {
+async fn version(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "name": "rantaiclaw",
+        "config_fingerprint": state.config_fingerprint.lock().clone(),
     }))
 }
 
@@ -1265,6 +1266,7 @@ mod tests {
         config.gateway.require_pairing = false;
         AppState {
             config: Arc::new(Mutex::new(config)),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
             provider: Arc::new(MockProvider),
             model: "test-model".into(),
             temperature: 0.0,
@@ -1491,5 +1493,16 @@ mod tests {
         .await
         .expect_err("unknown id should 404");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn version_reports_config_fingerprint() {
+        let state = test_state();
+        *state.config_fingerprint.lock() = "abc123".to_string();
+        let response = version(State(state)).await.into_response();
+        let body = response_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(json["config_fingerprint"], "abc123");
+        assert_eq!(json["name"], "rantaiclaw");
     }
 }
