@@ -88,15 +88,15 @@ impl TuiProvisioner for GatewayProvisioner {
             &events,
             ProvisionEvent::Prompt {
                 id: "port".into(),
-                label: "Gateway port (Enter for default 3000)".into(),
-                default: Some("3000".into()),
+                label: "Gateway port (Enter for default 9393)".into(),
+                default: Some("9393".into()),
                 secret: false,
             },
         )
         .await?;
 
         let port_str = recv_text(&mut responses).await?;
-        let port: u16 = port_str.trim().parse().unwrap_or(3000);
+        let port: u16 = port_str.trim().parse().unwrap_or(9393);
 
         // Host
         send(

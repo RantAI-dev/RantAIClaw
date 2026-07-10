@@ -154,7 +154,7 @@ rantaiclaw doctor
 Verify `~/.rantaiclaw/config.toml`:
 
 - `[gateway].host` (default `127.0.0.1`)
-- `[gateway].port` (default `3000`)
+- `[gateway].port` (default `9393`)
 - `allow_public_bind` only when intentionally exposing LAN/public interfaces
 
 ### Pairing / auth failures on webhook
@@ -175,7 +175,7 @@ Checks:
 
 ```bash
 rantaiclaw session list
-curl -s http://127.0.0.1:3000/api/v1/sessions
+curl -s http://127.0.0.1:9393/api/v1/sessions
 ```
 
 Expected behavior:
