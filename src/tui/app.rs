@@ -3445,11 +3445,8 @@ impl TuiApp {
                 wizard.render_fullscreen(frame, area);
             }
 
-            // Console login gate — rendered last so it sits above every other
-            // surface (including the first-run wizard) until the password verifies.
-            if let Some(gate) = self.login_gate.as_ref() {
-                gate.render_fullscreen(frame, area);
-            }
+            // Note: the console login gate is a full-screen surface handled
+            // by the alt-screen render path (see `want_alt`), never inline.
 
             // Slash-command dropdown — anchored just above the input box,
             // clamped to stay strictly inside the inline viewport.
@@ -5695,10 +5692,14 @@ async fn run_loop(
         // reflects the latest streaming state.
         app.drain_events();
 
-        // Alt-screen entry/exit covers TWO triggers — list picker open
-        // OR slash-autocomplete dropdown visible. Edge-triggered via
-        // option presence so we don't churn buffers on every keystroke.
-        let want_alt = app.list_picker.is_some()
+        // Alt-screen entry/exit covers every full-screen surface — the
+        // console login gate, list picker, info panel, slash-autocomplete
+        // dropdown, setup overlay, and first-run wizard. Each needs the
+        // whole terminal instead of the ~5-row inline viewport. Edge-
+        // triggered via option presence so we don't churn buffers on
+        // every keystroke.
+        let want_alt = app.login_gate.is_some()
+            || app.list_picker.is_some()
             || app.info_panel.is_some()
             || app.autocomplete.is_visible()
             || app.setup_overlay.is_some()
@@ -5776,12 +5777,22 @@ async fn run_loop(
         }
 
         if let Some(ref mut alt_term) = alt {
-            // Render priority: setup_overlay first. During the first-run
-            // wizard's RunningProvisioner phase BOTH wizard and overlay
-            // are active — the wizard intentionally renders nothing in
-            // that phase and delegates the screen to the overlay. If the
-            // wizard won the priority race, the screen would go black.
-            if app.setup_overlay.is_some() {
+            // Render priority: the console login gate owns the screen
+            // above everything else until the password verifies.
+            if app.login_gate.is_some() {
+                alt_term.draw(|frame| {
+                    let area = frame.area();
+                    if let Some(gate) = app.login_gate.as_ref() {
+                        gate.render_fullscreen(frame, area);
+                    }
+                })?;
+            }
+            // Then setup_overlay. During the first-run wizard's
+            // RunningProvisioner phase BOTH wizard and overlay are active —
+            // the wizard intentionally renders nothing in that phase and
+            // delegates the screen to the overlay. If the wizard won the
+            // priority race, the screen would go black.
+            else if app.setup_overlay.is_some() {
                 alt_term.draw(|frame| {
                     let area = frame.area();
                     if let Some(o) = app.setup_overlay.as_mut() {
