@@ -668,7 +668,9 @@ async fn graph_dedupes_edges_weights_and_recomputes_degree() {
 
 #[tokio::test]
 async fn graph_corpus_entities_respects_group() {
-    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, EntityType, ExtractSource};
+    use rantaiclaw::kb::intelligence::types::{
+        Entity, EntityMention, EntityType, ExtractSource, Relation, RelationType,
+    };
     use rantaiclaw::kb::store::IntelligenceStore;
 
     // `document_group.group_id` has an FK against `knowledge_base_group.id`,
@@ -735,6 +737,35 @@ async fn graph_corpus_entities_respects_group() {
                 })
                 .await
                 .expect("seed mention");
+
+            // One relation between two in-group entities (a->b), and one
+            // relation reaching an out-of-group entity (b->c). The grouped
+            // `corpus_relations` count restricts BOTH endpoints to in-group
+            // entities, so only a->b should be counted there.
+            store
+                .add_relation(&Relation {
+                    id: "r_ab".into(),
+                    source_entity_id: "a".into(),
+                    target_entity_id: "b".into(),
+                    relation_type: RelationType::RelatedTo,
+                    confidence: 0.9,
+                    document_id: "rantaiclaw_doc_group".into(),
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .expect("seed relation a->b");
+            store
+                .add_relation(&Relation {
+                    id: "r_bc".into(),
+                    source_entity_id: "b".into(),
+                    target_entity_id: "c".into(),
+                    relation_type: RelationType::RelatedTo,
+                    confidence: 0.9,
+                    document_id: "rantaiclaw_doc_other".into(),
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .expect("seed relation b->c");
         })
     })
     .await;
@@ -750,6 +781,10 @@ async fn graph_corpus_entities_respects_group() {
     .await
     .unwrap();
     assert_eq!(grouped["stats"]["corpus_entities"], 2, "grouped: {grouped}");
+    assert_eq!(
+        grouped["stats"]["corpus_relations"], 1,
+        "grouped: {grouped}"
+    );
 
     let ungrouped: Value = reqwest::get(format!("{}/api/v1/kb/graph?limit=100", h.base_url))
         .await
@@ -760,6 +795,15 @@ async fn graph_corpus_entities_respects_group() {
     assert_eq!(
         ungrouped["stats"]["corpus_entities"], 3,
         "ungrouped: {ungrouped}"
+    );
+    assert_eq!(
+        ungrouped["stats"]["corpus_relations"], 2,
+        "ungrouped: {ungrouped}"
+    );
+    assert!(
+        grouped["stats"]["corpus_relations"].as_u64().unwrap()
+            < ungrouped["stats"]["corpus_relations"].as_u64().unwrap(),
+        "group scope must restrict corpus_relations to in-group entities only: grouped={grouped} ungrouped={ungrouped}"
     );
 }
 

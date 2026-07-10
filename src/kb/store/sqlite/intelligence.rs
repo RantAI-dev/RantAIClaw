@@ -287,7 +287,7 @@ impl IntelligenceStore for SqliteStore {
                         params![g],
                         |r| r.get(0),
                     )?;
-                    (te as usize, tr as usize)
+                    (usize::try_from(te).unwrap_or(0), usize::try_from(tr).unwrap_or(0))
                 }
                 None => {
                     let te: i64 =
@@ -297,7 +297,7 @@ impl IntelligenceStore for SqliteStore {
                         [],
                         |r| r.get(0),
                     )?;
-                    (te as usize, tr as usize)
+                    (usize::try_from(te).unwrap_or(0), usize::try_from(tr).unwrap_or(0))
                 }
             };
 
