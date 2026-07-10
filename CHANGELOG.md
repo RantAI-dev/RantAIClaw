@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.7-alpha] — 2026-07-10
+
+### Added
+
+- **`rantaiclaw ui start` now self-heals a stale or foreign process on the
+  gateway port** instead of blindly reusing whatever is listening. It probes the
+  gateway's public `GET /api/v1/version` (which now also reports an opaque
+  `config_fingerprint` of the loaded config) and: reuses a current gateway;
+  restarts one running a stale binary version or stale config (e.g. an
+  out-of-date login `password_hash` after a failed hot-reload); and errors —
+  never signalling the process — when the port is held by a foreign or
+  unidentified app. Both stop paths are identity-guarded against PID reuse.
+
 ### Changed
 
 - **Default gateway port is now `9393`** (was `3000`, which collides with other
@@ -16,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default. Bumps the config schema to **v12** (no migration action needed).
   Docker/compose images keep an explicit `3000` (container-isolated) and are
   unaffected.
+
+### Fixed
+
+- **The TUI console login gate now renders full-screen** instead of being clipped
+  inside the inline chat viewport (the password field and hint were cut off and
+  the welcome splash bled through behind it). It takes over the terminal via the
+  alt-screen path like the first-run wizard, with a centred, padded card; the
+  banner + chat return after a successful unlock.
 
 ## [0.7.6-alpha] — 2026-07-09
 
