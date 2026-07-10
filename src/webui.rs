@@ -245,6 +245,207 @@ fn spawn_detached(cmd: &mut Command, log: &Path) -> Result<u32> {
     Ok(child.id())
 }
 
+/// Identity reported by a gateway's `GET /api/v1/version`.
+#[derive(Debug, Clone, PartialEq)]
+struct GatewayIdentity {
+    name: String,
+    version: String,
+    config_fingerprint: String,
+}
+
+/// What `ui start` should do about whatever is (or isn't) on the gateway port.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GatewayAction {
+    StartFresh,       // nothing on the port
+    Reuse,            // rantaiclaw gateway, current version + fingerprint
+    Restart,          // rantaiclaw gateway, but version/config drift
+    ForeignError,     // something answered, but not a rantaiclaw gateway
+    UnconfirmedError, // port busy, no valid /api/v1/version reply
+}
+
+/// Decide what to do about the gateway port given whether it's occupied and,
+/// if so, what identified itself there. Pure so it's cheap to test exhaustively.
+fn decide_gateway_action(
+    present: bool,
+    ident: Option<GatewayIdentity>,
+    current_version: &str,
+    disk_fp: &str,
+) -> GatewayAction {
+    if !present {
+        return GatewayAction::StartFresh;
+    }
+    match ident {
+        None => GatewayAction::UnconfirmedError,
+        Some(id) if id.name != "rantaiclaw" => GatewayAction::ForeignError,
+        Some(id) if id.version == current_version && id.config_fingerprint == disk_fp => {
+            GatewayAction::Reuse
+        }
+        Some(_) => GatewayAction::Restart,
+    }
+}
+
+#[cfg(test)]
+mod gateway_action_tests {
+    use super::*;
+
+    fn ident(v: &str, fp: &str) -> Option<GatewayIdentity> {
+        Some(GatewayIdentity {
+            name: "rantaiclaw".into(),
+            version: v.into(),
+            config_fingerprint: fp.into(),
+        })
+    }
+
+    #[test]
+    fn nothing_on_port_starts_fresh() {
+        assert_eq!(
+            decide_gateway_action(false, None, "1.0", "aa"),
+            GatewayAction::StartFresh
+        );
+    }
+    #[test]
+    fn fresh_gateway_is_reused() {
+        assert_eq!(
+            decide_gateway_action(true, ident("1.0", "aa"), "1.0", "aa"),
+            GatewayAction::Reuse
+        );
+    }
+    #[test]
+    fn stale_config_triggers_restart() {
+        assert_eq!(
+            decide_gateway_action(true, ident("1.0", "OLD"), "1.0", "NEW"),
+            GatewayAction::Restart
+        );
+    }
+    #[test]
+    fn stale_version_triggers_restart() {
+        assert_eq!(
+            decide_gateway_action(true, ident("0.9", "aa"), "1.0", "aa"),
+            GatewayAction::Restart
+        );
+    }
+    #[test]
+    fn foreign_app_errors() {
+        let other = Some(GatewayIdentity {
+            name: "vite".into(),
+            version: "x".into(),
+            config_fingerprint: "y".into(),
+        });
+        assert_eq!(
+            decide_gateway_action(true, other, "1.0", "aa"),
+            GatewayAction::ForeignError
+        );
+    }
+    #[test]
+    fn busy_but_silent_is_unconfirmed() {
+        assert_eq!(
+            decide_gateway_action(true, None, "1.0", "aa"),
+            GatewayAction::UnconfirmedError
+        );
+    }
+}
+
+/// GET http://host:port/api/v1/version via curl, parse the identity. Retries
+/// once (the gateway may be momentarily busy). `None` on repeated failure.
+fn probe_gateway_identity(gw_host: &str, gw_port: u16) -> Option<GatewayIdentity> {
+    let url = format!("http://{gw_host}:{gw_port}/api/v1/version");
+    for attempt in 0..2 {
+        if attempt == 1 {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        let out = Command::new("curl")
+            .args(["-fsS", "--max-time", "3", &url])
+            .output();
+        if let Ok(out) = out {
+            if out.status.success() {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    if let (Some(name), Some(version)) = (
+                        v.get("name").and_then(|x| x.as_str()),
+                        v.get("version").and_then(|x| x.as_str()),
+                    ) {
+                        return Some(GatewayIdentity {
+                            name: name.to_string(),
+                            version: version.to_string(),
+                            config_fingerprint: v
+                                .get("config_fingerprint")
+                                .and_then(|f| f.as_str())
+                                .unwrap_or("none")
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Stop a stale RantaiClaw gateway on `gw_port`. Prefer the PID we recorded when
+/// we started it (`<dir>/.run` `gateway=<pid>`), else discover the listener PID.
+/// BOTH paths confirm the PID is a rantaiclaw gateway before signalling (guards
+/// against PID reuse). Err with a manual instruction if it cannot be safely stopped.
+fn stop_stale_gateway(gw_port: u16, dir: &Path) -> Result<()> {
+    // `webui` is a binary-crate module and `lifecycle` is only compiled into the
+    // lib crate (unlike `config`, which the binary re-declares), so reach it via
+    // the `rantaiclaw` lib crate rather than `crate::`.
+    use rantaiclaw::lifecycle::process as proc;
+
+    // 1. PID recorded in <dir>/.run (`gateway=<pid>`), if ui start launched it.
+    if let Ok(state) = std::fs::read_to_string(run_file(dir)) {
+        if let Some(pid) = state.lines().find_map(|l| {
+            l.strip_prefix("gateway=")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+        }) {
+            if proc::process_is_alive(pid)
+                && proc::cmdline_contains(pid, &["rantaiclaw", "gateway"])
+                && proc::stop_process_graceful(pid)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    // 2. Discover the listener PID; confirm identity before signalling.
+    if let Some(pid) = proc::pid_listening_on_port(gw_port) {
+        if proc::cmdline_contains(pid, &["rantaiclaw", "gateway"])
+            && proc::stop_process_graceful(pid)
+        {
+            return Ok(());
+        }
+    }
+
+    bail!(
+        "a stale RantaiClaw gateway is on port {gw_port} but could not be stopped \
+         automatically. Stop it manually and re-run `rantaiclaw ui start`."
+    )
+}
+
+/// Start the gateway as a background process and wait for it to come up.
+fn start_fresh_gateway(
+    gw_host: &str,
+    gw_port: u16,
+    gateway: &str,
+    gw_log: &Path,
+    gateway_pid: &mut Option<u32>,
+) -> Result<()> {
+    println!("▶ starting gateway ({gateway}) …");
+    let exe = std::env::current_exe().context("could not resolve the rantaiclaw binary path")?;
+    let mut g = Command::new(&exe);
+    g.arg("gateway")
+        .arg("-p")
+        .arg(gw_port.to_string())
+        .arg("--host")
+        .arg(gw_host);
+    *gateway_pid = Some(spawn_detached(&mut g, gw_log)?);
+    if !wait_for_port(gw_host, gw_port, 20) {
+        bail!(
+            "gateway did not come up on {gw_host}:{gw_port} — see {}",
+            gw_log.display()
+        );
+    }
+    Ok(())
+}
+
 /// Obtain a bearer token by minting a short-lived, single-use on-demand
 /// "gateway" pairing code and exchanging it via `POST /pair`.
 ///
@@ -495,24 +696,59 @@ fn start(
     let (gw_host, gw_port) = split_host_port(&gateway);
     let gw_log = dir.join("gateway.log");
     let mut gateway_pid: Option<u32> = None;
-    if port_open(&gw_host, gw_port) {
-        println!("✓ gateway already running ({gateway})");
-    } else {
-        println!("▶ starting gateway ({gateway}) …");
-        let exe =
-            std::env::current_exe().context("could not resolve the rantaiclaw binary path")?;
-        let mut g = Command::new(&exe);
-        g.arg("gateway")
-            .arg("-p")
-            .arg(gw_port.to_string())
-            .arg("--host")
-            .arg(&gw_host);
-        gateway_pid = Some(spawn_detached(&mut g, &gw_log)?);
-        if !wait_for_port(&gw_host, gw_port, 20) {
+    let gw_present = port_open(&gw_host, gw_port);
+    let disk_fp = crate::config::fingerprint::fingerprint_file(&config.config_path);
+    let action = decide_gateway_action(
+        gw_present,
+        if gw_present {
+            probe_gateway_identity(&gw_host, gw_port)
+        } else {
+            None
+        },
+        env!("CARGO_PKG_VERSION"),
+        &disk_fp,
+    );
+    match action {
+        GatewayAction::Reuse => {
+            println!("✓ gateway already running ({gateway})");
+        }
+        GatewayAction::ForeignError => {
             bail!(
-                "gateway did not come up on {gw_host}:{gw_port} — see {}",
-                gw_log.display()
+                "port {gw_port} is in use by another application.\n  \
+                 Set a different gateway port with `--port <n>` or `gateway.port` in \
+                 config, then re-run `rantaiclaw ui start`."
             );
+        }
+        GatewayAction::UnconfirmedError => {
+            // Re-check: the gateway may have exited since the port probe, in which
+            // case a fresh start is correct rather than an error.
+            if port_open(&gw_host, gw_port) {
+                bail!(
+                    "something is listening on port {gw_port} but it does not answer as a \
+                     RantaiClaw gateway.\n  Check what is running there, or set a different \
+                     gateway port with `--port <n>` / `gateway.port`, then re-run."
+                );
+            }
+            start_fresh_gateway(&gw_host, gw_port, &gateway, &gw_log, &mut gateway_pid)?;
+        }
+        GatewayAction::Restart => {
+            println!("↻ gateway on :{gw_port} is stale (version/config drift) — restarting…");
+            stop_stale_gateway(gw_port, &dir)?;
+            for _ in 0..20 {
+                if !port_open(&gw_host, gw_port) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if port_open(&gw_host, gw_port) {
+                bail!(
+                    "port {gw_port} did not free after stopping the stale gateway; re-run shortly."
+                );
+            }
+            start_fresh_gateway(&gw_host, gw_port, &gateway, &gw_log, &mut gateway_pid)?;
+        }
+        GatewayAction::StartFresh => {
+            start_fresh_gateway(&gw_host, gw_port, &gateway, &gw_log, &mut gateway_pid)?;
         }
     }
 
