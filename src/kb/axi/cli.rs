@@ -661,12 +661,17 @@ async fn cmd_graph(
                     "source": e.source,
                     "target": e.target,
                     "relation_type": e.relation_type,
+                    "weight": e.weight,
                 })
             })
             .collect();
         print!(
             "{}",
-            super::format_toon("edges", &edge_rows, &["source", "target", "relation_type"]),
+            super::format_toon(
+                "edges",
+                &edge_rows,
+                &["source", "target", "relation_type", "weight"],
+            ),
         );
     }
     Ok(0)
@@ -723,6 +728,7 @@ fn graph_to_json(g: &Graph) -> String {
             "source": e.source,
             "target": e.target,
             "relation_type": e.relation_type,
+            "weight": e.weight,
         })).collect::<Vec<_>>(),
     });
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
@@ -839,4 +845,24 @@ fn re_embed_to_json(r: &BulkReEmbedReport, elapsed_ms: u64) -> String {
         "elapsed_ms": elapsed_ms,
     });
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::kb::store::{Graph, GraphEdge};
+
+    #[test]
+    fn graph_to_json_includes_edge_weight() {
+        let g = Graph {
+            edges: vec![GraphEdge {
+                source: "a".into(),
+                target: "b".into(),
+                relation_type: "RelatedTo".into(),
+                weight: 3,
+            }],
+            ..Default::default()
+        };
+        let v: serde_json::Value = serde_json::from_str(&super::graph_to_json(&g)).unwrap();
+        assert_eq!(v["edges"][0]["weight"], 3);
+    }
 }

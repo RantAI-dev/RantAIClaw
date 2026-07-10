@@ -62,6 +62,18 @@ const KB_UPLOAD_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// multi-MB document; genuinely huge corpora should move to async ingest.
 const KB_REQUEST_TIMEOUT_SECS: u64 = 600;
 
+/// Absolute ceiling on the number of graph nodes a single `/graph` request may
+/// pull, independent of the configurable `KB_GRAPH_MAX_NODES` default. A resource
+/// guard: 25× the 200-node default is ample for exploration, and it bounds the
+/// node set only (the normal path requests ~200).
+const GRAPH_HARD_CAP: usize = 5000;
+
+/// Resolve the effective `/graph` node limit: the caller's request or the
+/// configured default, clamped to [`GRAPH_HARD_CAP`].
+fn effective_graph_limit(requested: Option<usize>, default: usize) -> usize {
+    requested.unwrap_or(default).min(GRAPH_HARD_CAP)
+}
+
 /// Build the `/api/v1/kb/*` router. Merged into the main gateway router by
 /// `gateway::run_gateway` so it shares state and timeout layers.
 ///
@@ -558,11 +570,30 @@ struct IntelligenceStats {
     relation_types: std::collections::BTreeMap<String, usize>,
 }
 
+/// Capability/status the console needs to render honest empty vs disabled
+/// states: whether intelligence extraction is enabled, and the model it uses.
+/// The model name is not a secret.
+#[derive(Debug, Serialize, Default)]
+struct Capability {
+    intelligence_enabled: bool,
+    extraction_model: String,
+}
+
+impl Capability {
+    fn from_cfg(cfg: &KbConfig) -> Self {
+        Self {
+            intelligence_enabled: cfg.intelligence_enabled,
+            extraction_model: cfg.intelligence_model.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct IntelligenceResponse {
     entities: Vec<EntityJson>,
     relations: Vec<RelationJson>,
     stats: IntelligenceStats,
+    capability: Capability,
 }
 
 impl IntelligenceResponse {
@@ -590,6 +621,7 @@ impl IntelligenceResponse {
                 entity_types,
                 relation_types,
             },
+            capability: Capability::default(),
         }
     }
 }
@@ -609,12 +641,22 @@ struct GraphEdgeJson {
     source: String,
     target: String,
     relation_type: String,
+    weight: usize,
 }
 
 #[derive(Debug, Serialize)]
 struct GraphStats {
     total_nodes: usize,
     total_edges: usize,
+    /// Scope-wide (group-scoped when `?group=` is set, else corpus-wide)
+    /// entity count, computed before the top-N node cap `total_nodes` reflects.
+    corpus_entities: usize,
+    /// Scope-wide distinct `(source, target, relation_type)` relation count.
+    corpus_relations: usize,
+    /// True when the returned node set was capped below the scope-wide
+    /// `corpus_entities` total (`total_nodes < corpus_entities`) — i.e. the
+    /// graph is a truncated view the client should signal as "showing N of M".
+    truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -622,6 +664,7 @@ struct GraphResponse {
     nodes: Vec<GraphNodeJson>,
     edges: Vec<GraphEdgeJson>,
     stats: GraphStats,
+    capability: Capability,
 }
 
 impl From<Graph> for GraphResponse {
@@ -629,6 +672,9 @@ impl From<Graph> for GraphResponse {
         let stats = GraphStats {
             total_nodes: g.nodes.len(),
             total_edges: g.edges.len(),
+            corpus_entities: g.total_entities,
+            corpus_relations: g.total_relations,
+            truncated: g.total_entities > g.nodes.len(),
         };
         Self {
             nodes: g
@@ -649,9 +695,11 @@ impl From<Graph> for GraphResponse {
                     source: e.source,
                     target: e.target,
                     relation_type: e.relation_type,
+                    weight: e.weight,
                 })
                 .collect(),
             stats,
+            capability: Capability::default(),
         }
     }
 }
@@ -882,12 +930,25 @@ async fn get_intelligence(
 ) -> Result<Json<IntelligenceResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let ctx = ensure_kb_ctx(&state).await?;
+    // 404 for a missing document instead of an ambiguous 200-with-empty-arrays,
+    // matching `GET /documents/{id}` and `POST .../re-extract`.
+    if ctx
+        .store
+        .get_document(&DocumentId(id.clone()))
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err(ApiError::not_found(format!("document {id} not found")).into());
+    }
     let (entities, relations) = ctx
         .intel
         .intelligence_for_document(&id)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(IntelligenceResponse::build(&entities, &relations)))
+    let mut resp = IntelligenceResponse::build(&entities, &relations);
+    resp.capability = Capability::from_cfg(&ctx.cfg);
+    Ok(Json(resp))
 }
 
 async fn get_graph(
@@ -897,13 +958,15 @@ async fn get_graph(
 ) -> Result<Json<GraphResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let ctx = ensure_kb_ctx(&state).await?;
-    let limit = q.limit.unwrap_or(ctx.cfg.graph_max_nodes);
+    let limit = effective_graph_limit(q.limit, ctx.cfg.graph_max_nodes);
     let graph = ctx
         .intel
         .graph(q.group.as_deref(), limit)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(GraphResponse::from(graph)))
+    let mut resp = GraphResponse::from(graph);
+    resp.capability = Capability::from_cfg(&ctx.cfg);
+    Ok(Json(resp))
 }
 
 async fn re_extract_document(
@@ -1485,6 +1548,16 @@ mod tests {
         );
         assert!(split_csv("").is_empty());
         assert!(split_csv("   ").is_empty());
+    }
+
+    #[test]
+    fn effective_graph_limit_clamps_to_hard_cap() {
+        // A caller-supplied limit above the hard cap is clamped.
+        assert_eq!(effective_graph_limit(Some(100_000), 200), GRAPH_HARD_CAP);
+        // No request falls back to the configured default.
+        assert_eq!(effective_graph_limit(None, 200), 200);
+        // A modest request passes through unchanged.
+        assert_eq!(effective_graph_limit(Some(50), 200), 50);
     }
 
     #[test]

@@ -152,12 +152,16 @@ pub struct GraphNode {
     pub doc_count: usize,
 }
 
-/// A directed edge between two graph nodes (both endpoints are in the node set).
+/// A directed edge between two graph nodes (both endpoints are in the node
+/// set), deduplicated by `(source, target, relation_type)`. `weight` is the
+/// number of distinct relation rows collapsed into this edge (e.g. the same
+/// pair/type extracted from multiple documents).
 #[derive(Debug, Clone)]
 pub struct GraphEdge {
     pub source: String,
     pub target: String,
     pub relation_type: String,
+    pub weight: usize,
 }
 
 /// A materialized slice of the cross-document knowledge graph: the top-N
@@ -166,6 +170,11 @@ pub struct GraphEdge {
 pub struct Graph {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
+    /// Scope-wide (group-scoped when `group` is set, else corpus-wide) entity
+    /// count, computed before the top-N node cap.
+    pub total_entities: usize,
+    /// Scope-wide distinct `(source, target, relation_type)` relation count.
+    pub total_relations: usize,
 }
 
 /// Persistence seam for the cross-document knowledge graph. Kept separate from

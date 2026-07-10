@@ -576,6 +576,383 @@ async fn kb_graph_returns_nodes_edges_and_stats() {
 }
 
 #[tokio::test]
+async fn graph_limit_is_clamped_to_hard_cap() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, EntityType, ExtractSource};
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            let entity_id = store
+                .upsert_entity(&Entity {
+                    id: "e_lim".into(),
+                    canonical_key: "lim:Product".into(),
+                    name: "LimitProbe".into(),
+                    entity_type: EntityType::Product,
+                    confidence: 0.9,
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .expect("seed entity");
+            store
+                .add_mention(&EntityMention {
+                    id: "m_lim".into(),
+                    entity_id,
+                    document_id: "rantaiclaw_doc_lim".into(),
+                    chunk_index: Some(0),
+                    context: None,
+                    source: ExtractSource::Llm,
+                })
+                .await
+                .expect("seed mention");
+        })
+    })
+    .await;
+
+    // A caller-supplied limit far above the hard cap must not error; the
+    // response stays bounded by the server ceiling.
+    let resp = reqwest::get(format!("{}/api/v1/kb/graph?limit=100000", h.base_url))
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json body");
+    assert!(body["nodes"].as_array().unwrap().len() <= 5000);
+}
+
+#[tokio::test]
+async fn graph_stats_truncated_flag_reflects_cap() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, EntityType, ExtractSource};
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            for (id, key, name) in [("t1", "trunc:A", "A"), ("t2", "trunc:B", "B")] {
+                store
+                    .upsert_entity(&Entity {
+                        id: id.into(),
+                        canonical_key: key.into(),
+                        name: name.into(),
+                        entity_type: EntityType::Product,
+                        confidence: 0.9,
+                        metadata: serde_json::json!({}),
+                    })
+                    .await
+                    .expect("seed entity");
+                store
+                    .add_mention(&EntityMention {
+                        id: format!("m_{id}"),
+                        entity_id: id.into(),
+                        document_id: "rantaiclaw_doc_trunc".into(),
+                        chunk_index: Some(0),
+                        context: None,
+                        source: ExtractSource::Llm,
+                    })
+                    .await
+                    .expect("seed mention");
+            }
+        })
+    })
+    .await;
+
+    // limit below the corpus (2 entities) → truncated flag set, nodes capped at 1.
+    let body: Value = reqwest::get(format!("{}/api/v1/kb/graph?limit=1", h.base_url))
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        body["stats"]["truncated"], true,
+        "expected truncated: {body}"
+    );
+    assert_eq!(body["stats"]["corpus_entities"], 2);
+    assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
+
+    // limit above the corpus → not truncated.
+    let body2: Value = reqwest::get(format!("{}/api/v1/kb/graph?limit=10", h.base_url))
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        body2["stats"]["truncated"], false,
+        "expected not truncated: {body2}"
+    );
+}
+
+#[tokio::test]
+async fn graph_exposes_capability() {
+    // Default config: intelligence extraction is disabled and the model name
+    // (e.g. "openai/gpt-4.1-nano") always contains a "/".
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+
+    let body: Value = reqwest::get(format!("{}/api/v1/kb/graph", h.base_url))
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        body["capability"]["intelligence_enabled"], false,
+        "capability: {body}"
+    );
+    assert!(
+        body["capability"]["extraction_model"]
+            .as_str()
+            .unwrap()
+            .contains('/'),
+        "extraction_model: {body}"
+    );
+}
+
+#[tokio::test]
+async fn intelligence_404s_for_missing_document() {
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let resp = reqwest::get(format!(
+        "{}/api/v1/kb/documents/does-not-exist/intelligence",
+        h.base_url
+    ))
+    .await
+    .expect("request");
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "not_found");
+}
+
+#[tokio::test]
+async fn graph_dedupes_edges_weights_and_recomputes_degree() {
+    use rantaiclaw::kb::intelligence::types::{
+        Entity, EntityMention, EntityType, ExtractSource, Relation, RelationType,
+    };
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            for (id, key, name) in [("a", "k:A", "A"), ("b", "k:B", "B"), ("c", "k:C", "C")] {
+                store
+                    .upsert_entity(&Entity {
+                        id: id.into(),
+                        canonical_key: key.into(),
+                        name: name.into(),
+                        entity_type: EntityType::Product,
+                        confidence: 0.9,
+                        metadata: serde_json::json!({}),
+                    })
+                    .await
+                    .unwrap();
+                store
+                    .add_mention(&EntityMention {
+                        id: format!("m_{id}"),
+                        entity_id: id.into(),
+                        document_id: "doc1".into(),
+                        chunk_index: Some(0),
+                        context: None,
+                        source: ExtractSource::Llm,
+                    })
+                    .await
+                    .unwrap();
+            }
+            // A->B extracted from TWO docs (duplicate pair+type), B->C once.
+            for (rid, doc) in [("r1", "doc1"), ("r2", "doc2")] {
+                store
+                    .add_relation(&Relation {
+                        id: rid.into(),
+                        source_entity_id: "a".into(),
+                        target_entity_id: "b".into(),
+                        relation_type: RelationType::RelatedTo,
+                        confidence: 0.9,
+                        document_id: doc.into(),
+                        metadata: serde_json::json!({}),
+                    })
+                    .await
+                    .unwrap();
+            }
+            store
+                .add_relation(&Relation {
+                    id: "r3".into(),
+                    source_entity_id: "b".into(),
+                    target_entity_id: "c".into(),
+                    relation_type: RelationType::RelatedTo,
+                    confidence: 0.9,
+                    document_id: "doc2".into(),
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+        })
+    })
+    .await;
+
+    let body: Value = reqwest::get(format!("{}/api/v1/kb/graph?limit=100", h.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let edges = body["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 2, "A->B deduped + B->C");
+    let ab = edges
+        .iter()
+        .find(|e| e["source"] == "a" && e["target"] == "b")
+        .unwrap();
+    assert_eq!(ab["weight"], 2);
+    let deg = |n: &str| {
+        body["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == n)
+            .unwrap()["degree"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!((deg("a"), deg("b"), deg("c")), (1, 2, 1)); // NOT inflated by the duplicate
+    assert_eq!(body["stats"]["corpus_entities"], 3);
+    assert_eq!(body["stats"]["corpus_relations"], 2); // distinct (src,tgt,type)
+}
+
+#[tokio::test]
+async fn graph_corpus_entities_respects_group() {
+    use rantaiclaw::kb::intelligence::types::{
+        Entity, EntityMention, EntityType, ExtractSource, Relation, RelationType,
+    };
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    // `document_group.group_id` has an FK against `knowledge_base_group.id`,
+    // and `create_group` generates that id server-side — so the seed closure
+    // (which only returns `()`) stashes it here for the assertions below.
+    // `start_harness` awaits the closure to completion before returning, so
+    // this is populated by the time we read it.
+    let group_id_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let group_id_cell2 = group_id_cell.clone();
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            // A document that belongs to a freshly created group.
+            let group = store
+                .create_group("Group G", None, None)
+                .await
+                .expect("create group");
+            *group_id_cell2.lock() = Some(group.id.clone());
+            store
+                .create_document(&sample_doc("rantaiclaw_doc_group", "Group Doc"))
+                .await
+                .expect("seed doc");
+            store
+                .add_document_to_group("rantaiclaw_doc_group", &group.id)
+                .await
+                .expect("link doc to group");
+
+            // Three entities; only "a" and "b" are mentioned from the
+            // in-group document. "c" is mentioned from an out-of-group doc.
+            for (id, key, name) in [("a", "k:A", "A"), ("b", "k:B", "B"), ("c", "k:C", "C")] {
+                store
+                    .upsert_entity(&Entity {
+                        id: id.into(),
+                        canonical_key: key.into(),
+                        name: name.into(),
+                        entity_type: EntityType::Product,
+                        confidence: 0.9,
+                        metadata: serde_json::json!({}),
+                    })
+                    .await
+                    .expect("seed entity");
+            }
+            for id in ["a", "b"] {
+                store
+                    .add_mention(&EntityMention {
+                        id: format!("m_{id}"),
+                        entity_id: id.into(),
+                        document_id: "rantaiclaw_doc_group".into(),
+                        chunk_index: Some(0),
+                        context: None,
+                        source: ExtractSource::Llm,
+                    })
+                    .await
+                    .expect("seed mention");
+            }
+            store
+                .add_mention(&EntityMention {
+                    id: "m_c".into(),
+                    entity_id: "c".into(),
+                    document_id: "rantaiclaw_doc_other".into(),
+                    chunk_index: Some(0),
+                    context: None,
+                    source: ExtractSource::Llm,
+                })
+                .await
+                .expect("seed mention");
+
+            // One relation between two in-group entities (a->b), and one
+            // relation reaching an out-of-group entity (b->c). The grouped
+            // `corpus_relations` count restricts BOTH endpoints to in-group
+            // entities, so only a->b should be counted there.
+            store
+                .add_relation(&Relation {
+                    id: "r_ab".into(),
+                    source_entity_id: "a".into(),
+                    target_entity_id: "b".into(),
+                    relation_type: RelationType::RelatedTo,
+                    confidence: 0.9,
+                    document_id: "rantaiclaw_doc_group".into(),
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .expect("seed relation a->b");
+            store
+                .add_relation(&Relation {
+                    id: "r_bc".into(),
+                    source_entity_id: "b".into(),
+                    target_entity_id: "c".into(),
+                    relation_type: RelationType::RelatedTo,
+                    confidence: 0.9,
+                    document_id: "rantaiclaw_doc_other".into(),
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .expect("seed relation b->c");
+        })
+    })
+    .await;
+
+    let group_id = group_id_cell.lock().clone().expect("group id captured");
+    let grouped: Value = reqwest::get(format!(
+        "{}/api/v1/kb/graph?group={group_id}&limit=100",
+        h.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(grouped["stats"]["corpus_entities"], 2, "grouped: {grouped}");
+    assert_eq!(
+        grouped["stats"]["corpus_relations"], 1,
+        "grouped: {grouped}"
+    );
+
+    let ungrouped: Value = reqwest::get(format!("{}/api/v1/kb/graph?limit=100", h.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        ungrouped["stats"]["corpus_entities"], 3,
+        "ungrouped: {ungrouped}"
+    );
+    assert_eq!(
+        ungrouped["stats"]["corpus_relations"], 2,
+        "ungrouped: {ungrouped}"
+    );
+    assert!(
+        grouped["stats"]["corpus_relations"].as_u64().unwrap()
+            < ungrouped["stats"]["corpus_relations"].as_u64().unwrap(),
+        "group scope must restrict corpus_relations to in-group entities only: grouped={grouped} ungrouped={ungrouped}"
+    );
+}
+
+#[tokio::test]
 async fn kb_ingest_missing_file_field_returns_400() {
     let h = start_harness(|_store| Box::pin(async move {})).await;
 

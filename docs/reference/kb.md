@@ -245,7 +245,7 @@ All intelligence routes are under `/api/v1/kb/` and follow the same auth rules a
 GET /api/v1/kb/documents/{id}/intelligence
 ```
 
-Returns entities and relations extracted from one document, plus type-level stats.
+Returns entities and relations extracted from one document, plus type-level stats and a `capability` block (intelligence on/off + the extraction model). Returns `404 not_found` for a missing document (rather than a `200` with empty arrays).
 
 Response shape:
 
@@ -262,7 +262,8 @@ Response shape:
     "total_relations": 8,
     "entity_types": { "PERSON": 4, "ORG": 3 },
     "relation_types": { "GOVERNS": 5, "MENTIONS": 3 }
-  }
+  },
+  "capability": { "intelligence_enabled": false, "extraction_model": "openai/gpt-4.1-nano" }
 }
 ```
 
@@ -272,7 +273,7 @@ Response shape:
 GET /api/v1/kb/graph?group=<g>&limit=<n>
 ```
 
-Returns the merged cross-document graph, optionally filtered to one group and capped to `limit` nodes (top-N by degree; default cap from `KB_GRAPH_MAX_NODES`). `group` is optional.
+Returns the merged cross-document graph, optionally filtered to one group and capped to `limit` nodes (top-N by degree; default cap from `KB_GRAPH_MAX_NODES`). `group` is optional. A hard server ceiling of **5000 nodes** applies regardless of `limit`/`KB_GRAPH_MAX_NODES`.
 
 Response shape:
 
@@ -282,11 +283,18 @@ Response shape:
     { "id": "…", "name": "…", "entity_type": "ORG", "degree": 7, "doc_count": 3 }
   ],
   "edges": [
-    { "source": "…", "target": "…", "relation_type": "GOVERNS" }
+    { "source": "…", "target": "…", "relation_type": "GOVERNS", "weight": 2 }
   ],
-  "stats": { "total_nodes": 42, "total_edges": 61 }
+  "stats": {
+    "total_nodes": 42, "total_edges": 61,
+    "corpus_entities": 512, "corpus_relations": 890, "truncated": true
+  },
+  "capability": { "intelligence_enabled": false, "extraction_model": "openai/gpt-4.1-nano" }
 }
 ```
+
+- `total_nodes`/`total_edges` are the **returned** counts. `corpus_entities`/`corpus_relations` are the scope-wide totals (before the top-N cap, honoring `group`); `truncated` is `true` when the returned node set was capped below `corpus_entities` — render it as "showing N of M".
+- Edges are de-duplicated by `(source, target, relation_type)`; `weight` counts the collapsed relation rows (e.g. the same pair+type extracted from multiple documents). `degree` counts a node's incident de-duplicated edges.
 
 **Re-extract one document:**
 
