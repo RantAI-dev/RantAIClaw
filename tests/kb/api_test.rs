@@ -575,6 +575,49 @@ async fn kb_graph_returns_nodes_edges_and_stats() {
 }
 
 #[tokio::test]
+async fn graph_limit_is_clamped_to_hard_cap() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, EntityType, ExtractSource};
+    use rantaiclaw::kb::store::IntelligenceStore;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            let entity_id = store
+                .upsert_entity(&Entity {
+                    id: "e_lim".into(),
+                    canonical_key: "lim:Product".into(),
+                    name: "LimitProbe".into(),
+                    entity_type: EntityType::Product,
+                    confidence: 0.9,
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .expect("seed entity");
+            store
+                .add_mention(&EntityMention {
+                    id: "m_lim".into(),
+                    entity_id,
+                    document_id: "rantaiclaw_doc_lim".into(),
+                    chunk_index: Some(0),
+                    context: None,
+                    source: ExtractSource::Llm,
+                })
+                .await
+                .expect("seed mention");
+        })
+    })
+    .await;
+
+    // A caller-supplied limit far above the hard cap must not error; the
+    // response stays bounded by the server ceiling.
+    let resp = reqwest::get(format!("{}/api/v1/kb/graph?limit=100000", h.base_url))
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json body");
+    assert!(body["nodes"].as_array().unwrap().len() <= 5000);
+}
+
+#[tokio::test]
 async fn graph_dedupes_edges_weights_and_recomputes_degree() {
     use rantaiclaw::kb::intelligence::types::{
         Entity, EntityMention, EntityType, ExtractSource, Relation, RelationType,

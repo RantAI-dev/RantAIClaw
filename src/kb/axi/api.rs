@@ -62,6 +62,18 @@ const KB_UPLOAD_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// multi-MB document; genuinely huge corpora should move to async ingest.
 const KB_REQUEST_TIMEOUT_SECS: u64 = 600;
 
+/// Absolute ceiling on the number of graph nodes a single `/graph` request may
+/// pull, independent of the configurable `KB_GRAPH_MAX_NODES` default. A resource
+/// guard: 25× the 200-node default is ample for exploration, and it bounds the
+/// node set only (the normal path requests ~200).
+const GRAPH_HARD_CAP: usize = 5000;
+
+/// Resolve the effective `/graph` node limit: the caller's request or the
+/// configured default, clamped to [`GRAPH_HARD_CAP`].
+fn effective_graph_limit(requested: Option<usize>, default: usize) -> usize {
+    requested.unwrap_or(default).min(GRAPH_HARD_CAP)
+}
+
 /// Build the `/api/v1/kb/*` router. Merged into the main gateway router by
 /// `gateway::run_gateway` so it shares state and timeout layers.
 ///
@@ -906,7 +918,7 @@ async fn get_graph(
 ) -> Result<Json<GraphResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let ctx = ensure_kb_ctx(&state).await?;
-    let limit = q.limit.unwrap_or(ctx.cfg.graph_max_nodes);
+    let limit = effective_graph_limit(q.limit, ctx.cfg.graph_max_nodes);
     let graph = ctx
         .intel
         .graph(q.group.as_deref(), limit)
@@ -1494,6 +1506,16 @@ mod tests {
         );
         assert!(split_csv("").is_empty());
         assert!(split_csv("   ").is_empty());
+    }
+
+    #[test]
+    fn effective_graph_limit_clamps_to_hard_cap() {
+        // A caller-supplied limit above the hard cap is clamped.
+        assert_eq!(effective_graph_limit(Some(100_000), 200), GRAPH_HARD_CAP);
+        // No request falls back to the configured default.
+        assert_eq!(effective_graph_limit(None, 200), 200);
+        // A modest request passes through unchanged.
+        assert_eq!(effective_graph_limit(Some(50), 200), 50);
     }
 
     #[test]
