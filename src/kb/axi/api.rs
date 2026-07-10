@@ -930,6 +930,17 @@ async fn get_intelligence(
 ) -> Result<Json<IntelligenceResponse>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let ctx = ensure_kb_ctx(&state).await?;
+    // 404 for a missing document instead of an ambiguous 200-with-empty-arrays,
+    // matching `GET /documents/{id}` and `POST .../re-extract`.
+    if ctx
+        .store
+        .get_document(&DocumentId(id.clone()))
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err(ApiError::not_found(format!("document {id} not found")).into());
+    }
     let (entities, relations) = ctx
         .intel
         .intelligence_for_document(&id)

@@ -705,6 +705,20 @@ async fn graph_exposes_capability() {
 }
 
 #[tokio::test]
+async fn intelligence_404s_for_missing_document() {
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let resp = reqwest::get(format!(
+        "{}/api/v1/kb/documents/does-not-exist/intelligence",
+        h.base_url
+    ))
+    .await
+    .expect("request");
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "not_found");
+}
+
+#[tokio::test]
 async fn graph_dedupes_edges_weights_and_recomputes_degree() {
     use rantaiclaw::kb::intelligence::types::{
         Entity, EntityMention, EntityType, ExtractSource, Relation, RelationType,
