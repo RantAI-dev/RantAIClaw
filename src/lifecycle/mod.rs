@@ -14,6 +14,7 @@
 //! still work after a partial install or a corrupted config.
 
 pub mod binary_path;
+pub mod process;
 pub mod uninstall;
 pub mod update;
 pub mod update_service_restart;
