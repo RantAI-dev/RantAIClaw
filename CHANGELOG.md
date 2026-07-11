@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.8-alpha] — 2026-07-11
+
+### Added
+
+- **Knowledge Graph API now exposes an intelligence capability signal.** Both
+  `GET /api/v1/kb/graph` and `GET /api/v1/kb/documents/{id}/intelligence` return
+  a `capability { intelligence_enabled, extraction_model }` block so the console
+  can distinguish "extraction disabled" from "no entities yet" instead of an
+  indistinguishable empty graph. The model name is not a secret; additive — no
+  existing field changed.
+- **Scope-aware graph statistics.** `/graph` stats gain `corpus_entities`,
+  `corpus_relations`, and a `truncated` flag (scope-wide, honouring `?group=`)
+  alongside the existing `total_nodes`/`total_edges`, so the console can render an
+  honest "showing N of M" rather than presenting a capped count as the total.
+  Graph edges now carry a `weight` (merged duplicate relation rows), surfaced on
+  the API and in the `kb graph` CLI output (JSON + TOON).
+- **Hard node ceiling for graph queries.** `GET /api/v1/kb/graph?limit=` is now
+  clamped by a server-side `GRAPH_HARD_CAP` (5000), independent of `limit` and
+  `KB_GRAPH_MAX_NODES`, bounding the returned node set.
+
+### Fixed
+
+- **Graph edges are de-duplicated by `(source, target, relation_type)`** and node
+  `degree` is recomputed from the deduped set, so repeated per-document
+  extractions no longer inflate edges or degree.
+- **`GET /api/v1/kb/documents/{id}/intelligence` returns `404` for a missing
+  document** instead of `200` with empty arrays (which was indistinguishable from
+  a document that exists but has no entities), matching `GET /documents/{id}`.
+
 ## [0.7.7-alpha] — 2026-07-10
 
 ### Added
