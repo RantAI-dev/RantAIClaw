@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.10-alpha] — 2026-07-11
+
+### Fixed
+
+- **The TUI no longer leaves empty "Untitled" sessions on launch.** `TuiContext`
+  opened a `"tui"` session in the store before any input, so opening and closing
+  the TUI (or `/new`) with no message left empty, untitled 0-message sessions
+  accumulating in `session list` and the web console's session sidebar (a shared
+  `sessions.db`). Session creation is now deferred until the first message is
+  persisted; resume (`--resume` / `/resume`) still binds the existing session
+  immediately, and titling/multi-turn are unchanged.
+
 ## [0.7.9-alpha] — 2026-07-11
 
 ### Fixed
