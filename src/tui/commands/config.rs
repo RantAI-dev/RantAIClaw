@@ -17,7 +17,7 @@ impl CommandHandler for StatusCommand {
     }
 
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
-        let session_short = &ctx.session_id[..ctx.session_id.len().min(8)];
+        let session_short = ctx.session_id_short();
         let total_sessions = ctx.session_store.list_sessions(1000)?.len();
 
         let panel = InfoPanel::new("Status")
