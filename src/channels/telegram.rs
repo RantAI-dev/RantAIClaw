@@ -2768,7 +2768,7 @@ mod tests {
             "message": {
                 "message_id": 7,
                 "text": "hi",
-                "from": { "id": 1360247715_i64, "username": "sulthannauval" },
+                "from": { "id": 1_360_247_715_i64, "username": "sulthannauval" },
                 "chat": { "id": 4242 }
             }
         });
