@@ -188,10 +188,14 @@ mod tests {
     fn new_command_creates_new_session_and_signals_terminal_clear() {
         let cmd = NewCommand;
         let mut ctx = test_context();
+        ctx.append_user_message("seed an active session").unwrap();
         let old_id = ctx.session_id.clone();
+        assert!(old_id.is_some());
 
         let result = cmd.execute("", &mut ctx).unwrap();
 
+        // /new ends and unbinds the session (a fresh one is created lazily on
+        // the next message) and clears the transcript.
         assert_ne!(ctx.session_id, old_id);
         assert!(ctx.messages.is_empty());
         match result {

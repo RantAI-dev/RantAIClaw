@@ -9,11 +9,11 @@ use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 /// session so the user doesn't accidentally "resume" it onto itself.
 fn build_session_items(
     sessions: &[crate::sessions::SessionMeta],
-    current_session_id: &str,
+    current_session_id: Option<&str>,
 ) -> Vec<ListPickerItem> {
     sessions
         .iter()
-        .filter(|s| s.id != current_session_id)
+        .filter(|s| current_session_id != Some(s.id.as_str()))
         .map(|s| {
             let date = Utc
                 .timestamp_opt(s.started_at, 0)
@@ -54,7 +54,7 @@ impl CommandHandler for SessionsCommand {
 
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let sessions = ctx.session_store.list_sessions(200)?;
-        let items = build_session_items(&sessions, &ctx.session_id);
+        let items = build_session_items(&sessions, ctx.session_id.as_deref());
         let picker = ListPicker::new(
             ListPickerKind::Session,
             "Sessions",
@@ -87,7 +87,7 @@ impl CommandHandler for ResumeCommand {
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let prefix = args.trim();
         let sessions = ctx.session_store.list_sessions(200)?;
-        let items = build_session_items(&sessions, &ctx.session_id);
+        let items = build_session_items(&sessions, ctx.session_id.as_deref());
         let preselect = if prefix.is_empty() {
             None
         } else {
@@ -184,7 +184,12 @@ impl CommandHandler for TitleCommand {
             return Ok(CommandResult::Message("Usage: /title <name>".to_string()));
         }
 
-        ctx.session_store.set_title(&ctx.session_id, title)?;
+        let Some(sid) = ctx.session_id.clone() else {
+            return Ok(CommandResult::Message(
+                "No active session yet — send a message first.".to_string(),
+            ));
+        };
+        ctx.session_store.set_title(&sid, title)?;
 
         Ok(CommandResult::Message(format!(
             "Session title set to: {}",
@@ -262,6 +267,8 @@ mod tests {
     #[test]
     fn title_command_sets_title() {
         let mut ctx = test_context();
+        // /title needs an active session, which the first message binds.
+        ctx.append_user_message("start a session").unwrap();
 
         let cmd = TitleCommand;
         let result = cmd.execute("my-session-title", &mut ctx).unwrap();
@@ -274,11 +281,11 @@ mod tests {
         }
 
         // Verify it was actually persisted
-        let session = ctx
-            .session_store
-            .get_session(&ctx.session_id)
-            .unwrap()
-            .unwrap();
+        let sid = ctx
+            .session_id
+            .clone()
+            .expect("session bound by first message");
+        let session = ctx.session_store.get_session(&sid).unwrap().unwrap();
         assert_eq!(session.title.as_deref(), Some("my-session-title"));
     }
 }

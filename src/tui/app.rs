@@ -2211,7 +2211,7 @@ impl TuiApp {
                 // chat pane.
                 let summary_msg = crate::sessions::Message {
                     id: 0,
-                    session_id: self.context.session_id.clone(),
+                    session_id: self.context.session_id.clone().unwrap_or_default(),
                     role: "system".to_string(),
                     content: format!(
                         "[Compacted summary of earlier conversation]\n\n{}",
@@ -2225,13 +2225,16 @@ impl TuiApp {
                 self.context.messages.push(summary_msg);
                 self.context.messages.extend(kept_tail);
 
-                // Persist the new shape so it survives restart.
-                if let Err(e) = self
-                    .context
-                    .session_store
-                    .replace_messages(&self.context.session_id, &self.context.messages)
-                {
-                    tracing::warn!("failed to persist compacted history: {e}");
+                // Persist the new shape so it survives restart (only when a
+                // session is bound — compaction always runs on an active one).
+                if let Some(sid) = self.context.session_id.clone() {
+                    if let Err(e) = self
+                        .context
+                        .session_store
+                        .replace_messages(&sid, &self.context.messages)
+                    {
+                        tracing::warn!("failed to persist compacted history: {e}");
+                    }
                 }
 
                 // Returned to ready; the streaming working indicator
@@ -2549,7 +2552,7 @@ impl TuiApp {
                         return;
                     }
                 };
-                self.context.session_id = session.id.clone();
+                self.context.session_id = Some(session.id.clone());
                 self.context.model = session.model.clone();
                 self.context.messages.clear();
                 if let Err(e) = self.context.load_session_messages() {
@@ -3653,7 +3656,7 @@ impl TuiApp {
         // append only the session identifier here so the same info
         // doesn't appear twice in scrollback.
         let lines = render_splash_lines(ctx, size.width);
-        let session_short = &ctx.session_id[..8.min(ctx.session_id.len())];
+        let session_short = ctx.session_id_short();
         let mut all_lines = lines;
         all_lines.push(Line::from(Span::styled(
             format!("  · session {} ", session_short),
@@ -3666,7 +3669,7 @@ impl TuiApp {
     /// Original `render_header` shape, kept for backward callers.
     #[allow(dead_code)]
     fn render_header(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let session_short = &self.context.session_id[..8.min(self.context.session_id.len())];
+        let session_short = self.context.session_id_short();
         let header = Paragraph::new(Line::from(vec![
             Span::styled(
                 "  Rantaiclaw  ",
@@ -4080,7 +4083,7 @@ fn install_tui_tracing() {
 // ---------------------------------------------------------------------------
 
 fn render_header_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
-    let session_short = &ctx.session_id[..8.min(ctx.session_id.len())];
+    let session_short = ctx.session_id_short();
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             "  Rantaiclaw  ",
@@ -6008,11 +6011,12 @@ mod tests {
     }
 
     #[test]
-    fn app_creates_new_session_on_start() {
+    fn app_defers_session_until_first_message() {
         let store = SessionStore::in_memory().expect("store");
         let app = make_app_from_store(store, "test-model");
 
-        assert!(!app.context.session_id.is_empty());
+        // Launching alone must not create a session — only the first message does.
+        assert!(app.context.session_id.is_none());
         assert!(matches!(app.state, AppState::Ready));
         assert!(app.context.messages.is_empty());
     }
@@ -6033,8 +6037,6 @@ mod tests {
         let store = SessionStore::in_memory().expect("store");
         let mut app = make_app_from_store(store, "test-model");
 
-        let first_session_id = app.context.session_id.clone();
-
         // A non-command submit now dispatches via the bridge and transitions
         // the app to Streaming (no real actor in this test — the request
         // simply sits in the channel). The user message is still appended
@@ -6042,6 +6044,9 @@ mod tests {
         app.context.input_buffer = "hello".to_string();
         app.submit_input().await.unwrap();
         assert!(!app.context.messages.is_empty());
+        // The first message lazily bound a session; capture it to prove /new flips it.
+        let first_session_id = app.context.session_id.clone();
+        assert!(first_session_id.is_some());
 
         app.context.input_buffer = "/new".to_string();
         app.submit_input().await.unwrap();

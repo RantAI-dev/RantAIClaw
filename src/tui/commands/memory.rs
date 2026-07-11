@@ -604,7 +604,7 @@ mod tests {
         for i in 0..15 {
             ctx.messages.push(crate::sessions::Message {
                 id: 0,
-                session_id: ctx.session_id.clone(),
+                session_id: ctx.session_id.clone().unwrap_or_default(),
                 role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
                 content: format!("msg-{i}"),
                 tool_calls: None,
@@ -634,7 +634,7 @@ mod tests {
         for i in 0..15 {
             ctx.messages.push(crate::sessions::Message {
                 id: 0,
-                session_id: ctx.session_id.clone(),
+                session_id: ctx.session_id.clone().unwrap_or_default(),
                 role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
                 content: format!("msg-{i}"),
                 tool_calls: None,

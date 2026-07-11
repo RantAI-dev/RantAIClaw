@@ -15,7 +15,9 @@ pub struct TokenUsage {
 
 /// Holds the runtime state of an active TUI conversation.
 pub struct TuiContext {
-    pub session_id: String,
+    /// `None` until the first message is persisted. Deferring creation keeps
+    /// launch-and-close (with no input) from leaving empty "Untitled" sessions.
+    pub session_id: Option<String>,
     pub session_store: SessionStore,
     pub messages: Vec<Message>,
     pub model: String,
@@ -118,10 +120,11 @@ pub struct TuiContext {
 }
 
 impl TuiContext {
-    /// Create a new context, opening (or creating) a session in the store.
+    /// Create a new context for a TUI conversation.
     ///
-    /// If `resume_session` is `Some`, the existing session is loaded;
-    /// otherwise a fresh session is created.
+    /// If `resume_session` is `Some`, that existing session is loaded and bound
+    /// immediately. Otherwise the context starts unbound (`session_id = None`)
+    /// and defers creating its session until the first message is persisted.
     pub fn new(
         session_store: SessionStore,
         model: &str,
@@ -129,15 +132,14 @@ impl TuiContext {
         req_tx: mpsc::Sender<TurnRequest>,
         events_rx: mpsc::Receiver<AgentEvent>,
     ) -> Result<Self> {
+        // Resuming binds to the existing session immediately; a fresh launch
+        // stays unbound (`None`) and creates its session lazily on first message.
         let (session_id, messages) = match resume_session {
             Some(id) => {
                 let msgs = session_store.get_messages(id)?;
-                (id.to_string(), msgs)
+                (Some(id.to_string()), msgs)
             }
-            None => {
-                let session = session_store.new_session(model, "tui")?;
-                (session.id, Vec::new())
-            }
+            None => (None, Vec::new()),
         };
 
         Ok(Self {
@@ -352,6 +354,28 @@ impl TuiContext {
         (ctx, req_rx, events_tx)
     }
 
+    /// Return the active session id, creating the session lazily on first use.
+    ///
+    /// The TUI defers creation until there is something to persist, so opening
+    /// and closing without typing never leaves an empty, untitled session.
+    fn ensure_session_id(&mut self) -> Result<String> {
+        if let Some(id) = &self.session_id {
+            return Ok(id.clone());
+        }
+        let session = self.session_store.new_session(&self.model.clone(), "tui")?;
+        self.session_id = Some(session.id.clone());
+        Ok(session.id)
+    }
+
+    /// Short session id for status displays; `"new"` while the session is
+    /// still unbound (no message sent yet).
+    pub fn session_id_short(&self) -> &str {
+        match &self.session_id {
+            Some(id) => &id[..8.min(id.len())],
+            None => "new",
+        }
+    }
+
     /// Append a user message to the in-memory list and persist it.
     ///
     /// If this is the first message in the session and the session has no
@@ -360,14 +384,15 @@ impl TuiContext {
     /// best-effort UI affordance.
     pub fn append_user_message(&mut self, content: &str) -> Result<()> {
         let is_first_message = self.messages.is_empty();
-        let msg = Message::user(&self.session_id, content);
+        let sid = self.ensure_session_id()?;
+        let msg = Message::user(&sid, content);
         self.session_store.append_message(&msg)?;
         self.messages.push(msg);
 
         if is_first_message {
             let title = derive_session_title(content);
             if !title.is_empty() {
-                let _ = self.session_store.set_title(&self.session_id, &title);
+                let _ = self.session_store.set_title(&sid, &title);
             }
         }
         Ok(())
@@ -377,9 +402,10 @@ impl TuiContext {
     /// `/usage`, `/sessions`, etc.). Persisted to the session store so
     /// scrollback + resume still show the line.
     pub fn append_system_message(&mut self, content: &str) -> Result<()> {
+        let sid = self.ensure_session_id()?;
         let msg = Message {
             id: 0,
-            session_id: self.session_id.clone(),
+            session_id: sid,
             role: "system".to_string(),
             content: content.to_string(),
             tool_calls: None,
@@ -404,7 +430,8 @@ impl TuiContext {
         content: &str,
         tool_calls_json: Option<String>,
     ) -> Result<()> {
-        let mut msg = Message::assistant(&self.session_id, content);
+        let sid = self.ensure_session_id()?;
+        let mut msg = Message::assistant(&sid, content);
         msg.tool_calls = tool_calls_json;
         self.session_store.append_message(&msg)?;
         self.messages.push(msg);
@@ -413,7 +440,10 @@ impl TuiContext {
 
     /// Reload all messages for the current session from the store.
     pub fn load_session_messages(&mut self) -> Result<()> {
-        self.messages = self.session_store.get_messages(&self.session_id)?;
+        match &self.session_id {
+            Some(sid) => self.messages = self.session_store.get_messages(sid)?,
+            None => self.messages.clear(),
+        }
         Ok(())
     }
 
@@ -421,9 +451,11 @@ impl TuiContext {
     /// The active model is intentionally **preserved** — Hermes / Claude-Code
     /// convention: model is a runtime preference that survives `/new`.
     pub fn clear_session(&mut self) -> Result<()> {
-        self.session_store.end_session(&self.session_id)?;
-        let session = self.session_store.new_session(&self.model.clone(), "tui")?;
-        self.session_id = session.id;
+        // End the current session if one exists; leave `session_id` unbound so
+        // the next message lazily creates a fresh one (no empty session on /new).
+        if let Some(sid) = self.session_id.take() {
+            self.session_store.end_session(&sid)?;
+        }
         self.messages.clear();
         self.input_buffer.clear();
         self.scroll_offset = 0;
@@ -447,11 +479,14 @@ mod tests {
     #[test]
     fn first_user_message_auto_titles_session() {
         let mut ctx = in_memory_context("test-model");
-        let sid = ctx.session_id.clone();
 
         ctx.append_user_message("design the new picker overlay")
             .unwrap();
 
+        let sid = ctx
+            .session_id
+            .clone()
+            .expect("session created on first message");
         let after = ctx.session_store.get_session(&sid).unwrap().unwrap();
         assert_eq!(
             after.title.as_deref(),
@@ -460,10 +495,33 @@ mod tests {
     }
 
     #[test]
+    fn new_context_defers_session_creation_until_first_message() {
+        let mut ctx = in_memory_context("test-model");
+
+        // Opening the TUI without typing anything must NOT create a session —
+        // otherwise every launch-and-close leaves an empty "Untitled" row.
+        assert_eq!(
+            ctx.session_store.list_sessions(10).unwrap().len(),
+            0,
+            "no session should exist before the first message"
+        );
+
+        ctx.append_user_message("hello there agent").unwrap();
+
+        // The first message lazily creates exactly one, titled from that message.
+        let sessions = ctx.session_store.list_sessions(10).unwrap();
+        assert_eq!(sessions.len(), 1, "first message creates the session");
+        assert_eq!(sessions[0].title.as_deref(), Some("hello there agent"));
+    }
+
+    #[test]
     fn second_user_message_does_not_overwrite_title() {
         let mut ctx = in_memory_context("test-model");
-        let sid = ctx.session_id.clone();
         ctx.append_user_message("first prompt").unwrap();
+        let sid = ctx
+            .session_id
+            .clone()
+            .expect("session created on first message");
         ctx.session_store.set_title(&sid, "manually set").unwrap();
         ctx.append_user_message("follow-up that should not retitle")
             .unwrap();
@@ -570,7 +628,7 @@ mod tests {
 
         assert_eq!(ctx.messages.len(), 1);
         assert_eq!(ctx.messages[0].content, "persisted");
-        assert_eq!(ctx.session_id, session.id);
+        assert_eq!(ctx.session_id.as_deref(), Some(session.id.as_str()));
     }
 
     #[test]
