@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.9-alpha] — 2026-07-11
+
+### Fixed
+
+- **Channel owners are recognized under any of their identity forms.** The owner
+  gate matched only the single sender the runtime resolved (username-preferred
+  for Telegram), while the per-channel chat allowlist checks every form — so an
+  owner added by numeric id was silently treated as a guest whenever that sender
+  also had a username. Owner matching now checks every form via `can_approve_any`
+  and `ChannelMessage.sender_aliases` (`/claim` already stored both). No
+  permission is widened: matching stays case-sensitive with `@` stripped, and
+  `*`/empty-list semantics are unchanged.
+- **Channel agents no longer self-refuse owner-only tools.** When an approval
+  owner chats, the channel system prompt now states the sender is a verified
+  owner, so cautious models stop declining owner-only tools (`manage_permissions`,
+  `issue_pairing_code`) without calling them. The runtime gate remains the sole
+  enforcer; non-owner turns get no owner context.
+- **A leaked temp-dir workspace marker no longer shadows the active profile.** An
+  `active_workspace.toml` pointing under the OS temp dir (e.g. left by a
+  non-hermetic test) is ignored with a warning, preventing a config split-brain
+  where owner/config edits appeared not to apply until the marker was removed.
+
 ## [0.7.8-alpha] — 2026-07-11
 
 ### Added
