@@ -498,7 +498,7 @@ impl Channel for DiscordChannel {
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
-                    let channel_msg = ChannelMessage {
+                    let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
                         id: if message_id.is_empty() {
                             Uuid::new_v4().to_string()
                         } else {

@@ -649,6 +649,7 @@ impl Channel for MatrixChannel {
                 }
 
                 let msg = ChannelMessage {
+                    sender_aliases: Vec::new(),
                     id: event_id,
                     sender: sender.clone(),
                     reply_target: sender,

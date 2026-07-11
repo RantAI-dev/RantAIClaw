@@ -444,6 +444,7 @@ impl EmailChannel {
             }
 
             let msg = ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: email.msg_id,
                 reply_target: email.sender.clone(),
                 sender: email.sender,

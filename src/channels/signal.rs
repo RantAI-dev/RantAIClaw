@@ -363,6 +363,7 @@ impl SignalChannel {
             });
 
         Some(ChannelMessage {
+            sender_aliases: Vec::new(),
             id: format!("sig_{timestamp}"),
             sender: sender.clone(),
             reply_target: target,

@@ -1109,6 +1109,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             username.clone()
         };
 
+        // The alternate identity form for `sender` (the numeric id when
+        // `sender` is the username), so the owner gate can recognize an owner
+        // recorded under either form — the same two-form logic the chat
+        // allowlist already applies below.
+        let sender_aliases: Vec<String> = match sender_id.as_ref() {
+            Some(id) if id != &sender_identity => vec![id.clone()],
+            _ => Vec::new(),
+        };
+
         let mut identities = vec![username.as_str()];
         if let Some(id) = sender_id.as_deref() {
             identities.push(id);
@@ -1174,6 +1183,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     .unwrap_or_default()
                     .as_secs(),
                 thread_ts: None,
+                sender_aliases,
             },
             photo_file_id,
         ))
@@ -2745,6 +2755,40 @@ mod tests {
 
         assert_eq!(msg.sender, "555");
         assert_eq!(msg.reply_target, "12345");
+    }
+
+    #[test]
+    fn parse_update_message_records_numeric_id_as_sender_alias_for_owner_match() {
+        // A user with a username: `sender` resolves to the username, but the
+        // numeric id is kept as an alias so an owner recorded by numeric id is
+        // still recognized — parity with the two-form chat allowlist.
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 4,
+            "message": {
+                "message_id": 7,
+                "text": "hi",
+                "from": { "id": 1360247715_i64, "username": "sulthannauval" },
+                "chat": { "id": 4242 }
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .map(|(m, _)| m)
+            .expect("wildcard allowlist should pass");
+
+        assert_eq!(msg.sender, "sulthannauval");
+        assert_eq!(msg.sender_aliases, vec!["1360247715".to_string()]);
+        // Owner recorded by numeric id is recognized across the sender's forms,
+        // even though the runtime resolved `sender` to the username. The
+        // single-form check still misses it — the asymmetry this fix closes.
+        let owners = vec!["1360247715".to_string()];
+        assert!(crate::approval::can_approve_any(
+            &owners,
+            msg.sender_identities()
+        ));
+        assert!(!crate::approval::can_approve(&owners, &msg.sender));
     }
 
     #[test]

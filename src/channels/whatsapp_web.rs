@@ -494,7 +494,7 @@ impl Channel for WhatsAppWebChannel {
                                 let reply_target =
                                     Self::resolve_reply_target(&client, &chat_jid).await;
                                 if let Err(e) = tx_inner
-                                    .send(ChannelMessage {
+                                    .send(ChannelMessage { sender_aliases: Vec::new(),
                                         id: uuid::Uuid::new_v4().to_string(),
                                         channel: "whatsapp".to_string(),
                                         sender: normalized.clone(),

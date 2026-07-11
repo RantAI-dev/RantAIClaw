@@ -1672,8 +1672,10 @@ async fn process_channel_message(
     // Owner status drives both the prompt (tell the model the sender is an
     // owner so it doesn't self-refuse owner-only tools) and the capability
     // ceiling below. Compute once so the two never disagree.
-    let sender_is_owner =
-        crate::approval::can_approve(&runtime_defaults.approval_owners, &msg.sender);
+    let sender_is_owner = crate::approval::can_approve_any(
+        &runtime_defaults.approval_owners,
+        msg.sender_identities(),
+    );
     let system_prompt =
         build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, sender_is_owner);
     let mut history = vec![ChatMessage::system(system_prompt)];
@@ -2019,17 +2021,26 @@ async fn run_message_dispatch_loop(
             tracing::warn!("Failed to apply runtime config update: {err}");
         }
         let live_owners = live_approval_owners(ctx.as_ref());
+        // Authorize the reply against ANY of the sender's identity forms (parity
+        // with the capability gate), so an owner recorded under a different form
+        // than the one the runtime resolved `sender` to can still approve. The
+        // relay uses this identity only for the owner check, so handing it a
+        // matching form is equivalent and keeps the relay signatures single-form.
+        let approver = msg
+            .sender_identities()
+            .find(|id| crate::approval::can_approve(&live_owners, id))
+            .unwrap_or(msg.sender.as_str());
         let approval_reply = approval_relay::try_handle_tool_reply(
             &msg.content,
             ctx.tool_approvals.as_ref(),
-            &msg.sender,
+            approver,
             &live_owners,
         )
         .or_else(|| {
             approval_relay::try_handle_reply(
                 &msg.content,
                 ctx.security.as_ref(),
-                &msg.sender,
+                approver,
                 &live_owners,
             )
         });
@@ -4336,6 +4347,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-1".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
@@ -4403,6 +4415,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-raw-json".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-raw".to_string(),
@@ -4470,6 +4483,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-2".to_string(),
                 sender: "bob".to_string(),
                 reply_target: "chat-84".to_string(),
@@ -4546,6 +4560,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx.clone(),
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-cmd-1".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
@@ -4643,6 +4658,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-routed-1".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
@@ -4722,6 +4738,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-default-provider-cache".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
@@ -4824,6 +4841,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-runtime-store-model".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
@@ -5035,6 +5053,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-iter-success".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-iter-success".to_string(),
@@ -5107,6 +5126,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-iter-fail".to_string(),
                 sender: "bob".to_string(),
                 reply_target: "chat-iter-fail".to_string(),
@@ -5285,6 +5305,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
         tx.send(traits::ChannelMessage {
+            sender_aliases: Vec::new(),
             id: "1".to_string(),
             sender: "alice".to_string(),
             reply_target: "alice".to_string(),
@@ -5296,6 +5317,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .unwrap();
         tx.send(traits::ChannelMessage {
+            sender_aliases: Vec::new(),
             id: "2".to_string(),
             sender: "bob".to_string(),
             reply_target: "bob".to_string(),
@@ -5374,6 +5396,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
         let send_task = tokio::spawn(async move {
             tx.send(traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-1".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
@@ -5386,6 +5409,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
             tokio::time::sleep(Duration::from_millis(40)).await;
             tx.send(traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-2".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
@@ -5474,6 +5498,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
         let send_task = tokio::spawn(async move {
             tx.send(traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-a".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
@@ -5486,6 +5511,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
             tokio::time::sleep(Duration::from_millis(30)).await;
             tx.send(traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-b".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-2".to_string(),
@@ -5556,6 +5582,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "typing-msg".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-typing".to_string(),
@@ -5926,6 +5953,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn conversation_memory_key_uses_message_id() {
         let msg = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
             id: "msg_abc123".into(),
             sender: "U123".into(),
             reply_target: "C456".into(),
@@ -5941,6 +5969,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn conversation_memory_key_is_unique_per_message() {
         let msg1 = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
             id: "msg_1".into(),
             sender: "U123".into(),
             reply_target: "C456".into(),
@@ -5950,6 +5979,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
         };
         let msg2 = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
             id: "msg_2".into(),
             sender: "U123".into(),
             reply_target: "C456".into(),
@@ -5971,6 +6001,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let mem = SqliteMemory::new(tmp.path()).unwrap();
 
         let msg1 = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
             id: "msg_1".into(),
             sender: "U123".into(),
             reply_target: "C456".into(),
@@ -5980,6 +6011,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
         };
         let msg2 = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
             id: "msg_2".into(),
             sender: "U123".into(),
             reply_target: "C456".into(),
@@ -6093,6 +6125,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx.clone(),
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-a".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
@@ -6108,6 +6141,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx,
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-b".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
@@ -6186,6 +6220,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx.clone(),
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "msg-ctx-1".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-ctx".to_string(),
@@ -6279,6 +6314,7 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(
             runtime_ctx.clone(),
             traits::ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "tg-msg-1".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-telegram".to_string(),
