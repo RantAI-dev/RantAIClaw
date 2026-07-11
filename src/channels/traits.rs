@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 /// A message received from or sent to a channel
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
@@ -13,6 +13,23 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Additional identity forms for `sender` when a channel resolves one user
+    /// to more than one (e.g. Telegram exposes both a numeric id and a
+    /// username, but `sender` can only be one). The owner gate checks these
+    /// alongside `sender`, matching the per-channel chat allowlist which already
+    /// considers every form. Empty for channels with a single identity form.
+    pub sender_aliases: Vec<String>,
+}
+
+impl ChannelMessage {
+    /// Every identity form for the sender: the primary `sender` followed by any
+    /// `sender_aliases`. The owner gate matches against all of them so an owner
+    /// recorded under any single form (e.g. a Telegram numeric id) is
+    /// recognized even when the runtime resolves the sender to another form
+    /// (the username) — parity with the two-form chat allowlist.
+    pub fn sender_identities(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.sender.as_str()).chain(self.sender_aliases.iter().map(String::as_str))
+    }
 }
 
 /// Message to send through a channel
@@ -147,6 +164,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> anyhow::Result<()> {
             tx.send(ChannelMessage {
+                sender_aliases: Vec::new(),
                 id: "1".into(),
                 sender: "tester".into(),
                 reply_target: "tester".into(),
@@ -163,6 +181,7 @@ mod tests {
     #[test]
     fn channel_message_clone_preserves_fields() {
         let message = ChannelMessage {
+            sender_aliases: Vec::new(),
             id: "42".into(),
             sender: "alice".into(),
             reply_target: "alice".into(),

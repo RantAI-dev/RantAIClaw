@@ -291,6 +291,7 @@ impl LinqChannel {
         };
 
         messages.push(ChannelMessage {
+            sender_aliases: Vec::new(),
             id: Uuid::new_v4().to_string(),
             reply_target,
             sender: normalized_from,

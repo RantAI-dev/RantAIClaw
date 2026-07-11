@@ -244,6 +244,7 @@ impl Channel for SlackChannel {
                     last_ts = ts.to_string();
 
                     let channel_msg = ChannelMessage {
+                        sender_aliases: Vec::new(),
                         id: format!("slack_{channel_id}_{ts}"),
                         sender: user.to_string(),
                         reply_target: channel_id.clone(),

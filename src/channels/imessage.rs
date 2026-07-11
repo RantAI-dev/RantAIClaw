@@ -300,6 +300,7 @@ end tell"#
                         }
 
                         let msg = ChannelMessage {
+                            sender_aliases: Vec::new(),
                             id: rowid.to_string(),
                             sender: sender.clone(),
                             reply_target: sender.clone(),

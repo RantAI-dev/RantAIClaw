@@ -408,6 +408,7 @@ impl MattermostChannel {
         };
 
         Some(ChannelMessage {
+            sender_aliases: Vec::new(),
             id: format!("mattermost_{id}"),
             sender: user_id.to_string(),
             reply_target,

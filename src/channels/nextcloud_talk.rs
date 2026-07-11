@@ -259,6 +259,7 @@ impl NextcloudTalkChannel {
         let timestamp = Self::parse_timestamp_secs(message_obj.get("timestamp"));
 
         messages.push(ChannelMessage {
+            sender_aliases: Vec::new(),
             id: message_id,
             reply_target: room_token.to_string(),
             sender: actor_id.to_string(),

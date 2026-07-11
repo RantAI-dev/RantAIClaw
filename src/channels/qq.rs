@@ -436,7 +436,7 @@ impl Channel for QQChannel {
                                 continue;
                             }
 
-                            let channel_msg = ChannelMessage {
+                            let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
                                 id: Uuid::new_v4().to_string(),
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
@@ -482,7 +482,7 @@ impl Channel for QQChannel {
                                 continue;
                             }
 
-                            let channel_msg = ChannelMessage {
+                            let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
                                 id: Uuid::new_v4().to_string(),
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,

@@ -341,6 +341,7 @@ impl Channel for DingTalkChannel {
                     let _ = write.send(Message::Text(ack.to_string().into())).await;
 
                     let channel_msg = ChannelMessage {
+                        sender_aliases: Vec::new(),
                         id: Uuid::new_v4().to_string(),
                         sender: sender_id.to_string(),
                         reply_target: chat_id,

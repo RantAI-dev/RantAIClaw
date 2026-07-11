@@ -284,6 +284,7 @@ impl WhatsAppChannel {
                         });
 
                     messages.push(ChannelMessage {
+                        sender_aliases: Vec::new(),
                         id: Uuid::new_v4().to_string(),
                         reply_target: normalized_from.clone(),
                         sender: normalized_from,

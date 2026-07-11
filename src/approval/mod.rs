@@ -182,11 +182,34 @@ impl ApprovalManager {
 ///   `dramnerf`), but matching is otherwise exact and **case-sensitive** —
 ///   identical to `allowed_users`, so the two gates never disagree.
 pub fn can_approve(owners: &[String], sender: &str) -> bool {
+    can_approve_any(owners, std::iter::once(sender))
+}
+
+/// Like [`can_approve`], but authorizes if **any** of the sender's identity
+/// forms matches an owner.
+///
+/// A channel can resolve one sender to more than one identity (e.g. a Telegram
+/// numeric id AND a username). The per-channel chat allowlist already checks
+/// every form, so the owner gate must too — otherwise an owner added by one
+/// form (say a numeric id, as the CLI examples suggest) is silently treated as
+/// a guest whenever the runtime resolves that same sender to the other form
+/// (the username). Semantics otherwise match [`can_approve`]: `"*"` authorizes
+/// anyone, an empty owner list denies everyone, and matching is case-sensitive
+/// with a leading `@` stripped on both sides.
+pub fn can_approve_any<'a>(
+    owners: &[String],
+    identities: impl IntoIterator<Item = &'a str>,
+) -> bool {
     fn normalize(s: &str) -> &str {
         s.trim().trim_start_matches('@')
     }
-    let sender = normalize(sender);
-    owners.iter().any(|o| o == "*" || normalize(o) == sender)
+    if owners.iter().any(|o| o == "*") {
+        return true;
+    }
+    let normalized_owners: Vec<&str> = owners.iter().map(|o| normalize(o.as_str())).collect();
+    identities
+        .into_iter()
+        .any(|id| normalized_owners.contains(&normalize(id)))
 }
 
 // ── Approval backends (surface-pluggable decision) ───────────────
@@ -345,6 +368,24 @@ mod tests {
         assert!(can_approve(&owners, "@dramnerf"));
         assert!(!can_approve(&owners, "Dramnerf")); // case-sensitive, like allowed_users
         assert!(!can_approve(&owners, "someone_else"));
+    }
+
+    #[test]
+    fn owner_gate_matches_any_of_a_senders_identity_forms() {
+        // Owner stored as a Telegram numeric id. The runtime resolves the
+        // sender to their username, but the numeric id is available as an alias
+        // — the owner must be recognized, matching the chat allowlist which
+        // already checks both forms.
+        let owners = vec!["1360247715".to_string()];
+        assert!(can_approve_any(&owners, ["sulthannauval", "1360247715"]));
+        // The single-form check still misses it — this is the asymmetry the
+        // alias-aware check fixes.
+        assert!(!can_approve(&owners, "sulthannauval"));
+        // Secure default and wildcard behave like `can_approve`.
+        assert!(!can_approve_any(&[], ["a", "b"]));
+        assert!(can_approve_any(&["*".to_string()], ["anyone"]));
+        // A leading `@` is tolerated on either side, as in `can_approve`.
+        assert!(can_approve_any(&["@dramnerf".to_string()], ["@dramnerf"]));
     }
 
     // ── needs_approval ───────────────────────────────────────

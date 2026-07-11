@@ -643,7 +643,7 @@ impl LarkChannel {
 
                     self.try_add_ack_reaction(&lark_msg.message_id).await;
 
-                    let channel_msg = ChannelMessage {
+                    let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
                         id: Uuid::new_v4().to_string(),
                         sender: lark_msg.chat_id.clone(),
                         reply_target: lark_msg.chat_id.clone(),
@@ -955,6 +955,7 @@ impl LarkChannel {
             .unwrap_or(open_id);
 
         messages.push(ChannelMessage {
+            sender_aliases: Vec::new(),
             id: Uuid::new_v4().to_string(),
             sender: chat_id.to_string(),
             reply_target: chat_id.to_string(),
