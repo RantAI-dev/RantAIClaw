@@ -3283,6 +3283,22 @@ fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
     default_dir.join(ACTIVE_WORKSPACE_STATE_FILE)
 }
 
+/// Whether an active-workspace marker's `config_dir` looks like a leaked
+/// ephemeral workspace: it points under the OS temp dir while the real default
+/// config dir does not. A genuine install never keeps its workspace under the
+/// temp dir, but a non-hermetic test can leave a marker in the real
+/// `~/.rantaiclaw` pointing at a since-deleted tempdir — honoring it silently
+/// shadows the real config (a split-brain where owner/config edits "don't
+/// apply" until the marker is removed). Pure for testing; production passes
+/// `std::env::temp_dir()`. Test setups (default dir also under temp) are exempt.
+fn active_workspace_marker_is_temp_leak(
+    config_dir: &Path,
+    default_config_dir: &Path,
+    temp_dir: &Path,
+) -> bool {
+    config_dir.starts_with(temp_dir) && !default_config_dir.starts_with(temp_dir)
+}
+
 async fn load_persisted_workspace_dirs(
     default_config_dir: &Path,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
@@ -3328,6 +3344,18 @@ async fn load_persisted_workspace_dirs(
     } else {
         default_config_dir.join(parsed_dir)
     };
+
+    if active_workspace_marker_is_temp_leak(&config_dir, default_config_dir, &std::env::temp_dir())
+    {
+        tracing::warn!(
+            "Ignoring active workspace marker {} because {} is under the OS temp dir — this \
+             usually means a leaked ephemeral/test workspace. Falling back to the default profile.",
+            state_path.display(),
+            config_dir.display()
+        );
+        return Ok(None);
+    }
+
     Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
 }
 
@@ -6119,6 +6147,31 @@ default_temperature = 0.7
         assert_eq!(resolved_workspace_dir, marker_config_dir.join("workspace"));
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    #[test]
+    async fn active_workspace_marker_temp_leak_is_detected_only_for_real_installs() {
+        let temp = std::env::temp_dir();
+        // Real install whose marker points into the OS temp dir → leaked
+        // ephemeral/test workspace; must be ignored so it can't shadow config.
+        assert!(active_workspace_marker_is_temp_leak(
+            &temp.join(".tmpABC").join(".rantaiclaw"),
+            Path::new("/home/rantaiclaw_user/.rantaiclaw"),
+            &temp,
+        ));
+        // Test harness: the default dir is ALSO under temp → legitimate, honored.
+        let test_default = temp.join("rantaiclaw_test_root");
+        assert!(!active_workspace_marker_is_temp_leak(
+            &test_default.join("profiles").join("alpha"),
+            &test_default,
+            &temp,
+        ));
+        // Ordinary install (nothing under temp) → not a leak.
+        assert!(!active_workspace_marker_is_temp_leak(
+            Path::new("/home/rantaiclaw_user/.rantaiclaw/profiles/alpha"),
+            Path::new("/home/rantaiclaw_user/.rantaiclaw"),
+            &temp,
+        ));
     }
 
     #[test]
