@@ -1867,7 +1867,17 @@ async fn main() -> Result<()> {
             service::handle_command(&service_command, &config, init_system)
         }
 
-        Some(Commands::Ui { ui_command }) => webui::handle_command(&ui_command, &config),
+        Some(Commands::Ui { ui_command }) => {
+            // `webui::handle_command` now uses reqwest::blocking (artifact
+            // download during `ui install`), which builds its own Tokio
+            // runtime; calling it directly inside `#[tokio::main]` panics with
+            // "Cannot drop a runtime in a context where blocking is not
+            // allowed". Run it on a blocking thread, mirroring `update` above.
+            let config = config.clone();
+            tokio::task::spawn_blocking(move || webui::handle_command(&ui_command, &config))
+                .await
+                .map_err(|e| anyhow::anyhow!("ui command panicked: {e}"))?
+        }
 
         Some(Commands::Doctor {
             format,
