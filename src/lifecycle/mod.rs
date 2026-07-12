@@ -13,6 +13,7 @@
 //! operate on `~/.rantaiclaw/` and the running binary path directly, so they
 //! still work after a partial install or a corrupted config.
 
+pub mod artifact;
 pub mod binary_path;
 pub mod process;
 pub mod uninstall;
