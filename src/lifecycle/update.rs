@@ -1146,7 +1146,7 @@ mod tests {
         let archive = dir.path().join("rantaiclaw.tar.gz");
         fs::write(&archive, b"the release bytes").unwrap();
         // SHA-256 of the literal bytes "the release bytes".
-        let sum = "86c0ea10853cdebc340b41ccd1a151ff282ec570bad37f52fa2321dd34b7479";
+        let sum = "86c0ea10853cdebc340b41ccd1a151ff282ec570bad37f52fa2321dd34b7479f";
         let sums = dir.path().join("SHA256SUMS");
         fs::write(&sums, format!("{sum}  rantaiclaw.tar.gz\n")).unwrap();
 
