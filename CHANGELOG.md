@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.11-alpha] — 2026-07-12
+
+### Changed
+
+- **The web console now installs from a prebuilt, signed release instead of
+  building from source.** `rantaiclaw ui install` downloads a SHA256- and
+  cosign-signed claw-ui standalone artifact, verifies it (failing closed on a
+  missing signature), and extracts it; `rantaiclaw ui start` serves the
+  production build with `node server.js` bound to `127.0.0.1`. This removes the
+  on-machine `git clone` + JS build (and its `npm audit`/`sharp` noise), gives
+  the console the same SHA256 + cosign supply-chain guarantee as the binary
+  updater, and makes installs fast. Notes: `--ref` now selects a **release
+  tag** (was a git ref), and **`node`** is now a prerequisite for `ui start`.
+
 ## [0.7.10-alpha] — 2026-07-11
 
 ### Fixed
