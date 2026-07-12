@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.12-alpha] — 2026-07-12
+
+### Added
+
+- **`rantaiclaw ui start` prints an SSH port-forward hint on remote hosts.** The
+  web console binds `127.0.0.1` only, so on a VM accessed over SSH it isn't
+  reachable from your local machine. When a remote session is detected (via
+  `SSH_CONNECTION`), `ui start` now prints a ready-to-copy
+  `ssh -L <port>:127.0.0.1:<port> <user>@<server-ip>` command plus the URL — on
+  both the fresh-launch and already-running paths. The bind stays loopback-only;
+  no exposure change.
+
 ## [0.7.11-alpha] — 2026-07-12
 
 ### Changed
