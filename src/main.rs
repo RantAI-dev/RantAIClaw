@@ -148,19 +148,19 @@ enum ServiceCommands {
 
 #[derive(Subcommand, Debug)]
 enum UiCommands {
-    /// Install (or update) the web console into ~/.rantaiclaw/ui
+    /// Install the web console into ~/.rantaiclaw/ui from a signed prebuilt release
     Install {
         /// Install directory (default: ~/.rantaiclaw/ui)
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
-        /// Git ref (tag or branch) to check out
+        /// claw-ui release tag to install (default: the pinned release)
         #[arg(long)]
         r#ref: Option<String>,
         /// Overwrite a non-empty target directory
         #[arg(long)]
         force: bool,
     },
-    /// Start the web console (Next.js dev server, foreground)
+    /// Start the web console (background, serves the prebuilt production build)
     Start {
         /// Install directory (default: ~/.rantaiclaw/ui)
         #[arg(long)]
@@ -171,7 +171,7 @@ enum UiCommands {
         /// Gateway URL the console proxies to (default: from config [gateway], else the existing .env.local)
         #[arg(long)]
         gateway: Option<String>,
-        /// Bearer token for the gateway. Remembered in .env.local; omit to keep the existing one or $RANTAICLAW_TOKEN
+        /// Bearer token for the gateway, passed to the console process (not persisted to disk); omit to keep the existing one or $RANTAICLAW_TOKEN
         #[arg(long)]
         token: Option<String>,
     },

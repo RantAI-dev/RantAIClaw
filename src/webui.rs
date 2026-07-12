@@ -2,20 +2,64 @@
 //!
 //! The console is a separate Next.js app
 //! (<https://github.com/RantAI-dev/claw-ui>). It is intentionally NOT bundled in
-//! the binary — this command fetches it on demand into `~/.rantaiclaw/ui` and
-//! runs it against a local gateway. Everything here shells out to `git` and a
-//! JavaScript runtime (`bun`, falling back to `npm`); no JS toolchain is
-//! required unless the user opts into the console.
+//! the binary — this command fetches a signed, prebuilt release archive on
+//! demand into `~/.rantaiclaw/ui` and serves it (`node server.js`) against a
+//! local gateway. No `git` clone and no on-machine JS build; only `tar` (to
+//! extract) and `node` (to run the standalone server) are required.
 
+use std::collections::BTreeMap;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use rantaiclaw::lifecycle::artifact::{self, CosignOutcome};
 
-const REPO_URL: &str = "https://github.com/RantAI-dev/claw-ui.git";
 const DEFAULT_PORT: u16 = 3939;
+
+/// Pinned claw-ui release tag `ui install` fetches by default. Bump this to
+/// roll the console forward; overridable per-invocation with `--ref`.
+const CLAW_UI_RELEASE: &str = "v0.3.0";
+const CLAW_UI_REPO: &str = "https://github.com/RantAI-dev/claw-ui";
+/// Expected cosign signing identity for claw-ui releases — its `release.yml`
+/// workflow on a tag ref. Passed to the shared `lifecycle::artifact::verify_cosign`.
+const CLAW_UI_COSIGN_IDENTITY: &str =
+    r"^https://github\.com/RantAI-dev/claw-ui/\.github/workflows/release\.yml@.*$";
+
+/// Reject anything that isn't a plain tag/branch token so `--ref` cannot
+/// retarget the download URL to another repo or path.
+fn validate_ref(r: &str) -> Result<()> {
+    let ok = !r.is_empty()
+        && r.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !ok {
+        bail!("invalid ref '{r}': only letters, digits, '.', '_', '-' are allowed");
+    }
+    Ok(())
+}
+
+/// `(archive_url, sums_url, archive_name)` for a claw-ui release tag.
+fn claw_ui_urls(tag: &str) -> (String, String, String) {
+    let base = format!("{CLAW_UI_REPO}/releases/download/{tag}");
+    let name = format!("claw-ui-{tag}.tar.gz");
+    (format!("{base}/{name}"), format!("{base}/SHA256SUMS"), name)
+}
+
+/// Fresh scratch dir for downloading + verifying a release archive before
+/// extraction. `tempfile` is a dev-dependency only, so this mirrors
+/// `lifecycle::update::make_work_dir` rather than using `tempfile::tempdir()`.
+fn make_ui_work_dir() -> Result<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("rantaiclaw-ui-{pid}-{nanos:x}"));
+    std::fs::create_dir_all(&dir).with_context(|| format!("create temp dir {}", dir.display()))?;
+    Ok(dir)
+}
 
 /// Default install location: `~/.rantaiclaw/ui` (shared across profiles).
 fn default_dir() -> PathBuf {
@@ -29,147 +73,6 @@ fn has_binary(bin: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-}
-
-/// True when `cmd` resolves on PATH. Use for tools without a clean `--version`, e.g. `unzip`.
-fn has_command(cmd: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {cmd}"))
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// A JavaScript runtime and how to invoke it (`bun` preferred; `npm` is the fallback).
-enum JsRuntime {
-    Bun(String),
-    Npm(String),
-}
-
-impl JsRuntime {
-    /// Command (or absolute path) used to invoke the runtime.
-    fn cmd(&self) -> &str {
-        match self {
-            JsRuntime::Bun(c) | JsRuntime::Npm(c) => c,
-        }
-    }
-    /// Short name for log lines.
-    fn name(&self) -> &str {
-        match self {
-            JsRuntime::Bun(_) => "bun",
-            JsRuntime::Npm(_) => "npm",
-        }
-    }
-}
-
-/// Where bun lands when installed via <https://bun.sh/install>: `$BUN_INSTALL/bin/bun`
-/// (default `$HOME/.bun/bin/bun`).
-fn bun_default_path() -> PathBuf {
-    let base = std::env::var_os("BUN_INSTALL")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".bun")))
-        .unwrap_or_else(|| PathBuf::from(".bun"));
-    base.join("bin").join("bun")
-}
-
-/// Find an existing runtime: `bun` on PATH, a bun at its default install path, then `npm`.
-fn detect_js_runtime() -> Option<JsRuntime> {
-    if has_binary("bun") {
-        return Some(JsRuntime::Bun("bun".into()));
-    }
-    let bun = bun_default_path();
-    if bun.is_file()
-        && Command::new(&bun)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    {
-        return Some(JsRuntime::Bun(bun.to_string_lossy().into_owned()));
-    }
-    if has_binary("npm") {
-        return Some(JsRuntime::Npm("npm".into()));
-    }
-    None
-}
-
-/// Ensure `unzip` is present — bun's installer uses it to extract its release. Installs it via
-/// the system package manager (with `sudo` when not root) if missing.
-fn ensure_unzip() -> Result<()> {
-    if has_command("unzip") {
-        return Ok(());
-    }
-    println!("⤓ bun needs `unzip` to unpack its release — installing unzip …");
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
-    let sudo = if is_root || !has_command("sudo") {
-        ""
-    } else {
-        "sudo "
-    };
-    let managers: [(&str, String); 6] = [
-        (
-            "apt-get",
-            format!("{sudo}apt-get update && {sudo}apt-get install -y unzip"),
-        ),
-        ("dnf", format!("{sudo}dnf install -y unzip")),
-        ("yum", format!("{sudo}yum install -y unzip")),
-        ("apk", format!("{sudo}apk add --no-cache unzip")),
-        ("pacman", format!("{sudo}pacman -Sy --noconfirm unzip")),
-        ("zypper", format!("{sudo}zypper install -y unzip")),
-    ];
-    for (mgr, cmd) in &managers {
-        if has_command(mgr) {
-            let _ = Command::new("bash").arg("-c").arg(cmd).status();
-            if has_command("unzip") {
-                return Ok(());
-            }
-        }
-    }
-    bail!("`unzip` is required to install bun but couldn't be installed automatically — install unzip (e.g. `apt-get install -y unzip`) and retry");
-}
-
-/// Auto-install bun via its official installer (needs `curl` + `bash`; uses `unzip`).
-fn install_bun() -> Result<JsRuntime> {
-    if !has_binary("curl") {
-        bail!("a JavaScript runtime is required and `curl` isn't available to auto-install bun — install bun (https://bun.sh) or Node.js/npm, then retry");
-    }
-    ensure_unzip()?; // bun's installer unzips its release — make sure unzip exists first
-    println!("⤓ No JavaScript runtime found — installing bun (https://bun.sh) …");
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg("curl -fsSL https://bun.sh/install | bash")
-        .status()
-        .context("failed to run the bun installer")?;
-    if !status.success() {
-        bail!(
-            "bun install failed — install bun (https://bun.sh) or Node.js/npm manually, then retry"
-        );
-    }
-    let bun = bun_default_path();
-    if bun.is_file() {
-        println!("✓ bun installed → {}", bun.display());
-        Ok(JsRuntime::Bun(bun.to_string_lossy().into_owned()))
-    } else {
-        bail!(
-            "bun installed but {} was not found — open a new shell (so bun is on PATH) and retry",
-            bun.display()
-        );
-    }
-}
-
-/// Get a JS runtime, auto-installing bun when neither bun nor npm is present.
-fn ensure_js_runtime() -> Result<JsRuntime> {
-    match detect_js_runtime() {
-        Some(rt) => Ok(rt),
-        None => install_bun(),
-    }
 }
 
 /// Connect address for a bind host (`0.0.0.0`/empty → loopback).
@@ -341,6 +244,58 @@ mod gateway_action_tests {
         assert_eq!(
             decide_gateway_action(true, None, "1.0", "aa"),
             GatewayAction::UnconfirmedError
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_ref_accepts_a_tag_and_rejects_traversal() {
+        assert!(validate_ref("v0.3.0").is_ok());
+        assert!(validate_ref("main").is_ok());
+        assert!(validate_ref("../../other-repo/x").is_err());
+        assert!(validate_ref("a b").is_err());
+        assert!(validate_ref("").is_err());
+    }
+
+    #[test]
+    fn claw_ui_urls_builds_release_asset_paths() {
+        let (archive_url, sums_url, name) = claw_ui_urls("v0.3.0");
+        assert_eq!(name, "claw-ui-v0.3.0.tar.gz");
+        assert_eq!(
+            archive_url,
+            "https://github.com/RantAI-dev/claw-ui/releases/download/v0.3.0/claw-ui-v0.3.0.tar.gz"
+        );
+        assert_eq!(
+            sums_url,
+            "https://github.com/RantAI-dev/claw-ui/releases/download/v0.3.0/SHA256SUMS"
+        );
+    }
+
+    #[test]
+    fn managed_dir_is_detected_by_server_js() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("server.js"), "// standalone").unwrap();
+        assert!(dir.join("server.js").exists());
+    }
+
+    #[test]
+    fn console_env_pins_loopback_and_passes_secrets() {
+        let env = console_env(3939, "http://127.0.0.1:4939", "tok", "sec");
+        assert_eq!(env.get("HOSTNAME").map(String::as_str), Some("127.0.0.1"));
+        assert_eq!(env.get("PORT").map(String::as_str), Some("3939"));
+        assert_eq!(
+            env.get("RANTAICLAW_GATEWAY_URL").map(String::as_str),
+            Some("http://127.0.0.1:4939")
+        );
+        assert_eq!(env.get("RANTAICLAW_TOKEN").map(String::as_str), Some("tok"));
+        assert_eq!(
+            env.get("RANTAICLAW_UI_SECRET").map(String::as_str),
+            Some("sec")
         );
     }
 }
@@ -524,16 +479,6 @@ fn run_file(dir: &Path) -> PathBuf {
     dir.join(".run")
 }
 
-fn run(cmd: &mut Command) -> Result<()> {
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to spawn {cmd:?}"))?;
-    if !status.success() {
-        bail!("command failed ({status}): {cmd:?}");
-    }
-    Ok(())
-}
-
 pub fn handle_command(command: &crate::UiCommands, config: &crate::config::Config) -> Result<()> {
     match command {
         crate::UiCommands::Install { dir, r#ref, force } => {
@@ -553,75 +498,112 @@ pub fn handle_command(command: &crate::UiCommands, config: &crate::config::Confi
     }
 }
 
-/// Clone (or update) claw-ui and install its dependencies.
+/// Download, verify (SHA256 + cosign), and extract a signed claw-ui release
+/// archive into `dir`. No `git` clone, no on-machine JS build.
 fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
+    let tag = git_ref.as_deref().unwrap_or(CLAW_UI_RELEASE);
+    validate_ref(tag)?;
 
-    if !has_binary("git") {
-        bail!("`git` is required to install the web console — install git and retry");
+    if !has_binary("tar") {
+        bail!("`tar` is required to install the web console — install tar and retry");
     }
-    let runtime = ensure_js_runtime()?;
 
-    if dir.join(".git").is_dir() {
-        println!("↻ Updating existing console at {}", dir.display());
-        // This checkout is managed by rantaiclaw, not meant for hand edits. The
-        // JS runtime (`bun`/`npm`) rewrites the lockfile during install, leaving
-        // the tree dirty; discard that churn first so the fast-forward never
-        // aborts on "you have unstaged changes".
-        run(Command::new("git")
+    // Refuse to clobber a non-empty dir that we did not create, unless --force.
+    // `.git` covers a directory left over from the previous git-clone-based installer.
+    let managed = dir.join("server.js").exists() || dir.join(".git").is_dir();
+    let non_empty = dir
+        .read_dir()
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if non_empty && !managed && !force {
+        bail!(
+            "{} exists and is not empty — pass --force to overwrite",
+            dir.display()
+        );
+    }
+
+    let (archive_url, sums_url, archive_name) = claw_ui_urls(tag);
+    // Release download base — the dir cosign appends `<archive>.bundle` to.
+    let base_url = format!("{CLAW_UI_REPO}/releases/download/{tag}");
+
+    // `tempfile` is a dev-dependency only, so we manage + clean up our own
+    // scratch dir rather than `tempfile::tempdir()`. Run the fallible fetch +
+    // verify + extract steps in a closure so cleanup runs on every exit path.
+    let work = make_ui_work_dir()?;
+    let result = (|| -> Result<()> {
+        let archive_path = work.join(&archive_name);
+        let sums_path = work.join("SHA256SUMS");
+
+        println!("⤓ Downloading {archive_name} ({tag}) …");
+        artifact::download_to(&archive_url, &archive_path)?;
+        artifact::download_to(&sums_url, &sums_path)?;
+
+        artifact::verify_sha256(&archive_path, &sums_path, &archive_name)?;
+        println!("✓ SHA256 verified");
+
+        // Fail closed on a missing bundle: claw-ui is signed from its first release,
+        // so an absent bundle means tampering (signature-stripping downgrade), not
+        // a legacy pre-cosign tag. Only "cosign not installed locally" degrades.
+        match artifact::verify_cosign(
+            &base_url,
+            &archive_path,
+            &archive_name,
+            &work,
+            CLAW_UI_COSIGN_IDENTITY,
+        )? {
+            CosignOutcome::Verified => println!("✓ cosign signature verified"),
+            CosignOutcome::CosignNotInstalled => {} // helper already warned
+            CosignOutcome::BundleMissing => bail!(
+                "no cosign signature published for {tag} — refusing to install an \
+                 unsigned console artifact (possible tampering)"
+            ),
+        }
+
+        // Verified: safe to extract. Wipe any prior layout (managed dir).
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).with_context(|| format!("clear {}", dir.display()))?;
+        }
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let status = Command::new("tar")
+            .arg("xzf")
+            .arg(&archive_path)
             .arg("-C")
             .arg(&dir)
-            .args(["checkout", "--", "."]))?;
-        // `-c pull.rebase=false` neutralizes a user's global `pull.rebase=true`,
-        // which would otherwise turn `--ff-only` into a rebase that refuses to
-        // run with a dirty tree.
-        run(Command::new("git").arg("-C").arg(&dir).args([
-            "-c",
-            "pull.rebase=false",
-            "pull",
-            "--ff-only",
-        ]))?;
-    } else {
-        let non_empty = dir
-            .read_dir()
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-        if non_empty {
-            if !force {
-                bail!(
-                    "{} exists and is not empty — pass --force to overwrite",
-                    dir.display()
-                );
-            }
-            std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("failed to clear {}", dir.display()))?;
+            .status()
+            .context("extract console archive")?;
+        if !status.success() {
+            bail!("tar extraction failed ({status})");
         }
-        if let Some(parent) = dir.parent() {
-            std::fs::create_dir_all(parent).ok();
+        if !dir.join("server.js").exists() {
+            bail!("extracted archive has no server.js — unexpected artifact layout");
         }
-        println!("⤓ Cloning {REPO_URL} → {}", dir.display());
-        let mut c = Command::new("git");
-        c.arg("clone").arg("--depth").arg("1");
-        if let Some(r) = &git_ref {
-            c.arg("--branch").arg(r);
-        }
-        c.arg(REPO_URL).arg(&dir);
-        run(&mut c)?;
-    }
-
-    println!(
-        "⤓ Installing dependencies with `{}` (this may take a minute) …",
-        runtime.name()
-    );
-    run(Command::new(runtime.cmd()).arg("install").current_dir(&dir))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    result?;
 
     println!("\n✅ Web console installed at {}", dir.display());
     println!("   Start it with:  rantaiclaw ui start");
     Ok(())
 }
 
+/// Environment for the standalone console process. `HOSTNAME=127.0.0.1` pins
+/// the Next.js standalone server to loopback — it binds `0.0.0.0` otherwise,
+/// which would be an exposure-boundary regression.
+fn console_env(port: u16, gateway: &str, token: &str, ui_secret: &str) -> BTreeMap<String, String> {
+    let mut e = BTreeMap::new();
+    e.insert("PORT".into(), port.to_string());
+    e.insert("HOSTNAME".into(), "127.0.0.1".into());
+    e.insert("RANTAICLAW_GATEWAY_URL".into(), gateway.to_string());
+    e.insert("RANTAICLAW_TOKEN".into(), token.to_string());
+    e.insert("RANTAICLAW_UI_SECRET".into(), ui_secret.to_string());
+    e
+}
+
 /// Bring up the console: ensure the gateway is running (auto-start + auto-pair if needed) and
-/// launch the Next.js dev server — both in the background. Tear down with `rantaiclaw ui stop`.
+/// launch the standalone `node server.js` console process — both in the background. Tear down
+/// with `rantaiclaw ui stop`.
 fn start(
     dir: Option<PathBuf>,
     port: Option<u16>,
@@ -630,13 +612,17 @@ fn start(
     config: &crate::config::Config,
 ) -> Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
-    if !dir.join("package.json").exists() {
+    if !dir.join("server.js").exists() {
         bail!(
             "web console not installed at {} — run `rantaiclaw ui install` first",
             dir.display()
         );
     }
-    let runtime = ensure_js_runtime()?;
+    if !has_binary("node") {
+        bail!(
+            "`node` is required to run the web console (Node >= 18.18) — install Node.js and retry"
+        );
+    }
     let port = port.unwrap_or(DEFAULT_PORT);
 
     // Resolve gateway + token without clobbering what's already there: an explicit flag wins,
@@ -788,36 +774,16 @@ fn start(
         }
     }
 
-    // Point the console at the gateway via `.env.local` (gateway URL + resolved token).
-    let env_local = format!(
-        "RANTAICLAW_GATEWAY_URL={gateway}\nRANTAICLAW_TOKEN={token}\nRANTAICLAW_UI_SECRET={ui_secret}\n"
-    );
-    std::fs::write(&env_path, env_local)
-        .with_context(|| format!("failed to write {}/.env.local", dir.display()))?;
-
-    // 2. Launch the Next.js dev server in the background. Invoke Next directly so the port is
-    //    honoured regardless of the package script's hard-coded `-p`.
+    // 4. Launch the standalone console server. Gateway URL/token/secret are passed as
+    //    process env only — never written to disk — and `HOSTNAME=127.0.0.1` pins the
+    //    standalone server to loopback (it binds `0.0.0.0` by default otherwise).
     println!("▶ starting web console …");
     let ui_log = dir.join("ui.log");
-    let mut c = Command::new(runtime.cmd());
-    match &runtime {
-        JsRuntime::Bun(_) => {
-            c.arg("x")
-                .arg("next")
-                .arg("dev")
-                .arg("-p")
-                .arg(port.to_string());
-        }
-        JsRuntime::Npm(_) => {
-            c.arg("exec")
-                .arg("--")
-                .arg("next")
-                .arg("dev")
-                .arg("-p")
-                .arg(port.to_string());
-        }
+    let mut c = Command::new("node");
+    c.arg("server.js").current_dir(&dir);
+    for (k, v) in console_env(port, &gateway, &token, &ui_secret) {
+        c.env(k, v);
     }
-    c.current_dir(&dir);
     let ui_pid = spawn_detached(&mut c, &ui_log)?;
 
     // Record PIDs so `ui stop` can tear everything down.
