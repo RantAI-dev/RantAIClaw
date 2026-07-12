@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`rantaiclaw --help`).
 
-Last verified: **February 20, 2026**.
+Last verified: **July 12, 2026**.
 
 ## Top-Level Commands
 
@@ -28,6 +28,7 @@ Last verified: **February 20, 2026**.
 | `hardware` | Discover and introspect USB hardware |
 | `peripheral` | Configure and flash peripherals |
 | `kb` | Knowledge Base CRUD + maintenance (gated by `--features kb`) |
+| `ui` | Install/run/stop the optional web console (claw-ui) |
 
 ## Command Groups
 
@@ -102,6 +103,25 @@ Single-topic examples:
 - `rantaiclaw service restart`
 - `rantaiclaw service status`
 - `rantaiclaw service uninstall`
+
+### `ui`
+
+- `rantaiclaw ui install [--dir <path>] [--ref <tag>] [--force]`
+- `rantaiclaw ui start [--dir <path>] [--port <n>] [--gateway <url>] [--token <tok>]`
+- `rantaiclaw ui stop [--dir <path>]`
+- `rantaiclaw ui path [--dir <path>]`
+
+Install and run the optional web console ([claw-ui](https://github.com/RantAI-dev/claw-ui)) into `~/.rantaiclaw/ui` (shared across profiles).
+
+`ui install` downloads a **signed prebuilt release artifact** — no `git`, `npm`/`bun`, or on-machine build. `--ref` is now a claw-ui **release tag** (default: the pinned release), validated against `^[A-Za-z0-9._-]+$` before it's interpolated into the download URL. The archive is verified SHA256-then-cosign, in that order, before anything is extracted:
+
+- A SHA256 mismatch always fails.
+- A **missing cosign bundle fails closed** — claw-ui is signed from its first release, so an absent bundle is treated as a possible tampering/downgrade signal, not a legacy pre-cosign tag (unlike the binary self-updater, which tolerates missing signatures on its older, pre-cosign releases).
+- Only "`cosign` not installed on this host" degrades to a warning, with SHA-only verification continuing.
+
+`ui start` requires **Node.js ≥ 18.18** on `PATH` and serves the installed production build directly with `node server.js`, bound to `127.0.0.1` only (`HOSTNAME=127.0.0.1` — the standalone server binds `0.0.0.0` by default, so this is a deliberate exposure-boundary control, not a config knob). It auto-starts/reuses/restarts the gateway as needed and auto-pairs a token when the gateway requires pairing. `--gateway`/`--token` override the resolved values, which otherwise fall back to `$RANTAICLAW_GATEWAY_URL`/`$RANTAICLAW_TOKEN`, then a pre-existing `.env.local` (from an older install), then `[gateway]` config. The gateway URL, bearer token, and cookie-signing secret are passed to the `node` process as environment variables — `ui start` no longer writes them to `.env.local`.
+
+`ui stop` terminates the background gateway/console processes recorded by `ui start`. `ui path` prints the install directory.
 
 ### `cron`
 

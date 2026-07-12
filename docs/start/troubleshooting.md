@@ -2,7 +2,7 @@
 
 This guide focuses on common setup/runtime failures and fast resolution paths.
 
-Last verified: **May 9, 2026**.
+Last verified: **July 12, 2026**.
 
 ## Installation / Bootstrap
 
@@ -247,6 +247,40 @@ Linux logs:
 ```bash
 journalctl --user -u rantaiclaw.service -f
 ```
+
+## Web Console (`ui`)
+
+### `ui start` says node is required
+
+Symptom:
+
+- `ui start` exits with `` `node` is required to run the web console (Node >= 18.18) — install Node.js and retry ``
+
+Why this happens:
+
+- `ui install` downloads a signed prebuilt claw-ui release and `ui start` serves it directly with `node server.js` — there is no on-machine `npm`/`bun` build step anymore, so Node.js itself is the only runtime prerequisite left.
+
+Fix:
+
+- Install Node.js **18.18+** (20 LTS recommended) from <https://nodejs.org/> or your package manager, then re-run:
+
+```bash
+rantaiclaw ui start
+```
+
+### `ui install` refuses to verify the release
+
+Symptom:
+
+- `ui install` exits with a SHA256 mismatch, or `no cosign signature published for <tag> — refusing to install an unsigned console artifact (possible tampering)`
+
+Why this happens:
+
+- `ui install` verifies SHA256 then cosign, in that order, before extracting anything. claw-ui is signed from its first release, so — unlike the binary self-updater, which tolerates missing signatures on releases published before it started signing — a missing cosign bundle fails closed here.
+
+Fix:
+
+- Do not bypass this check. Confirm you're pulling the intended `--ref` (release tag) and that no proxy/mirror is altering the download. If `cosign` itself isn't installed locally, `ui install` only warns and continues with SHA-only verification — install cosign (<https://docs.sigstore.dev/system_config/installation/>) for the full guarantee.
 
 ## Legacy Installer Compatibility
 

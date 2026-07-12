@@ -23,14 +23,22 @@ use anyhow::{anyhow, bail, Context, Result};
 use fs2::FileExt;
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::lifecycle::artifact::{self, CosignOutcome};
 use crate::lifecycle::binary_path::{require_self_modifiable, BinaryInfo, InstallKind};
 
 const REPO: &str = "RantAI-dev/RantAIClaw";
+
+/// Expected cosign signing identity for RantAIClaw binary releases — the
+/// project's `pub-release.yml` workflow on a tag ref. Passed to the shared
+/// `lifecycle::artifact::verify_cosign` so this module doesn't hard-code it
+/// inside the shared verifier (the `ui` console installer pins its own
+/// claw-ui identity instead).
+const RANTAICLAW_COSIGN_IDENTITY: &str =
+    r"^https://github\.com/RantAI-dev/RantAIClaw/\.github/workflows/pub-release\.yml@.*$";
 
 /// First-launch verification timeout. The freshly-installed binary
 /// must respond to `update verify` and exit 0 within this window or
@@ -194,11 +202,11 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
 
     let result = (|| -> Result<()> {
         println!("⤓ {archive_url}");
-        download_to(&archive_url, &archive_path)?;
+        artifact::download_to(&archive_url, &archive_path)?;
         println!("⤓ {sums_url}");
-        download_to(&sums_url, &sums_path)?;
+        artifact::download_to(&sums_url, &sums_path)?;
 
-        verify_sha256(&archive_path, &sums_path, &archive_name)?;
+        artifact::verify_sha256(&archive_path, &sums_path, &archive_name)?;
         println!("✓ SHA256 verified");
 
         // Cosign signature check on top of the SHA. The pub-release
@@ -216,7 +224,13 @@ pub fn run(opts: UpdateOpts) -> Result<()> {
         // wider distros (it's already in homebrew, apt, AUR) this
         // becomes a hard requirement in a future cut.
         let bundle_url = format!("{base_url}/{archive_name}.bundle");
-        match verify_cosign_signature(&base_url, &archive_path, &archive_name, &work_dir)? {
+        match artifact::verify_cosign(
+            &base_url,
+            &archive_path,
+            &archive_name,
+            &work_dir,
+            RANTAICLAW_COSIGN_IDENTITY,
+        )? {
             CosignOutcome::Verified => println!("✓ cosign signature verified ({bundle_url})"),
             CosignOutcome::CosignNotInstalled => {
                 // Already printed the "cosign not found on PATH" warning
@@ -538,74 +552,6 @@ fn resolve_latest_tag(channel: Channel) -> Result<String> {
     Ok(tag)
 }
 
-fn download_to(url: &str, dest: &Path) -> Result<()> {
-    let client = Client::builder()
-        .user_agent(format!("rantaiclaw-update/{}", current_version()))
-        .build()?;
-    let mut resp = client
-        .get(url)
-        .send()
-        .with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        bail!("download {url} returned {}", resp.status());
-    }
-    let mut f = fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = resp.read(&mut buf).context("read response body")?;
-        if n == 0 {
-            break;
-        }
-        f.write_all(&buf[..n])
-            .with_context(|| format!("write {}", dest.display()))?;
-    }
-    Ok(())
-}
-
-fn verify_sha256(archive: &Path, sums_file: &Path, archive_name: &str) -> Result<()> {
-    let expected = read_sha_for_file(sums_file, archive_name)?;
-    let actual = compute_sha256(archive)?;
-    if !expected.eq_ignore_ascii_case(&actual) {
-        bail!("SHA256 mismatch for {archive_name}\n  expected: {expected}\n  actual:   {actual}");
-    }
-    Ok(())
-}
-
-fn read_sha_for_file(sums_file: &Path, archive_name: &str) -> Result<String> {
-    let content =
-        fs::read_to_string(sums_file).with_context(|| format!("read {}", sums_file.display()))?;
-    for line in content.lines() {
-        // Format: "<hex>  <filename>" (two spaces) or "<hex> *<filename>" or
-        // "<hex>  ./<filename>". Be liberal in parsing.
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut it = line.splitn(2, char::is_whitespace);
-        let Some(hash) = it.next() else { continue };
-        let Some(rest) = it.next() else { continue };
-        let name = rest.trim().trim_start_matches('*').trim_start_matches("./");
-        if name == archive_name {
-            return Ok(hash.to_string());
-        }
-    }
-    bail!("{archive_name} not listed in SHA256SUMS")
-}
-
-fn compute_sha256(path: &Path) -> Result<String> {
-    let mut f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
 /// Extract the `rantaiclaw` binary from the downloaded archive into a temp
 /// dir and return the resulting path. Uses the system `tar` (or `tar.exe`)
 /// to avoid adding a tar/zip dep.
@@ -859,111 +805,6 @@ fn verify_installed_binary(installed: &Path, expected_version: &str) -> Result<(
 pub fn run_verify() -> Result<()> {
     println!("{}", current_version());
     Ok(())
-}
-
-/// Cosign keyless-OIDC signature verification on the release archive.
-///
-/// Returns:
-/// * `Ok(true)`  — bundle found and signature verified
-/// * `Ok(false)` — bundle file 404, `cosign` not on PATH, or another
-///                 graceful-degradation condition; SHA-only continues
-/// * `Err(_)`    — bundle found but the verification itself failed
-///                 (signature mismatch, wrong identity, wrong issuer)
-///
-/// The expected signing identity is the project's `pub-release.yml`
-/// workflow on a tag ref. The OIDC issuer is GitHub Actions. Both
-/// are pinned via regex/literal so a signature from any other workflow
-/// or any other repo is rejected.
-/// Tri-state outcome from `verify_cosign_signature` so the caller can
-/// emit the right user-facing message. Distinguishes "no cosign on this
-/// host" (user-fixable: install cosign) from "no bundle published for
-/// this release" (release-side: historic pre-cosign tag).
-enum CosignOutcome {
-    Verified,
-    CosignNotInstalled,
-    BundleMissing,
-}
-
-fn verify_cosign_signature(
-    base_url: &str,
-    archive_path: &Path,
-    archive_name: &str,
-    work_dir: &Path,
-) -> Result<CosignOutcome> {
-    use std::process::Command;
-
-    // Bail-friendly local-prereq check. `which cosign` style.
-    let cosign_present = Command::new("cosign")
-        .arg("version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !cosign_present {
-        eprintln!("⚠ `cosign` not found on PATH — skipping signature verify.");
-        eprintln!("  Install: https://docs.sigstore.dev/system_config/installation/");
-        return Ok(CosignOutcome::CosignNotInstalled);
-    }
-
-    let bundle_url = format!("{base_url}/{archive_name}.bundle");
-    let bundle_path = work_dir.join(format!("{archive_name}.bundle"));
-
-    // Try to fetch the bundle. A 404 is the "no bundle for this
-    // release" path — historic releases predating the cosign step
-    // won't have one, and we don't want to break update for them.
-    let client = Client::builder()
-        .user_agent("rantaiclaw-update")
-        .build()
-        .context("build http client")?;
-    let resp = client
-        .get(&bundle_url)
-        .send()
-        .context("fetch cosign bundle")?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(CosignOutcome::BundleMissing);
-    }
-    if !resp.status().is_success() {
-        bail!("fetch {bundle_url} returned HTTP {}", resp.status());
-    }
-    let bytes = resp.bytes().context("read cosign bundle body")?;
-    fs::write(&bundle_path, &bytes)
-        .with_context(|| format!("write cosign bundle to {}", bundle_path.display()))?;
-
-    // Pin both the workflow identity and the OIDC issuer. Anything
-    // signed by a different workflow or a non-GitHub-Actions issuer
-    // is rejected. The regex matches any tag-ref on the project's
-    // pub-release workflow.
-    let identity_regex =
-        r"^https://github\.com/RantAI-dev/RantAIClaw/\.github/workflows/pub-release\.yml@.*$";
-    let issuer = "https://token.actions.githubusercontent.com";
-
-    let output = Command::new("cosign")
-        .args([
-            "verify-blob",
-            "--bundle",
-            bundle_path.to_str().unwrap_or_default(),
-            "--certificate-identity-regexp",
-            identity_regex,
-            "--certificate-oidc-issuer",
-            issuer,
-            archive_path.to_str().unwrap_or_default(),
-        ])
-        .output()
-        .context("invoke cosign verify-blob")?;
-
-    if !output.status.success() {
-        bail!(
-            "cosign verify-blob rejected the archive (exit {}): {}",
-            output
-                .status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "?".into()),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(CosignOutcome::Verified)
 }
 
 /// Apply a previously staged Windows update before doing anything else.
@@ -1282,29 +1123,6 @@ mod tests {
     }
 
     #[test]
-    fn read_sha_for_file_handles_multiple_formats() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("SHA256SUMS");
-        fs::write(
-            &p,
-            "abc123  rantaiclaw-x86_64-unknown-linux-gnu.tar.gz\n\
-             def456  ./rantaiclaw.spdx.json\n\
-             feed00 *some-other.zip\n",
-        )
-        .unwrap();
-        assert_eq!(
-            read_sha_for_file(&p, "rantaiclaw-x86_64-unknown-linux-gnu.tar.gz").unwrap(),
-            "abc123"
-        );
-        assert_eq!(
-            read_sha_for_file(&p, "rantaiclaw.spdx.json").unwrap(),
-            "def456"
-        );
-        assert_eq!(read_sha_for_file(&p, "some-other.zip").unwrap(), "feed00");
-        assert!(read_sha_for_file(&p, "missing.tar.gz").is_err());
-    }
-
-    #[test]
     fn normalize_tag_handles_both_forms() {
         assert_eq!(normalize_tag("v0.6.2-alpha"), "v0.6.2-alpha");
         assert_eq!(normalize_tag("0.6.2-alpha"), "v0.6.2-alpha");
@@ -1316,30 +1134,24 @@ mod tests {
         assert_eq!(strip_v_prefix("0.6.2-alpha"), "0.6.2-alpha");
     }
 
-    // ── Integrity gate: checksum verification ──────────────────────────────
-
-    #[test]
-    fn compute_sha256_matches_known_digest() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("blob");
-        fs::write(&p, b"abc").unwrap();
-        // Well-known SHA-256 test vector for the bytes "abc".
-        assert_eq!(
-            compute_sha256(&p).unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
+    // ── Integrity gate: checksum verification ───────────────────────────────
+    // `compute_sha256`/`read_sha_for_file` moved to `lifecycle::artifact`
+    // (Task 1) along with their direct-unit tests; these two stay here as
+    // an integration check that update.rs's call into the shared
+    // `artifact::verify_sha256` still behaves as before.
 
     #[test]
     fn verify_sha256_accepts_the_matching_sum() {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("rantaiclaw.tar.gz");
         fs::write(&archive, b"the release bytes").unwrap();
-        let sum = compute_sha256(&archive).unwrap();
+        // SHA-256 of the literal bytes "the release bytes".
+        let sum = "86c0ea10853cdebc340b41ccd1a151ff282ec570bad37f52fa2321dd34b7479f";
         let sums = dir.path().join("SHA256SUMS");
         fs::write(&sums, format!("{sum}  rantaiclaw.tar.gz\n")).unwrap();
 
-        verify_sha256(&archive, &sums, "rantaiclaw.tar.gz").expect("matching sum must verify");
+        artifact::verify_sha256(&archive, &sums, "rantaiclaw.tar.gz")
+            .expect("matching sum must verify");
     }
 
     #[test]
@@ -1355,7 +1167,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = verify_sha256(&archive, &sums, "rantaiclaw.tar.gz").unwrap_err();
+        let err = artifact::verify_sha256(&archive, &sums, "rantaiclaw.tar.gz").unwrap_err();
         assert!(
             err.to_string().contains("SHA256 mismatch"),
             "expected a mismatch error, got: {err}"

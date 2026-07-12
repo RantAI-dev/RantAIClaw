@@ -148,19 +148,19 @@ enum ServiceCommands {
 
 #[derive(Subcommand, Debug)]
 enum UiCommands {
-    /// Install (or update) the web console into ~/.rantaiclaw/ui
+    /// Install the web console into ~/.rantaiclaw/ui from a signed prebuilt release
     Install {
         /// Install directory (default: ~/.rantaiclaw/ui)
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
-        /// Git ref (tag or branch) to check out
+        /// claw-ui release tag to install (default: the pinned release)
         #[arg(long)]
         r#ref: Option<String>,
         /// Overwrite a non-empty target directory
         #[arg(long)]
         force: bool,
     },
-    /// Start the web console (Next.js dev server, foreground)
+    /// Start the web console (background, serves the prebuilt production build)
     Start {
         /// Install directory (default: ~/.rantaiclaw/ui)
         #[arg(long)]
@@ -171,7 +171,7 @@ enum UiCommands {
         /// Gateway URL the console proxies to (default: from config [gateway], else the existing .env.local)
         #[arg(long)]
         gateway: Option<String>,
-        /// Bearer token for the gateway. Remembered in .env.local; omit to keep the existing one or $RANTAICLAW_TOKEN
+        /// Bearer token for the gateway, passed to the console process (not persisted to disk); omit to keep the existing one or $RANTAICLAW_TOKEN
         #[arg(long)]
         token: Option<String>,
     },
@@ -1867,7 +1867,17 @@ async fn main() -> Result<()> {
             service::handle_command(&service_command, &config, init_system)
         }
 
-        Some(Commands::Ui { ui_command }) => webui::handle_command(&ui_command, &config),
+        Some(Commands::Ui { ui_command }) => {
+            // `webui::handle_command` now uses reqwest::blocking (artifact
+            // download during `ui install`), which builds its own Tokio
+            // runtime; calling it directly inside `#[tokio::main]` panics with
+            // "Cannot drop a runtime in a context where blocking is not
+            // allowed". Run it on a blocking thread, mirroring `update` above.
+            let config = config.clone();
+            tokio::task::spawn_blocking(move || webui::handle_command(&ui_command, &config))
+                .await
+                .map_err(|e| anyhow::anyhow!("ui command panicked: {e}"))?
+        }
 
         Some(Commands::Doctor {
             format,
