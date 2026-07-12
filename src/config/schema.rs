@@ -157,6 +157,10 @@ pub struct Config {
     #[serde(default)]
     pub gateway: GatewayConfig,
 
+    /// Web console (`[ui]`) settings: the `rantaiclaw ui start` bind address.
+    #[serde(default)]
+    pub ui: UiConfig,
+
     /// Composio managed OAuth tools integration (`[composio]`).
     #[serde(default)]
     pub composio: ComposioConfig,
@@ -934,6 +938,31 @@ fn default_gateway_port() -> u16 {
 }
 
 fn default_gateway_host() -> String {
+    "127.0.0.1".into()
+}
+
+/// Web console (`[ui]`) configuration.
+///
+/// The console served by `rantaiclaw ui start` binds `host` (default
+/// `127.0.0.1`, loopback-only). Set `host = "0.0.0.0"` to reach it from other
+/// devices on the LAN — the console is a full agent-control surface, so enable
+/// a login first (`rantaiclaw setup login`) before exposing it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct UiConfig {
+    /// Bind address for `rantaiclaw ui start` (default: `127.0.0.1`).
+    #[serde(default = "default_ui_host")]
+    pub host: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            host: default_ui_host(),
+        }
+    }
+}
+
+fn default_ui_host() -> String {
     "127.0.0.1".into()
 }
 
@@ -3202,6 +3231,7 @@ impl Default for Config {
         let rantaiclaw_dir = home.join(".rantaiclaw");
 
         Self {
+            ui: UiConfig::default(),
             schema_version: default_config_schema_version(),
             workspace_dir: rantaiclaw_dir.join("workspace"),
             config_path: rantaiclaw_dir.join("config.toml"),
@@ -4573,6 +4603,7 @@ default_temperature = 0.7
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            ui: Default::default(),
             schema_version: crate::config::migrations::CURRENT_VERSION,
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
@@ -4803,6 +4834,7 @@ tool_dispatcher = "xml"
 
         let config_path = dir.join("config.toml");
         let config = Config {
+            ui: Default::default(),
             schema_version: crate::config::migrations::CURRENT_VERSION,
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
