@@ -18,7 +18,7 @@ pub use schema::{
     RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
     SkillApiKey, SkillEntryConfig, SkillsConfig, SkillsInstallConfig, SkillsPromptInjectionMode,
     SlackConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode,
-    TasksConfig, TelegramConfig, TunnelConfig, WebSearchConfig, WebhookConfig,
+    TasksConfig, TelegramConfig, TunnelConfig, UiConfig, WebSearchConfig, WebhookConfig,
 };
 
 #[cfg(test)]

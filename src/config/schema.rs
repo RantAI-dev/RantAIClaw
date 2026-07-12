@@ -4603,7 +4603,7 @@ default_temperature = 0.7
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
-            ui: Default::default(),
+            ui: UiConfig::default(),
             schema_version: crate::config::migrations::CURRENT_VERSION,
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
@@ -4834,7 +4834,7 @@ tool_dispatcher = "xml"
 
         let config_path = dir.join("config.toml");
         let config = Config {
-            ui: Default::default(),
+            ui: UiConfig::default(),
             schema_version: crate::config::migrations::CURRENT_VERSION,
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
