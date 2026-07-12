@@ -63,6 +63,14 @@ pub fn run(opts: UninstallOpts) -> Result<()> {
         try_uninstall_daemon();
     }
 
+    // The web console (`ui start`) is tracked in ~/.rantaiclaw/ui/.run, not by
+    // the daemon sentinel, so the stop above misses it. When --all/--purge wipes
+    // the whole tree, its .run goes with it — stop the console first, else it's
+    // orphaned (keeps holding the port, untrackable by `ui stop`).
+    if opts.all || opts.purge {
+        stop_ui_console();
+    }
+
     // 2. Remove profile data.
     for path in &scope.dirs_to_remove {
         if path.exists() {
@@ -102,6 +110,33 @@ pub fn run(opts: UninstallOpts) -> Result<()> {
 
     print_summary(&scope, &opts, &info);
     Ok(())
+}
+
+/// Stop the web console started by `ui start`, tracked in `~/.rantaiclaw/ui/.run`
+/// (a separate mechanism from the daemon sentinel). Called before a full-tree
+/// wipe so removing that `.run` file doesn't orphan the still-running process.
+fn stop_ui_console() {
+    let run_file = paths::rantaiclaw_root().join("ui").join(".run");
+    let Ok(state) = fs::read_to_string(&run_file) else {
+        return;
+    };
+    for (name, pid) in parse_run_pids(&state) {
+        if crate::lifecycle::process::stop_process_graceful(pid) {
+            println!("  stopped web console {name} (pid {pid})");
+        }
+    }
+}
+
+/// Parse a console `.run` file (`name=pid` per line) into `(name, pid)` pairs,
+/// skipping malformed lines.
+fn parse_run_pids(state: &str) -> Vec<(&str, u32)> {
+    state
+        .lines()
+        .filter_map(|line| {
+            let (name, pid) = line.split_once('=')?;
+            Some((name.trim(), pid.trim().parse::<u32>().ok()?))
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -584,6 +619,22 @@ mod tests {
             yes: true,
             dry_run: false,
         }
+    }
+
+    #[test]
+    fn parse_run_pids_extracts_named_pids_and_skips_malformed() {
+        let pids = parse_run_pids("gateway=1234\nui=5678\ngarbage\nempty=\nui = 42\n");
+        assert_eq!(pids, vec![("gateway", 1234), ("ui", 5678), ("ui", 42)]);
+    }
+
+    #[test]
+    fn stop_ui_console_is_a_noop_when_no_run_file_exists() {
+        // No ~/.rantaiclaw/ui/.run under the temp HOME → must return quietly,
+        // never panic. (The actual PID-stopping path composes the unit-tested
+        // parse_run_pids with lifecycle::process::stop_process_graceful.)
+        with_home(|| {
+            stop_ui_console();
+        });
     }
 
     #[test]
