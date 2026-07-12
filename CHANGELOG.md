@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.13-alpha] — 2026-07-12
+
+### Added
+
+- **Configurable web-console bind address (`[ui] host` / `ui start --host`).**
+  The console binds `127.0.0.1` (loopback) by default; set `[ui] host = "0.0.0.0"`
+  (or a specific IP), or pass `ui start --host <addr>`, to reach it from other
+  devices on your LAN. `ui start` output adapts: a loopback bind prints the
+  `ssh -L` port-forward hint; a network bind prints the reachable LAN URL plus a
+  login-state note (🔒 when a console login is set, ⚠ otherwise — enable one with
+  `rantaiclaw setup login`). The console is a full agent-control surface, so the
+  default stays loopback and LAN exposure is an explicit operator opt-in.
+
+### Fixed
+
+- **`rantaiclaw ui install` no longer orphans a running console.** It now stops
+  the running console (via its `.run` PID file) before wiping the install dir, so
+  reinstalling (e.g. after `update`) no longer leaves an untrackable process
+  holding the port.
+
 ## [0.7.12-alpha] — 2026-07-12
 
 ### Added
