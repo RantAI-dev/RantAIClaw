@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.14-alpha] — 2026-07-12
+
+### Fixed
+
+- **Web-console login over a LAN IP no longer gets stuck.** The console now
+  ships claw-ui **v0.3.1**, which marks the `rc_session` cookie `Secure` based
+  on the request's real protocol instead of unconditionally (the prebuilt
+  release always runs `NODE_ENV=production`). Browsers no longer drop the
+  session cookie over plain `http://` at a LAN IP, so login persists and reaches
+  the chat page. `ui install` pins v0.3.1 by default.
+- **`rantaiclaw uninstall --all` / `--purge` no longer orphans the web console.**
+  Uninstall stopped the daemon but not the `ui start` console, which is tracked
+  separately in `~/.rantaiclaw/ui/.run` — so the full-tree wipe removed that file
+  out from under a still-running process, leaving it holding the port and
+  untrackable by `ui stop`. Uninstall now stops the console before the wipe.
+
 ## [0.7.13-alpha] — 2026-07-12
 
 ### Added
