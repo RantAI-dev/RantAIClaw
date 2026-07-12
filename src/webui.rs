@@ -262,6 +262,20 @@ mod tests {
     }
 
     #[test]
+    fn ssh_forward_hint_builds_command_in_ssh_session() {
+        let hint = ssh_forward_hint(Some("192.168.18.104 64231 192.168.18.170 22"), "bob", 3939)
+            .expect("SSH session should produce a hint");
+        assert!(hint.contains("ssh -L 3939:127.0.0.1:3939 bob@192.168.18.170"));
+        assert!(hint.contains("http://127.0.0.1:3939"));
+    }
+
+    #[test]
+    fn ssh_forward_hint_absent_without_ssh_or_when_malformed() {
+        assert!(ssh_forward_hint(None, "bob", 3939).is_none());
+        assert!(ssh_forward_hint(Some("a b"), "bob", 3939).is_none());
+    }
+
+    #[test]
     fn claw_ui_urls_builds_release_asset_paths() {
         let (archive_url, sums_url, name) = claw_ui_urls("v0.3.0");
         assert_eq!(name, "claw-ui-v0.3.0.tar.gz");
@@ -674,6 +688,7 @@ fn start(
     // Already serving on this port? Don't double-start.
     if port_open("127.0.0.1", port) {
         println!("✓ Web console already running → http://127.0.0.1:{port}");
+        print_ssh_hint(port);
         println!("  Stop it with: rantaiclaw ui stop");
         return Ok(());
     }
@@ -801,9 +816,36 @@ fn start(
     } else {
         println!("▶ Web console starting (first build can take a bit) → http://127.0.0.1:{port}");
     }
+    print_ssh_hint(port);
     println!("  logs: {} · {}", ui_log.display(), gw_log.display());
     println!("  stop: rantaiclaw ui stop");
     Ok(())
+}
+
+/// When running over SSH, the loopback-only console isn't reachable from the
+/// operator's own machine directly. Build a ready-to-copy `ssh -L` port-forward
+/// command from `SSH_CONNECTION` (`<client_ip> <client_port> <server_ip>
+/// <server_port>`) — field 3 is the exact address the operator connected to.
+/// Returns `None` when not in an SSH session or the server IP can't be parsed.
+fn ssh_forward_hint(ssh_connection: Option<&str>, user: &str, port: u16) -> Option<String> {
+    let server_ip = ssh_connection?.split_whitespace().nth(2)?;
+    if server_ip.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "ℹ Remote session — reach it from your local machine:\n    \
+         ssh -L {port}:127.0.0.1:{port} {user}@{server_ip}\n  \
+         then open http://127.0.0.1:{port}"
+    ))
+}
+
+/// Print the SSH port-forward hint when running in a remote session.
+fn print_ssh_hint(port: u16) {
+    let ssh_conn = std::env::var("SSH_CONNECTION").ok();
+    let user = std::env::var("USER").unwrap_or_else(|_| "<user>".into());
+    if let Some(hint) = ssh_forward_hint(ssh_conn.as_deref(), &user, port) {
+        println!("{hint}");
+    }
 }
 
 /// Terminate a background process (and its children) started by `ui start`.
