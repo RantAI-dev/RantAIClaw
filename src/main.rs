@@ -174,6 +174,9 @@ enum UiCommands {
         /// Bearer token for the gateway, passed to the console process (not persisted to disk); omit to keep the existing one or $RANTAICLAW_TOKEN
         #[arg(long)]
         token: Option<String>,
+        /// Bind address for the console (default: `[ui] host` in config, else 127.0.0.1 loopback). Use 0.0.0.0 to reach it from your LAN — enable a console login first (`rantaiclaw setup login`)
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Stop the background gateway + console started by `ui start`
     Stop {

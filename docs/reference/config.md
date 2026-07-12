@@ -302,6 +302,14 @@ and `ui start` stops auto-injecting a token so the browser prompts for it.
 Enabling this requires a claw-ui build that ships the login page. When
 `password_hash` is unset, behavior is unchanged (pairing/auto-pair as before).
 
+## `[ui]`
+
+Web console (`rantaiclaw ui start`) settings.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `host` | `127.0.0.1` | bind address for the console — loopback-only by default. Set `0.0.0.0` (or a specific IP) to reach it from your LAN; the console is a full agent-control surface, so enable a login (`[gateway.login]`) first. Override per-run with `ui start --host <addr>`. |
+
 ## `[autonomy]`
 
 | Key | Default | Purpose |

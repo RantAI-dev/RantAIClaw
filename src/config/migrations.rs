@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 12;
+pub const CURRENT_VERSION: u32 = 13;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -197,8 +197,18 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; default-value change only)
     }
 
-    // Future migrations (v13, v14, …) inserted here in order.
-    // if from < 13 { migrate_v13(raw)?; }
+    // v12 → v13: `[ui].host` (String, default "127.0.0.1") was added — the bind
+    // address for the web console served by `rantaiclaw ui start`. Additive
+    // field with a serde default: configs that lack it deserialise fine and gain
+    // the secure default (loopback) on next write, so there is nothing to
+    // transform. Burns a version slot so the schema_drift fingerprint is
+    // accepted with intent (mirrors prior additive-field arms).
+    if from < 13 {
+        // (no transformation; additive default-only field)
+    }
+
+    // Future migrations (v14, v15, …) inserted here in order.
+    // if from < 14 { migrate_v14(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -247,7 +257,7 @@ mod tests {
         let mut raw = parse("schema_version = 10\n[gateway]\nport = 3000\n");
         let changed = migrate(&mut raw).unwrap();
         assert!(changed);
-        assert_eq!(version_of(&raw), Some(12));
+        assert_eq!(version_of(&raw), Some(CURRENT_VERSION.into()));
     }
 
     #[test]
@@ -255,7 +265,7 @@ mod tests {
         let mut raw = parse("schema_version = 11\n[gateway]\nport = 3000\n");
         let changed = migrate(&mut raw).unwrap();
         assert!(changed, "stamps the new version");
-        assert_eq!(version_of(&raw), Some(12));
+        assert_eq!(version_of(&raw), Some(CURRENT_VERSION.into()));
         // an explicit port is preserved (not rewritten to the new default)
         assert_eq!(
             raw.get("gateway")

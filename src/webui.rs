@@ -298,8 +298,8 @@ mod tests {
     }
 
     #[test]
-    fn console_env_pins_loopback_and_passes_secrets() {
-        let env = console_env(3939, "http://127.0.0.1:4939", "tok", "sec");
+    fn console_env_binds_the_given_host_and_passes_secrets() {
+        let env = console_env(3939, "127.0.0.1", "http://127.0.0.1:4939", "tok", "sec");
         assert_eq!(env.get("HOSTNAME").map(String::as_str), Some("127.0.0.1"));
         assert_eq!(env.get("PORT").map(String::as_str), Some("3939"));
         assert_eq!(
@@ -311,6 +311,34 @@ mod tests {
             env.get("RANTAICLAW_UI_SECRET").map(String::as_str),
             Some("sec")
         );
+    }
+
+    #[test]
+    fn console_env_binds_lan_host_when_requested() {
+        let env = console_env(3939, "0.0.0.0", "http://127.0.0.1:4939", "tok", "sec");
+        assert_eq!(env.get("HOSTNAME").map(String::as_str), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn console_url_reflects_the_bind_host() {
+        // loopback and a specific address are shown verbatim.
+        assert_eq!(console_url("127.0.0.1", 3939), "http://127.0.0.1:3939");
+        assert_eq!(
+            console_url("192.168.18.170", 3939),
+            "http://192.168.18.170:3939"
+        );
+    }
+
+    #[test]
+    fn access_note_is_loopback_vs_network_aware() {
+        // Loopback → treated as loopback (SSH-hint path), never the login note.
+        assert!(matches!("127.0.0.1", "127.0.0.1" | "localhost" | "::1"));
+        // A LAN address is NOT loopback → the login-state note applies.
+        assert!(!matches!("0.0.0.0", "127.0.0.1" | "localhost" | "::1"));
+        assert!(!matches!(
+            "192.168.18.170",
+            "127.0.0.1" | "localhost" | "::1"
+        ));
     }
 }
 
@@ -503,7 +531,15 @@ pub fn handle_command(command: &crate::UiCommands, config: &crate::config::Confi
             port,
             gateway,
             token,
-        } => start(dir.clone(), *port, gateway.clone(), token.clone(), config),
+            host,
+        } => start(
+            dir.clone(),
+            *port,
+            gateway.clone(),
+            token.clone(),
+            host.clone(),
+            config,
+        ),
         crate::UiCommands::Stop { dir } => stop(dir.clone()),
         crate::UiCommands::Path { dir } => {
             println!("{}", dir.clone().unwrap_or_else(default_dir).display());
@@ -574,6 +610,16 @@ fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result
             ),
         }
 
+        // A previous console may still be running against this dir. Stop it
+        // before wiping — `remove_dir_all` would otherwise delete its `.run`
+        // and orphan the process (it keeps holding the port, untrackable by
+        // `ui stop`). Only reached after the new artifact is verified, so a
+        // failed download never tears down a working console.
+        if dir.join(".run").exists() {
+            println!("↻ Stopping the running console before reinstalling …");
+            let _ = stop(Some(dir.clone()));
+        }
+
         // Verified: safe to extract. Wipe any prior layout (managed dir).
         if dir.exists() {
             std::fs::remove_dir_all(&dir).with_context(|| format!("clear {}", dir.display()))?;
@@ -602,13 +648,20 @@ fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result
     Ok(())
 }
 
-/// Environment for the standalone console process. `HOSTNAME=127.0.0.1` pins
-/// the Next.js standalone server to loopback — it binds `0.0.0.0` otherwise,
-/// which would be an exposure-boundary regression.
-fn console_env(port: u16, gateway: &str, token: &str, ui_secret: &str) -> BTreeMap<String, String> {
+/// Environment for the standalone console process. `HOSTNAME` sets the bind
+/// address: `127.0.0.1` (the default) keeps the Next.js standalone server
+/// loopback-only; a `[ui] host` / `--host` of `0.0.0.0` (or a specific address)
+/// exposes it on that interface — an operator opt-in, not the default.
+fn console_env(
+    port: u16,
+    host: &str,
+    gateway: &str,
+    token: &str,
+    ui_secret: &str,
+) -> BTreeMap<String, String> {
     let mut e = BTreeMap::new();
     e.insert("PORT".into(), port.to_string());
-    e.insert("HOSTNAME".into(), "127.0.0.1".into());
+    e.insert("HOSTNAME".into(), host.to_string());
     e.insert("RANTAICLAW_GATEWAY_URL".into(), gateway.to_string());
     e.insert("RANTAICLAW_TOKEN".into(), token.to_string());
     e.insert("RANTAICLAW_UI_SECRET".into(), ui_secret.to_string());
@@ -623,6 +676,7 @@ fn start(
     port: Option<u16>,
     gateway: Option<String>,
     token: Option<String>,
+    host: Option<String>,
     config: &crate::config::Config,
 ) -> Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
@@ -638,6 +692,12 @@ fn start(
         );
     }
     let port = port.unwrap_or(DEFAULT_PORT);
+    // Bind address: `--host` flag > `[ui] host` config > 127.0.0.1 (loopback).
+    let host = host
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| config.ui.host.clone());
+    // Console login is gated by the presence of a stored password hash.
+    let login_on = config.gateway.login.password_hash.is_some();
 
     // Resolve gateway + token without clobbering what's already there: an explicit flag wins,
     // then the environment, then whatever is already in `.env.local` (so a paired token survives
@@ -686,9 +746,12 @@ fn start(
         .unwrap_or_else(|| hex::encode(rand::random::<[u8; 32]>()));
 
     // Already serving on this port? Don't double-start.
-    if port_open("127.0.0.1", port) {
-        println!("✓ Web console already running → http://127.0.0.1:{port}");
-        print_ssh_hint(port);
+    if port_open(connect_host(&host), port) {
+        println!(
+            "✓ Web console already running → {}",
+            console_url(&host, port)
+        );
+        print_access_note(&host, port, login_on);
         println!("  Stop it with: rantaiclaw ui stop");
         return Ok(());
     }
@@ -796,7 +859,7 @@ fn start(
     let ui_log = dir.join("ui.log");
     let mut c = Command::new("node");
     c.arg("server.js").current_dir(&dir);
-    for (k, v) in console_env(port, &gateway, &token, &ui_secret) {
+    for (k, v) in console_env(port, &host, &gateway, &token, &ui_secret) {
         c.env(k, v);
     }
     let ui_pid = spawn_detached(&mut c, &ui_log)?;
@@ -809,14 +872,20 @@ fn start(
     state.push_str(&format!("ui={ui_pid}\n"));
     std::fs::write(run_file(&dir), state).ok();
 
-    let ready = wait_for_port("127.0.0.1", port, 60);
+    let ready = wait_for_port(connect_host(&host), port, 60);
     println!();
     if ready {
-        println!("✓ Web console → http://127.0.0.1:{port}   (gateway: {gateway})");
+        println!(
+            "✓ Web console → {}   (gateway: {gateway})",
+            console_url(&host, port)
+        );
     } else {
-        println!("▶ Web console starting (first build can take a bit) → http://127.0.0.1:{port}");
+        println!(
+            "▶ Web console starting (first launch can take a bit) → {}",
+            console_url(&host, port)
+        );
     }
-    print_ssh_hint(port);
+    print_access_note(&host, port, login_on);
     println!("  logs: {} · {}", ui_log.display(), gw_log.display());
     println!("  stop: rantaiclaw ui stop");
     Ok(())
@@ -845,6 +914,53 @@ fn print_ssh_hint(port: u16) {
     let user = std::env::var("USER").unwrap_or_else(|_| "<user>".into());
     if let Some(hint) = ssh_forward_hint(ssh_conn.as_deref(), &user, port) {
         println!("{hint}");
+    }
+}
+
+/// Reachable URL to show for a bind `host`: loopback → `127.0.0.1`;
+/// `0.0.0.0`/`::` → the machine's LAN IP; a specific address → itself.
+fn console_url(host: &str, port: u16) -> String {
+    let ip = if host == "0.0.0.0" || host == "::" || host.is_empty() {
+        lan_ip().unwrap_or_else(|| "127.0.0.1".into())
+    } else {
+        host.to_string()
+    };
+    format!("http://{ip}:{port}")
+}
+
+/// The machine's primary non-loopback IPv4, for display when the console binds
+/// `0.0.0.0`. Prefers the address the operator connected on (`SSH_CONNECTION`
+/// field 3), falling back to `hostname -I`'s first token.
+fn lan_ip() -> Option<String> {
+    if let Some(ip) = std::env::var("SSH_CONNECTION")
+        .ok()
+        .as_deref()
+        .and_then(|c| c.split_whitespace().nth(2).map(str::to_string))
+        .filter(|ip| !ip.is_empty())
+    {
+        return Some(ip);
+    }
+    let out = Command::new("hostname").arg("-I").output().ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+/// Post-URL access note. Loopback → the SSH port-forward hint. A
+/// network-reachable bind → the console-login state: 🔒 when a login is set,
+/// ⚠ otherwise (anyone who can reach the address controls the agent).
+fn print_access_note(host: &str, port: u16, login_on: bool) {
+    let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1");
+    if loopback {
+        print_ssh_hint(port);
+    } else if login_on {
+        println!("  🔒 login required — console reachable on your network");
+    } else {
+        println!(
+            "  ⚠ no console login set — anyone who can reach this address controls the agent."
+        );
+        println!("    Enable one with: rantaiclaw setup login");
     }
 }
 
