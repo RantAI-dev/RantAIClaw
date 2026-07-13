@@ -116,10 +116,24 @@ pub async fn exec(id: &str, command: &str, timeout_secs: u64) -> Result<ExecOut>
     let conn = registry::get(id)
         .await
         .ok_or_else(|| anyhow!("no ssh session `{id}` (connect first)"))?;
-    let command = command.to_string();
-    let fut = async move {
-        let mut channel = conn.handle.channel_open_session().await?;
-        channel.exec(true, command.as_bytes()).await?;
+
+    // Open the channel OUTSIDE the timeout so that, on timeout, we still hold it
+    // and can EOF+close it — freeing the channel on both ends — instead of
+    // silently abandoning it. NOTE: OpenSSH commonly ignores signals on non-pty
+    // exec channels, so this reclaims resources but does NOT guarantee the remote
+    // command stops; the `pty`/tmux path is the answer when that's required.
+    let mut channel = match conn.handle.channel_open_session().await {
+        Ok(channel) => channel,
+        Err(e) => {
+            // A failed channel-open means the transport is gone — evict the corpse
+            // so a later exec gets a clean "reconnect" instead of hitting it again.
+            registry::remove(id).await;
+            return Err(anyhow!("ssh session `{id}` is dead ({e}); reconnect"));
+        }
+    };
+    channel.exec(true, command.as_bytes()).await?;
+
+    let collect = async {
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let mut code: Option<u32> = None;
@@ -137,15 +151,23 @@ pub async fn exec(id: &str, command: &str, timeout_secs: u64) -> Result<ExecOut>
                 _ => {}
             }
         }
-        Ok::<ExecOut, anyhow::Error>(ExecOut {
+        ExecOut {
             code: code.map_or(-1, i64::from),
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        })
+        }
     };
-    tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
-        .await
-        .map_err(|_| anyhow!("exec timed out after {timeout_secs}s"))?
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), collect).await {
+        Ok(out) => Ok(out),
+        Err(_) => {
+            let _ = channel.eof().await;
+            let _ = channel.close().await;
+            Err(anyhow!(
+                "exec timed out after {timeout_secs}s (channel closed)"
+            ))
+        }
+    }
 }
 
 /// Upload a local file to the remote host over SFTP.
