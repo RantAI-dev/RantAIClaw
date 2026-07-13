@@ -47,6 +47,14 @@ fn forget_target(session: &str) {
     targets().lock().expect("tmux target lock").remove(session);
 }
 
+/// A unique per-invocation tmux session name. Two concurrent `start`s (two agent
+/// turns / channels) that both omit `session` must NOT collide on a shared
+/// default — `do_start` kills a same-named session first, so a shared default
+/// would let one turn destroy another's running session.
+fn generated_session_name() -> String {
+    format!("nqr-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
+}
+
 // --- pure command builders (unit-tested) ---
 
 fn new_session_argv(session: &str, cols: u32, rows: u32, command: &str) -> Vec<String> {
@@ -189,14 +197,21 @@ impl PtyTool {
                 .unwrap_or(50),
         )
         .unwrap_or(50);
+        // Register the target BEFORE creating the session: if the create await is
+        // cancelled after tmux already spawned the session, this keeps it tracked
+        // so `stop` can still reap it (otherwise it's an untracked orphan). Forget
+        // again if creation fails outright.
+        remember_target(sess, target.clone());
         // best-effort: kill any stale session of the same name first
         let _ = run_tmux(&target, &kill_argv(sess), 15).await;
         match run_tmux(&target, &new_session_argv(sess, cols, rows, command), 30).await {
-            Ok(_) => {
-                remember_target(sess, target);
-                ok(format!("started tmux session `{sess}`"))
+            Ok(_) => ok(format!(
+                "started tmux session `{sess}` — pass session=\"{sess}\" to screen/send/wait/stop"
+            )),
+            Err(e) => {
+                forget_target(sess);
+                fail(format!("{e}"))
             }
-            Err(e) => fail(format!("{e}")),
         }
     }
 
@@ -310,7 +325,7 @@ impl Tool for PtyTool {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["start", "screen", "send", "wait", "stop"] },
-                "session": { "type": "string", "description": "tmux session name (default `nqr`)" },
+                "session": { "type": "string", "description": "tmux session name. Omit on `start` to get a unique auto-generated name (returned in the result); you MUST pass that exact name to screen/send/wait/stop." },
                 "target": { "type": "string", "description": "start only: `local` or an ssh session id" },
                 "command": { "type": "string", "description": "start only: command to run in tmux" },
                 "cols": { "type": "integer", "description": "start only: width (default 200)" },
@@ -342,7 +357,15 @@ impl Tool for PtyTool {
         if action == "start" && !self.security.record_action() {
             return Ok(fail("Action blocked: rate limit exceeded"));
         }
-        let sess = str_field(&args, "session").unwrap_or("nqr").to_string();
+        // On `start` with no explicit session, mint a unique name so concurrent
+        // starts don't collide (and don't kill each other's session). Other
+        // actions keep the `nqr` fallback, but callers should pass the name
+        // returned by `start`.
+        let sess = match str_field(&args, "session") {
+            Some(s) => s.to_string(),
+            None if action == "start" => generated_session_name(),
+            None => "nqr".to_string(),
+        };
         let result = match action {
             "start" => Self::do_start(&args, &sess).await,
             "screen" => Self::do_screen(&sess).await,
@@ -358,6 +381,18 @@ impl Tool for PtyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_session_names_are_unique_and_prefixed() {
+        let a = generated_session_name();
+        let b = generated_session_name();
+        assert!(a.starts_with("nqr-"), "prefixed: {a}");
+        assert!(b.starts_with("nqr-"), "prefixed: {b}");
+        assert_ne!(
+            a, b,
+            "two concurrent starts must not collide on a shared name"
+        );
+    }
 
     #[test]
     fn new_session_builder() {
