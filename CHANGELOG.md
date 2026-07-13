@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.15-alpha] — 2026-07-13
+
+### Fixed
+
+- **Stopping a web-chat turn now actually stops the work.** Cancelling a
+  long-running prompt (e.g. an install) — or hitting the shell timeout — used to
+  leave the underlying subprocesses running, so the agent kept "thinking" about
+  the cancelled prompt and the next turn stalled. The native runtime now runs
+  each shell command as its own process group and reaps the **whole group**
+  (SIGTERM → grace → SIGKILL) on cancel/timeout; docker containers are stopped
+  via signal forwarding; and a pending tool approval is aborted together with
+  the turn (#172, #174, #177).
+- **Chat session persistence is atomic and concurrency-safe.** Turns are written
+  in a single `IMMEDIATE` transaction with a busy-timeout, and a cancelled,
+  errored, or empty turn is no longer half-persisted (#173).
+- **pty / ssh session hygiene.** Unique default pty session names (no cross-turn
+  collision that destroyed another turn's session), no orphaned session on a
+  cancelled `start`, and ssh exec now closes its channel on timeout and evicts
+  dead sessions from the registry (#175, #176).
+- **Shell timeout raised 60s → 10min**, with clearer tool-result reporting
+  (stderr folded in on success, exit code surfaced on failure) and a bounded
+  read to cap output memory (#174).
+
+### Changed
+
+- **Console bumped to claw-ui v0.3.2.** Hardens web-chat cancel/cleanup (no UI
+  wedge, no context bleed, no stuck streaming), adds a mobile off-canvas sidebar
+  and a focus-trapped tool-approval modal, and lands a batch of accessibility +
+  rendering fixes (icon aria-labels, skip link, keyboard-operable session rows,
+  `<think>`/`[object Object]` render guards). `ui install` now pins v0.3.2 by
+  default.
+
 ## [0.7.14-alpha] — 2026-07-12
 
 ### Fixed
