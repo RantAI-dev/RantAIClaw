@@ -104,6 +104,25 @@ struct Inner {
     timeout: Option<Duration>,
 }
 
+/// RAII cleanup for one pending request. Removes its `waiting` + `snapshot`
+/// entries on drop, so a request whose awaiting future is cancelled (dropped
+/// mid-`.await`, e.g. by a caller's `tokio::select!`) never leaks a phantom
+/// entry — which would otherwise break `resolve_by_basename`'s uniqueness
+/// check. Also covers the normal-return path.
+struct Cleanup {
+    inner: Arc<Inner>,
+    id: Uuid,
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        // Two separate lock statements — the guards never overlap, so this
+        // can't deadlock against `resolve`/`resolve_by_basename`.
+        self.inner.waiting.lock().remove(&self.id);
+        self.inner.snapshot.lock().remove(&self.id);
+    }
+}
+
 impl PendingApprovals {
     /// Create a registry with the given decision timeout. `None` waits
     /// indefinitely for an explicit decision.
@@ -151,14 +170,20 @@ impl PendingApprovals {
             self.inner.waiting.lock().insert(id, tx);
             self.inner.snapshot.lock().insert(id, request.clone());
         }
+        // Remove both entries when we leave this scope — on a normal return AND
+        // when the future is dropped by a caller cancelling us mid-wait.
+        let _cleanup = Cleanup {
+            inner: Arc::clone(&self.inner),
+            id,
+        };
         // Ignore send error: no live subscribers is fine.
         let _ = self.inner.notify_tx.send(request);
 
-        let decision = match self.inner.timeout {
+        // `_cleanup` drops after this value is produced, removing both entries.
+        match self.inner.timeout {
             Some(d) => match tokio::time::timeout(d, rx).await {
                 Ok(Ok(decision)) => decision,
-                // Timed out or sender dropped — deny is the safe
-                // default. Cleanup happens below regardless.
+                // Timed out or sender dropped — deny is the safe default.
                 _ => Decision::Deny,
             },
             None => match rx.await {
@@ -166,13 +191,7 @@ impl PendingApprovals {
                 // Oneshot sender dropped (registry shut down) — deny.
                 Err(_) => Decision::Deny,
             },
-        };
-
-        // Always clean up before returning.
-        self.inner.waiting.lock().remove(&id);
-        self.inner.snapshot.lock().remove(&id);
-
-        decision
+        }
     }
 
     /// Resolve a pending request. Returns `true` if a sender was
@@ -252,6 +271,37 @@ mod tests {
             registry.list().is_empty(),
             "registry should clean up after resolve"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_request_future_cleans_up_registry() {
+        // A caller cancelling the approval wait drops the request_decision
+        // future mid-`.await`. The RAII cleanup must remove the pending entry —
+        // otherwise a phantom entry leaks and breaks resolve_by_basename.
+        let registry = PendingApprovals::new(None); // waits forever
+        let r = registry.clone();
+        let task =
+            tokio::spawn(async move { r.request_decision("brew", "brew --version", "tui").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(registry.list().len(), 1, "request should have registered");
+
+        // Drop the awaiting future (models a tokio::select! losing the race).
+        task.abort();
+        let _ = task.await;
+        assert!(
+            registry.list().is_empty(),
+            "cancelled request must be cleaned up, not leaked"
+        );
+
+        // The `waiting` map is clear too: a fresh unique request resolves.
+        let r2 = registry.clone();
+        let t2 =
+            tokio::spawn(async move { r2.request_decision("brew", "brew --version", "tui").await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(registry
+            .resolve_by_basename("brew", Decision::Once)
+            .is_some());
+        assert_eq!(t2.await.unwrap(), Decision::Once);
     }
 
     #[tokio::test]

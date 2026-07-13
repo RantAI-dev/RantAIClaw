@@ -1252,7 +1252,21 @@ pub(crate) async fn execute_tool_calls_collecting(
                         default_backend.as_ref()
                     }
                 };
-                let decision = backend.decide(mgr, &request).await;
+                // Race the approval wait against turn cancellation. Without this
+                // a client disconnect (web Stop) can't interrupt a web-modal
+                // approval, stranding the agent until the backend's deadline
+                // (up to 5 min). Only Some(token) callers (the gateway SSE path)
+                // change behaviour; CLI/webhook pass None and are unaffected.
+                // Dropping the decide() future is cancel-safe — PendingApprovals'
+                // RAII cleanup removes the pending entry.
+                let decision = if let Some(token) = cancellation_token {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        d = backend.decide(mgr, &request) => d,
+                    }
+                } else {
+                    backend.decide(mgr, &request).await
+                };
                 mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
                 if decision == ApprovalResponse::No {
                     if let Some(tx) = events {
@@ -3241,6 +3255,68 @@ mod tests {
         );
         assert!(results[0].success);
         assert_eq!(results[0].output, "did the thing");
+    }
+
+    /// Never resolves — models an approval prompt awaiting a user who never answers.
+    struct BlockingBackend;
+
+    #[async_trait::async_trait]
+    impl crate::approval::ApprovalBackend for BlockingBackend {
+        async fn decide(
+            &self,
+            _mgr: &ApprovalManager,
+            _request: &ApprovalRequest,
+        ) -> ApprovalResponse {
+            std::future::pending::<ApprovalResponse>().await
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_wait_aborts_on_cancellation() {
+        // A gated tool whose approval never resolves must abort promptly when the
+        // turn's cancellation token fires — not hang until the backend deadline.
+        let mgr = supervised_manager();
+        let call = ParsedToolCall {
+            name: "do_thing".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RanFlagTool {
+            ran: Arc::clone(&ran),
+        })];
+        let backend = BlockingBackend;
+        let token = CancellationToken::new();
+
+        // Fire cancellation shortly after the executor parks on the approval wait.
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token2.cancel();
+        });
+
+        let result = execute_tool_calls_collecting(
+            std::slice::from_ref(&call),
+            &tools,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            Some(&backend as &dyn crate::approval::ApprovalBackend),
+            None,
+            false,
+            Some(&token),
+            None,
+        )
+        .await;
+
+        assert!(
+            is_tool_loop_cancelled(&result.expect_err("cancelled turn must return an error")),
+            "cancel must abort the approval wait with ToolLoopCancelled"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "cancelled approval must not run the tool"
+        );
     }
 
     #[tokio::test]
