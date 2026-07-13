@@ -6,9 +6,12 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
-/// Maximum shell command execution time before kill.
-const SHELL_TIMEOUT_SECS: u64 = 60;
+/// Maximum shell command execution time before the process group is killed.
+/// Generous enough for real installs (apt/dpkg, `docker pull`, image builds);
+/// a genuinely hung command still dies at this bound.
+const SHELL_TIMEOUT_SECS: u64 = 600;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
@@ -27,6 +30,80 @@ const BLOCKED_COMMAND_REMEDIATION: &str = "\nBlocked by the active security poli
 An operator can allow the base command via [autonomy].allowed_commands in config.toml, \
 or remove approval prompts entirely with `rantaiclaw autonomy full` \
 (no prompts — use only in trusted/sandboxed environments).";
+
+/// Read an async pipe to EOF, keeping at most `cap` bytes in memory. Bytes past
+/// the cap are still drained (so the child never blocks on a full pipe) but
+/// discarded — a runaway command can't OOM the agent, unlike `Command::output`
+/// which buffers everything before truncation.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    reader: Option<&mut R>,
+    cap: usize,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let Some(reader) = reader else {
+        return buf;
+    };
+    // Heap buffer (not a stack array) so the read future stays small.
+    let mut chunk = vec![0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let take = n.min(cap - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+        }
+    }
+    buf
+}
+
+/// RAII guard that reaps the shell's whole process group on drop — i.e. when the
+/// tool future is dropped by an agent cancel (`tokio::select!`) or by the shell
+/// timeout. SIGTERM immediately, then SIGKILL after a short grace if any group
+/// member is still alive. Disarmed on normal completion so a since-reused pgid is
+/// never signalled. No-op on non-Unix (`pgid` is always `None` there).
+struct ProcGroupKill {
+    pgid: Option<i32>,
+}
+
+impl ProcGroupKill {
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for ProcGroupKill {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            if let Some(pgid) = self.pgid {
+                // SAFETY: `pgid > 1` (checked at construction) and names the
+                // shell's own new group (created via setsid), never rantaiclaw's.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGTERM);
+                }
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        // Escalate only if a member is still alive; skipping on
+                        // ESRCH avoids racing a pgid that has since been reused.
+                        if unsafe { libc::kill(-pgid, 0) } == 0 {
+                            unsafe {
+                                libc::kill(-pgid, libc::SIGKILL);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.pgid;
+        }
+    }
+}
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
@@ -256,40 +333,17 @@ impl Tool for ShellTool {
             cmd.env(k, v);
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
-
-        match result {
-            Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-                // Truncate output to prevent OOM
-                if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
-                    stdout.push_str("\n... [output truncated at 1MB]");
-                }
-                if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
-                    stderr.push_str("\n... [stderr truncated at 1MB]");
-                }
-
-                Ok(ToolResult {
-                    success: output.status.success(),
-                    output: stdout,
-                    error: if stderr.is_empty() {
-                        None
-                    } else {
-                        Some(stderr)
-                    },
-                })
-            }
-            Ok(Err(e)) => {
-                // ENOENT here usually means either `sh` isn't on PATH
-                // (env_clear stripped it and SAFE_ENV_VARS didn't pick it
-                // back up — unusual) or the workspace_dir we chdir'd
-                // into doesn't exist on disk. Pre-flight checks below
-                // give the user a clearer hint than the raw io::Error.
+        // Spawn with piped stdio so we can (a) bound-read the output to cap memory
+        // and (b) reap the whole process group on cancel/timeout. `Command::output`
+        // instead buffers to EOF (OOM risk) and stops only the direct child.
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // ENOENT usually means `sh` isn't on PATH (env_clear stripped it
+                // and SAFE_ENV_VARS didn't restore it) or workspace_dir vanished.
                 let mut hint = format!("Failed to execute command: {e}");
                 if e.kind() == std::io::ErrorKind::NotFound {
                     if !self.security.workspace_dir.exists() {
@@ -305,17 +359,99 @@ impl Tool for ShellTool {
                             .to_string();
                     }
                 }
-                Ok(ToolResult {
+                return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(hint),
-                })
+                });
             }
+        };
+
+        // Arm the process-group killer (native/Unix only). On agent cancel OR
+        // timeout the tool future is dropped, dropping this guard, which reaps the
+        // shell's whole tree — apt/dpkg/ssh/pipeline children that `kill_on_drop`
+        // (direct child only) would otherwise leave running.
+        let pgid = if self.runtime.spawns_process_group() {
+            child
+                .id()
+                .and_then(|id| i32::try_from(id).ok())
+                .filter(|p| *p > 1)
+        } else {
+            None
+        };
+        let mut group_kill = ProcGroupKill { pgid };
+
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let collect = async {
+            let (out_bytes, err_bytes) = tokio::join!(
+                read_capped(stdout_pipe.as_mut(), MAX_OUTPUT_BYTES),
+                read_capped(stderr_pipe.as_mut(), MAX_OUTPUT_BYTES),
+            );
+            let status = child.wait().await;
+            (status, out_bytes, err_bytes)
+        };
+
+        match tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), collect).await {
+            Ok((Ok(status), out_bytes, err_bytes)) => {
+                // Completed on its own — disarm so we never signal a reused pgid.
+                group_kill.disarm();
+                let mut stdout = String::from_utf8_lossy(&out_bytes).to_string();
+                let mut stderr = String::from_utf8_lossy(&err_bytes).to_string();
+                if stdout.len() > MAX_OUTPUT_BYTES {
+                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    stdout.push_str("\n... [output truncated at 1MB]");
+                }
+                if stderr.len() > MAX_OUTPUT_BYTES {
+                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    stderr.push_str("\n... [stderr truncated at 1MB]");
+                }
+                if status.success() {
+                    // Fold stderr into output — apt/docker/git write progress and
+                    // warnings to stderr even on success, and the agent loop
+                    // discards `error` on success, so this is the only surviving
+                    // channel for it.
+                    let output = if stderr.is_empty() {
+                        stdout
+                    } else {
+                        format!("{stdout}\n[stderr]\n{stderr}")
+                    };
+                    Ok(ToolResult {
+                        success: true,
+                        output,
+                        error: None,
+                    })
+                } else {
+                    // Surface the exit code so a silent non-zero exit isn't a bare
+                    // "Error:" with no signal for the model.
+                    let status_desc = match status.code() {
+                        Some(code) => format!("Command exited with status {code}"),
+                        None => "Command terminated by signal".to_string(),
+                    };
+                    let error = if stderr.is_empty() {
+                        status_desc
+                    } else {
+                        format!("{status_desc}: {stderr}")
+                    };
+                    Ok(ToolResult {
+                        success: false,
+                        output: stdout,
+                        error: Some(error),
+                    })
+                }
+            }
+            Ok((Err(e), _, _)) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to wait on command: {e}")),
+            }),
+            // Timeout: `group_kill` (still armed) drops after this match and reaps
+            // the whole group, so the message is now accurate.
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {SHELL_TIMEOUT_SECS}s; the process group was terminated"
                 )),
             }),
         }
@@ -545,7 +681,10 @@ mod tests {
 
     #[test]
     fn shell_timeout_constant_is_reasonable() {
-        assert_eq!(SHELL_TIMEOUT_SECS, 60, "shell timeout must be 60 seconds");
+        assert_eq!(
+            SHELL_TIMEOUT_SECS, 600,
+            "shell timeout must be 600s — long enough for real installs, still bounded"
+        );
     }
 
     #[test]
