@@ -360,16 +360,16 @@ async fn agent_chat_sync(
     }
     let text = agent.turn(&body.message).await.map_err(err_500)?;
     let mut session_id = body.session_id.clone().unwrap_or_default();
-    if let Ok(store) = open_session_store() {
-        match record_api_chat_session(
-            &store,
-            &model,
-            body.session_id.as_deref(),
-            &body.message,
-            &text,
-        ) {
-            Ok(id) => session_id = id,
-            Err(err) => tracing::warn!(error = %err, "api agent chat session persistence failed"),
+    // `agent.turn` already returned Err on failure; skip persisting an empty
+    // answer so a no-op turn doesn't create or append to a session.
+    if !text.trim().is_empty() {
+        if let Ok(mut store) = open_session_store() {
+            match store.record_api_turn(&model, body.session_id.as_deref(), &body.message, &text) {
+                Ok(id) => session_id = id,
+                Err(err) => {
+                    tracing::warn!(error = %err, "api agent chat session persistence failed");
+                }
+            }
         }
     }
     Ok(Json(ChatResponseBody {
@@ -464,6 +464,9 @@ async fn agent_chat_stream(
     let stream = async_stream::stream! {
         let _cancel_on_drop = CancelOnDrop(cancel_for_stream);
         let mut buffered_text = String::new();
+        // Set when the agent emits an Error — a failed turn must not be persisted
+        // (it would store a user message with an empty/partial assistant reply).
+        let mut errored = false;
         while let Some(ev) = events_rx.recv().await {
             let payload = match ev {
                 crate::agent::AgentEvent::Chunk(text) => {
@@ -479,6 +482,7 @@ async fn agent_chat_stream(
                     "cost_usd": usage.cost_usd,
                 }),
                 crate::agent::AgentEvent::Error(message) => {
+                    errored = true;
                     serde_json::json!({"type": "error", "message": message})
                 }
                 crate::agent::AgentEvent::Done { final_text, cancelled } => {
@@ -488,10 +492,12 @@ async fn agent_chat_stream(
                         final_text.clone()
                     };
                     let mut session_id = req_session_id.clone().unwrap_or_default();
-                    if !cancelled {
-                        if let Ok(store) = open_session_store() {
-                            match record_api_chat_session(
-                                &store,
+                    // Persist only a real, completed turn: not cancelled, not
+                    // errored, and with a non-empty answer. Failed/empty turns
+                    // would otherwise pollute history and create titled sessions.
+                    if !cancelled && !errored && !persisted_text.trim().is_empty() {
+                        if let Ok(mut store) = open_session_store() {
+                            match store.record_api_turn(
                                 &model,
                                 req_session_id.as_deref(),
                                 &user_message,
@@ -594,36 +600,6 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
     }
-}
-
-fn record_api_chat_session(
-    store: &crate::sessions::SessionStore,
-    model: &str,
-    session_id: Option<&str>,
-    user_message: &str,
-    assistant_message: &str,
-) -> anyhow::Result<String> {
-    // Continue the supplied session when it exists so a multi-turn conversation
-    // lands in ONE session instead of a fresh session per turn. An absent or
-    // unknown id starts a new session.
-    let (id, is_new) = match session_id {
-        Some(sid) if !sid.is_empty() && store.get_session(sid)?.is_some() => {
-            (sid.to_string(), false)
-        }
-        _ => (store.new_session(model, "api")?.id, true),
-    };
-    store.append_message(&crate::sessions::Message::user(&id, user_message))?;
-    store.append_message(&crate::sessions::Message::assistant(&id, assistant_message))?;
-    // Title only the first turn — derived from the user's own text (decorations
-    // are appended after it, so the first line stays the real question).
-    if is_new {
-        let title = crate::sessions::derive_session_title(user_message);
-        if !title.is_empty() {
-            store.set_title(&id, &title)?;
-        }
-    }
-    store.end_session(&id)?;
-    Ok(id)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1312,16 +1288,16 @@ mod tests {
 
     #[test]
     fn record_api_chat_session_persists_user_and_assistant_messages() {
-        let store = crate::sessions::SessionStore::in_memory().unwrap();
+        let mut store = crate::sessions::SessionStore::in_memory().unwrap();
 
-        let id = record_api_chat_session(
-            &store,
-            "test-model",
-            None,
-            "Summarize the runtime contract",
-            "Runtime contract summary.",
-        )
-        .unwrap();
+        let id = store
+            .record_api_turn(
+                "test-model",
+                None,
+                "Summarize the runtime contract",
+                "Runtime contract summary.",
+            )
+            .unwrap();
 
         let session = store.get_session(&id).unwrap().unwrap();
         assert_eq!(session.source, "api");
@@ -1343,13 +1319,14 @@ mod tests {
 
     #[test]
     fn record_api_chat_session_continues_existing_session() {
-        let store = crate::sessions::SessionStore::in_memory().unwrap();
+        let mut store = crate::sessions::SessionStore::in_memory().unwrap();
 
-        let first =
-            record_api_chat_session(&store, "test-model", None, "turn one", "reply one").unwrap();
-        let second =
-            record_api_chat_session(&store, "test-model", Some(&first), "turn two", "reply two")
-                .unwrap();
+        let first = store
+            .record_api_turn("test-model", None, "turn one", "reply one")
+            .unwrap();
+        let second = store
+            .record_api_turn("test-model", Some(&first), "turn two", "reply two")
+            .unwrap();
         assert_eq!(
             first, second,
             "a supplied session id must be continued, not replaced"
@@ -1364,9 +1341,9 @@ mod tests {
         assert_eq!(session.title.as_deref(), Some("turn one"));
 
         // An unknown id falls back to a fresh session.
-        let third =
-            record_api_chat_session(&store, "test-model", Some("does-not-exist"), "t3", "r3")
-                .unwrap();
+        let third = store
+            .record_api_turn("test-model", Some("does-not-exist"), "t3", "r3")
+            .unwrap();
         assert_ne!(third, first);
     }
 
