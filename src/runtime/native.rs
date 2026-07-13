@@ -34,6 +34,13 @@ impl RuntimeAdapter for NativeRuntime {
         true
     }
 
+    /// Each shell command runs in its own session/process group (via `setsid`
+    /// in `build_shell_command`), so the shell tool can reap the whole tree with
+    /// `kill(-pid, …)` on cancel/timeout. Unix only; `false` elsewhere.
+    fn spawns_process_group(&self) -> bool {
+        cfg!(unix)
+    }
+
     fn build_shell_command(
         &self,
         command: &str,
@@ -54,11 +61,26 @@ impl RuntimeAdapter for NativeRuntime {
         };
         let mut process = tokio::process::Command::new(SH_PATH);
         process.arg("-c").arg(command).current_dir(workspace_dir);
-        // Kill the child if the parent future is dropped — covers the
+        // Put the shell in its own session/process group so the shell tool can
+        // reap the WHOLE tree (apt/dpkg, ssh-to-VM, pipelines, background jobs)
+        // with `kill(-pgid, …)` on cancel/timeout. `kill_on_drop` below only
+        // stops this direct `/bin/sh` child, leaving descendants running.
+        // Mirrors src/webui.rs. Unix only.
+        #[cfg(unix)]
+        {
+            // SAFETY: setsid() only starts a new session in the post-fork child,
+            // before exec; nothing else runs there. `pre_exec` is inherent on
+            // tokio's Command (no CommandExt import needed).
+            unsafe {
+                process.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+        // Kill the direct child if the parent future is dropped — covers the
         // Ctrl+C path in the TUI where `execute_tool_call` is cancelled
-        // mid-run. Without this, a long-running shell (e.g. `pip
-        // install`) keeps executing after the agent has moved on,
-        // wasting cycles and racing with the next turn.
+        // mid-run. Belt-and-suspenders alongside the process-group kill.
         process.kill_on_drop(true);
         Ok(process)
     }

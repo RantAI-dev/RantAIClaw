@@ -52,6 +52,15 @@ pub trait RuntimeAdapter: Send + Sync {
         0
     }
 
+    /// Report whether [`build_shell_command`](Self::build_shell_command) puts the
+    /// child in its own process group (via `setsid`), so the caller may reap the
+    /// whole process tree with `kill(-pid, …)` on cancel/timeout. Only the native
+    /// runtime does this (Unix); other runtimes rely on `kill_on_drop`, which only
+    /// stops the direct child.
+    fn spawns_process_group(&self) -> bool {
+        false
+    }
+
     /// Build a shell command process configured for this runtime.
     ///
     /// Constructs a [`tokio::process::Command`] that will execute `command`
