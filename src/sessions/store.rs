@@ -44,7 +44,12 @@ impl SessionStore {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open session db at {}", path.display()))?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        // busy_timeout is REQUIRED: every /api/v1 handler opens its own connection
+        // to this file, so concurrent writers must retry instead of failing
+        // immediately with "database is locked". Matches channels/history_store.rs.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        )?;
         run_migrations(&conn)?;
 
         Ok(Self { conn })
@@ -243,11 +248,91 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Atomically record one API chat turn: continue-or-create the session,
+    /// append the user + assistant messages, bump `message_count`, title a new
+    /// session, and stamp `ended_at` — all in a single transaction. If any step
+    /// fails the whole turn rolls back, so a contended write can never leave an
+    /// orphan user row or a drifted `message_count`.
+    ///
+    /// Uses `IMMEDIATE` (not the default `DEFERRED`): this reads the session row
+    /// then writes, and two concurrent DEFERRED read→write transactions deadlock
+    /// with a `SQLITE_BUSY` that `busy_timeout` cannot resolve. `IMMEDIATE` takes
+    /// the write lock up front so contenders serialize and retry cleanly.
+    ///
+    /// Returns the session id the turn landed in.
+    pub fn record_api_turn(
+        &mut self,
+        model: &str,
+        session_id: Option<&str>,
+        user_message: &str,
+        assistant_message: &str,
+    ) -> Result<String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Continue the supplied session when it exists; else start a fresh one.
+        let existing = match session_id {
+            Some(sid) if !sid.is_empty() => {
+                match tx.query_row("SELECT 1 FROM sessions WHERE id = ?1", params![sid], |_| {
+                    Ok(())
+                }) {
+                    Ok(()) => Some(sid.to_string()),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            _ => None,
+        };
+        let (id, is_new) = match existing {
+            Some(id) => (id, false),
+            None => {
+                let id = Uuid::new_v4().to_string();
+                let started_at = chrono::Utc::now().timestamp();
+                tx.execute(
+                    "INSERT INTO sessions (id, model, started_at, source) VALUES (?1, ?2, ?3, ?4)",
+                    params![id, model, started_at, "api"],
+                )?;
+                (id, true)
+            }
+        };
+
+        // Same timestamp for the pair — get_messages' `id ASC` tiebreaker keeps
+        // the user turn before the assistant turn on replay.
+        let now = chrono::Utc::now().timestamp();
+        for (role, content) in [("user", user_message), ("assistant", assistant_message)] {
+            tx.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) \
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+                params![id, role, content, now],
+            )?;
+        }
+        tx.execute(
+            "UPDATE sessions SET message_count = message_count + 2, ended_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+
+        // Title only the first turn — from the user's own text (decorations are
+        // appended after it, so the first line stays the real question).
+        if is_new {
+            let title = derive_session_title(user_message);
+            if !title.is_empty() {
+                tx.execute(
+                    "UPDATE sessions SET title = ?1 WHERE id = ?2",
+                    params![title, id],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// Retrieve all messages for a session, ordered by timestamp ascending.
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, role, content, tool_calls, timestamp \
-             FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC",
+             FROM messages WHERE session_id = ?1 ORDER BY timestamp ASC, id ASC",
         )?;
 
         let messages = stmt
@@ -370,6 +455,41 @@ mod tests {
 
     fn store() -> SessionStore {
         SessionStore::in_memory().expect("in-memory store")
+    }
+
+    #[test]
+    fn open_sets_busy_timeout() {
+        // File-backed stores must retry on lock contention instead of erroring,
+        // so concurrent /api/v1 handlers don't hit "database is locked".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(&dir.path().join("sessions.db")).expect("open store");
+        let ms: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .expect("query busy_timeout");
+        assert_eq!(ms, 5000);
+    }
+
+    #[test]
+    fn record_api_turn_orders_user_before_assistant() {
+        let mut s = store();
+        let id = s
+            .record_api_turn("m", None, "the question", "the answer")
+            .unwrap();
+
+        let msgs = s.get_messages(&id).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+        // Both rows share a (second-granular) timestamp — replay order relies on
+        // the `id ASC` tiebreaker in get_messages, not on the timestamp.
+        assert_eq!(msgs[0].timestamp, msgs[1].timestamp);
+        assert!(msgs[0].id < msgs[1].id);
+
+        let sess = s.get_session(&id).unwrap().unwrap();
+        assert_eq!(sess.message_count, 2);
+        assert_eq!(sess.title.as_deref(), Some("the question"));
+        assert!(sess.ended_at.is_some());
     }
 
     #[test]
