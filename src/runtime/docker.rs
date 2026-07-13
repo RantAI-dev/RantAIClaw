@@ -83,6 +83,14 @@ impl RuntimeAdapter for DockerRuntime {
             .map_or(0, |mb| mb.saturating_mul(1024 * 1024))
     }
 
+    /// The `docker run` CLI runs in its own process group (via `setsid`, below).
+    /// On cancel/timeout the shell tool SIGTERMs that group; `docker run`'s
+    /// `--sig-proxy` (non-TTY) then forwards the signal into the container, which
+    /// exits and is auto-removed by `--rm`. Unix only.
+    fn spawns_process_group(&self) -> bool {
+        cfg!(unix)
+    }
+
     fn build_shell_command(
         &self,
         command: &str,
@@ -93,7 +101,11 @@ impl RuntimeAdapter for DockerRuntime {
             .arg("run")
             .arg("--rm")
             .arg("--init")
-            .arg("--interactive");
+            .arg("--interactive")
+            // Forward signals from the `docker run` CLI into the container's PID 1
+            // (default in non-TTY mode — we run without `-t` — but set explicitly).
+            // This is what lets a SIGTERM'd CLI actually stop the container.
+            .arg("--sig-proxy=true");
 
         let network = self.config.network.trim();
         if !network.is_empty() {
@@ -133,10 +145,25 @@ impl RuntimeAdapter for DockerRuntime {
             .arg("-c")
             .arg(command);
 
-        // Kill the `docker run …` child if the future is dropped — the
-        // `--rm` flag then cleans up the container. Without this, a
-        // Ctrl+C mid-run leaves the docker CLI process waiting on the
-        // container and the container itself keeps executing.
+        // Reap the container on cancel/timeout. On Unix, put the `docker run` CLI
+        // in its own process group (mirrors native) so the shell tool can SIGTERM
+        // the group; `--sig-proxy` forwards that into the container, which exits
+        // and is auto-removed by `--rm`. We deliberately do NOT use `kill_on_drop`
+        // on Unix: its SIGKILL would race — and win — against the CLI forwarding
+        // the SIGTERM, leaving the container running (the old bug). On non-Unix
+        // (no process-group support), fall back to `kill_on_drop`.
+        #[cfg(unix)]
+        {
+            // SAFETY: setsid() only starts a new session in the post-fork child,
+            // before exec; nothing else runs there. Mirrors src/webui.rs.
+            unsafe {
+                process.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(not(unix))]
         process.kill_on_drop(true);
 
         Ok(process)
@@ -151,6 +178,23 @@ mod tests {
     fn docker_runtime_name() {
         let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
         assert_eq!(runtime.name(), "docker");
+    }
+
+    #[test]
+    fn docker_spawns_process_group_on_unix() {
+        // Enables the shell tool's group-kill guard: SIGTERM the `docker run`
+        // group -> --sig-proxy forwards to the container -> --rm removes it.
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        assert_eq!(runtime.spawns_process_group(), cfg!(unix));
+    }
+
+    #[test]
+    fn docker_build_shell_command_forwards_signals() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        let command = runtime
+            .build_shell_command("echo hi", &std::env::temp_dir())
+            .unwrap();
+        assert!(format!("{command:?}").contains("--sig-proxy=true"));
     }
 
     #[test]
