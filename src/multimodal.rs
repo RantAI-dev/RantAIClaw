@@ -245,6 +245,12 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
 
     validate_mime(source, &mime)?;
 
+    // Reject an oversized payload BEFORE allocating the decoded buffer — base64
+    // decodes to ~3/4 its length, so this cheaply upper-bounds the decoded size
+    // (the local/remote paths already check their size before allocating; this
+    // brings the data-URI path to parity).
+    validate_size(source, payload.len() / 4 * 3, max_bytes)?;
+
     let decoded = STANDARD
         .decode(payload)
         .map_err(|error| MultimodalError::InvalidMarker {
@@ -444,6 +450,19 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_data_uri_rejects_oversized_payload() {
+        // An oversized data-URI is rejected via the decoded-size estimate
+        // (~3/4 of the base64 length) before the buffer is allocated.
+        let payload = "A".repeat(4096); // ~3072 decoded bytes
+        let source = format!("data:image/png;base64,{payload}");
+        let err = normalize_data_uri(&source, 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("size limit exceeded"),
+            "expected ImageTooLarge, got: {err}"
+        );
+    }
 
     #[test]
     fn parse_image_markers_extracts_multiple_markers() {
