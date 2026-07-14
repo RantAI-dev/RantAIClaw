@@ -697,7 +697,8 @@ impl SecurityPolicy {
                 // commands; -delete removes files; -fprint/-fprintf/-fls write to
                 // arbitrary paths. (args are already lowercased by the caller.)
                 const FIND_DANGEROUS: &[&str] = &[
-                    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls",
+                    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0",
+                    "-fprintf", "-fls",
                 ];
                 !args
                     .iter()
@@ -1251,6 +1252,10 @@ mod tests {
         assert!(
             !p.is_command_allowed("find . -fprintf /tmp/x %p"),
             "find -fprintf must be blocked"
+        );
+        assert!(
+            !p.is_command_allowed("find /nonexistent -fprint0 /home/op/.bashrc"),
+            "find -fprint0 must be blocked (writes NUL-separated paths to a file)"
         );
         // A benign find is still allowed.
         assert!(
