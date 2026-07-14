@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Shell commands now inherit common tooling env vars.** The shell tool's env
+  allowlist (`SAFE_ENV_VARS`) was so narrow that `kubectl`, `docker` (remote /
+  rootless), `aws`/`gcloud`, `git`-over-ssh-agent, and proxied commands failed
+  with "not found" / "no credentials" even in the TUI. It now also forwards the
+  HTTP(S) proxy vars, `KUBECONFIG`, `DOCKER_HOST`, `SSH_AUTH_SOCK`,
+  `GIT_SSH_COMMAND`, `AWS_PROFILE`/`AWS_REGION`/`AWS_DEFAULT_REGION`,
+  `GOOGLE_APPLICATION_CREDENTIALS`, `XDG_RUNTIME_DIR`, and `KRB5CCNAME`. These
+  are functional pointers (paths / sockets / selectors), never secret values —
+  API keys and tokens are still stripped (local-capability widening, CLAUDE.md §3.6).
+
 ## [0.7.15-alpha] — 2026-07-13
 
 ### Fixed
