@@ -705,14 +705,29 @@ impl SecurityPolicy {
                     .any(|arg| FIND_DANGEROUS.contains(&arg.as_str()))
             }
             "git" => {
-                // git config, alias, and -c can be used to set dangerous options
-                // (e.g. git config core.editor "rm -rf /")
+                // Two classes of git arguments give arbitrary command execution
+                // that bypasses the command allowlist:
+                //   - config/alias/-c set dangerous options
+                //     (e.g. git config core.editor "rm -rf /")
+                //   - --upload-pack/--receive-pack/--exec name the program run
+                //     for the transport; against a local path git launches it via
+                //     the shell, so `git ls-remote --upload-pack='sh -c evil' .`
+                //     is silent RCE (ls-remote/fetch/clone are not "medium" verbs,
+                //     so the risk gate never prompts). Block both the separate-arg
+                //     (`--upload-pack /x`) and inline (`--upload-pack=/x`) forms.
+                //     (args are already lowercased by the caller.)
                 !args.iter().any(|arg| {
                     arg == "config"
                         || arg.starts_with("config.")
                         || arg == "alias"
                         || arg.starts_with("alias.")
                         || arg == "-c"
+                        || arg == "--upload-pack"
+                        || arg.starts_with("--upload-pack=")
+                        || arg == "--receive-pack"
+                        || arg.starts_with("--receive-pack=")
+                        || arg == "--exec"
+                        || arg.starts_with("--exec=")
                 })
             }
             _ => true,
@@ -1646,6 +1661,40 @@ mod tests {
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
         assert!(p.is_command_allowed("git add ."));
+    }
+
+    #[test]
+    fn git_transport_exec_flags_are_blocked() {
+        // git's --upload-pack / --receive-pack / --exec run an arbitrary program
+        // for the (local) transport, giving RCE that bypasses the command
+        // allowlist — the same class as `find -exec` and `git -c`. These slip
+        // past the risk gate too (ls-remote/fetch/clone are not "medium" verbs),
+        // so they execute silently with no approval. Must be denied.
+        let p = default_policy();
+        assert!(
+            !p.is_command_allowed("git ls-remote --upload-pack=\"touch /tmp/pwned;true\" ."),
+            "git --upload-pack= must be blocked (runs an arbitrary program)"
+        );
+        assert!(
+            !p.is_command_allowed("git fetch --upload-pack /tmp/evil.sh origin"),
+            "git --upload-pack (separate arg) must be blocked"
+        );
+        assert!(
+            !p.is_command_allowed("git clone --upload-pack=/tmp/evil.sh . dest"),
+            "git clone --upload-pack= must be blocked"
+        );
+        assert!(
+            !p.is_command_allowed("git push --receive-pack=\"sh -c evil\" origin"),
+            "git --receive-pack= must be blocked"
+        );
+        assert!(
+            !p.is_command_allowed("git push --exec=/tmp/evil.sh origin"),
+            "git --exec= (alias of --receive-pack) must be blocked"
+        );
+        // Legitimate git usage must still pass.
+        assert!(p.is_command_allowed("git fetch origin main"));
+        assert!(p.is_command_allowed("git ls-remote origin"));
+        assert!(p.is_command_allowed("git clone https://example.com/repo.git"));
     }
 
     #[test]
