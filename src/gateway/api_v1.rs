@@ -358,7 +358,15 @@ async fn agent_chat_sync(
     if !prior.is_empty() {
         agent.restore_history(&prior).map_err(err_500)?;
     }
-    let text = agent.turn(&body.message).await.map_err(err_500)?;
+    let text = agent.turn(&body.message).await.map_err(|e| {
+        // Scrub any secret-looking token from the error before returning it, the
+        // same way the /webhook path does (defense in depth — the provider layer
+        // already sanitizes at the HTTP-body source).
+        err_500(anyhow::anyhow!(
+            "{}",
+            crate::providers::sanitize_api_error(&format!("{e:#}"))
+        ))
+    })?;
     let mut session_id = body.session_id.clone().unwrap_or_default();
     // `agent.turn` already returned Err on failure; skip persisting an empty
     // answer so a no-op turn doesn't create or append to a session.
@@ -449,7 +457,9 @@ async fn agent_chat_stream(
             }
             Err(err) => {
                 let _ = events_tx
-                    .send(crate::agent::AgentEvent::Error(format!("{err:#}")))
+                    .send(crate::agent::AgentEvent::Error(
+                        crate::providers::sanitize_api_error(&format!("{err:#}")),
+                    ))
                     .await;
                 let _ = events_tx
                     .send(crate::agent::AgentEvent::Done {

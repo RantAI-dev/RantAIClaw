@@ -60,7 +60,26 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
         cleaned.push_str(&content[cursor..start]);
 
         let marker_start = start + IMAGE_MARKER_PREFIX.len();
-        let Some(rel_end) = content[marker_start..].find(']') else {
+        // Find the marker's closing ']', skipping any ']' that belongs to a
+        // nested bracket pair — e.g. an IPv6-literal URL host `[::1]` in
+        // `[IMAGE:http://[::1]:8080/x.png]`. A plain `.find(']')` truncated the
+        // reference at the first inner ']'.
+        let mut depth = 0usize;
+        let rel_end = content[marker_start..]
+            .char_indices()
+            .find_map(|(idx, ch)| match ch {
+                '[' => {
+                    depth += 1;
+                    None
+                }
+                ']' if depth > 0 => {
+                    depth -= 1;
+                    None
+                }
+                ']' => Some(idx),
+                _ => None,
+            });
+        let Some(rel_end) = rel_end else {
             cleaned.push_str(&content[start..]);
             cursor = content.len();
             break;
@@ -454,6 +473,14 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0], "/tmp/a.png");
         assert_eq!(refs[1], "https://example.com/b.jpg");
+    }
+
+    #[test]
+    fn parse_image_markers_handles_ipv6_literal_url() {
+        // A ']' inside an IPv6-literal host must not truncate the reference.
+        let (cleaned, refs) = parse_image_markers("see [IMAGE:http://[::1]:8080/x.png] ok");
+        assert_eq!(refs, vec!["http://[::1]:8080/x.png".to_string()]);
+        assert_eq!(cleaned, "see  ok");
     }
 
     #[test]
