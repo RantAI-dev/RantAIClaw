@@ -594,6 +594,9 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     }
 
     let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
+    // Snapshot the currently-applied defaults BEFORE we overwrite the store, so we
+    // can tell whether the operator actually changed the provider/model.
+    let prev_defaults = runtime_defaults_snapshot(ctx);
     let next_default_provider = providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
@@ -646,6 +649,28 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
                 last_applied_stamp: Some(stamp),
             },
         );
+    }
+
+    // If the operator changed the provider or default model (Web-UI switch or a
+    // direct config edit), clear per-sender route overrides so senders pinned by
+    // an in-chat `/model` / `/models` re-base to the new default — the operator
+    // switch wins. Only clear on an actual change, never on unrelated reloads.
+    if prev_defaults.default_provider != next_defaults.default_provider
+        || prev_defaults.model != next_defaults.model
+    {
+        let mut routes = ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !routes.is_empty() {
+            tracing::info!(
+                cleared = routes.len(),
+                provider = %next_defaults.default_provider,
+                model = %next_defaults.model,
+                "Cleared per-sender route overrides after a provider/model change"
+            );
+            routes.clear();
+        }
     }
 
     tracing::info!(
@@ -4996,6 +5021,113 @@ BTC is currently around $65,000 based on latest tool output."#
                 .unwrap_or_else(|e| e.into_inner());
             store.remove(&config_path);
         }
+    }
+
+    #[tokio::test]
+    async fn maybe_apply_runtime_config_update_clears_pinned_sender_on_provider_switch() {
+        // A per-sender override (set via /model in-channel) pins that sender to a
+        // provider. A Web-UI provider switch rewrites config.toml; the reload must
+        // CLEAR the override so the pinned sender follows the new default —
+        // otherwise the switch never reaches them (the reported bug).
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+
+        let write_config = |provider: &str, model: &str| {
+            let mut config = crate::config::Config::default();
+            config.default_provider = Some(provider.to_string());
+            config.default_model = Some(model.to_string());
+            let toml = toml::to_string(&config).expect("serialize config");
+            std::fs::write(&config_path, toml).expect("write config");
+        };
+
+        write_config("openrouter", "model-a");
+
+        let mut channels_by_name = HashMap::new();
+        let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("model-a".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                rantaiclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+        };
+
+        // Seed the store from the initial config.
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("initial apply");
+
+        // A sender pins their own provider/model in-channel — differs from the
+        // default, so it is stored as an override.
+        set_route_selection(
+            &ctx,
+            "sender-1",
+            ChannelRouteSelection {
+                provider: "groq".to_string(),
+                model: "model-b".to_string(),
+            },
+        );
+        assert_eq!(
+            get_route_selection(&ctx, "sender-1").provider,
+            "groq",
+            "override is active before the switch"
+        );
+
+        // Operator switches provider in the Web UI → config.toml changes.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_config("deepseek", "model-c");
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload apply");
+
+        // The pinned sender must now follow the new default (override cleared).
+        let route = get_route_selection(&ctx, "sender-1");
+        assert_eq!(
+            route.provider, "deepseek",
+            "pinned sender re-based to the new provider after a Web-UI switch"
+        );
+        assert_eq!(
+            route.model, "model-c",
+            "pinned sender re-based to the new model"
+        );
+
+        runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&config_path);
     }
 
     // TODO(agent-loop): regressed between v0.4 and v0.6 — the agent returns
