@@ -27,8 +27,13 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// bare shell essentials so common operator tooling — kubectl, docker,
 /// aws/gcloud, git-over-ssh, corporate proxies — works out of the box instead of
 /// failing with "command/credentials not found" (CLAUDE.md §3.6, usable by
-/// default). None of these carry a secret value: they point at files/sockets the
-/// agent's shell can already reach, or select a profile/region.
+/// default). Most are functional pointers — files/sockets the agent's shell can
+/// already reach, or a profile/region selector. The one exception is the proxy
+/// vars: a `*_PROXY` URL may embed `user:pass@` basic-auth, so a command that
+/// echoes the environment (e.g. `env`) can surface it. That is an accepted cost
+/// of supporting authenticated corporate proxies (an authenticated proxy needs
+/// its credential inline); note the `shell_safe_env_vars_excludes_secrets` guard
+/// only checks variable NAMES, not values, so it can't catch that case.
 const SAFE_ENV_VARS: &[&str] = &[
     // Core shell essentials.
     "PATH",
