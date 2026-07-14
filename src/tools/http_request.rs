@@ -223,6 +223,16 @@ impl Tool for HttpRequestTool {
             }
         };
 
+        // Re-check the resolved IPs, not just the literal host string, to close
+        // DNS-rebinding SSRF (a public domain pointing at an internal address).
+        if let Err(e) = assert_host_resolves_to_public(&url).await {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+            });
+        }
+
         let method = match self.validate_method(method_str) {
             Ok(m) => m,
             Err(e) => {
@@ -438,6 +448,48 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
+/// Return the first non-global (private/local/reserved) address in `addrs`.
+fn first_non_global_addr(addrs: &[std::net::SocketAddr]) -> Option<std::net::IpAddr> {
+    addrs
+        .iter()
+        .map(std::net::SocketAddr::ip)
+        .find(|ip| match ip {
+            std::net::IpAddr::V4(v4) => is_non_global_v4(*v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(*v6),
+        })
+}
+
+/// Guard against DNS-rebinding SSRF. `validate_url` only checks the *literal*
+/// host string, so a public domain whose DNS record points at an internal
+/// address (169.254.169.254 metadata, 127.0.0.1, 10/8, the gateway port) slips
+/// through the `allowed_domains = ["*"]` easy-mode default. Resolve the host and
+/// reject if ANY resolved address is non-global.
+///
+/// Redirects are already disabled (`Policy::none`), closing redirect-based
+/// rebinding. A fast rebinding race between this lookup and reqwest's own
+/// connect-time resolution remains a residual limitation short of pinning the
+/// resolved IP into the connector.
+async fn assert_host_resolves_to_public(url: &str) -> anyhow::Result<()> {
+    let host = extract_host(url)?;
+
+    // A literal IP host was already fully classified by is_private_or_local_host.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    let port: u16 = if url.starts_with("https://") { 443 } else { 80 };
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| anyhow::anyhow!("Cannot resolve host '{host}': {e}"))?
+        .collect();
+
+    if let Some(ip) = first_non_global_addr(&addrs) {
+        anyhow::bail!("Blocked: host '{host}' resolves to a private/local address ({ip})");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +536,58 @@ mod tests {
             "api.anything.com",
             &["example.com".to_string()]
         ));
+    }
+
+    #[test]
+    fn first_non_global_addr_flags_internal_targets() {
+        let addrs: Vec<std::net::SocketAddr> = [
+            "8.8.8.8:443",        // public — fine
+            "169.254.169.254:80", // link-local metadata endpoint
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        assert_eq!(
+            first_non_global_addr(&addrs),
+            Some("169.254.169.254".parse().unwrap())
+        );
+
+        let loopback: Vec<std::net::SocketAddr> = vec!["127.0.0.1:80".parse().unwrap()];
+        assert!(first_non_global_addr(&loopback).is_some());
+
+        let mapped: Vec<std::net::SocketAddr> = vec!["[::ffff:10.0.0.1]:80".parse().unwrap()];
+        assert!(first_non_global_addr(&mapped).is_some());
+    }
+
+    #[test]
+    fn first_non_global_addr_passes_public() {
+        let addrs: Vec<std::net::SocketAddr> = vec![
+            "1.1.1.1:443".parse().unwrap(),
+            "8.8.4.4:80".parse().unwrap(),
+        ];
+        assert!(first_non_global_addr(&addrs).is_none());
+    }
+
+    #[tokio::test]
+    async fn resolution_guard_blocks_host_resolving_to_loopback() {
+        // "localhost" resolves to a loopback address on essentially all systems;
+        // a public domain with an internal A-record would fail here the same way.
+        let err = assert_host_resolves_to_public("http://localhost/latest/meta-data")
+            .await
+            .expect_err("localhost must be rejected by the resolution guard");
+        assert!(
+            err.to_string().contains("private/local"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolution_guard_allows_public_ip_literal_without_dns() {
+        // A public IP literal short-circuits (already validated upstream) and
+        // must not be blocked — this also keeps the test free of DNS egress.
+        assert_host_resolves_to_public("http://8.8.8.8/")
+            .await
+            .expect("public IP literal must pass the resolution guard");
     }
 
     #[test]
