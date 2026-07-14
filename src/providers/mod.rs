@@ -1326,6 +1326,21 @@ pub fn create_routed_provider(
     )
 }
 
+/// The credential a routed provider should build with: its own per-route key if
+/// present; otherwise the primary provider's key ONLY when it IS the primary. A
+/// non-primary routed provider must resolve its OWN credential downstream (its
+/// env var / config) — inheriting the primary's key would authenticate the wrong
+/// provider and 401. Mirrors the `api_url` gating and the fallback-provider
+/// handling in `create_resilient_provider_with_options`.
+fn routed_provider_credential<'a>(
+    name: &str,
+    primary_name: &str,
+    routed_credential: Option<&'a str>,
+    api_key: Option<&'a str>,
+) -> Option<&'a str> {
+    routed_credential.or(if name == primary_name { api_key } else { None })
+}
+
 /// Create a routed provider using explicit runtime options.
 pub fn create_routed_provider_with_options(
     primary_name: &str,
@@ -1366,7 +1381,7 @@ pub fn create_routed_provider_with_options(
                     (!trimmed_key.is_empty()).then_some(trimmed_key)
                 })
             });
-        let key = routed_credential.or(api_key);
+        let key = routed_provider_credential(name, primary_name, routed_credential, api_key);
         // Only use api_url for the primary provider
         let url = if name == primary_name { api_url } else { None };
         match create_resilient_provider_with_options(name, key, url, reliability, options) {
@@ -1648,6 +1663,32 @@ pub fn list_providers() -> Vec<ProviderInfo> {
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn routed_provider_does_not_inherit_the_primary_key() {
+        // A non-primary routed provider without its own key must NOT get the
+        // primary's key — it resolves its own credential downstream (None here).
+        assert_eq!(
+            routed_provider_credential("deepseek", "openai", None, Some("sk-openai")),
+            None,
+            "non-primary routed provider must not inherit the primary key"
+        );
+        // The primary provider without a per-route key still inherits the key.
+        assert_eq!(
+            routed_provider_credential("openai", "openai", None, Some("sk-openai")),
+            Some("sk-openai")
+        );
+        // A per-route key always wins, even for a non-primary provider.
+        assert_eq!(
+            routed_provider_credential(
+                "deepseek",
+                "openai",
+                Some("sk-deepseek"),
+                Some("sk-openai")
+            ),
+            Some("sk-deepseek")
+        );
+    }
 
     struct EnvGuard {
         key: &'static str,
