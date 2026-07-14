@@ -702,9 +702,18 @@ impl Provider for ReliableProvider {
     }
 
     fn supports_vision(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+        // Require EVERY pooled provider to support vision, not just one. With
+        // `any()` the vision gate passed (a capable provider exists in the pool),
+        // but the retry/failover chain could then hand an image-bearing request
+        // to a text-only member, which silently receives the base64 data-URI as
+        // plain text (garbage output + wasted cost). A uniformly vision-capable
+        // pool is the supported setup; a mixed pool now refuses image requests up
+        // front with a clean capability error instead of degrading on failover.
+        !self.providers.is_empty()
+            && self
+                .providers
+                .iter()
+                .all(|(_, provider)| provider.supports_vision())
     }
 
     async fn chat_with_tools(
@@ -932,6 +941,66 @@ mod tests {
             }
             Ok(self.response.to_string())
         }
+    }
+
+    /// Mock with a configurable vision capability.
+    struct VisionMock(bool);
+
+    #[async_trait]
+    impl Provider for VisionMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn supports_vision_requires_every_pooled_provider() {
+        // A mixed pool must NOT claim vision: the failover chain could otherwise
+        // route an image request to the text-only member.
+        let mixed = ReliableProvider::new(
+            vec![
+                (
+                    "vision".into(),
+                    Box::new(VisionMock(true)) as Box<dyn Provider>,
+                ),
+                ("text-only".into(), Box::new(VisionMock(false))),
+            ],
+            1,
+            1,
+        );
+        assert!(
+            !mixed.supports_vision(),
+            "a pool with a text-only member must not claim vision support"
+        );
+        // A uniformly vision-capable pool does support vision.
+        let all_vision = ReliableProvider::new(
+            vec![
+                ("v1".into(), Box::new(VisionMock(true)) as Box<dyn Provider>),
+                ("v2".into(), Box::new(VisionMock(true))),
+            ],
+            1,
+            1,
+        );
+        assert!(all_vision.supports_vision());
     }
 
     /// Mock that records which model was used for each call.
