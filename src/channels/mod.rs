@@ -3637,7 +3637,10 @@ pub async fn start_channels_with_cancellation(
         workspace_dir: Arc::new(config.workspace_dir.clone()),
         message_timeout_secs,
         interrupt_on_new_message,
-        multimodal: config.multimodal.clone(),
+        multimodal: config
+            .multimodal
+            .clone()
+            .with_runtime_workspace(config.workspace_dir.clone()),
         security: Arc::clone(&security),
         // Gate tools on polling channels unless explicitly opted into
         // unattended execution. Default (off) → deny tools that need

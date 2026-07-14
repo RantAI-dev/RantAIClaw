@@ -2920,6 +2920,7 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let err = run_tool_call_loop(

@@ -237,7 +237,20 @@ async fn normalize_image_reference(
         return normalize_remote_image(source, max_bytes, remote_client).await;
     }
 
-    normalize_local_image(source, max_bytes).await
+    normalize_local_image(source, max_bytes, config.runtime_workspace.as_deref()).await
+}
+
+/// True only if `path` (canonicalized, resolving symlinks and `..`) is under the
+/// canonical `workspace` root. Fails closed on an unresolvable path. Mirrors the
+/// `file_*` tool sandbox (`SecurityPolicy::is_resolved_path_allowed`).
+fn path_within_workspace(path: &Path, workspace: &Path) -> bool {
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    canonical.starts_with(&root)
 }
 
 fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> {
@@ -343,13 +356,27 @@ async fn normalize_remote_image(
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
-async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result<String> {
+async fn normalize_local_image(
+    source: &str,
+    max_bytes: usize,
+    workspace: Option<&Path>,
+) -> anyhow::Result<String> {
     let path = Path::new(source);
     if !path.exists() || !path.is_file() {
         return Err(MultimodalError::ImageSourceNotFound {
             input: source.to_string(),
         }
         .into());
+    }
+
+    // Confine local reads to the workspace when one is set (remote channel /
+    // gateway messages). A `[IMAGE:/path]` marker in an inbound user message
+    // must not read arbitrary host files into the model's vision context.
+    // `None` (local CLI, library/tests) leaves local reads unconfined.
+    if let Some(ws) = workspace {
+        if !path_within_workspace(path, ws) {
+            anyhow::bail!("local image path is outside the workspace and was blocked: {source}");
+        }
     }
 
     let metadata =
@@ -563,6 +590,65 @@ mod tests {
         assert!(refs[0].starts_with("data:image/png;base64,"));
     }
 
+    #[test]
+    fn path_within_workspace_confines_correctly() {
+        let workspace = tempfile::tempdir().unwrap();
+        let inside = workspace.path().join("pic.png");
+        std::fs::write(&inside, b"x").unwrap();
+        assert!(path_within_workspace(&inside, workspace.path()));
+
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.png");
+        std::fs::write(&secret, b"x").unwrap();
+        assert!(!path_within_workspace(&secret, workspace.path()));
+
+        // Fails closed on a missing path.
+        assert!(!path_within_workspace(
+            &workspace.path().join("nope"),
+            workspace.path()
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_blocks_local_image_outside_workspace() {
+        // A remote channel/gateway message carries a workspace; a [IMAGE:/path]
+        // marker pointing outside it must not read arbitrary host files into
+        // the vision context.
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("evil.png");
+        std::fs::write(&target, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+
+        let messages = vec![ChatMessage::user(format!("[IMAGE:{}]", target.display()))];
+        let config =
+            MultimodalConfig::default().with_runtime_workspace(workspace.path().to_path_buf());
+
+        let error = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect_err("out-of-workspace local image must be blocked");
+        assert!(
+            error.to_string().contains("outside the workspace"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_allows_local_image_inside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let target = workspace.path().join("ok.png");
+        std::fs::write(&target, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+
+        let messages = vec![ChatMessage::user(format!("[IMAGE:{}]", target.display()))];
+        let config =
+            MultimodalConfig::default().with_runtime_workspace(workspace.path().to_path_buf());
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("in-workspace local image must be allowed");
+        let (_cleaned, refs) = parse_image_markers(&prepared.messages[0].content);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
+    }
+
     #[tokio::test]
     async fn prepare_messages_rejects_too_many_images() {
         let messages = vec![ChatMessage::user(
@@ -573,6 +659,7 @@ mod tests {
             max_images: 1,
             max_image_size_mb: 5,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let error = prepare_messages_for_provider(&messages, &config)
@@ -615,6 +702,7 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let error = prepare_messages_for_provider(&messages, &config)
