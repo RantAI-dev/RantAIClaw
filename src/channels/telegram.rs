@@ -1212,11 +1212,30 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             self.bot_token, file_path
         );
         let img_resp = self.http_client().get(&download_url).send().await?;
+        // Reject an oversized download before buffering it. Telegram caps bot
+        // file downloads at ~20MB; a body claiming more is malformed/hostile.
+        const MAX_PHOTO_BYTES: u64 = 25 * 1024 * 1024;
+        if let Some(len) = img_resp.content_length() {
+            if len > MAX_PHOTO_BYTES {
+                anyhow::bail!("telegram photo too large to process: {len} bytes");
+            }
+        }
         let bytes = img_resp.bytes().await?;
 
-        // Step 3: resize to max 1024px on longest side to fit within model context
+        // Step 3: resize to max 512px on longest side to fit within model context.
         let resized_bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            let img = image::load_from_memory(&bytes)?;
+            // Bound the decode: a small, heavily-compressed image can declare huge
+            // dimensions and force a multi-GB pixel allocation (decompression
+            // bomb) before the thumbnail step. Cap dimensions + total allocation.
+            let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes.as_ref()))
+                .with_guessed_format()
+                .map_err(|e| anyhow::anyhow!("failed to read image header: {e}"))?;
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(16_384);
+            limits.max_image_height = Some(16_384);
+            limits.max_alloc = Some(256 * 1024 * 1024);
+            reader.limits(limits);
+            let img = reader.decode()?;
             let (w, h) = (img.width(), img.height());
             let max_dim = 512u32;
             let resized = if w > max_dim || h > max_dim {
