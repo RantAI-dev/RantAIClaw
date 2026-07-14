@@ -121,6 +121,16 @@ mod tests {
         assert!(path.to_string_lossy().contains("rantaiclaw"));
     }
 
+    #[test]
+    fn native_build_with_cleanup_has_no_reaper() {
+        // The native runtime's process-group kill fully reaps the child, so it
+        // uses the default (no out-of-group container to force-remove).
+        let prepared = NativeRuntime::new()
+            .build_shell_command_with_cleanup("echo hi", &std::env::temp_dir())
+            .unwrap();
+        assert!(prepared.cancel_reaper.is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn kill_on_drop_terminates_child_when_future_dropped() {
         // Proves the fix for the v0.6.49 "cancel not instant" bug:

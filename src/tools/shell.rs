@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::runtime::RuntimeAdapter;
+use crate::runtime::{PreparedShellCommand, RuntimeAdapter};
 use crate::security::{Decision, SecurityPolicy};
 use crate::tools::RATE_LIMIT_REMEDIATION;
 use async_trait::async_trait;
@@ -162,6 +162,47 @@ impl Drop for ProcGroupKill {
         #[cfg(not(unix))]
         {
             let _ = self.pgid;
+        }
+    }
+}
+
+/// RAII guard that force-removes a docker container on cancel/timeout. A
+/// container runs under dockerd, NOT in the `docker run` CLI's process group, so
+/// [`ProcGroupKill`] can't reach it: a container whose PID 1 ignores the
+/// `--sig-proxy`-forwarded SIGTERM would orphan (the CLI dies, the container
+/// lives). Fires `docker rm -f <name>` after a short grace so the graceful path
+/// gets a chance first. Disarmed on normal completion. `None` (no-op) for
+/// non-docker runtimes, which have no container to reap.
+struct DockerContainerKill {
+    name: Option<String>,
+}
+
+impl DockerContainerKill {
+    fn disarm(&mut self) {
+        self.name = None;
+    }
+}
+
+impl Drop for DockerContainerKill {
+    fn drop(&mut self) {
+        let Some(name) = self.name.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                // Give the graceful path (SIGTERM via --sig-proxy) a moment, then
+                // force-remove. Only bites a container that ignored the signal;
+                // if it already exited (--rm cleaned it up), `docker rm -f` is a
+                // harmless no-op.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let _ = tokio::process::Command::new("docker")
+                    .args(["rm", "-f", &name])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+            });
         }
     }
 }
@@ -365,11 +406,14 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self
+        let PreparedShellCommand {
+            command: mut cmd,
+            cancel_reaper,
+        } = match self
             .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
+            .build_shell_command_with_cleanup(command, &self.security.workspace_dir)
         {
-            Ok(cmd) => cmd,
+            Ok(prepared) => prepared,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
@@ -441,6 +485,11 @@ impl Tool for ShellTool {
             None
         };
         let mut group_kill = ProcGroupKill { pgid };
+        // Docker containers live under dockerd, outside the process group above —
+        // arm a separate force-remove for the docker runtime (None otherwise).
+        let mut docker_kill = DockerContainerKill {
+            name: cancel_reaper.map(|r| r.container_name),
+        };
 
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
@@ -481,6 +530,7 @@ impl Tool for ShellTool {
             Ok(Ok(status)) => {
                 // Completed on its own — disarm so we never signal a reused pgid.
                 group_kill.disarm();
+                docker_kill.disarm();
                 let mut stdout = String::from_utf8_lossy(&out_bytes).to_string();
                 let mut stderr = String::from_utf8_lossy(&err_bytes).to_string();
                 if stdout.len() > MAX_OUTPUT_BYTES {
@@ -530,6 +580,7 @@ impl Tool for ShellTool {
                 // Disarm: the process is gone, so signalling its pgid could only
                 // hit a since-reused group — same invariant as the success path.
                 group_kill.disarm();
+                docker_kill.disarm();
                 Ok(ToolResult {
                     success: false,
                     output: String::new(),
