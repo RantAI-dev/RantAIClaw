@@ -14,10 +14,46 @@ use tokio::io::AsyncReadExt;
 const SHELL_TIMEOUT_SECS: u64 = 600;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
-/// Environment variables safe to pass to shell commands.
-/// Only functional variables are included — never API keys or secrets.
+/// Environment variables safe to pass to shell commands — functional pointers
+/// only (paths, sockets, region/profile selectors), NEVER API keys, tokens, or
+/// secret values (the `env_clear` + allowlist strips everything else, and
+/// `shell_safe_env_vars_excludes_secrets` guards the list). Widened beyond the
+/// bare shell essentials so common operator tooling — kubectl, docker,
+/// aws/gcloud, git-over-ssh, corporate proxies — works out of the box instead of
+/// failing with "command/credentials not found" (CLAUDE.md §3.6, usable by
+/// default). None of these carry a secret value: they point at files/sockets the
+/// agent's shell can already reach, or select a profile/region.
 const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+    // Core shell essentials.
+    "PATH",
+    "HOME",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "USER",
+    "SHELL",
+    "TMPDIR",
+    // HTTP(S) proxy config — both cases, since tools read either.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    // Tool config pointers — paths / sockets / selectors, not secrets.
+    "KUBECONFIG",      // kubectl
+    "DOCKER_HOST",     // remote / rootless docker
+    "SSH_AUTH_SOCK",   // ssh-agent (git-over-ssh)
+    "GIT_SSH_COMMAND", // custom git ssh transport
+    "AWS_PROFILE",     // aws cli — key still resolved via file/role
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "GOOGLE_APPLICATION_CREDENTIALS", // gcloud — path to a credentials file
+    "XDG_RUNTIME_DIR",                // user runtime dir (rootless docker socket, …)
+    "KRB5CCNAME",                     // kerberos credential-cache path
 ];
 
 /// Appended to hard-blocked shell errors so the operator discovers a concrete
@@ -618,6 +654,31 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_forwards_functional_tooling_env_but_not_secrets() {
+        // A functional pointer (KUBECONFIG) must now reach the command so tools
+        // like kubectl work; a secret (API_KEY) must still be stripped.
+        let _kube = EnvGuard::set("KUBECONFIG", "/tmp/rantaiclaw-test-kubeconfig-marker");
+        let _secret = EnvGuard::set("API_KEY", "sk-test-secret-should-not-leak");
+
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command execution should succeed");
+        assert!(result.success);
+        assert!(
+            result
+                .output
+                .contains("KUBECONFIG=/tmp/rantaiclaw-test-kubeconfig-marker"),
+            "KUBECONFIG (a functional pointer) should be forwarded to shell commands"
+        );
+        assert!(
+            !result.output.contains("sk-test-secret-should-not-leak"),
+            "API_KEY must still be stripped from shell command env"
+        );
+    }
+
     #[tokio::test]
     async fn shell_preserves_path_and_home() {
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
@@ -722,6 +783,27 @@ mod tests {
             SAFE_ENV_VARS.contains(&"TERM"),
             "TERM must be in safe env vars"
         );
+    }
+
+    #[test]
+    fn shell_safe_env_vars_includes_common_tooling() {
+        // Functional (non-secret) pointers common CLIs need — stripping these
+        // made kubectl/docker/aws/git-over-ssh/proxied commands fail even in the
+        // TUI. Guard against a regression that re-narrows the list.
+        for var in [
+            "KUBECONFIG",
+            "DOCKER_HOST",
+            "SSH_AUTH_SOCK",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "AWS_PROFILE",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ] {
+            assert!(
+                SAFE_ENV_VARS.contains(&var),
+                "{var} should be forwarded to shell commands"
+            );
+        }
     }
 
     #[tokio::test]
