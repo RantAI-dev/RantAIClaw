@@ -78,7 +78,13 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
                 }
                 ']' => Some(idx),
                 _ => None,
-            });
+            })
+            // Fallback: if the marker content has an UNBALANCED '[' (e.g. a path
+            // like `/tmp/a[1.png`), the depth scan never returns to 0 and finds no
+            // close. Fall back to the first ']' (pre-bracket-scan behavior) so
+            // this marker — and every following one — is still parsed, instead of
+            // swallowing to end-of-string and leaking raw marker text.
+            .or_else(|| content[marker_start..].find(']'));
         let Some(rel_end) = rel_end else {
             cleaned.push_str(&content[start..]);
             cursor = content.len();
@@ -500,6 +506,22 @@ mod tests {
         let (cleaned, refs) = parse_image_markers("see [IMAGE:http://[::1]:8080/x.png] ok");
         assert_eq!(refs, vec!["http://[::1]:8080/x.png".to_string()]);
         assert_eq!(cleaned, "see  ok");
+    }
+
+    #[test]
+    fn parse_image_markers_unbalanced_bracket_does_not_drop_later_markers() {
+        // A stray '[' in one marker (e.g. a path `a[b`) must not swallow the rest
+        // of the string or drop the following valid marker. Regression guard for
+        // the bracket-depth scan falling through to end-of-string.
+        let (cleaned, refs) = parse_image_markers("[IMAGE:a[b] and [IMAGE:/tmp/real.png]");
+        assert!(
+            refs.contains(&"/tmp/real.png".to_string()),
+            "the following valid marker must still be parsed: {refs:?}"
+        );
+        assert!(
+            !cleaned.contains("[IMAGE:"),
+            "raw marker syntax must not leak into the cleaned text: {cleaned:?}"
+        );
     }
 
     #[test]
