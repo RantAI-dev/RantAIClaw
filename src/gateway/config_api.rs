@@ -209,13 +209,20 @@ struct ModelBody {
     temperature: Option<f64>,
 }
 
-/// Serializes every config-file mutation behind a process-global lock.
-/// `config.toml` is a single shared resource: two concurrent gateway writers
-/// that each cloned the in-memory config, changed one field, and saved the whole
-/// file would clobber each other's fields; and an out-of-band writer (a Telegram
-/// `/claim` persisting an approval owner) would be silently overwritten by a
-/// stale in-memory snapshot. Holding this lock across the read-modify-write makes
-/// each write atomic vs other writers.
+/// Serializes config-file mutations made through the gateway config API behind a
+/// process-global lock. `config.toml` is a single shared resource: two concurrent
+/// gateway writers that each cloned the in-memory config, changed one field, and
+/// saved the whole file would clobber each other's fields — this lock plus the
+/// per-write fresh disk read (`lock_and_load`) prevents that.
+///
+/// SCOPE (do not overstate): this covers the config_api writers only. The
+/// out-of-band writers — a Telegram `/claim` (`persist_approval_owner`) and
+/// client pairing (`persist_pairing_tokens`) — do NOT take this lock. The
+/// per-write fresh disk read shrinks the window in which one of those could be
+/// clobbered by an interleaving gateway write from "the whole gateway uptime"
+/// (the pre-lock bug) down to the few milliseconds of a single read-modify-write,
+/// but does not fully eliminate it. Making it airtight would require those paths
+/// to share this lock (they live in other modules — a follow-up).
 static CONFIG_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Take the config write lock and return the FRESHEST config from disk (not the
