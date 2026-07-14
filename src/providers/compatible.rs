@@ -287,7 +287,15 @@ fn strip_think_tags(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut rest = s;
     loop {
-        if let Some(start) = rest.find("<think>") {
+        let open = rest.find("<think>");
+        let close = rest.find("</think>");
+        if let Some(c) = close.filter(|&c| open.is_none_or(|o| c < o)) {
+            // A closing tag with no opening before it — some models (e.g.
+            // MiniMax) emit a bare `</think>` because the opening tag was
+            // consumed upstream / lives in a separate reasoning field. Treat
+            // everything up to and including it as leaked reasoning and drop it.
+            rest = &rest[c + "</think>".len()..];
+        } else if let Some(start) = open {
             result.push_str(&rest[..start]);
             if let Some(end) = rest[start..].find("</think>") {
                 rest = &rest[start + end + "</think>".len()..];
@@ -505,29 +513,40 @@ pub(crate) fn filter_think_tags(input: &str, in_think: &mut bool, partial: &mut 
                 return out;
             }
         } else {
-            if let Some(start_rel) = combined[i..].find("<think>") {
+            let next_open = combined[i..].find("<think>");
+            let next_close = combined[i..].find("</think>");
+            if let Some(c) = next_close.filter(|&c| next_open.is_none_or(|o| c < o)) {
+                // A closing tag before any opening — a leaked reasoning
+                // terminator whose `<think>` was dropped upstream (e.g. MiniMax
+                // emits a bare `</think>`). Drop this buffer's reasoning tail up
+                // to and including it; stay outside a think block.
+                i += c + "</think>".len();
+            } else if let Some(start_rel) = next_open {
                 let start_abs = i + start_rel;
                 out.push_str(&combined[i..start_abs]);
                 i = start_abs + "<think>".len();
                 *in_think = true;
             } else {
-                // Maybe a partial opening tag — buffer the tail if it
-                // could be the start of `<think>`.
+                // No complete tag left. A partial `<think>` or `</think>` may
+                // straddle the chunk boundary (`<thi`, `</thin`, …) — buffer
+                // the longest suffix that could begin either tag, emit the rest.
+                // The char-boundary guard keeps multi-byte tails (em-dash =
+                // 3 bytes) from slicing mid-char and panicking.
                 let tail = &combined[i..];
-                let max_partial = "<think>".len() - 1;
-                // `len() - N` is a BYTE offset and can land inside a multi-byte char (e.g. an
-                // em-dash is 3 bytes) — slicing there panics. Walk back to a char boundary.
-                let mut candidate_start = tail.len().saturating_sub(max_partial);
-                while candidate_start > 0 && !tail.is_char_boundary(candidate_start) {
-                    candidate_start -= 1;
+                let mut cut = tail.len();
+                let mut j = 0;
+                while j < tail.len() {
+                    if tail.is_char_boundary(j) {
+                        let suffix = &tail[j..];
+                        if "<think>".starts_with(suffix) || "</think>".starts_with(suffix) {
+                            cut = j;
+                            break;
+                        }
+                    }
+                    j += 1;
                 }
-                let suffix = &tail[candidate_start..];
-                if !suffix.is_empty() && "<think>".starts_with(suffix) {
-                    out.push_str(&tail[..candidate_start]);
-                    partial.push_str(suffix);
-                } else {
-                    out.push_str(tail);
-                }
+                out.push_str(&tail[..cut]);
+                partial.push_str(&tail[cut..]);
                 return out;
             }
         }
@@ -2540,6 +2559,68 @@ mod tests {
         let out = filter_think_tags(" — I'm", &mut in_think, &mut partial);
         assert_eq!(format!("{out}{partial}"), " — I'm");
         assert!(!in_think);
+    }
+
+    #[test]
+    fn strip_think_tags_drops_orphan_closing_tag() {
+        // MiniMax sometimes emits a bare `</think>` (its opening tag lives in a
+        // separate reasoning field). Everything up to and including it is leaked
+        // reasoning and must not surface.
+        assert_eq!(strip_think_tags("</think>The answer."), "The answer.");
+        assert_eq!(
+            strip_think_tags("weighing options</think>Final answer"),
+            "Final answer",
+        );
+        // A leading orphan followed by a normal paired block.
+        assert_eq!(
+            strip_think_tags("reasoning</think>A <think>more</think>B"),
+            "A B",
+        );
+    }
+
+    /// Feed `text` through `filter_think_tags` one char at a time to exercise
+    /// chunk-boundary handling; returns the concatenated visible output.
+    fn stream_filter(text: &str) -> String {
+        let mut in_think = false;
+        let mut partial = String::new();
+        let mut out = String::new();
+        for ch in text.chars() {
+            out.push_str(&filter_think_tags(
+                &ch.to_string(),
+                &mut in_think,
+                &mut partial,
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn filter_think_tags_strips_orphan_closing_tag() {
+        // Single delta: a bare `</think>` (plus any reasoning tail in the same
+        // buffer) is dropped, leaving only the answer.
+        let mut in_think = false;
+        let mut partial = String::new();
+        assert_eq!(
+            filter_think_tags("</think>Hello", &mut in_think, &mut partial),
+            "Hello",
+        );
+        assert!(!in_think);
+        let mut in_think = false;
+        let mut partial = String::new();
+        assert_eq!(
+            filter_think_tags("mulling it over</think>Done", &mut in_think, &mut partial),
+            "Done",
+        );
+    }
+
+    #[test]
+    fn filter_think_tags_orphan_close_split_across_chunks() {
+        // A leading `</think>` split character-by-character is still stripped
+        // (nothing real precedes it, so nothing leaks).
+        assert_eq!(stream_filter("</think>answer"), "answer");
+        // Normal paired blocks and plain text survive char-streaming unchanged.
+        assert_eq!(stream_filter("A<think>hidden</think>B"), "AB");
+        assert_eq!(stream_filter("plain text"), "plain text");
     }
 
     #[test]
