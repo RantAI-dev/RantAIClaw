@@ -118,43 +118,47 @@ async fn get_config(
     Ok(Json(val))
 }
 
-/// Recursively null every JSON field whose key names a secret. Runs on the
+/// Recursively redact every JSON field whose key names a secret. Runs on the
 /// serialized config response as a completeness guarantee behind the typed
-/// `redact_config_secrets`. Exact key-name match (not substring) so a non-secret
-/// like `max_tokens` is never redacted.
+/// `redact_config_secrets`.
+///
+/// Matches by secret-bearing SUFFIX (`_token`, `_secret`, `_password`, `_key`)
+/// so credentials across ALL channels — and future ones — are caught by shape:
+/// `server_password`/`nickserv_password` (IRC), `encrypt_key`/`verification_token`
+/// (Lark), `verify_token` (WhatsApp), etc. The suffixes are chosen NOT to hit
+/// non-secret look-alikes: `secrets` (a config section), `max_tokens` /
+/// `chunk_max_tokens` (counts ending in the plural `_tokens`), and
+/// `rate_limit_max_keys` / `idempotency_max_keys` (counts ending in `_keys`).
 fn redact_secrets_in_json(v: &mut serde_json::Value) {
     fn is_secret_key(k: &str) -> bool {
-        matches!(
-            k.to_ascii_lowercase().as_str(),
-            "api_key"
-                | "api_keys"
-                | "provider_api_keys"
-                | "brave_api_key"
-                | "embedding_api_key"
-                | "vision_api_key"
-                | "bot_token"
-                | "app_token"
-                | "access_token"
-                | "api_token"
-                | "auth_token"
-                | "token"
-                | "paired_tokens"
-                | "app_secret"
-                | "signing_secret"
-                | "webhook_secret"
-                | "client_secret"
-                | "secret"
-                | "password_hash"
-                | "password"
-                | "db_url"
-                | "private_key"
-        )
+        let k = k.to_ascii_lowercase();
+        k.ends_with("_token")           // bot_token, access_token, verify_token, verification_token, …
+            || k == "token"             // bare matrix / tunnel token
+            || k == "paired_tokens"     // hashed pairing tokens
+            || k.ends_with("_secret")   // app_secret, webhook_secret, signing_secret, client_secret
+            || k == "secret"            // webhook.secret
+            || k.ends_with("_password") // server_password, nickserv_password, sasl_password
+            || k == "password"
+            || k == "password_hash"
+            || k.ends_with("_key")      // api_key, encrypt_key, private_key, brave_api_key, …
+            || k == "api_keys"          // reliability key list
+            || k == "provider_api_keys" // per-provider key map
+            || k.contains("credential")
+            || k == "db_url"
     }
     match v {
         serde_json::Value::Object(map) => {
             for (k, child) in map.iter_mut() {
                 if is_secret_key(k) && !child.is_null() {
-                    *child = serde_json::Value::Null;
+                    // Preserve the JSON type where possible: a string secret
+                    // becomes "" (not null) so the console, if it types the field
+                    // as a non-nullable string, doesn't break on the redacted
+                    // response. Key maps/lists become null.
+                    *child = if child.is_string() {
+                        serde_json::Value::String(String::new())
+                    } else {
+                        serde_json::Value::Null
+                    };
                 } else {
                     redact_secrets_in_json(child);
                 }
@@ -930,20 +934,26 @@ mod tests {
                 "telegram": { "bot_token": "SEC_TG", "allowed_users": ["u"] },
                 "discord": { "bot_token": "SEC_DISCORD" },
                 "slack": { "bot_token": "SEC_SLACK", "app_token": "SEC_SLACK_APP" },
-                "whatsapp": { "access_token": "SEC_WA", "app_secret": "SEC_WA_SECRET" },
+                "whatsapp": { "access_token": "SEC_WA", "app_secret": "SEC_WA_SECRET", "verify_token": "SEC_WA_VERIFY" },
                 "linq": { "api_token": "SEC_LINQ", "signing_secret": "SEC_LINQ_SIG" },
                 "nextcloud_talk": { "app_token": "SEC_NC", "webhook_secret": "SEC_NC_WH" },
                 "matrix": { "token": "SEC_MATRIX" },
                 "webhook": { "secret": "SEC_WEBHOOK" },
+                "irc": { "server_password": "SEC_IRC_SRV", "nickserv_password": "SEC_IRC_NS", "sasl_password": "SEC_IRC_SASL" },
+                "lark": { "encrypt_key": "SEC_LARK_ENC", "verification_token": "SEC_LARK_VER" },
             },
             "gateway": {
                 "login": { "password_hash": "SEC_PWHASH" },
                 "paired_tokens": ["SEC_PAIRED"],
+                "rate_limit_max_keys": 10000,
+                "idempotency_max_keys": 10000,
             },
             "tunnel": { "auth_token": "SEC_TUNNEL" },
             "api_key": "SEC_API",
             "provider_api_keys": { "openai": "SEC_PROVIDER" },
+            "secrets": { "encrypt": true },
             "agent": { "max_tokens": 4096, "max_history_messages": 50 },
+            "knowledge": { "chunk_max_tokens": 512 },
         });
         redact_secrets_in_json(&mut v);
         let json = v.to_string();
@@ -954,12 +964,18 @@ mod tests {
             "SEC_SLACK_APP",
             "SEC_WA",
             "SEC_WA_SECRET",
+            "SEC_WA_VERIFY",
             "SEC_LINQ",
             "SEC_LINQ_SIG",
             "SEC_NC",
             "SEC_NC_WH",
             "SEC_MATRIX",
             "SEC_WEBHOOK",
+            "SEC_IRC_SRV",
+            "SEC_IRC_NS",
+            "SEC_IRC_SASL",
+            "SEC_LARK_ENC",
+            "SEC_LARK_VER",
             "SEC_PWHASH",
             "SEC_PAIRED",
             "SEC_TUNNEL",
@@ -971,9 +987,25 @@ mod tests {
                 "secret {sec} leaked in GET /config: {json}"
             );
         }
-        // Non-secret numeric field whose key contains "token" must NOT be nulled.
+        // Non-secret look-alikes (counts / a config SECTION named `secrets`) whose
+        // keys share a secret stem must NOT be nulled.
         assert_eq!(v["agent"]["max_tokens"], serde_json::json!(4096));
         assert_eq!(v["agent"]["max_history_messages"], serde_json::json!(50));
+        assert_eq!(v["knowledge"]["chunk_max_tokens"], serde_json::json!(512));
+        assert_eq!(
+            v["gateway"]["rate_limit_max_keys"],
+            serde_json::json!(10000)
+        );
+        assert_eq!(
+            v["gateway"]["idempotency_max_keys"],
+            serde_json::json!(10000)
+        );
+        assert_eq!(v["secrets"]["encrypt"], serde_json::json!(true));
+        // String secrets are redacted to "" (type preserved), not null.
+        assert_eq!(
+            v["channels_config"]["telegram"]["bot_token"],
+            serde_json::json!("")
+        );
     }
 
     #[test]
