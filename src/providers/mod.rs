@@ -807,6 +807,14 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 /// For MiniMax, OAuth mode supports `api_key = "minimax-oauth"`, resolving credentials from
 /// `MINIMAX_OAUTH_TOKEN` first, then `MINIMAX_API_KEY`, and finally
 /// `MINIMAX_OAUTH_REFRESH_TOKEN` (automatic access-token refresh).
+/// True when `name` resolves a usable credential — from `config_key` (an
+/// explicit config/api_key value) or a provider-specific env var. Providers that
+/// need no key (or none is configured/env-set) return `false`; the gateway uses
+/// this to warn when a switched provider likely can't be used.
+pub fn has_usable_credential(name: &str, config_key: Option<&str>) -> bool {
+    resolve_provider_credential(name, config_key).is_some()
+}
+
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
     let mut minimax_oauth_placeholder_requested = false;
 

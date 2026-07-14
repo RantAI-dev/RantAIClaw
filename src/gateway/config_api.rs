@@ -157,12 +157,31 @@ async fn persist_and_swap(state: &AppState, cfg: crate::config::Config) -> Resul
     Ok(())
 }
 
+/// If a provider switch left the active provider without a usable credential,
+/// return a warning to surface in the UI. The switch still persisted — this is a
+/// heads-up that channels (and web chat) can't use the new provider until a key
+/// is configured. Hedged wording so it's also correct for keyless providers.
+fn provider_switch_warning(cfg: &crate::config::Config, provider_changed: bool) -> Option<String> {
+    if !provider_changed {
+        return None;
+    }
+    let provider = cfg.default_provider.as_deref()?;
+    if crate::providers::has_usable_credential(provider, cfg.api_key.as_deref()) {
+        return None;
+    }
+    Some(format!(
+        "No API key found for '{provider}'. If it needs one, channels and chat \
+         can't use it until you add it in Configuration."
+    ))
+}
+
 async fn set_model(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ModelBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
+    let provider_changed = body.provider.is_some();
     let mut cfg = state.config.lock().clone();
     if let Some(p) = body.provider {
         let new_provider = if p.trim().is_empty() {
@@ -182,11 +201,15 @@ async fn set_model(
     if let Some(t) = body.temperature {
         cfg.default_temperature = t;
     }
-    let resp = json!({
+    let warning = provider_switch_warning(&cfg, provider_changed);
+    let mut resp = json!({
         "default_provider": cfg.default_provider,
         "default_model": cfg.default_model,
         "default_temperature": cfg.default_temperature,
     });
+    if let Some(w) = warning {
+        resp["warning"] = json!(w);
+    }
     persist_and_swap(&state, cfg).await?;
     Ok(Json(resp))
 }
@@ -772,6 +795,27 @@ mod tests {
         assert!(!json.contains("sk-vision-secret"));
         assert_eq!(cfg.knowledge.embedding_api_key, None);
         assert_eq!(cfg.knowledge.vision_api_key, None);
+    }
+
+    #[test]
+    fn provider_switch_warning_flags_a_provider_without_a_credential() {
+        // An unknown provider name has no env candidates, so with no config key it
+        // resolves no credential -> warn. Env-independent, hence deterministic.
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("totally-unknown-provider-xyz".into());
+        cfg.api_key = None;
+        assert!(
+            provider_switch_warning(&cfg, true).is_some(),
+            "warns when the switched provider has no usable credential"
+        );
+
+        // A configured key resolves a credential -> no warning.
+        cfg.api_key = Some("sk-configured".into());
+        assert!(provider_switch_warning(&cfg, true).is_none());
+
+        // No provider change -> never warns.
+        cfg.api_key = None;
+        assert!(provider_switch_warning(&cfg, false).is_none());
     }
 
     #[test]

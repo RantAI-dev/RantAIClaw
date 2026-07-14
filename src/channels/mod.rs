@@ -198,11 +198,26 @@ struct ConfigFileStamp {
 struct RuntimeConfigState {
     defaults: ChannelRuntimeDefaults,
     last_applied_stamp: Option<ConfigFileStamp>,
+    /// Reason the most recent reload could not apply the new provider (e.g. no
+    /// usable API key). `Some` means the runtime kept the previous provider.
+    last_reload_error: Option<String>,
 }
 
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
     static STORE: OnceLock<Mutex<HashMap<PathBuf, RuntimeConfigState>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The most recent reload failure reason for `config_path`, if the runtime kept
+/// the previous provider instead of swapping to a broken one. Exposed so an
+/// operator surface can report why a channel didn't follow a provider switch.
+#[cfg_attr(not(test), allow(dead_code))]
+fn last_reload_error(config_path: &Path) -> Option<String> {
+    runtime_config_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(config_path)
+        .and_then(|s| s.last_reload_error.clone())
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "rantaiclaw.service"];
@@ -594,13 +609,43 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     }
 
     let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
-    let next_default_provider = providers::create_resilient_provider_with_options(
+    // Snapshot the currently-applied defaults BEFORE we overwrite the store, so we
+    // can tell whether the operator actually changed the provider/model.
+    let prev_defaults = runtime_defaults_snapshot(ctx);
+    let next_default_provider = match providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
         next_defaults.api_url.as_deref(),
         &next_defaults.reliability,
         &ctx.provider_runtime_options,
-    )?;
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            // Can't build the new provider (e.g. no usable API key). Keep the
+            // working provider + previously-applied defaults; advance the stamp so
+            // we don't rebuild-and-fail on every message; record the reason so an
+            // operator surface can report it. The operator's fix is itself a config
+            // write, which changes the stamp and re-triggers this reload.
+            let reason = format!("provider '{}': {err}", next_defaults.default_provider);
+            tracing::warn!(
+                provider = %next_defaults.default_provider,
+                "Config reload kept the previous provider — could not build the new one: {err}"
+            );
+            let mut store = runtime_config_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = store
+                .entry(config_path.clone())
+                .or_insert_with(|| RuntimeConfigState {
+                    defaults: prev_defaults.clone(),
+                    last_applied_stamp: None,
+                    last_reload_error: None,
+                });
+            entry.last_applied_stamp = Some(stamp);
+            entry.last_reload_error = Some(reason);
+            return Ok(());
+        }
+    };
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
 
     if let Err(err) = next_default_provider.warmup().await {
@@ -644,8 +689,31 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             RuntimeConfigState {
                 defaults: next_defaults.clone(),
                 last_applied_stamp: Some(stamp),
+                last_reload_error: None,
             },
         );
+    }
+
+    // If the operator changed the provider or default model (Web-UI switch or a
+    // direct config edit), clear per-sender route overrides so senders pinned by
+    // an in-chat `/model` / `/models` re-base to the new default — the operator
+    // switch wins. Only clear on an actual change, never on unrelated reloads.
+    if prev_defaults.default_provider != next_defaults.default_provider
+        || prev_defaults.model != next_defaults.model
+    {
+        let mut routes = ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !routes.is_empty() {
+            tracing::info!(
+                cleared = routes.len(),
+                provider = %next_defaults.default_provider,
+                model = %next_defaults.model,
+                "Cleared per-sender route overrides after a provider/model change"
+            );
+            routes.clear();
+        }
     }
 
     tracing::info!(
@@ -3083,6 +3151,7 @@ pub async fn start_channels_with_cancellation(
             RuntimeConfigState {
                 defaults: runtime_defaults_from_config(&config),
                 last_applied_stamp: initial_stamp,
+                last_reload_error: None,
             },
         );
     }
@@ -4795,6 +4864,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         autonomy_level: crate::security::AutonomyLevel::Supervised,
                     },
                     last_applied_stamp: None,
+                    last_reload_error: None,
                 },
             );
         }
@@ -4996,6 +5066,207 @@ BTC is currently around $65,000 based on latest tool output."#
                 .unwrap_or_else(|e| e.into_inner());
             store.remove(&config_path);
         }
+    }
+
+    #[tokio::test]
+    async fn maybe_apply_runtime_config_update_clears_pinned_sender_on_provider_switch() {
+        // A per-sender override (set via /model in-channel) pins that sender to a
+        // provider. A Web-UI provider switch rewrites config.toml; the reload must
+        // CLEAR the override so the pinned sender follows the new default —
+        // otherwise the switch never reaches them (the reported bug).
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+
+        let write_config = |provider: &str, model: &str| {
+            let mut config = crate::config::Config::default();
+            config.default_provider = Some(provider.to_string());
+            config.default_model = Some(model.to_string());
+            let toml = toml::to_string(&config).expect("serialize config");
+            std::fs::write(&config_path, toml).expect("write config");
+        };
+
+        write_config("openrouter", "model-a");
+
+        let mut channels_by_name = HashMap::new();
+        let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("model-a".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                rantaiclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+        };
+
+        // Seed the store from the initial config.
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("initial apply");
+
+        // A sender pins their own provider/model in-channel — differs from the
+        // default, so it is stored as an override.
+        set_route_selection(
+            &ctx,
+            "sender-1",
+            ChannelRouteSelection {
+                provider: "groq".to_string(),
+                model: "model-b".to_string(),
+            },
+        );
+        assert_eq!(
+            get_route_selection(&ctx, "sender-1").provider,
+            "groq",
+            "override is active before the switch"
+        );
+
+        // Operator switches provider in the Web UI → config.toml changes.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_config("deepseek", "model-c");
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload apply");
+
+        // The pinned sender must now follow the new default (override cleared).
+        let route = get_route_selection(&ctx, "sender-1");
+        assert_eq!(
+            route.provider, "deepseek",
+            "pinned sender re-based to the new provider after a Web-UI switch"
+        );
+        assert_eq!(
+            route.model, "model-c",
+            "pinned sender re-based to the new model"
+        );
+
+        runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&config_path);
+    }
+
+    #[tokio::test]
+    async fn maybe_apply_runtime_config_update_keeps_provider_and_records_reason_on_build_failure()
+    {
+        // Switching to a provider that can't be built (unknown / no usable key)
+        // must NOT swap the channel onto a broken provider: keep the working one,
+        // advance the stamp (no per-message retry loop), and record the reason.
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+
+        let write_config = |provider: &str, model: &str| {
+            let mut config = crate::config::Config::default();
+            config.default_provider = Some(provider.to_string());
+            config.default_model = Some(model.to_string());
+            let toml = toml::to_string(&config).expect("serialize config");
+            std::fs::write(&config_path, toml).expect("write config");
+        };
+
+        write_config("openrouter", "model-a");
+
+        let mut channels_by_name = HashMap::new();
+        let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("model-a".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                rantaiclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+        };
+
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("initial apply");
+        assert_eq!(
+            runtime_defaults_snapshot(&ctx).default_provider,
+            "openrouter"
+        );
+
+        // Switch to a provider that cannot be built.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_config("nonexistent-provider-xyz", "whatever");
+        // Must return Ok (kept the old provider), not propagate the build error.
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload keeps old provider on failure");
+
+        assert_eq!(
+            runtime_defaults_snapshot(&ctx).default_provider,
+            "openrouter",
+            "kept the working provider instead of swapping to a broken one"
+        );
+        assert!(
+            last_reload_error(&config_path).is_some(),
+            "recorded the reload failure reason for surfacing"
+        );
+
+        runtime_config_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&config_path);
     }
 
     // TODO(agent-loop): regressed between v0.4 and v0.6 — the agent returns
