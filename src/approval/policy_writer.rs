@@ -201,6 +201,50 @@ pub fn read_active_preset(policy_dir: &Path) -> Option<PolicyPreset> {
     PolicyPreset::from_str_ci(preset_str).ok()
 }
 
+/// Classify a live autonomy config back into the `PolicyPreset` it represents —
+/// the inverse of [`apply_preset_to_config`]. The gateway UI edits autonomy via
+/// granular `level`/`always_ask` fields rather than by preset name, so this lets
+/// the gateway keep the on-disk preset marker in step. Mirrors the console's
+/// `levelToRung`.
+pub fn preset_for_autonomy(autonomy: &crate::config::AutonomyConfig) -> PolicyPreset {
+    use crate::security::AutonomyLevel;
+    match autonomy.level {
+        AutonomyLevel::ReadOnly => PolicyPreset::Strict,
+        AutonomyLevel::Full => PolicyPreset::Off,
+        AutonomyLevel::Supervised if autonomy.always_ask.is_empty() => PolicyPreset::Smart,
+        AutonomyLevel::Supervised => PolicyPreset::Manual,
+    }
+}
+
+/// Update **only** the active-preset marker in `<policy_dir>/autonomy.toml`,
+/// preserving every other field and leaving `command_allowlist.toml` /
+/// `forbidden_paths.toml` untouched. The gateway calls this after an autonomy
+/// change so the agent's system prompt (which reads the marker via
+/// [`read_active_preset`]) reflects the enforced policy — without rewriting the
+/// allowlist bundle, which the enforcement gate must never have change under it.
+pub fn write_active_preset(policy_dir: &Path, preset: PolicyPreset) -> Result<()> {
+    let path = policy_dir.join("autonomy.toml");
+    let mut table: toml::value::Table = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| toml::from_str(&raw).ok())
+        .unwrap_or_default();
+    let autonomy = table
+        .entry("autonomy".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+    if let Some(t) = autonomy.as_table_mut() {
+        t.insert(
+            "preset".to_string(),
+            toml::Value::String(preset.id().to_string()),
+        );
+    }
+    fs::create_dir_all(policy_dir)
+        .with_context(|| format!("create policy dir {}", policy_dir.display()))?;
+    let serialized =
+        toml::to_string(&toml::Value::Table(table)).context("serialize autonomy.toml")?;
+    fs::write(&path, serialized).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 // ── Bundle deserialisation ──────────────────────────────────────
 
 /// In-memory shape of a preset bundle. Mirrors the TOML files under
@@ -654,6 +698,56 @@ mod tests {
         assert!(err.to_string().contains("unknown policy preset"));
         let err2 = PolicyPreset::from_str_ci("L42").unwrap_err();
         assert!(err2.to_string().contains("unknown policy preset"));
+    }
+
+    #[test]
+    fn preset_for_autonomy_maps_each_level() {
+        use crate::config::AutonomyConfig;
+        use crate::security::AutonomyLevel;
+        let cfg = |level, always_ask: &[&str]| AutonomyConfig {
+            level,
+            always_ask: always_ask.iter().map(|s| s.to_string()).collect(),
+            ..AutonomyConfig::default()
+        };
+        assert_eq!(
+            preset_for_autonomy(&cfg(AutonomyLevel::ReadOnly, &[])),
+            PolicyPreset::Strict
+        );
+        assert_eq!(
+            preset_for_autonomy(&cfg(AutonomyLevel::Full, &[])),
+            PolicyPreset::Off
+        );
+        assert_eq!(
+            preset_for_autonomy(&cfg(AutonomyLevel::Supervised, &[])),
+            PolicyPreset::Smart
+        );
+        assert_eq!(
+            preset_for_autonomy(&cfg(AutonomyLevel::Supervised, &["shell"])),
+            PolicyPreset::Manual
+        );
+    }
+
+    #[test]
+    fn write_active_preset_updates_marker_and_preserves_other_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("autonomy.toml"),
+            "[autonomy]\npreset = \"off\"\nkeep_me = 42\n",
+        )
+        .unwrap();
+        write_active_preset(tmp.path(), PolicyPreset::Manual).unwrap();
+        // marker now reads back as the new preset (what the system prompt sees)
+        assert_eq!(read_active_preset(tmp.path()), Some(PolicyPreset::Manual));
+        // an unrelated field in the same section survived the rewrite
+        let raw = fs::read_to_string(tmp.path().join("autonomy.toml")).unwrap();
+        assert!(raw.contains("keep_me = 42"));
+    }
+
+    #[test]
+    fn write_active_preset_creates_marker_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_active_preset(tmp.path(), PolicyPreset::Smart).unwrap();
+        assert_eq!(read_active_preset(tmp.path()), Some(PolicyPreset::Smart));
     }
 
     #[test]

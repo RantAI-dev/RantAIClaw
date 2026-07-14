@@ -265,6 +265,20 @@ async fn set_autonomy(
     if let Some(v) = body.require_approval_for_medium_risk {
         cfg.autonomy.require_approval_for_medium_risk = v;
     }
+    // Keep the on-disk preset marker (which the agent's system prompt reads via
+    // `read_active_preset`) in step with the enforced policy, so the model never
+    // narrates a stale approval mode. Marker-only: the enforcement gate reads
+    // `config.toml` (updated by `persist_and_swap` below), so this touches
+    // nothing the gate depends on. Best-effort — a marker write failure must not
+    // fail the autonomy update itself.
+    if let Ok(profile) = crate::profile::ProfileManager::active() {
+        let preset = crate::approval::policy_writer::preset_for_autonomy(&cfg.autonomy);
+        if let Err(e) =
+            crate::approval::policy_writer::write_active_preset(&profile.policy_dir(), preset)
+        {
+            tracing::warn!(error = %e, "failed to sync policy preset marker after autonomy change");
+        }
+    }
     let resp = serde_json::to_value(&cfg.autonomy).map_err(err_500)?;
     persist_and_swap(&state, cfg).await?;
     Ok(Json(resp))
