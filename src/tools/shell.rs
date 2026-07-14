@@ -12,6 +12,12 @@ use tokio::io::AsyncReadExt;
 /// Generous enough for real installs (apt/dpkg, `docker pull`, image builds);
 /// a genuinely hung command still dies at this bound.
 const SHELL_TIMEOUT_SECS: u64 = 600;
+/// Grace period to drain already-flushed output after the direct shell exits but
+/// a pipe is still held open by a backgrounded grandchild. Long enough to collect
+/// the shell's buffered output (a pipe holds ≤64KB, drained in <1ms), short
+/// enough that returning still feels instant instead of blocking on the detached
+/// child's whole lifetime.
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
@@ -31,17 +37,21 @@ An operator can allow the base command via [autonomy].allowed_commands in config
 or remove approval prompts entirely with `rantaiclaw autonomy full` \
 (no prompts — use only in trusted/sandboxed environments).";
 
-/// Read an async pipe to EOF, keeping at most `cap` bytes in memory. Bytes past
-/// the cap are still drained (so the child never blocks on a full pipe) but
-/// discarded — a runaway command can't OOM the agent, unlike `Command::output`
-/// which buffers everything before truncation.
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+/// Read an async pipe to EOF, appending into `buf` (kept at most `cap` bytes).
+/// Bytes past the cap are still drained (so the child never blocks on a full
+/// pipe) but discarded — a runaway command can't OOM the agent, unlike
+/// `Command::output` which buffers everything before truncation.
+///
+/// The buffer is a caller-owned `&mut Vec<u8>` (not a return value) so that when
+/// the caller stops this future early — e.g. the shell exited but a backgrounded
+/// grandchild still holds the pipe open — the bytes read so far are preserved.
+async fn read_into_capped<R: tokio::io::AsyncRead + Unpin>(
     reader: Option<&mut R>,
+    buf: &mut Vec<u8>,
     cap: usize,
-) -> Vec<u8> {
-    let mut buf = Vec::new();
+) {
     let Some(reader) = reader else {
-        return buf;
+        return;
     };
     // Heap buffer (not a stack array) so the read future stays small.
     let mut chunk = vec![0u8; 8192];
@@ -56,7 +66,6 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
             }
         }
     }
-    buf
 }
 
 /// RAII guard that reaps the shell's whole process group on drop — i.e. when the
@@ -383,17 +392,41 @@ impl Tool for ShellTool {
 
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
-        let collect = async {
-            let (out_bytes, err_bytes) = tokio::join!(
-                read_capped(stdout_pipe.as_mut(), MAX_OUTPUT_BYTES),
-                read_capped(stderr_pipe.as_mut(), MAX_OUTPUT_BYTES),
-            );
-            let status = child.wait().await;
-            (status, out_bytes, err_bytes)
+        let mut out_bytes = Vec::new();
+        let mut err_bytes = Vec::new();
+        // Drain output and wait for the DIRECT child concurrently, but stop
+        // reading once the shell itself exits. A backgrounded grandchild
+        // (`sleep 300 &`, a started server) inherits the stdout/stderr pipes, so
+        // draining to EOF used to block the tool for the full timeout — and then
+        // the process-group kill reaped the very job the caller launched. Now we
+        // return on the shell's own exit, keeping whatever it already flushed.
+        let exec = async {
+            let waited = child.wait();
+            tokio::pin!(waited);
+            let read_both = async {
+                tokio::join!(
+                    read_into_capped(stdout_pipe.as_mut(), &mut out_bytes, MAX_OUTPUT_BYTES),
+                    read_into_capped(stderr_pipe.as_mut(), &mut err_bytes, MAX_OUTPUT_BYTES),
+                );
+            };
+            tokio::pin!(read_both);
+            tokio::select! {
+                // Pipes reached EOF (shell and any inheritors all closed) — the
+                // ordinary case, with the full output captured.
+                () = &mut read_both => (&mut waited).await,
+                // Shell exited while a pipe is still held open by a detached
+                // grandchild: grab whatever the shell already flushed, then stop
+                // rather than waiting on the grandchild's whole lifetime.
+                status = &mut waited => {
+                    let _ = tokio::time::timeout(POST_EXIT_DRAIN, &mut read_both).await;
+                    status
+                }
+            }
         };
+        let timed = tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), exec).await;
 
-        match tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), collect).await {
-            Ok((Ok(status), out_bytes, err_bytes)) => {
+        match timed {
+            Ok(Ok(status)) => {
                 // Completed on its own — disarm so we never signal a reused pgid.
                 group_kill.disarm();
                 let mut stdout = String::from_utf8_lossy(&out_bytes).to_string();
@@ -440,11 +473,17 @@ impl Tool for ShellTool {
                     })
                 }
             }
-            Ok((Err(e), _, _)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to wait on command: {e}")),
-            }),
+            Ok(Err(e)) => {
+                // wait() failed (e.g. the child was already reaped, ECHILD).
+                // Disarm: the process is gone, so signalling its pgid could only
+                // hit a since-reused group — same invariant as the success path.
+                group_kill.disarm();
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to wait on command: {e}")),
+                })
+            }
             // Timeout: `group_kill` (still armed) drops after this match and reaps
             // the whole group, so the message is now accurate.
             Err(_) => Ok(ToolResult {
@@ -562,6 +601,100 @@ mod tests {
             .await
             .expect("command with nonexistent path should return a result");
         assert!(!result.success);
+    }
+
+    /// A backgrounded grandchild inherits the shell's stdout/stderr pipes. The
+    /// tool must return when the direct shell exits — not block until the
+    /// grandchild dies (draining to EOF previously hung it for the full
+    /// SHELL_TIMEOUT_SECS, then SIGKILLed the very job it launched).
+    #[tokio::test]
+    async fn shell_returns_promptly_when_a_child_is_backgrounded() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
+        let start = std::time::Instant::now();
+        let result = tool
+            .execute(json!({"command": "echo started; sleep 3 &"}))
+            .await
+            .expect("backgrounded command should return a result");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "shell blocked on a backgrounded child for {elapsed:?} (expected prompt return)"
+        );
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(
+            result.output.contains("started"),
+            "flushed output before exit must survive the drain: {:?}",
+            result.output
+        );
+    }
+
+    /// The drain-on-exit restructure must not truncate a normal command's
+    /// output: a command that exits on its own still yields every line.
+    #[tokio::test]
+    async fn shell_captures_full_output_of_a_normal_command() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
+        let result = tool
+            .execute(json!({"command": "seq 1 1000"}))
+            .await
+            .expect("seq command should return a result");
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(
+            result.output.contains("\n1000"),
+            "final line missing — output was truncated"
+        );
+        assert_eq!(
+            result
+                .output
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count(),
+            1000
+        );
+    }
+
+    /// Cancelling a running shell command (dropping the execute future) must still
+    /// reap the WHOLE process group — the backgrounded grandchild included — so
+    /// the drain-on-exit change didn't weaken the Stop/timeout kill path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_cancel_reaps_the_whole_process_group() {
+        let pidfile =
+            std::env::temp_dir().join(format!("rantaiclaw_pgtest_{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
+        // Background a long sleep, record its pid, then block so the execute
+        // future is still in-flight when we cancel it.
+        let cmd = format!("sleep 30 & echo $! > {} ; wait", pidfile.display());
+        let handle = tokio::spawn(async move { tool.execute(json!({ "command": cmd })).await });
+
+        // Wait until the backgrounded child has actually started.
+        let mut pid = None;
+        for _ in 0..200 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    pid = Some(p);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = pid.expect("backgrounded child should have recorded its pid");
+
+        // Cancel mid-run: dropping the future fires the process-group killer.
+        handle.abort();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let _ = std::fs::remove_file(&pidfile);
+        if alive {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !alive,
+            "backgrounded child pid {pid} survived cancel — process group not reaped"
+        );
     }
 
     fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {
