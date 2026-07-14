@@ -505,11 +505,26 @@ pub(crate) fn filter_think_tags(input: &str, in_think: &mut bool, partial: &mut 
                 i = end_abs;
                 *in_think = false;
             } else {
-                // Maybe a partial closing tag at the tail — buffer it.
+                // No complete `</think>` in this buffer. The reasoning text is
+                // discarded, but a partial closing tag may straddle the chunk
+                // boundary (`reasoning</thi`) — buffer the longest tail suffix
+                // that could BEGIN `</think>` so the close is re-detected on the
+                // next delta. The old check only buffered when the WHOLE tail was
+                // a prefix of `</think>` or ended in `<`, so `text</thi` was
+                // dropped, `in_think` stayed stuck true, and the entire rest of
+                // the answer was swallowed. Same suffix scan as the non-think
+                // branch below; the char-boundary guard avoids slicing mid-char.
                 let tail = &combined[i..];
-                if "</think>".starts_with(tail) || tail.ends_with('<') {
-                    partial.push_str(tail);
+                let mut cut = tail.len();
+                let mut j = 0;
+                while j < tail.len() {
+                    if tail.is_char_boundary(j) && "</think>".starts_with(&tail[j..]) {
+                        cut = j;
+                        break;
+                    }
+                    j += 1;
                 }
+                partial.push_str(&tail[cut..]);
                 return out;
             }
         } else {
@@ -1809,6 +1824,17 @@ impl Provider for OpenAiCompatibleProvider {
             }
         }
 
+        // Flush any residual buffered bytes at end of stream. When NOT inside a
+        // think block, a leftover `think_partial` (a trailing `<` / `</th` that
+        // looked like a tag start but the stream ended) is literal answer text —
+        // emit it instead of silently truncating the tail. Inside an unclosed
+        // think block it's reasoning and is correctly discarded.
+        if !in_think && !think_partial.is_empty() {
+            let leftover = std::mem::take(&mut think_partial);
+            full_text.push_str(&leftover);
+            let _ = text_tx.send(leftover).await;
+        }
+
         Ok(ProviderChatResponse {
             text: if full_text.is_empty() {
                 None
@@ -2579,7 +2605,9 @@ mod tests {
     }
 
     /// Feed `text` through `filter_think_tags` one char at a time to exercise
-    /// chunk-boundary handling; returns the concatenated visible output.
+    /// chunk-boundary handling; returns the concatenated visible output. Mirrors
+    /// the streaming caller, including its end-of-stream flush of a leftover
+    /// literal partial when not inside a think block.
     fn stream_filter(text: &str) -> String {
         let mut in_think = false;
         let mut partial = String::new();
@@ -2590,6 +2618,9 @@ mod tests {
                 &mut in_think,
                 &mut partial,
             ));
+        }
+        if !in_think && !partial.is_empty() {
+            out.push_str(&partial);
         }
         out
     }
@@ -2621,6 +2652,49 @@ mod tests {
         // Normal paired blocks and plain text survive char-streaming unchanged.
         assert_eq!(stream_filter("A<think>hidden</think>B"), "AB");
         assert_eq!(stream_filter("plain text"), "plain text");
+    }
+
+    #[test]
+    fn filter_think_tags_close_split_after_reasoning_survives() {
+        // A `</think>` split across deltas AFTER reasoning text (`reasoning</th`
+        // then `ink>ANSWER`) must not swallow the answer. Regression: the in_think
+        // branch dropped the partial close, stayed stuck true, and lost the rest.
+        let mut in_think = false;
+        let mut partial = String::new();
+        let out1 = filter_think_tags("<think>reasoning</th", &mut in_think, &mut partial);
+        let out2 = filter_think_tags("ink>ANSWER", &mut in_think, &mut partial);
+        assert_eq!(
+            format!("{out1}{out2}"),
+            "ANSWER",
+            "answer after a boundary-split </think> must survive"
+        );
+        assert!(
+            !in_think,
+            "in_think must clear once the split close completes"
+        );
+
+        // Multi-block: visible X survives; the second block's split close (…</thin
+        // + k>) must still resolve so Y survives too.
+        let mut in_think = false;
+        let mut partial = String::new();
+        let a = filter_think_tags(
+            "<think>a</think>X<think>b</thin",
+            &mut in_think,
+            &mut partial,
+        );
+        let b = filter_think_tags("k>Y", &mut in_think, &mut partial);
+        assert_eq!(format!("{a}{b}"), "XY");
+        assert!(!in_think);
+    }
+
+    #[test]
+    fn filter_think_tags_flushes_trailing_tag_like_literal_at_stream_end() {
+        // An answer ending in bytes that look like the start of a tag (`<`, `</`,
+        // `</th`) must not be truncated: at end of stream the buffered literal is
+        // flushed. (Regression for the missing end-of-stream flush.)
+        assert_eq!(stream_filter("The value is <"), "The value is <");
+        assert_eq!(stream_filter("compare a < b"), "compare a < b");
+        assert_eq!(stream_filter("close with </th"), "close with </th");
     }
 
     #[test]
