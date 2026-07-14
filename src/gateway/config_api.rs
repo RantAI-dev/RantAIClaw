@@ -108,8 +108,65 @@ async fn get_config(
     // Never expose raw secrets over the API. This is a response-only copy; the
     // in-memory + on-disk config keep their real values.
     redact_config_secrets(&mut cfg);
-    let val = serde_json::to_value(&cfg).map_err(err_500)?;
+    let mut val = serde_json::to_value(&cfg).map_err(err_500)?;
+    // Backstop: the typed redactor above only clears a hardcoded set and silently
+    // missed every non-Telegram channel credential (Discord/Slack/WhatsApp/…),
+    // the gateway login hash, tunnel tokens, and paired tokens. Recursively null
+    // ANY field whose key names a secret, so a channel — including one added
+    // later — can't leak a credential over this endpoint by omission.
+    redact_secrets_in_json(&mut val);
     Ok(Json(val))
+}
+
+/// Recursively null every JSON field whose key names a secret. Runs on the
+/// serialized config response as a completeness guarantee behind the typed
+/// `redact_config_secrets`. Exact key-name match (not substring) so a non-secret
+/// like `max_tokens` is never redacted.
+fn redact_secrets_in_json(v: &mut serde_json::Value) {
+    fn is_secret_key(k: &str) -> bool {
+        matches!(
+            k.to_ascii_lowercase().as_str(),
+            "api_key"
+                | "api_keys"
+                | "provider_api_keys"
+                | "brave_api_key"
+                | "embedding_api_key"
+                | "vision_api_key"
+                | "bot_token"
+                | "app_token"
+                | "access_token"
+                | "api_token"
+                | "auth_token"
+                | "token"
+                | "paired_tokens"
+                | "app_secret"
+                | "signing_secret"
+                | "webhook_secret"
+                | "client_secret"
+                | "secret"
+                | "password_hash"
+                | "password"
+                | "db_url"
+                | "private_key"
+        )
+    }
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, child) in map.iter_mut() {
+                if is_secret_key(k) && !child.is_null() {
+                    *child = serde_json::Value::Null;
+                } else {
+                    redact_secrets_in_json(child);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                redact_secrets_in_json(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Clear every secret field before a Config is serialized into an API response.
@@ -859,6 +916,64 @@ mod tests {
         assert!(!json.contains("sk-openai-secret"), "leaked in:\n{json}");
         assert!(!json.contains("mm-secret"), "leaked in:\n{json}");
         assert!(cfg.provider_api_keys.is_empty());
+    }
+
+    #[test]
+    fn redact_secrets_in_json_nulls_all_channel_and_gateway_secrets() {
+        // Mirrors the shape `get_config` serializes: channel credentials the
+        // typed redactor missed (Discord/Slack/WhatsApp/Matrix/webhook/…), the
+        // gateway login hash + paired tokens, and tunnel tokens must all be
+        // stripped — while a non-secret like `max_tokens` (contains "token")
+        // must survive.
+        let mut v = serde_json::json!({
+            "channels_config": {
+                "telegram": { "bot_token": "SEC_TG", "allowed_users": ["u"] },
+                "discord": { "bot_token": "SEC_DISCORD" },
+                "slack": { "bot_token": "SEC_SLACK", "app_token": "SEC_SLACK_APP" },
+                "whatsapp": { "access_token": "SEC_WA", "app_secret": "SEC_WA_SECRET" },
+                "linq": { "api_token": "SEC_LINQ", "signing_secret": "SEC_LINQ_SIG" },
+                "nextcloud_talk": { "app_token": "SEC_NC", "webhook_secret": "SEC_NC_WH" },
+                "matrix": { "token": "SEC_MATRIX" },
+                "webhook": { "secret": "SEC_WEBHOOK" },
+            },
+            "gateway": {
+                "login": { "password_hash": "SEC_PWHASH" },
+                "paired_tokens": ["SEC_PAIRED"],
+            },
+            "tunnel": { "auth_token": "SEC_TUNNEL" },
+            "api_key": "SEC_API",
+            "provider_api_keys": { "openai": "SEC_PROVIDER" },
+            "agent": { "max_tokens": 4096, "max_history_messages": 50 },
+        });
+        redact_secrets_in_json(&mut v);
+        let json = v.to_string();
+        for sec in [
+            "SEC_TG",
+            "SEC_DISCORD",
+            "SEC_SLACK",
+            "SEC_SLACK_APP",
+            "SEC_WA",
+            "SEC_WA_SECRET",
+            "SEC_LINQ",
+            "SEC_LINQ_SIG",
+            "SEC_NC",
+            "SEC_NC_WH",
+            "SEC_MATRIX",
+            "SEC_WEBHOOK",
+            "SEC_PWHASH",
+            "SEC_PAIRED",
+            "SEC_TUNNEL",
+            "SEC_API",
+            "SEC_PROVIDER",
+        ] {
+            assert!(
+                !json.contains(sec),
+                "secret {sec} leaked in GET /config: {json}"
+            );
+        }
+        // Non-secret numeric field whose key contains "token" must NOT be nulled.
+        assert_eq!(v["agent"]["max_tokens"], serde_json::json!(4096));
+        assert_eq!(v["agent"]["max_history_messages"], serde_json::json!(50));
     }
 
     #[test]
