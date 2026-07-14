@@ -612,6 +612,26 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     // Snapshot the currently-applied defaults BEFORE we overwrite the store, so we
     // can tell whether the operator actually changed the provider/model.
     let prev_defaults = runtime_defaults_snapshot(ctx);
+
+    // Apply the non-provider settings FIRST, before trying to build the new
+    // provider. They don't depend on the provider, and a safety-motivated
+    // autonomy downgrade (or command-allowlist change) must take effect even when
+    // the — often unrelated — new provider can't be built. Applying them only on
+    // the success path meant `rantaiclaw autonomy off` bundled with a broken
+    // provider silently never applied.
+    //
+    // `add_runtime_command` is idempotent (dedup via a HashSet); the runtime
+    // allowlist only ever grows here, so command *removals* from config still
+    // require a restart — an acceptable limitation for a security boundary we only
+    // ever widen at runtime, never silently narrow.
+    for cmd in next_defaults.allowed_commands.iter() {
+        let _ = ctx.security.add_runtime_command(cmd, false);
+    }
+    // The autonomy level is a deliberate operator setting, applied verbatim so
+    // `rantaiclaw autonomy off`/`strict`/etc. takes effect on the running daemon
+    // at the next message, no restart required.
+    ctx.security.set_autonomy(next_defaults.autonomy_level);
+
     let next_default_provider = match providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
@@ -664,22 +684,8 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         );
     }
 
-    // Sync the autonomy command allowlist into the live SecurityPolicy so the
-    // shell tool picks up newly-owner-allowed commands without a restart.
-    // `add_runtime_command` is idempotent (dedup via a HashSet); the runtime
-    // allowlist only ever grows here, so command *removals* from config still
-    // require a restart — an acceptable limitation for a security boundary that
-    // we only ever widen at runtime, never silently narrow.
-    for cmd in next_defaults.allowed_commands.iter() {
-        let _ = ctx.security.add_runtime_command(cmd, false);
-    }
-
-    // Hot-swap the autonomy level too. Unlike the allowlist (which only ever
-    // grows at runtime), the level is a deliberate operator setting, so we
-    // apply it verbatim — `rantaiclaw autonomy off`/`strict`/etc. takes effect
-    // on the running daemon at the next message, no restart required.
-    ctx.security.set_autonomy(next_defaults.autonomy_level);
-
+    // (autonomy level + allowed_commands were already applied above, before the
+    // provider build, so they take effect even on the keep-old-provider branch.)
     {
         let mut store = runtime_config_store()
             .lock()
@@ -5058,6 +5064,108 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             live_approval_owners(&ctx).as_slice(),
             &["rantaiclaw_user".to_string()]
+        );
+
+        {
+            let mut store = runtime_config_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.remove(&config_path);
+        }
+    }
+
+    /// A config reload whose NEW provider can't be built must still apply the
+    /// non-provider settings. A safety autonomy downgrade bundled with a broken
+    /// provider previously never took effect — the reload returned early on the
+    /// keep-old-provider branch before touching the SecurityPolicy.
+    #[tokio::test]
+    async fn maybe_apply_runtime_config_update_applies_autonomy_when_provider_build_fails() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+
+        let write_config = |provider: &str, level: crate::security::AutonomyLevel| {
+            let mut config = crate::config::Config::default();
+            config.default_provider = Some(provider.to_string());
+            config.autonomy.level = level;
+            let toml = toml::to_string(&config).expect("serialize config");
+            std::fs::write(&config_path, toml).expect("write config");
+        };
+
+        // Initial: a buildable provider at Full autonomy.
+        write_config("openrouter", crate::security::AutonomyLevel::Full);
+
+        let mut channels_by_name = HashMap::new();
+        let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("startup-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                rantaiclaw_dir: Some(temp.path().to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+        };
+
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("initial apply");
+        assert_eq!(
+            ctx.security.effective_autonomy(),
+            crate::security::AutonomyLevel::Full
+        );
+
+        // Rewrite: an UNKNOWN provider (build fails) + a safety downgrade to ReadOnly.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_config(
+            "totally-unknown-provider-xyz",
+            crate::security::AutonomyLevel::ReadOnly,
+        );
+
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload returns Ok even when the new provider build fails");
+
+        // We took the keep-old-provider branch (the failure is recorded)...
+        assert!(
+            last_reload_error(&config_path).is_some(),
+            "a failed provider build should be recorded"
+        );
+        // ...yet the safety autonomy downgrade STILL took effect.
+        assert_eq!(
+            ctx.security.effective_autonomy(),
+            crate::security::AutonomyLevel::ReadOnly,
+            "autonomy downgrade must apply even when the new provider can't be built"
         );
 
         {
