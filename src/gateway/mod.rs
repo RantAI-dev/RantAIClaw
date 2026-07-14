@@ -1227,7 +1227,14 @@ async fn run_gateway_chat_with_multimodal(
     }
     history.extend(user_messages);
 
-    let multimodal_config = state.config.lock().multimodal.clone();
+    // Confine local [IMAGE:/path] markers in gateway chat input to the
+    // workspace (untrusted remote surface).
+    let multimodal_config = {
+        let cfg = state.config.lock();
+        cfg.multimodal
+            .clone()
+            .with_runtime_workspace(cfg.workspace_dir.clone())
+    };
 
     // Create approval manager from config so autonomy levels are enforced.
     // In gateway mode, tools that need approval are auto-denied (no interactive

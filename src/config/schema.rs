@@ -602,6 +602,14 @@ pub struct MultimodalConfig {
     /// Allow fetching remote image URLs (http/https). Disabled by default.
     #[serde(default)]
     pub allow_remote_fetch: bool,
+    /// Runtime-only workspace root used to confine local image-marker reads
+    /// (`[IMAGE:/path]`) that arrive from remote channels/gateway. Populated at
+    /// those entry points from the active workspace; `None` (the default — e.g.
+    /// local CLI, library/tests) leaves local reads unconfined. Never
+    /// serialized and absent from the JSON schema — not a config key.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub runtime_workspace: Option<PathBuf>,
 }
 
 fn default_multimodal_max_images() -> usize {
@@ -619,6 +627,15 @@ impl MultimodalConfig {
         let max_image_size_mb = self.max_image_size_mb.clamp(1, 20);
         (max_images, max_image_size_mb)
     }
+
+    /// Return a copy confined to `workspace`: local image-marker reads
+    /// (`[IMAGE:/path]`) will be restricted to files under it. Applied at
+    /// remote entry points (channels / gateway) to sandbox untrusted markers.
+    #[must_use]
+    pub fn with_runtime_workspace(mut self, workspace: PathBuf) -> Self {
+        self.runtime_workspace = Some(workspace);
+        self
+    }
 }
 
 impl Default for MultimodalConfig {
@@ -627,6 +644,7 @@ impl Default for MultimodalConfig {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             allow_remote_fetch: false,
+            runtime_workspace: None,
         }
     }
 }

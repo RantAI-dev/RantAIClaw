@@ -106,6 +106,7 @@ impl TuiProvisioner for MultimodalProvisioner {
             max_images,
             max_image_size_mb,
             allow_remote_fetch,
+            ..Default::default()
         };
 
         send(
