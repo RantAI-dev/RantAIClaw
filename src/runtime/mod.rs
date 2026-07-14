@@ -4,7 +4,7 @@ pub mod traits;
 
 pub use docker::DockerRuntime;
 pub use native::NativeRuntime;
-pub use traits::RuntimeAdapter;
+pub use traits::{PreparedShellCommand, RuntimeAdapter};
 
 use crate::config::RuntimeConfig;
 

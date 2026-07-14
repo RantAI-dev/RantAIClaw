@@ -1,5 +1,23 @@
 use std::path::{Path, PathBuf};
 
+/// A best-effort reaper for a resource a process-group kill can't reach — a
+/// docker container is managed by dockerd, not in the `docker run` CLI's process
+/// group, so `kill(-pgid)` only stops the CLI. The shell tool runs this on
+/// cancel/timeout to force-remove the container.
+#[derive(Debug, Clone)]
+pub struct CancelReaper {
+    /// The `--name` of the container to `docker rm -f` on cancel/timeout.
+    pub container_name: String,
+}
+
+/// A shell command plus any out-of-process-group cleanup the caller must run on
+/// cancel/timeout. `cancel_reaper` is `None` for runtimes whose process-group
+/// kill fully reaps the child (native); `Some` for docker.
+pub struct PreparedShellCommand {
+    pub command: tokio::process::Command,
+    pub cancel_reaper: Option<CancelReaper>,
+}
+
 /// Runtime adapter that abstracts platform differences for the agent.
 ///
 /// Implement this trait to port the agent to a new execution environment.
@@ -77,6 +95,25 @@ pub trait RuntimeAdapter: Send + Sync {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command>;
+
+    /// Build a shell command AND declare any out-of-process-group cleanup the
+    /// caller must run on cancel/timeout (e.g. `docker kill <container>`).
+    ///
+    /// Default: wrap [`build_shell_command`](Self::build_shell_command) with no
+    /// reaper — correct for runtimes (native) whose process-group kill fully
+    /// reaps the child. The docker runtime overrides this to name the container
+    /// and return a [`CancelReaper`], because a `docker run` container lives
+    /// under dockerd, outside the killed process group.
+    fn build_shell_command_with_cleanup(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+    ) -> anyhow::Result<PreparedShellCommand> {
+        Ok(PreparedShellCommand {
+            command: self.build_shell_command(command, workspace_dir)?,
+            cancel_reaper: None,
+        })
+    }
 }
 
 #[cfg(test)]
