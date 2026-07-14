@@ -248,6 +248,40 @@ Linux logs:
 journalctl --user -u rantaiclaw.service -f
 ```
 
+### Agent can't find a CLI tool (e.g. `kubectl`) as a service, but it worked in the TUI
+
+Symptom: a shell command the agent runs fine when you launch `rantaiclaw` interactively
+reports "not found" / "not set up" once you run it via `rantaiclaw service install` + `start`.
+Provider keys, Telegram owner, and other config-stored settings still work — only the shell
+tool is affected.
+
+Cause: a systemd `--user` service starts with a minimal `PATH` that omits user-local bin
+directories (`~/.local/bin`, `~/.cargo/bin`, `~/.nvm/…`) where operator-installed tools like
+`kubectl` usually live. Your interactive shell has them; the bare service does not.
+
+Fix: `service install` captures your current working directory and `PATH` into the unit, so
+reinstalling from a shell where the tool is on `PATH` resolves it:
+
+```bash
+which kubectl                 # confirm the tool is on your interactive PATH
+rantaiclaw service install    # re-run from that shell to capture PATH + working directory
+rantaiclaw service start
+```
+
+Or add a drop-in without reinstalling:
+
+```bash
+systemctl --user edit rantaiclaw.service
+# [Service]
+# Environment=PATH=/home/<you>/.local/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
+# WorkingDirectory=/home/<you>/<your-project>
+systemctl --user restart rantaiclaw.service
+```
+
+Caveat: the shell tool forwards only an allowlist of environment variables. A default
+`~/.kube/config` is found via `HOME` and works; a custom `KUBECONFIG` path is **not** currently
+forwarded to shell commands — point kubectl at the default location or symlink your config there.
+
 ## Web Console (`ui`)
 
 ### `ui start` says node is required
