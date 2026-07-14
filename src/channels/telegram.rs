@@ -135,6 +135,29 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
     }
 }
 
+/// Confine an outbound attachment's local path to the agent workspace.
+///
+/// Returns `true` only if `target` — after canonicalization, which resolves
+/// symlinks and `..` — lives under the canonical `workspace` root. A model
+/// reply can be influenced (or prompt-injected) by a channel guest, so an
+/// attachment marker like `[DOCUMENT:~/.rantaiclaw/config.toml]` must not be
+/// able to read arbitrary host files (config with API keys + bot token, ssh
+/// keys, `/etc/*`) and upload them to the chat. This mirrors the workspace
+/// confinement the `file_*` tools already enforce (`is_resolved_path_allowed`);
+/// the attachment path was a second, unsandboxed file read.
+///
+/// Fails closed: an unresolvable target (missing file, canonicalize error) is
+/// not sendable.
+fn attachment_path_within_workspace(target: &Path, workspace: &Path) -> bool {
+    let Ok(canonical_target) = target.canonicalize() else {
+        return false;
+    };
+    let workspace_root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    canonical_target.starts_with(&workspace_root)
+}
+
 fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
@@ -1419,6 +1442,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let path = Path::new(target);
         if !path.exists() {
             anyhow::bail!("Telegram attachment path not found: {target}");
+        }
+
+        // Confine local attachments to the workspace: a reply (which a channel
+        // guest can influence or prompt-inject) must not exfiltrate arbitrary
+        // host files — the config with API keys/bot token, ssh keys — to the
+        // chat. Mirrors the file_* tool sandbox. Resolve the active workspace
+        // lazily here (attachments are infrequent) and fail closed.
+        let (_config_path, workspace_dir) = Config::resolve_active_paths()
+            .await
+            .context("cannot resolve workspace to validate attachment path")?;
+        if !attachment_path_within_workspace(path, &workspace_dir) {
+            anyhow::bail!(
+                "Telegram attachment path is outside the workspace and was blocked: {target}"
+            );
         }
 
         match attachment.kind {
@@ -2754,6 +2791,50 @@ mod tests {
     #[test]
     fn parse_path_only_attachment_rejects_sentence_text() {
         assert!(parse_path_only_attachment("Screenshot saved to /tmp/snap.png").is_none());
+    }
+
+    #[test]
+    fn attachment_path_within_workspace_allows_file_inside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("report.pdf");
+        std::fs::write(&file, b"data").unwrap();
+        assert!(attachment_path_within_workspace(&file, workspace.path()));
+    }
+
+    #[test]
+    fn attachment_path_within_workspace_blocks_file_outside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("config.toml");
+        std::fs::write(&secret, b"bot_token = \"secret\"").unwrap();
+        // A reply containing [DOCUMENT:<secret>] must not read a file living
+        // outside the workspace and upload it to the chat.
+        assert!(!attachment_path_within_workspace(&secret, workspace.path()));
+    }
+
+    #[test]
+    fn attachment_path_within_workspace_blocks_symlink_escape() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("id_rsa");
+        std::fs::write(&secret, b"PRIVATE KEY").unwrap();
+        let link = workspace.path().join("innocent.txt");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            // canonicalize resolves the symlink to its out-of-workspace target.
+            assert!(!attachment_path_within_workspace(&link, workspace.path()));
+        }
+    }
+
+    #[test]
+    fn attachment_path_within_workspace_fails_closed_on_missing_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let missing = workspace.path().join("does-not-exist");
+        assert!(!attachment_path_within_workspace(
+            &missing,
+            workspace.path()
+        ));
     }
 
     #[test]
