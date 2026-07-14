@@ -148,9 +148,31 @@ struct ModelBody {
     temperature: Option<f64>,
 }
 
-/// Persist a snapshot of the mutated config, then swap it into the running
-/// state. Cloning out from under the lock keeps the (sync) mutex un-held across
-/// the async `save()`.
+/// Serializes every config-file mutation behind a process-global lock.
+/// `config.toml` is a single shared resource: two concurrent gateway writers
+/// that each cloned the in-memory config, changed one field, and saved the whole
+/// file would clobber each other's fields; and an out-of-band writer (a Telegram
+/// `/claim` persisting an approval owner) would be silently overwritten by a
+/// stale in-memory snapshot. Holding this lock across the read-modify-write makes
+/// each write atomic vs other writers.
+static CONFIG_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Take the config write lock and return the FRESHEST config from disk (not the
+/// possibly-stale in-memory `state.config`), so a write applies its field delta
+/// onto on-disk truth. The caller MUST keep the returned guard in scope across
+/// the subsequent [`persist_and_swap`] for the read-modify-write to be atomic.
+async fn lock_and_load(
+) -> Result<(tokio::sync::MutexGuard<'static, ()>, crate::config::Config), ApiError> {
+    let guard = CONFIG_WRITE_LOCK.lock().await;
+    let cfg = crate::config::Config::load_or_init()
+        .await
+        .map_err(err_500)?;
+    Ok((guard, cfg))
+}
+
+/// Persist the mutated config, then swap it into the running state. Must be
+/// called while holding the [`lock_and_load`] guard so a concurrent writer can't
+/// interleave between the disk read and this save.
 async fn persist_and_swap(state: &AppState, cfg: crate::config::Config) -> Result<(), ApiError> {
     cfg.save().await.map_err(err_500)?;
     *state.config.lock() = cfg;
@@ -182,7 +204,7 @@ async fn set_model(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let provider_changed = body.provider.is_some();
-    let mut cfg = state.config.lock().clone();
+    let (_guard, mut cfg) = lock_and_load().await?;
     if let Some(p) = body.provider {
         let new_provider = if p.trim().is_empty() {
             None
@@ -256,7 +278,7 @@ async fn set_autonomy(
     Json(body): Json<AutonomyBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let mut cfg = state.config.lock().clone();
+    let (_guard, mut cfg) = lock_and_load().await?;
     if let Some(l) = body.level {
         cfg.autonomy.level =
             parse_level(&l).ok_or_else(|| err_400(format!("invalid autonomy level: {l}")))?;
@@ -332,7 +354,7 @@ async fn add_mcp_server(
     if body.command.trim().is_empty() {
         return Err(err_400("command must not be empty"));
     }
-    let mut cfg = state.config.lock().clone();
+    let (_guard, mut cfg) = lock_and_load().await?;
     cfg.mcp_servers.insert(
         name.clone(),
         McpServerConfig {
@@ -352,7 +374,7 @@ async fn remove_mcp_server(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let mut cfg = state.config.lock().clone();
+    let (_guard, mut cfg) = lock_and_load().await?;
     let removed = cfg.mcp_servers.remove(&name).is_some();
     let count = cfg.mcp_servers.len();
     persist_and_swap(&state, cfg).await?;
@@ -514,11 +536,16 @@ async fn connect_telegram(
         TokenPlan::KeepExisting => (None, None),
     };
 
-    let tg = apply_telegram_update(existing, new_token.as_deref(), body.allowed_users.clone())?;
-
-    // Clone the full config only now (after the await) to keep the window where a
-    // concurrent config write could be clobbered as small as possible.
-    let mut cfg = state.config.lock().clone();
+    // Serialize + apply onto the freshest on-disk config so a concurrent
+    // out-of-band write (e.g. a Telegram `/claim` persisting an approval owner)
+    // can't be clobbered. Build on the fresh Telegram config, not the snapshot
+    // taken before the `getMe` await.
+    let (_guard, mut cfg) = lock_and_load().await?;
+    let tg = apply_telegram_update(
+        cfg.channels_config.telegram.clone(),
+        new_token.as_deref(),
+        body.allowed_users.clone(),
+    )?;
     cfg.channels_config.telegram = Some(tg);
     persist_and_swap(&state, cfg).await?;
 
@@ -566,7 +593,7 @@ async fn disconnect_telegram(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let mut cfg = state.config.lock().clone();
+    let (_guard, mut cfg) = lock_and_load().await?;
     let was_configured = cfg.channels_config.telegram.is_some();
     cfg.channels_config.telegram = None;
     persist_and_swap(&state, cfg).await?;
@@ -684,7 +711,7 @@ async fn set_secrets(
     Json(body): Json<SecretsBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let mut cfg = state.config.lock().clone();
+    let (_guard, mut cfg) = lock_and_load().await?;
     apply_secrets(&mut cfg, &body);
     let present = api_key_present(&cfg);
     persist_and_swap(&state, cfg).await?;
@@ -751,7 +778,7 @@ async fn set_knowledge(
     Json(body): Json<KnowledgeBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let mut cfg = state.config.lock().clone();
+    let (_guard, mut cfg) = lock_and_load().await?;
     if let Some(k) = body.embedding_api_key {
         let k = k.trim();
         cfg.knowledge.embedding_api_key = if k.is_empty() {
