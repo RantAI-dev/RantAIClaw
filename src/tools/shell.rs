@@ -86,13 +86,29 @@ impl Drop for ProcGroupKill {
                 }
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        // Escalate only if a member is still alive; skipping on
-                        // ESRCH avoids racing a pgid that has since been reused.
-                        if unsafe { libc::kill(-pgid, 0) } == 0 {
-                            unsafe {
-                                libc::kill(-pgid, libc::SIGKILL);
+                        // Poll for the group to exit rather than sleeping the full
+                        // grace and checking once at the end. As soon as the group
+                        // is gone (ESRCH) we stop — so we escalate to SIGKILL only
+                        // for a group that is STILL alive after the grace (one
+                        // genuinely ignoring SIGTERM, i.e. our own). This shrinks
+                        // the window in which the pgid could have been reused by an
+                        // unrelated group and then wrongly force-killed from the
+                        // full 2s down to a single poll interval. (A race-free fix
+                        // needs pidfd; this is the portable mitigation.)
+                        const GRACE: Duration = Duration::from_secs(2);
+                        const POLL: Duration = Duration::from_millis(50);
+                        let mut waited = Duration::ZERO;
+                        while waited < GRACE {
+                            // ESRCH => the whole group has exited; nothing to kill.
+                            if unsafe { libc::kill(-pgid, 0) } != 0 {
+                                return;
                             }
+                            tokio::time::sleep(POLL).await;
+                            waited += POLL;
+                        }
+                        // Still alive after the grace — force-kill.
+                        unsafe {
+                            libc::kill(-pgid, libc::SIGKILL);
                         }
                     });
                 }
@@ -861,6 +877,52 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_millis(40),
             "structural rejection must skip the approval timeout"
+        );
+    }
+
+    /// A group leader that ignores SIGTERM must still be reaped by the SIGKILL
+    /// escalation after the grace — the polling refactor must not weaken that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_cancel_escalates_to_sigkill_for_a_sigterm_ignoring_group() {
+        let pidfile =
+            std::env::temp_dir().join(format!("rantaiclaw_sigkill_{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
+        // Trap SIGTERM and loop forever: SIGTERM alone can't stop it, so only the
+        // SIGKILL escalation can.
+        let cmd = format!(
+            "trap '' TERM; echo $$ > {}; while :; do sleep 0.2; done",
+            pidfile.display()
+        );
+        let handle = tokio::spawn(async move { tool.execute(json!({ "command": cmd })).await });
+
+        let mut pid = None;
+        for _ in 0..200 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    pid = Some(p);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = pid.expect("leader should have recorded its pid");
+
+        // Cancel: SIGTERM (ignored) → then SIGKILL after the ~2s grace.
+        handle.abort();
+        tokio::time::sleep(Duration::from_millis(2800)).await;
+
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let _ = std::fs::remove_file(&pidfile);
+        if alive {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !alive,
+            "SIGTERM-ignoring leader pid {pid} must be SIGKILLed by the escalation"
         );
     }
 }
