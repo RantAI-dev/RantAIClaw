@@ -579,6 +579,42 @@ fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
+/// Build the systemd `--user` unit contents. Pure + testable.
+///
+/// Captures the operator's working directory and PATH at install time so the
+/// service reproduces the interactive launch: the agent's shell tool inherits
+/// the daemon's PATH, and a bare systemd `--user` manager otherwise starts with
+/// a minimal PATH that omits `~/.local/bin`, `~/.cargo/bin`, etc. where
+/// operator-installed tools (for example `kubectl`) live — so a command that
+/// runs fine in the TUI reports "not found" under the service. Absent CWD/PATH
+/// → the line is omitted, leaving the unit byte-identical to the pre-capture one.
+///
+/// KillSignal=SIGTERM (explicit) + KillMode=mixed: send SIGTERM only to the main
+/// daemon so it runs its own graceful shutdown (drain, stop auto-managed
+/// containers, clear the sentinel), and only SIGKILL any cgroup stragglers after
+/// the timeout. TimeoutStopSec=30 leaves room for `docker stop` (default ~10s
+/// grace) on one or two auto-launch services before systemd force-kills.
+fn systemd_user_unit(exe: &Path, working_dir: Option<&Path>, path_env: Option<&str>) -> String {
+    use std::fmt::Write as _;
+    let mut service = String::from("Type=simple\n");
+    if let Some(dir) = working_dir {
+        let _ = writeln!(service, "WorkingDirectory={}", dir.display());
+    }
+    if let Some(path) = path_env.filter(|p| !p.is_empty()) {
+        // Double-quote so a directory containing a space cannot split the
+        // assignment into multiple malformed tokens (systemd whitespace-splits
+        // an unquoted Environment= value).
+        let _ = writeln!(service, "Environment=\"PATH={path}\"");
+    }
+    format!(
+        "[Unit]\nDescription=RantaiClaw daemon\nAfter=network.target\n\n\
+         [Service]\n{service}ExecStart={} daemon\nRestart=always\nRestartSec=3\n\
+         KillSignal=SIGTERM\nKillMode=mixed\nTimeoutStopSec=30\n\n\
+         [Install]\nWantedBy=default.target\n",
+        exe.display()
+    )
+}
+
 fn install_linux_systemd(config: &Config) -> Result<()> {
     let file = linux_service_file(config)?;
     if let Some(parent) = file.parent() {
@@ -586,21 +622,20 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let unit = format!(
-        // KillSignal=SIGTERM (explicit) + KillMode=mixed: send SIGTERM only to
-        // the main daemon so it runs its own graceful shutdown (drain, stop
-        // auto-managed containers, clear the sentinel), and only SIGKILL any
-        // cgroup stragglers after the timeout. TimeoutStopSec=30 leaves room
-        // for `docker stop` (default ~10s grace) on one or two auto-launch
-        // services before systemd force-kills.
-        "[Unit]\nDescription=RantaiClaw daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\nKillSignal=SIGTERM\nKillMode=mixed\nTimeoutStopSec=30\n\n[Install]\nWantedBy=default.target\n",
-        exe.display()
-    );
+    let working_dir = std::env::current_dir().ok();
+    let path_env = std::env::var("PATH").ok();
+    let unit = systemd_user_unit(exe.as_path(), working_dir.as_deref(), path_env.as_deref());
 
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
     let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "rantaiclaw.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
+    if let Some(dir) = &working_dir {
+        println!(
+            "   Captured your working directory + PATH so tools (e.g. kubectl) resolve as in your shell: {}",
+            dir.display()
+        );
+    }
     println!("   Start with: rantaiclaw service start");
     Ok(())
 }
@@ -1436,5 +1471,58 @@ mod tests {
     #[test]
     fn decide_start_action_starts_when_stopped() {
         assert_eq!(decide_start_action(false), StartAction::Start);
+    }
+
+    #[test]
+    fn systemd_user_unit_captures_working_dir_and_path() {
+        let unit = systemd_user_unit(
+            Path::new("/home/op/.cargo/bin/rantaiclaw"),
+            Some(Path::new("/home/op/repo")),
+            Some("/home/op/.local/bin:/usr/bin"),
+        );
+        assert!(
+            unit.contains("WorkingDirectory=/home/op/repo\n"),
+            "unit: {unit}"
+        );
+        assert!(
+            unit.contains("Environment=\"PATH=/home/op/.local/bin:/usr/bin\"\n"),
+            "unit: {unit}"
+        );
+        assert!(
+            unit.contains("ExecStart=/home/op/.cargo/bin/rantaiclaw daemon\n"),
+            "unit: {unit}"
+        );
+    }
+
+    #[test]
+    fn systemd_user_unit_omits_env_lines_when_absent() {
+        let unit = systemd_user_unit(Path::new("/usr/bin/rantaiclaw"), None, None);
+        assert!(!unit.contains("WorkingDirectory="), "unit: {unit}");
+        assert!(!unit.contains("Environment="), "unit: {unit}");
+        // Fallback is byte-compatible with the pre-capture unit shape.
+        assert!(
+            unit.contains("[Service]\nType=simple\nExecStart=/usr/bin/rantaiclaw daemon\n"),
+            "unit: {unit}"
+        );
+    }
+
+    #[test]
+    fn systemd_user_unit_omits_path_when_empty() {
+        let unit = systemd_user_unit(Path::new("/x/rantaiclaw"), Some(Path::new("/w")), Some(""));
+        assert!(unit.contains("WorkingDirectory=/w\n"), "unit: {unit}");
+        assert!(!unit.contains("Environment="), "unit: {unit}");
+    }
+
+    #[test]
+    fn systemd_user_unit_preserves_shutdown_settings() {
+        let unit = systemd_user_unit(Path::new("/x/rantaiclaw"), None, None);
+        for needle in [
+            "Restart=always\n",
+            "KillSignal=SIGTERM\n",
+            "KillMode=mixed\n",
+            "TimeoutStopSec=30\n",
+        ] {
+            assert!(unit.contains(needle), "missing {needle:?} in {unit}");
+        }
     }
 }
