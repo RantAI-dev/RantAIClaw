@@ -1705,27 +1705,39 @@ async fn handle_whatsapp_message(
         );
     };
 
-    // ── Security: Verify X-Hub-Signature-256 if app_secret is configured ──
-    if let Some(ref app_secret) = state.whatsapp_app_secret {
-        let signature = headers
-            .get("X-Hub-Signature-256")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    // ── Security: X-Hub-Signature-256 is the ONLY authentication for this
+    // public webhook (external provider servers cannot pair). Without the shared
+    // app secret the sender cannot be verified, so refuse the request rather than
+    // process a spoofable payload — fail-closed, per deny-by-default for exposure
+    // surfaces. Set RANTAICLAW_WHATSAPP_APP_SECRET to enable the endpoint. ──
+    let Some(app_secret) = state.whatsapp_app_secret.as_deref() else {
+        tracing::warn!(
+            "WhatsApp webhook rejected: no app secret configured. Set RANTAICLAW_WHATSAPP_APP_SECRET to authenticate this endpoint."
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Webhook authentication not configured"})),
+        );
+    };
 
-        if !verify_whatsapp_signature(app_secret, &body, signature) {
-            tracing::warn!(
-                "WhatsApp webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
+    let signature = headers
+        .get("X-Hub-Signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !verify_whatsapp_signature(app_secret, &body, signature) {
+        tracing::warn!(
+            "WhatsApp webhook signature verification failed (signature: {})",
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
     }
 
     // Parse JSON body
@@ -1818,37 +1830,48 @@ async fn handle_linq_webhook(
 
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
-    if let Some(ref signing_secret) = state.linq_signing_secret {
-        let timestamp = headers
-            .get("X-Webhook-Timestamp")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    // ── Security: the X-Webhook-Signature is the ONLY authentication for this
+    // public webhook (the Linq server cannot pair). Without the shared signing
+    // secret the sender cannot be verified, so refuse rather than process a
+    // spoofable payload — fail-closed. Set RANTAICLAW_LINQ_SIGNING_SECRET. ──
+    let Some(signing_secret) = state.linq_signing_secret.as_deref() else {
+        tracing::warn!(
+            "Linq webhook rejected: no signing secret configured. Set RANTAICLAW_LINQ_SIGNING_SECRET to authenticate this endpoint."
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Webhook authentication not configured"})),
+        );
+    };
 
-        let signature = headers
-            .get("X-Webhook-Signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    let timestamp = headers
+        .get("X-Webhook-Timestamp")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
-        if !crate::channels::linq::verify_linq_signature(
-            signing_secret,
-            &body_str,
-            timestamp,
-            signature,
-        ) {
-            tracing::warn!(
-                "Linq webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
+    let signature = headers
+        .get("X-Webhook-Signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !crate::channels::linq::verify_linq_signature(
+        signing_secret,
+        &body_str,
+        timestamp,
+        signature,
+    ) {
+        tracing::warn!(
+            "Linq webhook signature verification failed (signature: {})",
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
     }
 
     // Parse JSON body
@@ -1959,37 +1982,48 @@ async fn handle_nextcloud_talk_webhook(
 
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
-    if let Some(ref webhook_secret) = state.nextcloud_talk_webhook_secret {
-        let random = headers
-            .get("X-Nextcloud-Talk-Random")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    // ── Security: the HMAC signature is the ONLY authentication for this public
+    // webhook (the Nextcloud server cannot pair). Without the shared secret the
+    // sender cannot be verified, so refuse rather than process a spoofable
+    // payload — fail-closed. Set RANTAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET. ──
+    let Some(webhook_secret) = state.nextcloud_talk_webhook_secret.as_deref() else {
+        tracing::warn!(
+            "Nextcloud Talk webhook rejected: no webhook secret configured. Set RANTAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET to authenticate this endpoint."
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Webhook authentication not configured"})),
+        );
+    };
 
-        let signature = headers
-            .get("X-Nextcloud-Talk-Signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    let random = headers
+        .get("X-Nextcloud-Talk-Random")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
-        if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
-            webhook_secret,
-            random,
-            &body_str,
-            signature,
-        ) {
-            tracing::warn!(
-                "Nextcloud Talk webhook signature verification failed (signature: {})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
+    let signature = headers
+        .get("X-Nextcloud-Talk-Signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
+        webhook_secret,
+        random,
+        &body_str,
+        signature,
+    ) {
+        tracing::warn!(
+            "Nextcloud Talk webhook signature verification failed (signature: {})",
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
     }
 
     // Parse JSON body
@@ -3150,6 +3184,57 @@ mod tests {
         let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
             .await
             .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rejects_when_no_secret_configured() {
+        // Fail-closed: the HMAC signature is the only authentication for this
+        // public webhook. With no secret configured the sender cannot be
+        // verified, so an unsigned request must be refused, not processed.
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            vec!["*".into()],
+        ));
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: Some(channel),
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            tools_registry: Arc::new(Vec::new()),
+        };
+
+        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+
+        let response =
+            handle_nextcloud_talk_webhook(State(state), HeaderMap::new(), Bytes::from(body))
+                .await
+                .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
