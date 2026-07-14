@@ -3,7 +3,6 @@ use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
 use async_trait::async_trait;
-use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use std::path::Path;
@@ -426,11 +425,14 @@ impl TelegramChannel {
     }
 
     async fn load_config_without_env() -> anyhow::Result<Config> {
-        let home = UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
-        let rantaiclaw_dir = home.join(".rantaiclaw");
-        let config_path = rantaiclaw_dir.join("config.toml");
+        // Resolve the SAME config path the daemon reads (profile / env-dir /
+        // active_workspace-marker aware) instead of a hardcoded
+        // `~/.rantaiclaw/config.toml`. The legacy hardcoded path missed the
+        // profile layout entirely, so `/claim`/`/bind` persisted owner +
+        // allowlist to a file the daemon never reads (or, on migrated installs,
+        // clobbered the compatibility symlink). We still skip env-VALUE overrides
+        // by parsing the file directly rather than going through `load_or_init`.
+        let (config_path, workspace_dir) = Config::resolve_active_paths().await?;
 
         let contents = fs::read_to_string(&config_path)
             .await
@@ -439,7 +441,7 @@ impl TelegramChannel {
             "Failed to parse config.toml — check [channels_config.telegram] section for syntax errors",
         )?;
         config.config_path = config_path;
-        config.workspace_dir = rantaiclaw_dir.join("workspace");
+        config.workspace_dir = workspace_dir;
         Ok(config)
     }
 
@@ -2414,6 +2416,47 @@ mod tests {
         let owners = &config.channels_config.approval_owners;
         assert!(owners.contains(&"999".to_string()), "owners: {owners:?}");
         assert!(owners.contains(&"carol".to_string()), "owners: {owners:?}");
+
+        std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    }
+
+    /// The legacy `/claim`/`/bind` owner-persist path must write to the config
+    /// file the daemon actually reads (profile / env-dir aware), not a hardcoded
+    /// `~/.rantaiclaw/config.toml`. Regression for the wrong-path bug: before the
+    /// fix this either failed (legacy file absent) or wrote where the daemon
+    /// never looks, so `approval_owners` stayed empty across restarts.
+    #[tokio::test]
+    async fn legacy_owner_persist_targets_the_active_config_dir() {
+        let _guard = PAIR_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", root);
+        std::env::remove_var("RANTAICLAW_WORKSPACE");
+
+        // Seed a config in the ACTIVE dir (this is where the daemon reads).
+        crate::config::Config::load_or_init()
+            .await
+            .unwrap()
+            .save()
+            .await
+            .unwrap();
+
+        // Persist an owner via the legacy path (what `/claim` calls).
+        let ch = TelegramChannel::new("t".into(), vec![], false);
+        ch.persist_approval_owner(&["999".to_string()])
+            .await
+            .expect("owner persist should target the active config and succeed");
+
+        // The daemon (load_or_init) must now see the owner.
+        let config = crate::config::Config::load_or_init().await.unwrap();
+        assert!(
+            config
+                .channels_config
+                .approval_owners
+                .contains(&"999".to_string()),
+            "legacy owner-persist must land in the active config dir; owners: {:?}",
+            config.channels_config.approval_owners
+        );
 
         std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }

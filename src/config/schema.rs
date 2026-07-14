@@ -3657,6 +3657,21 @@ impl Config {
         None
     }
 
+    /// Resolve the active `config.toml` path and workspace dir the same way
+    /// [`Config::load_or_init`] does — honoring `RANTAICLAW_CONFIG_DIR`,
+    /// `RANTAICLAW_WORKSPACE`, the `active_workspace.toml` marker, and the active
+    /// profile — WITHOUT reading, parsing, or applying env-value overrides.
+    ///
+    /// For callers that must load config without env-value overrides (e.g. the
+    /// Telegram owner-persist path) yet still target the daemon's real config
+    /// file, not a hardcoded legacy location.
+    pub async fn resolve_active_paths() -> Result<(PathBuf, PathBuf)> {
+        let (default_dir, default_ws) = default_config_and_workspace_dirs()?;
+        let (rantaiclaw_dir, workspace_dir, _src) =
+            resolve_runtime_config_dirs(&default_dir, &default_ws).await?;
+        Ok((rantaiclaw_dir.join("config.toml"), workspace_dir))
+    }
+
     pub async fn load_or_init() -> Result<Self> {
         // v0.5.0 introduces a profile-aware storage layout
         // (~/.rantaiclaw/profiles/<name>/...). On first run after upgrading
