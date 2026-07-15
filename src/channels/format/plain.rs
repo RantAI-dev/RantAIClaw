@@ -3,6 +3,8 @@
 //! code keeps its text (indented, for fence-averse platforms).
 
 use super::ast::{Block, Inline};
+use super::nest::{indent_continuation, prefix_lines};
+use super::split::join_all;
 use super::table::ascii_table;
 use super::{CodeWrap, RenderedBlock};
 
@@ -43,42 +45,29 @@ fn render_block(block: &Block) -> RenderedBlock {
             start,
             items,
         } => {
-            let mut text = String::new();
+            let mut parts = Vec::new();
             for (i, item) in items.iter().enumerate() {
-                if *ordered {
+                let mut marker = if *ordered {
                     let n = usize::try_from(*start).unwrap_or(1) + i;
-                    text.push_str(&n.to_string());
-                    text.push_str(". ");
+                    let mut m = n.to_string();
+                    m.push_str(". ");
+                    m
                 } else {
-                    text.push_str("• ");
-                }
-                let body = render(item)
-                    .iter()
-                    .map(|b| b.text.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                text.push_str(body.trim());
-                text.push('\n');
+                    "• ".to_string()
+                };
+                // `join_all`, NOT `.text`: a `Code` sub-block holds the RAW body
+                // with its fence deferred to `code_wrap`, so `.text` would drop
+                // the fence and inline the snippet into the bullet.
+                let body = join_all(&render(item));
+                let width = marker.chars().count();
+                marker.push_str(&indent_continuation(body.trim_end(), width));
+                parts.push(marker.trim_end().to_string());
             }
-            RenderedBlock::prose(text.trim_end().to_string())
+            RenderedBlock::prose(parts.join("\n"))
         }
         Block::BlockQuote(inner) => {
-            let quoted = render(inner)
-                .iter()
-                .map(|b| {
-                    b.text
-                        .lines()
-                        .map(|l| {
-                            let mut s = String::from("> ");
-                            s.push_str(l);
-                            s
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            RenderedBlock::prose(quoted)
+            let body = join_all(&render(inner));
+            RenderedBlock::prose(prefix_lines(&body, "> "))
         }
         Block::Table { headers, rows, .. } => {
             RenderedBlock::code(ascii_table(headers, rows), CodeWrap::Indent)
@@ -142,5 +131,16 @@ mod tests {
     fn one_rendered_block_per_input_block() {
         let blocks = parse("# a\n\np\n\n- x\n\n```\nc\n```");
         assert_eq!(render(&blocks).len(), blocks.len());
+    }
+
+    #[test]
+    fn nested_list_is_indented_not_flattened() {
+        assert_eq!(joined("- a\n  - b"), "• a\n\n  • b");
+    }
+
+    #[test]
+    fn code_in_a_list_item_keeps_its_indent() {
+        let out = joined("1. Run:\n\n   ```\n   cmd\n   ```");
+        assert!(out.contains("    cmd"), "indent wrapper dropped: {out}");
     }
 }

@@ -4,6 +4,8 @@
 //! its tables also go to `<pre>` because client `<table>` support is inconsistent.
 
 use super::ast::{Block, Inline};
+use super::nest::{indent_continuation, prefix_lines};
+use super::split::join_all;
 use super::table::ascii_table;
 use super::{CodeWrap, RenderedBlock};
 
@@ -98,24 +100,10 @@ fn render_block(block: &Block, dialect: Dialect) -> RenderedBlock {
             items,
         } => RenderedBlock::prose_html(list_html(*ordered, *start, items, dialect)),
         Block::BlockQuote(inner) => {
-            let body = render(inner, dialect)
-                .iter()
-                .map(|b| b.text.clone())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let body = join_all(&render(inner, dialect));
             let mut text = String::new();
             match dialect {
-                Dialect::Telegram => {
-                    text = body
-                        .lines()
-                        .map(|l| {
-                            let mut s = String::from("&gt; ");
-                            s.push_str(l);
-                            s
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                }
+                Dialect::Telegram => text = prefix_lines(&body, "&gt; "),
                 Dialect::Matrix => wrap_tag(&mut text, "blockquote", &body),
             }
             RenderedBlock::prose_html(text)
@@ -136,11 +124,7 @@ fn list_html(ordered: bool, start: u64, items: &[Vec<Block>], dialect: Dialect) 
             let tag = if ordered { "ol" } else { "ul" };
             let mut body = String::new();
             for item in items {
-                let inner = render(item, dialect)
-                    .iter()
-                    .map(|b| b.text.clone())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let inner = join_all(&render(item, dialect));
                 wrap_tag(&mut body, "li", &inner);
             }
             // Not `wrap_tag`: it reuses one string for the open AND close tag, so
@@ -163,24 +147,25 @@ fn list_html(ordered: bool, start: u64, items: &[Vec<Block>], dialect: Dialect) 
             out
         }
         Dialect::Telegram => {
-            let mut text = String::new();
+            let mut parts = Vec::new();
             for (i, item) in items.iter().enumerate() {
-                if ordered {
+                let mut marker = if ordered {
                     let n = usize::try_from(start).unwrap_or(1) + i;
-                    text.push_str(&n.to_string());
-                    text.push_str(". ");
+                    let mut m = n.to_string();
+                    m.push_str(". ");
+                    m
                 } else {
-                    text.push_str("• ");
-                }
-                let inner = render(item, dialect)
-                    .iter()
-                    .map(|b| b.text.clone())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                text.push_str(inner.trim());
-                text.push('\n');
+                    "• ".to_string()
+                };
+                // `join_all`, NOT `.text`: a `Code` sub-block holds the RAW body
+                // with its fence deferred to `code_wrap`, so `.text` would drop
+                // the `<pre>` and inline the snippet into the bullet.
+                let body = join_all(&render(item, dialect));
+                let width = marker.chars().count();
+                marker.push_str(&indent_continuation(body.trim_end(), width));
+                parts.push(marker.trim_end().to_string());
             }
-            text.trim_end().to_string()
+            parts.join("\n")
         }
     }
 }
@@ -275,5 +260,17 @@ mod tests {
         let blocks = parse("# a\n\np\n\n- x");
         assert_eq!(render_telegram(&blocks).len(), blocks.len());
         assert_eq!(render_matrix(&blocks).len(), blocks.len());
+    }
+
+    #[test]
+    fn telegram_code_in_list_item_keeps_pre() {
+        let out = tg("1. Run:\n\n   ```\n   cmd\n   ```");
+        assert!(out.contains("<pre>cmd</pre>"), "pre dropped: {out}");
+    }
+
+    #[test]
+    fn matrix_code_in_list_item_keeps_pre() {
+        let out = mx("1. Run:\n\n   ```\n   cmd\n   ```");
+        assert!(out.contains("<pre>cmd</pre>"), "pre dropped: {out}");
     }
 }

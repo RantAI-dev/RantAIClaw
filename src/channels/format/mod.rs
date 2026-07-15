@@ -12,6 +12,7 @@ mod ast;
 mod html;
 mod light;
 mod markdown;
+mod nest;
 mod plain;
 mod split;
 mod table;
