@@ -72,9 +72,14 @@ fn render_block(block: &Block, links: LinkStyle) -> RenderedBlock {
             RenderedBlock::prose(text)
         }
         Block::Paragraph(inlines) => RenderedBlock::prose(inlines_light(inlines, links)),
-        Block::CodeBlock { code, .. } => {
-            RenderedBlock::code(code.trim_end_matches('\n'), CodeWrap::Fence(None))
-        }
+        // A fence is not an escaping exemption: Slack wants `&`/`<`/`>` escaped
+        // everywhere in message text, code blocks included. The body stays RAW
+        // (no fence) — `split.rs` adds that, and re-adds it per chunk — so what
+        // is handed over must already be final.
+        Block::CodeBlock { code, .. } => RenderedBlock::code(
+            maybe_escape(code.trim_end_matches('\n'), links),
+            CodeWrap::Fence(None),
+        ),
         // Same shape as `plain.rs`/`markdown.rs` (see Task 7b). The loop is
         // duplicated per renderer on purpose: each `render()` takes a different
         // extra argument (`links` here, `tables_native`/`dialect`/none elsewhere),
@@ -110,9 +115,14 @@ fn render_block(block: &Block, links: LinkStyle) -> RenderedBlock {
             let body = join_all(&render(inner, links));
             RenderedBlock::prose(prefix_lines(&body, "> "))
         }
-        Block::Table { headers, rows, .. } => {
-            RenderedBlock::code(ascii_table(headers, rows), CodeWrap::Fence(None))
-        }
+        // Escaped for the same reason as `CodeBlock`: the ASCII grid goes out as
+        // message text, and Slack reads `&`/`<`/`>` in it whether or not a fence
+        // surrounds it. Escaping AFTER `ascii_table` is deliberate — the column
+        // widths must be measured on what the user sees, not on `&lt;`.
+        Block::Table { headers, rows, .. } => RenderedBlock::code(
+            maybe_escape(&ascii_table(headers, rows), links),
+            CodeWrap::Fence(None),
+        ),
         Block::Rule => RenderedBlock::prose("──────────".to_string()),
     }
 }
@@ -128,6 +138,17 @@ mod tests {
             .map(|b| b.text.clone())
             .collect::<Vec<_>>()
             .join("\n\n")
+    }
+
+    /// The message as the platform actually receives it.
+    ///
+    /// Unlike `light`, this materializes each block through `join_all`, so a
+    /// code block arrives fenced rather than as the bare body `.text` holds.
+    fn light_full(src: &str, links: LinkStyle) -> String {
+        crate::channels::format::render_to_string(
+            src,
+            &crate::channels::format::RenderTarget::LightMarkup { links },
+        )
     }
 
     #[test]
@@ -212,6 +233,72 @@ mod tests {
             out.contains("```"),
             "code fence should be preserved in a blockquote: {}",
             out
+        );
+    }
+
+    // --- Slack escaping ------------------------------------------------------
+    //
+    // Slack requires `&`/`<`/`>` to be escaped everywhere in message text — a
+    // code fence is not an exemption, it is still message text. Paragraphs,
+    // inline code, blockquotes and list items already escaped; code blocks and
+    // tables did not, so the SAME characters survived or not purely by which
+    // block they landed in.
+
+    const SCRIPT: &str = "```\n<script>a&b</script>\n```";
+
+    #[test]
+    fn slack_escapes_a_code_block_body() {
+        let out = light_full(SCRIPT, LinkStyle::Slack);
+        assert!(
+            out.contains("&lt;script&gt;a&amp;b&lt;/script&gt;"),
+            "code block left unescaped: {out}"
+        );
+        assert!(!out.contains("<script>"), "raw markup reached Slack: {out}");
+    }
+
+    #[test]
+    fn slack_escapes_table_cells() {
+        let out = light_full("| A | B |\n|---|---|\n| <b> | a&b |", LinkStyle::Slack);
+        assert!(out.contains("&lt;b&gt;"), "table cell unescaped: {out}");
+        assert!(out.contains("a&amp;b"), "table cell unescaped: {out}");
+        assert!(!out.contains("<b>"), "raw markup reached Slack: {out}");
+    }
+
+    // The counterweight: `escape_slack` is Slack's dialect, not the renderer's.
+    // WhatsApp and Zulip render HTML entities literally, so escaping for them
+    // would show the reader `&lt;script&gt;` — the bug, inverted.
+    #[test]
+    fn raw_link_style_leaves_a_code_block_body_alone() {
+        let out = light_full(SCRIPT, LinkStyle::Raw);
+        assert!(out.contains("<script>a&b</script>"), "body altered: {out}");
+        assert!(
+            !out.contains("&lt;"),
+            "entity leaked to WhatsApp/Zulip: {out}"
+        );
+        assert!(
+            !out.contains("&amp;"),
+            "entity leaked to WhatsApp/Zulip: {out}"
+        );
+    }
+
+    // Escaping must happen AFTER `ascii_table` lays the grid out, not before.
+    // The table is padded to the widest cell, and Slack renders `&lt;` back to
+    // the single char `<` — so measuring the 9-char entity instead of the 3-char
+    // `<b>` the reader sees pads every other column to a width that only exists
+    // in the wire text, and the grid arrives visibly crooked.
+    #[test]
+    fn slack_table_escapes_after_layout_so_the_grid_stays_aligned() {
+        let out = light_full("| A | B |\n|---|---|\n| <b> | x |", LinkStyle::Slack);
+        // Undo the escaping to see the table as Slack renders it.
+        let seen = out
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&");
+        let rows: Vec<&str> = seen.lines().filter(|l| !l.starts_with("```")).collect();
+        let width = rows[0].chars().count();
+        assert!(
+            rows.iter().all(|r| r.chars().count() == width),
+            "rendered grid is ragged, so layout measured the entities: {rows:?}"
         );
     }
 
