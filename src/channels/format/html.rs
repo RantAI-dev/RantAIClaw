@@ -143,8 +143,23 @@ fn list_html(ordered: bool, start: u64, items: &[Vec<Block>], dialect: Dialect) 
                     .join(" ");
                 wrap_tag(&mut body, "li", &inner);
             }
+            // Not `wrap_tag`: it reuses one string for the open AND close tag, so
+            // an attribute would emit the malformed `</ol start="3">`. `start` must
+            // survive — without it a client renumbers `3. a` as "1.", and the AST
+            // carries `start` precisely so it does not (the Telegram arm honors it).
             let mut out = String::new();
-            wrap_tag(&mut out, tag, &body);
+            out.push('<');
+            out.push_str(tag);
+            if ordered && start != 1 {
+                out.push_str(" start=\"");
+                out.push_str(&start.to_string());
+                out.push('"');
+            }
+            out.push('>');
+            out.push_str(&body);
+            out.push_str("</");
+            out.push_str(tag);
+            out.push('>');
             out
         }
         Dialect::Telegram => {
@@ -225,6 +240,26 @@ mod tests {
     #[test]
     fn matrix_heading_uses_hn() {
         assert_eq!(mx("## Title"), "<h2>Title</h2>");
+    }
+
+    // Without `start`, a client renumbers "3." as "1." — the AST carries it and
+    // the Telegram arm honors it, so Matrix must too.
+    #[test]
+    fn matrix_ordered_list_keeps_start() {
+        assert_eq!(
+            mx("3. a\n4. b"),
+            "<ol start=\"3\"><li>a</li><li>b</li></ol>"
+        );
+    }
+
+    #[test]
+    fn matrix_ordered_list_from_one_omits_start() {
+        assert_eq!(mx("1. a"), "<ol><li>a</li></ol>");
+    }
+
+    #[test]
+    fn matrix_unordered_list_has_no_start() {
+        assert_eq!(mx("- a"), "<ul><li>a</li></ul>");
     }
 
     #[test]
