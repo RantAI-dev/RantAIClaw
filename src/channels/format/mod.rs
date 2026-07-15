@@ -6,7 +6,7 @@
 //! HTML tag. Pure and deterministic: no clock, no randomness.
 //!
 //! Invariant: every renderer emits exactly one [`RenderedBlock`] per input
-//! block, in order. [`split_paired`] relies on it.
+//! block, in order. `split_paired` relies on it.
 
 mod ast;
 mod html;
@@ -111,7 +111,7 @@ pub fn render(md: &str, target: &RenderTarget) -> Vec<RenderedBlock> {
 }
 
 /// Render an already-parsed AST. Use this (with one `ast::parse`) when you need
-/// two renderings of the SAME source — see [`split_paired`].
+/// two renderings of the SAME source — see `split_paired`.
 ///
 /// `pub(crate)`: `ast::Block` is private to `format`, so no caller outside this
 /// module could construct an argument for it anyway.
@@ -126,7 +126,7 @@ pub(crate) fn render_blocks(blocks: &[ast::Block], target: &RenderTarget) -> Vec
 }
 
 /// Parse once and render to two targets. The two lists are 1:1 with each other
-/// (renderer invariant), which is what makes [`split_paired`] sound.
+/// (renderer invariant), which is what makes `split_paired` sound.
 pub fn render_pair(
     md: &str,
     primary: &RenderTarget,
@@ -143,5 +143,3 @@ pub fn render_pair(
 pub fn render_to_string(md: &str, target: &RenderTarget) -> String {
     split::join_all(&render(md, target))
 }
-
-pub use split::{split, split_paired};
