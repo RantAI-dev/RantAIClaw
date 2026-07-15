@@ -592,4 +592,18 @@ mod tests {
         // ...and the bare text really is inert: it survives a round trip.
         assert_eq!(inline_plain(&round_trip_paragraph(src)), src);
     }
+
+    // `escape_anywhere`'s `'\\'` arm was the only load-bearing rule in this
+    // module with no coverage: replacing it with `'\\' => false` left every
+    // other test passing while silently eating the user's backslash.
+    #[test]
+    fn a_literal_backslash_before_punctuation_is_doubled() {
+        // Source `\\\#` is the TEXT `\#` — an escaped backslash then an escaped
+        // hash — so the renderer must double the backslash to carry it out.
+        let src = r"\\\#";
+        assert_eq!(md(src, false), r"\\#");
+        // Why the doubling matters: emit a bare `\#` and it re-parses as `#`,
+        // losing the backslash the user wrote.
+        assert_eq!(inline_plain(&round_trip_paragraph(src)), r"\#");
+    }
 }
