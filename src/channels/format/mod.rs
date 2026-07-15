@@ -37,6 +37,14 @@ pub enum RenderTarget {
     TelegramHtml,
     /// Matrix `org.matrix.custom.html`: headings→`<h1>..<h6>`, lists→`<ul>/<ol>`,
     /// tables→`<pre>` ASCII (client `<table>` support is inconsistent).
+    ///
+    /// **Split this at Matrix's own limit (~64KB), not at another platform's.**
+    /// Paragraphs are wrapped in `<p>` (Matrix is real HTML — without it every
+    /// paragraph boundary collapses), and [`split`] treats a complete element as
+    /// atomic, so a paragraph longer than the limit is emitted whole rather than
+    /// broken into unbalanced markup. At ~64KB that needs a single >64KB
+    /// paragraph and is unreachable in practice; measured at Telegram's 4096 it
+    /// bites at ~8200 chars. Copying another channel's limit here is the hazard.
     MatrixHtml,
     /// CommonMark-ish markdown kept mostly intact.
     StdMarkdown {
