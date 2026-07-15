@@ -355,6 +355,9 @@ impl Builder {
                 }
             }
             TagEnd::BlockQuote(_) => {
+                if self.leave_suppressed() {
+                    return;
+                }
                 if let Some(Container::Quote(children)) = self.block_stack.pop() {
                     self.push_block(Block::BlockQuote(children));
                 }
@@ -629,6 +632,42 @@ mod tests {
                 blocks.last()
             );
         }
+    }
+
+    /// Renders `blocks` to plain text so a test can assert on STRUCTURE, not
+    /// just on the trailing block: `container_stack_unwinds_after_refused_opens`
+    /// only inspects `blocks.last()`, and a trailing paragraph lands fine even
+    /// while earlier content is being silently dropped. That blindness let a
+    /// real content-deletion bug pass the whole suite.
+    fn rendered(md: &str) -> String {
+        crate::channels::format::render_to_string(md, &crate::channels::format::RenderTarget::Plain)
+    }
+
+    // A refused container's `End` must NOT pop a frame that was never pushed.
+    // When `TagEnd::BlockQuote` skipped its `leave_suppressed()` guard, each
+    // refused quote-End popped a real `Item`/`List` frame instead, which failed
+    // the `Container::Quote` pattern and was dropped with all its children — and
+    // `suppressed` never drained, poisoning every later list in the document.
+    #[test]
+    fn a_refused_quote_does_not_eat_its_enclosing_list_item() {
+        // 31 is UNDER the cap on its own; the enclosing list item's frames are
+        // what push it over, which is why this needs a quote inside a list.
+        let quote = ">".repeat(31);
+        let out = rendered(&format!("- BEFORE\n\n  {quote} dq\n\n- AFTER"));
+        assert!(out.contains("BEFORE"), "list item deleted: {out:?}");
+        assert!(out.contains("dq"), "quote text deleted: {out:?}");
+        assert!(out.contains("AFTER"), "trailing item deleted: {out:?}");
+    }
+
+    #[test]
+    fn a_refused_quote_does_not_poison_a_later_list() {
+        let quote = ">".repeat(33);
+        let out = rendered(&format!("{quote} q\n\n- a\n- b"));
+        assert!(out.contains('q'), "quote text deleted: {out:?}");
+        assert!(
+            out.contains("• a") && out.contains("• b"),
+            "later list flattened to bare paragraphs, so `suppressed` leaked: {out:?}"
+        );
     }
 
     // The property that actually matters: the cap protects the renderers, so
