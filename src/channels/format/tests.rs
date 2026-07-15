@@ -1,8 +1,7 @@
 //! End-to-end checks: the canonical tutorial (headings + table + code) renders
 //! cleanly for every target, and split never orphans a fence or exceeds a limit.
 
-use super::split::{split, split_paired};
-use super::{render, render_pair, render_to_string, LinkStyle, RenderTarget};
+use super::{render, render_pair, render_to_string, split, split_paired, LinkStyle, RenderTarget};
 
 const FENCE: &str = "```";
 

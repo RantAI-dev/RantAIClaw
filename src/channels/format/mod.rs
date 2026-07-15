@@ -6,7 +6,7 @@
 //! HTML tag. Pure and deterministic: no clock, no randomness.
 //!
 //! Invariant: every renderer emits exactly one [`RenderedBlock`] per input
-//! block, in order. `split_paired` relies on it.
+//! block, in order. [`split_paired`] relies on it.
 
 mod ast;
 mod html;
@@ -111,7 +111,7 @@ pub fn render(md: &str, target: &RenderTarget) -> Vec<RenderedBlock> {
 }
 
 /// Render an already-parsed AST. Use this (with one `ast::parse`) when you need
-/// two renderings of the SAME source — see `split_paired`.
+/// two renderings of the SAME source — see [`split_paired`].
 ///
 /// `pub(crate)`: `ast::Block` is private to `format`, so no caller outside this
 /// module could construct an argument for it anyway.
@@ -126,7 +126,7 @@ pub(crate) fn render_blocks(blocks: &[ast::Block], target: &RenderTarget) -> Vec
 }
 
 /// Parse once and render to two targets. The two lists are 1:1 with each other
-/// (renderer invariant), which is what makes `split_paired` sound.
+/// (renderer invariant), which is what makes [`split_paired`] sound.
 pub fn render_pair(
     md: &str,
     primary: &RenderTarget,
@@ -143,3 +143,19 @@ pub fn render_pair(
 pub fn render_to_string(md: &str, target: &RenderTarget) -> String {
     split::join_all(&render(md, target))
 }
+
+// `cargo clippy --all-targets` compiles this module twice: once as part of the
+// lib crate (`src/lib.rs: pub mod channels;`) and once as the bin crate's own
+// private copy (`src/main.rs: mod channels;`). The lib unit is exempt from
+// `unused_imports` on `pub` re-exports because a lib crate might be used by a
+// downstream crate; a bin crate has no downstream, so that exemption never
+// applies there. Neither `split`'s own module visibility nor this re-export's
+// visibility changes that — verified empirically (private/`pub(crate)`/`pub`
+// all warn identically) — because the bin's `mod channels;` is itself private,
+// which breaks external reachability regardless of how `pub` anything nested
+// under it is. The only real consumers right now are this crate's own test
+// suite (`tests.rs`) and, once PR2 lands, sibling channel modules under
+// `src/channels/*.rs` — both reach this via the re-export below, not via
+// `split`'s own (deliberately private) module path.
+#[allow(unused_imports)]
+pub use split::{split, split_paired};
