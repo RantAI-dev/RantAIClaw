@@ -617,6 +617,38 @@ mod tests {
         );
     }
 
+    // `wrap_overhead` must charge the fence width the BODY forces, not a
+    // hard-coded 3-backtick fence. The bug needs two things at once: a body long
+    // enough to split, AND a wide backtick run sitting in a chunk that packing
+    // has filled to the budget. None of the three fence tests above has both —
+    // their bodies are 4 and 12 chars and never split at all, and the long-info
+    // -string case only over-charges, which is the safe direction. So all three
+    // pass against the historical `8 + lang` formula while a real chunk overflows:
+    // at limit 2000 the widest chunk came out 2005, at 4096 it came out 4106 —
+    // both rejected by the platform.
+    #[test]
+    fn wide_fence_in_an_oversized_body_respects_limit() {
+        // SHORT lines on purpose: packing is line-granular, so long lines leave
+        // the last one short of the budget and the 16-char lie fits in the slack
+        // (48-char lines hide it entirely at limit 2000). Short lines pack tight
+        // against the budget, which is where the miscount actually shows.
+        let mut lines: Vec<String> = (0..800).map(|_| "c".repeat(8)).collect();
+        // A 10-backtick run mid-body forces an 11-wide fence, so the real wrap
+        // costs 24 chars where the old formula charged 8.
+        lines[400] = "`".repeat(10);
+        let code = lines.join("\n");
+        let blocks = vec![RenderedBlock::code(code, CodeWrap::Fence(None))];
+        for limit in [2000usize, 4096] {
+            let chunks = split(&blocks, limit);
+            assert!(chunks.len() > 1, "limit {limit}: body must actually split");
+            assert!(
+                chunks.iter().all(|c| c.chars().count() <= limit),
+                "limit {limit}: chunk lengths {:?}",
+                chunks.iter().map(|c| c.chars().count()).collect::<Vec<_>>()
+            );
+        }
+    }
+
     // `Indent` adds 4 chars to EVERY line. Charging that overhead once per chunk
     // (instead of per line) lets an N-line chunk overrun the limit by 4*N — the
     // Fence path has always been covered, this path was not.
@@ -749,6 +781,34 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         for chunk in &with_element {
+            assert_eq!(
+                chunk.matches("<b>").count(),
+                chunk.matches("</b>").count(),
+                "unbalanced: {chunk:?}"
+            );
+        }
+
+        // The mirror, and NOT a duplicate of the case above: text-then-element is
+        // the shape the CJK repro actually had, and it leans on a different flush
+        // point. `<b>x</b>{run}` is saved by the flush AFTER depth returns to 0 —
+        // the element leaves `pending` before the run accumulates. Only
+        // `{run}<b>x</b>` exercises the flush BEFORE the tag is consumed; without
+        // it the run rides into `pending` alongside the element, `contains('<')`
+        // then reads the whole thing as one atomic element, and the 6008 chars go
+        // out as a single chunk Telegram rejects.
+        let element_last = split(
+            &[RenderedBlock::prose_html(format!("{run}<b>x</b>"))],
+            limit,
+        );
+        assert!(
+            element_last.iter().all(|c| c.chars().count() <= limit),
+            "an element AFTER the run must not make it unsplittable: {:?}",
+            element_last
+                .iter()
+                .map(|c| c.chars().count())
+                .collect::<Vec<_>>()
+        );
+        for chunk in &element_last {
             assert_eq!(
                 chunk.matches("<b>").count(),
                 chunk.matches("</b>").count(),
