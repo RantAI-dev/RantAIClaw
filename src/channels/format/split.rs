@@ -38,11 +38,17 @@ fn wrap_code(body: &str, wrap: &CodeWrap) -> String {
     }
 }
 
-fn wrap_overhead(wrap: &CodeWrap) -> usize {
+/// Overhead a wrap adds, as `(fixed, per_line)`.
+///
+/// `Fence` and `HtmlPre` pay once around the whole body. `Indent` prefixes four
+/// spaces to EVERY line, so it cannot be modelled as a scalar: charging it once
+/// lets an N-line chunk overflow the limit by `4 * N` (a 200-line plain table at
+/// limit 4096 came out at 4454; single-char lines reached ~3x the limit).
+fn wrap_overhead(wrap: &CodeWrap) -> (usize, usize) {
     match wrap {
-        CodeWrap::Fence(lang) => 8 + lang.as_deref().unwrap_or("").chars().count(),
-        CodeWrap::HtmlPre => 11,
-        CodeWrap::Indent => 4,
+        CodeWrap::Fence(lang) => (8 + lang.as_deref().unwrap_or("").chars().count(), 0),
+        CodeWrap::HtmlPre => (11, 0),
+        CodeWrap::Indent => (0, 4),
     }
 }
 
@@ -65,8 +71,9 @@ fn split_oversized(block: &RenderedBlock, limit: usize) -> Vec<String> {
     match block.kind {
         BlockKind::Code => {
             let wrap = block.code_wrap.clone().unwrap_or(CodeWrap::Fence(None));
-            let budget = limit.saturating_sub(wrap_overhead(&wrap)).max(1);
-            pack_lines(&block.text, budget)
+            let (fixed, per_line) = wrap_overhead(&wrap);
+            let budget = limit.saturating_sub(fixed).max(1);
+            pack_lines(&block.text, budget, per_line)
                 .iter()
                 .map(|piece| wrap_code(piece, &wrap))
                 .collect()
@@ -210,26 +217,39 @@ pub fn split_paired(
     pairs
 }
 
-/// Greedily pack whole lines under `budget` chars.
-fn pack_lines(text: &str, budget: usize) -> Vec<String> {
+/// Greedily pack whole lines so that the WRAPPED chunk fits `budget` chars.
+///
+/// `per_line` is what the wrap will add to each line (see [`wrap_overhead`]); it
+/// must be charged as each line is packed, not once per chunk. `cost` tracks the
+/// wrapped size of `cur`, so the caller's `wrap_code` can never push a chunk past
+/// the limit.
+fn pack_lines(text: &str, budget: usize, per_line: usize) -> Vec<String> {
     let budget = budget.max(1);
+    // Budget for a piece that will stand alone as its own single-line chunk.
+    let line_budget = budget.saturating_sub(per_line).max(1);
     let mut out = Vec::new();
     let mut cur = String::new();
+    let mut cost = 0usize;
     for line in text.lines() {
-        let add = line.chars().count() + usize::from(!cur.is_empty());
-        if !cur.is_empty() && cur.chars().count() + add > budget {
+        let line_len = line.chars().count();
+        // `+1` for the '\n' that joins this line to the previous one.
+        let line_cost = line_len + per_line + usize::from(!cur.is_empty());
+        if !cur.is_empty() && cost + line_cost > budget {
             out.push(std::mem::take(&mut cur));
+            cost = 0;
         }
-        if line.chars().count() > budget {
+        if line_len + per_line > budget {
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
+                cost = 0;
             }
-            out.extend(hard_split(line, budget));
+            out.extend(hard_split(line, line_budget));
         } else {
             if !cur.is_empty() {
                 cur.push('\n');
             }
             cur.push_str(line);
+            cost += line_cost;
         }
     }
     if !cur.is_empty() {
@@ -387,6 +407,28 @@ mod tests {
     fn every_chunk_within_limit() {
         let blocks = vec![RenderedBlock::prose("x ".repeat(100))];
         assert!(split(&blocks, 50).iter().all(|c| c.chars().count() <= 50));
+    }
+
+    // `Indent` adds 4 chars to EVERY line. Charging that overhead once per chunk
+    // (instead of per line) lets an N-line chunk overrun the limit by 4*N — the
+    // Fence path has always been covered, this path was not.
+    #[test]
+    fn oversized_indented_code_respects_limit() {
+        let code = (0..50)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let blocks = vec![RenderedBlock::code(code, CodeWrap::Indent)];
+        assert!(split(&blocks, 40).iter().all(|c| c.chars().count() <= 40));
+    }
+
+    // Regression for the realistic shape: a long plain-rendered ASCII table.
+    // Many short lines maximize the per-line overhead the old scalar model lost.
+    #[test]
+    fn oversized_indented_many_short_lines_respects_limit() {
+        let code = (0..500).map(|_| "x").collect::<Vec<_>>().join("\n");
+        let blocks = vec![RenderedBlock::code(code, CodeWrap::Indent)];
+        assert!(split(&blocks, 100).iter().all(|c| c.chars().count() <= 100));
     }
 
     #[test]
