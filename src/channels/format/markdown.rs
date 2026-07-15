@@ -113,7 +113,26 @@ fn opens_inline_span(c: char, run: usize, before: Option<char>, after: Option<ch
                 && !(before.is_some_and(char::is_alphanumeric)
                     && after.is_some_and(char::is_alphanumeric))
         }
-        // Only `~~` strikes in GFM, so `~/path` and `(~2s)` stay bare.
+        // A lone `~` is left bare DELIBERATELY — not because it is inert. This
+        // parser strikes on a single tilde (`parse("~a~")` -> `Strikethrough`),
+        // so `\~a\~` really does come back struck with its tildes gone. That is
+        // the accepted trade-off, not an oversight: `~/path` and `(~2s)` are
+        // ordinary prose, the shipped targets (Discord, Mattermost) only strike
+        // on `~~`, and a backslash in front of every stray tilde reads worse than
+        // the loss on a parser we do not send to.
+        //
+        // `run >= 2` still earns its keep, and not for strikethrough: a flanking
+        // `~`/`~~` is a delimiter candidate, so pulldown hands it over as
+        // one-tilde-per-node and the run never reaches 2 here. What DOES arrive
+        // whole is a longer run — and 3+ tildes at a block start open a FENCE.
+        // Emitted bare, `~~~~a` is not merely struck, it swallows the paragraph
+        // into an empty code block. See
+        // `escaped_tilde_run_does_not_reopen_a_code_fence`.
+        //
+        // The same node-splitting is why the fully-escaped spelling `\~\~\~\~a`
+        // is NOT covered: it arrives as four run=1 nodes, so this rule cannot
+        // see the run and the fence is re-armed. Fixing that needs cross-node
+        // run tracking in `push_text`, which this rule cannot do alone.
         '~' => run >= 2 && flanking,
         _ => false,
     }
@@ -502,6 +521,22 @@ mod tests {
         // code span — still one `Code` inline, not two `Text` fragments.
         assert_eq!(rows[0][0], vec![Inline::Code("a|b".into())], "{out}");
         assert_eq!(inline_plain(&rows[0][1]), "2", "{out}");
+    }
+
+    // `\~~~~a` reaches this renderer as the bare `Text("~~~~a")` — pulldown
+    // strips the escape and, because a 4-tilde run is no strikethrough delimiter,
+    // hands the run over WHOLE rather than one node per tilde. Four tildes at a
+    // block start are a fence: re-emitted bare they do not merely strike the
+    // text, they swallow the paragraph into an empty `CodeBlock { lang:
+    // Some("a") }` and the content is gone. This is what the `run >= 2` half of
+    // the `~` rule actually guards — the `~~`-strikethrough case the comment used
+    // to cite never reaches it, since a flanking `~~` arrives pre-split into
+    // run=1 nodes.
+    #[test]
+    fn escaped_tilde_run_does_not_reopen_a_code_fence() {
+        // `round_trip_paragraph` panics if this re-parses as a CodeBlock.
+        let inlines = round_trip_paragraph(r"\~~~~a");
+        assert_eq!(inline_plain(&inlines), "~~~~a");
     }
 
     // The counterweight to every test above: escaping must be *surgical*. Each
