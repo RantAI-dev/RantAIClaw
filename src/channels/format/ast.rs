@@ -70,6 +70,22 @@ fn align_of(a: Alignment) -> TableAlign {
     }
 }
 
+/// Max nesting depth of `Container` frames the builder will open.
+///
+/// This guards a **stack overflow, not a style preference**. `parse` itself is
+/// safe at any depth (it is a `Vec` stack over a flat event stream), but every
+/// renderer (`html`/`plain`/`markdown`/`light`) walks the resulting tree with
+/// one Rust stack frame per `List`/`BlockQuote` level. Channels render from
+/// async tasks on tokio workers, whose default stack is 2 MB — where a debug
+/// build dies at ~1000 levels. A stack overflow is a `SIGABRT`, not a panic:
+/// it is not catchable, so one deep reply would take the whole agent runtime
+/// down (CLAUDE.md §7.3 forbids panics in the runtime path; an abort is worse).
+///
+/// 32 is ~4x the deepest nesting a real agent reply plausibly uses (a 3-4 level
+/// list inside a quote) and ~30x below the measured ~1000-level failure point,
+/// so it is invisible to real content while leaving a wide margin.
+const MAX_CONTAINER_DEPTH: usize = 32;
+
 /// Parse `md` as GFM (tables + strikethrough enabled) into blocks.
 pub fn parse(md: &str) -> Vec<Block> {
     let mut opts = Options::empty();
@@ -103,6 +119,9 @@ struct Builder {
     /// Inline accumulation stack; the top frame collects the current run.
     inline_stack: Vec<Vec<Inline>>,
     block_stack: Vec<Container>,
+    /// Count of container opens refused by [`MAX_CONTAINER_DEPTH`] that are
+    /// still awaiting their matching `End`. See [`Builder::try_enter`].
+    suppressed: usize,
     code: Option<(Option<String>, String)>,
     table: Option<TableBuild>,
     link_urls: Vec<String>,
@@ -121,6 +140,48 @@ impl Builder {
             Some(Container::Item(children) | Container::Quote(children)) => children.push(block),
             _ => self.blocks.push(block),
         }
+    }
+
+    /// Whether a `List`/`Quote` may be opened at the current depth, recording
+    /// the refusal when it may not. See [`MAX_CONTAINER_DEPTH`].
+    ///
+    /// The refusal is sticky: while `suppressed > 0` nothing is pushed and
+    /// (because every container `End` is guarded) nothing is popped, so
+    /// `block_stack.len()` cannot drop back under the cap mid-suppression.
+    /// Refused opens are therefore always the innermost, contiguous region of
+    /// the nesting, and their `End`s — which arrive innermost-first — are
+    /// exactly the next `suppressed` container `End`s. That is what makes a
+    /// plain counter, rather than a parallel stack, sound here.
+    fn try_enter(&mut self) -> bool {
+        if self.block_stack.len() >= MAX_CONTAINER_DEPTH {
+            self.suppressed += 1;
+            return false;
+        }
+        true
+    }
+
+    /// Whether an `Item` may be opened. It inherits its parent `List`'s
+    /// decision instead of re-checking depth, which keeps the pair atomic: a
+    /// pushed `List` always gets its `Item`s. Re-checking would let a `List`
+    /// open at `MAX_CONTAINER_DEPTH - 1` while its `Item`s were refused, and
+    /// `TagEnd::Item` files an item's children into the enclosing `List` — so
+    /// that `List` would silently drop every item's content.
+    fn try_enter_item(&mut self) -> bool {
+        if self.suppressed > 0 {
+            self.suppressed += 1;
+            return false;
+        }
+        true
+    }
+
+    /// Symmetric to [`Builder::try_enter`]: `true` when this `End` closes a
+    /// refused open and must therefore NOT pop a real frame.
+    fn leave_suppressed(&mut self) -> bool {
+        if self.suppressed > 0 {
+            self.suppressed -= 1;
+            return true;
+        }
+        false
     }
 
     /// Auto-open a frame: tight list items and HTML blocks deliver text with no
@@ -187,18 +248,31 @@ impl Builder {
                 };
                 self.code = Some((lang, String::new()));
             }
+            // `flush_implicit` runs whether or not the container is refused: it
+            // closes any open tight-item text into a Paragraph in the enclosing
+            // container FIRST, which is what keeps `- a\n  - b` as
+            // `[Paragraph(a), List(b)]`, and on the refused path is what emits
+            // over-deep text as siblings instead of merging it into one run.
             Tag::List(start) => {
                 self.flush_implicit();
-                self.block_stack.push(Container::List {
-                    ordered: start.is_some(),
-                    start: start.unwrap_or(1),
-                    items: Vec::new(),
-                });
+                if self.try_enter() {
+                    self.block_stack.push(Container::List {
+                        ordered: start.is_some(),
+                        start: start.unwrap_or(1),
+                        items: Vec::new(),
+                    });
+                }
             }
-            Tag::Item => self.block_stack.push(Container::Item(Vec::new())),
+            Tag::Item => {
+                if self.try_enter_item() {
+                    self.block_stack.push(Container::Item(Vec::new()));
+                }
+            }
             Tag::BlockQuote(_) => {
                 self.flush_implicit();
-                self.block_stack.push(Container::Quote(Vec::new()));
+                if self.try_enter() {
+                    self.block_stack.push(Container::Quote(Vec::new()));
+                }
             }
             Tag::Table(aligns) => {
                 self.table = Some(TableBuild {
@@ -247,7 +321,13 @@ impl Builder {
                     self.push_block(Block::CodeBlock { lang, code });
                 }
             }
+            // Each container `End` must mirror `start`'s refusal: popping a real
+            // frame to close an open that was never pushed would desync the
+            // stack, which is worse than the overflow this cap prevents.
             TagEnd::List(_) => {
+                if self.leave_suppressed() {
+                    return;
+                }
                 if let Some(Container::List {
                     ordered,
                     start,
@@ -262,7 +342,12 @@ impl Builder {
                 }
             }
             TagEnd::Item => {
+                // Before the guard: a refused item's text still has to land in
+                // the nearest surviving container, or over-deep content is lost.
                 self.flush_implicit();
+                if self.leave_suppressed() {
+                    return;
+                }
                 if let Some(Container::Item(children)) = self.block_stack.pop() {
                     if let Some(Container::List { items, .. }) = self.block_stack.last_mut() {
                         items.push(children);
@@ -429,5 +514,174 @@ mod tests {
         assert!(ordered);
         assert_eq!(*start, 3);
         assert_eq!(items.len(), 2);
+    }
+
+    // --- MAX_CONTAINER_DEPTH -------------------------------------------------
+    //
+    // The cap exists to protect the RENDERERS: each recurses one Rust stack
+    // frame per List/BlockQuote level, and channels render on 2 MB tokio worker
+    // stacks where a debug build overflows at ~1000 levels. An overflow is a
+    // SIGABRT, not a catchable panic, so it kills the whole runtime.
+    //
+    // Depth 200 is deliberate: it is ~6x the cap (so the cap must engage) yet
+    // stays under the ~1000/~4000-level overflow thresholds, so if the cap ever
+    // stopped binding these tests would FAIL an assertion rather than abort the
+    // harness and take every other test's result with them.
+
+    const OVER_CAP: usize = 200;
+
+    /// Max nesting of renderer-recursive containers in a parsed tree. Recurses
+    /// only over the already-capped AST, so it is itself depth-bounded.
+    fn container_depth(blocks: &[Block]) -> usize {
+        blocks
+            .iter()
+            .map(|b| match b {
+                Block::BlockQuote(inner) => 1 + container_depth(inner),
+                Block::List { items, .. } => {
+                    1 + items.iter().map(|i| container_depth(i)).max().unwrap_or(0)
+                }
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn nested_quotes(depth: usize) -> String {
+        format!("{} deepest", ">".repeat(depth))
+    }
+
+    fn nested_lists(depth: usize) -> String {
+        (0..depth)
+            .map(|i| format!("{}- level{i}", " ".repeat(i * 2)))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+            + &" ".repeat(depth * 2)
+            + "- deepest"
+    }
+
+    #[test]
+    fn quotes_past_the_cap_stay_bounded_and_keep_their_text() {
+        let blocks = parse(&nested_quotes(OVER_CAP));
+        assert!(
+            container_depth(&blocks) <= MAX_CONTAINER_DEPTH,
+            "cap did not bind: depth {}",
+            container_depth(&blocks)
+        );
+        let out = crate::channels::format::render_to_string(
+            &nested_quotes(OVER_CAP),
+            &crate::channels::format::RenderTarget::Plain,
+        );
+        assert!(out.contains("deepest"), "over-deep text was lost: {out:?}");
+    }
+
+    #[test]
+    fn lists_past_the_cap_stay_bounded_and_keep_their_text() {
+        let blocks = parse(&nested_lists(OVER_CAP));
+        assert!(
+            container_depth(&blocks) <= MAX_CONTAINER_DEPTH,
+            "cap did not bind: depth {}",
+            container_depth(&blocks)
+        );
+        let out = crate::channels::format::render_to_string(
+            &nested_lists(OVER_CAP),
+            &crate::channels::format::RenderTarget::Plain,
+        );
+        assert!(out.contains("deepest"), "over-deep text was lost: {out:?}");
+        // Flattened, not dropped: every level's text still reaches the user.
+        assert!(out.contains("level0") && out.contains("level199"));
+    }
+
+    // The normal path must be untouched: under the cap, shape is exact.
+    #[test]
+    fn nesting_just_under_the_cap_is_unaffected() {
+        let blocks = parse(&nested_quotes(MAX_CONTAINER_DEPTH - 1));
+        assert_eq!(container_depth(&blocks), MAX_CONTAINER_DEPTH - 1);
+
+        // Peel every level: nothing refused, nothing flattened.
+        let mut cur = &blocks;
+        for _ in 0..MAX_CONTAINER_DEPTH - 1 {
+            let [Block::BlockQuote(inner)] = cur.as_slice() else {
+                panic!("expected a single blockquote, got {cur:?}")
+            };
+            cur = inner;
+        }
+        assert_eq!(
+            cur.as_slice(),
+            [Block::Paragraph(vec![Inline::Text("deepest".into())])]
+        );
+    }
+
+    // Desync guard. Every refused open must have its `End` refused too. If the
+    // counter under- or over-drained, the block_stack would not unwind back to
+    // empty, and `push_block` would file this trailing paragraph into a
+    // leftover container instead of at root — so `blocks` would not end with it
+    // at top level. Covers both container kinds, since `List`/`Item` refuse via
+    // different predicates (depth vs. inherited).
+    #[test]
+    fn container_stack_unwinds_after_refused_opens() {
+        for deep in [nested_quotes(OVER_CAP), nested_lists(OVER_CAP)] {
+            let blocks = parse(&format!("{deep}\n\nafter"));
+            assert_eq!(
+                blocks.last(),
+                Some(&Block::Paragraph(vec![Inline::Text("after".into())])),
+                "stack desynced: trailing block is {:?}",
+                blocks.last()
+            );
+        }
+    }
+
+    // The property that actually matters: the cap protects the renderers, so
+    // every target must complete on over-deep input.
+    #[test]
+    fn all_targets_render_over_deep_input() {
+        use crate::channels::format::{render_to_string, LinkStyle, RenderTarget};
+
+        let targets = [
+            RenderTarget::Plain,
+            RenderTarget::TelegramHtml,
+            RenderTarget::MatrixHtml,
+            RenderTarget::StdMarkdown {
+                tables_native: true,
+            },
+            RenderTarget::LightMarkup {
+                links: LinkStyle::Slack,
+            },
+        ];
+        for md in [nested_quotes(OVER_CAP), nested_lists(OVER_CAP)] {
+            for target in &targets {
+                let out = render_to_string(&md, target);
+                assert!(
+                    out.contains("deepest"),
+                    "{target:?} lost the over-deep text: {out:?}"
+                );
+            }
+        }
+    }
+
+    /// The original defect, reproduced at the size that killed the runtime, on
+    /// a tokio-worker-sized stack.
+    ///
+    /// `#[ignore]`d on purpose: it asserts the ABSENCE of a process abort. If
+    /// the cap ever regresses this does not fail — it SIGABRTs the whole test
+    /// harness and destroys every other test's result. Opt-in:
+    /// `cargo test --lib channels::format -- --ignored`.
+    #[test]
+    #[ignore = "asserts the absence of a SIGABRT: a regression aborts the harness \
+                instead of failing, destroying every other test's result"]
+    fn deep_quote_renders_on_worker_sized_stack() {
+        let md = nested_quotes(2000);
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024) // tokio worker default
+            .spawn(move || {
+                let out = crate::channels::format::render_to_string(
+                    &md,
+                    &crate::channels::format::RenderTarget::Plain,
+                );
+                assert!(out.contains("deepest"));
+            })
+            .unwrap()
+            .join()
+            .expect("renderer overflowed a 2 MB worker stack");
     }
 }
