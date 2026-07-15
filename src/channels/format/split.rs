@@ -335,6 +335,45 @@ fn pack_lines(text: &str, budget: usize, per_line: usize) -> Vec<String> {
     out
 }
 
+/// How far back a char-boundary cut will look for the `&` of an entity, in chars.
+///
+/// The escaper (`html::escape_html`) emits only `&amp; &lt; &gt; &quot;
+/// &#39;` — 6 chars at worst — so 12 is double the longest sequence that can
+/// actually reach here. The bound is what makes a STRAY `&` safe: text is not
+/// required to be escaped (`hard_split` also splits Plain prose and code bodies,
+/// where `&` is literal), so `cats&dogs` must not drag the cut arbitrarily far
+/// back looking for a `;` that does not exist. It also keeps the scan O(1) per
+/// cut rather than O(limit).
+const ENTITY_SCAN_MAX: usize = 12;
+
+/// Move a char-boundary cut at `end` back so it never lands inside an `&…;`.
+///
+/// Scans back from the cut for the nearest entity-significant char and decides:
+/// a `&` means an entity opened before the cut and did not close before it, so
+/// the cut lands INSIDE it — move the cut to before the `&`. A `;` means the cut
+/// follows a complete entity. Anything an entity body cannot contain means the
+/// cut is not in one. All three are safe as-is.
+///
+/// Returns a cut STRICTLY greater than `start` in every case, which is what keeps
+/// `hard_split`'s loop terminating: a cut backed all the way up to `start` would
+/// make the loop re-cut the same range forever (the same failure the `limit.max(1)`
+/// clamp guards). When backing up cannot make progress — `start` itself is the
+/// `&`, reachable only when `limit` is shorter than the entity — the unadjusted
+/// cut is kept and the entity is split, which is unavoidable at that limit and
+/// never happens at a real platform limit, where any entity fits.
+fn entity_safe_cut(chars: &[char], start: usize, end: usize) -> usize {
+    let lower = start.max(end.saturating_sub(ENTITY_SCAN_MAX));
+    for j in (lower..end).rev() {
+        match chars[j] {
+            '&' => return if j > start { j } else { end },
+            ';' => return end,
+            c if c.is_ascii_alphanumeric() || c == '#' => {}
+            _ => return end,
+        }
+    }
+    end
+}
+
 /// Hard-split at word boundaries, then char boundaries, so no piece exceeds
 /// `limit`. `limit` is clamped to >= 1: a 0 limit would loop forever.
 fn hard_split(text: &str, limit: usize) -> Vec<String> {
@@ -350,9 +389,18 @@ fn hard_split(text: &str, limit: usize) -> Vec<String> {
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
             }
-            let mut chars = word.chars().peekable();
-            while chars.peek().is_some() {
-                out.push(chars.by_ref().take(limit).collect::<String>());
+            // Cut by index rather than `take(limit)` so the cut can be moved
+            // back off an entity. Every cut still advances (see
+            // `entity_safe_cut`), so this terminates for any `limit >= 1`.
+            let chars: Vec<char> = word.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let mut end = (i + limit).min(chars.len());
+                if end < chars.len() {
+                    end = entity_safe_cut(&chars, i, end);
+                }
+                out.push(chars[i..end].iter().collect::<String>());
+                i = end;
             }
         } else {
             if !cur.is_empty() {
@@ -378,8 +426,26 @@ fn hard_split(text: &str, limit: usize) -> Vec<String> {
 /// classified: closing tags decrement, void tags (`<br>`, `<hr>`, `… />`) do
 /// nothing, everything else increments.
 ///
-/// A single element run longer than `limit` is atomic — it cannot be split
-/// without breaking its tags — so it is emitted oversized. See
+/// `pending` is flushed at every depth-0 boundary: a space/newline, and — the
+/// part that makes the oversized branch below correct — the START and END of
+/// every top-level element. That yields the invariant every flush relies on:
+///
+/// > `pending` holds EITHER tag-free text OR exactly one complete element.
+///
+/// It holds because a `<` at depth 0 flushes before the tag is appended (so the
+/// text before it leaves alone), and depth returning to 0 flushes right after the
+/// element closes (so the element leaves alone). Text accumulated at depth 0 can
+/// therefore never contain a `<`, since one would have flushed it.
+///
+/// Without those two flush points, `pending` mixed text and elements, the
+/// oversized branch saw `contains('<')` and emitted the ENTIRE run — so one
+/// `<b>` in a space-free 5709-char CJK paragraph turned `[4096, 1604]` into a
+/// single 5709-char chunk Telegram rejects, while the same text rendered Plain
+/// split fine. The exemption is only sound for something that truly cannot be
+/// broken.
+///
+/// A single element longer than `limit` IS atomic — it cannot be split without
+/// breaking its tags — so it alone is emitted oversized. See
 /// `html_prose_oversized_run_stays_balanced`.
 fn hard_split_html(text: &str, limit: usize) -> Vec<String> {
     let limit = limit.max(1);
@@ -395,8 +461,9 @@ fn hard_split_html(text: &str, limit: usize) -> Vec<String> {
         }
         if cur.is_empty() && pending.chars().count() > limit {
             if pending.contains('<') {
-                // One atomic element run longer than the limit — splitting it
-                // would unbalance its tags, so it goes out oversized.
+                // Per the flush invariant, a `<` here means `pending` is exactly
+                // ONE element and nothing else, so it is genuinely atomic:
+                // splitting it would unbalance its tags. It goes out oversized.
                 out.push(std::mem::take(pending));
             } else {
                 // Plain text between elements: safe to break at words.
@@ -411,6 +478,13 @@ fn hard_split_html(text: &str, limit: usize) -> Vec<String> {
 
     while let Some(ch) = chars.next() {
         if ch == '<' {
+            // A top-level element opens here. Flush the text before it on its
+            // own: carried into `pending` alongside the element, it would make
+            // the whole run look atomic. Depth is 0, so this cannot cut inside
+            // an element.
+            if depth == 0 {
+                flush(&mut pending, &mut cur, &mut out);
+            }
             let closing = chars.peek() == Some(&'/');
             let mut tag = String::from('<');
             for c in chars.by_ref() {
@@ -426,6 +500,12 @@ fn hard_split_html(text: &str, limit: usize) -> Vec<String> {
                 depth += 1;
             }
             pending.push_str(&tag);
+            // Back to depth 0: the element (or void/stray tag) is complete and
+            // `pending` is exactly that one element. Flush it as the single
+            // atomic unit it is, so trailing text never rides along with it.
+            if depth == 0 {
+                flush(&mut pending, &mut cur, &mut out);
+            }
             continue;
         }
         pending.push(ch);
@@ -596,6 +676,148 @@ mod tests {
             assert_eq!(chunk.matches("<b>").count(), chunk.matches("</b>").count());
         }
         assert!(chunks.iter().any(|c| c.chars().count() > 50));
+
+        // ...and ONLY the atomic element may exceed the limit. The exemption is
+        // "an element cannot be broken", not "anything adjacent to an element
+        // rides along": the ` tail` next to it has a legal break point and must
+        // use it. Without this, an oversized chunk may quietly carry unbounded
+        // breakable text (see `html_prose_unspaced_run_splits_with_and_without_
+        // an_element`, where that text is 6000 chars).
+        let oversized: Vec<&String> = chunks.iter().filter(|c| c.chars().count() > 50).collect();
+        assert_eq!(oversized.len(), 1, "chunks {chunks:?}");
+        assert_eq!(
+            *oversized[0],
+            format!("<b>{}</b>", "y".repeat(80)),
+            "the oversized chunk must be the bare element, with no text dragged along"
+        );
+    }
+
+    // Two elements that each fit the limit EXACTLY, separated by one space. The
+    // single space is the whole bug: carried into `pending` behind the element it
+    // made the pair look like one atomic run of limit+1, which then went out
+    // oversized — `[4097, 4096]` at Telegram's real limit, from input that is
+    // entirely legal and needs no exemption at all. Nothing here is unsplittable.
+    #[test]
+    fn html_prose_adjacent_fitting_elements_respect_limit() {
+        let limit = 4096;
+        let element = format!("<b>{}</b>", "a".repeat(4089));
+        assert_eq!(element.chars().count(), limit, "element must fit exactly");
+        let chunks = split(
+            &[RenderedBlock::prose_html(format!("{element} {element}"))],
+            limit,
+        );
+        assert!(
+            chunks.iter().all(|c| c.chars().count() <= limit),
+            "two limit-sized elements must not merge into an over-limit chunk: {:?}",
+            chunks.iter().map(|c| c.chars().count()).collect::<Vec<_>>()
+        );
+        for chunk in &chunks {
+            assert_eq!(chunk.matches("<b>").count(), chunk.matches("</b>").count());
+        }
+    }
+
+    // The decisive control pair for the depth-0 break: the SAME space-free run,
+    // once alone and once with one small element in front. Only the element
+    // differs, so a split/no-split divergence can only come from the element
+    // handling. This is the ASCII analogue of the CJK repro — Chinese/Japanese/
+    // Thai prose carries no spaces, so one `<b>` used to flip a 5709-char
+    // paragraph from `[4096, 1604]` to a single undeliverable 5709-char chunk.
+    // Base64 blobs, minified JSON and stack traces after inline markup are the
+    // ASCII shapes that hit the same path.
+    #[test]
+    fn html_prose_unspaced_run_splits_with_and_without_an_element() {
+        let run = "x".repeat(6000);
+        let limit = 4096;
+
+        let bare = split(&[RenderedBlock::prose_html(run.clone())], limit);
+        assert!(
+            bare.iter().all(|c| c.chars().count() <= limit),
+            "control: a space-free run with no element must split: {:?}",
+            bare.iter().map(|c| c.chars().count()).collect::<Vec<_>>()
+        );
+
+        let with_element = split(
+            &[RenderedBlock::prose_html(format!("<b>x</b>{run}"))],
+            limit,
+        );
+        assert!(
+            with_element.iter().all(|c| c.chars().count() <= limit),
+            "one small element must not make the same run unsplittable: {:?}",
+            with_element
+                .iter()
+                .map(|c| c.chars().count())
+                .collect::<Vec<_>>()
+        );
+        for chunk in &with_element {
+            assert_eq!(
+                chunk.matches("<b>").count(),
+                chunk.matches("</b>").count(),
+                "unbalanced: {chunk:?}"
+            );
+        }
+    }
+
+    // Every `</b><code>` seam is a clean depth-0 break. Emitting the whole run
+    // because it merely CONTAINS tags ignores all of them: 600 repeats produced
+    // one 13200-char chunk at limit 20.
+    #[test]
+    fn html_prose_breaks_at_element_seams() {
+        let text = "<b>a</b><code>b</code>".repeat(600);
+        let limit = 20;
+        let chunks = split(&[RenderedBlock::prose_html(text)], limit);
+        assert!(
+            chunks.iter().all(|c| c.chars().count() <= limit),
+            "every element fits the limit, so every chunk must: {:?}",
+            chunks.iter().map(|c| c.chars().count()).collect::<Vec<_>>()
+        );
+        for chunk in &chunks {
+            assert_eq!(chunk.matches("<b>").count(), chunk.matches("</b>").count());
+            assert_eq!(
+                chunk.matches("<code>").count(),
+                chunk.matches("</code>").count()
+            );
+        }
+    }
+
+    // `hard_split`'s char-level fallback is the last resort for a word longer
+    // than the limit. It must not cut inside an `&…;`: the user sees literal
+    // `&`/`amp;` garbage and the original character is destroyed. Reachable at
+    // Telegram's real 4096 limit, not just at synthetic ones.
+    #[test]
+    fn hard_split_never_cuts_an_html_entity() {
+        // What the escaper emits for `"a&b".repeat(3000)` — one 21000-char
+        // space-free word, so the char-level fallback is what splits it.
+        let text = "a&amp;b".repeat(3000);
+        let limit = 4096;
+        let chunks = split(&[RenderedBlock::prose_html(text)], limit);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.chars().count() <= limit));
+
+        // The only `&` and `;` in this input come from `&amp;`, so these two
+        // assertions can actually fail: any `&` must reach its `;` inside the
+        // same chunk, and no chunk may open with an orphaned entity tail.
+        for chunk in &chunks {
+            if let Some(amp) = chunk.rfind('&') {
+                assert!(
+                    chunk[amp..].contains(';'),
+                    "chunk ends inside an entity: {:?}",
+                    &chunk[amp..]
+                );
+            }
+            match (chunk.find('&'), chunk.find(';')) {
+                (Some(amp), Some(semi)) => assert!(
+                    semi > amp,
+                    "chunk starts with an entity tail: {:?}",
+                    &chunk[..=semi]
+                ),
+                (None, Some(semi)) => {
+                    panic!("chunk starts with an entity tail: {:?}", &chunk[..=semi])
+                }
+                _ => {}
+            }
+        }
+        // Content is preserved exactly: splitting only removes break points.
+        assert_eq!(chunks.concat(), "a&amp;b".repeat(3000));
     }
 
     #[test]
