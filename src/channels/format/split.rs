@@ -8,16 +8,78 @@ use super::{BlockKind, CodeWrap, RenderedBlock};
 
 const SEP: &str = "\n\n";
 
+/// Cap on a fence info string, in chars.
+///
+/// Every real language identifier is far shorter (`objective-c` is 11,
+/// `typescript` 10); 32 clears the whole highlight.js/linguist registry. The cap
+/// exists for the budget, not for looks: `wrap_overhead` puts the info string in
+/// the fence's FIXED cost, so an uncapped one makes that cost exceed the limit,
+/// `budget` saturates to 1, and every chunk overflows (a 300-char info string at
+/// limit 64 produced 291 chunks of 309). At 32 the fence costs at most 40 — an
+/// order of magnitude under the smallest platform limit (Discord 2000).
+const FENCE_LANG_MAX: usize = 32;
+
+/// Width of the backtick fence that can wrap `body`, in backticks.
+///
+/// A fence must be LONGER than the longest backtick run in its body, or the body
+/// closes the block early. The common case is an LLM quoting markdown: it emits a
+/// 4-backtick fence around a 3-backtick one, `ast.rs` parses that correctly and
+/// hands us a body containing ```` ``` ````, and a hard-coded 3-backtick wrapper
+/// then truncates the block at the body's own fence — silently losing the
+/// content. Parity guards do not see it: the backtick count stays even.
+fn fence_width(body: &str) -> usize {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for ch in body.chars() {
+        if ch == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    (longest + 1).max(3)
+}
+
+/// Sanitize a fence info string down to something that cannot break the fence.
+///
+/// Two rules, for two different failure modes:
+/// - First whitespace-delimited word only. Whitespace — a newline above all — in
+///   an info string ends the opening fence line early and turns the remainder
+///   into content. `ast.rs` already takes the first word, but `wrap_code` is a
+///   separate boundary and must emit a valid fence for any block handed to it.
+/// - No backtick or tilde. CommonMark forbids backticks in a backtick fence's
+///   info string, but a TILDE fence's info string may contain them and survives
+///   parsing intact — so an info string of ``a```b`` reaches us and, passed
+///   through, emitted three fences: ODD parity, breaking the very invariant
+///   `split_respects_small_limit_without_orphan_fence` asserts.
+///
+/// A delimiter is DROPPED rather than stripped: it makes the fence invalid, and
+/// stripping would silently invent a different language (``a```b`` -> `ab`).
+/// Over-length is only useless, not invalid, so it truncates instead — which
+/// costs a legitimate identifier nothing and keeps the prefix readable.
+fn fence_lang(lang: Option<&str>) -> String {
+    let word = lang
+        .unwrap_or_default()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    if word.contains('`') || word.contains('~') {
+        return String::new();
+    }
+    word.chars().take(FENCE_LANG_MAX).collect()
+}
+
 fn wrap_code(body: &str, wrap: &CodeWrap) -> String {
     match wrap {
         CodeWrap::Fence(lang) => {
-            let mut out = String::from("```");
-            if let Some(l) = lang {
-                out.push_str(l);
-            }
+            let fence = "`".repeat(fence_width(body));
+            let mut out = fence.clone();
+            out.push_str(&fence_lang(lang.as_deref()));
             out.push('\n');
             out.push_str(body);
-            out.push_str("\n```");
+            out.push('\n');
+            out.push_str(&fence);
             out
         }
         CodeWrap::HtmlPre => {
@@ -38,15 +100,24 @@ fn wrap_code(body: &str, wrap: &CodeWrap) -> String {
     }
 }
 
-/// Overhead a wrap adds, as `(fixed, per_line)`.
+/// Overhead a wrap adds to `body`, as `(fixed, per_line)`.
 ///
 /// `Fence` and `HtmlPre` pay once around the whole body. `Indent` prefixes four
 /// spaces to EVERY line, so it cannot be modelled as a scalar: charging it once
 /// lets an N-line chunk overflow the limit by `4 * N` (a 200-line plain table at
 /// limit 4096 came out at 4454; single-char lines reached ~3x the limit).
-fn wrap_overhead(wrap: &CodeWrap) -> (usize, usize) {
+///
+/// `Fence` MUST derive from the same [`fence_width`]/[`fence_lang`] helpers
+/// `wrap_code` emits from, or the budget lies and the re-wrapped chunk overflows.
+/// `wrap_code` writes `<fence><lang>\n<body>\n<fence>`, so the cost around the
+/// body is `2 * width + lang + 2` — which reduces to the historical `8 + lang`
+/// for a 3-wide fence, the only case that existed before bodies could widen it.
+fn wrap_overhead(wrap: &CodeWrap, body: &str) -> (usize, usize) {
     match wrap {
-        CodeWrap::Fence(lang) => (8 + lang.as_deref().unwrap_or("").chars().count(), 0),
+        CodeWrap::Fence(lang) => (
+            2 * fence_width(body) + fence_lang(lang.as_deref()).chars().count() + 2,
+            0,
+        ),
         CodeWrap::HtmlPre => (11, 0),
         CodeWrap::Indent => (0, 4),
     }
@@ -71,7 +142,13 @@ fn split_oversized(block: &RenderedBlock, limit: usize) -> Vec<String> {
     match block.kind {
         BlockKind::Code => {
             let wrap = block.code_wrap.clone().unwrap_or(CodeWrap::Fence(None));
-            let (fixed, per_line) = wrap_overhead(&wrap);
+            // Budget from the WHOLE body, then re-wrap each piece: `wrap_code`
+            // recomputes `fence_width(piece)`, which can only be <= the width
+            // charged here. Splitting never merges two backtick runs — it cuts
+            // between lines/words/chars and rejoins with the separator it cut on
+            // — so a piece's longest run cannot exceed the body's. A narrower
+            // fence than budgeted just under-fills the chunk, never overflows it.
+            let (fixed, per_line) = wrap_overhead(&wrap, &block.text);
             let budget = limit.saturating_sub(fixed).max(1);
             pack_lines(&block.text, budget, per_line)
                 .iter()
@@ -407,6 +484,57 @@ mod tests {
     fn every_chunk_within_limit() {
         let blocks = vec![RenderedBlock::prose("x ".repeat(100))];
         assert!(split(&blocks, 50).iter().all(|c| c.chars().count() <= 50));
+    }
+
+    #[test]
+    fn fence_widens_past_backticks_in_the_body() {
+        let blocks = vec![RenderedBlock::code(
+            "```\ncode\n```",
+            CodeWrap::Fence(Some("md".into())),
+        )];
+        let chunks = split(&blocks, 100);
+        assert_eq!(chunks, vec!["````md\n```\ncode\n```\n````".to_string()]);
+
+        let reparsed = crate::channels::format::ast::parse(&chunks[0]);
+        assert_eq!(reparsed.len(), 1, "{reparsed:?}");
+        match &reparsed[0] {
+            crate::channels::format::ast::Block::CodeBlock { lang, code } => {
+                assert_eq!(lang.as_deref(), Some("md"));
+                assert_eq!(code, "```\ncode\n```\n");
+            }
+            other => panic!("expected one code block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fence_info_string_with_backticks_keeps_fence_parity_even() {
+        let blocks = vec![RenderedBlock::code(
+            "code",
+            CodeWrap::Fence(Some("a```b".into())),
+        )];
+        let chunks = split(&blocks, 100);
+        for c in &chunks {
+            assert_eq!(c.matches("```").count() % 2, 0, "odd fence parity: {c}");
+        }
+        assert_eq!(chunks, vec!["```\ncode\n```".to_string()]);
+    }
+
+    #[test]
+    fn long_fence_info_string_does_not_overflow_every_chunk() {
+        let code = (0..50)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let blocks = vec![RenderedBlock::code(
+            code,
+            CodeWrap::Fence(Some("z".repeat(300))),
+        )];
+        let chunks = split(&blocks, 64);
+        assert!(
+            chunks.iter().all(|c| c.chars().count() <= 64),
+            "chunk lengths {:?}",
+            chunks.iter().map(|c| c.chars().count()).collect::<Vec<_>>()
+        );
     }
 
     // `Indent` adds 4 chars to EVERY line. Charging that overhead once per chunk
