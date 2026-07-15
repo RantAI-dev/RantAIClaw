@@ -73,10 +73,10 @@ fn starts_block(c: char, run: usize, after: Option<char>) -> bool {
 /// backslash in front of the number.
 ///
 /// This looks BACKWARD at `out` rather than forward from the digits, because
-/// the two need not arrive together: `1\. x` parses to `Text("1")` +
-/// `Text(". x")` (the stripped escape splits the run), so a scan starting at
-/// the digits never sees the delimiter, and one starting at the delimiter's own
-/// node never sees the digits.
+/// the two need not arrive in the same node: only `Text` is coalesced, so the
+/// digits can still reach `out` as another inline entirely (`` `1` ``, `*1*`)
+/// with the delimiter opening this node. `out` holds them either way, which a
+/// scan starting at the digits within `text` would not.
 fn closes_ordered_marker(out: &str, next: Option<char>) -> bool {
     if !next.is_none_or(|n| n == ' ' || n == '\t') {
         return false;
@@ -121,18 +121,23 @@ fn opens_inline_span(c: char, run: usize, before: Option<char>, after: Option<ch
         // on `~~`, and a backslash in front of every stray tilde reads worse than
         // the loss on a parser we do not send to.
         //
-        // `run >= 2` still earns its keep, and not for strikethrough: a flanking
-        // `~`/`~~` is a delimiter candidate, so pulldown hands it over as
-        // one-tilde-per-node and the run never reaches 2 here. What DOES arrive
-        // whole is a longer run — and 3+ tildes at a block start open a FENCE.
-        // Emitted bare, `~~~~a` is not merely struck, it swallows the paragraph
-        // into an empty code block. See
-        // `escaped_tilde_run_does_not_reopen_a_code_fence`.
+        // `run >= 2` is exactly what buys that trade-off, and it is load-bearing:
+        // dropping it escapes the lone tilde in `(~2s)` too. Both
+        // `escaped_lone_tildes_are_not_escaped` and
+        // `ordinary_prose_is_not_over_escaped` fail if it goes.
         //
-        // The same node-splitting is why the fully-escaped spelling `\~\~\~\~a`
-        // is NOT covered: it arrives as four run=1 nodes, so this rule cannot
-        // see the run and the fence is re-armed. Fixing that needs cross-node
-        // run tracking in `push_text`, which this rule cannot do alone.
+        // At `run >= 2` and up, two live constructs are being disarmed: `~~`
+        // strikes, and 3+ tildes at a block start open a FENCE — emitted bare,
+        // `~~~~a` is not merely struck, it swallows the paragraph into an empty
+        // code block. See `escaped_tilde_run_does_not_reopen_a_code_fence`.
+        //
+        // This rule can only see those runs because `ast.rs`'s `push_inline`
+        // COALESCES adjacent `Text`. `run`/`after` are computed within one node,
+        // and pulldown splits a flanking run at every stripped escape, so
+        // `\~\~a\~\~` arrives as `["~", "~a", "~", "~"]` — four run=1 nodes. Left
+        // split, no run here ever reaches 2 and the fully-escaped spellings go
+        // back out as LIVE `~~a~~`/`~~~~a`. Do not simplify that coalescing away.
+        // See `fully_escaped_strikethrough_survives_a_round_trip_as_text`.
         '~' => run >= 2 && flanking,
         _ => false,
     }
@@ -529,14 +534,49 @@ mod tests {
     // block start are a fence: re-emitted bare they do not merely strike the
     // text, they swallow the paragraph into an empty `CodeBlock { lang:
     // Some("a") }` and the content is gone. This is what the `run >= 2` half of
-    // the `~` rule actually guards — the `~~`-strikethrough case the comment used
-    // to cite never reaches it, since a flanking `~~` arrives pre-split into
-    // run=1 nodes.
+    // the `~` rule guards.
+    //
+    // Both spellings are covered, and they arrive by different routes: `\~~~~a`
+    // is handed over whole (a 4-tilde run is no strikethrough delimiter, so
+    // pulldown does not split it), while the fully-escaped `\~\~\~\~a` arrives as
+    // four run=1 nodes and is only seen as a run because `push_inline` coalesces
+    // adjacent `Text`. The second spelling was live until that coalescing landed.
     #[test]
     fn escaped_tilde_run_does_not_reopen_a_code_fence() {
-        // `round_trip_paragraph` panics if this re-parses as a CodeBlock.
-        let inlines = round_trip_paragraph(r"\~~~~a");
-        assert_eq!(inline_plain(&inlines), "~~~~a");
+        // `round_trip_paragraph` panics if either re-parses as a CodeBlock.
+        for src in [r"\~~~~a", r"\~\~\~\~a"] {
+            let inlines = round_trip_paragraph(src);
+            assert_eq!(inline_plain(&inlines), "~~~~a", "{src}");
+        }
+    }
+
+    // The fully-escaped spelling of a strikethrough. Unlike `\~~~~a` above, a
+    // FLANKING `~~` is a delimiter candidate, so pulldown hands it over
+    // one-tilde-per-node (`\~\~a\~\~` -> `[Text("~"), Text("~a"), Text("~"),
+    // Text("~")]`). `run`/`after` are computed per node, so the `~` rule's
+    // `run >= 2` half could never see a run that spans nodes, and the tildes went
+    // out bare — the platform struck text the user had explicitly escaped.
+    // `push_inline` now coalesces adjacent `Text`, so the run arrives whole.
+    #[test]
+    fn fully_escaped_strikethrough_survives_a_round_trip_as_text() {
+        let inlines = round_trip_paragraph(r"\~\~a\~\~");
+        assert!(
+            !inlines
+                .iter()
+                .any(|i| matches!(i, Inline::Strikethrough(_))),
+            "text became strikethrough: {inlines:?}"
+        );
+        assert_eq!(inline_plain(&inlines), "~~a~~");
+    }
+
+    // The counterweight to the test above, and the reason its fix had to be
+    // cross-node run tracking rather than dropping the `~` rule's `run >= 2`:
+    // a LONE tilde must still go out bare. Dropping the run requirement would
+    // pass the test above and put a backslash in front of every `~/path` and
+    // `(~2s)` — see `ordinary_prose_is_not_over_escaped`.
+    #[test]
+    fn escaped_lone_tildes_are_not_escaped() {
+        assert_eq!(md(r"\~a\~", false), "~a~");
     }
 
     // The counterweight to every test above: escaping must be *surgical*. Each

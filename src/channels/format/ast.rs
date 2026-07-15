@@ -186,11 +186,28 @@ impl Builder {
 
     /// Auto-open a frame: tight list items and HTML blocks deliver text with no
     /// enclosing Paragraph tag, and that text must not be dropped.
+    ///
+    /// Adjacent `Text` is COALESCED into one node. Where the parser splits a run
+    /// of text is an artifact of its own scanning, not structure the renderers
+    /// should see: a stripped backslash escape ends a node (`\~\~a\~\~` arrives
+    /// as `["~", "~a", "~", "~"]`), as does a rejected delimiter candidate or an
+    /// entity. Renderers that judge a character by its CONTEXT — `markdown.rs`
+    /// asks how long a `~`/`*` run is and what follows it — read that context
+    /// from the node they are handed, so a split run made those questions
+    /// unanswerable: the `~` rule's `run >= 2` test could never see a run that
+    /// spanned nodes, and a fully-escaped `\~\~a\~\~` went back out as live
+    /// `~~a~~`. Joining here fixes that once, for every renderer, rather than
+    /// per-renderer lookahead. See `markdown.rs`'s
+    /// `fully_escaped_strikethrough_survives_a_round_trip_as_text`.
     fn push_inline(&mut self, inline: Inline) {
         if self.inline_stack.is_empty() {
             self.inline_stack.push(Vec::new());
         }
         if let Some(top) = self.inline_stack.last_mut() {
+            if let (Inline::Text(next), Some(Inline::Text(prev))) = (&inline, top.last_mut()) {
+                prev.push_str(next);
+                return;
+            }
             top.push(inline);
         }
     }
