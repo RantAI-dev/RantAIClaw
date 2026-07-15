@@ -21,6 +21,7 @@ pub mod conversation;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
+pub mod format;
 mod history_store;
 pub mod imessage;
 pub mod irc;

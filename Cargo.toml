@@ -41,6 +41,11 @@ rig-core = { version = "0.37", default-features = false, features = ["reqwest", 
 # Matrix client + E2EE decryption
 matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown"] }
 
+# Markdown parser (parser only; we render per-platform ourselves).
+# 0.13 matches the version already in Cargo.lock via ruma-events/matrix-sdk —
+# pinning 0.12 would compile a second copy under --features channel-matrix.
+pulldown-cmark = { version = "0.13", default-features = false }
+
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
