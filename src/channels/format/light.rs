@@ -187,6 +187,35 @@ mod tests {
     }
 
     #[test]
+    fn code_in_a_nested_list_item_keeps_its_fence() {
+        // A fenced code block inside a NESTED list item exercises the
+        // recursive `render(item, links)` -> `join_all` path a second time:
+        // the outer item's own body is itself materialized via `join_all`
+        // over sub-blocks that include a rendered inner List (Prose) AND,
+        // through it, a Code sub-block several levels down. `.text` would
+        // drop the inner fence just as it does for a single-level list.
+        let out = light("- a\n  - b\n\n    ```\n    cmd\n    ```", LinkStyle::Raw);
+        assert!(
+            out.contains("```"),
+            "code fence should be preserved in a nested list item: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn blockquote_code_keeps_its_fence() {
+        // Mirrors markdown.rs's `fenced_code_in_a_blockquote_keeps_its_fence`.
+        // The BlockQuote handler also calls `join_all`, not `.text` — a fenced
+        // code block quoted here must keep its fence, not get inlined bare.
+        let out = light("> ```\n> cmd\n> ```", LinkStyle::Raw);
+        assert!(
+            out.contains("```"),
+            "code fence should be preserved in a blockquote: {}",
+            out
+        );
+    }
+
+    #[test]
     fn nested_list_is_indented_not_flattened() {
         // A nested list should be indented relative to the parent item.
         // This mirrors the plain.rs test "nested_list_is_indented_not_flattened"
