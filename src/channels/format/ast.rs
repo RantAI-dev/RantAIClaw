@@ -1,8 +1,6 @@
 //! GFM → a small block AST that every renderer walks.
 
-use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
-};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableAlign {
@@ -29,10 +27,20 @@ pub enum Inline {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
-    Heading { level: u8, inlines: Vec<Inline> },
+    Heading {
+        level: u8,
+        inlines: Vec<Inline>,
+    },
     Paragraph(Vec<Inline>),
-    CodeBlock { lang: Option<String>, code: String },
-    List { ordered: bool, start: u64, items: Vec<Vec<Block>> },
+    CodeBlock {
+        lang: Option<String>,
+        code: String,
+    },
+    List {
+        ordered: bool,
+        start: u64,
+        items: Vec<Vec<Block>>,
+    },
     BlockQuote(Vec<Block>),
     Table {
         align: Vec<TableAlign>,
@@ -71,7 +79,11 @@ pub fn parse(md: &str) -> Vec<Block> {
 }
 
 enum Container {
-    List { ordered: bool, start: u64, items: Vec<Vec<Block>> },
+    List {
+        ordered: bool,
+        start: u64,
+        items: Vec<Vec<Block>>,
+    },
     Item(Vec<Block>),
     Quote(Vec<Block>),
 }
@@ -223,7 +235,10 @@ impl Builder {
             }
             TagEnd::Heading(level) => {
                 let inlines = self.inline_stack.pop().unwrap_or_default();
-                self.push_block(Block::Heading { level: heading_level(level), inlines });
+                self.push_block(Block::Heading {
+                    level: heading_level(level),
+                    inlines,
+                });
             }
             // Tight list items and HTML blocks deliver text without Paragraph tags.
             TagEnd::HtmlBlock => self.flush_implicit(),
@@ -233,8 +248,17 @@ impl Builder {
                 }
             }
             TagEnd::List(_) => {
-                if let Some(Container::List { ordered, start, items }) = self.block_stack.pop() {
-                    self.push_block(Block::List { ordered, start, items });
+                if let Some(Container::List {
+                    ordered,
+                    start,
+                    items,
+                }) = self.block_stack.pop()
+                {
+                    self.push_block(Block::List {
+                        ordered,
+                        start,
+                        items,
+                    });
                 }
             }
             TagEnd::Item => {
@@ -342,7 +366,9 @@ mod tests {
         };
         assert!(inlines.iter().any(|i| matches!(i, Inline::Strong(_))));
         assert!(inlines.iter().any(|i| matches!(i, Inline::Emphasis(_))));
-        assert!(inlines.iter().any(|i| matches!(i, Inline::Strikethrough(_))));
+        assert!(inlines
+            .iter()
+            .any(|i| matches!(i, Inline::Strikethrough(_))));
     }
 
     // Regression: tight list items carry no Paragraph tags — their text must not
@@ -354,8 +380,14 @@ mod tests {
             panic!("expected list")
         };
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0], vec![Block::Paragraph(vec![Inline::Text("a".into())])]);
-        assert_eq!(items[1], vec![Block::Paragraph(vec![Inline::Text("b".into())])]);
+        assert_eq!(
+            items[0],
+            vec![Block::Paragraph(vec![Inline::Text("a".into())])]
+        );
+        assert_eq!(
+            items[1],
+            vec![Block::Paragraph(vec![Inline::Text("b".into())])]
+        );
     }
 
     #[test]
@@ -365,7 +397,10 @@ mod tests {
             panic!("expected list")
         };
         assert_eq!(items[0].len(), 2);
-        assert_eq!(items[0][0], Block::Paragraph(vec![Inline::Text("a".into())]));
+        assert_eq!(
+            items[0][0],
+            Block::Paragraph(vec![Inline::Text("a".into())])
+        );
         assert!(matches!(items[0][1], Block::List { .. }));
     }
 
@@ -383,7 +418,12 @@ mod tests {
     #[test]
     fn ordered_list_start_is_kept() {
         let blocks = parse("3. a\n4. b");
-        let Block::List { ordered, start, items } = &blocks[0] else {
+        let Block::List {
+            ordered,
+            start,
+            items,
+        } = &blocks[0]
+        else {
             panic!("expected list")
         };
         assert!(ordered);

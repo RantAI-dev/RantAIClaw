@@ -81,13 +81,25 @@ pub struct RenderedBlock {
 
 impl RenderedBlock {
     pub fn prose(text: impl Into<String>) -> Self {
-        Self { kind: BlockKind::Prose, text: text.into(), code_wrap: None }
+        Self {
+            kind: BlockKind::Prose,
+            text: text.into(),
+            code_wrap: None,
+        }
     }
     pub fn prose_html(text: impl Into<String>) -> Self {
-        Self { kind: BlockKind::ProseHtml, text: text.into(), code_wrap: None }
+        Self {
+            kind: BlockKind::ProseHtml,
+            text: text.into(),
+            code_wrap: None,
+        }
     }
     pub fn code(text: impl Into<String>, wrap: CodeWrap) -> Self {
-        Self { kind: BlockKind::Code, text: text.into(), code_wrap: Some(wrap) }
+        Self {
+            kind: BlockKind::Code,
+            text: text.into(),
+            code_wrap: Some(wrap),
+        }
     }
 }
 
@@ -120,7 +132,10 @@ pub fn render_pair(
     fallback: &RenderTarget,
 ) -> (Vec<RenderedBlock>, Vec<RenderedBlock>) {
     let blocks = ast::parse(md);
-    (render_blocks(&blocks, primary), render_blocks(&blocks, fallback))
+    (
+        render_blocks(&blocks, primary),
+        render_blocks(&blocks, fallback),
+    )
 }
 
 /// Convenience: render to a single `String` (unchunked).
