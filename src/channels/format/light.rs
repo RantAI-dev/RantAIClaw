@@ -187,10 +187,50 @@ mod tests {
         assert!(light("a < b", LinkStyle::Slack).contains("&lt;"));
     }
 
+    // Every block kind, not just the three that happen to be one-liners — see
+    // the same guard in `html.rs` for why the narrow input is not enough.
     #[test]
     fn one_rendered_block_per_input_block() {
-        let blocks = parse("# a\n\np\n\n- x");
+        let blocks = parse("# a\n\np\n\n- x\n\n```\nc\n```\n\n> q\n\n| A |\n|---|\n| 1 |\n\n---");
+        assert_eq!(blocks.len(), 7, "input lost a block: {blocks:?}");
         assert_eq!(render(&blocks, LinkStyle::Raw).len(), blocks.len());
+        assert_eq!(render(&blocks, LinkStyle::Slack).len(), blocks.len());
+    }
+
+    #[test]
+    fn rule_becomes_a_horizontal_line() {
+        assert_eq!(light("---", LinkStyle::Raw), "──────────");
+    }
+
+    #[test]
+    fn table_becomes_an_aligned_ascii_grid_in_a_fence() {
+        let out = light_full("| A | Bee |\n|---|---|\n| 1 | 2 |", LinkStyle::Raw);
+        // Exact: the fence must be there (the body is RAW until `join_all`), and
+        // the grid must be padded to equal width. A `contains("A")` would pass on
+        // a table that silently rendered as prose.
+        assert_eq!(out, "```\nA | Bee\n--+----\n1 | 2  \n```");
+    }
+
+    // The Slack link branch escapes the URL with `escape_slack(url)`, which
+    // nothing covered: every other Slack guard drives text, not a destination.
+    // A query string is where this bites — `&` is the separator AND the thing
+    // Slack wants escaped.
+    #[test]
+    fn slack_escapes_a_link_url() {
+        assert_eq!(
+            light("[docs](http://x.io?a=1&b=2)", LinkStyle::Slack),
+            "<http://x.io?a=1&amp;b=2|docs>"
+        );
+    }
+
+    // The counterweight, mirroring the code-block pair above: WhatsApp/Zulip
+    // render entities literally, so the same URL must arrive untouched there.
+    #[test]
+    fn raw_link_style_leaves_a_link_url_alone() {
+        assert_eq!(
+            light("[docs](http://x.io?a=1&b=2)", LinkStyle::Raw),
+            "docs (http://x.io?a=1&b=2)"
+        );
     }
 
     #[test]
