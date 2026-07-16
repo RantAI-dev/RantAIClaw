@@ -119,9 +119,26 @@ impl ListPickerEntry {
     }
 }
 
-/// Page size for fullscreen-mode pagination. The picker shows up to
-/// this many items per page; Left/Right step through pages.
-pub const PAGE_SIZE: usize = 5;
+/// Page size used before the first frame has told the picker how tall its
+/// list area actually is. `render_fullscreen` replaces it via
+/// [`ListPicker::set_page_size_from_area`].
+///
+/// This was a hardcoded `PAGE_SIZE = 5` that no render path ever revised, so
+/// a 120x40 terminal paginated at 5 while ~15 rows sat blank. It halved every
+/// picker: `/help` ran to 7 pages, `/sessions` to 40, and `/setup` → Core put
+/// `knowledge` — the 7th of 7 — on page 2, where nobody found it.
+pub const DEFAULT_PAGE_SIZE: usize = 5;
+
+/// Rows one entry occupies in the fullscreen list.
+///
+/// The tallest form: a category header is always primary + count + spacer, and
+/// an item is primary + secondary + spacer whenever it has a secondary (every
+/// real picker's items do). Items without a secondary take 2, so sizing off 3
+/// can under-fill such a list by a row per entry — deliberate: it errs toward
+/// leaving a gap rather than pushing an entry off the bottom, and a per-entry
+/// measurement would make each page hold a different number of entries, which
+/// the page/selected index math is not built for.
+const ROWS_PER_ENTRY: usize = 3;
 
 /// Which UI element currently owns the cursor. Default is `Search` —
 /// the picker opens with focus on the search bar so the user can type
@@ -143,7 +160,7 @@ pub struct ListPicker {
     /// to a collapsed category are still present but skipped by
     /// `filtered_indices()` so they don't appear in navigation.
     entries: Vec<ListPickerEntry>,
-    /// Index into the *current page* of the filtered view (0..PAGE_SIZE).
+    /// Index into the *current page* of the filtered view (0..page_size).
     /// Reset to 0 whenever the query or page changes.
     pub selected: usize,
     pub list_state: ListState,
@@ -153,6 +170,10 @@ pub struct ListPicker {
     pub query: String,
     /// Current page index (0-based). Reset to 0 whenever the query changes.
     pub page: usize,
+    /// Entries per page, derived from the list area the layout actually
+    /// grants. Set every frame by [`Self::set_page_size_from_area`]; holds
+    /// [`DEFAULT_PAGE_SIZE`] until the first render.
+    page_size: usize,
     /// Which UI element owns the cursor: search bar or list. Defaults
     /// to `Search`. Down moves Search→List; Up at list[0] returns to
     /// Search; typing returns focus to Search.
@@ -209,9 +230,9 @@ impl ListPicker {
         let page = if entries.is_empty() {
             0
         } else {
-            absolute / PAGE_SIZE
+            absolute / DEFAULT_PAGE_SIZE
         };
-        let initial = absolute % PAGE_SIZE;
+        let initial = absolute % DEFAULT_PAGE_SIZE;
         let mut list_state = ListState::default();
         if !entries.is_empty() {
             list_state.select(Some(initial));
@@ -225,6 +246,7 @@ impl ListPicker {
             empty_hint: empty_hint.into(),
             query: String::new(),
             page,
+            page_size: DEFAULT_PAGE_SIZE,
             focus: Focus::Search,
             collapsed_categories: HashSet::new(),
             search_pending: false,
@@ -250,9 +272,9 @@ impl ListPicker {
         let page = if entries.is_empty() {
             0
         } else {
-            absolute / PAGE_SIZE
+            absolute / DEFAULT_PAGE_SIZE
         };
-        let initial = absolute % PAGE_SIZE;
+        let initial = absolute % DEFAULT_PAGE_SIZE;
         let mut list_state = ListState::default();
         if !entries.is_empty() {
             list_state.select(Some(initial));
@@ -266,6 +288,7 @@ impl ListPicker {
             empty_hint: empty_hint.into(),
             query: String::new(),
             page,
+            page_size: DEFAULT_PAGE_SIZE,
             focus: Focus::Search,
             collapsed_categories: HashSet::new(),
             search_pending: false,
@@ -273,24 +296,53 @@ impl ListPicker {
     }
 
     /// Total page count for the current filtered view (>= 1 even when
+    /// Entries per page. Never zero — `page_count` divides by it.
+    pub fn page_size(&self) -> usize {
+        self.page_size.max(1)
+    }
+
+    /// Re-derive the page size from the height the layout actually granted
+    /// the list chunk.
+    ///
+    /// Must be called with the *granted* height, not a requested one. The
+    /// same trap is documented on `SetupOverlay::last_choose_viewport`: when
+    /// the stored viewport reflects what the widget asked for rather than
+    /// what it got, the clamp never engages and the cursor walks into rows
+    /// that were clipped away.
+    ///
+    /// `page`/`selected` are page-relative, so a changed page size would
+    /// silently point them at a different entry. Recompute both from the
+    /// absolute index to keep the cursor on the entry the user selected.
+    pub fn set_page_size_from_area(&mut self, list_area_height: u16) {
+        let derived = (list_area_height as usize / ROWS_PER_ENTRY).max(1);
+        if derived == self.page_size {
+            return;
+        }
+        let absolute = self.page.saturating_mul(self.page_size()) + self.selected;
+        self.page_size = derived;
+        self.page = absolute / derived;
+        self.selected = absolute % derived;
+        self.list_state.select(Some(self.selected));
+    }
+
     /// the view is empty, so consumers can format `1/1` cleanly).
     pub fn page_count(&self) -> usize {
         let len = self.visible_len();
         if len == 0 {
             1
         } else {
-            len.div_ceil(PAGE_SIZE)
+            len.div_ceil(self.page_size())
         }
     }
 
     /// Slice of `filtered_indices` for the current page.
     pub fn page_indices(&self) -> Vec<usize> {
         let visible = self.filtered_indices();
-        let start = self.page.saturating_mul(PAGE_SIZE);
+        let start = self.page.saturating_mul(self.page_size());
         if start >= visible.len() {
             return Vec::new();
         }
-        let end = (start + PAGE_SIZE).min(visible.len());
+        let end = (start + self.page_size()).min(visible.len());
         visible[start..end].to_vec()
     }
 
@@ -703,6 +755,13 @@ impl ListPicker {
             ])
             .split(outer);
 
+        // Size the page off the list chunk the layout actually handed back —
+        // `Constraint::Min(3)` means the granted height is whatever is left
+        // after the chrome, which is the only number the page may be derived
+        // from. Must happen before `page_count`/`page_indices` are read below
+        // so the title's `n/m` and the rendered slice agree with each other.
+        self.set_page_size_from_area(chunks[4].height);
+
         // Title — includes filtered count + page indicator.
         let visible_indices = self.filtered_indices();
         let page_count = self.page_count();
@@ -1007,6 +1066,79 @@ mod tests {
         assert_eq!(p.visible_len(), 1);
     }
 
+    /// The list chunk on a 120x40 terminal gets ~30 rows, which holds 10
+    /// entries at 3 rows each — but `PAGE_SIZE` was a hardcoded 5, so half
+    /// the area sat blank while the picker paginated.
+    #[test]
+    fn page_size_derives_from_the_list_area_height() {
+        let mut p = picker((0..20).map(|i| item(&i.to_string(), "x")).collect());
+        p.set_page_size_from_area(30);
+        assert_eq!(p.page_size(), 10);
+        p.set_page_size_from_area(15);
+        assert_eq!(p.page_size(), 5);
+    }
+
+    /// `Constraint::Min(3)` can hand back a chunk too short for one entry on
+    /// a very small terminal. A page size of 0 would make `page_count`
+    /// divide by zero and `page_indices` return nothing at all.
+    #[test]
+    fn page_size_never_drops_below_one() {
+        let mut p = picker(vec![item("a", "a")]);
+        for h in 0..3u16 {
+            p.set_page_size_from_area(h);
+            assert!(p.page_size() >= 1, "height {h} gave {}", p.page_size());
+        }
+    }
+
+    /// This is the user-visible bug: `/setup` → Core holds 7 provisioners and
+    /// `knowledge` is the 7th, so at a page size of 5 the Knowledge Base
+    /// setup was invisible on page 1 and most users never found it.
+    #[test]
+    fn seven_entries_fit_one_page_on_a_normal_terminal() {
+        let mut p = picker(
+            [
+                "persona",
+                "provider",
+                "approvals",
+                "mcp",
+                "login",
+                "skills",
+                "knowledge",
+            ]
+            .iter()
+            .map(|n| item(n, n))
+            .collect(),
+        );
+        p.set_page_size_from_area(30); // 120x40 terminal
+        assert_eq!(p.page_count(), 1, "knowledge must not be paged out of view");
+        assert_eq!(p.page_indices().len(), 7);
+    }
+
+    /// A resize must not silently move the cursor to a different entry:
+    /// page/selected are relative to the page size, so both have to be
+    /// recomputed from the absolute index when it changes.
+    #[test]
+    fn resizing_keeps_the_selected_entry_selected() {
+        let mut p = picker((0..20).map(|i| item(&i.to_string(), "x")).collect());
+        p.set_page_size_from_area(15); // 5 per page
+        p.page = 2;
+        p.selected = 3; // absolute index 13
+        p.set_page_size_from_area(30); // 10 per page
+        assert_eq!(p.page, 1);
+        assert_eq!(p.selected, 3); // 1*10 + 3 == 13
+    }
+
+    #[test]
+    fn page_count_follows_the_derived_page_size() {
+        let mut p = picker((0..20).map(|i| item(&i.to_string(), "x")).collect());
+        p.set_page_size_from_area(15);
+        assert_eq!(p.page_count(), 4);
+        p.set_page_size_from_area(30);
+        assert_eq!(p.page_count(), 2);
+        p.set_page_size_from_area(60);
+        assert_eq!(p.page_count(), 1);
+    }
+
     #[test]
     fn picker_starts_with_search_focus() {
         let p = picker(vec![item("a", "x"), item("b", "y")]);
@@ -1176,12 +1308,18 @@ mod tests {
             .collect()
     }
 
+    /// Pins the *pre-render* default only. A picker that has never been
+    /// rendered has no list area to size itself from, so it pages at
+    /// `DEFAULT_PAGE_SIZE`; `set_page_size_from_area` revises this on the
+    /// first frame. Five is no longer the rule — do not read this test as
+    /// saying pages are five entries.
     #[test]
-    fn pagination_splits_visible_into_pages_of_five() {
+    fn pagination_before_the_first_render_uses_the_default_page_size() {
         let p = picker(many_items(12));
+        assert_eq!(p.page_size(), DEFAULT_PAGE_SIZE);
         assert_eq!(p.page_count(), 3);
         assert_eq!(p.page, 0);
-        assert_eq!(p.page_indices().len(), 5);
+        assert_eq!(p.page_indices().len(), DEFAULT_PAGE_SIZE);
         assert_eq!(p.page_indices(), vec![0, 1, 2, 3, 4]);
     }
 
