@@ -21,6 +21,12 @@ impl DoctorCheck for DaemonRegistrationCheck {
                 CheckResult::ok(self.name(), format!("daemon registered via {backend}"))
                     .with_category(cat)
             }
+            DaemonState::Inactive { backend } => CheckResult::info(
+                self.name(),
+                format!("daemon registered with {backend} but not running"),
+            )
+            .with_category(cat)
+            .with_hint("run: rantaiclaw service start"),
             DaemonState::NotRegistered { backend } => CheckResult::info(
                 self.name(),
                 format!("daemon not registered with {backend} (optional)"),
@@ -37,9 +43,39 @@ impl DoctorCheck for DaemonRegistrationCheck {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonState {
-    Registered { backend: &'static str },
-    NotRegistered { backend: &'static str },
+    Registered {
+        backend: &'static str,
+    },
+    /// Installed but not running. `systemctl status` returns exit 3 for this,
+    /// which the check used to fold into `NotRegistered` — so a stopped-but-
+    /// installed service was told to re-install, a no-op.
+    Inactive {
+        backend: &'static str,
+    },
+    NotRegistered {
+        backend: &'static str,
+    },
     Unsupported,
+}
+
+/// Map a `systemctl --user status` result to a [`DaemonState`].
+///
+/// Exit codes (verified empirically on systemd): `0` = unit active, `3` = unit
+/// exists but is inactive/dead, `4` = no such unit. Folding 3 and 4 together —
+/// as the old `Ok(_) => NotRegistered` arm did — told a stopped-but-installed
+/// service to re-install itself, which does nothing. Any other non-zero code
+/// (e.g. `1`/`2` for a failed unit that still exists) is treated as inactive
+/// rather than absent: the unit is registered, just not healthy.
+#[cfg(target_os = "linux")]
+fn classify_systemctl(success: bool, code: Option<i32>) -> DaemonState {
+    let backend = "systemd (user)";
+    if success {
+        DaemonState::Registered { backend }
+    } else if code == Some(4) {
+        DaemonState::NotRegistered { backend }
+    } else {
+        DaemonState::Inactive { backend }
+    }
 }
 
 pub fn detect_registration() -> DaemonState {
@@ -50,12 +86,7 @@ pub fn detect_registration() -> DaemonState {
                 .args(["--user", "status", "rantaiclaw"])
                 .output();
             return match out {
-                Ok(o) if o.status.success() => DaemonState::Registered {
-                    backend: "systemd (user)",
-                },
-                Ok(_) => DaemonState::NotRegistered {
-                    backend: "systemd (user)",
-                },
+                Ok(o) => classify_systemctl(o.status.success(), o.status.code()),
                 Err(_) => DaemonState::Unsupported,
             };
         }
@@ -87,6 +118,42 @@ mod tests {
     #[test]
     fn detect_registration_does_not_panic() {
         let _ = detect_registration();
+    }
+
+    /// Exit 3 (installed but stopped) and exit 4 (not installed) are distinct
+    /// states — verified against real synthetic units — and must not both map
+    /// to NotRegistered, which hints at a re-install that is a no-op.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemctl_exit_codes_map_to_distinct_states() {
+        let sd = "systemd (user)";
+        assert_eq!(
+            classify_systemctl(true, Some(0)),
+            DaemonState::Registered { backend: sd },
+            "active"
+        );
+        assert_eq!(
+            classify_systemctl(false, Some(3)),
+            DaemonState::Inactive { backend: sd },
+            "installed but stopped"
+        );
+        assert_eq!(
+            classify_systemctl(false, Some(4)),
+            DaemonState::NotRegistered { backend: sd },
+            "no such unit"
+        );
+        // A failed-but-present unit (1/2) is registered, not absent.
+        assert_eq!(
+            classify_systemctl(false, Some(1)),
+            DaemonState::Inactive { backend: sd },
+            "failed but present"
+        );
+        // A signal-killed probe with no code must not read as 'not installed'.
+        assert_eq!(
+            classify_systemctl(false, None),
+            DaemonState::Inactive { backend: sd },
+            "no exit code"
+        );
     }
 
     #[tokio::test]
