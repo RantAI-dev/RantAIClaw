@@ -663,7 +663,18 @@ impl TuiApp {
                     // in the buffer as '\n': that is the invariant the caret
                     // walker counts and the renderer splits on, and a raw '\r'
                     // reaching the terminal wrecks the input box's border.
-                    self.context.paste_at_cursor(&normalize_line_breaks(&text));
+                    let normalized = normalize_line_breaks(&text);
+                    // A tall paste is collapsed to a one-line placeholder; the
+                    // real content is held on the context and re-expanded at
+                    // submit. Short pastes land inline as before.
+                    if normalized.split('\n').count()
+                        > crate::tui::context::PASTE_PLACEHOLDER_MIN_LINES
+                    {
+                        let marker = self.context.register_paste(normalized);
+                        self.context.paste_at_cursor(&marker);
+                    } else {
+                        self.context.paste_at_cursor(&normalized);
+                    }
                     self.context.exit_history_navigation();
                     self.refresh_autocomplete();
                 }
@@ -1518,6 +1529,11 @@ impl TuiApp {
     pub async fn submit_input(&mut self) -> Result<()> {
         let raw = std::mem::take(&mut self.context.input_buffer);
         self.context.cursor_pos = 0;
+        // Swap any `[Pasted text #N +M lines]` placeholders back for their real
+        // content before the message is read or sent. Must precede the
+        // empty-check: a buffer holding only a placeholder is not empty once
+        // expanded.
+        let raw = self.context.expand_pending_pastes(raw);
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Ok(());
