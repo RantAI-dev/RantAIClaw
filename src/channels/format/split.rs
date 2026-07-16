@@ -1000,6 +1000,25 @@ mod tests {
         assert_eq!(chunks.concat(), "a&amp;b".repeat(3000));
     }
 
+    // `hard_split_html` reproduces its input EXACTLY: it inserts chunk
+    // boundaries and drops nothing, spaces included. Chunks therefore keep a
+    // trailing space (`"<i>aaaa</i> "`), which reads like a cosmetic slip and is
+    // not one — that space is the word separator between two elements, and the
+    // break merely fell on it. Trimming chunks would look tidier in isolation
+    // and would silently make this invariant false; `hard_split`'s entity test
+    // cannot catch that, as its input has no spaces to lose.
+    //
+    // Trimming the other end is worse: a chunk can legitimately OPEN with
+    // meaningful whitespace, e.g. a Telegram list's indent column
+    // (`"1. First item here\n\n   "` splits right there).
+    #[test]
+    fn html_prose_split_preserves_its_input_exactly() {
+        let text = "<i>aaaa</i> <i>bbbb</i> <i>cccc</i>";
+        let chunks = split(&[RenderedBlock::prose_html(text)], 12);
+        assert!(chunks.len() > 1, "input must actually split: {chunks:?}");
+        assert_eq!(chunks.concat(), text, "chunks {chunks:?}");
+    }
+
     #[test]
     fn html_prose_breakable_text_respects_limit() {
         let blocks = vec![RenderedBlock::prose_html(
