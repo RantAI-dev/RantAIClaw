@@ -3,8 +3,21 @@
 
 use super::ast::Inline;
 
-/// Flatten inline runs to plain text (drops styling and link URLs — cells and
-/// `Plain` headings want bare text; `plain.rs` handles link URLs separately).
+/// Flatten inline runs to plain text for an `ascii_table` cell: styling and
+/// link URLs are dropped, keeping only the label.
+///
+/// Dropping the URL is the ASCII grid's constraint, not a policy on links. A
+/// cell is padded to its column's widest entry, so one `text (https://…)` at 60
+/// chars widens every row in that column and pushes the block toward `split`'s
+/// oversized path — where `pack_lines` cuts by width and destroys the alignment
+/// that is the grid's only reason to exist. A missing URL beats an unreadable
+/// grid whose URL was cut in half anyway. The lossless rendering is
+/// `StdMarkdown { tables_native: true }`, which keeps the real table; every
+/// ASCII target is a degraded view by construction and already drops
+/// bold/italic/code the same way.
+///
+/// `plain.rs`'s `inline_text` is this function plus link URLs. They differ on
+/// exactly the `Link` arm — that difference is the point, so they stay separate.
 pub(crate) fn inline_plain(inlines: &[Inline]) -> String {
     let mut out = String::new();
     for inline in inlines {
@@ -23,6 +36,12 @@ pub(crate) fn inline_plain(inlines: &[Inline]) -> String {
 /// Build an aligned ASCII table. Columns are padded to the widest cell; columns
 /// are joined with `" | "` and the header separator with `"-+-"` so every line
 /// has identical width.
+///
+/// The last column is padded like any other, so rows carry trailing spaces.
+/// Deliberate: equal line width is the property callers check to know the grid
+/// survived (see `html.rs`'s table-in-list-item guard), the padding is invisible
+/// inside the `<pre>`/fence/indent every ASCII target wraps this in, and
+/// right-trimming would only shrink a width `split` has already budgeted on.
 pub fn ascii_table(headers: &[Vec<Inline>], rows: &[Vec<Vec<Inline>>]) -> String {
     let cols = headers
         .len()

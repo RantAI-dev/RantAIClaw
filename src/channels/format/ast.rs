@@ -236,7 +236,17 @@ impl Builder {
             Event::SoftBreak => self.push_inline(Inline::SoftBreak),
             Event::HardBreak => self.push_inline(Inline::HardBreak),
             Event::Rule => self.push_block(Block::Rule),
-            // Keep the literal text of HTML/inline-HTML; drop the markup itself.
+            // HTML never becomes markup — but the markup is not dropped either:
+            // the tag is captured as literal TEXT. `<script>x</script>` yields
+            // the text `<script>`, `x`, `</script>` (which `push_inline` then
+            // coalesces into one run), never a `script` element.
+            //
+            // What each target does with that text is the target's call, and
+            // every one of them is safe: the HTML renderers escape it (Telegram
+            // and Matrix would otherwise be injectable), while StdMarkdown
+            // re-emits it verbatim because its consumers do not render HTML —
+            // Discord and Slack show it literally and Mattermost sanitizes it
+            // server-side.
             Event::Html(t) | Event::InlineHtml(t) => self.push_inline(Inline::Text(t.to_string())),
             _ => {}
         }

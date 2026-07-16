@@ -209,12 +209,18 @@ mod tests {
 
     #[test]
     fn code_in_a_nested_list_item_keeps_its_fence() {
-        // A fenced code block inside a NESTED list item exercises the
-        // recursive `render(item, links)` -> `join_all` path a second time:
-        // the outer item's own body is itself materialized via `join_all`
-        // over sub-blocks that include a rendered inner List (Prose) AND,
-        // through it, a Code sub-block several levels down. `.text` would
-        // drop the inner fence just as it does for a single-level list.
+        // NOT a second, distinct `join_all`: this pins the SAME call site the
+        // single-level test above does — the List arm's — just one level down.
+        // The OUTER item's sub-blocks are `[Paragraph, List]`, which render to
+        // `[Prose, Prose]`, and `materialize` for Prose is literally
+        // `text.clone()`; at the outer level `join_all` and `.text` are
+        // byte-identical and discriminate nothing. The fence survives only
+        // because the List arm called `join_all` on the INNER item, where the
+        // Code sub-block still exists as Code. (Swapping the arm to `.text`
+        // fails this test AND the single-level one, for that one reason.)
+        //
+        // What it adds over the single-level test is the second pass: the fence
+        // must survive being indented again as the outer item's continuation.
         let out = light("- a\n  - b\n\n    ```\n    cmd\n    ```", LinkStyle::Raw);
         assert!(
             out.contains("```"),
