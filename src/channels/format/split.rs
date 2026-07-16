@@ -123,6 +123,39 @@ fn wrap_overhead(wrap: &CodeWrap, body: &str) -> (usize, usize) {
     }
 }
 
+/// Largest piece a `Fence` can always wrap within `limit`, whatever backticks the
+/// piece itself holds.
+///
+/// [`wrap_overhead`] prices the fence from the WHOLE body, which is the right
+/// conservative bound until the body's own backtick run makes that price exceed
+/// the limit: `budget` then saturates to 1 and every 1-char piece gets a full
+/// fence of its own — a 1000-backtick body at limit 2000 went out as 1000 chunks
+/// of 9 chars, i.e. 1000 messages. The run needed is large (> ~limit/2) but it is
+/// remote input: a model asked to echo backticks emits exactly this.
+///
+/// A piece of `b` chars holds a run of at most `b`, so its own fence is at most
+/// `b + 1` wide and `wrap_code` writes at most `(b+1) + lang + 1 + b + 1 + (b+1)`
+/// = `3b + lang + 4`. Solving `<= limit` gives the bound below, which depends only
+/// on the limit — so it cannot saturate. Sound for every `b >= 2`; below that
+/// `wrap_code`'s `.max(3)` floor applies instead and costs `b + lang + 8`, which
+/// fits whenever this bound is >= 2 (i.e. `limit >= lang + 10`) — and where it is
+/// not, `budget` was already clamped to 1 and nothing changes.
+///
+/// `split_oversized` takes the MAX of this and `limit - fixed`. Both are proved
+/// for every piece up to their own value, so the larger is safe for every piece
+/// up to it.
+fn fence_floor(wrap: &CodeWrap, limit: usize) -> usize {
+    match wrap {
+        CodeWrap::Fence(lang) => {
+            let lang = fence_lang(lang.as_deref()).chars().count();
+            limit.saturating_sub(lang + 4) / 3
+        }
+        // Neither wrap's cost depends on the piece, so `limit - fixed` never
+        // saturates for them and there is no floor to raise.
+        CodeWrap::HtmlPre | CodeWrap::Indent => 0,
+    }
+}
+
 fn materialize(block: &RenderedBlock) -> String {
     match block.kind {
         BlockKind::Prose | BlockKind::ProseHtml => block.text.clone(),
@@ -149,7 +182,10 @@ fn split_oversized(block: &RenderedBlock, limit: usize) -> Vec<String> {
             // — so a piece's longest run cannot exceed the body's. A narrower
             // fence than budgeted just under-fills the chunk, never overflows it.
             let (fixed, per_line) = wrap_overhead(&wrap, &block.text);
-            let budget = limit.saturating_sub(fixed).max(1);
+            let budget = limit
+                .saturating_sub(fixed)
+                .max(fence_floor(&wrap, limit))
+                .max(1);
             pack_lines(&block.text, budget, per_line)
                 .iter()
                 .map(|piece| wrap_code(piece, &wrap))
@@ -651,6 +687,38 @@ mod tests {
                 chunks.iter().all(|c| c.chars().count() <= limit),
                 "limit {limit}: chunk lengths {:?}",
                 chunks.iter().map(|c| c.chars().count()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // A backtick run wide enough to force `fixed > limit` saturates `budget` to 1,
+    // and a 1-char piece per chunk turns one message into a message PER CHAR:
+    // 1000 backticks at limit 2000 sent 1000 chunks. `fence_floor` is what stops
+    // it — a piece is bounded by what its OWN fence can wrap, not by what the
+    // whole body's fence costs.
+    //
+    // Both `lang` arms matter: the info string is charged in the same budget, so
+    // an unshared `lang` term is an off-by-`lang` overflow. At limit 2000 the
+    // widest chunk lands on 1999 (no lang) and exactly 2000 (lang `rust`) — the
+    // bound is tight, so an arithmetic slip shows up as a real overflow here.
+    #[test]
+    fn a_wide_backtick_run_does_not_explode_into_a_chunk_per_char() {
+        let limit = 2000;
+        for lang in [None, Some("rust".to_string())] {
+            let blocks = vec![RenderedBlock::code(
+                "`".repeat(1000),
+                CodeWrap::Fence(lang.clone()),
+            )];
+            let chunks = split(&blocks, limit);
+            let lens: Vec<usize> = chunks.iter().map(|c| c.chars().count()).collect();
+            assert!(
+                chunks.iter().all(|c| c.chars().count() <= limit),
+                "lang {lang:?}: chunk lengths {lens:?}"
+            );
+            assert!(
+                chunks.len() <= 4,
+                "lang {lang:?}: {} chunks for a 1000-char body, lengths {lens:?}",
+                chunks.len()
             );
         }
     }
