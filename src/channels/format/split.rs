@@ -1015,8 +1015,13 @@ mod tests {
         assert!(!split(&blocks, 0).is_empty());
     }
 
+    // NOT "counts are equal" — `Vec<(String, String)>` makes that true by
+    // construction and no code could falsify it. What is worth pinning is that
+    // every pair actually carries BOTH members: a fitting block must never leave
+    // a twin empty, because callers read an empty fallback as "no sound twin
+    // exists" (see `paired_split_oversized_block_has_no_twin`) and bail.
     #[test]
-    fn paired_split_keeps_chunk_counts_equal() {
+    fn paired_split_gives_both_members_on_every_pair() {
         let primary = vec![
             RenderedBlock::prose_html("<b>aaaa</b>"),
             RenderedBlock::prose_html("<b>bbbb</b>"),
