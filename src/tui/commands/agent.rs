@@ -106,7 +106,16 @@ impl CommandHandler for ContinueCommand {
     }
 }
 
-/// /stop command — signal intent to cancel ongoing streaming (future integration)
+/// /stop command — cancel the in-flight turn.
+///
+/// This was a stub: it took neither `args` nor `ctx`, returned a canned
+/// "Streaming cancellation will be integrated with agent loop" and cancelled
+/// nothing, while `description()` claimed "Stop ongoing agent generation" and
+/// `/help` listed it. The capability existed the whole time — Esc sends
+/// `TurnRequest::Cancel` (app.rs) through to `token.cancel()` in the async
+/// bridge, and the working indicator hints "esc to interrupt". `/stop` was
+/// simply never wired to it, so a user who typed the documented command got a
+/// no-op plus an internal TODO.
 pub struct StopCommand;
 
 impl CommandHandler for StopCommand {
@@ -119,10 +128,7 @@ impl CommandHandler for StopCommand {
     }
 
     fn execute(&self, _args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
-        Ok(CommandResult::Message(
-            "Stop command received. (Streaming cancellation will be integrated with agent loop)"
-                .to_string(),
-        ))
+        Ok(CommandResult::CancelTurn)
     }
 }
 
