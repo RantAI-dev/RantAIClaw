@@ -81,6 +81,16 @@ pub enum CodeWrap {
 
 /// One fully-rendered block. For prose, `text` is the final platform text. For
 /// `Code`, `text` is the RAW code (no fence) and `code_wrap` says how to wrap it.
+///
+/// Every renderer strips ALL trailing newlines from that body
+/// (`trim_end_matches('\n')`), not only the one a closing fence needs. That is
+/// deliberate and is NOT a latent `strip_suffix('\n')` bug: [`CodeWrap::Indent`]
+/// re-emits line-wise via `.lines()`, which drops a trailing blank line no
+/// matter what the body holds. Keeping one would therefore reach only three of
+/// the four wraps — `Plain` would still drop it while Telegram/Discord/Slack
+/// kept it — trading today's uniform "a code body ends at its last non-empty
+/// line" for a Plain-vs-rest divergence, in order to carry trailing whitespace
+/// no reader asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedBlock {
     pub kind: BlockKind,
