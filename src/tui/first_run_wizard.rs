@@ -42,6 +42,16 @@ pub struct FirstRunWizard {
     pub queue: Vec<String>,
     pub picker: Option<ActiveChoose>,
     pub picker_names: Vec<String>,
+    /// First visible option row, and the option-area height the layout last
+    /// granted. `ActiveChoose` is shared with `SetupOverlay`, but the scroll
+    /// state lives on the owner, not the struct — the overlay has
+    /// `choose_scroll`/`last_choose_viewport` and the wizard had neither, so
+    /// its option list rendered from row 0 forever. `channel_options()`
+    /// returns all 16 channel provisioners (18 lines) into a
+    /// `Constraint::Min(4)` chunk: on a 24-row terminal most of them were
+    /// invisible and the cursor walked into rows that had been clipped away.
+    choose_scroll: usize,
+    last_choose_viewport: u16,
     pub profile: Profile,
     /// Phase history for the back button. Each completed phase transition
     /// pushes the previous phase here; `back()` pops one and restores it.
@@ -103,6 +113,8 @@ impl FirstRunWizard {
             queue,
             picker: None,
             picker_names: Vec::new(),
+            choose_scroll: 0,
+            last_choose_viewport: 0,
             profile,
             history: Vec::new(),
         }
@@ -247,6 +259,7 @@ impl FirstRunWizard {
     pub fn open_picker(&mut self, options: Vec<(String, String)>) {
         self.picker_names = options.iter().map(|(name, _)| name.clone()).collect();
         let labels: Vec<String> = options.into_iter().map(|(_, label)| label).collect();
+        self.choose_scroll = 0;
         self.picker = Some(ActiveChoose {
             id: match self.phase {
                 WizardPhase::PickChannels => "channels".into(),
@@ -271,6 +284,7 @@ impl FirstRunWizard {
                 p.cursor -= 1;
             }
         }
+        self.clamp_choose_scroll_to_cursor();
     }
 
     pub fn picker_move_down(&mut self) {
@@ -278,6 +292,28 @@ impl FirstRunWizard {
             if p.cursor + 1 < p.options.len() {
                 p.cursor += 1;
             }
+        }
+        self.clamp_choose_scroll_to_cursor();
+    }
+
+    /// Keep the cursor inside the rendered option viewport.
+    ///
+    /// Mirrors `SetupOverlayState::clamp_choose_scroll_to_cursor`, whose
+    /// comment records why the viewport must be the height the layout
+    /// *granted*: a requested height leaves the clamp disengaged and the
+    /// cursor walks into clipped rows. Bug-hunt round 2 reported exactly that
+    /// against the overlay's ClawHub chooser; the wizard never got the fix.
+    fn clamp_choose_scroll_to_cursor(&mut self) {
+        let Some(p) = self.picker.as_ref() else {
+            return;
+        };
+        let viewport = self.last_choose_viewport.max(1) as usize;
+        if p.cursor < self.choose_scroll {
+            self.choose_scroll = p.cursor;
+        }
+        let bottom = self.choose_scroll + viewport;
+        if p.cursor >= bottom {
+            self.choose_scroll = p.cursor.saturating_sub(viewport.saturating_sub(1));
         }
     }
 
@@ -317,7 +353,10 @@ impl FirstRunWizard {
         }
     }
 
-    pub fn render_fullscreen(&self, frame: &mut Frame, area: Rect) {
+    /// `&mut self` because the option viewport is recorded during render —
+    /// the same shape as `ListPicker::render_fullscreen`. Only the render
+    /// knows the height the layout granted, and the clamp needs it.
+    pub fn render_fullscreen(&mut self, frame: &mut Frame, area: Rect) {
         if area.height < 16 || area.width < 64 {
             return self.render_compact(frame, area);
         }
@@ -526,8 +565,10 @@ impl FirstRunWizard {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
+    /// `&mut self`: dispatches to `render_picker`, which records the option
+    /// viewport height the layout granted.
     fn render_content(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         coral: Color,
@@ -696,8 +737,10 @@ impl FirstRunWizard {
         frame.render_widget(Paragraph::new(lines), area);
     }
 
+    /// `&mut self` for the same reason as `render_fullscreen`: this is where
+    /// the option viewport height becomes known.
     fn render_picker(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         coral: Color,
@@ -831,8 +874,15 @@ impl FirstRunWizard {
                 Span::styled("  · Enter to confirm", Style::default().fg(muted)),
             ]));
         }
+        // Record the height the layout actually granted (chunks[7] is
+        // Constraint::Min(4), so it is whatever survives the chrome) and scroll
+        // to it. Without this the Paragraph rendered from row 0 forever.
+        self.last_choose_viewport = chunks[7].height;
+        self.clamp_choose_scroll_to_cursor();
         frame.render_widget(
-            Paragraph::new(option_lines).wrap(Wrap { trim: false }),
+            Paragraph::new(option_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((self.choose_scroll as u16, 0)),
             chunks[7],
         );
 
@@ -1239,5 +1289,111 @@ mod tests {
             w.queue.is_empty(),
             "stale picker selections must be cleared on restore"
         );
+    }
+}
+
+#[cfg(test)]
+mod choose_scroll_tests {
+    use super::*;
+    use crate::profile::Profile;
+    use std::path::PathBuf;
+
+    fn test_profile() -> Profile {
+        Profile {
+            name: "test".into(),
+            root: PathBuf::from("/tmp/rantaiclaw-test"),
+        }
+    }
+
+    fn wizard_with_options(n: usize) -> FirstRunWizard {
+        let mut w = FirstRunWizard::new(test_profile());
+        w.phase = WizardPhase::PickChannels;
+        w.open_picker(
+            (0..n)
+                .map(|i| (format!("ch{i}"), format!("Channel {i}")))
+                .collect(),
+        );
+        w
+    }
+
+    /// The bug: `ActiveChoose` is shared with `SetupOverlay`, but the scroll
+    /// state lives on the owner — the overlay has `choose_scroll`, the wizard
+    /// had nothing. `channel_options()` returns all 16 channels into a
+    /// `Constraint::Min(4)` chunk, so on a 24-row terminal the cursor walked
+    /// into rows that had been clipped away.
+    #[test]
+    fn cursor_stays_inside_the_viewport_walking_all_the_way_down() {
+        let mut w = wizard_with_options(16);
+        w.last_choose_viewport = 4;
+        for _ in 0..20 {
+            w.picker_move_down();
+            let cursor = w.picker.as_ref().unwrap().cursor;
+            assert!(
+                cursor >= w.choose_scroll && cursor < w.choose_scroll + 4,
+                "cursor {cursor} outside window [{}, {})",
+                w.choose_scroll,
+                w.choose_scroll + 4
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_stays_inside_the_viewport_walking_back_up() {
+        let mut w = wizard_with_options(16);
+        w.last_choose_viewport = 4;
+        for _ in 0..15 {
+            w.picker_move_down();
+        }
+        for _ in 0..20 {
+            w.picker_move_up();
+            let cursor = w.picker.as_ref().unwrap().cursor;
+            assert!(
+                cursor >= w.choose_scroll && cursor < w.choose_scroll + 4,
+                "cursor {cursor} outside window [{}, {})",
+                w.choose_scroll,
+                w.choose_scroll + 4
+            );
+        }
+        assert_eq!(w.choose_scroll, 0, "back at the top the view must be too");
+    }
+
+    /// The view must sit still while the cursor is inside it — scrolling on
+    /// every keypress would make a short list jitter.
+    #[test]
+    fn no_scroll_while_the_cursor_fits() {
+        let mut w = wizard_with_options(16);
+        w.last_choose_viewport = 8;
+        for _ in 0..7 {
+            w.picker_move_down();
+            assert_eq!(w.choose_scroll, 0);
+        }
+    }
+
+    /// A viewport of 0 (layout gave nothing) must not divide-by-zero or hang.
+    #[test]
+    fn a_zero_viewport_is_treated_as_one_row() {
+        let mut w = wizard_with_options(16);
+        w.last_choose_viewport = 0;
+        for _ in 0..5 {
+            w.picker_move_down();
+        }
+        let cursor = w.picker.as_ref().unwrap().cursor;
+        assert_eq!(
+            w.choose_scroll, cursor,
+            "1-row window pins scroll to cursor"
+        );
+    }
+
+    /// Opening a fresh picker must not inherit the previous one's scroll.
+    #[test]
+    fn opening_a_picker_resets_the_scroll() {
+        let mut w = wizard_with_options(16);
+        w.last_choose_viewport = 4;
+        for _ in 0..12 {
+            w.picker_move_down();
+        }
+        assert!(w.choose_scroll > 0);
+        w.open_picker(vec![("a".into(), "A".into())]);
+        assert_eq!(w.choose_scroll, 0);
     }
 }
