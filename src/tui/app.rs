@@ -1971,6 +1971,7 @@ impl TuiApp {
         // Refresh the channels snapshot so /channels and /platforms reflect
         // any wizard-driven add/remove since launch.
         let prev_channels_count = count_configured_channels(&self.config);
+        self.context.provider_key_ok = provider_key_status(&config);
         self.context.channels_summary = channel_status_summary(&config)
             .into_iter()
             .map(|(name, configured)| (name.to_string(), configured))
@@ -5756,18 +5757,31 @@ pub(crate) fn count_configured_channels(c: &crate::config::Config) -> usize {
     n
 }
 
+/// Whether the active provider can actually send a message: it has a key
+/// resolved the way the send paths resolve it, or it is a local provider that
+/// needs none. `None` when there is no `default_provider` to judge.
+///
+/// Mirrors the `config.provider_key` doctor check so the TUI panel and the CLI
+/// doctor agree. The panel's old `!ctx.model.is_empty()` was structurally
+/// unfalsifiable — `Config::default` always sets a model — so it reported
+/// "✓ Model configured" on a keyless install.
+pub(crate) fn provider_key_status(c: &crate::config::Config) -> Option<bool> {
+    let provider = c.default_provider.as_deref()?;
+    Some(
+        crate::providers::provider_is_local(provider)
+            || c.resolve_key_for_provider(provider).is_some(),
+    )
+}
+
 /// Per-channel state for the `/channels` and `/platforms` commands.
 /// `(name, configured, transport-hint)`. `configured=true` means the
 /// channel has a config block in `config.toml`; whether it's actually
 /// polling depends on whether `channels_autostart_count > 0` was true
 /// at TUI startup.
-/// Per-channel "is this actually configured" — the credential is present and
-/// non-empty, not merely that the `[channels_config.<x>]` section exists.
 ///
-/// The old check was `section.is_some()`, so a block with an empty `bot_token`
-/// (a hand-edit, or an aborted `/setup`) rendered "✓ configured". Each channel
-/// carries its own notion of a credential, so this checks the right field per
-/// channel rather than one uniform rule:
+/// "Configured" is credential-presence, not section-presence: a block with an
+/// empty `bot_token` (a hand-edit, or an aborted `/setup`) used to render
+/// "✓ configured". Each channel carries its own notion of a credential:
 ///
 /// - token-bearing channels: the required credential string is non-blank;
 /// - iMessage / Webhook: presence *is* configuration — iMessage drives the
@@ -6094,6 +6108,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // user can still chat locally; the failure is logged + surfaced via
     // /channels.
     let configured_channels = count_configured_channels(&app_config);
+    app.context.provider_key_ok = provider_key_status(&app_config);
     app.context.channels_summary = channel_status_summary(&app_config)
         .into_iter()
         .map(|(name, configured)| (name.to_string(), configured))
@@ -6511,6 +6526,52 @@ mod tests {
             Some(serde_json::from_value(serde_json::json!({ "allowed_contacts": [] })).unwrap());
         let rows = channel_status_summary(&c);
         assert!(is_configured(&rows, "iMessage"));
+    }
+
+    #[test]
+    fn provider_key_status_is_false_for_the_keyless_default() {
+        // The exact config the old `!ctx.model.is_empty()` check green-lit:
+        // Config::default sets default_provider = openrouter and no key.
+        let c = crate::config::Config::default();
+        assert_eq!(provider_key_status(&c), Some(false));
+    }
+
+    #[test]
+    fn provider_key_status_true_with_a_top_level_key() {
+        let mut c = crate::config::Config::default();
+        c.api_key = Some("sk-test".into());
+        assert_eq!(provider_key_status(&c), Some(true));
+    }
+
+    #[test]
+    fn provider_key_status_true_with_a_per_provider_key() {
+        let mut c = crate::config::Config::default();
+        c.api_key = None;
+        c.provider_api_keys
+            .insert("openrouter".into(), "sk-test".into());
+        assert_eq!(provider_key_status(&c), Some(true));
+    }
+
+    #[test]
+    fn provider_key_status_true_for_a_local_provider_without_a_key() {
+        let mut c = crate::config::Config::default();
+        c.default_provider = Some("ollama".into());
+        c.api_key = None;
+        assert_eq!(provider_key_status(&c), Some(true));
+    }
+
+    #[test]
+    fn provider_key_status_none_without_a_default_provider() {
+        let mut c = crate::config::Config::default();
+        c.default_provider = None;
+        assert_eq!(provider_key_status(&c), None);
+    }
+
+    #[test]
+    fn provider_key_status_rejects_a_blank_key() {
+        let mut c = crate::config::Config::default();
+        c.api_key = Some("   ".into());
+        assert_eq!(provider_key_status(&c), Some(false));
     }
     use crate::sessions::SessionStore;
     use crate::tui::context::TuiContext;

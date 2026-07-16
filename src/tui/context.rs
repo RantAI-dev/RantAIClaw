@@ -74,6 +74,12 @@ pub struct TuiContext {
     /// `/channels` and `/platforms` to render the table without needing
     /// live access to the on-disk config. Refreshed by `reload_config`.
     pub channels_summary: Vec<(String, bool)>,
+    /// Whether the active provider has a usable API key (or is a local provider
+    /// that needs none). Precomputed where `Config` is available — same pattern
+    /// as `channels_summary` — so `/doctor` can report the truth without the
+    /// panel carrying `Config`. `None` until the first config load; the panel
+    /// is unreachable before then. Refreshed by `reload_config`.
+    pub provider_key_ok: Option<bool>,
     pub input_history: Vec<String>,
     /// Current position in history navigation, indexed from the end:
     /// `Some(0)` = most recent submission, `Some(1)` = next-most, etc.
@@ -164,6 +170,7 @@ impl TuiContext {
             available_commands: Vec::new(),
             channels_autostart_count: 0,
             channels_summary: Vec::new(),
+            provider_key_ok: None,
             input_history: Vec::new(),
             input_history_pos: None,
             input_history_stash: None,
