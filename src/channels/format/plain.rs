@@ -72,7 +72,12 @@ fn render_block(block: &Block) -> RenderedBlock {
         Block::Table { headers, rows, .. } => {
             RenderedBlock::code(ascii_table(headers, rows), CodeWrap::Indent)
         }
-        Block::Rule => RenderedBlock::prose("—".repeat(10)),
+        // The same box-drawing glyph Telegram and LightMarkup use. This arm
+        // diverged with an em dash (`—`), which is neither more portable —
+        // Plain already emits `•` above, so it was never ASCII-only — nor a
+        // better rule: repeated em dashes leave visible gaps in most fonts
+        // where `─` joins into a continuous line. `tests.rs` pins the agreement.
+        Block::Rule => RenderedBlock::prose("──────────".to_string()),
     }
 }
 

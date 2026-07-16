@@ -264,3 +264,37 @@ fn nested_list_stays_indented_across_targets() {
         "plain nested list not indented: {plain}"
     );
 }
+
+// Same input, same intent, so the same glyph. The three text targets had
+// diverged for no stated reason: Plain emitted an em dash (`—`) while Telegram
+// and LightMarkup emitted box-drawing (`─`).
+//
+// Not a claim that EVERY target agrees — the two markup targets legitimately
+// differ, because each has a native rule of its own, and that is asserted here
+// too so this test cannot be "unified" into a false one.
+#[test]
+fn text_targets_agree_on_the_rule_glyph() {
+    const RULE: &str = "──────────";
+    for target in [
+        RenderTarget::Plain,
+        RenderTarget::TelegramHtml,
+        RenderTarget::LightMarkup {
+            links: LinkStyle::Raw,
+        },
+        RenderTarget::LightMarkup {
+            links: LinkStyle::Slack,
+        },
+    ] {
+        assert_eq!(render_to_string("---", &target), RULE, "{target:?}");
+    }
+    assert_eq!(render_to_string("---", &RenderTarget::MatrixHtml), "<hr>");
+    assert_eq!(
+        render_to_string(
+            "---",
+            &RenderTarget::StdMarkdown {
+                tables_native: true
+            }
+        ),
+        "---"
+    );
+}
