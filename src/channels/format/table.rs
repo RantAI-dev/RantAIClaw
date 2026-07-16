@@ -129,10 +129,15 @@ mod tests {
         assert_eq!(out, "A\n-\n1");
     }
 
+    // The line count alone is blind to the thing this is named for: a row that
+    // dropped its missing cell outright, or padded it to the wrong width, still
+    // yields exactly three lines. Pin the padding AND the equal width.
     #[test]
     fn ragged_row_is_padded() {
         let out = ascii_table(&[cell("A"), cell("B")], &[vec![cell("1")]]);
-        assert_eq!(out.lines().count(), 3);
+        assert_eq!(out, "A | B\n--+--\n1 |  ");
+        let widths: Vec<usize> = out.lines().map(|l| l.chars().count()).collect();
+        assert_eq!(widths, vec![5, 5, 5], "ragged: {out:?}");
     }
 
     #[test]

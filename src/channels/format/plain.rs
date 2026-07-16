@@ -138,9 +138,13 @@ mod tests {
         assert_eq!(joined("- a\n  - b"), "• a\n\n  • b");
     }
 
+    // `contains("    cmd")` pins neither the column nor the width: it matches on
+    // ANY indent of four or more, so it passes on the marker's 3-space
+    // continuation alone and cannot tell the wrapper's 4 from the 7 the two
+    // compose to. The exact string pins both.
     #[test]
     fn code_in_a_list_item_keeps_its_indent() {
         let out = joined("1. Run:\n\n   ```\n   cmd\n   ```");
-        assert!(out.contains("    cmd"), "indent wrapper dropped: {out}");
+        assert_eq!(out, "1. Run:\n\n       cmd");
     }
 }
