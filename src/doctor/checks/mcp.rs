@@ -1,4 +1,12 @@
-//! MCP startup check — verifies launch commands resolve to executables.
+//! MCP startup check — verifies each server's launch command resolves on
+//! `$PATH`.
+//!
+//! This is a `which`-only check: it confirms the binary exists, not that it
+//! starts or speaks MCP. It does not spawn the server or do an `initialize`
+//! handshake, and it does not look at `args`/`env`. The messages say "on PATH"
+//! rather than "launchable" so the verdict does not claim more than a name
+//! lookup can prove — a command on PATH can still fail to start or fail the
+//! protocol.
 
 use async_trait::async_trait;
 
@@ -32,8 +40,11 @@ impl DoctorCheck for McpStartupCheck {
         }
 
         if missing.is_empty() {
-            CheckResult::ok(self.name(), format!("{ok_count} MCP server(s) launchable"))
-                .with_category(self.category())
+            CheckResult::ok(
+                self.name(),
+                format!("{ok_count} MCP server command(s) found on PATH"),
+            )
+            .with_category(self.category())
         } else {
             CheckResult::fail(
                 self.name(),
@@ -94,5 +105,33 @@ mod tests {
         let r = McpStartupCheck.run(&c).await;
         assert_eq!(r.severity, crate::doctor::Severity::Fail);
         assert!(r.message.contains("definitely-not-a-real-binary-xyz123"));
+    }
+
+    /// The ok message must not claim more than a PATH lookup proves. `which`
+    /// resolving a name does not mean the server starts or speaks MCP, so the
+    /// verdict says "on PATH", never "launchable".
+    #[tokio::test]
+    async fn ok_message_does_not_overclaim_launchability() {
+        let mut cfg = Config::default();
+        let mut servers = HashMap::new();
+        // A command guaranteed to be on PATH in the test environment.
+        servers.insert(
+            "present".to_string(),
+            crate::config::schema::McpServerConfig {
+                command: "sh".into(),
+                args: vec![],
+                env: HashMap::new(),
+            },
+        );
+        cfg.mcp_servers = servers;
+        let (c, _t) = ctx(cfg);
+        let r = McpStartupCheck.run(&c).await;
+        assert_eq!(r.severity, crate::doctor::Severity::Ok);
+        assert!(r.message.contains("on PATH"), "msg: {}", r.message);
+        assert!(
+            !r.message.contains("launchable"),
+            "must not overclaim: {}",
+            r.message
+        );
     }
 }
