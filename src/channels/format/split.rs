@@ -309,9 +309,9 @@ fn pack_lines(text: &str, budget: usize, per_line: usize) -> Vec<String> {
     let mut cost = 0usize;
     for line in text.lines() {
         let line_len = line.chars().count();
-        // `+1` for the '\n' that joins this line to the previous one.
-        let line_cost = line_len + per_line + usize::from(!cur.is_empty());
-        if !cur.is_empty() && cost + line_cost > budget {
+        // `+1` for the '\n' that would join this line to the previous one. `cur`
+        // is non-empty here, so that join is real.
+        if !cur.is_empty() && cost + line_len + per_line + 1 > budget {
             out.push(std::mem::take(&mut cur));
             cost = 0;
         }
@@ -322,11 +322,17 @@ fn pack_lines(text: &str, budget: usize, per_line: usize) -> Vec<String> {
             }
             out.extend(hard_split(line, line_budget));
         } else {
-            if !cur.is_empty() {
+            // Read the join AFTER the flush above, never before it: a flush
+            // empties `cur` and writes no '\n', so a join priced against the
+            // pre-flush `cur` charges a newline that was never written. `cost`
+            // then runs 1 over for the rest of the chunk and closes it a char
+            // early — safe, but it under-fills every chunk after a flush.
+            let join = usize::from(!cur.is_empty());
+            if join == 1 {
                 cur.push('\n');
             }
             cur.push_str(line);
-            cost += line_cost;
+            cost += line_len + per_line + join;
         }
     }
     if !cur.is_empty() {
@@ -669,6 +675,33 @@ mod tests {
         let code = (0..500).map(|_| "x").collect::<Vec<_>>().join("\n");
         let blocks = vec![RenderedBlock::code(code, CodeWrap::Indent)];
         assert!(split(&blocks, 100).iter().all(|c| c.chars().count() <= 100));
+    }
+
+    // `line_cost` charges `+1` for the '\n' that joins this line to the previous
+    // one. Read before the flush block, that `+1` is stale: the flush empties
+    // `cur`, so no '\n' is written, yet the phantom join is still charged. Every
+    // chunk after a flush then believes it is one char fuller than it is.
+    //
+    // The input is tuned so the lie actually changes the packing: at budget 10
+    // "cccc" (4) plus its join is the exact char that "eeeee" (5) needs, so the
+    // stale `+1` closes the chunk one char early and "eeeee" becomes a third
+    // piece. A body that does not pack tight against the budget hides this
+    // entirely — under-filling by 1 is invisible unless something needs that 1.
+    #[test]
+    fn pack_lines_fills_the_budget_after_a_flush() {
+        let pieces = pack_lines("aaaa\nbbbb\ncccc\neeeee", 10, 0);
+        assert_eq!(
+            pieces,
+            vec!["aaaa\nbbbb".to_string(), "cccc\neeeee".to_string()],
+            "a chunk after a flush must be packed to the full budget"
+        );
+        assert_eq!(
+            pieces[1].chars().count(),
+            10,
+            "post-flush chunk short of budget"
+        );
+        // Packing only inserts break points; it never drops content.
+        assert_eq!(pieces.join("\n"), "aaaa\nbbbb\ncccc\neeeee");
     }
 
     #[test]
