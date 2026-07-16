@@ -508,7 +508,13 @@ fn hard_split_html(text: &str, limit: usize) -> Vec<String> {
                 // splitting it would unbalance its tags. It goes out oversized.
                 out.push(std::mem::take(pending));
             } else {
-                // Plain text between elements: safe to break at words.
+                // Tag-free text between elements. Per the flush invariant it is
+                // ONE word plus at most its trailing terminator — any earlier
+                // space or newline at depth 0 would already have flushed it — so
+                // `hard_split`'s word loop has nothing to break on here and it is
+                // the char-level cut, with its entity back-off, that does the
+                // work. That is exactly what an over-limit word needs; do not
+                // read this call as word-wrapping.
                 out.extend(hard_split(pending, limit));
                 pending.clear();
             }
@@ -535,6 +541,19 @@ fn hard_split_html(text: &str, limit: usize) -> Vec<String> {
                     break;
                 }
             }
+            // A PREFIX test, deliberately. It must accept `<br>`, `<br/>`,
+            // `<br />` and any attribute a renderer might add, and matching the
+            // name exactly would need a name parser here — in the depth tracker,
+            // to buy nothing: `br` and `hr` are the only HTML tags that start
+            // with these prefixes, so the only false positive is a tag no
+            // renderer emits (the set is `<b> <i> <s> <code> <pre> <a> <h1>..<h6>
+            // <blockquote> <ul> <ol> <li> <p> <br/> <hr>`).
+            //
+            // The asymmetry is why it stays: a void tag misread as an OPENER
+            // never returns depth to 0, so the rest of the message becomes one
+            // atomic `pending` and goes out oversized — the bug this function has
+            // already been burned by. A hypothetical `<brie>` misread as void
+            // costs a balanced pair, and nothing emits one.
             let void = tag.ends_with("/>") || tag.starts_with("<br") || tag.starts_with("<hr");
             if closing {
                 depth = (depth - 1).max(0);
