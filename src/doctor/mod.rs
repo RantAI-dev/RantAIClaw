@@ -137,6 +137,7 @@ async fn run_one(check: &dyn DoctorCheck, ctx: &DoctorContext) -> CheckResult {
 pub async fn run_all(ctx: DoctorContext, brief: bool) -> Vec<CheckResult> {
     let registry: Vec<Box<dyn DoctorCheck>> = vec![
         Box::new(checks::config::ConfigSchemaCheck),
+        Box::new(checks::config::ProviderKeyCheck),
         Box::new(checks::config::PathsCheck),
         Box::new(checks::policy::AllowlistCheck),
         Box::new(checks::provider::ProviderPingCheck::default()),
