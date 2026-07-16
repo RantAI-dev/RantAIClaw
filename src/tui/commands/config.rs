@@ -253,10 +253,21 @@ impl CommandHandler for DoctorCommand {
             s
         };
 
-        // Roll up overall verdict for the footer.
-        let any_fail = false; // probes above don't currently produce hard fails post-init
+        // Roll up the verdict from the rows actually rendered.
+        //
+        // This was `let any_fail = false;` with the comment "probes above
+        // don't currently produce hard fails post-init" — contradicted by its
+        // own file, which constructs StatusKind::Fail rows for a dead session
+        // store, an unset model, a missing ~/.rantaiclaw and a missing
+        // profiles/ dir. The footer therefore printed "all checks ok" in the
+        // same frame as a red ✗.
+        let sections = [&core, &channels, &skills_section, &workspace_section];
+        let any_fail = sections.iter().any(|s| s.has_fail());
+        let any_warn = sections.iter().any(|s| s.has_warn());
         let footer = if any_fail {
             "Esc close · some checks failed — review above"
+        } else if any_warn {
+            "Esc close · checks passed with warnings — review above"
         } else {
             "Esc close · all checks ok — `/channels` for transport details"
         };
