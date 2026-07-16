@@ -52,6 +52,11 @@ pub enum CommandResult {
         provisioner: Option<String>,
     },
     /// Launch the first-run wizard — sequential setup covering all topics.
+    /// `/setup <category>` — open that category's sub-picker, the same view
+    /// the top-level picker reaches by drilling into a `cat:` row.
+    OpenSetupCategory {
+        category: String,
+    },
     OpenFirstRunWizard,
     /// Fetch the ClawHub catalogue and open an interactive install picker.
     /// Mirrors the `/sessions` pattern (search + paginate via ListPicker)

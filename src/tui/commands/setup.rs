@@ -30,6 +30,17 @@ impl CommandHandler for SetupCommand {
             return Ok(CommandResult::OpenFirstRunWizard);
         }
         if !arg.is_empty() {
+            // Provisioner first: `runtime` and `hardware` name both a
+            // provisioner and a category, and they have always opened the
+            // provisioner. Category resolution is a fallback, so nothing that
+            // works today changes — only args that used to error now resolve.
+            if crate::onboard::provision::provisioner_for(arg).is_none() {
+                if let Some(cat) = category_from_arg(arg) {
+                    return Ok(CommandResult::OpenSetupCategory {
+                        category: category_key(cat).to_string(),
+                    });
+                }
+            }
             return Ok(CommandResult::OpenSetupOverlay {
                 provisioner: Some(arg.to_string()),
             });
@@ -120,6 +131,28 @@ pub fn category_key(c: ProvisionerCategory) -> &'static str {
     }
 }
 
+/// Resolve a `/setup <arg>` to a category, accepting the plural the UI prints.
+///
+/// `category_from_key` only knows the canonical singular keys, and it was only
+/// ever reachable from the picker's `cat:` drill-down — the arg path never
+/// consulted it, so `/setup core|channel|integration|routing` all died with
+/// "unknown provisioner". Meanwhile the startup banner, `/channels`' footer
+/// and its empty state all tell the user to run `/setup channels`, and
+/// `docs/reference/commands.md` documents `rantaiclaw setup channels`. Accept
+/// the plural rather than making four call sites lie in the singular.
+///
+/// `runtime` and `hardware` are BOTH provisioner names and category names.
+/// Callers resolve provisioners first so those keep opening the provisioner
+/// they open today; this is a fallback for args that match nothing else.
+pub fn category_from_arg(arg: &str) -> Option<ProvisionerCategory> {
+    let lower = arg.trim().to_ascii_lowercase();
+    category_from_key(&lower).or_else(|| {
+        lower
+            .strip_suffix('s')
+            .and_then(|singular| category_from_key(singular))
+    })
+}
+
 pub fn category_from_key(key: &str) -> Option<ProvisionerCategory> {
     match key {
         "core" => Some(ProvisionerCategory::Core),
@@ -140,5 +173,75 @@ fn cat_order(c: ProvisionerCategory) -> u8 {
         ProvisionerCategory::Runtime => 3,
         ProvisionerCategory::Hardware => 4,
         ProvisionerCategory::Routing => 5,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The four category names that used to die with "unknown provisioner",
+    /// plus the plural the banner/footer/docs actually tell users to type.
+    #[test]
+    fn category_args_that_used_to_error_now_resolve() {
+        for (arg, want) in [
+            ("core", ProvisionerCategory::Core),
+            ("channel", ProvisionerCategory::Channel),
+            ("channels", ProvisionerCategory::Channel),
+            ("integration", ProvisionerCategory::Integration),
+            ("integrations", ProvisionerCategory::Integration),
+            ("routing", ProvisionerCategory::Routing),
+        ] {
+            assert_eq!(category_from_arg(arg), Some(want), "arg {arg:?}");
+        }
+    }
+
+    #[test]
+    fn category_args_are_case_and_space_insensitive() {
+        assert_eq!(
+            category_from_arg("  Channels "),
+            Some(ProvisionerCategory::Channel)
+        );
+        assert_eq!(category_from_arg("CORE"), Some(ProvisionerCategory::Core));
+    }
+
+    #[test]
+    fn non_category_args_do_not_resolve() {
+        for arg in ["telegram", "provider", "knowledge", "", "nonsense"] {
+            assert_eq!(category_from_arg(arg), None, "arg {arg:?}");
+        }
+    }
+
+    /// `runtime` and `hardware` name both a provisioner and a category. They
+    /// have always opened the provisioner, and the dispatcher resolves
+    /// provisioners first so they still do — this pins that the fallback is
+    /// additive, not a behavior change.
+    #[test]
+    fn runtime_and_hardware_still_resolve_as_provisioners_first() {
+        for name in ["runtime", "hardware"] {
+            assert!(
+                crate::onboard::provision::provisioner_for(name).is_some(),
+                "{name} must stay a provisioner"
+            );
+            // They also name categories — which is exactly why order matters.
+            assert!(
+                category_from_arg(name).is_some(),
+                "{name} also names a category"
+            );
+        }
+    }
+
+    #[test]
+    fn category_key_round_trips_through_category_from_arg() {
+        for cat in [
+            ProvisionerCategory::Core,
+            ProvisionerCategory::Channel,
+            ProvisionerCategory::Integration,
+            ProvisionerCategory::Runtime,
+            ProvisionerCategory::Hardware,
+            ProvisionerCategory::Routing,
+        ] {
+            assert_eq!(category_from_arg(category_key(cat)), Some(cat));
+        }
     }
 }
