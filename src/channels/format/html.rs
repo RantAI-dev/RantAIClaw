@@ -310,14 +310,23 @@ mod tests {
 
     #[test]
     fn telegram_script_is_escaped_not_injected() {
-        assert!(tg("<script>x</script>").contains("&lt;script&gt;"));
+        let out = tg("<script>x</script>");
+        assert!(out.contains("&lt;script&gt;"), "{out}");
+        // The negative is the half that matters: the positive alone passes even
+        // if a raw `<script>` rides along beside the escaped one.
+        assert!(!out.contains("<script>"), "raw markup survived: {out}");
     }
 
     #[test]
     fn link_url_cannot_break_out_of_href() {
         let out = tg("[x](https://a\"onmouseover=\"evil)");
-        assert!(!out.contains("\"onmouseover=\""));
-        assert!(out.contains("&quot;"));
+        // Pin the attribute context FIRST. If pulldown ever stopped parsing that
+        // destination as a link, the text would be escaped as ordinary prose and
+        // both asserts below would still pass — the guard would silently stop
+        // covering the thing it is named for.
+        assert!(out.contains("<a href="), "not an attribute context: {out}");
+        assert!(!out.contains("\"onmouseover=\""), "{out}");
+        assert!(out.contains("&quot;"), "{out}");
     }
 
     #[test]
@@ -353,9 +362,17 @@ mod tests {
         );
     }
 
+    // Every block kind, not just the three that happen to be one-liners. The
+    // invariant is structural (`render` is a `.map()`), so no input can falsify
+    // it today — but a renderer that grew a second block would grow it in ONE
+    // arm (a table caption, a rule's spacer, a `<pre>`'s language label) behind
+    // a `flat_map`, and only that arm's own input can catch it.
     #[test]
     fn one_rendered_block_per_input_block() {
-        let blocks = parse("# a\n\np\n\n- x");
+        let blocks = parse("# a\n\np\n\n- x\n\n```\nc\n```\n\n> q\n\n| A |\n|---|\n| 1 |\n\n---");
+        // Guards the assertion itself: `len() == len()` is vacuously true if the
+        // input collapsed to fewer kinds than this test means to cover.
+        assert_eq!(blocks.len(), 7, "input lost a block: {blocks:?}");
         assert_eq!(render_telegram(&blocks).len(), blocks.len());
         assert_eq!(render_matrix(&blocks).len(), blocks.len());
     }
@@ -388,8 +405,28 @@ mod tests {
         out
     }
 
-    /// Final element depth, classifying tags exactly as `split::hard_split_html`
-    /// does. 0 means every tag opened was also closed.
+    /// Final element depth: 0 means every tag opened was also closed.
+    ///
+    /// A DELIBERATE reimplementation of `split::hard_split_html`'s walk, not a
+    /// call into it — do not "DRY" this away. This oracle checks that
+    /// function's OUTPUT, so classifying tags with the classifier under test
+    /// would make it blind to the bug it is here to catch: a tag `split`
+    /// wrongly thinks is VOID gets flushed as if the element were complete, and
+    /// the two halves can land in different chunks. Sharing the classifier, both
+    /// sides would call the severed chunk balanced and agree it was fine.
+    ///
+    /// So it is written to be able to DISAGREE:
+    /// - `split` PREFIX-matches `<br`/`<hr`, a deliberate over-approximation (it
+    ///   documents why: guessing void is the safe direction there). This
+    ///   exact-matches the `<hr>` and `…/>` forms the renderers above actually
+    ///   emit, so if that prefix ever over-reaches onto a real element, the
+    ///   severed chunk fails here instead of passing on both sides.
+    /// - `split` clamps with `.max(0)` because it must keep making progress on
+    ///   malformed input; this lets depth go NEGATIVE, so a surplus close tag is
+    ///   a failure rather than a silent floor.
+    ///
+    /// (Proven: making `split` treat `<b>` as void severs `"&gt; quoted <b>"`
+    /// from its `</b>` and this fails with depth 1.)
     fn tag_depth(s: &str) -> i32 {
         let mut depth = 0;
         let mut chars = s.chars().peekable();
@@ -405,7 +442,7 @@ mod tests {
                     break;
                 }
             }
-            let void = tag.ends_with("/>") || tag.starts_with("<br") || tag.starts_with("<hr");
+            let void = tag.ends_with("/>") || tag == "<hr>";
             if closing {
                 depth -= 1;
             } else if !void {
@@ -512,6 +549,10 @@ mod tests {
             "line a  \nline b",
             "1. Para one.\n\n   Para two.",
             "> quoted **bold**\n>\n> second",
+            // The two void tags the renderers emit — `<hr>` (Matrix rule) and
+            // `<br/>` (hard break, above). Without a rule in the corpus, the
+            // void arm of `tag_depth` and of `hard_split_html` is never taken.
+            "a\n\n---\n\nb",
         ];
         for md in cases {
             for limit in [16, 64, 4096] {
