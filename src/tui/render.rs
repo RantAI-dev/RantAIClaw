@@ -273,7 +273,13 @@ fn preview_args(args: &serde_json::Value) -> String {
     truncate_preview(&compact, TOOL_ARG_PREVIEW_MAX)
 }
 
-fn truncate_preview(s: &str, max: usize) -> String {
+/// Crop `s` to `max` *chars* (not bytes) and mark the cut with an ellipsis.
+///
+/// Char-based so a multi-byte codepoint is never split — `&s[..max]` panics
+/// when `max` lands mid-codepoint, which is reachable from any model-supplied
+/// string. `crate::agent::events::truncate_preview` guards the same class on
+/// the agent side.
+pub fn truncate_preview(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
