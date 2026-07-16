@@ -5863,6 +5863,7 @@ dependencies = [
  "probe-rs",
  "prometheus",
  "prost 0.14.3",
+ "pulldown-cmark",
  "qrcode",
  "rand 0.10.1",
  "ratatui",
