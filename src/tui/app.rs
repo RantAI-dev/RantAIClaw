@@ -5869,7 +5869,7 @@ async fn run_loop(
             } else if app.first_run_wizard.is_some() {
                 alt_term.draw(|frame| {
                     let area = frame.area();
-                    if let Some(w) = app.first_run_wizard.as_ref() {
+                    if let Some(w) = app.first_run_wizard.as_mut() {
                         w.render_fullscreen(frame, area);
                     }
                 })?;
