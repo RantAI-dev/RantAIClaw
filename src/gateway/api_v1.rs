@@ -1137,43 +1137,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Serializes tests that mutate process-global env vars (e.g.
-    /// `XDG_DATA_HOME`). Without this, two such tests running on parallel test
-    /// threads clobber each other's value, so `open_session_store()` can read a
-    /// different test's data dir — a latent race exposed by any timing change.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &std::path::Path) -> Self {
-            // Hold the lock for the guard's lifetime so concurrent env-var
-            // tests run one at a time. Ignore poisoning from an unrelated panic.
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self {
-                key,
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-
     #[derive(Default)]
     struct MockProvider;
 
@@ -1359,8 +1322,6 @@ mod tests {
 
     #[tokio::test]
     async fn sse_chat_emits_chunk_then_done() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", temp.path());
         let mut headers = HeaderMap::new();
         headers.insert("accept", "text/event-stream".parse().unwrap());
 
@@ -1402,11 +1363,20 @@ mod tests {
         assert_eq!(done["text"], "hello stream");
         assert_eq!(done["cancelled"], false);
 
+        // Look up the exact session the handler created — its id is in the
+        // `done` event — instead of `first()`. `open_session_store` now resolves
+        // the active profile's sessions.db, which other tests share, so a
+        // by-id lookup keeps this assertion immune to their concurrent writes.
+        let session_id = done["session_id"]
+            .as_str()
+            .expect("session_id in done event");
+        assert!(
+            !session_id.is_empty(),
+            "handler must persist and return a session id"
+        );
         let store = open_session_store().expect("session store");
-        let sessions = store.list_sessions(10).expect("sessions");
-        let meta = sessions.first().expect("persisted session");
         let session = store
-            .get_session(&meta.id)
+            .get_session(session_id)
             .expect("get session")
             .expect("session row");
         assert_eq!(session.source, "api");
@@ -1416,9 +1386,6 @@ mod tests {
 
     #[tokio::test]
     async fn agent_chat_without_stream_accept_returns_sync_json() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", temp.path());
-
         let response = agent_chat_dispatch(
             State(test_state()),
             HeaderMap::new(),
