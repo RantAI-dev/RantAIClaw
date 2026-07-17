@@ -13,6 +13,25 @@ pub struct TokenUsage {
     pub total_tokens: u64,
 }
 
+/// A large paste held out of the composer behind a placeholder marker.
+///
+/// Substitution is by EXACT string match on `marker` — not by parsing a
+/// bracket grammar — because we generate the marker ourselves. That sidesteps
+/// the fragility that repeatedly bit `multimodal::parse_image_markers`
+/// (nested `[::1]`, unbalanced `[`): there is no grammar here to break, only a
+/// literal string we put in and take back out.
+#[derive(Debug, Clone)]
+pub struct PendingPaste {
+    pub marker: String,
+    pub content: String,
+}
+
+/// A paste of more than this many lines is collapsed to a placeholder. Below
+/// it, the paste lands inline as before — a two- or three-line paste is not
+/// worth hiding. Line-count, not byte-count: the reported problem was tall
+/// pastes burying the composer.
+pub const PASTE_PLACEHOLDER_MIN_LINES: usize = 5;
+
 /// Holds the runtime state of an active TUI conversation.
 pub struct TuiContext {
     /// `None` until the first message is persisted. Deferring creation keeps
@@ -22,6 +41,12 @@ pub struct TuiContext {
     pub messages: Vec<Message>,
     pub model: String,
     pub input_buffer: String,
+    /// Large pastes collapsed to a `[Pasted text #N +M lines]` placeholder in
+    /// the buffer, with the real content held here until submit. Keeps a
+    /// 500-line log paste from burying the composer while still sending the
+    /// full text. Expanded and cleared by `expand_pending_pastes` on submit;
+    /// cleared with the buffer on `/new`.
+    pub pending_pastes: Vec<PendingPaste>,
     /// Cursor position inside `input_buffer`, measured in characters (not
     /// bytes). Always `<= input_buffer.chars().count()`. Drives the
     /// terminal cursor placement in `render_input_pane` and the insert /
@@ -154,6 +179,7 @@ impl TuiContext {
             messages,
             model: model.to_string(),
             input_buffer: String::new(),
+            pending_pastes: Vec::new(),
             cursor_pos: 0,
             scroll_offset: 0,
             token_usage: TokenUsage::default(),
@@ -297,6 +323,38 @@ impl TuiContext {
         let byte_idx = self.cursor_byte_index();
         self.input_buffer.insert_str(byte_idx, text);
         self.cursor_pos += text.chars().count();
+    }
+
+    /// Register a large paste and return the placeholder marker to insert in
+    /// its place. The marker is numbered per pending list so multiple pastes in
+    /// one message read `#1`, `#2`, … .
+    pub fn register_paste(&mut self, content: String) -> String {
+        let id = self.pending_pastes.len() + 1;
+        // `lines()` not `split('\n')`: a trailing newline should not inflate
+        // the count a user would get by eye (a 40-line paste reads "+40").
+        let lines = content.lines().count();
+        let marker = format!("[Pasted text #{id} +{lines} lines]");
+        self.pending_pastes.push(PendingPaste {
+            marker: marker.clone(),
+            content,
+        });
+        marker
+    }
+
+    /// Replace each pending placeholder marker in `text` with its real content
+    /// and clear the pending list. Exact-string substitution: a marker the user
+    /// edited or deleted no longer matches, so its content is simply dropped
+    /// (they removed it) and the leftover text goes through literally. Called
+    /// once at submit.
+    pub fn expand_pending_pastes(&mut self, text: String) -> String {
+        if self.pending_pastes.is_empty() {
+            return text;
+        }
+        let mut out = text;
+        for p in self.pending_pastes.drain(..) {
+            out = out.replace(&p.marker, &p.content);
+        }
+        out
     }
 
     /// Delete the char immediately before the cursor (Backspace).
@@ -465,6 +523,7 @@ impl TuiContext {
         }
         self.messages.clear();
         self.input_buffer.clear();
+        self.pending_pastes.clear();
         self.scroll_offset = 0;
         self.token_usage = TokenUsage::default();
         self.last_error = None;
@@ -481,6 +540,79 @@ mod tests {
         let (req_tx, _req_rx) = mpsc::channel(4);
         let (_events_tx, events_rx) = mpsc::channel(32);
         TuiContext::new(store, model, None, req_tx, events_rx).expect("context creation")
+    }
+
+    fn tall(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The whole point: the placeholder shown in the composer must expand back
+    /// to the exact pasted content on submit — nothing lost, nothing altered.
+    #[test]
+    fn a_registered_paste_round_trips_through_the_placeholder() {
+        let mut ctx = in_memory_context("m");
+        let content = tall(40);
+        let marker = ctx.register_paste(content.clone());
+        assert!(marker.starts_with("[Pasted text #1 +"));
+        // The buffer would hold the marker plus whatever the user types around it.
+        let buffer = format!("please review {marker} and explain");
+        let expanded = ctx.expand_pending_pastes(buffer);
+        assert_eq!(expanded, format!("please review {content} and explain"));
+        assert!(ctx.pending_pastes.is_empty(), "consumed on expand");
+    }
+
+    #[test]
+    fn multiple_pastes_number_and_expand_independently() {
+        let mut ctx = in_memory_context("m");
+        let a = ctx.register_paste("AAA\nAAA".into());
+        let b = ctx.register_paste("BBB\nBBB".into());
+        assert!(a.contains("#1"));
+        assert!(b.contains("#2"));
+        let expanded = ctx.expand_pending_pastes(format!("{a} then {b}"));
+        assert_eq!(expanded, "AAA\nAAA then BBB\nBBB");
+    }
+
+    /// If the user edits or deletes the marker, it no longer matches, so its
+    /// content is dropped (they removed it) and the rest passes through — no
+    /// panic, no stray content.
+    #[test]
+    fn an_edited_marker_is_not_expanded() {
+        let mut ctx = in_memory_context("m");
+        let _marker = ctx.register_paste(tall(40));
+        let expanded = ctx.expand_pending_pastes("I deleted the paste".into());
+        assert_eq!(expanded, "I deleted the paste");
+        assert!(ctx.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn expand_is_a_noop_without_pending_pastes() {
+        let mut ctx = in_memory_context("m");
+        assert_eq!(ctx.expand_pending_pastes("hello".into()), "hello");
+    }
+
+    /// A paste containing a `]` or a bracketed IPv6 host must round-trip
+    /// intact — the exact-string substitution has no grammar to trip on,
+    /// unlike the image-marker parser.
+    #[test]
+    fn content_with_brackets_round_trips() {
+        let mut ctx = in_memory_context("m");
+        let content =
+            "curl http://[::1]:8080/x\ngrep '[' file\nmore\nlines\nhere\nand more".to_string();
+        let marker = ctx.register_paste(content.clone());
+        assert_eq!(ctx.expand_pending_pastes(marker), content);
+    }
+
+    /// `/new` clears held pastes so they cannot leak into the next message.
+    #[test]
+    fn new_session_clears_pending_pastes() {
+        let mut ctx = in_memory_context("m");
+        ctx.register_paste(tall(40));
+        assert!(!ctx.pending_pastes.is_empty());
+        ctx.clear_session().unwrap();
+        assert!(ctx.pending_pastes.is_empty());
     }
 
     #[test]
