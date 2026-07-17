@@ -79,6 +79,14 @@ pub fn sessions_db(profile: &str) -> PathBuf {
     sessions_dir(profile).join("sessions.db")
 }
 
+/// `~/.rantaiclaw/profiles/<name>/kb.db` — the per-profile knowledge-base
+/// SQLite database. Like `sessions_db`, this leaked to a single global XDG
+/// data dir pre-v0.7.x; see `migration::maybe_migrate_global_kb_db`. Kept at
+/// the profile root (not a subdir) — it is a single file, not a tree.
+pub fn kb_db(profile: &str) -> PathBuf {
+    profile_dir(profile).join("kb.db")
+}
+
 pub fn skills_dir(profile: &str) -> PathBuf {
     profile_dir(profile).join("skills")
 }

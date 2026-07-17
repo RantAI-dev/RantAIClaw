@@ -99,6 +99,23 @@ pub fn maybe_migrate_global_sessions_db() -> Result<bool> {
     )
 }
 
+/// One-shot migration of the global `kb.db` into the `default` profile.
+///
+/// Same rationale and guarantees as [`maybe_migrate_global_sessions_db`]: the
+/// knowledge base used to live at one global `~/.local/share/rantaiclaw/kb.db`
+/// shared by every profile. We MOVE it into `profiles/default/kb.db` so each
+/// profile owns its own corpus. Returns `Ok(true)` iff a move happened.
+pub fn maybe_migrate_global_kb_db() -> Result<bool> {
+    let Some(global) = global_data_dir() else {
+        return Ok(false);
+    };
+    migrate_global_db_locked(
+        &global.join("kb.db"),
+        &paths::kb_db("default"),
+        "migrate_kb.lock",
+    )
+}
+
 /// Shared driver for the global-db → per-profile-db migrations. Detection is
 /// "source exists AND destination does not"; a populated destination is never
 /// overwritten. The move is WAL-checkpointed first and `EXDEV`-safe.
