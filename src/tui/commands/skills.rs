@@ -108,11 +108,18 @@ impl CommandHandler for SkillsCommand {
 
         let status = active_skill_status_from_context(ctx);
         let items = build_skill_items(&status);
+        // Honour a name argument instead of dropping it. `/skills <name>` used
+        // to build the picker with `preselect_key: None`, so the arg vanished
+        // without a word — one letter away from `/skill <name>`, which opens
+        // that skill's detail panel. Same word, silently different outcomes.
+        // A name that matches nothing preselects nothing and the picker opens
+        // as before.
+        let preselect = (!trimmed.is_empty()).then_some(trimmed);
         let picker = ListPicker::new(
             ListPickerKind::Skill,
             "Skills",
             items,
-            None,
+            preselect,
             "No skills loaded. Drop a SKILL.md in ~/.rantaiclaw/profiles/<profile>/skills/<name>/, or run `/setup skills`.",
         );
         Ok(CommandResult::OpenListPicker(picker))

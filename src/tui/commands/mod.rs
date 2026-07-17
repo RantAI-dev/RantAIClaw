@@ -57,6 +57,9 @@ pub enum CommandResult {
     OpenSetupCategory {
         category: String,
     },
+    /// Cancel the in-flight turn — the same TurnRequest::Cancel that Esc
+    /// sends. The dispatcher owns the async send.
+    CancelTurn,
     OpenFirstRunWizard,
     /// Fetch the ClawHub catalogue and open an interactive install picker.
     /// Mirrors the `/sessions` pattern (search + paginate via ListPicker)

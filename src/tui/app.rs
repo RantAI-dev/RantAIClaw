@@ -2487,6 +2487,24 @@ impl TuiApp {
             CmdResult::OpenSetupCategory { category } => {
                 self.open_category_sub_picker(&category);
             }
+            CmdResult::CancelTurn => {
+                // Same path Esc takes. Only meaningful mid-turn; say so
+                // rather than silently doing nothing when idle.
+                if matches!(self.state, AppState::Streaming { .. }) {
+                    if let AppState::Streaming { cancelling, .. } = &mut self.state {
+                        *cancelling = true;
+                    }
+                    if let Err(e) = self.context.req_tx.send(TurnRequest::Cancel).await {
+                        self.context.last_error = Some(format!("cancel failed: {e}"));
+                    }
+                } else {
+                    let msg =
+                        "Nothing is running — /stop cancels an in-flight turn (Esc does the same)."
+                            .to_string();
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".to_string(), msg));
+                }
+            }
             CmdResult::OpenFirstRunWizard => {
                 self.first_run_wizard = Some(super::FirstRunWizard::new(self.profile.clone()));
             }
