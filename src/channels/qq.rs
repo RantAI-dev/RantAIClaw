@@ -582,8 +582,7 @@ allowed_users = ["user1"]
         use crate::channels::pairing::{try_handle_pairing, AllowlistField};
         use crate::security::pairing_store;
 
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

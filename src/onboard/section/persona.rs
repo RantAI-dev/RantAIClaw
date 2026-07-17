@@ -81,6 +81,9 @@ mod tests {
 
     #[test]
     fn is_already_configured_flips_after_write() {
+        // Serialize against every other test that mutates HOME / config-dir env;
+        // sync test (no runtime), so acquire the shared async lock via blocking.
+        let _guard = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());

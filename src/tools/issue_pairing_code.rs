@@ -195,12 +195,6 @@ impl Tool for IssuePairingCodeTool {
 mod tests {
     use super::*;
 
-    /// `issue_pairing_code` resolves the store root via `ProfileManager::active`,
-    /// which reads `HOME` (→ `~/.rantaiclaw/profiles/<name>`). Point `HOME` at a
-    /// temp dir so the test never touches a real profile. Serialized (async
-    /// mutex, held across awaits) because it mutates a process-global env var.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// Restore the pre-test HOME instead of unsetting it — `remove_var` strips
     /// HOME from the whole test process and breaks every later env-reading test.
     fn restore_home(prev: Option<std::ffi::OsString>) {
@@ -212,7 +206,7 @@ mod tests {
 
     #[tokio::test]
     async fn mint_returns_code_in_output() {
-        let _g = ENV_LOCK.lock().await;
+        let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
@@ -239,7 +233,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_owner_flag_omits_claim_owner_line() {
-        let _g = ENV_LOCK.lock().await;
+        let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
@@ -263,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_channel_is_rejected() {
-        let _g = ENV_LOCK.lock().await;
+        let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());

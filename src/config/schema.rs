@@ -4432,7 +4432,7 @@ mod tests {
     use std::path::PathBuf;
     #[cfg(unix)]
     use std::{fs::Permissions, os::unix::fs::PermissionsExt};
-    use tokio::sync::{Mutex, MutexGuard};
+    use tokio::sync::MutexGuard;
     use tokio::test;
     use tokio_stream::wrappers::ReadDirStream;
     use tokio_stream::StreamExt;
@@ -5872,8 +5872,9 @@ default_temperature = 0.7
     // ── Environment variable overrides (Docker support) ─────────
 
     async fn env_override_lock() -> MutexGuard<'static, ()> {
-        static ENV_OVERRIDE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
-        ENV_OVERRIDE_TEST_LOCK.lock().await
+        // Shared with every other config-resolution-env test in the crate;
+        // per-module locks don't serialize across modules. See `crate::test_env`.
+        crate::test_env::ENV_LOCK.lock().await
     }
 
     fn clear_proxy_env_test_vars() {

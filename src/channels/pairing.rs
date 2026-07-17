@@ -385,9 +385,6 @@ mod tests {
 
     // ── try_handle_pairing (happy path) ──────────────────────
 
-    // Serialize the env-mutating Config::load_or_init test against itself.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[tokio::test]
     async fn try_handle_pairing_non_command_returns_none() {
         // No store, no config needed — a non-command short-circuits.
@@ -419,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_handle_pairing_happy_path_owner() {
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
