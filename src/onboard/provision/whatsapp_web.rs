@@ -46,16 +46,16 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(&self, config: &mut Config, profile: &Profile, io: ProvisionIo) -> Result<()> {
         let ProvisionIo {
             events,
             mut responses,
         } = io;
 
         // ── 1. Prompt for session DB path ──────────────────────────
-        let default_session: PathBuf = directories::ProjectDirs::from("", "", "rantaiclaw")
-            .map(|d| d.data_dir().join("whatsapp.db"))
-            .unwrap_or_else(|| PathBuf::from("whatsapp.db"));
+        // Default under the active profile's workspace so each profile links
+        // its own WhatsApp device instead of sharing one global session store.
+        let default_session: PathBuf = profile.workspace_dir().join("whatsapp.db");
         events
             .send(ProvisionEvent::Prompt {
                 id: "session_path".into(),

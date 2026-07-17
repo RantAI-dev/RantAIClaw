@@ -103,10 +103,6 @@ pub fn secrets_dir(profile: &str) -> PathBuf {
     profile_dir(profile).join("secrets")
 }
 
-pub fn runtime_dir(profile: &str) -> PathBuf {
-    profile_dir(profile).join("runtime")
-}
-
 pub fn audit_log(profile: &str) -> PathBuf {
     profile_dir(profile).join("audit.log")
 }

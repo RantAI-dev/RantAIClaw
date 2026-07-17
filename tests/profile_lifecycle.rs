@@ -57,7 +57,6 @@ fn ensure_default_creates_full_tree() {
         assert!(p.persona_dir().exists(), "persona/");
         assert!(p.policy_dir().exists(), "policy/");
         assert!(p.secrets_dir().exists(), "secrets/");
-        assert!(p.runtime_dir().exists(), "runtime/");
     });
 }
 
