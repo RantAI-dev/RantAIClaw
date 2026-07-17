@@ -3700,6 +3700,13 @@ impl Config {
             tracing::warn!("legacy-layout migration failed: {e:#}; continuing with current layout");
         }
 
+        // v0.7.x: sessions.db used to leak to a single global XDG data dir
+        // shared by every profile. Move it into profiles/default/ so history
+        // is per-profile. No-op on fresh installs and once already moved.
+        if let Err(e) = crate::profile::migration::maybe_migrate_global_sessions_db() {
+            tracing::warn!("sessions.db migration failed: {e:#}; continuing with current layout");
+        }
+
         let (default_rantaiclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
         let (rantaiclaw_dir, workspace_dir, resolution_source) =

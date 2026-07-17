@@ -146,11 +146,11 @@ fn err_400(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
 // ────────────────────────────────────────────────────────────────────────────
 
 fn open_session_store() -> anyhow::Result<crate::sessions::SessionStore> {
-    let data_dir = directories::ProjectDirs::from("", "", "rantaiclaw")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from(".rantaiclaw"));
-    std::fs::create_dir_all(&data_dir)?;
-    crate::sessions::SessionStore::open(&data_dir.join("sessions.db"))
+    let path = crate::profile::ProfileManager::active()?.sessions_db_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::sessions::SessionStore::open(&path)
 }
 
 /// Load a session's prior turns as `(role, content)` history so a

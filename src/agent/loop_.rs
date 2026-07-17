@@ -126,13 +126,13 @@ fn autosave_memory_key(prefix: &str) -> String {
 /// `None` on any I/O failure — sessions are a "nice-to-have" persistence
 /// layer; never block the actual turn.
 fn open_cli_session_store() -> Option<crate::sessions::SessionStore> {
-    let data_dir = directories::ProjectDirs::from("", "", "rantaiclaw")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from(".rantaiclaw"));
-    if std::fs::create_dir_all(&data_dir).is_err() {
-        return None;
+    let path = crate::profile::ProfileManager::active()
+        .ok()?
+        .sessions_db_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
     }
-    crate::sessions::SessionStore::open(&data_dir.join("sessions.db")).ok()
+    crate::sessions::SessionStore::open(&path).ok()
 }
 
 /// Trim conversation history to prevent unbounded growth.
