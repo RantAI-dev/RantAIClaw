@@ -183,7 +183,7 @@ Expected behavior:
 - `POST /api/v1/agent/chat` records a completed turn with `source = "api"`.
 - The session contains the user message, assistant response, derived title, and end timestamp.
 
-If chat succeeds but persistence fails, the gateway logs a warning and still returns the completed response. Verify the RantaiClaw data directory is writable and that `sessions.db` is not locked by another long-running process.
+If chat succeeds but persistence fails, the gateway logs a warning and still returns the completed response. Verify the RantaiClaw data directory is writable and that the active profile's `sessions.db` (`~/.rantaiclaw/profiles/<name>/sessions/sessions.db`) is not locked by another long-running process.
 
 ### `skills install-deps` download extraction fails
 

@@ -607,7 +607,7 @@ Gateway config API (for the management console; key values are never returned):
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `KB_DB_PATH` | platform data dir (`~/.local/share/rantaiclaw/kb.db` on Linux, `~/Library/Application Support/rantaiclaw/kb.db` on macOS) | SQLite database path; `./kb.db` is used as a final fallback when HOME is unavailable |
+| `KB_DB_PATH` | active profile's `~/.rantaiclaw/profiles/<name>/kb.db` | SQLite database path; `./kb.db` is used as a final fallback when HOME is unavailable |
 
 ### Embedding
 

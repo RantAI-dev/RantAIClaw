@@ -6,7 +6,7 @@ Last verified: **May 15, 2026** (Phase 14 — feature-gated, off by default).
 
 ## Architecture
 
-- **Storage**: SQLite with the `sqlite-vec` virtual table for embeddings, plus FTS5 for BM25 lexical search. One `kb.db` per deployment (per workspace).
+- **Storage**: SQLite with the `sqlite-vec` virtual table for embeddings, plus FTS5 for BM25 lexical search. One `kb.db` per profile (`~/.rantaiclaw/profiles/<name>/kb.db`), so each profile keeps a separate corpus.
 - **Embedding**: OpenRouter by default (`qwen/qwen3-embedding-8b` at 4096 dimensions). A Text Embeddings Inference (TEI) sidecar is supported via `KB_EMBEDDING_BASE_URL`.
 - **Retrieval**: hybrid (vector + BM25 via Reciprocal Rank Fusion) with optional reranker (LLM via OpenRouter, Cohere, or vLLM sidecar). Optional query expansion and Anthropic-style contextual retrieval.
 - **Extraction**: smart-router PDF pipeline. Defaults to unpdf; falls through to a vision LLM (or MinerU sidecar) when text-layer signals indicate the PDF needs OCR. Image OCR uses an OpenRouter vision LLM.
@@ -93,7 +93,7 @@ All KB settings are environment-driven. The full list of `KB_*` variables and th
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `KB_DB_PATH` | platform data dir (`~/.local/share/rantaiclaw/kb.db` on Linux) | Path to the SQLite file |
+| `KB_DB_PATH` | active profile's `~/.rantaiclaw/profiles/<name>/kb.db` | Path to the SQLite file |
 | `KB_EMBEDDING_MODEL` | `qwen/qwen3-embedding-8b` | Embedding model ID |
 | `KB_EMBEDDING_DIM` | `4096` | Vector dimension; must match the model |
 | `KB_HYBRID_BM25_ENABLED` | `true` | Hybrid vector + BM25 retrieval (set `false` to disable BM25) |
@@ -103,8 +103,10 @@ All KB settings are environment-driven. The full list of `KB_*` variables and th
 Storage path resolution:
 
 1. `KB_DB_PATH` (when non-empty)
-2. Platform data dir via `directories::ProjectDirs` (`~/.local/share/rantaiclaw/kb.db` on Linux, `~/Library/Application Support/rantaiclaw/kb.db` on macOS)
+2. The active profile's `kb.db` (`~/.rantaiclaw/profiles/<name>/kb.db`), resolved via the same profile precedence as everything else: `RANTAICLAW_PROFILE` → `~/.rantaiclaw/active_profile` → `default`
 3. `./kb.db` in the current working directory (final fallback for containers without HOME)
+
+Before v0.7.x the KB lived at a single global `~/.local/share/rantaiclaw/kb.db` shared by every profile; on first run after upgrading, that file is moved once into `profiles/default/kb.db`.
 
 ## Sidecars (optional)
 

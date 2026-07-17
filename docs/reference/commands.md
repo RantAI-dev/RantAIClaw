@@ -193,7 +193,7 @@ In the TUI, `/skills` opens the local skills picker. Press `Ctrl+I` (or Tab in t
 
 ### API sessions
 
-`POST /api/v1/agent/chat` records completed turns in the same `sessions.db` used by `agent -m`, the TUI, and the `/api/v1/sessions*` endpoints. API-created sessions use `source = "api"` and include the user message, assistant response, derived title, and end timestamp.
+`POST /api/v1/agent/chat` records completed turns in the same `sessions.db` used by `agent -m`, the TUI, and the `/api/v1/sessions*` endpoints — the active profile's `~/.rantaiclaw/profiles/<name>/sessions/sessions.db`, so history is scoped per profile. API-created sessions use `source = "api"` and include the user message, assistant response, derived title, and end timestamp.
 
 The same endpoint can stream partial output as Server-Sent Events when called
 with `Accept: text/event-stream` or `?stream=1`; see
