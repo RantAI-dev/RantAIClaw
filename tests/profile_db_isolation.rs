@@ -1,10 +1,11 @@
-//! Per-profile isolation of `sessions.db`.
+//! Per-profile isolation of `sessions.db` and `kb.db`.
 //!
 //! Before this fix every profile shared one global XDG `sessions.db`
-//! (`~/.local/share/rantaiclaw/sessions.db`), so `--profile work` saw
-//! `--profile personal`'s chat history. These tests pin the isolation: each
-//! profile resolves its own `profiles/<name>/sessions/sessions.db`, and the
-//! one-shot migration moves the legacy global file into `default`.
+//! (`~/.local/share/rantaiclaw/sessions.db`) and `kb.db`, so `--profile work`
+//! saw `--profile personal`'s chat history and knowledge base. These tests pin
+//! the isolation: each profile resolves its own
+//! `profiles/<name>/sessions/sessions.db` and `profiles/<name>/kb.db`, and the
+//! one-shot migrations move the legacy global files into `default`.
 //!
 //! As with `migrate_legacy.rs`, `$HOME` is redirected to a tempdir and the
 //! suite serializes on a global `Mutex` so concurrent tests don't race on
@@ -169,6 +170,111 @@ fn migration_is_idempotent_and_never_clobbers() {
                 .model,
             "keep:model",
             "profile db must be preserved untouched",
+        );
+    });
+}
+
+// ── kb.db ──────────────────────────────────────────────────────────────────
+//
+// The db-migration machinery (WAL checkpoint → move → no-clobber → idempotent)
+// is shared with sessions and fully exercised by the tests above. kb's own
+// migration operates at the file level and is schema-agnostic, so we seed the
+// fixtures with a `SessionStore` purely because it is the handiest way to
+// produce a valid WAL-mode SQLite file in-test — the row count, not the
+// schema, is what these assertions track.
+
+/// kb.db resolves per-profile, so two profiles never share a corpus. Mirrors
+/// what `resolve_kb_db_path` computes for its profile branch
+/// (`resolve_active_name` → `paths::kb_db`).
+#[test]
+fn kb_dbs_are_isolated_per_profile() {
+    with_home(|_home| {
+        assert_ne!(
+            paths::kb_db("work"),
+            paths::kb_db("personal"),
+            "each profile must resolve its own kb.db"
+        );
+
+        std::env::set_var("RANTAICLAW_PROFILE", "work");
+        let active = paths::kb_db(&ProfileManager::resolve_active_name());
+        assert!(
+            active.ends_with("profiles/work/kb.db"),
+            "active profile kb.db should live under profiles/work/: {}",
+            active.display()
+        );
+        assert_eq!(
+            active,
+            ProfileManager::ensure("work").unwrap().kb_db_path(),
+            "Profile::kb_db_path must match the resolver's path"
+        );
+    });
+}
+
+/// The one-shot migration moves the global kb.db into `default`, preserving
+/// its data through the WAL checkpoint, and leaves the source gone.
+#[test]
+fn global_kb_db_moves_into_default_profile() {
+    with_home(|home| {
+        let global = global_data_dir(home);
+        std::fs::create_dir_all(&global).unwrap();
+        let legacy = global.join("kb.db");
+        SessionStore::open(&legacy)
+            .unwrap()
+            .new_session("kb:fixture", "legacy")
+            .unwrap();
+
+        let did = migration::maybe_migrate_global_kb_db().unwrap();
+        assert!(did, "migration should fire when a global kb.db exists");
+
+        let dest = paths::kb_db("default");
+        assert!(dest.exists(), "kb.db should now live under default");
+        assert_eq!(
+            SessionStore::open(&dest)
+                .unwrap()
+                .list_sessions(10)
+                .unwrap()
+                .len(),
+            1,
+            "migrated kb.db retains its data through the WAL checkpoint",
+        );
+        assert!(
+            !legacy.exists(),
+            "legacy global kb.db must be moved, not copied"
+        );
+    });
+}
+
+/// kb migration is idempotent and never clobbers a populated per-profile db.
+#[test]
+fn kb_migration_is_idempotent_and_never_clobbers() {
+    with_home(|home| {
+        // No global db → no-op.
+        assert!(!migration::maybe_migrate_global_kb_db().unwrap());
+
+        let dest = paths::kb_db("default");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        SessionStore::open(&dest)
+            .unwrap()
+            .new_session("keep:fixture", "profile")
+            .unwrap();
+
+        let global = global_data_dir(home);
+        std::fs::create_dir_all(&global).unwrap();
+        SessionStore::open(&global.join("kb.db"))
+            .unwrap()
+            .new_session("stale:fixture", "global")
+            .unwrap();
+
+        let did = migration::maybe_migrate_global_kb_db().unwrap();
+        assert!(!did, "must not move when destination already has data");
+        assert_eq!(
+            SessionStore::open(&dest)
+                .unwrap()
+                .list_sessions(10)
+                .unwrap()[0]
+                .model,
+            "keep:fixture",
+            "profile kb.db must be preserved untouched",
         );
     });
 }

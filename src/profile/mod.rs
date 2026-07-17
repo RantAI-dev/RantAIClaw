@@ -51,6 +51,9 @@ impl Profile {
     pub fn sessions_db_path(&self) -> PathBuf {
         paths::sessions_db(&self.name)
     }
+    pub fn kb_db_path(&self) -> PathBuf {
+        paths::kb_db(&self.name)
+    }
     pub fn skills_dir(&self) -> PathBuf {
         paths::skills_dir(&self.name)
     }

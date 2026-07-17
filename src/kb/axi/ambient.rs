@@ -19,7 +19,7 @@ use super::cli::resolve_kb_db_path;
 /// AXI ambient-context one-liner for the agent's system prompt.
 ///
 /// Returns `Some(text)` when a KB database is reachable at the resolved
-/// path (`KB_DB_PATH` env → XDG data dir → `./kb.db`). Returns `None`
+/// path (`KB_DB_PATH` env → active profile's `kb.db` → `./kb.db`). Returns `None`
 /// when no DB file is present — in that case the agent never learns
 /// about the capability and never shells out to it, which is the
 /// correct deny-by-default behavior.

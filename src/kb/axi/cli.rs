@@ -10,8 +10,8 @@
 //! - `Err(KbError)` — internal failure (DB unreachable, bad config). `main.rs`
 //!   prints a TOON error block to stdout and exits 1.
 //!
-//! Storage path resolution: `KB_DB_PATH` env var → XDG data dir
-//! (`~/.local/share/rantaiclaw/kb.db` on Linux) → `./kb.db` cwd fallback.
+//! Storage path resolution: `KB_DB_PATH` env var → the active profile's
+//! `profiles/<name>/kb.db` → `./kb.db` cwd fallback.
 //!
 //! Heavy components (config, store, embedder, optional reranker) are built
 //! lazily inside the dispatcher rather than at construct-time, so `--help`
@@ -738,20 +738,23 @@ fn graph_to_json(g: &Graph) -> String {
 ///
 /// Precedence:
 /// 1. `KB_DB_PATH` env var (explicit override, used by tests + power users).
-/// 2. `directories::ProjectDirs` data dir
-///    (`~/.local/share/rantaiclaw/kb.db` on Linux, `~/Library/Application
-///    Support/rantaiclaw/kb.db` on macOS, etc.).
-/// 3. `./kb.db` in the current working directory — final fallback when
-///    even the user's HOME is unavailable (CI containers, embedded
-///    systems).
+/// 2. The active profile's `profiles/<name>/kb.db` — so `--profile work` and
+///    `--profile personal` keep separate knowledge bases. `resolve_active_name`
+///    is pure (no dir creation), keeping this cheap on the per-turn ambient
+///    path; `SqliteStore::open` creates the parent dir on first write.
+/// 3. `./kb.db` in the current working directory — final fallback when even
+///    the user's HOME is unavailable (CI containers, embedded systems).
 pub(crate) fn resolve_kb_db_path() -> PathBuf {
     if let Ok(env_path) = std::env::var("KB_DB_PATH") {
         if !env_path.is_empty() {
             return PathBuf::from(env_path);
         }
     }
-    if let Some(dirs) = directories::ProjectDirs::from("", "", "rantaiclaw") {
-        return dirs.data_dir().join("kb.db");
+    // Guard on HOME so we never panic in `paths::home_dir` on hosts without
+    // one — fall through to the cwd default instead.
+    if directories::UserDirs::new().is_some() {
+        let name = crate::profile::ProfileManager::resolve_active_name();
+        return crate::profile::paths::kb_db(&name);
     }
     PathBuf::from("./kb.db")
 }
