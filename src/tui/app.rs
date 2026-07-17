@@ -15,7 +15,7 @@ use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Widget, Wrap},
     Terminal, TerminalOptions, Viewport,
 };
@@ -658,7 +658,12 @@ impl TuiApp {
                         o.push_str(&cleaned);
                     }
                 } else if self.first_run_wizard.is_none() {
-                    self.context.paste_at_cursor(&text);
+                    // Terminals transmit pasted line breaks as CR, so this
+                    // payload arrives as "a\rb" for a two-line paste. Land it
+                    // in the buffer as '\n': that is the invariant the caret
+                    // walker counts and the renderer splits on, and a raw '\r'
+                    // reaching the terminal wrecks the input box's border.
+                    self.context.paste_at_cursor(&normalize_line_breaks(&text));
                     self.context.exit_history_navigation();
                     self.refresh_autocomplete();
                 }
@@ -1105,7 +1110,18 @@ impl TuiApp {
                 self.refresh_autocomplete();
             }
             // Regular character input — insert at the cursor.
-            KeyCode::Char(c) if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
+            // Plain text input. The CONTROL check is load-bearing: crossterm
+            // reports an unhandled chord like Ctrl+U as `Char('u')` with the
+            // CONTROL modifier, so without it every readline chord the app
+            // does not implement typed its own letter into the buffer
+            // (Ctrl+A/E/W/K/U on `hello` produced `helloaewku`). Chords we do
+            // implement — Ctrl+C/D/J/G — match in arms above this one. SHIFT
+            // and ALT must still pass through: they carry real text.
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none() =>
+            {
                 self.context.insert_char_at_cursor(c);
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
@@ -4416,23 +4432,302 @@ fn render_approval_pane(
     frame.render_widget(para, area);
 }
 
-fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
+#[cfg(test)]
+mod composer_body_tests {
+    use super::composer_body;
+
+    /// The bug this guards: `Span::raw(input_buffer)` handed ratatui a span
+    /// whose content held `\n`. Ratatui writes span content verbatim, so the
+    /// newline moved the terminal cursor out of the input box and the border
+    /// was overwritten — reproduced with any 2-line paste.
+    #[test]
+    fn no_span_carries_a_raw_newline() {
+        for buffer in ["a\nb", "one\ntwo\nthree", "trailing\n", "\nleading"] {
+            let text = composer_body(buffer);
+            for line in &text.lines {
+                for span in &line.spans {
+                    assert!(
+                        !span.content.contains('\n'),
+                        "buffer {buffer:?} produced a span carrying a raw newline: {:?}",
+                        span.content
+                    );
+                }
+            }
+        }
+    }
+
+    /// A terminal transmits pasted line breaks as CR, not LF: a known-good
+    /// crossterm probe fed `"AAA\nBBB"` through tmux's bracketed paste
+    /// received `Event::Paste("AAA\rBBB")`. A bare `\r` in a `Span` returns
+    /// the real cursor to column 0, so the rest of the paste overwrites the
+    /// composer's left border — this, not `\n`, is what shredded the box.
+    /// Guard every line-break form a paste can carry.
+    #[test]
+    fn no_span_carries_any_bare_carriage_return() {
+        for buffer in [
+            "a\rb",
+            "a\r\nb",
+            "one\rtwo\rthree",
+            "trailing\r",
+            "\rleading",
+        ] {
+            let text = composer_body(buffer);
+            for line in &text.lines {
+                for span in &line.spans {
+                    assert!(
+                        !span.content.contains('\r') && !span.content.contains('\n'),
+                        "buffer {buffer:?} produced a span carrying a raw line break: {:?}",
+                        span.content
+                    );
+                }
+            }
+        }
+    }
+
+    /// CR, LF and CRLF must all break exactly one line — CRLF must not
+    /// produce a phantom empty line between the two halves.
+    #[test]
+    fn every_line_break_form_splits_the_same_way() {
+        assert_eq!(composer_body("a\nb").lines.len(), 2, "LF");
+        assert_eq!(composer_body("a\rb").lines.len(), 2, "CR");
+        assert_eq!(composer_body("a\r\nb").lines.len(), 2, "CRLF");
+    }
+
+    #[test]
+    fn splits_one_line_per_logical_line() {
+        assert_eq!(composer_body("a\nb\nc").lines.len(), 3);
+        assert_eq!(composer_body("single").lines.len(), 1);
+    }
+
+    /// A trailing newline is where the cursor sits after `Ctrl+J`; dropping
+    /// the empty final line (as `str::lines` would) hides it.
+    #[test]
+    fn trailing_newline_keeps_its_empty_final_line() {
+        let text = composer_body("body\n");
+        assert_eq!(text.lines.len(), 2);
+        let last: String = text.lines[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(last.trim(), "");
+    }
+
+    #[test]
+    fn empty_buffer_renders_the_placeholder_on_one_line() {
+        let text = composer_body("");
+        assert_eq!(text.lines.len(), 1);
+        let rendered: String = text.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(rendered.contains("Type a message"), "got {rendered:?}");
+    }
+
+    /// Every logical line must survive verbatim — the fix must not drop or
+    /// reorder content while splitting.
+    #[test]
+    fn content_survives_the_split_verbatim() {
+        let text = composer_body("first\nsecond\nthird");
+        let bodies: Vec<String> = text
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim_start_matches(['▎', ' '])
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(bodies, vec!["first", "second", "third"]);
+    }
+}
+
+#[cfg(test)]
+mod composer_caret_tests {
+    use super::{composer_caret_cell, composer_scroll};
+
+    #[test]
+    fn caret_starts_after_the_prefix() {
+        assert_eq!(composer_caret_cell("", 0, 40), (0, 2));
+    }
+
+    #[test]
+    fn caret_advances_along_the_first_row() {
+        assert_eq!(composer_caret_cell("abc", 3, 40), (0, 5)); // 2 prefix + 3
+    }
+
+    #[test]
+    fn a_newline_returns_the_caret_to_column_zero_on_the_next_row() {
+        assert_eq!(composer_caret_cell("ab\ncd", 5, 40), (1, 2));
+        assert_eq!(composer_caret_cell("ab\n", 3, 40), (1, 0));
+    }
+
+    #[test]
+    fn caret_wraps_when_it_runs_past_the_inner_width() {
+        // width 10, prefix 2 → 8 chars fit on row 0.
+        assert_eq!(composer_caret_cell(&"x".repeat(8), 8, 10), (1, 0));
+    }
+
+    /// The view must not move until the caret would leave the window — the
+    /// composer should sit still while the user types the first rows.
+    #[test]
+    fn no_scroll_while_the_caret_fits() {
+        for caret_row in 0..3 {
+            assert_eq!(composer_scroll(caret_row, 3), 0, "row {caret_row}");
+        }
+    }
+
+    /// The bug: the caret row was `min`-clamped to the last visible row, so
+    /// past 2 rows of input the caret froze on the bottom line and lied about
+    /// where typing was going. Scrolling by exactly the overflow keeps it
+    /// honest.
+    #[test]
+    fn scrolls_exactly_enough_to_keep_the_caret_visible() {
+        assert_eq!(composer_scroll(3, 3), 1);
+        assert_eq!(composer_scroll(9, 2), 8);
+    }
+
+    /// The invariant the render relies on: caret_row - scroll is always a
+    /// valid row inside the window, for any buffer and any window height.
+    #[test]
+    fn caret_always_lands_inside_the_window() {
+        for inner_h in 1..6u16 {
+            for caret_row in 0..40u16 {
+                let scroll = composer_scroll(caret_row, inner_h);
+                let visible = caret_row.saturating_sub(scroll);
+                assert!(
+                    visible < inner_h,
+                    "caret_row {caret_row} inner_h {inner_h} scroll {scroll} → {visible}"
+                );
+            }
+        }
+    }
+}
+
+/// Collapse every line-break form to `\n`.
+///
+/// The composer's buffer invariant is "line breaks are `\n`". Terminals do
+/// not honour it for free: a bracketed paste transmits breaks as CR, so
+/// pasting `"AAA\nBBB"` delivers `Event::Paste("AAA\rBBB")` (verified against
+/// a standalone crossterm probe through tmux). A bare `\r` reaching a ratatui
+/// `Span` returns the physical cursor to column 0 and the rest of the paste
+/// overwrites the input box's border; a `\r` in the buffer also desyncs the
+/// caret walker, which only counts `\n`.
+///
+/// CRLF collapses to one break, never two.
+fn normalize_line_breaks(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Caret cell for `cursor_pos` as `(row, col)` inside the composer's inner
+/// area, before any scroll is applied.
+///
+/// Char-cell wrap model: each char (including the leading "▎ " prefix)
+/// consumes one terminal cell. Exact for ASCII, approximate for full-width
+/// and combining glyphs, and it hard-breaks at `inner_w` where ratatui's
+/// `Wrap` breaks on word boundaries — a pre-existing skew this preserves
+/// rather than fixes.
+fn composer_caret_cell(buffer: &str, cursor_pos: usize, inner_w: u16) -> (u16, u16) {
+    let prefix_cells: u16 = 2; // "▎ "
+    let mut col: u16 = prefix_cells.min(inner_w.saturating_sub(1));
+    let mut row: u16 = 0;
+    for ch in buffer.chars().take(cursor_pos) {
+        if ch == '\n' {
+            col = 0;
+            row = row.saturating_add(1);
+        } else {
+            col = col.saturating_add(1);
+            if col >= inner_w {
+                col = 0;
+                row = row.saturating_add(1);
+            }
+        }
+    }
+    (row, col.min(inner_w.saturating_sub(1)))
+}
+
+/// Vertical scroll that keeps `caret_row` inside an `inner_h`-row window.
+///
+/// Zero until the caret would fall off the bottom, then exactly the overflow
+/// — so the box stays put while the user types the first rows and then
+/// follows the caret one row at a time.
+fn composer_scroll(caret_row: u16, inner_h: u16) -> u16 {
+    caret_row.saturating_sub(inner_h.saturating_sub(1))
+}
+
+/// Build the composer's renderable text.
+///
+/// A ratatui `Span` must stay newline-free: its content is written to the
+/// terminal verbatim, so an embedded `\n` moves the real cursor out of the
+/// widget and shreds the surrounding border. `Ctrl+J` (`insert_char_at_cursor`)
+/// and bracketed paste both put literal `\n` in `input_buffer`, so split into
+/// one `Line` per logical line here rather than handing the raw buffer to
+/// `Span::raw`.
+fn composer_body(input_buffer: &str) -> Text<'static> {
     let prefix = Span::styled(
         "▎ ",
         Style::default()
             .fg(Color::Rgb(94, 184, 255))
             .add_modifier(Modifier::BOLD),
     );
-    let body = if ctx.input_buffer.is_empty() {
-        Span::styled(
-            "Type a message…  (Enter sends · /help for commands · Ctrl+J newline · Ctrl+C exit)",
-            Style::default().fg(Color::Rgb(107, 114, 128)),
-        )
-    } else {
-        Span::raw(ctx.input_buffer.clone())
-    };
 
-    let input = Paragraph::new(Line::from(vec![prefix, body]))
+    if input_buffer.is_empty() {
+        return Text::from(Line::from(vec![
+            prefix,
+            Span::styled(
+                "Type a message…  (Enter sends · /help for commands · Ctrl+J newline · Ctrl+C exit)",
+                Style::default().fg(Color::Rgb(107, 114, 128)),
+            ),
+        ]));
+    }
+
+    // `split('\n')` (not `lines()`) so a trailing newline keeps its empty
+    // final line — the cursor sits there and the user must see it.
+    //
+    // Continuation lines carry no indent: ratatui's own soft-wrap returns to
+    // column 0, and the caret walker below likewise resets `col` to 0 after a
+    // '\n'. Indenting here would make hard-broken lines disagree with both.
+    //
+    // Normalize defensively even though `Event::Paste` already does: this is
+    // the last hop before the bytes reach the terminal, and a single stray
+    // '\r' here is not a cosmetic bug — it returns the real cursor to column
+    // 0 and the rest of the line eats the border.
+    let normalized = normalize_line_breaks(input_buffer);
+    let lines: Vec<Line<'static>> = normalized
+        .split('\n')
+        .enumerate()
+        .map(|(i, logical)| {
+            let text = Span::raw(logical.to_string());
+            if i == 0 {
+                Line::from(vec![prefix.clone(), text])
+            } else {
+                Line::from(text)
+            }
+        })
+        .collect();
+
+    Text::from(lines)
+}
+
+fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
+    let inner_x = area.x.saturating_add(1);
+    let inner_y = area.y.saturating_add(1);
+    let inner_w = area.width.saturating_sub(2).max(1);
+    let inner_h = area.height.saturating_sub(2).max(1);
+
+    // Scroll the box to follow the caret. Without this the Paragraph renders
+    // from row 0 forever and everything past `inner_h` is silently clipped —
+    // a long paste looked like it had been swallowed even though the whole
+    // buffer was there and submitted intact.
+    let (caret_row, caret_col) = composer_caret_cell(&ctx.input_buffer, ctx.cursor_pos, inner_w);
+    let scroll = composer_scroll(caret_row, inner_h);
+
+    let input = Paragraph::new(composer_body(&ctx.input_buffer))
+        .scroll((scroll, 0))
         .block(
             Block::default()
                 .title(Line::from(vec![
@@ -4458,38 +4753,7 @@ fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
     // is called on every frame — without it the input box looks frozen
     // even though the buffer is actually updating, which was reported
     // as "characters don't appear until I press Enter".
-    //
-    // Char-cell wrap model: assume each char (including the leading
-    // "▎ " prefix) consumes one terminal cell. This is exact for ASCII
-    // and slightly off for full-width / combining glyphs, but the
-    // common case (latin prose + slash commands) lands the cursor on
-    // the right cell. Long inputs that wrap inside the 2-row inner area
-    // still get a roughly-correct cursor row.
-    let inner_x = area.x.saturating_add(1);
-    let inner_y = area.y.saturating_add(1);
-    let inner_w = area.width.saturating_sub(2).max(1);
-    let inner_h = area.height.saturating_sub(2).max(1);
-    let prefix_cells: u16 = 2; // "▎ "
-    let mut col: u16 = prefix_cells.min(inner_w.saturating_sub(1));
-    let mut row: u16 = 0;
-    for ch in ctx.input_buffer.chars().take(ctx.cursor_pos) {
-        if ch == '\n' {
-            col = 0;
-            row = row.saturating_add(1);
-        } else {
-            col = col.saturating_add(1);
-            if col >= inner_w {
-                col = 0;
-                row = row.saturating_add(1);
-            }
-        }
-    }
-    // Clamp to inner area so we never point the terminal at a row
-    // outside the input box (would draw the caret on top of the
-    // status bar).
-    let row = row.min(inner_h.saturating_sub(1));
-    let col = col.min(inner_w.saturating_sub(1));
-    frame.set_cursor_position((inner_x + col, inner_y + row));
+    frame.set_cursor_position((inner_x + caret_col, inner_y + caret_row - scroll));
 }
 
 fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::Frame, area: Rect) {
@@ -6298,6 +6562,68 @@ mod ctrl_c_tests {
             autonomy_hint_shown_this_turn: false,
             pending_approval: None,
         }
+    }
+
+    /// The `KeyCode::Char(c)` insert arm gated only on "no overlay / no
+    /// wizard" and never looked at `key.modifiers`, so every Ctrl chord the
+    /// app does not explicitly handle fell through and typed its own letter.
+    /// Reproduced live: typing `hello` then Ctrl+A/E/W/K/U left `helloaewku`.
+    #[tokio::test]
+    async fn unhandled_ctrl_chords_do_not_type_their_letter() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+
+        for c in "hello".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        // Standard readline chords the composer does not implement. Each one
+        // must be ignored, never inserted.
+        for c in ['a', 'e', 'w', 'k', 'u', 'b', 'f', 'l', 'n', 'p'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(app.context.input_buffer, "hello");
+    }
+
+    /// Ctrl+J is the composer's documented newline ("Ctrl+J newline" in the
+    /// placeholder) and must keep working once the CONTROL guard lands.
+    #[tokio::test]
+    async fn ctrl_j_still_inserts_a_newline() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.context.input_buffer, "a\nb");
+    }
+
+    /// Shift+letter and AltGr-style composed input must still type — the
+    /// guard has to reject CONTROL specifically, not "any modifier".
+    #[tokio::test]
+    async fn shift_and_alt_modified_chars_still_type() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::ALT))
+            .await
+            .unwrap();
+
+        assert_eq!(app.context.input_buffer, "Aé");
     }
 
     #[tokio::test]
