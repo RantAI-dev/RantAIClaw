@@ -5743,31 +5743,105 @@ pub(crate) fn count_configured_channels(c: &crate::config::Config) -> usize {
 /// channel has a config block in `config.toml`; whether it's actually
 /// polling depends on whether `channels_autostart_count > 0` was true
 /// at TUI startup.
+/// Per-channel "is this actually configured" — the credential is present and
+/// non-empty, not merely that the `[channels_config.<x>]` section exists.
+///
+/// The old check was `section.is_some()`, so a block with an empty `bot_token`
+/// (a hand-edit, or an aborted `/setup`) rendered "✓ configured". Each channel
+/// carries its own notion of a credential, so this checks the right field per
+/// channel rather than one uniform rule:
+///
+/// - token-bearing channels: the required credential string is non-blank;
+/// - iMessage / Webhook: presence *is* configuration — iMessage drives the
+///   local Messages app and has no credential, Webhook is an inbound receiver
+///   keyed by a port;
+/// - WhatsApp: cloud (`access_token`) OR web (`session_path`), mirroring
+///   `doctor::checks::channels::inspect_channels`;
+/// - DingTalk / Email: left as presence-only. Their required credential is not
+///   determinable from the struct alone (DingTalk has four credential-ish
+///   fields; Email lives in another module with IMAP+SMTP auth), and guessing
+///   would risk the same false report this fixes. Tightening them needs their
+///   construction code read — tracked as follow-up.
 pub(crate) fn channel_status_summary(c: &crate::config::Config) -> Vec<(&'static str, bool)> {
     let cc = &c.channels_config;
+    let non_blank = |s: &str| !s.trim().is_empty();
+
     #[allow(unused_mut)]
     let mut rows: Vec<(&'static str, bool)> = vec![
-        ("Telegram", cc.telegram.is_some()),
-        ("Discord", cc.discord.is_some()),
-        ("Slack", cc.slack.is_some()),
-        ("WhatsApp", cc.whatsapp.is_some()),
-        ("Mattermost", cc.mattermost.is_some()),
-        ("Signal", cc.signal.is_some()),
+        (
+            "Telegram",
+            cc.telegram
+                .as_ref()
+                .is_some_and(|t| non_blank(&t.bot_token)),
+        ),
+        (
+            "Discord",
+            cc.discord.as_ref().is_some_and(|d| non_blank(&d.bot_token)),
+        ),
+        (
+            "Slack",
+            cc.slack.as_ref().is_some_and(|s| non_blank(&s.bot_token)),
+        ),
+        (
+            "WhatsApp",
+            cc.whatsapp.as_ref().is_some_and(|w| {
+                w.access_token.as_deref().is_some_and(non_blank)
+                    || w.session_path.as_deref().is_some_and(non_blank)
+            }),
+        ),
+        (
+            "Mattermost",
+            cc.mattermost
+                .as_ref()
+                .is_some_and(|m| non_blank(&m.url) && non_blank(&m.bot_token)),
+        ),
+        (
+            "Signal",
+            cc.signal
+                .as_ref()
+                .is_some_and(|s| non_blank(&s.http_url) && non_blank(&s.account)),
+        ),
+        // Email / DingTalk: presence-only, see fn doc.
         ("Email", cc.email.is_some()),
-        ("IRC", cc.irc.is_some()),
+        (
+            "IRC",
+            cc.irc
+                .as_ref()
+                .is_some_and(|i| non_blank(&i.server) && non_blank(&i.nickname)),
+        ),
         ("DingTalk", cc.dingtalk.is_some()),
+        // Webhook: an inbound receiver; presence is configuration.
         ("Webhook", cc.webhook.is_some()),
-        ("Linq", cc.linq.is_some()),
-        ("Nextcloud Talk", cc.nextcloud_talk.is_some()),
+        (
+            "Linq",
+            cc.linq.as_ref().is_some_and(|l| non_blank(&l.api_token)),
+        ),
+        (
+            "Nextcloud Talk",
+            cc.nextcloud_talk
+                .as_ref()
+                .is_some_and(|n| non_blank(&n.base_url) && non_blank(&n.app_token)),
+        ),
+        // iMessage: local Messages app, no credential; presence is configuration.
         ("iMessage", cc.imessage.is_some()),
     ];
     #[cfg(feature = "channel-matrix")]
     {
-        rows.push(("Matrix", cc.matrix.is_some()));
+        rows.push((
+            "Matrix",
+            cc.matrix
+                .as_ref()
+                .is_some_and(|m| non_blank(&m.homeserver) && non_blank(&m.access_token)),
+        ));
     }
     #[cfg(feature = "channel-lark")]
     {
-        rows.push(("Lark / Feishu", cc.lark.is_some()));
+        rows.push((
+            "Lark / Feishu",
+            cc.lark
+                .as_ref()
+                .is_some_and(|l| non_blank(&l.app_id) && non_blank(&l.app_secret)),
+        ));
     }
     rows
 }
@@ -6287,6 +6361,64 @@ mod error_format_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg_with_telegram(token: &str) -> crate::config::Config {
+        let mut c = crate::config::Config::default();
+        c.channels_config.telegram = Some(
+            serde_json::from_value(serde_json::json!({
+                "bot_token": token,
+                "allowed_users": [],
+            }))
+            .unwrap(),
+        );
+        c
+    }
+
+    fn is_configured(rows: &[(&'static str, bool)], name: &str) -> bool {
+        rows.iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, c)| *c)
+            .unwrap()
+    }
+
+    /// The bug: a `[channels_config.telegram]` block with an empty bot_token —
+    /// a hand-edit or aborted /setup — used to render "✓ configured" because
+    /// the check was `.is_some()`.
+    #[test]
+    fn empty_bot_token_reads_as_not_configured() {
+        let rows = channel_status_summary(&cfg_with_telegram(""));
+        assert!(!is_configured(&rows, "Telegram"));
+        let rows = channel_status_summary(&cfg_with_telegram("   "));
+        assert!(
+            !is_configured(&rows, "Telegram"),
+            "whitespace is not a token"
+        );
+    }
+
+    #[test]
+    fn a_real_bot_token_reads_as_configured() {
+        let rows = channel_status_summary(&cfg_with_telegram("123:XYZ"));
+        assert!(is_configured(&rows, "Telegram"));
+    }
+
+    #[test]
+    fn an_absent_channel_reads_as_not_configured() {
+        let rows = channel_status_summary(&crate::config::Config::default());
+        assert!(!is_configured(&rows, "Telegram"));
+        assert!(!is_configured(&rows, "Discord"));
+    }
+
+    /// iMessage has no credential (it drives the local Messages app), so its
+    /// presence IS its configuration — a credential check would wrongly flip a
+    /// working iMessage setup to "not configured".
+    #[test]
+    fn imessage_is_configured_by_presence_alone() {
+        let mut c = crate::config::Config::default();
+        c.channels_config.imessage =
+            Some(serde_json::from_value(serde_json::json!({ "allowed_contacts": [] })).unwrap());
+        let rows = channel_status_summary(&c);
+        assert!(is_configured(&rows, "iMessage"));
+    }
     use crate::sessions::SessionStore;
     use crate::tui::context::TuiContext;
 
