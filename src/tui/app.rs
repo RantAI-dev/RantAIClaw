@@ -2468,6 +2468,9 @@ impl TuiApp {
                     }
                 }
             }
+            CmdResult::OpenSetupCategory { category } => {
+                self.open_category_sub_picker(&category);
+            }
             CmdResult::OpenFirstRunWizard => {
                 self.first_run_wizard = Some(super::FirstRunWizard::new(self.profile.clone()));
             }
@@ -5639,8 +5642,23 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         // boot the first-run wizard — the canonical "set everything up"
         // entry point. Named topics route to the overlay for that one
         // provisioner; unknown names surface the existing error.
+        // Resolve a category name only when nothing else claims the topic.
+        // `rantaiclaw setup channels` is documented in
+        // docs/reference/commands.md and printed by the post-setup banner, yet
+        // only its `--non-interactive` form worked: the headless path falls
+        // back to `onboard::wizard::run_setup`, which knows section names,
+        // while this interactive path had no fallback at all. Same command,
+        // opposite outcome depending on a flag.
+        let category = if crate::onboard::provision::provisioner_for(&topic).is_none() {
+            crate::tui::commands::setup::category_from_arg(&topic)
+        } else {
+            None
+        };
+
         if topic.is_empty() || topic.eq_ignore_ascii_case("full") {
             app.first_run_wizard = Some(crate::tui::FirstRunWizard::new(profile.clone()));
+        } else if let Some(cat) = category {
+            app.open_category_sub_picker(crate::tui::commands::setup::category_key(cat));
         } else if let Err(e) = app.open_setup_overlay(topic) {
             let msg = format!("Failed to open setup: {}", e);
             let _ = app.context.append_system_message(&msg);
