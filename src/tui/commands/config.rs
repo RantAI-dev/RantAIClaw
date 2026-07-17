@@ -168,13 +168,7 @@ impl CommandHandler for DoctorCommand {
         // install. `provider_key_ok` (precomputed where Config is available)
         // reports whether the provider can actually send: it has a key, or it
         // is local. `None` means no default_provider to judge.
-        core = if !model_set {
-            core.status_with(
-                StatusKind::Fail,
-                "Model configured",
-                "no model set — run /setup provider",
-            )
-        } else {
+        core = if model_set {
             match ctx.provider_key_ok {
                 Some(true) | None => {
                     core.status_with(StatusKind::Ok, "Model configured", &ctx.model)
@@ -188,6 +182,12 @@ impl CommandHandler for DoctorCommand {
                     format!("{} — no API key; run /setup provider", ctx.model),
                 ),
             }
+        } else {
+            core.status_with(
+                StatusKind::Fail,
+                "Model configured",
+                "no model set — run /setup provider",
+            )
         };
         core = core.status_with(StatusKind::Ok, "TUI", "running");
 
