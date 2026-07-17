@@ -155,7 +155,7 @@ impl CommandHandler for DoctorCommand {
     fn execute(&self, _args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         // Core probes — fast, infallible-ish.
         let store_ok = ctx.session_store.list_sessions(1).is_ok();
-        let model_ok = !ctx.model.is_empty();
+        let model_set = !ctx.model.is_empty();
 
         let mut core = InfoSection::new("Core");
         core = if store_ok {
@@ -163,14 +163,31 @@ impl CommandHandler for DoctorCommand {
         } else {
             core.status_with(StatusKind::Fail, "Session store", "could not list sessions")
         };
-        core = if model_ok {
-            core.status_with(StatusKind::Ok, "Model configured", &ctx.model)
-        } else {
+        // `!ctx.model.is_empty()` alone was unfalsifiable — Config::default
+        // always sets a model — so this said "✓ Model configured" on a keyless
+        // install. `provider_key_ok` (precomputed where Config is available)
+        // reports whether the provider can actually send: it has a key, or it
+        // is local. `None` means no default_provider to judge.
+        core = if !model_set {
             core.status_with(
                 StatusKind::Fail,
                 "Model configured",
                 "no model set — run /setup provider",
             )
+        } else {
+            match ctx.provider_key_ok {
+                Some(true) | None => {
+                    core.status_with(StatusKind::Ok, "Model configured", &ctx.model)
+                }
+                // Warn, not Fail: a missing key is a setup gap (matches the CLI
+                // `config.provider_key` check) — surfaced as ⚠ with a hint, not
+                // a hard ✗.
+                Some(false) => core.status_with(
+                    StatusKind::Warn,
+                    "Model configured",
+                    format!("{} — no API key; run /setup provider", ctx.model),
+                ),
+            }
         };
         core = core.status_with(StatusKind::Ok, "TUI", "running");
 
