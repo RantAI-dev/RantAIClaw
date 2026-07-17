@@ -4924,6 +4924,70 @@ fn format_tokens(n: u64) -> String {
 /// scalar field (`command`, `path`, `query`, etc.) and truncates so
 /// the whole line stays readable. Multi-field objects degrade to
 /// `<N args>` rather than smearing across the screen.
+#[cfg(test)]
+mod compact_args_for_log_tests {
+    use super::compact_args_for_log;
+
+    /// Tool arguments are model-supplied and routinely non-ASCII — a CJK
+    /// search `query`, an emoji in a `path`. Cropping them with a byte
+    /// slice panicked whenever the 50-byte mark landed inside a multi-byte
+    /// char, so formatting one log line killed the whole TUI.
+    ///
+    /// `crate::agent::events::truncate_preview` already guards the same
+    /// class (see `tool_output_preview_respects_char_boundaries`), and the
+    /// sibling `render::truncate_preview` crops by chars; this site was the
+    /// one that reached for `&s[..n]`.
+    #[test]
+    fn does_not_panic_when_the_crop_lands_inside_a_multibyte_char() {
+        // '世' occupies bytes 48..51, so the byte-50 crop is mid-codepoint.
+        let args = serde_json::json!({ "query": format!("{}世界", "a".repeat(48)) });
+        let out = compact_args_for_log(&args);
+        assert!(out.starts_with("query="), "got {out:?}");
+    }
+
+    /// A crop must never split a char, whatever the multi-byte width.
+    #[test]
+    fn crops_every_multibyte_width_safely() {
+        for filler in ['é', '世', '🦀'] {
+            for pad in 40..60 {
+                let args = serde_json::json!({
+                    "path": format!("{}{}", "a".repeat(pad), filler.to_string().repeat(20)),
+                });
+                let out = compact_args_for_log(&args);
+                assert!(
+                    out.starts_with("path="),
+                    "pad {pad} filler {filler}: {out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_values_are_cropped_with_an_ellipsis() {
+        let args = serde_json::json!({ "command": "b".repeat(200) });
+        let out = compact_args_for_log(&args);
+        assert!(out.contains('…'), "got {out:?}");
+    }
+
+    #[test]
+    fn short_values_are_kept_whole() {
+        let args = serde_json::json!({ "command": "ls -la" });
+        assert_eq!(compact_args_for_log(&args), r#"command="ls -la""#);
+    }
+
+    #[test]
+    fn unpreferred_keys_fall_back_to_a_count() {
+        let args = serde_json::json!({ "alpha": "x", "beta": "y" });
+        assert_eq!(compact_args_for_log(&args), "<2 args>");
+    }
+
+    #[test]
+    fn empty_and_non_object_args_render_nothing() {
+        assert_eq!(compact_args_for_log(&serde_json::json!({})), "");
+        assert_eq!(compact_args_for_log(&serde_json::json!("bare")), "");
+    }
+}
+
 fn compact_args_for_log(args: &serde_json::Value) -> String {
     const PREFERRED_KEYS: &[&str] = &[
         "command",
@@ -4944,12 +5008,9 @@ fn compact_args_for_log(args: &serde_json::Value) -> String {
         for k in PREFERRED_KEYS {
             if let Some(v) = map.get(*k) {
                 if let Some(s) = v.as_str() {
-                    let trimmed = s.trim();
-                    let cropped = if trimmed.len() > MAX_LEN {
-                        format!("{}…", &trimmed[..MAX_LEN])
-                    } else {
-                        trimmed.to_string()
-                    };
+                    // Crop by chars, not bytes: tool args are model-supplied
+                    // and a byte crop panics when it lands mid-codepoint.
+                    let cropped = super::render::truncate_preview(s.trim(), MAX_LEN);
                     return format!("{k}={cropped:?}");
                 }
             }
