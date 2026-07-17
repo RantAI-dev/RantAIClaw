@@ -954,9 +954,6 @@ mod tests {
         assert!(reply.is_none());
     }
 
-    // Serialize the env-mutating Config::load_or_init test against itself.
-    static PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// A store-minted "whatsapp" code is accepted on `/claim` via the extracted
     /// helper: the shared core lands the sender in `allowed_numbers` AND
     /// `approval_owners`, and `handle_pairing_for` extends the runtime allowlist.
@@ -964,7 +961,7 @@ mod tests {
     async fn store_minted_whatsapp_code_claims_owner_and_extends_runtime() {
         use crate::security::pairing_store;
 
-        let _guard = PAIR_ENV_LOCK.lock().await;
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 

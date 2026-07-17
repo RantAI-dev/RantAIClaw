@@ -1069,9 +1069,6 @@ mod tests {
         assert!(!handled, "no store code => must fall through");
     }
 
-    // Serialize the env-mutating Config::load_or_init test against itself.
-    static PAIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// A store-minted "signal" code (the kind `rantaiclaw channels pair --channel
     /// signal` issues) is accepted on `/claim`: the shared core lands the sender
     /// in `allowed_from` AND `approval_owners`. Drives the same code path
@@ -1082,7 +1079,7 @@ mod tests {
         use crate::channels::pairing::{try_handle_pairing, AllowlistField};
         use crate::security::pairing_store;
 
-        let _guard = PAIR_ENV_LOCK.lock().await;
+        let _guard = crate::test_env::ENV_LOCK.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 

@@ -228,12 +228,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// `manage_permissions` resolves its config via `Config::load_or_init`, which
-    /// reads `RANTAICLAW_CONFIG_DIR`. Point it at a temp dir so the test never
-    /// touches a real profile. Serialized (async mutex, held across awaits) because
-    /// it mutates a process-global env var.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     fn tool_in(tmp: &TempDir) -> ManagePermissionsTool {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -245,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_show_remove_roundtrip() {
-        let _g = ENV_LOCK.lock().await;
+        let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
@@ -277,7 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_value_is_rejected() {
-        let _g = ENV_LOCK.lock().await;
+        let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
@@ -294,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_to_remove_last_owner() {
-        let _g = ENV_LOCK.lock().await;
+        let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);
@@ -325,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_action_is_rejected() {
-        let _g = ENV_LOCK.lock().await;
+        let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
         let tool = tool_in(&tmp);

@@ -152,11 +152,6 @@ impl CommandHandler for PairCommand {
 mod tests {
     use super::*;
 
-    /// `/pair` mints into the active profile store, resolved via `HOME`. Point
-    /// `HOME` at a temp dir and serialize (process-global env var) so the test
-    /// never touches a real profile.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn test_context() -> TuiContext {
         let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
         ctx
@@ -173,7 +168,7 @@ mod tests {
 
     #[test]
     fn default_shows_a_code() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
@@ -194,7 +189,7 @@ mod tests {
 
     #[test]
     fn no_owner_flag_is_chat_only() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());

@@ -80,6 +80,8 @@ pub(crate) mod services;
 pub mod sessions;
 pub mod skills;
 pub(crate) mod tasks;
+#[cfg(test)]
+mod test_env;
 pub mod tools;
 pub mod tui;
 pub(crate) mod tunnel;
