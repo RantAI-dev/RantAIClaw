@@ -3707,6 +3707,12 @@ impl Config {
             tracing::warn!("sessions.db migration failed: {e:#}; continuing with current layout");
         }
 
+        // Same story for the knowledge-base db — move the global kb.db into
+        // profiles/default/ so each profile owns its own corpus.
+        if let Err(e) = crate::profile::migration::maybe_migrate_global_kb_db() {
+            tracing::warn!("kb.db migration failed: {e:#}; continuing with current layout");
+        }
+
         let (default_rantaiclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
         let (rantaiclaw_dir, workspace_dir, resolution_source) =
