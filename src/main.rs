@@ -100,6 +100,8 @@ mod remote;
 mod skillforge;
 mod skills;
 mod tasks;
+#[cfg(test)]
+mod test_env;
 mod tools;
 mod tunnel;
 mod util;
