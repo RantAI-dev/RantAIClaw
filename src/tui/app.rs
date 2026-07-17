@@ -5220,15 +5220,28 @@ pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     // auto-submits the prompt and the rest of the buffer becomes the
     // next turn(s). Terminals that don't understand the escape ignore
     // it and fall back to per-key delivery — same behavior as before.
+    reinit_inline_terminal()
+}
+
+/// Build (or rebuild) the inline-viewport terminal AND re-arm bracketed paste.
+///
+/// Bracketed paste is a terminal *mode* (`ESC[?2004h`), not terminal state
+/// ratatui tracks. Anything that resets the terminal clears it — most sharply
+/// the RIS (`ESC c`) the resize handler emits — and `Terminal::with_options`
+/// does not re-issue it. It was enabled exactly once, in `setup_terminal`,
+/// against six `with_options` re-inits, so after a resize (or returning from
+/// `$EDITOR`) pasted line breaks arrived as `Enter` again: a two-line paste
+/// submitted its first line and left the rest. Re-arm here so every rebuild
+/// carries the mode with it.
+fn reinit_inline_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     let _ = execute!(io::stdout(), EnableBracketedPaste);
-    let backend = CrosstermBackend::new(io::stdout());
-    let terminal = Terminal::with_options(
-        backend,
+    Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
         TerminalOptions {
             viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
         },
-    )?;
-    Ok(terminal)
+    )
+    .map_err(Into::into)
 }
 
 /// Suspend the TUI, hand control to `$EDITOR` (or `EDITOR`/`VISUAL`,
@@ -5294,12 +5307,7 @@ fn run_external_editor(
     } else {
         // Inline mode: re-claim a fresh terminal so the inline viewport
         // is re-laid-out cleanly after the editor printed to the tty.
-        *terminal = Terminal::with_options(
-            CrosstermBackend::new(io::stdout()),
-            TerminalOptions {
-                viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
-            },
-        )?;
+        *terminal = reinit_inline_terminal()?;
     }
 
     let result = match status {
@@ -5365,12 +5373,7 @@ pub fn swap_to_fullscreen(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> 
 pub fn swap_to_inline(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let _ = terminal.flush();
     execute!(io::stdout(), LeaveAlternateScreen)?;
-    *terminal = Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
-        },
-    )?;
+    *terminal = reinit_inline_terminal()?;
     Ok(())
 }
 
@@ -5801,12 +5804,7 @@ async fn run_loop(
             let mut out = io::stdout();
             let _ = out.write_all(b"\x1b[2J\x1b[H");
             let _ = out.flush();
-            *terminal = Terminal::with_options(
-                CrosstermBackend::new(io::stdout()),
-                TerminalOptions {
-                    viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
-                },
-            )?;
+            *terminal = reinit_inline_terminal()?;
         }
 
         // /new and /clear request a full screen+scrollback wipe so
@@ -5822,12 +5820,7 @@ async fn run_loop(
             let mut out = io::stdout();
             let _ = out.write_all(b"\x1b[3J\x1b[2J\x1b[H");
             let _ = out.flush();
-            *terminal = Terminal::with_options(
-                CrosstermBackend::new(io::stdout()),
-                TerminalOptions {
-                    viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
-                },
-            )?;
+            *terminal = reinit_inline_terminal()?;
             let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
         }
 
@@ -5936,12 +5929,7 @@ async fn run_loop(
                     let mut out = io::stdout();
                     let _ = out.write_all(b"\x1bc\x1b[3J\x1b[2J\x1b[H");
                     let _ = out.flush();
-                    *terminal = Terminal::with_options(
-                        CrosstermBackend::new(io::stdout()),
-                        TerminalOptions {
-                            viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
-                        },
-                    )?;
+                    *terminal = reinit_inline_terminal()?;
                     let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
                     let messages = app.context.messages.clone();
                     for msg in messages {
