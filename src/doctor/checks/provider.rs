@@ -50,7 +50,24 @@ impl DoctorCheck for ProviderPingCheck {
             .clone()
             .unwrap_or_else(|| resolve_endpoint(provider, ctx.config.api_url.as_deref()));
 
-        let api_key = ctx.config.api_key.clone();
+        // Resolve the way the send paths do. Reading only the top-level
+        // `api_key` missed anything stored under `provider_api_keys` — what
+        // the web console writes — and reported a spurious 401 for it.
+        let api_key = ctx.config.resolve_key_for_provider(provider);
+
+        // Never probe unauthenticated. Several providers serve `/models`
+        // publicly (openrouter among them), so a keyless install got a 200 and
+        // this check reported "provider responded 200 OK" for a config that
+        // cannot send a single message. Local providers legitimately need no
+        // key; everyone else without one is a hard fail, not a probe.
+        if api_key.is_none() && !crate::providers::provider_is_local(provider) {
+            return CheckResult::fail(
+                self.name(),
+                format!("no API key for {provider} — not probing; a public endpoint would answer 200 and prove nothing"),
+            )
+            .with_category(self.category())
+            .with_hint("run: rantaiclaw setup provider");
+        }
 
         let client = match reqwest::Client::builder().timeout(TIMEOUT).build() {
             Ok(c) => c,
@@ -142,6 +159,53 @@ fn join_models(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::doctor::Severity;
+    use crate::profile::Profile;
+
+    fn ctx(cfg: Config) -> DoctorContext {
+        DoctorContext {
+            profile: Profile {
+                name: "test".into(),
+                root: std::path::PathBuf::from("/nonexistent"),
+            },
+            config: cfg,
+            offline: false,
+        }
+    }
+
+    /// Was: with no key the check sent an UNAUTHENTICATED GET. Several
+    /// providers serve `/models` publicly — openrouter, the default, among
+    /// them — so it got a 200 and reported "provider responded 200 OK" for a
+    /// config that cannot send a message. The endpoint here is unreachable on
+    /// purpose: if the guard regresses, the check tries to probe and this
+    /// fails on the message, not on the network.
+    #[tokio::test]
+    async fn ping_refuses_to_probe_without_a_key_rather_than_reporting_ok() {
+        let mut cfg = Config::default();
+        cfg.api_key = None;
+        let check = ProviderPingCheck::with_endpoint("http://127.0.0.1:1/models");
+        let result = check.run(&ctx(cfg)).await;
+        assert_eq!(result.severity, Severity::Fail, "msg: {}", result.message);
+        assert!(result.message.contains("no API key"), "{}", result.message);
+    }
+
+    /// Local providers have no key by design; refusing to probe them would
+    /// turn a working Ollama install into a red cross.
+    #[tokio::test]
+    async fn ping_still_probes_local_providers_without_a_key() {
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("ollama".into());
+        cfg.api_key = None;
+        let check = ProviderPingCheck::with_endpoint("http://127.0.0.1:1/models");
+        let result = check.run(&ctx(cfg)).await;
+        // Connection refused, not the no-key refusal — it reached the network.
+        assert!(
+            !result.message.contains("no API key"),
+            "should have probed: {}",
+            result.message
+        );
+    }
 
     #[test]
     fn resolve_endpoint_uses_api_url_override() {

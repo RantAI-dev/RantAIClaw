@@ -1431,6 +1431,21 @@ pub struct ProviderInfo {
     pub local: bool,
 }
 
+/// Whether `name` runs locally and therefore needs no API key.
+///
+/// Reads [`ProviderInfo::local`] from [`list_providers`], which is the
+/// documented source of truth for this. Two other encodings of the same fact
+/// exist and have both drifted from it — `onboard::wizard`'s
+/// `provider_supports_keyless_local_usage` omits `lmstudio`, and
+/// `doctor::legacy` hardcodes `{ollama}` alone — so read it from the catalog
+/// rather than adding a fourth list.
+pub fn provider_is_local(name: &str) -> bool {
+    let canonical = normalize_provider_name(name);
+    list_providers()
+        .iter()
+        .any(|p| p.name == canonical && p.local)
+}
+
 /// Return the list of all known providers for display in `rantaiclaw providers list`.
 ///
 /// This is intentionally separate from the factory match in `create_provider`
