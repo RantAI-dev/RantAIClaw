@@ -84,6 +84,38 @@ pub struct InfoSection {
 }
 
 impl InfoSection {
+    /// Does any row in this section report a hard failure?
+    ///
+    /// Exists so a panel footer can state a verdict it actually computed.
+    /// `/doctor`'s footer was a hardcoded `let any_fail = false`, commented
+    /// "probes above don't currently produce hard fails post-init" — which its
+    /// own file contradicts in six places. The panel could render
+    /// `✗ ~/.rantaiclaw missing` and `all checks ok` in the same frame.
+    pub fn has_fail(&self) -> bool {
+        self.rows.iter().any(|r| {
+            matches!(
+                r,
+                InfoRow::Status {
+                    kind: StatusKind::Fail,
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Does any row warn (and none fail)? Callers decide precedence.
+    pub fn has_warn(&self) -> bool {
+        self.rows.iter().any(|r| {
+            matches!(
+                r,
+                InfoRow::Status {
+                    kind: StatusKind::Warn,
+                    ..
+                }
+            )
+        })
+    }
+
     pub fn new<H: Into<String>>(heading: H) -> Self {
         Self {
             heading: Some(heading.into()),
@@ -460,5 +492,48 @@ mod tests {
         assert_eq!(p.sections.len(), 2);
         assert_eq!(p.title, "Channels");
         assert_eq!(p.subtitle.as_deref(), Some("13 transports"));
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+
+    fn section_with(kinds: &[StatusKind]) -> InfoSection {
+        let mut s = InfoSection::new("t");
+        for (i, k) in kinds.iter().enumerate() {
+            s = s.status_with(*k, format!("row{i}"), "detail");
+        }
+        s
+    }
+
+    /// The bug: `/doctor`'s footer hardcoded `any_fail = false`, so a section
+    /// carrying a ✗ still printed "all checks ok".
+    #[test]
+    fn has_fail_sees_a_failing_row() {
+        assert!(section_with(&[StatusKind::Ok, StatusKind::Fail]).has_fail());
+        assert!(section_with(&[StatusKind::Fail]).has_fail());
+    }
+
+    #[test]
+    fn has_fail_is_false_without_one() {
+        assert!(!section_with(&[StatusKind::Ok, StatusKind::Warn, StatusKind::Info]).has_fail());
+        assert!(!section_with(&[]).has_fail());
+    }
+
+    #[test]
+    fn has_warn_sees_a_warning_row() {
+        assert!(section_with(&[StatusKind::Ok, StatusKind::Warn]).has_warn());
+        assert!(!section_with(&[StatusKind::Ok, StatusKind::Fail]).has_warn());
+    }
+
+    /// Non-status rows must not be mistaken for a verdict.
+    #[test]
+    fn key_value_and_bullet_rows_are_not_statuses() {
+        let s = InfoSection::new("t")
+            .key_value("k", "v")
+            .bullet_with("primary", "secondary");
+        assert!(!s.has_fail());
+        assert!(!s.has_warn());
     }
 }
