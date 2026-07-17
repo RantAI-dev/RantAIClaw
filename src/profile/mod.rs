@@ -66,9 +66,6 @@ impl Profile {
     pub fn secrets_dir(&self) -> PathBuf {
         paths::secrets_dir(&self.name)
     }
-    pub fn runtime_dir(&self) -> PathBuf {
-        paths::runtime_dir(&self.name)
-    }
     pub fn audit_log(&self) -> PathBuf {
         paths::audit_log(&self.name)
     }
@@ -114,7 +111,6 @@ impl ProfileManager {
             "persona",
             "policy",
             "secrets",
-            "runtime",
         ] {
             let p = dir.join(sub);
             if !p.exists() {
@@ -375,7 +371,7 @@ fn clone_into(src: &Profile, dst: &Profile, opts: CloneOpts) -> Result<()> {
     if opts.include_secrets {
         copy_dir_all(&src.secrets_dir(), &dst.secrets_dir())?;
     }
-    // workspace/, sessions/, audit.log, runtime/ never copied — see spec table.
+    // workspace/, sessions/, audit.log never copied — see spec table.
     Ok(())
 }
 
