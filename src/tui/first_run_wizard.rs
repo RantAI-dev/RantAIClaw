@@ -882,7 +882,7 @@ impl FirstRunWizard {
         frame.render_widget(
             Paragraph::new(option_lines)
                 .wrap(Wrap { trim: false })
-                .scroll((self.choose_scroll as u16, 0)),
+                .scroll((u16::try_from(self.choose_scroll).unwrap_or(u16::MAX), 0)),
             chunks[7],
         );
 

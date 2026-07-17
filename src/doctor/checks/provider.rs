@@ -61,7 +61,11 @@ impl DoctorCheck for ProviderPingCheck {
         // cannot send a single message. Local providers legitimately need no
         // key; everyone else without one is a hard fail, not a probe.
         if api_key.is_none() && !crate::providers::provider_is_local(provider) {
-            return CheckResult::fail(
+            // Warn, not Fail: a missing key is a setup gap (same as
+            // `config.provider_key`), not a probe failure. Still refuses to
+            // probe — a public endpoint answering 200 proves nothing — and
+            // still surfaces it with a hint.
+            return CheckResult::warn(
                 self.name(),
                 format!("no API key for {provider} — not probing; a public endpoint would answer 200 and prove nothing"),
             )
@@ -186,7 +190,7 @@ mod tests {
         cfg.api_key = None;
         let check = ProviderPingCheck::with_endpoint("http://127.0.0.1:1/models");
         let result = check.run(&ctx(cfg)).await;
-        assert_eq!(result.severity, Severity::Fail, "msg: {}", result.message);
+        assert_eq!(result.severity, Severity::Warn, "msg: {}", result.message);
         assert!(result.message.contains("no API key"), "{}", result.message);
     }
 

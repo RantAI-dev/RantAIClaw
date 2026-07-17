@@ -146,11 +146,7 @@ pub fn category_key(c: ProvisionerCategory) -> &'static str {
 /// they open today; this is a fallback for args that match nothing else.
 pub fn category_from_arg(arg: &str) -> Option<ProvisionerCategory> {
     let lower = arg.trim().to_ascii_lowercase();
-    category_from_key(&lower).or_else(|| {
-        lower
-            .strip_suffix('s')
-            .and_then(|singular| category_from_key(singular))
-    })
+    category_from_key(&lower).or_else(|| lower.strip_suffix('s').and_then(category_from_key))
 }
 
 pub fn category_from_key(key: &str) -> Option<ProvisionerCategory> {

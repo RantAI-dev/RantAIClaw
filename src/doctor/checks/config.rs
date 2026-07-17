@@ -102,9 +102,15 @@ impl DoctorCheck for ProviderKeyCheck {
         match ctx.config.resolve_key_for_provider(provider) {
             Some(_) => CheckResult::ok(self.name(), format!("API key resolved for {provider}"))
                 .with_category(self.category()),
-            None => CheckResult::fail(
+            // Warn, not Fail: a missing key is a setup GAP, not a breakage — a
+            // fresh headless `setup --non-interactive` legitimately leaves it
+            // unset, and `doctor --brief` must still exit 0 there (the
+            // `setup && doctor` smoke contract, `tests/setup_e2e.rs`). Warn
+            // still surfaces it as `⚠` with an actionable hint, which is the
+            // whole point — doctor no longer claims a keyless config is `✓`.
+            None => CheckResult::warn(
                 self.name(),
-                format!("no API key for {provider} — the agent cannot send a message"),
+                format!("no API key for {provider} — the agent cannot send a message yet"),
             )
             .with_category(self.category())
             .with_hint("run: rantaiclaw setup provider"),
@@ -214,14 +220,17 @@ mod tests {
 
     /// The gap this check closes: a fresh install has `default_provider =
     /// openrouter` and no key, and every diagnostic reported healthy while the
-    /// agent could not send a single message.
+    /// agent could not send a single message. It surfaces as Warn (a setup
+    /// gap), not Fail — so `doctor --brief` after a headless setup still exits
+    /// 0 — but it is no longer `✓`.
     #[tokio::test]
-    async fn provider_key_check_fails_when_the_active_provider_has_no_key() {
+    async fn provider_key_check_warns_when_the_active_provider_has_no_key() {
         let cfg = Config::default();
         assert!(cfg.api_key.is_none(), "precondition: default has no key");
         let (ctx, _tmp) = ctx_with_config(cfg);
         let result = ProviderKeyCheck.run(&ctx).await;
-        assert_eq!(result.severity, Severity::Fail, "msg: {}", result.message);
+        assert_eq!(result.severity, Severity::Warn, "msg: {}", result.message);
+        assert!(result.hint.is_some(), "must hint at setup provider");
     }
 
     /// A key under `provider_api_keys` is what the web console writes. Reading
@@ -248,14 +257,15 @@ mod tests {
     }
 
     /// An empty-string key is not a key. `resolve_key_for_provider` trims and
-    /// rejects it; the check must not paper over that.
+    /// rejects it; the check must not paper over that (warns like any missing
+    /// key, does not report `✓`).
     #[tokio::test]
     async fn provider_key_check_rejects_a_blank_key() {
         let mut cfg = Config::default();
         cfg.api_key = Some("   ".into());
         let (ctx, _tmp) = ctx_with_config(cfg);
         let result = ProviderKeyCheck.run(&ctx).await;
-        assert_eq!(result.severity, Severity::Fail, "msg: {}", result.message);
+        assert_eq!(result.severity, Severity::Warn, "msg: {}", result.message);
     }
 
     /// Local providers need no key — failing them would be a false alarm.
