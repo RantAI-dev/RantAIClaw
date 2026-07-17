@@ -2936,7 +2936,10 @@ impl TuiApp {
                         .iter()
                         .position(|e| e.as_item().is_some_and(|i| i.key == key))
                     {
-                        let page_size = crate::tui::widgets::list_picker::PAGE_SIZE;
+                        // The picker's live page size, not a constant: it is
+                        // derived from the rendered list area, so a hardcoded
+                        // value would land the cursor on a different skill.
+                        let page_size = picker.page_size();
                         picker.page = abs_idx / page_size;
                         picker.selected = abs_idx % page_size;
                         picker.list_state.select(Some(picker.selected));
