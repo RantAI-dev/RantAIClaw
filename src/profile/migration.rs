@@ -19,8 +19,9 @@
 //! - v0.6.0: warn-on-direct-access (planned; not implemented here)
 //! - v0.7.0: removed (planned; not implemented here)
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -68,6 +69,122 @@ pub fn maybe_migrate_legacy_layout() -> Result<bool> {
     };
 
     Ok(did)
+}
+
+/// The pre-profile global data dir (`~/.local/share/rantaiclaw/` on Linux)
+/// where `sessions.db` and `kb.db` leaked before the per-profile fix. `None`
+/// only when the platform has no resolvable data dir (no HOME).
+fn global_data_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "rantaiclaw").map(|d| d.data_dir().to_path_buf())
+}
+
+/// One-shot migration of the global `sessions.db` into the `default` profile.
+///
+/// Pre-fix every profile shared one `~/.local/share/rantaiclaw/sessions.db`;
+/// each profile now owns `profiles/<name>/sessions/sessions.db`. We MOVE the
+/// legacy file into `profiles/default/` (running without `--profile` resolves
+/// to `default`, so it inherits the history; other profiles start empty).
+///
+/// Invariants mirror `maybe_migrate_legacy_layout`: idempotent (the source is
+/// gone after a successful move), race-safe (advisory flock), and it never
+/// clobbers a populated destination. Returns `Ok(true)` iff a move happened.
+pub fn maybe_migrate_global_sessions_db() -> Result<bool> {
+    let Some(global) = global_data_dir() else {
+        return Ok(false);
+    };
+    migrate_global_db_locked(
+        &global.join("sessions.db"),
+        &paths::sessions_db("default"),
+        "migrate_sessions.lock",
+    )
+}
+
+/// Shared driver for the global-db → per-profile-db migrations. Detection is
+/// "source exists AND destination does not"; a populated destination is never
+/// overwritten. The move is WAL-checkpointed first and `EXDEV`-safe.
+fn migrate_global_db_locked(src: &Path, dst: &Path, lock_name: &str) -> Result<bool> {
+    if !src.exists() || dst.exists() {
+        return Ok(false);
+    }
+
+    let root = paths::rantaiclaw_root();
+    fs::create_dir_all(&root)
+        .with_context(|| format!("create rantaiclaw root {}", root.display()))?;
+
+    let lock_path = root.join(lock_name);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open db-migration lock {}", lock_path.display()))?;
+
+    // Race-loser path: another process holds the lock and will finish (or has
+    // finished) the move; silently no-op.
+    if lock_file.try_lock_exclusive().is_err() {
+        return Ok(false);
+    }
+
+    // Re-check under the lock so a woken loser cannot double-move.
+    let did = if src.exists() && !dst.exists() {
+        let result = checkpoint_and_move_db(src, dst);
+        let _ = FileExt::unlock(&lock_file);
+        result?;
+        true
+    } else {
+        let _ = FileExt::unlock(&lock_file);
+        false
+    };
+    Ok(did)
+}
+
+/// Fold a SQLite WAL back into its main `.db`, then move the single file to
+/// `dst` and drop the now-inert `-wal`/`-shm` sidecars at the source.
+///
+/// The checkpoint is load-bearing: `sessions.db-wal` can be larger than the
+/// `.db` itself, so a naive `mv sessions.db` would silently lose every
+/// uncommitted page. `wal_checkpoint(TRUNCATE)` writes those pages into the
+/// main file and zeroes the WAL before we touch it.
+fn checkpoint_and_move_db(src: &Path, dst: &Path) -> Result<()> {
+    if let Ok(conn) = rusqlite::Connection::open(src) {
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+        // Ignore the returned (busy, log, checkpointed) row — a failure here
+        // just means we fall back to moving whatever is already in the .db.
+        let _: std::result::Result<i64, _> =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0));
+        let _ = conn.close();
+    }
+
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create db parent {}", parent.display()))?;
+    }
+
+    match fs::rename(src, dst) {
+        Ok(()) => {}
+        Err(e) if is_cross_device(&e) => {
+            copy_recursive(src, dst)?;
+            remove_recursive(src)?;
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("move {} -> {}", src.display(), dst.display()));
+        }
+    }
+
+    // Best-effort: the sidecars are 0-byte after TRUNCATE; leave nothing stale.
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(sidecar(src, suffix));
+    }
+    Ok(())
+}
+
+/// `sessions.db` + `-wal` → `sessions.db-wal`. SQLite names sidecars by
+/// appending to the full db filename, not by swapping the extension.
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut s: OsString = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
 }
 
 /// Detection predicate (also exposed for tests).

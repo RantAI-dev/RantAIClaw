@@ -360,8 +360,12 @@ impl TuiApp {
         req_tx: mpsc::Sender<TurnRequest>,
         events_rx: mpsc::Receiver<AgentEvent>,
     ) -> Result<Self> {
-        std::fs::create_dir_all(&tui_config.data_dir)?;
-        let db_path = tui_config.data_dir.join("sessions.db");
+        // Per-profile sessions.db — `profile` is the active profile the TUI
+        // launched under, so history never leaks across profiles.
+        let db_path = profile.sessions_db_path();
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let store = SessionStore::open(&db_path)?;
         // Best-effort one-shot: derive titles for legacy sessions that
         // never went through the auto-titling path. Idempotent — a no-op

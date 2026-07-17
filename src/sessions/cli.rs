@@ -8,13 +8,14 @@ use chrono::{TimeZone, Utc};
 
 use super::SessionStore;
 
-/// Resolve the same sessions.db path the TUI opens.
+/// Resolve the same sessions.db path the TUI opens — the active profile's
+/// `profiles/<name>/sessions/sessions.db`.
 pub fn open_store() -> Result<SessionStore> {
-    let data_dir = directories::ProjectDirs::from("", "", "rantaiclaw")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from(".rantaiclaw"));
-    std::fs::create_dir_all(&data_dir)?;
-    SessionStore::open(&data_dir.join("sessions.db"))
+    let path = crate::profile::ProfileManager::active()?.sessions_db_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    SessionStore::open(&path)
 }
 
 fn fmt_ts(ts: i64) -> String {

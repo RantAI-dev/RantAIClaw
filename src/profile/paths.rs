@@ -72,6 +72,13 @@ pub fn sessions_dir(profile: &str) -> PathBuf {
     profile_dir(profile).join("sessions")
 }
 
+/// `~/.rantaiclaw/profiles/<name>/sessions/sessions.db` — the per-profile
+/// SQLite session history. Before v0.7.x this leaked to a single global XDG
+/// data dir shared by every profile; see `migration::maybe_migrate_global_sessions_db`.
+pub fn sessions_db(profile: &str) -> PathBuf {
+    sessions_dir(profile).join("sessions.db")
+}
+
 pub fn skills_dir(profile: &str) -> PathBuf {
     profile_dir(profile).join("skills")
 }
