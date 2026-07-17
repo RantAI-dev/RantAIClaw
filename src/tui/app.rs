@@ -5775,11 +5775,12 @@ pub(crate) fn count_configured_channels(c: &crate::config::Config) -> usize {
 ///   keyed by a port;
 /// - WhatsApp: cloud (`access_token`) OR web (`session_path`), mirroring
 ///   `doctor::checks::channels::inspect_channels`;
-/// - DingTalk / Email: left as presence-only. Their required credential is not
-///   determinable from the struct alone (DingTalk has four credential-ish
-///   fields; Email lives in another module with IMAP+SMTP auth), and guessing
-///   would risk the same false report this fixes. Tightening them needs their
-///   construction code read — tracked as follow-up.
+/// - DingTalk: `client_id` + `client_secret` — the pair the channel actually
+///   sends to authenticate (dingtalk.rs). Its `app_id`/`app_secret` struct
+///   fields are unused by the channel (test-only), so they are not checked.
+/// - Email: `imap_host` + `smtp_host` + `username` + `password` — all required
+///   `String`s; the channel needs IMAP to receive, SMTP to send, and the pair
+///   to authenticate (channels::email_channel).
 pub(crate) fn channel_status_summary(c: &crate::config::Config) -> Vec<(&'static str, bool)> {
     let cc = &c.channels_config;
     let non_blank = |s: &str| !s.trim().is_empty();
@@ -5819,15 +5820,27 @@ pub(crate) fn channel_status_summary(c: &crate::config::Config) -> Vec<(&'static
                 .as_ref()
                 .is_some_and(|s| non_blank(&s.http_url) && non_blank(&s.account)),
         ),
-        // Email / DingTalk: presence-only, see fn doc.
-        ("Email", cc.email.is_some()),
+        (
+            "Email",
+            cc.email.as_ref().is_some_and(|e| {
+                non_blank(&e.imap_host)
+                    && non_blank(&e.smtp_host)
+                    && non_blank(&e.username)
+                    && non_blank(&e.password)
+            }),
+        ),
         (
             "IRC",
             cc.irc
                 .as_ref()
                 .is_some_and(|i| non_blank(&i.server) && non_blank(&i.nickname)),
         ),
-        ("DingTalk", cc.dingtalk.is_some()),
+        (
+            "DingTalk",
+            cc.dingtalk
+                .as_ref()
+                .is_some_and(|d| non_blank(&d.client_id) && non_blank(&d.client_secret)),
+        ),
         // Webhook: an inbound receiver; presence is configuration.
         ("Webhook", cc.webhook.is_some()),
         (
@@ -6417,6 +6430,68 @@ mod tests {
     fn a_real_bot_token_reads_as_configured() {
         let rows = channel_status_summary(&cfg_with_telegram("123:XYZ"));
         assert!(is_configured(&rows, "Telegram"));
+    }
+
+    /// DingTalk authenticates with client_id + client_secret (the pair the
+    /// channel sends). A block missing either — or with a blank one — is not
+    /// configured; app_id/app_secret are unused by the channel and not checked.
+    #[test]
+    fn dingtalk_requires_client_id_and_secret() {
+        let with = |cid: &str, sec: &str| {
+            let mut c = crate::config::Config::default();
+            c.channels_config.dingtalk = Some(
+                serde_json::from_value(serde_json::json!({
+                    "client_id": cid,
+                    "client_secret": sec,
+                    "allowed_users": [],
+                    "app_id": "",
+                    "app_secret": "",
+                }))
+                .unwrap(),
+            );
+            channel_status_summary(&c)
+        };
+        assert!(is_configured(&with("cid", "sec"), "DingTalk"));
+        assert!(!is_configured(&with("", "sec"), "DingTalk"), "no client_id");
+        assert!(!is_configured(&with("cid", ""), "DingTalk"), "no secret");
+        assert!(!is_configured(&with("  ", "sec"), "DingTalk"), "blank id");
+    }
+
+    /// Email needs both hosts (receive + send) and the username/password pair
+    /// to authenticate. Missing any one leaves it unconfigured.
+    #[test]
+    fn email_requires_hosts_and_auth() {
+        let cfg = |imap: &str, smtp: &str, user: &str, pass: &str| {
+            let mut c = crate::config::Config::default();
+            c.channels_config.email = Some(
+                serde_json::from_value(serde_json::json!({
+                    "imap_host": imap, "imap_port": 993, "imap_folder": "INBOX",
+                    "smtp_host": smtp, "smtp_port": 587, "smtp_tls": true,
+                    "username": user, "password": pass,
+                    "from_address": "a@example.com",
+                    "allowed_senders": [],
+                }))
+                .unwrap(),
+            );
+            channel_status_summary(&c)
+        };
+        assert!(is_configured(&cfg("imap.x", "smtp.x", "u", "p"), "Email"));
+        assert!(
+            !is_configured(&cfg("", "smtp.x", "u", "p"), "Email"),
+            "no imap"
+        );
+        assert!(
+            !is_configured(&cfg("imap.x", "", "u", "p"), "Email"),
+            "no smtp"
+        );
+        assert!(
+            !is_configured(&cfg("imap.x", "smtp.x", "", "p"), "Email"),
+            "no user"
+        );
+        assert!(
+            !is_configured(&cfg("imap.x", "smtp.x", "u", ""), "Email"),
+            "no pass"
+        );
     }
 
     #[test]
