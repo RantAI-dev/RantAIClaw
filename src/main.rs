@@ -775,7 +775,7 @@ Examples:
 
     /// Browse, search, or rename past sessions (CLI parity for TUI `/sessions /search /title`).
     #[command(long_about = "\
-Browse, search, or rename past sessions stored in ~/.local/share/rantaiclaw/sessions.db.
+Browse, search, or rename past sessions stored in the active profile's sessions.db (~/.rantaiclaw/profiles/<name>/sessions/sessions.db).
 
 Examples:
   rantaiclaw session list                       # 50 most recent
@@ -828,7 +828,7 @@ Examples:
     ///
     /// Token-efficient TOON output by default; pass `--json` for full JSON.
     /// All operations target the KB database resolved from `KB_DB_PATH` (env)
-    /// or the platform's data dir (`~/.local/share/rantaiclaw/kb.db` on Linux).
+    /// or the active profile's `~/.rantaiclaw/profiles/<name>/kb.db`.
     ///
     /// Examples:
     ///   rantaiclaw kb list
