@@ -191,6 +191,24 @@ pub trait IntelligenceStore: Send + Sync {
     async fn add_mention(&self, m: &crate::kb::intelligence::types::EntityMention) -> KbResult<()>;
     /// Record a directed relation between two entities within a document.
     async fn add_relation(&self, r: &crate::kb::intelligence::types::Relation) -> KbResult<()>;
+    /// Batched equivalent of calling `upsert_entity`/`add_mention`/`add_relation`
+    /// once per item, but inside a SINGLE transaction. `entities` may carry
+    /// provisional (pre-assigned) ids; because entities are deduplicated
+    /// globally by `canonical_key` (see `upsert_entity`), a provisional id can
+    /// collide with an existing row from another document. Implementations
+    /// MUST resolve each entity to its surviving (first-seen) id and remap
+    /// `mentions[].entity_id` and BOTH `relations[].source_entity_id` /
+    /// `relations[].target_entity_id` through that mapping before inserting —
+    /// otherwise cross-document entity merges silently orphan mentions/edges.
+    /// `document_id` is the document these mentions/relations belong to (each
+    /// mention/relation also carries its own `document_id` field).
+    async fn store_intelligence(
+        &self,
+        document_id: &str,
+        entities: &[crate::kb::intelligence::types::Entity],
+        mentions: &[crate::kb::intelligence::types::EntityMention],
+        relations: &[crate::kb::intelligence::types::Relation],
+    ) -> KbResult<()>;
     /// Fetch the entities (via mentions) and relations attached to a document.
     async fn intelligence_for_document(
         &self,
