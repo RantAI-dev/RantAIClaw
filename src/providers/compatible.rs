@@ -751,6 +751,32 @@ fn drain_tool_accumulator(
         .collect()
 }
 
+/// Append `chunk` to the carry-over `pending` buffer and decode the
+/// longest valid UTF-8 prefix into `out`, leaving any incomplete trailing
+/// multi-byte sequence in `pending` for the next call.
+///
+/// A network chunk boundary can land in the middle of a multi-byte UTF-8
+/// codepoint (emoji, CJK, accented Latin, em-dash, ...). Decoding each
+/// chunk independently with `String::from_utf8_lossy` would turn the
+/// split codepoint into U+FFFD replacement character(s) instead of the
+/// correct character; this carries the incomplete tail forward instead,
+/// so the codepoint is decoded whole once the rest of its bytes arrive.
+fn push_decoded(pending: &mut Vec<u8>, chunk: &[u8], out: &mut String) {
+    pending.extend_from_slice(chunk);
+    let valid_up_to = match std::str::from_utf8(pending.as_slice()) {
+        Ok(_) => pending.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    if valid_up_to == 0 {
+        return;
+    }
+    // `pending[..valid_up_to]` was just confirmed valid UTF-8 above, so
+    // this conversion is infallible and never actually introduces a
+    // replacement character.
+    out.push_str(&String::from_utf8_lossy(&pending[..valid_up_to]));
+    pending.drain(..valid_up_to);
+}
+
 /// Convert SSE byte stream to text chunks.
 fn sse_bytes_to_chunks(
     response: reqwest::Response,
@@ -1754,6 +1780,12 @@ impl Provider for OpenAiCompatibleProvider {
             std::collections::BTreeMap::new();
         let mut bytes_stream = response.bytes_stream();
         let mut buffer = String::new();
+        // Bytes carried over from a previous chunk that end mid-codepoint
+        // (a multi-byte UTF-8 character split across two TCP/SSE chunks).
+        // Without this, decoding each chunk independently would turn the
+        // split codepoint into replacement character(s) instead of the
+        // correct character. See `push_decoded`.
+        let mut pending: Vec<u8> = Vec::new();
         // Some servers (MiniMax in particular) "stream" by emitting one
         // mega-chunk per response stage instead of true token-by-token
         // SSE. We split each incoming delta into word-sized pieces and
@@ -1764,7 +1796,7 @@ impl Provider for OpenAiCompatibleProvider {
         let mut think_partial = String::new();
         while let Some(item) = bytes_stream.next().await {
             let bytes = item?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            push_decoded(&mut pending, &bytes, &mut buffer);
             while let Some(pos) = buffer.find('\n') {
                 let line: String = buffer.drain(..=pos).collect();
                 let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -1822,6 +1854,14 @@ impl Provider for OpenAiCompatibleProvider {
                     }
                 }
             }
+        }
+
+        // Stream ended with an incomplete trailing codepoint (e.g. a
+        // truncated response). Decode what's left lossily rather than
+        // silently dropping it; this can only insert a replacement
+        // character for the last, already-truncated byte(s).
+        if !pending.is_empty() {
+            buffer.push_str(&String::from_utf8_lossy(&pending));
         }
 
         // Flush any residual buffered bytes at end of stream. When NOT inside a
@@ -3215,5 +3255,56 @@ mod tests {
             deltas[0].function.as_ref().unwrap().arguments.as_deref(),
             Some("\"end\"")
         );
+    }
+
+    #[test]
+    fn push_decoded_reassembles_utf8_char_split_across_chunks() {
+        // "🦀" = [0xF0, 0x9F, 0xA6, 0x80], split mid-codepoint across two chunks.
+        let mut pending: Vec<u8> = Vec::new();
+        let mut out = String::new();
+        push_decoded(&mut pending, &[0xF0, 0x9F], &mut out);
+        // Nothing decodable yet; the whole prefix is an incomplete sequence.
+        assert!(out.is_empty());
+        assert_eq!(pending, vec![0xF0, 0x9F]);
+        push_decoded(&mut pending, &[0xA6, 0x80], &mut out);
+        assert_eq!(out, "🦀");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn push_decoded_reassembles_cjk_char_split_across_chunks() {
+        // "中" = [0xE4, 0xB8, 0xAD], split after the first byte.
+        let mut pending: Vec<u8> = Vec::new();
+        let mut out = String::new();
+        push_decoded(&mut pending, &[0xE4], &mut out);
+        assert!(out.is_empty());
+        push_decoded(&mut pending, &[0xB8, 0xAD], &mut out);
+        assert_eq!(out, "中");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn push_decoded_ascii_unaffected() {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut out = String::new();
+        push_decoded(&mut pending, b"hello world", &mut out);
+        assert_eq!(out, "hello world");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn push_decoded_trailing_incomplete_at_stream_end() {
+        // A truncated response ends mid-codepoint; the caller must be able
+        // to flush what's left without panicking (lossy decode, U+FFFD for
+        // the byte(s) that never completed).
+        let mut pending: Vec<u8> = Vec::new();
+        let mut out = String::new();
+        push_decoded(&mut pending, b"hi ", &mut out);
+        push_decoded(&mut pending, &[0xE4, 0xB8], &mut out); // incomplete "中"
+        assert_eq!(out, "hi ");
+        assert_eq!(pending, vec![0xE4, 0xB8]);
+        // Simulate the end-of-stream flush from `chat_stream`.
+        out.push_str(&String::from_utf8_lossy(&pending));
+        assert_eq!(out, "hi \u{FFFD}");
     }
 }
