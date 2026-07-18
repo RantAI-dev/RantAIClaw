@@ -410,6 +410,26 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
     false
 }
 
+/// Detect an unambiguous prefix-abbreviation of a dangerous git long option
+/// (`--upload-pack`, `--receive-pack`, `--exec`). Git accepts any unambiguous
+/// abbreviation of a long option (e.g. `--upload-pac`), so matching only the
+/// full spellings misses real bypasses. `arg` is already lowercased by the
+/// caller. The minimum-length guard avoids over-broad matches against short,
+/// generic prefixes that could collide with unrelated legitimate options.
+fn is_dangerous_git_long_opt(arg: &str) -> bool {
+    let Some(rest) = arg.strip_prefix("--") else {
+        return false;
+    };
+    let name = rest.split('=').next().unwrap_or(rest);
+    if name.len() < 4 {
+        return false;
+    }
+    ["upload-pack", "receive-pack"]
+        .iter()
+        .any(|full| full.starts_with(name))
+        || "exec".starts_with(name)
+}
+
 impl SecurityPolicy {
     // ── Risk Classification ──────────────────────────────────────────────
     // Risk is assessed per-segment (split on shell operators), and the
@@ -501,6 +521,15 @@ impl SecurityPolicy {
                             | "checkout"
                             | "switch"
                             | "tag"
+                            // Transport verbs: not destructive by themselves, but
+                            // they're the vector for the --upload-pack/-u RCE class
+                            // above. Risk-gating them means an unapproved
+                            // Supervised session still hits the approval prompt
+                            // even if is_args_safe's blocklist ever has a gap.
+                            | "clone"
+                            | "fetch"
+                            | "ls-remote"
+                            | "pull"
                     )
                 }),
                 "npm" | "pnpm" | "yarn" => args.iter().any(|verb| {
@@ -714,7 +743,12 @@ impl SecurityPolicy {
                 //     the shell, so `git ls-remote --upload-pack='sh -c evil' .`
                 //     is silent RCE (ls-remote/fetch/clone are not "medium" verbs,
                 //     so the risk gate never prompts). Block both the separate-arg
-                //     (`--upload-pack /x`) and inline (`--upload-pack=/x`) forms.
+                //     (`--upload-pack /x`) and inline (`--upload-pack=/x`) forms,
+                //     the short alias `-u <program>` (documented for
+                //     clone/fetch/ls-remote/pull), and unambiguous prefix
+                //     abbreviations of the long forms (e.g. `--upload-pac=/x`) —
+                //     git accepts all of these, so matching only the exact long
+                //     spelling misses real bypasses.
                 //     (args are already lowercased by the caller.)
                 !args.iter().any(|arg| {
                     arg == "config"
@@ -722,12 +756,14 @@ impl SecurityPolicy {
                         || arg == "alias"
                         || arg.starts_with("alias.")
                         || arg == "-c"
+                        || arg == "-u"
                         || arg == "--upload-pack"
                         || arg.starts_with("--upload-pack=")
                         || arg == "--receive-pack"
                         || arg.starts_with("--receive-pack=")
                         || arg == "--exec"
                         || arg.starts_with("--exec=")
+                        || is_dangerous_git_long_opt(arg)
                 })
             }
             _ => true,
@@ -1695,6 +1731,68 @@ mod tests {
         assert!(p.is_command_allowed("git fetch origin main"));
         assert!(p.is_command_allowed("git ls-remote origin"));
         assert!(p.is_command_allowed("git clone https://example.com/repo.git"));
+    }
+
+    #[test]
+    fn git_upload_pack_short_flag_blocked() {
+        // `-u <program>` is the documented short alias for `--upload-pack`
+        // (clone/fetch/ls-remote/pull) — the exact-string check on the long
+        // form alone misses this bypass.
+        let p = default_policy();
+        assert!(
+            !p.is_command_allowed("git clone -u /tmp/evil.sh . dest"),
+            "git -u (short --upload-pack alias) must be blocked"
+        );
+    }
+
+    #[test]
+    fn git_upload_pack_abbrev_blocked() {
+        // Git accepts unambiguous prefix abbreviations of long options.
+        let p = default_policy();
+        assert!(
+            !p.is_command_allowed("git fetch --upload-pac=/tmp/evil.sh origin"),
+            "abbreviated --upload-pac= must be blocked"
+        );
+    }
+
+    #[test]
+    fn git_receive_pack_abbrev_blocked() {
+        let p = default_policy();
+        assert!(
+            !p.is_command_allowed("git push --receive-pac=/tmp/evil.sh origin"),
+            "abbreviated --receive-pac= must be blocked"
+        );
+    }
+
+    #[test]
+    fn git_normal_clone_still_allowed() {
+        // No false positive: a plain clone with no dangerous flags must pass.
+        let p = default_policy();
+        assert!(p.is_command_allowed("git clone https://example.com/repo.git"));
+    }
+
+    #[test]
+    fn git_transport_verbs_are_risk_gated() {
+        // clone/fetch/ls-remote/pull must be at least Medium risk so a
+        // Supervised session hits the approval gate, closing the silent-RCE
+        // window even if is_args_safe's blocklist ever has a gap.
+        let p = default_policy();
+        assert_eq!(
+            p.command_risk_level("git clone https://example.com/repo.git"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("git fetch origin main"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("git ls-remote origin"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("git pull origin main"),
+            CommandRiskLevel::Medium
+        );
     }
 
     #[test]
