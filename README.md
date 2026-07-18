@@ -318,7 +318,7 @@ GITHUB_PERSONAL_ACCESS_TOKEN = "ghp_..."
 [gateway]
 enabled = true
 port = 8080
-allow_public_bind = true
+allow_public_bind = false   # localhost-only by default; see docs/operations/network-deployment.md to expose on a LAN
 ```
 
 See [Config Reference](docs/reference/config.md) for all options.
