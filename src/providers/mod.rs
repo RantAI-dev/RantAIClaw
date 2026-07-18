@@ -2291,8 +2291,10 @@ mod tests {
 
     #[test]
     fn factory_anthropic_custom_no_key() {
+        // Fail-fast: a custom Anthropic endpoint needs an API key; the rig
+        // reroute rejects a missing key at construction rather than deferring.
         let p = create_provider("anthropic-custom:https://api.example.com", None);
-        assert!(p.is_ok());
+        assert!(p.is_err());
     }
 
     #[test]

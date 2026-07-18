@@ -239,6 +239,31 @@ fn tool_result_message_from(content: &str) -> RigMessage {
 /// flattened to the `preamble` field for compatibility with all three
 /// providers — rig also accepts a leading `Message::System` in
 /// `chat_history` but mixing the two confuses some providers.
+/// Anthropic's Messages API rejects a completion with no `max_tokens`
+/// ("max_tokens must be set for Anthropic"), and rig only auto-defaults the
+/// claude-4 tiers — so a claude-3.x request built with `max_tokens: None`
+/// errors before it is ever sent (the request never reaches the network).
+/// Fill a per-model default: mirror rig's own claude-4 values, and fall back to
+/// 4096 — the claude-3 output cap and the legacy `AnthropicProvider` default —
+/// for everything else. 4096 never exceeds any Anthropic model's cap, so it is
+/// always accepted. Only applied for the Anthropic backend; OpenAI/Gemini keep
+/// `None` (their APIs treat it as "model default").
+fn with_anthropic_max_tokens(mut req: CompletionRequest, model: &str) -> CompletionRequest {
+    if req.max_tokens.is_none() {
+        req.max_tokens = Some(match model {
+            m if m.starts_with("claude-opus-4-7") || m.starts_with("claude-opus-4-6") => 128_000,
+            m if m.starts_with("claude-opus-4")
+                || m.starts_with("claude-sonnet-4")
+                || m.starts_with("claude-haiku-4-5") =>
+            {
+                64_000
+            }
+            _ => 4_096,
+        });
+    }
+    req
+}
+
 fn build_rig_request(
     request: ChatRequest<'_>,
     model: &str,
@@ -456,6 +481,7 @@ impl Provider for RigProvider {
         match &self.inner {
             RigClient::Anthropic(c) => {
                 let m = c.completion_model(model);
+                let req = with_anthropic_max_tokens(req, model);
                 let resp = m
                     .completion(req)
                     .await
@@ -494,6 +520,7 @@ impl Provider for RigProvider {
         let req = build_rig_request(request, model, temperature)?;
         match &self.inner {
             RigClient::Anthropic(c) => {
+                let req = with_anthropic_max_tokens(req, model);
                 stream_through_rig(c.completion_model(model), req, text_tx, self.canonical_name)
                     .await
             }
