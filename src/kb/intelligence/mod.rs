@@ -37,30 +37,30 @@ pub async fn extract_document_intelligence(
     store.delete_document_intelligence(document_id).await?;
 
     let mut entity_id_by_name: HashMap<String, String> = HashMap::new();
+    let mut entities: Vec<Entity> = Vec::new();
+    let mut mentions: Vec<EntityMention> = Vec::new();
     let mut n_ent = 0usize;
 
     // 1) LLM entities — aggregated for the whole document (chunk_index = None).
     let llm = extractor.extract(chunks).await?;
     for (name, ty, conf) in &llm.entities {
-        let entity = Entity {
-            id: new_id(),
+        let id = new_id();
+        entities.push(Entity {
+            id: id.clone(),
             canonical_key: canonical_key(name, ty),
             name: name.clone(),
             entity_type: ty.clone(),
             confidence: *conf,
             metadata: serde_json::json!({}),
-        };
-        let id = store.upsert_entity(&entity).await?;
-        store
-            .add_mention(&EntityMention {
-                id: new_id(),
-                entity_id: id.clone(),
-                document_id: document_id.to_string(),
-                chunk_index: None,
-                context: None,
-                source: ExtractSource::Llm,
-            })
-            .await?;
+        });
+        mentions.push(EntityMention {
+            id: new_id(),
+            entity_id: id.clone(),
+            document_id: document_id.to_string(),
+            chunk_index: None,
+            context: None,
+            source: ExtractSource::Llm,
+        });
         entity_id_by_name.entry(name.clone()).or_insert(id);
         n_ent += 1;
     }
@@ -69,48 +69,53 @@ pub async fn extract_document_intelligence(
     for (idx, chunk) in chunks.iter().enumerate() {
         let chunk_index = i64::try_from(idx).unwrap_or(0);
         for (name, ty) in extract_pattern_entities(chunk) {
-            let entity = Entity {
-                id: new_id(),
+            let id = new_id();
+            entities.push(Entity {
+                id: id.clone(),
                 canonical_key: canonical_key(&name, &ty),
                 name: name.clone(),
                 entity_type: ty.clone(),
                 confidence: 1.0,
                 metadata: serde_json::json!({}),
-            };
-            let id = store.upsert_entity(&entity).await?;
-            store
-                .add_mention(&EntityMention {
-                    id: new_id(),
-                    entity_id: id.clone(),
-                    document_id: document_id.to_string(),
-                    chunk_index: Some(chunk_index),
-                    context: None,
-                    source: ExtractSource::Pattern,
-                })
-                .await?;
+            });
+            mentions.push(EntityMention {
+                id: new_id(),
+                entity_id: id.clone(),
+                document_id: document_id.to_string(),
+                chunk_index: Some(chunk_index),
+                context: None,
+                source: ExtractSource::Pattern,
+            });
             entity_id_by_name.entry(name).or_insert(id);
             n_ent += 1;
         }
     }
 
     // 3) Relations (from the LLM), wired by entity name.
+    let mut relations: Vec<Relation> = Vec::new();
     let mut n_rel = 0usize;
     for (src, tgt, rty, conf) in &llm.relations {
         if let (Some(s), Some(t)) = (entity_id_by_name.get(src), entity_id_by_name.get(tgt)) {
-            store
-                .add_relation(&Relation {
-                    id: new_id(),
-                    source_entity_id: s.clone(),
-                    target_entity_id: t.clone(),
-                    relation_type: rty.clone(),
-                    confidence: *conf,
-                    document_id: document_id.to_string(),
-                    metadata: serde_json::json!({}),
-                })
-                .await?;
+            relations.push(Relation {
+                id: new_id(),
+                source_entity_id: s.clone(),
+                target_entity_id: t.clone(),
+                relation_type: rty.clone(),
+                confidence: *conf,
+                document_id: document_id.to_string(),
+                metadata: serde_json::json!({}),
+            });
             n_rel += 1;
         }
     }
+
+    // One transactional round-trip for the whole batch. The store resolves
+    // each entity's provisional id to its surviving (canonical_key-deduped)
+    // id and remaps mentions/relations accordingly — see
+    // `IntelligenceStore::store_intelligence`.
+    store
+        .store_intelligence(document_id, &entities, &mentions, &relations)
+        .await?;
 
     Ok(IntelligenceSummary {
         entities: n_ent,
