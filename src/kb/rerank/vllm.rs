@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::kb::rerank::{fill_remaining_in_order, Candidate, Reranked, Reranker};
+use crate::kb::rerank::{fill_remaining_in_order, post_json_rerank, Candidate, Reranked, Reranker};
 use crate::kb::{KbConfig, KbError, KbResult};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:8200";
@@ -96,18 +96,8 @@ impl Reranker for VllmReranker {
         });
 
         // Intentionally no `Authorization` header — sidecar runs in-cluster.
-        let resp = self.http.post(&self.endpoint).json(&body).send().await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(KbError::ChatApi {
-                status: status.as_u16(),
-                body: truncate(&text, 300),
-            });
-        }
-
-        let parsed: VllmResponse = resp.json().await?;
+        let parsed: VllmResponse =
+            post_json_rerank(&self.http, &self.endpoint, None, &body).await?;
         let picked: Vec<(usize, f32)> = parsed
             .results
             .into_iter()
@@ -120,19 +110,5 @@ impl Reranker for VllmReranker {
             final_k,
             |_rank, _cand| 0.0,
         ))
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let cut = s
-            .char_indices()
-            .take(max)
-            .last()
-            .map(|(idx, ch)| idx + ch.len_utf8())
-            .unwrap_or(0);
-        format!("{}…", &s[..cut])
     }
 }
