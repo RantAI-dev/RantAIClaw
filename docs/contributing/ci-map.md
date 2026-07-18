@@ -20,7 +20,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
         - `build` — `cargo build --profile release-fast --locked` smoke + binary-size guard (`scripts/ci/check_binary_size.sh`).
         - `docs-quality` — incremental `markdownlint` on changed lines + offline `lychee` on links added on changed lines.
         - `lint-feedback` — posts actionable failure comment when lint/docs gates fail on a PR.
-    - PR gating: heavy stages (`lint`, `test`, `features`, `bench-compile`, `docs-quality`) require the `ci:full` label; `build` always runs for rust changes; `e2e` is push-only.
+    - PR gating: `lint` and `test` run on every Rust-changing PR (no label needed) and are required by `CI Required Gate`; `features`, `bench-compile`, and `docs-quality` still require the `ci:full` label; `build` always runs for rust changes; `e2e` is push-only.
     - Merge gate: `CI Required Gate` aggregates all stage results.
 - `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
     - Purpose: lint GitHub workflow files (`actionlint`, tab checks).
