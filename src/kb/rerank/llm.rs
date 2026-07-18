@@ -13,7 +13,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::kb::rerank::{fill_remaining_in_order, Candidate, Reranked, Reranker};
+use crate::kb::rerank::{fill_remaining_in_order, post_json_rerank, Candidate, Reranked, Reranker};
 use crate::kb::{KbError, KbResult};
 
 const CANDIDATE_TEXT_LIMIT: usize = 400;
@@ -101,24 +101,8 @@ impl Reranker for LlmReranker {
             "temperature": 0,
         });
 
-        let resp = self
-            .http
-            .post(&self.chat_url)
-            .bearer_auth(&api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(KbError::ChatApi {
-                status: status.as_u16(),
-                body: truncate(&text, 300),
-            });
-        }
-
-        let parsed: Value = resp.json().await?;
+        let parsed: Value =
+            post_json_rerank(&self.http, &self.chat_url, Some(&api_key), &body).await?;
         let raw = parsed
             .pointer("/choices/0/message/content")
             .and_then(|v| v.as_str())
@@ -169,18 +153,4 @@ fn char_truncate(s: &str, max_chars: usize) -> &str {
         .map(|(idx, ch)| idx + ch.len_utf8())
         .unwrap_or(0);
     &s[..cut]
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let cut = s
-            .char_indices()
-            .take(max)
-            .last()
-            .map(|(idx, ch)| idx + ch.len_utf8())
-            .unwrap_or(0);
-        format!("{}…", &s[..cut])
-    }
 }
