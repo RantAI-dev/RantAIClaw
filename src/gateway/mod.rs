@@ -2532,10 +2532,6 @@ mod tests {
         assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
     }
 
-    /// Serializes the `HOME`-mutating gateway store-pairing test (process-global
-    /// env var). Held with `std::sync::Mutex` because the test body is sync.
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Minimal `AppState` for the store-pairing test: a fresh pairing guard plus
     /// the smallest set of mocks. Only `pairing` and `config` matter here.
     fn store_pairing_test_state(config: Config) -> AppState {
@@ -2588,7 +2584,10 @@ mod tests {
     /// returns `None`.
     #[test]
     fn gateway_store_minted_code_is_consumed_and_issues_token() {
-        let _g = HOME_ENV_LOCK.lock().unwrap();
+        // Serializes the `HOME`-mutating gateway store-pairing test against the
+        // crate-shared ENV_LOCK so it can't clobber other tests (e.g. in
+        // channels/config) that mutate the same process-global env.
+        let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
