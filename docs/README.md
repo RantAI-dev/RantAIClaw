@@ -43,6 +43,8 @@ These tracks behavior. Every PR that affects a CLI flag or config key updates th
 - [reference/providers.md](reference/providers.md)
 - [reference/channels.md](reference/channels.md)
 - [reference/custom-providers.md](reference/custom-providers.md)
+- [reference/api-v1.md](reference/api-v1.md) — `/api/v1` HTTP API full contract
+- [reference/api-v1-streaming.md](reference/api-v1-streaming.md) — `/api/v1/agent/chat` SSE streaming
 
 ## Operations
 
