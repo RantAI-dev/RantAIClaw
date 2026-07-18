@@ -34,7 +34,7 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// of supporting authenticated corporate proxies (an authenticated proxy needs
 /// its credential inline); note the `shell_safe_env_vars_excludes_secrets` guard
 /// only checks variable NAMES, not values, so it can't catch that case.
-const SAFE_ENV_VARS: &[&str] = &[
+pub(crate) const SAFE_ENV_VARS: &[&str] = &[
     // Core shell essentials.
     "PATH",
     "HOME",
