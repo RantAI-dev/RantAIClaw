@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::kb::rerank::{fill_remaining_in_order, Candidate, Reranked, Reranker};
+use crate::kb::rerank::{fill_remaining_in_order, post_json_rerank, Candidate, Reranked, Reranker};
 use crate::kb::{KbConfig, KbError, KbResult};
 
 const DEFAULT_ENDPOINT: &str = "https://api.cohere.com/v2/rerank";
@@ -102,24 +102,8 @@ impl Reranker for CohereReranker {
             "top_n": final_k,
         });
 
-        let resp = self
-            .http
-            .post(&self.endpoint)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(KbError::ChatApi {
-                status: status.as_u16(),
-                body: truncate(&text, 300),
-            });
-        }
-
-        let parsed: CohereResponse = resp.json().await?;
+        let parsed: CohereResponse =
+            post_json_rerank(&self.http, &self.endpoint, Some(&self.api_key), &body).await?;
         let picked: Vec<(usize, f32)> = parsed
             .results
             .into_iter()
@@ -133,19 +117,5 @@ impl Reranker for CohereReranker {
             final_k,
             |_rank, _cand| 0.0,
         ))
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let cut = s
-            .char_indices()
-            .take(max)
-            .last()
-            .map(|(idx, ch)| idx + ch.len_utf8())
-            .unwrap_or(0);
-        format!("{}…", &s[..cut])
     }
 }
