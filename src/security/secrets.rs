@@ -178,16 +178,29 @@ impl SecretStore {
             if let Some(parent) = self.key_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&self.key_path, hex_encode(&key))
-                .context("Failed to write secret key file")?;
 
-            // Set restrictive permissions
+            // Create the key file with owner-only permissions (0600) at open
+            // time, so the key is never briefly readable under the process
+            // umask between write and a later chmod.
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&self.key_path, fs::Permissions::from_mode(0o600))
-                    .context("Failed to set key file permissions")?;
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&self.key_path)
+                    .context("Failed to create secret key file")?;
+                f.write_all(hex_encode(&key).as_bytes())
+                    .context("Failed to write secret key file")?;
             }
+            #[cfg(not(unix))]
+            {
+                fs::write(&self.key_path, hex_encode(&key))
+                    .context("Failed to write secret key file")?;
+            }
+
             #[cfg(windows)]
             {
                 // On Windows, use icacls to restrict permissions to current user only
@@ -846,6 +859,27 @@ mod tests {
             perms.mode() & 0o777,
             0o600,
             "Key file must be owner-only (0600)"
+        );
+    }
+
+    /// The master key file must be created with 0600 permissions at open
+    /// time (via `OpenOptions::mode`), not written first under the process
+    /// umask and chmod'd afterward — closing the window where the key would
+    /// briefly be group/world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn master_key_file_created_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        assert!(!store.key_path.exists());
+
+        store.encrypt("trigger key creation").unwrap();
+
+        let mode = fs::metadata(&store.key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "Key file must be created with 0600 at open time (no write-then-chmod window)"
         );
     }
 }
