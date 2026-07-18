@@ -16,12 +16,18 @@
 //! To add a new provider, implement [`Provider`] in a new submodule and register it
 //! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
+// Legacy hand-rolled Anthropic/Gemini providers are kept compiled in the default
+// build: they serve auth modes rig-core cannot (Anthropic setup-tokens, Gemini
+// CLI OAuth / cloudcode-pa) and are the routed backend for those modes — not dead
+// code. 016 Stage-2 deletion is cancelled; see plans/025-rigprovider-auth-parity.md.
 pub mod anthropic;
 pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
+pub mod gemini_cli;
 pub mod ollama;
+#[cfg(feature = "legacy-providers")]
 pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
@@ -812,7 +818,15 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
 /// need no key (or none is configured/env-set) return `false`; the gateway uses
 /// this to warn when a switched provider likely can't be used.
 pub fn has_usable_credential(name: &str, config_key: Option<&str>) -> bool {
-    resolve_provider_credential(name, config_key).is_some()
+    if resolve_provider_credential(name, config_key).is_some() {
+        return true;
+    }
+    // Gemini CLI OAuth has no API key / env var but is a usable credential — it
+    // is routed to the legacy cloudcode-pa path. Report it as configured so
+    // `doctor` and the setup wizard don't tell CLI-authed users they're
+    // unconfigured (plan 025).
+    matches!(name, "gemini" | "google" | "google-gemini")
+        && gemini_cli::gemini_cli_has_credentials()
 }
 
 fn resolve_provider_credential(name: &str, credential_override: Option<&str>) -> Option<String> {
@@ -870,6 +884,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
+        "gemini" | "google" | "google-gemini" => vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         _ => vec![],
     };
 
@@ -925,6 +940,15 @@ fn parse_custom_provider_url(
             "{provider_label} requires an http:// or https:// URL. Format: {format_hint}"
         ),
     }
+}
+
+/// Anthropic OAuth "setup-tokens" (`sk-ant-oat01-…`) authenticate via
+/// `Authorization: Bearer` + the `anthropic-beta` header — which rig-core's
+/// Anthropic client does not send (it uses `x-api-key`). Detect them so the
+/// factory can route to the legacy provider, which speaks that auth flow.
+fn is_anthropic_setup_token(key: Option<&str>) -> bool {
+    key.map(|k| k.trim().starts_with("sk-ant-oat01-"))
+        .unwrap_or(false)
 }
 
 /// Factory: create the right provider from config (without custom URL)
@@ -984,11 +1008,21 @@ fn create_provider_with_url_and_options(
         // Anthropic / OpenAI native / Gemini route through `RigProvider`
         // by default — see `src/providers/rig_native.rs`. Build with
         // `--features legacy-providers` to fall back to the hand-rolled
-        // files (kept in tree through v0.7.0 for safety).
+        // files (gated out of default builds; deletion needs maintainer
+        // approval — see plans/016-legacy-providers-sunset.md).
         #[cfg(not(feature = "legacy-providers"))]
-        "anthropic" => Ok(Box::new(rig_native::RigProvider::for_provider(
-            "anthropic", key,
-        )?)),
+        "anthropic" => {
+            // Setup-tokens need Bearer + anthropic-beta (rig can't send them);
+            // route to the legacy provider (which also gives prompt caching).
+            // Plain API keys keep the rig path (streaming + native tools).
+            if is_anthropic_setup_token(key) {
+                Ok(Box::new(anthropic::AnthropicProvider::new(key)))
+            } else {
+                Ok(Box::new(rig_native::RigProvider::for_provider(
+                    "anthropic", key,
+                )?))
+            }
+        }
         #[cfg(feature = "legacy-providers")]
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         #[cfg(not(feature = "legacy-providers"))]
@@ -1004,9 +1038,17 @@ fn create_provider_with_url_and_options(
             options.reasoning_enabled,
         ))),
         #[cfg(not(feature = "legacy-providers"))]
-        "gemini" | "google" | "google-gemini" => Ok(Box::new(
-            rig_native::RigProvider::for_provider("gemini", key)?,
-        )),
+        "gemini" | "google" | "google-gemini" => {
+            // rig's gemini client only speaks the public endpoint; Gemini CLI
+            // OAuth tokens are scoped for cloudcode-pa. With no API key but CLI
+            // creds present, route to the legacy provider (handles cloudcode-pa);
+            // otherwise the rig path (streaming + native tools).
+            if key.is_none() && gemini_cli::gemini_cli_has_credentials() {
+                Ok(Box::new(gemini::GeminiProvider::new(key)))
+            } else {
+                Ok(Box::new(rig_native::RigProvider::for_provider("gemini", key)?))
+            }
+        }
         #[cfg(feature = "legacy-providers")]
         "gemini" | "google" | "google-gemini" => {
             Ok(Box::new(gemini::GeminiProvider::new(key)))
@@ -1170,9 +1212,11 @@ fn create_provider_with_url_and_options(
         ))),
 
         // ── Cloud AI endpoints ───────────────────────────────
-        "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
-            Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
+        "ovhcloud" | "ovh" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "OVHcloud",
+            "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
             key,
+            AuthStyle::Bearer,
         ))),
 
         // ── Bring Your Own Provider (custom URL) ───────────
@@ -1199,10 +1243,9 @@ fn create_provider_with_url_and_options(
                 "Anthropic-custom provider",
                 "anthropic-custom:https://your-api.com",
             )?;
-            Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
-                key,
-                Some(&base_url),
-            )))
+            Ok(Box::new(rig_native::RigProvider::for_provider_with_url(
+                "anthropic", key, Some(&base_url),
+            )?))
         }
 
         _ => anyhow::bail!(
@@ -2005,10 +2048,69 @@ mod tests {
         assert!(create_provider("gemini", Some("test-key")).is_ok());
         assert!(create_provider("google", Some("test-key")).is_ok());
         assert!(create_provider("google-gemini", Some("test-key")).is_ok());
-        // The rig-native gemini client requires an API key at construction
-        // ("gemini: GEMINI_API_KEY required") — the legacy CLI-auth fallback
-        // this assertion used to cover no longer exists.
-        assert!(create_provider("gemini", None).is_err());
+    }
+
+    #[test]
+    fn factory_gemini_resolves_env_api_key() {
+        // Regression (plan 025): the default path must honor GEMINI_API_KEY /
+        // GOOGLE_API_KEY again. The rig-native migration dropped the gemini arm
+        // in resolve_provider_credential, so env-key users hit "no key".
+        let _g = crate::test_env::ENV_LOCK.blocking_lock();
+        let prev_g = std::env::var_os("GEMINI_API_KEY");
+        let prev_goog = std::env::var_os("GOOGLE_API_KEY");
+        std::env::remove_var("GOOGLE_API_KEY");
+        std::env::set_var("GEMINI_API_KEY", "AIzaSyTEST-env-key");
+        let with_env_ok = create_provider("gemini", None).is_ok();
+        let resolved = resolve_provider_credential("gemini", None);
+        match prev_g {
+            Some(v) => std::env::set_var("GEMINI_API_KEY", v),
+            None => std::env::remove_var("GEMINI_API_KEY"),
+        }
+        match prev_goog {
+            Some(v) => std::env::set_var("GOOGLE_API_KEY", v),
+            None => std::env::remove_var("GOOGLE_API_KEY"),
+        }
+        assert_eq!(resolved.as_deref(), Some("AIzaSyTEST-env-key"));
+        assert!(
+            with_env_ok,
+            "GEMINI_API_KEY must resolve a usable gemini provider"
+        );
+    }
+
+    #[test]
+    fn anthropic_setup_token_detected_for_routing() {
+        // Plan 025: setup-tokens route to the legacy provider (Bearer+beta).
+        assert!(is_anthropic_setup_token(Some("sk-ant-oat01-abc")));
+        assert!(is_anthropic_setup_token(Some("  sk-ant-oat01-abc  ")));
+        assert!(!is_anthropic_setup_token(Some("sk-ant-api03-abc")));
+        assert!(!is_anthropic_setup_token(None));
+    }
+
+    #[test]
+    fn has_usable_credential_gemini_env_and_config() {
+        // Plan 025 (diagnostics): doctor/setup must see gemini env + config keys
+        // as usable again (the CLI-OAuth branch is env-dependent, covered by
+        // gemini_cli's own tests).
+        let _g = crate::test_env::ENV_LOCK.blocking_lock();
+        let prev_g = std::env::var_os("GEMINI_API_KEY");
+        let prev_goog = std::env::var_os("GOOGLE_API_KEY");
+        std::env::remove_var("GEMINI_API_KEY");
+        std::env::remove_var("GOOGLE_API_KEY");
+        assert!(has_usable_credential("gemini", Some("cfg-key")));
+        std::env::set_var("GOOGLE_API_KEY", "AIzaSy-goog");
+        let via_env = has_usable_credential("gemini", None);
+        match prev_g {
+            Some(v) => std::env::set_var("GEMINI_API_KEY", v),
+            None => std::env::remove_var("GEMINI_API_KEY"),
+        }
+        match prev_goog {
+            Some(v) => std::env::set_var("GOOGLE_API_KEY", v),
+            None => std::env::remove_var("GOOGLE_API_KEY"),
+        }
+        assert!(
+            via_env,
+            "GOOGLE_API_KEY must count as a usable gemini credential"
+        );
     }
 
     // ── OpenAI-compatible providers ──────────────────────────
@@ -2285,8 +2387,10 @@ mod tests {
 
     #[test]
     fn factory_anthropic_custom_no_key() {
+        // Fail-fast: a custom Anthropic endpoint needs an API key; the rig
+        // reroute rejects a missing key at construction rather than deferring.
         let p = create_provider("anthropic-custom:https://api.example.com", None);
-        assert!(p.is_ok());
+        assert!(p.is_err());
     }
 
     #[test]
