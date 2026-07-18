@@ -1031,6 +1031,33 @@ async fn channels_list(
     if cfg.channels_config.whatsapp.is_some() {
         configured.push("whatsapp");
     }
+    if cfg.channels_config.webhook.is_some() {
+        configured.push("webhook");
+    }
+    if cfg!(feature = "channel-matrix") && cfg.channels_config.matrix.is_some() {
+        configured.push("matrix");
+    }
+    if cfg.channels_config.linq.is_some() {
+        configured.push("linq");
+    }
+    if cfg.channels_config.nextcloud_talk.is_some() {
+        configured.push("nextcloud_talk");
+    }
+    if cfg.channels_config.email.is_some() {
+        configured.push("email");
+    }
+    if cfg.channels_config.irc.is_some() {
+        configured.push("irc");
+    }
+    if cfg!(feature = "channel-lark") && cfg.channels_config.lark.is_some() {
+        configured.push("lark");
+    }
+    if cfg.channels_config.dingtalk.is_some() {
+        configured.push("dingtalk");
+    }
+    if cfg.channels_config.qq.is_some() {
+        configured.push("qq");
+    }
     Ok(Json(serde_json::json!({
         "configured": configured,
         "count": configured.len(),
