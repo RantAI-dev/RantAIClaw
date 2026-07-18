@@ -480,7 +480,10 @@ impl Provider for RigProvider {
         let req = build_rig_request(request, model, temperature)?;
         match &self.inner {
             RigClient::Anthropic(c) => {
-                let m = c.completion_model(model);
+                // Enable Anthropic prompt caching (system prompt + messages) so
+                // long contexts aren't re-billed each turn — parity with the
+                // legacy provider's caching heuristic (plan 025).
+                let m = c.completion_model(model).with_prompt_caching();
                 let req = with_anthropic_max_tokens(req, model);
                 let resp = m
                     .completion(req)
@@ -521,8 +524,13 @@ impl Provider for RigProvider {
         match &self.inner {
             RigClient::Anthropic(c) => {
                 let req = with_anthropic_max_tokens(req, model);
-                stream_through_rig(c.completion_model(model), req, text_tx, self.canonical_name)
-                    .await
+                stream_through_rig(
+                    c.completion_model(model).with_prompt_caching(),
+                    req,
+                    text_tx,
+                    self.canonical_name,
+                )
+                .await
             }
             RigClient::OpenAi(c) => {
                 stream_through_rig(c.completion_model(model), req, text_tx, self.canonical_name)
