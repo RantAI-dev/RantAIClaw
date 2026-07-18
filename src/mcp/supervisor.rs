@@ -13,6 +13,10 @@ use super::McpRegistry;
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_CAP: Duration = Duration::from_mins(1);
+/// How long a respawned server must stay running before it is considered
+/// recovered and its consecutive-failure counter is cleared. Tunable: raise
+/// this if MCP servers legitimately take longer than 30s to become stable.
+const STABILITY_WINDOW: Duration = Duration::from_secs(30);
 
 fn backoff_delay(consecutive_failures: u32) -> Duration {
     let delay = BACKOFF_BASE * 2u32.saturating_pow(consecutive_failures.saturating_sub(1));
@@ -52,6 +56,13 @@ pub fn spawn_supervisor(
                                         None
                                     }
                                 } else {
+                                    if handle
+                                        .last_respawn
+                                        .is_some_and(|t| t.elapsed() >= STABILITY_WINDOW)
+                                    {
+                                        handle.consecutive_failures = 0;
+                                        handle.last_respawn = None;
+                                    }
                                     None
                                 }
                             } else {
@@ -78,4 +89,15 @@ pub fn spawn_supervisor(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_delay_escalates() {
+        assert!(backoff_delay(1) < backoff_delay(3));
+        assert_eq!(backoff_delay(10), BACKOFF_CAP);
+    }
 }

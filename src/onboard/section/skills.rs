@@ -169,14 +169,14 @@ fn block_on_clawhub_install_many(profile: &Profile, slugs: &[String]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     use tempfile::TempDir;
 
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-
+    // Tests mutate the process-global HOME env; serialize against the
+    // crate-shared ENV_LOCK so they can't clobber other tests (e.g. in
+    // channels/config) that mutate the same process-global env.
     fn with_home<F: FnOnce()>(f: F) {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = TempDir::new().unwrap();
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());

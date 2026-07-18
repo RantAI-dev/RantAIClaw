@@ -582,14 +582,12 @@ fn list_other_profiles() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // Tests mutate the process-global HOME/RANTAICLAW_PROFILE env; serialize
-    // them and restore prior values so they can't clobber each other.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-
+    // them against the crate-shared ENV_LOCK so they can't clobber other
+    // tests (e.g. in channels/config) that mutate the same process-global env.
     fn with_home<F: FnOnce()>(f: F) {
-        let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
         let prev_home = std::env::var_os("HOME");
         let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");

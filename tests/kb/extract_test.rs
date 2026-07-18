@@ -760,6 +760,64 @@ fn merge_handles_non_ascii_prose_without_panic() {
     let _ = merge_structural_with_text_layer(structural_mb, text_layer_mb);
 }
 
+// ----- kb-ocr spike: OllamaOcrExtractor (wiremock) -----------------------
+//
+// SPIKE prototype behind `--features kb-ocr` (non-default). Design note:
+// docs/kb/ocr-design.md. Mirrors the mineru_extractor_* tests above: no
+// live Ollama server required, `OllamaOcrExtractor::new` points directly at
+// the wiremock server so nothing here touches process env vars.
+
+#[cfg(feature = "kb-ocr")]
+#[tokio::test]
+async fn ocr_ollama_extractor_posts_image_and_parses_response() {
+    use rantaiclaw::kb::extract::ocr_ollama::OllamaOcrExtractor;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "response": "RantaiClawSample OCR text",
+            "done": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ext = OllamaOcrExtractor::new(format!("{}/api/generate", server.uri()), "llava");
+    // A 1x1 PNG signature — content is irrelevant, the mock ignores the body.
+    let png: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let result = ext.extract(png).await.unwrap();
+    assert_eq!(result.text, "RantaiClawSample OCR text");
+    assert_eq!(result.model, "llava");
+    assert_eq!(result.pages, Some(1));
+}
+
+#[cfg(feature = "kb-ocr")]
+#[tokio::test]
+async fn ocr_ollama_extractor_surfaces_endpoint_errors() {
+    use rantaiclaw::kb::extract::ocr_ollama::OllamaOcrExtractor;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/generate"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("model not found"))
+        .mount(&server)
+        .await;
+
+    let ext = OllamaOcrExtractor::new(format!("{}/api/generate", server.uri()), "llava");
+    let err = ext
+        .extract(b"\x89PNG")
+        .await
+        .expect_err("5xx endpoint response must surface as KbError::Extraction");
+    let msg = err.to_string();
+    assert!(msg.contains("500"), "error must include status code: {msg}");
+}
+
 // ----- live integration (skipped unless OPENROUTER_API_KEY set) ----------
 
 #[tokio::test]

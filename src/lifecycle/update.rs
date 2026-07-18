@@ -728,13 +728,36 @@ fn verify_installed_binary(installed: &Path, expected_version: &str) -> Result<(
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    let mut child = Command::new(installed)
-        .args(["update", "--verify"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn {} for first-launch verify", installed.display()))?;
+    // ETXTBSY (errno 26): the kernel refuses to exec a file that is still open
+    // for writing anywhere in the system. We run this right after installing
+    // (writing) the new binary, and on a multithreaded host a fork in another
+    // thread can transiently inherit a write-fd to it, so the first exec can
+    // spuriously fail with ETXTBSY. Retry a few times with a short backoff
+    // before giving up. (26 on all unix; harmless elsewhere — never matched.)
+    const ETXTBSY: i32 = 26;
+    let mut child = {
+        let mut attempt = 0u32;
+        loop {
+            match Command::new(installed)
+                .args(["update", "--verify"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < 10 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20 * u64::from(attempt)));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("spawn {} for first-launch verify", installed.display())
+                    });
+                }
+            }
+        }
+    };
 
     let deadline = Instant::now() + Duration::from_secs(VERIFY_TIMEOUT_SECS);
     loop {
@@ -1216,5 +1239,36 @@ mod tests {
             err.to_string().contains("exited"),
             "expected a nonzero-exit error, got: {err}"
         );
+    }
+
+    // Regression for the post-install ETXTBSY spawn race: right after we write
+    // the new binary we exec it, and while any thread still holds a write-fd to
+    // it, exec fails with ETXTBSY ("text file busy"). `verify_installed_binary`
+    // must retry past that transient window instead of failing. We reproduce it
+    // deterministically by holding a write-fd open and releasing it shortly
+    // after — well within the retry budget. Without the retry loop the first
+    // spawn returns ETXTBSY and this test fails.
+    #[cfg(unix)]
+    #[test]
+    fn verify_retries_through_transient_etxtbsy() {
+        use std::fs::OpenOptions;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("rantaiclaw-stub");
+        write_version_stub(&bin, "#!/bin/sh\necho '0.7.5-alpha'\n");
+
+        // An open write-fd makes exec of the file fail with ETXTBSY for as long
+        // as it is held. Release it after ~120ms so a later retry succeeds.
+        let writer = OpenOptions::new().write(true).open(&bin).unwrap();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            drop(writer);
+        });
+
+        verify_installed_binary(&bin, "0.7.5-alpha")
+            .expect("verify should retry through a transient ETXTBSY and then succeed");
+        releaser.join().unwrap();
     }
 }

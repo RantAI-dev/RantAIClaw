@@ -68,13 +68,14 @@ impl McpClient {
         env: &HashMap<String, String>,
     ) -> Result<Self> {
         let server_name = server_name.into();
-        let mut child = Command::new(command)
-            .args(args)
-            .envs(env)
-            .stdin(Stdio::piped())
+        let mut cmd = Command::new(command);
+        cmd.args(args);
+        crate::mcp::apply_hardened_env(&mut cmd, env);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn MCP server `{server_name}` ({command})"))?;
 

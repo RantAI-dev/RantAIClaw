@@ -35,6 +35,8 @@
 - [reference/kb.md](reference/kb.md) — Knowledge Base (feature-gated)
 - [reference/kb-bench.md](reference/kb-bench.md) — KB retrieval latency baseline
 - [reference/kb-tuning.md](reference/kb-tuning.md) — KB retrieval quality knobs
+- [reference/api-v1.md](reference/api-v1.md) — `/api/v1` HTTP API full contract
+- [reference/api-v1-streaming.md](reference/api-v1-streaming.md) — `/api/v1/agent/chat` SSE streaming
 
 ## 4) Operations & deployment
 

@@ -2,7 +2,41 @@ use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+// Result parser regexes are compile-time constants — compile them once instead
+// of on every call to `parse_duckduckgo_results` / `parse_searxng_html` /
+// `strip_tags`.
+static DDG_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#)
+        .expect("valid regex")
+});
+
+static DDG_SNIPPET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#).expect("valid regex")
+});
+
+static SEARXNG_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<article[^>]*class="[^"]*result[^"]*"[^>]*>([\s\S]*?)</article>"#)
+        .expect("valid regex")
+});
+
+static SEARXNG_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<a[^>]*href="([^"]+)"[^>]*class="[^"]*url_header[^"]*"[\s\S]*?>"#)
+        .expect("valid regex")
+});
+
+static SEARXNG_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<h3[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)</a>"#).expect("valid regex")
+});
+
+static SEARXNG_SNIPPET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<p[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)</p>"#).expect("valid regex")
+});
+
+static STRIP_TAGS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<[^>]+>").expect("valid regex"));
 
 /// Web search tool for searching the internet.
 /// Supports multiple providers: DuckDuckGo (free), Brave (requires API key),
@@ -58,19 +92,13 @@ impl WebSearchTool {
 
     fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
         // Extract result links: <a class="result__a" href="...">Title</a>
-        let link_regex = Regex::new(
-            r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#,
-        )?;
-
         // Extract snippets: <a class="result__snippet">...</a>
-        let snippet_regex = Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#)?;
-
-        let link_matches: Vec<_> = link_regex
+        let link_matches: Vec<_> = DDG_LINK_RE
             .captures_iter(html)
             .take(self.max_results + 2)
             .collect();
 
-        let snippet_matches: Vec<_> = snippet_regex
+        let snippet_matches: Vec<_> = DDG_SNIPPET_RE
             .captures_iter(html)
             .take(self.max_results + 2)
             .collect();
@@ -204,14 +232,7 @@ impl WebSearchTool {
 
     fn parse_searxng_html(&self, html: &str, query: &str) -> anyhow::Result<String> {
         // <article class="result"> ... <a href="...">title</a> ... <p class="content">snippet</p>
-        let block_regex =
-            Regex::new(r#"<article[^>]*class="[^"]*result[^"]*"[^>]*>([\s\S]*?)</article>"#)?;
-        let link_regex =
-            Regex::new(r#"<a[^>]*href="([^"]+)"[^>]*class="[^"]*url_header[^"]*"[\s\S]*?>"#)?;
-        let title_regex = Regex::new(r#"<h3[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)</a>"#)?;
-        let snippet_regex = Regex::new(r#"<p[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)</p>"#)?;
-
-        let blocks: Vec<_> = block_regex
+        let blocks: Vec<_> = SEARXNG_BLOCK_RE
             .captures_iter(html)
             .take(self.max_results)
             .collect();
@@ -222,15 +243,15 @@ impl WebSearchTool {
         let mut lines = vec![format!("Search results for: {query} (via SearXNG)")];
         for (i, block) in blocks.iter().enumerate() {
             let body = &block[1];
-            let title = title_regex
+            let title = SEARXNG_TITLE_RE
                 .captures(body)
                 .map(|c| strip_tags(&c[1]).trim().to_string())
                 .unwrap_or_default();
-            let url = link_regex
+            let url = SEARXNG_LINK_RE
                 .captures(body)
                 .map(|c| c[1].to_string())
                 .unwrap_or_default();
-            let snippet = snippet_regex
+            let snippet = SEARXNG_SNIPPET_RE
                 .captures(body)
                 .map(|c| strip_tags(&c[1]).trim().to_string())
                 .unwrap_or_default();
@@ -294,8 +315,7 @@ fn decode_ddg_redirect_url(raw_url: &str) -> String {
 }
 
 fn strip_tags(content: &str) -> String {
-    let re = Regex::new(r"<[^>]+>").unwrap();
-    re.replace_all(content, "").to_string()
+    STRIP_TAGS_RE.replace_all(content, "").to_string()
 }
 
 #[async_trait]
@@ -400,6 +420,31 @@ mod tests {
         let result = tool.parse_duckduckgo_results(html, "test").unwrap();
         assert!(result.contains("Example Title"));
         assert!(result.contains("https://example.com"));
+    }
+
+    #[test]
+    fn test_parse_searxng_html_extracts_title_url_snippet() {
+        let tool = WebSearchTool::new("searxng".to_string(), None, None, 5, 15);
+        let html = r#"
+            <article class="result">
+                <h3><a href="https://example.com">Example Title</a></h3>
+                <a href="https://example.com" class="url_header">example.com</a>
+                <p class="content">This is a description</p>
+            </article>
+        "#;
+        let result = tool.parse_searxng_html(html, "test").unwrap();
+        assert!(result.contains("Example Title"));
+        assert!(result.contains("https://example.com"));
+        assert!(result.contains("This is a description"));
+    }
+
+    #[test]
+    fn test_parse_searxng_html_empty() {
+        let tool = WebSearchTool::new("searxng".to_string(), None, None, 5, 15);
+        let result = tool
+            .parse_searxng_html("<html>No results here</html>", "test")
+            .unwrap();
+        assert!(result.contains("No results found"));
     }
 
     #[test]

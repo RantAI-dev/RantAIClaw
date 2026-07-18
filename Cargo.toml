@@ -277,6 +277,17 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 kb = ["dep:sqlite-vec", "dep:lopdf", "rag-pdf"]
 # kb-office = Office-document ingestion for the KB (docx/xlsx/pptx)
 kb-office = ["kb", "dep:calamine", "dep:docx-rs"]
+# kb-ocr = OCR ingestion prototype (SPIKE, non-default). Routes
+# `ProcessingOptions.use_ocr_pipeline` through a local/self-hosted Ollama
+# vision-model HTTP call (`OllamaOcrExtractor`) instead of the permanent
+# fail-fast error. No new Cargo dependency: the extractor reuses `reqwest`,
+# `serde_json`, and `base64`, which are already unconditional deps (used by
+# `kb::extract::mineru`/`kb::file::image` today), so this flag adds zero
+# binary-size cost to non-kb-ocr builds — it exists purely to gate the
+# runtime behavior change. See docs/kb/ocr-design.md for the backend
+# comparison (this vs. tesseract/leptonica system-lib bindings) and open
+# questions before any production build-out.
+kb-ocr = ["kb"]
 # remote-install = ssh transport (russh) + tmux pty driver for piloting remote installers
 remote-install = ["dep:russh", "dep:russh-keys", "dep:russh-sftp"]
 # Note: a future `kb-lancedb` feature + `lancedb` dep will land together with
