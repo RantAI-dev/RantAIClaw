@@ -5,7 +5,8 @@ use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 // ── Error Classification ─────────────────────────────────────────────────
@@ -657,9 +658,13 @@ impl Provider for ReliableProvider {
     /// `chat()` and emits one big chunk — which kills real streaming for
     /// the TUI. Delegate to the first provider's own `chat_stream` so SSE
     /// deltas reach the caller token-by-token. Retry/fallback is skipped
-    /// here to keep streaming linear; if the streaming call fails, we
-    /// fall back to the non-streaming `chat()` (which has full
-    /// retry/fallback) and emit its result as a single chunk.
+    /// here to keep streaming linear; if the streaming call fails, we fall
+    /// back to the non-streaming `chat()` (which has full retry/fallback).
+    /// If the primary already streamed partial deltas before failing, the
+    /// fallback's full text is NOT re-emitted on `text_tx` — the caller has
+    /// already displayed those deltas, and re-sending the whole response
+    /// would duplicate it. The returned `ChatResponse` always carries the
+    /// complete text either way.
     async fn chat_stream(
         &self,
         request: ChatRequest<'_>,
@@ -667,16 +672,35 @@ impl Provider for ReliableProvider {
         temperature: f64,
         text_tx: tokio::sync::mpsc::Sender<String>,
     ) -> anyhow::Result<ChatResponse> {
+        let emitted = Arc::new(AtomicBool::new(false));
         if let Some((_, provider)) = self.providers.first() {
             if provider.supports_streaming() {
+                // Relay the primary's deltas through an intermediate channel so
+                // we can observe whether anything was actually forwarded before
+                // deciding whether to re-emit on fallback below.
+                let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<String>(64);
+                let real_tx = text_tx.clone();
+                let emitted_c = emitted.clone();
+                let pump = tokio::spawn(async move {
+                    while let Some(s) = relay_rx.recv().await {
+                        emitted_c.store(true, Ordering::SeqCst);
+                        if real_tx.send(s).await.is_err() {
+                            break;
+                        }
+                    }
+                });
                 let req = ChatRequest {
                     messages: request.messages,
                     tools: request.tools,
                 };
-                match provider
-                    .chat_stream(req, model, temperature, text_tx.clone())
-                    .await
-                {
+                let result = provider
+                    .chat_stream(req, model, temperature, relay_tx)
+                    .await;
+                // `relay_tx` was moved into the call above, so it's fully
+                // dropped once `chat_stream` returns; that ends the pump's
+                // `recv()` loop and lets `pump.await` complete.
+                let _ = pump.await;
+                match result {
                     Ok(resp) => return Ok(resp),
                     Err(e) => {
                         tracing::warn!(
@@ -693,9 +717,11 @@ impl Provider for ReliableProvider {
             tools: request.tools,
         };
         let response = self.chat(req, model, temperature).await?;
-        if let Some(text) = response.text.as_deref() {
-            if !text.is_empty() {
-                let _ = text_tx.send(text.to_string()).await;
+        if !emitted.load(Ordering::SeqCst) {
+            if let Some(text) = response.text.as_deref() {
+                if !text.is_empty() {
+                    let _ = text_tx.send(text.to_string()).await;
+                }
             }
         }
         Ok(response)
@@ -2088,5 +2114,171 @@ mod tests {
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── chat_stream fallback double-emit regression tests ──────────────
+
+    /// Mock provider for `chat_stream` fallback tests: `chat_stream` emits
+    /// zero or more deltas and then either succeeds or fails; the
+    /// non-streaming `chat_with_system` backs the fallback path that
+    /// `ReliableProvider::chat_stream` calls into when streaming fails.
+    struct StreamingMock {
+        deltas: Vec<&'static str>,
+        stream_result: Result<&'static str, &'static str>,
+        fallback_response: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for StreamingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(self.fallback_response.to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            text_tx: tokio::sync::mpsc::Sender<String>,
+        ) -> anyhow::Result<ChatResponse> {
+            for delta in &self.deltas {
+                let _ = text_tx.send(delta.to_string()).await;
+            }
+            match self.stream_result {
+                Ok(text) => Ok(ChatResponse {
+                    text: Some(text.to_string()),
+                    tool_calls: vec![],
+                }),
+                Err(e) => anyhow::bail!(e),
+            }
+        }
+    }
+
+    /// Drain everything currently buffered on `rx` without blocking.
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(s) = rx.try_recv() {
+            out.push(s);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn fallback_after_partial_does_not_reemit() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(StreamingMock {
+                    deltas: vec!["Hello"],
+                    stream_result: Err("mid-stream failure"),
+                    fallback_response: "Hello world",
+                }) as Box<dyn Provider>,
+            )],
+            1,
+            1,
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let response = provider
+            .chat_stream(request, "test", 0.0, tx)
+            .await
+            .unwrap();
+
+        let received = drain(&mut rx);
+        assert_eq!(
+            received,
+            vec!["Hello".to_string()],
+            "the fallback must not re-emit the full text after a partial delta already went out"
+        );
+        assert_eq!(
+            response.text.as_deref(),
+            Some("Hello world"),
+            "the returned ChatResponse must still carry the complete fallback text"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_with_no_partial_still_emits() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(StreamingMock {
+                    deltas: vec![],
+                    stream_result: Err("immediate failure"),
+                    fallback_response: "fallback text",
+                }) as Box<dyn Provider>,
+            )],
+            1,
+            1,
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let response = provider
+            .chat_stream(request, "test", 0.0, tx)
+            .await
+            .unwrap();
+
+        let received = drain(&mut rx);
+        assert_eq!(
+            received,
+            vec!["fallback text".to_string()],
+            "with no partial deltas emitted, the fallback text must still be sent once"
+        );
+        assert_eq!(response.text.as_deref(), Some("fallback text"));
+    }
+
+    #[tokio::test]
+    async fn happy_path_streams_through() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(StreamingMock {
+                    deltas: vec!["Hel", "lo"],
+                    stream_result: Ok("Hello"),
+                    fallback_response: "should not be used",
+                }) as Box<dyn Provider>,
+            )],
+            1,
+            1,
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let response = provider
+            .chat_stream(request, "test", 0.0, tx)
+            .await
+            .unwrap();
+
+        let received = drain(&mut rx);
+        assert_eq!(
+            received,
+            vec!["Hel".to_string(), "lo".to_string()],
+            "on the happy path, deltas pass through and there is no fallback emit"
+        );
+        assert_eq!(response.text.as_deref(), Some("Hello"));
     }
 }
