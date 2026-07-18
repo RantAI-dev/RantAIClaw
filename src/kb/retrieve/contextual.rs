@@ -104,10 +104,11 @@ async fn fetch_prefixes(
     body: &serde_json::Value,
     expected_len: usize,
 ) -> Result<Vec<String>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(TIMEOUT)
-        .build()
-        .map_err(|e| format!("client build: {e}"))?;
+    let client = crate::config::build_runtime_proxy_client_with_timeouts(
+        "kb.retrieve.contextual",
+        TIMEOUT.as_secs(),
+        10,
+    );
     let resp = client
         .post(url)
         .bearer_auth(api_key)

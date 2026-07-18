@@ -176,10 +176,11 @@ async fn fetch_rewrite(
     api_key: &str,
     body: &serde_json::Value,
 ) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(TIMEOUT)
-        .build()
-        .map_err(|e| format!("client build: {e}"))?;
+    let client = crate::config::build_runtime_proxy_client_with_timeouts(
+        "kb.retrieve.standalone_query",
+        TIMEOUT.as_secs(),
+        10,
+    );
     let resp = client
         .post(url)
         .bearer_auth(api_key)

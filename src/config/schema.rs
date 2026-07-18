@@ -1789,6 +1789,43 @@ pub fn build_runtime_proxy_client_with_timeouts(
     client
 }
 
+/// Like `build_runtime_proxy_client_with_timeouts`, but also disables
+/// redirect-following (`Policy::none()`), for callers that need SSRF-safe
+/// no-redirect behavior (e.g. `tool.http_request`).
+///
+/// The cache key appends a `|redirect=none` discriminator on top of the
+/// existing `service_key|timeout|connect_timeout` key so a no-redirect
+/// client never aliases with a normal client built for the same
+/// service/timeouts via `build_runtime_proxy_client_with_timeouts`.
+pub fn build_runtime_proxy_client_no_redirect(
+    service_key: &str,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    let cache_key = format!(
+        "{}|redirect=none",
+        runtime_proxy_cache_key(service_key, Some(timeout_secs), Some(connect_timeout_secs))
+    );
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = apply_runtime_proxy_to_builder(builder, service_key);
+    let client = builder.build().unwrap_or_else(|error| {
+        tracing::warn!(
+            service_key,
+            "Failed to build proxied no-redirect client: {error}"
+        );
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    client
+}
+
 fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "environment" | "env" => Some(ProxyScope::Environment),
@@ -6820,6 +6857,42 @@ default_model = "legacy-model"
 
         set_runtime_proxy_config(ProxyConfig::default());
         assert!(!runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn build_runtime_proxy_client_no_redirect_is_cached() {
+        let service_key = format!(
+            "provider.cache_no_redirect_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let no_redirect_cache_key = format!(
+            "{}|redirect=none",
+            runtime_proxy_cache_key(&service_key, Some(20), Some(10))
+        );
+        let normal_cache_key = runtime_proxy_cache_key(&service_key, Some(20), Some(10));
+
+        clear_runtime_proxy_client_cache();
+        assert!(!runtime_proxy_cache_contains(&no_redirect_cache_key));
+        assert!(!runtime_proxy_cache_contains(&normal_cache_key));
+
+        // Two calls with the same key reuse the cached client — the cache
+        // gains exactly one entry for the no-redirect key.
+        let _ = build_runtime_proxy_client_no_redirect(&service_key, 20, 10);
+        assert!(runtime_proxy_cache_contains(&no_redirect_cache_key));
+        let _ = build_runtime_proxy_client_no_redirect(&service_key, 20, 10);
+        assert!(runtime_proxy_cache_contains(&no_redirect_cache_key));
+
+        // A normal (redirect-following) client for the same service key and
+        // timeouts must land in a SEPARATE cache entry — the redirect
+        // discriminator prevents aliasing between the two variants.
+        assert!(!runtime_proxy_cache_contains(&normal_cache_key));
+        let _ = build_runtime_proxy_client_with_timeouts(&service_key, 20, 10);
+        assert!(runtime_proxy_cache_contains(&normal_cache_key));
+        assert!(runtime_proxy_cache_contains(&no_redirect_cache_key));
+        assert_ne!(no_redirect_cache_key, normal_cache_key);
     }
 
     #[test]
