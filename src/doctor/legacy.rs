@@ -437,7 +437,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {
-    match crate::providers::create_provider(name, None) {
+    // Validate the provider spec's SHAPE (name / custom URL), not credential
+    // presence: pass a placeholder key so providers that now require one at
+    // construction (e.g. the rig `anthropic-custom:` path) don't report a
+    // missing key as an invalid-shape error. Credential presence is checked
+    // separately (see `has_usable_credential`).
+    match crate::providers::create_provider(name, Some("doctor-shape-check")) {
         Ok(_) => None,
         Err(err) => Some(
             err.to_string()
