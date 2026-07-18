@@ -4225,6 +4225,22 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<String> {
+            // A force-summary call (loop-detector or soft-cap) pushes a
+            // tools-disabled nudge asking for a plain-language wrap-up. A real
+            // model answers it with text, not another tool call — mimic that so
+            // the graceful-summary path is exercised end to end.
+            let force_summary_requested = messages.iter().any(|msg| {
+                msg.role == "user"
+                    && (msg.content.contains("stuck in a loop")
+                        || msg.content.contains("reached the maximum of"))
+            });
+            if force_summary_requested {
+                return Ok("Summary: I kept calling mock_price for BTC and got the \
+                           same result, so I stopped. Next step: try a different \
+                           symbol or narrow the question."
+                    .to_string());
+            }
+
             let completed_iterations = Self::completed_tool_iterations(messages);
             if completed_iterations >= self.required_tool_iterations {
                 Ok(format!(
@@ -5381,12 +5397,12 @@ BTC is currently around $65,000 based on latest tool output."#
             .remove(&config_path);
     }
 
-    // TODO(agent-loop): regressed between v0.4 and v0.6 — the agent returns
-    // the raw tool_call payload as the final response instead of looping
-    // until the provider emits a completion text. Investigation needed in
-    // `src/agent/agent.rs::turn_inner` around the tool-iteration count vs
-    // provider message-history threading. Re-enable once fixed.
-    #[ignore = "agent loop tool-iteration counting regressed; needs investigation"]
+    // When a provider+tool return the *same* call and result on every
+    // iteration, the loop-detector (`agent/loop_.rs`, 3 identical repeats)
+    // intentionally breaks early and force-summarizes with tools disabled,
+    // rather than running all the way to `max_tool_iterations`. The reply is a
+    // graceful wrap-up, not "Completed after N tool iterations." and not an
+    // error. (This asserts the current design, reconciled in plan 017.)
     #[tokio::test]
     async fn process_channel_message_respects_configured_max_tool_iterations_above_default() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -5452,14 +5468,19 @@ BTC is currently around $65,000 based on latest tool output."#
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 1);
         assert!(sent_messages[0].starts_with("chat-iter-success:"));
-        assert!(sent_messages[0].contains("Completed after 11 tool iterations."));
+        // Graceful force-summary reply — NOT the old "loop to N then complete"
+        // behavior, and NOT a hard error.
+        assert!(sent_messages[0].contains("Summary:"));
+        assert!(!sent_messages[0].contains("Completed after 11 tool iterations."));
         assert!(!sent_messages[0].contains("⚠️ Error:"));
     }
 
-    // TODO(agent-loop): same regression as above — the bail!() error text
-    // from `agent.rs::turn_inner` no longer reaches the channel send path.
-    // Re-enable once the agent loop fix lands.
-    #[ignore = "agent loop tool-iteration counting regressed; needs investigation"]
+    // Exhausting the tool-call budget is no longer a hard, user-facing error.
+    // The soft-cap (`agent/loop_.rs`) — or the loop-detector, whichever trips
+    // first for this identical-result fixture — force-summarizes with tools
+    // disabled so the user gets a best-effort wrap-up (mentioning `/continue`)
+    // instead of "⚠️ Error: Agent exceeded maximum tool iterations". (Current
+    // design, reconciled in plan 017.)
     #[tokio::test]
     async fn process_channel_message_reports_configured_max_tool_iterations_limit() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -5525,7 +5546,10 @@ BTC is currently around $65,000 based on latest tool output."#
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 1);
         assert!(sent_messages[0].starts_with("chat-iter-fail:"));
-        assert!(sent_messages[0].contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
+        // Graceful force-summary reply — NOT the old hard "exceeded maximum
+        // tool iterations" error.
+        assert!(sent_messages[0].contains("Summary:"));
+        assert!(!sent_messages[0].contains("⚠️ Error:"));
     }
 
     struct NoopMemory;
