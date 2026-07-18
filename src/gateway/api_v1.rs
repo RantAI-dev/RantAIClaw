@@ -1031,6 +1031,33 @@ async fn channels_list(
     if cfg.channels_config.whatsapp.is_some() {
         configured.push("whatsapp");
     }
+    if cfg.channels_config.webhook.is_some() {
+        configured.push("webhook");
+    }
+    if cfg!(feature = "channel-matrix") && cfg.channels_config.matrix.is_some() {
+        configured.push("matrix");
+    }
+    if cfg.channels_config.linq.is_some() {
+        configured.push("linq");
+    }
+    if cfg.channels_config.nextcloud_talk.is_some() {
+        configured.push("nextcloud_talk");
+    }
+    if cfg.channels_config.email.is_some() {
+        configured.push("email");
+    }
+    if cfg.channels_config.irc.is_some() {
+        configured.push("irc");
+    }
+    if cfg!(feature = "channel-lark") && cfg.channels_config.lark.is_some() {
+        configured.push("lark");
+    }
+    if cfg.channels_config.dingtalk.is_some() {
+        configured.push("dingtalk");
+    }
+    if cfg.channels_config.qq.is_some() {
+        configured.push("qq");
+    }
     Ok(Json(serde_json::json!({
         "configured": configured,
         "count": configured.len(),
@@ -1042,8 +1069,14 @@ async fn channels_list(
 // ────────────────────────────────────────────────────────────────────────────
 
 async fn providers_list(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    // Gated like every other `/api/v1` data route: the module contract says all
+    // endpoints (except `version`/`auth/info`) require a bearer token when
+    // pairing is enabled. The payload is only the static provider catalog, but
+    // leaving it open silently contradicted that deny-by-default posture.
+    check_auth(&state, &headers)?;
     let providers = crate::providers::list_providers();
     let json: Vec<_> = providers
         .iter()
@@ -1458,5 +1491,45 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
         assert_eq!(json["config_fingerprint"], "abc123");
         assert_eq!(json["name"], "rantaiclaw");
+    }
+
+    /// Build a state fixture with pairing enabled and one known token.
+    fn paired_state(token: &str) -> AppState {
+        let mut state = test_state();
+        state.pairing = Arc::new(crate::security::pairing::PairingGuard::new(
+            true,
+            &[token.to_string()],
+        ));
+        state
+    }
+
+    #[tokio::test]
+    async fn providers_list_requires_auth_when_pairing_enabled() {
+        // Regression guard: `/api/v1/providers` must honor the same bearer-auth
+        // contract as the rest of `/api/v1` when pairing is on.
+        let err = providers_list(State(paired_state("tok")), HeaderMap::new())
+            .await
+            .expect_err("missing bearer must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn providers_list_with_valid_token_returns_catalog() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer tok".parse().unwrap());
+        let resp = providers_list(State(paired_state("tok")), headers)
+            .await
+            .expect("authenticated request should succeed");
+        assert!(resp.0["count"].as_u64().unwrap() > 0);
+        assert!(resp.0["providers"].is_array());
+    }
+
+    #[tokio::test]
+    async fn providers_list_public_when_pairing_disabled() {
+        // Local-dev default (require_pairing = false): still open, unchanged.
+        let resp = providers_list(State(test_state()), HeaderMap::new())
+            .await
+            .expect("open in local dev");
+        assert!(resp.0["providers"].is_array());
     }
 }

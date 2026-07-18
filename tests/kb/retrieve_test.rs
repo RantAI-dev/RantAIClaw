@@ -383,6 +383,15 @@ impl IntelligenceStore for FakeIntel {
     async fn add_relation(&self, _r: &Relation) -> KbResult<()> {
         unimplemented!("FakeIntel only exercises graph_expand_chunks")
     }
+    async fn store_intelligence(
+        &self,
+        _document_id: &str,
+        _entities: &[Entity],
+        _mentions: &[EntityMention],
+        _relations: &[Relation],
+    ) -> KbResult<()> {
+        unimplemented!("FakeIntel only exercises graph_expand_chunks")
+    }
     async fn intelligence_for_document(
         &self,
         _document_id: &str,

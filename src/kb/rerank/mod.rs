@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 
-use crate::kb::{KbConfig, KbResult};
+use crate::kb::{KbConfig, KbError, KbResult};
 
 pub mod cohere;
 pub mod llm;
@@ -152,4 +152,113 @@ where
     }
 
     out
+}
+
+/// Shared POST-and-parse transport for the rerank HTTP backends (Cohere,
+/// vLLM, LLM-as-judge). Builds the request, sends it, maps a non-2xx status
+/// to `KbError::ChatApi`, then deserializes the body into the caller's own
+/// response type — the three backends' response *shapes* genuinely differ,
+/// so only the transport is shared here; each backend keeps its own body
+/// construction and response-schema mapping.
+///
+/// `api_key = None` omits the `Authorization` header (used by `VllmReranker`,
+/// which talks to an unauthenticated in-cluster sidecar).
+///
+/// Extracted once the third backend (`vllm`) lined up the exact same
+/// post/status-check/parse shape as `cohere` and `llm` (rule-of-three). A
+/// fourth rerank backend should call this from day one rather than
+/// re-inlining `post().json().send()` + status-check + `resp.json()`.
+pub(in crate::kb::rerank) async fn post_json_rerank<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    body: &serde_json::Value,
+) -> KbResult<T> {
+    let mut req = http.post(endpoint).json(body);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(KbError::ChatApi {
+            status: status.as_u16(),
+            body: truncate(&text, 300),
+        });
+    }
+
+    Ok(resp.json::<T>().await?)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let cut = s
+            .char_indices()
+            .take(max)
+            .last()
+            .map(|(idx, ch)| idx + ch.len_utf8())
+            .unwrap_or(0);
+        format!("{}…", &s[..cut])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::post_json_rerank;
+    use crate::kb::KbError;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestBody {
+        ok: bool,
+    }
+
+    #[tokio::test]
+    async fn post_json_rerank_parses_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let body = serde_json::json!({ "query": "q" });
+        let parsed: TestBody = post_json_rerank(&http, &server.uri(), None, &body)
+            .await
+            .expect("2xx response parses into caller's schema");
+        assert_eq!(parsed, TestBody { ok: true });
+    }
+
+    #[tokio::test]
+    async fn post_json_rerank_maps_error_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let body = serde_json::json!({ "query": "q" });
+        let err = post_json_rerank::<TestBody>(&http, &server.uri(), None, &body)
+            .await
+            .expect_err("non-2xx must surface as ChatApi");
+        match err {
+            KbError::ChatApi { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("boom"), "body = {body}");
+            }
+            other => panic!("expected KbError::ChatApi(500), got {other:?}"),
+        }
+    }
 }

@@ -534,3 +534,281 @@ async fn hard_delete_clears_intelligence_soft_delete_keeps_it() {
         "soft delete must preserve the document's intelligence"
     );
 }
+
+#[tokio::test]
+async fn store_intelligence_persists_all() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, Relation};
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    let alice = Entity {
+        id: "e_alice".into(),
+        canonical_key: "alice:Person".into(),
+        name: "Alice".into(),
+        entity_type: EntityType::Person,
+        confidence: 0.9,
+        metadata: serde_json::json!({}),
+    };
+    let corp = Entity {
+        id: "e_corp".into(),
+        canonical_key: "techcorp:Organization".into(),
+        name: "TechCorp".into(),
+        entity_type: EntityType::Organization,
+        confidence: 0.95,
+        metadata: serde_json::json!({}),
+    };
+    let mentions = vec![
+        EntityMention {
+            id: "m1".into(),
+            entity_id: alice.id.clone(),
+            document_id: "d1".into(),
+            chunk_index: Some(0),
+            context: None,
+            source: ExtractSource::Llm,
+        },
+        EntityMention {
+            id: "m2".into(),
+            entity_id: corp.id.clone(),
+            document_id: "d1".into(),
+            chunk_index: Some(0),
+            context: None,
+            source: ExtractSource::Llm,
+        },
+    ];
+    let relations = vec![Relation {
+        id: "r1".into(),
+        source_entity_id: alice.id.clone(),
+        target_entity_id: corp.id.clone(),
+        relation_type: RelationType::WorksFor,
+        confidence: 0.85,
+        document_id: "d1".into(),
+        metadata: serde_json::json!({}),
+    }];
+
+    store
+        .store_intelligence("d1", &[alice.clone(), corp.clone()], &mentions, &relations)
+        .await
+        .unwrap();
+
+    let (entities, got_relations) = store.intelligence_for_document("d1").await.unwrap();
+    assert_eq!(entities.len(), 2, "both entities landed");
+    assert_eq!(got_relations.len(), 1, "the relation landed");
+    assert_eq!(got_relations[0].source_entity_id, alice.id);
+    assert_eq!(got_relations[0].target_entity_id, corp.id);
+
+    let graph = store.graph(None, 100).await.unwrap();
+    assert_eq!(graph.nodes.len(), 2, "both entities are graph nodes");
+    assert!(
+        graph.nodes.iter().all(|n| n.doc_count == 1),
+        "each entity mentioned in exactly one document"
+    );
+}
+
+#[tokio::test]
+async fn store_intelligence_cross_document_merge() {
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, Relation};
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    // Doc A: "Acme" entity, mentioned once, with its own provisional id.
+    let acme_a = Entity {
+        id: "provA_acme".into(),
+        canonical_key: "acme:Organization".into(),
+        name: "Acme".into(),
+        entity_type: EntityType::Organization,
+        confidence: 0.9,
+        metadata: serde_json::json!({}),
+    };
+    store
+        .store_intelligence(
+            "docA",
+            &[acme_a.clone()],
+            &[EntityMention {
+                id: "mA".into(),
+                entity_id: acme_a.id.clone(),
+                document_id: "docA".into(),
+                chunk_index: Some(0),
+                context: None,
+                source: ExtractSource::Llm,
+            }],
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let (entities_a, _) = store.intelligence_for_document("docA").await.unwrap();
+    assert_eq!(entities_a.len(), 1);
+    // Nothing collided yet, so the surviving id equals the provisional one.
+    let surviving_id = entities_a[0].id.clone();
+    assert_eq!(surviving_id, acme_a.id);
+
+    // Doc B: SAME canonical_key as Acme but a FRESH, DIFFERENT provisional id
+    // (mimics a second document's independent extraction), plus a distinct
+    // "Beta" entity and a relation wired against Acme's PROVISIONAL id.
+    let acme_b = Entity {
+        id: "provB_acme".into(),
+        canonical_key: "acme:Organization".into(),
+        ..acme_a.clone()
+    };
+    assert_ne!(
+        acme_b.id, acme_a.id,
+        "doc B must use a fresh provisional id"
+    );
+    let beta = Entity {
+        id: "provB_beta".into(),
+        canonical_key: "beta:Organization".into(),
+        name: "Beta".into(),
+        entity_type: EntityType::Organization,
+        confidence: 0.8,
+        metadata: serde_json::json!({}),
+    };
+    store
+        .store_intelligence(
+            "docB",
+            &[acme_b.clone(), beta.clone()],
+            &[
+                EntityMention {
+                    id: "mB1".into(),
+                    entity_id: acme_b.id.clone(),
+                    document_id: "docB".into(),
+                    chunk_index: Some(0),
+                    context: None,
+                    source: ExtractSource::Llm,
+                },
+                EntityMention {
+                    id: "mB2".into(),
+                    entity_id: beta.id.clone(),
+                    document_id: "docB".into(),
+                    chunk_index: Some(0),
+                    context: None,
+                    source: ExtractSource::Llm,
+                },
+            ],
+            &[Relation {
+                id: "rB".into(),
+                source_entity_id: acme_b.id.clone(),
+                target_entity_id: beta.id.clone(),
+                relation_type: RelationType::WorksFor,
+                confidence: 0.7,
+                document_id: "docB".into(),
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    // REGRESSION GUARD: without the in-transaction remap, docB's mention/
+    // relation would still carry the provisional id "provB_acme", which was
+    // never inserted as its own entity row (ON CONFLICT kept docA's row) —
+    // the mention would orphan (drop out of the JOIN) and the relation would
+    // carry a dangling source_entity_id.
+    let (entities_b, relations_b) = store.intelligence_for_document("docB").await.unwrap();
+    assert_eq!(entities_b.len(), 2, "docB must see Acme (merged) + Beta");
+    assert!(
+        entities_b.iter().any(|e| e.id == surviving_id),
+        "docB's Acme mention must resolve to docA's surviving id {surviving_id}, not the \
+         provisional id {}; entities_b={entities_b:?}",
+        acme_b.id
+    );
+    assert_eq!(relations_b.len(), 1);
+    assert_eq!(
+        relations_b[0].source_entity_id, surviving_id,
+        "relation source must remap through to the surviving id, not the provisional id"
+    );
+    let beta_surviving_id = entities_b
+        .iter()
+        .find(|e| e.name == "Beta")
+        .expect("Beta entity present")
+        .id
+        .clone();
+    assert_eq!(relations_b[0].target_entity_id, beta_surviving_id);
+
+    // Global graph view: exactly 2 merged nodes; Acme's doc_count reflects
+    // BOTH documents, proving the merge (not a duplicate node per document).
+    let graph = store.graph(None, 100).await.unwrap();
+    assert_eq!(
+        graph.nodes.len(),
+        2,
+        "one merged Acme node + one Beta node, not 3"
+    );
+    let acme_node = graph
+        .nodes
+        .iter()
+        .find(|n| n.id == surviving_id)
+        .expect("surviving Acme node present");
+    assert_eq!(acme_node.doc_count, 2, "Acme merged across docA + docB");
+}
+
+#[tokio::test]
+async fn store_intelligence_reingest_idempotent() {
+    use async_trait::async_trait;
+    use rantaiclaw::kb::intelligence::extract::{EntityRelationExtractor, Extracted};
+    use rantaiclaw::kb::intelligence::extract_document_intelligence;
+    use rantaiclaw::kb::store::{sqlite::SqliteStore, IntelligenceStore};
+    use tempfile::TempDir;
+
+    struct CannedExtractor;
+    #[async_trait]
+    impl EntityRelationExtractor for CannedExtractor {
+        async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
+            Ok(Extracted {
+                entities: vec![
+                    ("NQRust".into(), EntityType::Product, 0.9),
+                    ("NexusQuantum".into(), EntityType::Organization, 0.85),
+                ],
+                relations: vec![(
+                    "NQRust".into(),
+                    "NexusQuantum".into(),
+                    RelationType::PartOf,
+                    0.8,
+                )],
+            })
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let ext = CannedExtractor;
+
+    let summary1 = extract_document_intelligence(&store, &ext, "d1", &["chunk one"], "exact")
+        .await
+        .unwrap();
+    let summary2 = extract_document_intelligence(&store, &ext, "d1", &["chunk one"], "exact")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary1.entities, summary2.entities,
+        "IntelligenceSummary per-iteration entity count must stay stable across a re-ingest"
+    );
+    assert_eq!(
+        summary1.relations, summary2.relations,
+        "IntelligenceSummary relation count must stay stable across a re-ingest"
+    );
+
+    let (entities, relations) = store.intelligence_for_document("d1").await.unwrap();
+    assert_eq!(entities.len(), 2, "no duplicate entities after re-ingest");
+    assert_eq!(relations.len(), 1, "no duplicate relations after re-ingest");
+
+    let graph = store.graph(None, 100).await.unwrap();
+    assert_eq!(graph.nodes.len(), 2, "no duplicate graph nodes");
+    assert!(
+        graph.nodes.iter().all(|n| n.doc_count == 1),
+        "re-ingesting the SAME document must not double its doc_count: {:?}",
+        graph.nodes
+    );
+}

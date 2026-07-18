@@ -164,9 +164,11 @@ pub async fn validate_mcp_startup(
     env: &[(String, String)],
 ) -> Result<()> {
     let (cmd, args) = server.split_command();
-    let mut child = Command::new(&cmd)
-        .args(&args)
-        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    let env_map: HashMap<String, String> = env.iter().cloned().collect();
+    let mut child_cmd = Command::new(&cmd);
+    child_cmd.args(&args);
+    crate::mcp::apply_hardened_env(&mut child_cmd, &env_map);
+    let mut child = child_cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

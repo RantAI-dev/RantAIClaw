@@ -19,6 +19,8 @@ use crate::kb::{KbConfig, KbError, KbResult};
 
 pub mod hybrid;
 pub mod mineru;
+#[cfg(feature = "kb-ocr")]
+pub mod ocr_ollama;
 pub mod pdf_splitter;
 pub mod smart_router;
 pub mod text_layer_signals;

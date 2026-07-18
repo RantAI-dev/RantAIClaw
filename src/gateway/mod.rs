@@ -38,7 +38,7 @@ use axum::{
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -177,11 +177,37 @@ impl GatewayRateLimiter {
     }
 }
 
+/// Idempotency key lifecycle: `InProgress` while the request is being
+/// processed, `Done` once it has completed successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyState {
+    InProgress,
+    Done,
+}
+
+#[derive(Debug)]
+struct Entry {
+    state: KeyState,
+    seen_at: Instant,
+}
+
+/// Outcome of [`IdempotencyStore::begin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeginOutcome {
+    /// No prior entry (or it expired) — the caller should proceed and
+    /// eventually call `mark_done` or `abort`.
+    Started,
+    /// Another request with this key is currently being processed.
+    InProgress,
+    /// This key already completed successfully.
+    Done,
+}
+
 #[derive(Debug)]
 pub struct IdempotencyStore {
     ttl: Duration,
     max_keys: usize,
-    keys: Mutex<HashMap<String, Instant>>,
+    keys: Mutex<HashMap<String, Entry>>,
 }
 
 impl IdempotencyStore {
@@ -193,29 +219,60 @@ impl IdempotencyStore {
         }
     }
 
-    /// Returns true if this key is new and is now recorded.
-    fn record_if_new(&self, key: &str) -> bool {
+    /// Attempts to begin processing `key`. Expires stale entries (both
+    /// `InProgress` and `Done`) on every call so a dropped/cancelled handler
+    /// future (e.g. client disconnect) doesn't strand a key forever — after
+    /// `ttl`, a stranded `InProgress` entry is treated as new again.
+    fn begin(&self, key: &str) -> BeginOutcome {
         let now = Instant::now();
         let mut keys = self.keys.lock();
 
-        keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        keys.retain(|_, entry| now.duration_since(entry.seen_at) < self.ttl);
 
-        if keys.contains_key(key) {
-            return false;
+        match keys.get(key).map(|entry| entry.state) {
+            Some(KeyState::Done) => return BeginOutcome::Done,
+            Some(KeyState::InProgress) => return BeginOutcome::InProgress,
+            None => {}
         }
 
         if keys.len() >= self.max_keys {
             let evict_key = keys
                 .iter()
-                .min_by_key(|(_, seen_at)| *seen_at)
+                .min_by_key(|(_, entry)| entry.seen_at)
                 .map(|(k, _)| k.clone());
             if let Some(evict_key) = evict_key {
                 keys.remove(&evict_key);
             }
         }
 
-        keys.insert(key.to_owned(), now);
-        true
+        keys.insert(
+            key.to_owned(),
+            Entry {
+                state: KeyState::InProgress,
+                seen_at: now,
+            },
+        );
+        BeginOutcome::Started
+    }
+
+    /// Marks `key` as successfully completed, so a later retry with the
+    /// same key gets `BeginOutcome::Done` instead of being reprocessed.
+    fn mark_done(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        keys.insert(
+            key.to_owned(),
+            Entry {
+                state: KeyState::Done,
+                seen_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Removes `key` after a failed attempt so a retry with the same key is
+    /// reprocessed rather than permanently rejected.
+    fn abort(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        keys.remove(key);
     }
 }
 
@@ -351,29 +408,21 @@ pub struct AppState {
     pub web_approvals: Arc<crate::security::PendingApprovals>,
 }
 
-/// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+/// Build the full gateway [`AppState`] and [`Router`] from `config`, using the
+/// SAME public factories `run_gateway` uses to construct the provider, memory
+/// backend, tools, and pairing guard. These factories are synchronous and
+/// lazy (credential resolution only; no network I/O happens at construction
+/// time), so this fn is cheap and hermetic — safe to call from a temp-dir
+/// test config.
+///
+/// `pub` (not `pub(crate)`): exposed for embedding and for integration tests
+/// under `tests/`, which compile as a separate crate and cannot see
+/// `pub(crate)` items. `run_gateway` calls this so there remains ONE source
+/// of truth for `AppState`/route construction; it then binds the listener,
+/// starts the optional tunnel, and serves the returned router itself.
 #[allow(clippy::too_many_lines)]
-pub async fn run_gateway(
-    host: &str,
-    port: u16,
-    config: Config,
-    shutdown: tokio_util::sync::CancellationToken,
-) -> Result<()> {
-    // ── Security: refuse public bind without tunnel or explicit opt-in ──
-    if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
-    {
-        anyhow::bail!(
-            "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
-             Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
-             [gateway] allow_public_bind = true in config.toml (NOT recommended)."
-        );
-    }
+pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
     let config_state = Arc::new(Mutex::new(config.clone()));
-
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let actual_port = listener.local_addr()?.port();
-    let display_addr = format!("{host}:{actual_port}");
 
     let gateway_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let gateway_provider_credential = config.resolve_key_for_provider(gateway_provider_name);
@@ -578,57 +627,6 @@ pub async fn run_gateway(
         idempotency_max_keys,
     ));
 
-    // ── Tunnel ────────────────────────────────────────────────
-    let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
-    let mut tunnel_url: Option<String> = None;
-
-    if let Some(ref tun) = tunnel {
-        println!("🔗 Starting {} tunnel...", tun.name());
-        match tun.start(host, actual_port).await {
-            Ok(url) => {
-                println!("🌐 Tunnel active: {url}");
-                tunnel_url = Some(url);
-            }
-            Err(e) => {
-                println!("⚠️  Tunnel failed to start: {e}");
-                println!("   Falling back to local-only mode.");
-            }
-        }
-    }
-
-    println!("🦀 RantaiClaw Gateway listening on http://{display_addr}");
-    if let Some(ref url) = tunnel_url {
-        println!("  🌐 Public URL: {url}");
-    }
-    println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
-    println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
-    if whatsapp_channel.is_some() {
-        println!("  GET  /whatsapp  — Meta webhook verification");
-        println!("  POST /whatsapp  — WhatsApp message webhook");
-    }
-    if linq_channel.is_some() {
-        println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
-    }
-    if nextcloud_talk_channel.is_some() {
-        println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
-    }
-    println!("  GET  /health    — liveness check");
-    println!("  GET  /readyz    — readiness check (503 if a component is down)");
-    println!("  GET  /metrics   — Prometheus metrics");
-    if let Some(code) = pairing.pairing_code() {
-        println!();
-        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
-        println!("     ┌──────────────┐");
-        println!("     │  {code}  │");
-        println!("     └──────────────┘");
-        println!("     Send: POST /pair with header X-Pairing-Code: {code}");
-    } else if pairing.require_pairing() {
-        println!("  🔒 Pairing: ACTIVE (bearer token required)");
-    } else {
-        println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
-    }
-    println!("  Press Ctrl+C to stop.\n");
-
     crate::health::mark_component_ok("gateway");
 
     // Build shared state
@@ -741,7 +739,86 @@ pub async fn run_gateway(
     #[cfg(feature = "kb")]
     let app = app.merge(crate::kb::axi::api::router());
 
-    let app = app.with_state(state);
+    let app = app.with_state(state.clone());
+
+    Ok((state, app))
+}
+
+/// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+#[allow(clippy::too_many_lines)]
+pub async fn run_gateway(
+    host: &str,
+    port: u16,
+    config: Config,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    // ── Security: refuse public bind without tunnel or explicit opt-in ──
+    if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
+    {
+        anyhow::bail!(
+            "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
+             Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
+             [gateway] allow_public_bind = true in config.toml (NOT recommended)."
+        );
+    }
+
+    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let actual_port = listener.local_addr()?.port();
+    let display_addr = format!("{host}:{actual_port}");
+
+    let (state, app) = build_gateway_router(config.clone())?;
+
+    // ── Tunnel ────────────────────────────────────────────────
+    let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
+    let mut tunnel_url: Option<String> = None;
+
+    if let Some(ref tun) = tunnel {
+        println!("🔗 Starting {} tunnel...", tun.name());
+        match tun.start(host, actual_port).await {
+            Ok(url) => {
+                println!("🌐 Tunnel active: {url}");
+                tunnel_url = Some(url);
+            }
+            Err(e) => {
+                println!("⚠️  Tunnel failed to start: {e}");
+                println!("   Falling back to local-only mode.");
+            }
+        }
+    }
+
+    println!("🦀 RantaiClaw Gateway listening on http://{display_addr}");
+    if let Some(ref url) = tunnel_url {
+        println!("  🌐 Public URL: {url}");
+    }
+    println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
+    println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
+    if state.whatsapp.is_some() {
+        println!("  GET  /whatsapp  — Meta webhook verification");
+        println!("  POST /whatsapp  — WhatsApp message webhook");
+    }
+    if state.linq.is_some() {
+        println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
+    }
+    if state.nextcloud_talk.is_some() {
+        println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
+    }
+    println!("  GET  /health    — liveness check");
+    println!("  GET  /readyz    — readiness check (503 if a component is down)");
+    println!("  GET  /metrics   — Prometheus metrics");
+    if let Some(code) = state.pairing.pairing_code() {
+        println!();
+        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
+        println!("     ┌──────────────┐");
+        println!("     │  {code}  │");
+        println!("     └──────────────┘");
+        println!("     Send: POST /pair with header X-Pairing-Code: {code}");
+    } else if state.pairing.require_pairing() {
+        println!("  🔒 Pairing: ACTIVE (bearer token required)");
+    } else {
+        println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
+    }
+    println!("  Press Ctrl+C to stop.\n");
 
     // Run the server. `with_graceful_shutdown` lets in-flight requests finish
     // (and stops accepting new connections) when `shutdown` is cancelled,
@@ -1072,6 +1149,16 @@ struct GatewayChatResult {
     denied_tools: Vec<String>,
 }
 
+// Compile-time-constant patterns — compiled once instead of on every
+// `extract_tool_calls_from_history` call.
+static TOOL_CALL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#).expect("valid regex")
+});
+static TOOL_RESULT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"<tool_result name="([^"]+)">\s*([\s\S]*?)\s*</tool_result>"#)
+        .expect("valid regex")
+});
+
 /// Extract structured tool call info from the conversation history that
 /// `run_tool_call_loop` built up during execution.
 ///
@@ -1079,12 +1166,6 @@ struct GatewayChatResult {
 /// and tool-result messages. We parse the XML from assistant messages and pair
 /// them with subsequent results.
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCall> {
-    let call_re =
-        regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#).expect("valid regex");
-    let result_re =
-        regex::Regex::new(r#"<tool_result name="([^"]+)">\s*([\s\S]*?)\s*</tool_result>"#)
-            .expect("valid regex");
-
     let mut tool_calls = Vec::new();
     let mut call_index = 0u32;
 
@@ -1092,7 +1173,7 @@ fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCa
     let mut result_map: HashMap<String, Vec<String>> = HashMap::new();
     for msg in history {
         if (msg.role == "user" && msg.content.starts_with("[Tool results]")) || msg.role == "tool" {
-            for cap in result_re.captures_iter(&msg.content) {
+            for cap in TOOL_RESULT_RE.captures_iter(&msg.content) {
                 result_map
                     .entry(cap[1].to_string())
                     .or_default()
@@ -1122,7 +1203,7 @@ fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCa
         if msg.role != "assistant" {
             continue;
         }
-        for cap in call_re.captures_iter(&msg.content) {
+        for cap in TOOL_CALL_RE.captures_iter(&msg.content) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cap[1]) {
                 let tool_name = parsed
                     .get("name")
@@ -1511,20 +1592,38 @@ async fn handle_webhook(
     };
 
     // ── Idempotency (optional) ──
-    if let Some(idempotency_key) = headers
+    // A key is marked `Done` only after successful processing (see the `Ok`
+    // arm below), and cleared on failure (see the `Err` arm) — so a webhook
+    // sender retrying with the same key after a 5xx/timeout gets reprocessed
+    // instead of permanently losing the request. `BeginOutcome::InProgress`
+    // means a concurrent/in-flight attempt with the same key is still
+    // running; we answer 503 (not 409) so senders that treat 4xx as terminal
+    // don't give up — they should retry once the in-flight attempt resolves.
+    let idem_key = headers
         .get("X-Idempotency-Key")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if !state.idempotency_store.record_if_new(idempotency_key) {
-            tracing::info!("Webhook duplicate ignored (idempotency key: {idempotency_key})");
-            let body = serde_json::json!({
-                "status": "duplicate",
-                "idempotent": true,
-                "message": "Request already processed for this idempotency key"
-            });
-            return (StatusCode::OK, Json(body));
+        .filter(|value| !value.is_empty());
+    if let Some(key) = idem_key {
+        match state.idempotency_store.begin(key) {
+            BeginOutcome::Done => {
+                tracing::info!("Webhook duplicate ignored (idempotency key: {key})");
+                let body = serde_json::json!({
+                    "status": "duplicate",
+                    "idempotent": true,
+                    "message": "Request already processed for this idempotency key"
+                });
+                return (StatusCode::OK, Json(body));
+            }
+            BeginOutcome::InProgress => {
+                tracing::info!("Webhook in-progress, retry later (idempotency key: {key})");
+                let body = serde_json::json!({
+                    "status": "in_progress",
+                    "message": "A request with this idempotency key is already being processed; retry shortly"
+                });
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
+            }
+            BeginOutcome::Started => {}
         }
     }
 
@@ -1594,9 +1693,15 @@ async fn handle_webhook(
                 body["tool_calls"] = serde_json::to_value(&result.tool_calls)
                     .unwrap_or(serde_json::Value::Array(vec![]));
             }
+            if let Some(key) = idem_key {
+                state.idempotency_store.mark_done(key);
+            }
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
+            if let Some(key) = idem_key {
+                state.idempotency_store.abort(key);
+            }
             let duration = started_at.elapsed();
             let sanitized = providers::sanitize_api_error(&e.to_string());
 
@@ -2263,6 +2368,25 @@ mod tests {
     }
 
     #[test]
+    fn extract_tool_calls_from_history_parses_known() {
+        let history = vec![
+            ChatMessage::assistant(
+                r#"<tool_call>{"name": "shell", "arguments": {"cmd": "ls"}}</tool_call>"#,
+            ),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"shell\">files.txt</tool_result>",
+            ),
+        ];
+
+        let tool_calls = extract_tool_calls_from_history(&history);
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].tool_name, "shell");
+        assert_eq!(tool_calls[0].input, serde_json::json!({"cmd": "ls"}));
+        assert_eq!(tool_calls[0].output, "files.txt");
+    }
+
+    #[test]
     fn whatsapp_query_fields_are_optional() {
         let q = WhatsAppVerifyQuery {
             mode: None,
@@ -2417,9 +2541,10 @@ mod tests {
     #[test]
     fn idempotency_store_rejects_duplicate_key() {
         let store = IdempotencyStore::new(Duration::from_secs(30), 10);
-        assert!(store.record_if_new("req-1"));
-        assert!(!store.record_if_new("req-1"));
-        assert!(store.record_if_new("req-2"));
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+        store.mark_done("req-1");
+        assert_eq!(store.begin("req-1"), BeginOutcome::Done);
+        assert_eq!(store.begin("req-2"), BeginOutcome::Started);
     }
 
     #[test]
@@ -2438,17 +2563,48 @@ mod tests {
     #[test]
     fn idempotency_store_bounded_cardinality_evicts_oldest_key() {
         let store = IdempotencyStore::new(Duration::from_secs(300), 2);
-        assert!(store.record_if_new("k1"));
+        assert_eq!(store.begin("k1"), BeginOutcome::Started);
         std::thread::sleep(Duration::from_millis(2));
-        assert!(store.record_if_new("k2"));
+        assert_eq!(store.begin("k2"), BeginOutcome::Started);
         std::thread::sleep(Duration::from_millis(2));
-        assert!(store.record_if_new("k3"));
+        assert_eq!(store.begin("k3"), BeginOutcome::Started);
 
         let keys = store.keys.lock();
         assert_eq!(keys.len(), 2);
         assert!(!keys.contains_key("k1"));
         assert!(keys.contains_key("k2"));
         assert!(keys.contains_key("k3"));
+    }
+
+    #[test]
+    fn idempotency_retry_after_failure_reprocesses() {
+        let store = IdempotencyStore::new(Duration::from_secs(30), 10);
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+        store.abort("req-1");
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+    }
+
+    #[test]
+    fn idempotency_success_then_duplicate() {
+        let store = IdempotencyStore::new(Duration::from_secs(30), 10);
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+        store.mark_done("req-1");
+        assert_eq!(store.begin("req-1"), BeginOutcome::Done);
+    }
+
+    #[test]
+    fn idempotency_concurrent_inflight() {
+        let store = IdempotencyStore::new(Duration::from_secs(30), 10);
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+        assert_eq!(store.begin("req-1"), BeginOutcome::InProgress);
+    }
+
+    #[test]
+    fn idempotency_inprogress_expires_after_ttl() {
+        let store = IdempotencyStore::new(Duration::from_millis(5), 10);
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
     }
 
     #[test]
@@ -2532,10 +2688,6 @@ mod tests {
         assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
     }
 
-    /// Serializes the `HOME`-mutating gateway store-pairing test (process-global
-    /// env var). Held with `std::sync::Mutex` because the test body is sync.
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Minimal `AppState` for the store-pairing test: a fresh pairing guard plus
     /// the smallest set of mocks. Only `pairing` and `config` matter here.
     fn store_pairing_test_state(config: Config) -> AppState {
@@ -2588,7 +2740,10 @@ mod tests {
     /// returns `None`.
     #[test]
     fn gateway_store_minted_code_is_consumed_and_issues_token() {
-        let _g = HOME_ENV_LOCK.lock().unwrap();
+        // Serializes the `HOME`-mutating gateway store-pairing test against the
+        // crate-shared ENV_LOCK so it can't clobber other tests (e.g. in
+        // channels/config) that mutate the same process-global env.
+        let _g = crate::test_env::ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", home.path());
@@ -3447,40 +3602,40 @@ mod tests {
     #[test]
     fn idempotency_store_allows_different_keys() {
         let store = IdempotencyStore::new(Duration::from_secs(60), 100);
-        assert!(store.record_if_new("key-a"));
-        assert!(store.record_if_new("key-b"));
-        assert!(store.record_if_new("key-c"));
-        assert!(store.record_if_new("key-d"));
+        assert_eq!(store.begin("key-a"), BeginOutcome::Started);
+        assert_eq!(store.begin("key-b"), BeginOutcome::Started);
+        assert_eq!(store.begin("key-c"), BeginOutcome::Started);
+        assert_eq!(store.begin("key-d"), BeginOutcome::Started);
     }
 
     #[test]
     fn idempotency_store_max_keys_clamped_to_one() {
         let store = IdempotencyStore::new(Duration::from_secs(60), 0);
-        assert!(store.record_if_new("only-key"));
-        assert!(!store.record_if_new("only-key"));
+        assert_eq!(store.begin("only-key"), BeginOutcome::Started);
+        assert_eq!(store.begin("only-key"), BeginOutcome::InProgress);
     }
 
     #[test]
     fn idempotency_store_rapid_duplicate_rejected() {
         let store = IdempotencyStore::new(Duration::from_secs(300), 100);
-        assert!(store.record_if_new("rapid"));
-        assert!(!store.record_if_new("rapid"));
+        assert_eq!(store.begin("rapid"), BeginOutcome::Started);
+        assert_eq!(store.begin("rapid"), BeginOutcome::InProgress);
     }
 
     #[test]
     fn idempotency_store_accepts_after_ttl_expires() {
         let store = IdempotencyStore::new(Duration::from_millis(1), 100);
-        assert!(store.record_if_new("ttl-key"));
+        assert_eq!(store.begin("ttl-key"), BeginOutcome::Started);
         std::thread::sleep(Duration::from_millis(10));
-        assert!(store.record_if_new("ttl-key"));
+        assert_eq!(store.begin("ttl-key"), BeginOutcome::Started);
     }
 
     #[test]
     fn idempotency_store_eviction_preserves_newest() {
         let store = IdempotencyStore::new(Duration::from_secs(300), 1);
-        assert!(store.record_if_new("old-key"));
+        assert_eq!(store.begin("old-key"), BeginOutcome::Started);
         std::thread::sleep(Duration::from_millis(2));
-        assert!(store.record_if_new("new-key"));
+        assert_eq!(store.begin("new-key"), BeginOutcome::Started);
 
         let keys = store.keys.lock();
         assert_eq!(keys.len(), 1);

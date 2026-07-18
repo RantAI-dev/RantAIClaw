@@ -268,13 +268,34 @@ fn scan_into(path: &Path, out: &mut Vec<PathBuf>) {
 /// optionally pre-routes through an Ollama OCR pipeline when
 /// `use_ocr_pipeline=true`; that pipeline isn't ported yet, so we return
 /// a typed error instead of silently downgrading.
+///
+/// SPIKE (`--features kb-ocr`, non-default): `kb-ocr` wires OCR for single
+/// **images** only (`kb::file::image::process_image`) — see
+/// `docs/kb/ocr-design.md`. PDF-page OCR needs a rasterization step (PDF
+/// page -> image) that this spike deliberately does not add (it would pull
+/// a real, environment-dependent dependency such as pdfium/poppler just to
+/// prove the slice — out of scope; tracked as an open question in the
+/// design note). So this stays a typed error under `kb-ocr` too, just with
+/// a message that reflects images now being supported.
 async fn process_pdf(cfg: &KbConfig, bytes: &[u8], opts: &ProcessingOptions) -> KbResult<String> {
     if opts.use_ocr_pipeline {
-        // TODO(kb-ocr): port `src/lib/ocr` (Ollama models) in a later phase.
-        // For now fail-fast rather than silently fall back to vision-LLM.
-        return Err(KbError::Other(
-            "OCR pipeline not yet implemented; set use_ocr_pipeline=false".into(),
-        ));
+        #[cfg(feature = "kb-ocr")]
+        {
+            return Err(KbError::Other(
+                "OCR pipeline is available for images under --features kb-ocr, but PDF page \
+                 rasterization is not implemented yet; ingest as an image or set \
+                 use_ocr_pipeline=false"
+                    .into(),
+            ));
+        }
+        #[cfg(not(feature = "kb-ocr"))]
+        {
+            // TODO(kb-ocr): port `src/lib/ocr` (Ollama models) in a later phase.
+            // For now fail-fast rather than silently fall back to vision-LLM.
+            return Err(KbError::Other(
+                "OCR pipeline not yet implemented; set use_ocr_pipeline=false".into(),
+            ));
+        }
     }
     let primary = build_extractor(cfg, &cfg.extract_primary)?;
     let fallback = build_extractor(cfg, &cfg.extract_fallback)?;
