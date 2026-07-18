@@ -9,6 +9,12 @@
 //! The Ollama OCR fallback present in the TS source (`use_ocr_pipeline`) is
 //! intentionally not ported in Phase 6 — calling with that flag returns a
 //! typed error so we never silently downgrade.
+//!
+//! SPIKE (`--features kb-ocr`, non-default): when that feature is on, the
+//! flag routes through [`crate::kb::extract::ocr_ollama::OllamaOcrExtractor`]
+//! instead of erroring — the "single image → OCR text" slice from
+//! `docs/kb/ocr-design.md`. Without the feature, the error above still
+//! applies unchanged.
 
 use std::path::Path;
 use std::time::Duration;
@@ -71,10 +77,17 @@ pub async fn process_image(
     opts: &ProcessingOptions,
 ) -> KbResult<String> {
     if opts.use_ocr_pipeline {
-        // TODO(kb-ocr): same Ollama-OCR TODO as `process_pdf` in super.
-        return Err(KbError::Other(
-            "OCR pipeline not yet implemented; set use_ocr_pipeline=false".into(),
-        ));
+        #[cfg(feature = "kb-ocr")]
+        {
+            return process_image_via_ocr(path).await;
+        }
+        #[cfg(not(feature = "kb-ocr"))]
+        {
+            // TODO(kb-ocr): same Ollama-OCR TODO as `process_pdf` in super.
+            return Err(KbError::Other(
+                "OCR pipeline not yet implemented; set use_ocr_pipeline=false".into(),
+            ));
+        }
     }
 
     let api_key = KbConfig::resolve_key(&cfg.extract_vision_api_key);
@@ -112,6 +125,24 @@ pub async fn process_image(
 
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
     Ok(format!("[Image: {filename}]\n\n{description}"))
+}
+
+/// SPIKE (`kb-ocr`): OCR a single image via a local/self-hosted Ollama vision
+/// model instead of the OpenRouter vision-LLM path above. Prototype only —
+/// see `docs/kb/ocr-design.md`. Config (endpoint/model) comes from
+/// [`crate::kb::extract::ocr_ollama::OllamaOcrExtractor::from_env`], not
+/// `KbConfig`, so this stays out of the non-OCR extract path entirely.
+#[cfg(feature = "kb-ocr")]
+async fn process_image_via_ocr(path: &Path) -> KbResult<String> {
+    use crate::kb::extract::ocr_ollama::OllamaOcrExtractor;
+    use crate::kb::extract::Extractor;
+
+    let bytes = tokio::fs::read(path).await?;
+    let extractor = OllamaOcrExtractor::from_env();
+    let result = extractor.extract(&bytes).await?;
+
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("image");
+    Ok(format!("[Image: {filename}]\n\n{}", result.text))
 }
 
 /// Map a path's extension to an HTTP `Content-Type`. Unknown extensions

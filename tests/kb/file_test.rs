@@ -349,6 +349,7 @@ async fn process_file_errors_on_missing_file() {
     );
 }
 
+#[cfg(not(feature = "kb-ocr"))]
 #[tokio::test]
 async fn process_pdf_with_ocr_pipeline_flag_returns_not_implemented_error() {
     // Guard: the Ollama OCR pipeline isn't ported yet, but the flag still
@@ -367,6 +368,32 @@ async fn process_pdf_with_ocr_pipeline_flag_returns_not_implemented_error() {
     assert!(
         msg.contains("OCR pipeline not yet implemented"),
         "error must explain OCR pipeline isn't ported: {msg}"
+    );
+}
+
+// SPIKE (`kb-ocr`, see docs/kb/ocr-design.md): `kb-ocr` wires OCR for
+// single images only — `process_pdf` must still fail fast for PDFs even
+// with the feature on, just with a message that reflects images now being
+// supported. Companion to the `not(kb-ocr)` variant above; kept as a
+// separate test (rather than editing the assertion in place) so both
+// builds have an explicit, always-compiled regression test for the exact
+// error text they promise.
+#[cfg(feature = "kb-ocr")]
+#[tokio::test]
+async fn process_pdf_with_ocr_pipeline_flag_returns_pdf_not_implemented_error() {
+    let cfg = make_kb_cfg("http://127.0.0.1:1/unused".into());
+    let pdf_path = ensure_sample_pdf();
+    let opts = ProcessingOptions {
+        use_ocr_pipeline: true,
+        ..Default::default()
+    };
+    let err = process_file(&cfg, &pdf_path, opts)
+        .await
+        .expect_err("PDF OCR must still fail fast under kb-ocr (image-only prototype)");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("page rasterization"),
+        "error must explain PDF OCR isn't implemented in this spike: {msg}"
     );
 }
 
