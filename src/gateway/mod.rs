@@ -408,29 +408,21 @@ pub struct AppState {
     pub web_approvals: Arc<crate::security::PendingApprovals>,
 }
 
-/// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+/// Build the full gateway [`AppState`] and [`Router`] from `config`, using the
+/// SAME public factories `run_gateway` uses to construct the provider, memory
+/// backend, tools, and pairing guard. These factories are synchronous and
+/// lazy (credential resolution only; no network I/O happens at construction
+/// time), so this fn is cheap and hermetic — safe to call from a temp-dir
+/// test config.
+///
+/// `pub` (not `pub(crate)`): exposed for embedding and for integration tests
+/// under `tests/`, which compile as a separate crate and cannot see
+/// `pub(crate)` items. `run_gateway` calls this so there remains ONE source
+/// of truth for `AppState`/route construction; it then binds the listener,
+/// starts the optional tunnel, and serves the returned router itself.
 #[allow(clippy::too_many_lines)]
-pub async fn run_gateway(
-    host: &str,
-    port: u16,
-    config: Config,
-    shutdown: tokio_util::sync::CancellationToken,
-) -> Result<()> {
-    // ── Security: refuse public bind without tunnel or explicit opt-in ──
-    if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
-    {
-        anyhow::bail!(
-            "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
-             Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
-             [gateway] allow_public_bind = true in config.toml (NOT recommended)."
-        );
-    }
+pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
     let config_state = Arc::new(Mutex::new(config.clone()));
-
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let actual_port = listener.local_addr()?.port();
-    let display_addr = format!("{host}:{actual_port}");
 
     let gateway_provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let gateway_provider_credential = config.resolve_key_for_provider(gateway_provider_name);
@@ -635,57 +627,6 @@ pub async fn run_gateway(
         idempotency_max_keys,
     ));
 
-    // ── Tunnel ────────────────────────────────────────────────
-    let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
-    let mut tunnel_url: Option<String> = None;
-
-    if let Some(ref tun) = tunnel {
-        println!("🔗 Starting {} tunnel...", tun.name());
-        match tun.start(host, actual_port).await {
-            Ok(url) => {
-                println!("🌐 Tunnel active: {url}");
-                tunnel_url = Some(url);
-            }
-            Err(e) => {
-                println!("⚠️  Tunnel failed to start: {e}");
-                println!("   Falling back to local-only mode.");
-            }
-        }
-    }
-
-    println!("🦀 RantaiClaw Gateway listening on http://{display_addr}");
-    if let Some(ref url) = tunnel_url {
-        println!("  🌐 Public URL: {url}");
-    }
-    println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
-    println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
-    if whatsapp_channel.is_some() {
-        println!("  GET  /whatsapp  — Meta webhook verification");
-        println!("  POST /whatsapp  — WhatsApp message webhook");
-    }
-    if linq_channel.is_some() {
-        println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
-    }
-    if nextcloud_talk_channel.is_some() {
-        println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
-    }
-    println!("  GET  /health    — liveness check");
-    println!("  GET  /readyz    — readiness check (503 if a component is down)");
-    println!("  GET  /metrics   — Prometheus metrics");
-    if let Some(code) = pairing.pairing_code() {
-        println!();
-        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
-        println!("     ┌──────────────┐");
-        println!("     │  {code}  │");
-        println!("     └──────────────┘");
-        println!("     Send: POST /pair with header X-Pairing-Code: {code}");
-    } else if pairing.require_pairing() {
-        println!("  🔒 Pairing: ACTIVE (bearer token required)");
-    } else {
-        println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
-    }
-    println!("  Press Ctrl+C to stop.\n");
-
     crate::health::mark_component_ok("gateway");
 
     // Build shared state
@@ -798,7 +739,86 @@ pub async fn run_gateway(
     #[cfg(feature = "kb")]
     let app = app.merge(crate::kb::axi::api::router());
 
-    let app = app.with_state(state);
+    let app = app.with_state(state.clone());
+
+    Ok((state, app))
+}
+
+/// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+#[allow(clippy::too_many_lines)]
+pub async fn run_gateway(
+    host: &str,
+    port: u16,
+    config: Config,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    // ── Security: refuse public bind without tunnel or explicit opt-in ──
+    if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
+    {
+        anyhow::bail!(
+            "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
+             Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
+             [gateway] allow_public_bind = true in config.toml (NOT recommended)."
+        );
+    }
+
+    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let actual_port = listener.local_addr()?.port();
+    let display_addr = format!("{host}:{actual_port}");
+
+    let (state, app) = build_gateway_router(config.clone())?;
+
+    // ── Tunnel ────────────────────────────────────────────────
+    let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
+    let mut tunnel_url: Option<String> = None;
+
+    if let Some(ref tun) = tunnel {
+        println!("🔗 Starting {} tunnel...", tun.name());
+        match tun.start(host, actual_port).await {
+            Ok(url) => {
+                println!("🌐 Tunnel active: {url}");
+                tunnel_url = Some(url);
+            }
+            Err(e) => {
+                println!("⚠️  Tunnel failed to start: {e}");
+                println!("   Falling back to local-only mode.");
+            }
+        }
+    }
+
+    println!("🦀 RantaiClaw Gateway listening on http://{display_addr}");
+    if let Some(ref url) = tunnel_url {
+        println!("  🌐 Public URL: {url}");
+    }
+    println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
+    println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");
+    if state.whatsapp.is_some() {
+        println!("  GET  /whatsapp  — Meta webhook verification");
+        println!("  POST /whatsapp  — WhatsApp message webhook");
+    }
+    if state.linq.is_some() {
+        println!("  POST /linq      — Linq message webhook (iMessage/RCS/SMS)");
+    }
+    if state.nextcloud_talk.is_some() {
+        println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
+    }
+    println!("  GET  /health    — liveness check");
+    println!("  GET  /readyz    — readiness check (503 if a component is down)");
+    println!("  GET  /metrics   — Prometheus metrics");
+    if let Some(code) = state.pairing.pairing_code() {
+        println!();
+        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
+        println!("     ┌──────────────┐");
+        println!("     │  {code}  │");
+        println!("     └──────────────┘");
+        println!("     Send: POST /pair with header X-Pairing-Code: {code}");
+    } else if state.pairing.require_pairing() {
+        println!("  🔒 Pairing: ACTIVE (bearer token required)");
+    } else {
+        println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
+    }
+    println!("  Press Ctrl+C to stop.\n");
 
     // Run the server. `with_graceful_shutdown` lets in-flight requests finish
     // (and stops accepting new connections) when `shutdown` is cancelled,
