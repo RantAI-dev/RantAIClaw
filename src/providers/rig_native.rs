@@ -45,10 +45,10 @@
 //! ## Fallback
 //!
 //! Build with `--features legacy-providers` to route Anthropic/
-//! OpenAI/Gemini back through the hand-rolled files (kept in tree
-//! through v0.7.0 for safety). The factory in `mod.rs` chooses at
-//! compile time. Will be removed after one release cycle of clean
-//! production use.
+//! OpenAI/Gemini back through the hand-rolled files. The factory in
+//! `mod.rs` chooses at compile time; the three modules are gated out
+//! of default builds but retained in tree pending maintainer approval
+//! to delete them (see `plans/016-legacy-providers-sunset.md`).
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -110,11 +110,11 @@ impl RigProvider {
     }
 
     /// Same as [`Self::for_provider`] but lets the caller override the
-    /// provider's default API base URL. Only meaningful for OpenAI
-    /// (used to point at compat endpoints like MiniMax, Together,
-    /// xAI when the user prefers `openai` as the canonical name).
-    /// Ignored for Anthropic + Gemini — rig's clients don't support
-    /// arbitrary base URLs there.
+    /// provider's default API base URL. Used for OpenAI (compat endpoints
+    /// like MiniMax, Together, xAI when the user prefers `openai` as the
+    /// canonical name) and Anthropic (e.g. `anthropic-custom:` endpoints).
+    /// Ignored for Gemini — rig's Gemini client doesn't support arbitrary
+    /// base URLs.
     pub fn for_provider_with_url(
         canonical_name: &'static str,
         api_key: Option<&str>,
@@ -123,10 +123,11 @@ impl RigProvider {
         let inner = match canonical_name {
             "anthropic" => {
                 let key = api_key.context("anthropic: ANTHROPIC_API_KEY required")?;
-                let client = anthropic::Client::builder()
-                    .api_key(key)
-                    .build()
-                    .context("rig anthropic client build")?;
+                let mut builder = anthropic::Client::builder().api_key(key);
+                if let Some(url) = api_url {
+                    builder = builder.base_url(url);
+                }
+                let client = builder.build().context("rig anthropic client build")?;
                 RigClient::Anthropic(client)
             }
             "openai" => {
@@ -666,6 +667,57 @@ mod tests {
     fn for_provider_constructs_anthropic_with_key() {
         let p = RigProvider::for_provider("anthropic", Some("sk-fake")).expect("ctor");
         assert_eq!(p.canonical_name, "anthropic");
+    }
+
+    /// `for_provider_with_url("anthropic", ..)` is the reroute target for
+    /// the `anthropic-custom:` factory branch in `mod.rs`. The `Provider`
+    /// trait has no base-URL getter and `Box<dyn Provider>` isn't
+    /// downcastable, so `is_ok()` on construction can't prove the custom
+    /// URL was actually threaded through to rig's HTTP client — a naive
+    /// reroute could silently drop it and still construct fine. Instead,
+    /// point the custom base URL at a wiremock server and prove the
+    /// client actually sent its request there: if `.base_url(url)` weren't
+    /// wired up, rig would fall back to the real `api.anthropic.com` and
+    /// this mock would never see a request.
+    #[tokio::test]
+    async fn for_provider_with_url_anthropic_honors_custom_base_url() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "type": "message",
+                    "id": "msg_test",
+                    "model": "claude-3-haiku-20240307",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello from mock"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = RigProvider::for_provider_with_url(
+            "anthropic",
+            Some("test-key"),
+            Some(&mock_server.uri()),
+        )
+        .expect("construct anthropic provider with custom base url");
+
+        let result = provider
+            .chat_with_system(None, "hi", "claude-3-haiku-20240307", 0.5)
+            .await;
+
+        // The core assertion: exactly one request landed on the mock. This
+        // is what proves the custom base URL was honored, independent of
+        // whether the mocked response happens to parse cleanly.
+        mock_server.verify().await;
+
+        assert_eq!(
+            result.expect("chat should succeed against the mock server"),
+            "hello from mock"
+        );
     }
 
     #[test]

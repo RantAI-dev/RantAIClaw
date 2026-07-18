@@ -2369,7 +2369,7 @@ pub(crate) fn setup_provider(
         key
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
-        if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
+        if crate::providers::gemini_cli::gemini_cli_has_credentials() {
             print_bullet(&format!(
                 "{} Gemini CLI credentials detected! You can skip the API key.",
                 style("✓").green().bold()

@@ -244,7 +244,9 @@ default = ["tui", "whatsapp-web", "remote-install", "kb"]
 # Anthropic/OpenAI/Gemini. Default off — those providers route
 # through `RigProvider` (src/providers/rig_native.rs). Build with
 # --features legacy-providers if rig misbehaves and you need to
-# fall back. Will be removed in v0.7.0 once rig has soaked.
+# fall back. The three modules are gated out of default builds (this
+# feature); actual deletion is a separate, maintainer-approved step —
+# see plans/016-legacy-providers-sunset.md.
 legacy-providers = []
 tui = ["dep:ratatui", "dep:crossterm"]
 hardware = ["nusb", "tokio-serial"]

@@ -16,12 +16,16 @@
 //! To add a new provider, implement [`Provider`] in a new submodule and register it
 //! in [`create_provider_with_url`]. See `AGENTS.md` §7.1 for the full change playbook.
 
+#[cfg(feature = "legacy-providers")]
 pub mod anthropic;
 pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
+#[cfg(feature = "legacy-providers")]
 pub mod gemini;
+pub mod gemini_cli;
 pub mod ollama;
+#[cfg(feature = "legacy-providers")]
 pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
@@ -984,7 +988,8 @@ fn create_provider_with_url_and_options(
         // Anthropic / OpenAI native / Gemini route through `RigProvider`
         // by default — see `src/providers/rig_native.rs`. Build with
         // `--features legacy-providers` to fall back to the hand-rolled
-        // files (kept in tree through v0.7.0 for safety).
+        // files (gated out of default builds; deletion needs maintainer
+        // approval — see plans/016-legacy-providers-sunset.md).
         #[cfg(not(feature = "legacy-providers"))]
         "anthropic" => Ok(Box::new(rig_native::RigProvider::for_provider(
             "anthropic", key,
@@ -1170,9 +1175,11 @@ fn create_provider_with_url_and_options(
         ))),
 
         // ── Cloud AI endpoints ───────────────────────────────
-        "ovhcloud" | "ovh" => Ok(Box::new(openai::OpenAiProvider::with_base_url(
-            Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
+        "ovhcloud" | "ovh" => Ok(Box::new(OpenAiCompatibleProvider::new(
+            "OVHcloud",
+            "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
             key,
+            AuthStyle::Bearer,
         ))),
 
         // ── Bring Your Own Provider (custom URL) ───────────
@@ -1199,10 +1206,9 @@ fn create_provider_with_url_and_options(
                 "Anthropic-custom provider",
                 "anthropic-custom:https://your-api.com",
             )?;
-            Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
-                key,
-                Some(&base_url),
-            )))
+            Ok(Box::new(rig_native::RigProvider::for_provider_with_url(
+                "anthropic", key, Some(&base_url),
+            )?))
         }
 
         _ => anyhow::bail!(
