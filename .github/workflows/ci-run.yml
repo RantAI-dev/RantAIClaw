@@ -42,7 +42,7 @@ jobs:
     lint:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 25
         steps:
@@ -64,7 +64,7 @@ jobs:
     test:
         name: Test
         needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
         runs-on: ubuntu-latest
         # 45min: cargo test on the full workspace runs ~6,300 tests over
         # 32 binaries. Empirically takes 9–12 min when the cache is warm,
@@ -364,10 +364,22 @@ jobs:
                       echo "Required PR build job did not pass."
                       exit 1
                     fi
-                    # When `ci:full` is set, also require test/features/bench-compile.
-                    # When it isn't set, these were skipped -> is_ok returns success.
-                    if ! is_ok "$test_result" || ! is_ok "$features_result" || ! is_ok "$bench_compile_result"; then
-                      echo "Required PR jobs (test/features/bench-compile) did not pass."
+                    # lint + test are no longer skippable on a Rust-changing PR (see the
+                    # lint/test job `if:` conditions) -> require them explicitly here rather
+                    # than via is_ok, which would accept a `skipped` result as success.
+                    if [ "$rust_changed" = "true" ]; then
+                      if [ "$lint_result" != "success" ]; then
+                        echo "Lint is required on Rust PRs."
+                        exit 1
+                      fi
+                      if [ "$test_result" != "success" ]; then
+                        echo "Unit tests are required on Rust PRs."
+                        exit 1
+                      fi
+                    fi
+                    # features/bench-compile remain gated behind `ci:full`; a skip there is fine.
+                    if ! is_ok "$features_result" || ! is_ok "$bench_compile_result"; then
+                      echo "Required PR jobs (features/bench-compile) did not pass."
                       exit 1
                     fi
                     echo "PR required checks passed."
