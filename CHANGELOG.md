@@ -5,10 +5,66 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0-alpha] — 2026-07-18
+
+A large accumulated batch spanning multiple review/hardening sprints since
+0.7.15-alpha. The headline is a broad security sweep of the exposure surface
+(two RCE-class allowlist bypasses, two SSRF vectors, three secret-leak paths),
+alongside profile isolation, per-channel markdown rendering, and a provider-auth
+parity fix for the rig-core migration. Minor bump (not patch) because several
+changes alter runtime contracts — see **Changed** for the behavior flags.
+
+### Security
+
+- **Command-allowlist bypass hardening.** Closed two allowlist-completeness
+  gaps that allowed arbitrary command execution past the shell high-risk gate:
+  `find -execdir/-exec` and `git --upload-pack=`/short-flag smuggling both
+  reached a shell without gate review. The gate now inspects the effective verb
+  after global flags and rejects the exec-delegating forms.
+- **SSRF defense on outbound fetch tools.** `http_request` and `browser` now
+  pin the resolved address and block DNS-rebinding / redirect-to-internal
+  (link-local, loopback, RFC1918) so a hostile URL cannot pivot to gateway or
+  cloud-metadata endpoints.
+- **Secret-leak fixes.** Config redaction now covers the IRC / Lark / WhatsApp
+  credential stems it previously missed; channel config no longer echoes secret
+  values in diagnostics; MCP subprocesses are spawned with a cleared
+  environment (`env_clear` + explicit allowlist) so provider keys don't leak to
+  third-party MCP servers.
+- **Secret-file permissions.** The master key / secret store is written `0600`
+  without a world-readable window (TOCTOU-safe create).
+- **Webhook signature enforcement is fail-closed.** Unsigned / bad-signature
+  inbound webhook requests are rejected rather than processed.
+- **Inbound image handling is workspace-confined** and guarded against
+  decompression-bomb payloads.
+
+### Added
+
+- **Per-profile data isolation.** `sessions.db` and `kb.db` (knowledge base)
+  now live under the active profile directory instead of a shared global path,
+  with a WAL-checkpoint-first migration on load. WhatsApp defaults are also
+  per-profile.
+- **Channel markdown rendering.** A shared formatting library renders agent
+  output per channel (light-markup, standard-markdown, and HTML variants for
+  platforms that need it) instead of leaking raw markdown.
+- **Knowledge-base OCR ingestion** for image documents.
+- **Gateway credential-awareness.** Switching to a provider with no usable
+  credential now surfaces a warning instead of silently failing later.
+- **TUI paste handling** collapses large pastes and shreds them from scrollback.
 
 ### Changed
 
+- **Anthropic/Gemini provider auth parity restored (rig-core migration).** The
+  default provider path routes special auth modes correctly again: Gemini
+  `GEMINI_API_KEY`/`GOOGLE_API_KEY` env keys resolve, Gemini CLI OAuth and
+  Anthropic setup-tokens (`sk-ant-oat01-`) route to the legacy providers (which
+  the rig client cannot serve), and Anthropic prompt caching is re-enabled on
+  the rig path. Consequence: **`anthropic-custom` now requires an API key**, and
+  the legacy provider modules are permanent (their planned removal is
+  cancelled). Setup-token / CLI-OAuth requests do not stream (documented
+  tradeoff); the API-key path is unchanged (streaming + native tools).
+- **`GET /api/v1/providers` now requires a bearer token.** It was the only
+  `/api/v1` data route without an auth check; it now honors the same pairing
+  gate as the rest of the API.
 - **Shell commands now inherit common tooling env vars.** The shell tool's env
   allowlist (`SAFE_ENV_VARS`) was so narrow that `kubectl`, `docker` (remote /
   rootless), `aws`/`gcloud`, `git`-over-ssh-agent, and proxied commands failed
@@ -18,6 +74,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GOOGLE_APPLICATION_CREDENTIALS`, `XDG_RUNTIME_DIR`, and `KRB5CCNAME`. These
   are functional pointers (paths / sockets / selectors), never secret values —
   API keys and tokens are still stripped (local-capability widening, CLAUDE.md §3.6).
+- **README no longer teaches `allow_public_bind = true`** in its example; the
+  exposure boundary stays localhost-by-default.
+- **Bundled claw-ui console pinned to v0.3.4** (the `ui install` default). Picks
+  up the render-time `</think>` / `[IMAGE:…]` strip fixes and the
+  provider-switch no-credential toast that pairs with the gateway
+  credential-warning above.
+
+### Fixed
+
+- **Anthropic `max_tokens` regression.** The default (rig) Anthropic path sent
+  `max_tokens: None`, which the API rejects for every non-claude-4 model
+  ("max_tokens must be set for Anthropic") — so all claude-3.x requests errored
+  before being sent. Fixed with a per-model default.
+- **Streaming UTF-8 chunk-boundary splits** in the OpenRouter / OpenAI-compatible
+  providers no longer abort a stream when a multibyte character lands on a
+  buffer boundary.
+- **MCP supervisor backoff** no longer resets its retry counter on every respawn
+  (runaway restart loop) and honors the configured backoff.
+- **Service install (systemd --user)** now captures `PATH` /
+  `WorkingDirectory` at install time, so tools like `kubectl` resolve when the
+  agent runs as a service.
+- **Failing-provider hot-reload** no longer drops the configured autonomy level.
+- **Docker tool timeout** escalates to `SIGKILL` after `SIGTERM` instead of
+  hanging.
+- **Flaky-test env-lock fragmentation.** Consolidated ~17 per-module env mutexes
+  into one crate-shared lock so channel-owner / pairing / persona / config tests
+  stop clobbering each other under parallel `cargo test`.
+- Numerous smaller correctness fixes across channels, gateway config
+  lost-update, think-tag stream handling, and the agent tool-loop
+  force-summary path.
+
+### Performance
+
+- HTTP client reuse across runtime-proxy calls, lazy-compiled regexes, a
+  batched knowledge-base ingest transaction, and a lighter rerank helper.
 
 ## [0.7.15-alpha] — 2026-07-13
 
