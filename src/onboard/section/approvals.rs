@@ -104,13 +104,13 @@ mod tests {
     use super::*;
 
     use crate::profile::ProfileManager;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-
+    // Tests mutate the process-global HOME/RANTAICLAW_PROFILE env; serialize
+    // against the crate-shared ENV_LOCK so they can't clobber other tests
+    // (e.g. in channels/config) that mutate the same process-global env.
     fn with_home<F: FnOnce()>(f: F) {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::ENV_LOCK.blocking_lock();
         let tmp = TempDir::new().expect("tempdir");
         let prev_home = std::env::var_os("HOME");
         let prev_profile = std::env::var_os("RANTAICLAW_PROFILE");
