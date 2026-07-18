@@ -19,6 +19,24 @@ pub use handle::{McpHandle, McpStatus};
 
 const MAX_MCP_SERVERS: usize = 10;
 
+/// Strip the inherited daemon environment and re-add only a non-secret
+/// allowlist plus the explicitly-configured `env` map, mirroring the shell
+/// tool's hardening (`src/tools/shell.rs`). Without this, every MCP
+/// subprocess — frequently a third-party npm/uv package the operator did not
+/// write — inherits the daemon's entire process environment (provider API
+/// keys, proxy credentials) on top of its own declared `env`. A compromised
+/// or malicious MCP server could otherwise read and exfiltrate every daemon
+/// secret with no extra access.
+pub(crate) fn apply_hardened_env(cmd: &mut tokio::process::Command, env: &HashMap<String, String>) {
+    cmd.env_clear();
+    for var in crate::tools::shell::SAFE_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+    cmd.envs(env); // configured env overrides the allowlist — intentional.
+}
+
 pub struct McpRegistry {
     servers: HashMap<String, McpHandle>,
 }
