@@ -177,11 +177,37 @@ impl GatewayRateLimiter {
     }
 }
 
+/// Idempotency key lifecycle: `InProgress` while the request is being
+/// processed, `Done` once it has completed successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyState {
+    InProgress,
+    Done,
+}
+
+#[derive(Debug)]
+struct Entry {
+    state: KeyState,
+    seen_at: Instant,
+}
+
+/// Outcome of [`IdempotencyStore::begin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeginOutcome {
+    /// No prior entry (or it expired) — the caller should proceed and
+    /// eventually call `mark_done` or `abort`.
+    Started,
+    /// Another request with this key is currently being processed.
+    InProgress,
+    /// This key already completed successfully.
+    Done,
+}
+
 #[derive(Debug)]
 pub struct IdempotencyStore {
     ttl: Duration,
     max_keys: usize,
-    keys: Mutex<HashMap<String, Instant>>,
+    keys: Mutex<HashMap<String, Entry>>,
 }
 
 impl IdempotencyStore {
@@ -193,29 +219,60 @@ impl IdempotencyStore {
         }
     }
 
-    /// Returns true if this key is new and is now recorded.
-    fn record_if_new(&self, key: &str) -> bool {
+    /// Attempts to begin processing `key`. Expires stale entries (both
+    /// `InProgress` and `Done`) on every call so a dropped/cancelled handler
+    /// future (e.g. client disconnect) doesn't strand a key forever — after
+    /// `ttl`, a stranded `InProgress` entry is treated as new again.
+    fn begin(&self, key: &str) -> BeginOutcome {
         let now = Instant::now();
         let mut keys = self.keys.lock();
 
-        keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        keys.retain(|_, entry| now.duration_since(entry.seen_at) < self.ttl);
 
-        if keys.contains_key(key) {
-            return false;
+        match keys.get(key).map(|entry| entry.state) {
+            Some(KeyState::Done) => return BeginOutcome::Done,
+            Some(KeyState::InProgress) => return BeginOutcome::InProgress,
+            None => {}
         }
 
         if keys.len() >= self.max_keys {
             let evict_key = keys
                 .iter()
-                .min_by_key(|(_, seen_at)| *seen_at)
+                .min_by_key(|(_, entry)| entry.seen_at)
                 .map(|(k, _)| k.clone());
             if let Some(evict_key) = evict_key {
                 keys.remove(&evict_key);
             }
         }
 
-        keys.insert(key.to_owned(), now);
-        true
+        keys.insert(
+            key.to_owned(),
+            Entry {
+                state: KeyState::InProgress,
+                seen_at: now,
+            },
+        );
+        BeginOutcome::Started
+    }
+
+    /// Marks `key` as successfully completed, so a later retry with the
+    /// same key gets `BeginOutcome::Done` instead of being reprocessed.
+    fn mark_done(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        keys.insert(
+            key.to_owned(),
+            Entry {
+                state: KeyState::Done,
+                seen_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Removes `key` after a failed attempt so a retry with the same key is
+    /// reprocessed rather than permanently rejected.
+    fn abort(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        keys.remove(key);
     }
 }
 
@@ -1511,20 +1568,38 @@ async fn handle_webhook(
     };
 
     // ── Idempotency (optional) ──
-    if let Some(idempotency_key) = headers
+    // A key is marked `Done` only after successful processing (see the `Ok`
+    // arm below), and cleared on failure (see the `Err` arm) — so a webhook
+    // sender retrying with the same key after a 5xx/timeout gets reprocessed
+    // instead of permanently losing the request. `BeginOutcome::InProgress`
+    // means a concurrent/in-flight attempt with the same key is still
+    // running; we answer 503 (not 409) so senders that treat 4xx as terminal
+    // don't give up — they should retry once the in-flight attempt resolves.
+    let idem_key = headers
         .get("X-Idempotency-Key")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if !state.idempotency_store.record_if_new(idempotency_key) {
-            tracing::info!("Webhook duplicate ignored (idempotency key: {idempotency_key})");
-            let body = serde_json::json!({
-                "status": "duplicate",
-                "idempotent": true,
-                "message": "Request already processed for this idempotency key"
-            });
-            return (StatusCode::OK, Json(body));
+        .filter(|value| !value.is_empty());
+    if let Some(key) = idem_key {
+        match state.idempotency_store.begin(key) {
+            BeginOutcome::Done => {
+                tracing::info!("Webhook duplicate ignored (idempotency key: {key})");
+                let body = serde_json::json!({
+                    "status": "duplicate",
+                    "idempotent": true,
+                    "message": "Request already processed for this idempotency key"
+                });
+                return (StatusCode::OK, Json(body));
+            }
+            BeginOutcome::InProgress => {
+                tracing::info!("Webhook in-progress, retry later (idempotency key: {key})");
+                let body = serde_json::json!({
+                    "status": "in_progress",
+                    "message": "A request with this idempotency key is already being processed; retry shortly"
+                });
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
+            }
+            BeginOutcome::Started => {}
         }
     }
 
@@ -1594,9 +1669,15 @@ async fn handle_webhook(
                 body["tool_calls"] = serde_json::to_value(&result.tool_calls)
                     .unwrap_or(serde_json::Value::Array(vec![]));
             }
+            if let Some(key) = idem_key {
+                state.idempotency_store.mark_done(key);
+            }
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
+            if let Some(key) = idem_key {
+                state.idempotency_store.abort(key);
+            }
             let duration = started_at.elapsed();
             let sanitized = providers::sanitize_api_error(&e.to_string());
 
@@ -2417,9 +2498,10 @@ mod tests {
     #[test]
     fn idempotency_store_rejects_duplicate_key() {
         let store = IdempotencyStore::new(Duration::from_secs(30), 10);
-        assert!(store.record_if_new("req-1"));
-        assert!(!store.record_if_new("req-1"));
-        assert!(store.record_if_new("req-2"));
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+        store.mark_done("req-1");
+        assert_eq!(store.begin("req-1"), BeginOutcome::Done);
+        assert_eq!(store.begin("req-2"), BeginOutcome::Started);
     }
 
     #[test]
@@ -2438,17 +2520,48 @@ mod tests {
     #[test]
     fn idempotency_store_bounded_cardinality_evicts_oldest_key() {
         let store = IdempotencyStore::new(Duration::from_secs(300), 2);
-        assert!(store.record_if_new("k1"));
+        assert_eq!(store.begin("k1"), BeginOutcome::Started);
         std::thread::sleep(Duration::from_millis(2));
-        assert!(store.record_if_new("k2"));
+        assert_eq!(store.begin("k2"), BeginOutcome::Started);
         std::thread::sleep(Duration::from_millis(2));
-        assert!(store.record_if_new("k3"));
+        assert_eq!(store.begin("k3"), BeginOutcome::Started);
 
         let keys = store.keys.lock();
         assert_eq!(keys.len(), 2);
         assert!(!keys.contains_key("k1"));
         assert!(keys.contains_key("k2"));
         assert!(keys.contains_key("k3"));
+    }
+
+    #[test]
+    fn idempotency_retry_after_failure_reprocesses() {
+        let store = IdempotencyStore::new(Duration::from_secs(30), 10);
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+        store.abort("req-1");
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+    }
+
+    #[test]
+    fn idempotency_success_then_duplicate() {
+        let store = IdempotencyStore::new(Duration::from_secs(30), 10);
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+        store.mark_done("req-1");
+        assert_eq!(store.begin("req-1"), BeginOutcome::Done);
+    }
+
+    #[test]
+    fn idempotency_concurrent_inflight() {
+        let store = IdempotencyStore::new(Duration::from_secs(30), 10);
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+        assert_eq!(store.begin("req-1"), BeginOutcome::InProgress);
+    }
+
+    #[test]
+    fn idempotency_inprogress_expires_after_ttl() {
+        let store = IdempotencyStore::new(Duration::from_millis(5), 10);
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(store.begin("req-1"), BeginOutcome::Started);
     }
 
     #[test]
@@ -3447,40 +3560,40 @@ mod tests {
     #[test]
     fn idempotency_store_allows_different_keys() {
         let store = IdempotencyStore::new(Duration::from_secs(60), 100);
-        assert!(store.record_if_new("key-a"));
-        assert!(store.record_if_new("key-b"));
-        assert!(store.record_if_new("key-c"));
-        assert!(store.record_if_new("key-d"));
+        assert_eq!(store.begin("key-a"), BeginOutcome::Started);
+        assert_eq!(store.begin("key-b"), BeginOutcome::Started);
+        assert_eq!(store.begin("key-c"), BeginOutcome::Started);
+        assert_eq!(store.begin("key-d"), BeginOutcome::Started);
     }
 
     #[test]
     fn idempotency_store_max_keys_clamped_to_one() {
         let store = IdempotencyStore::new(Duration::from_secs(60), 0);
-        assert!(store.record_if_new("only-key"));
-        assert!(!store.record_if_new("only-key"));
+        assert_eq!(store.begin("only-key"), BeginOutcome::Started);
+        assert_eq!(store.begin("only-key"), BeginOutcome::InProgress);
     }
 
     #[test]
     fn idempotency_store_rapid_duplicate_rejected() {
         let store = IdempotencyStore::new(Duration::from_secs(300), 100);
-        assert!(store.record_if_new("rapid"));
-        assert!(!store.record_if_new("rapid"));
+        assert_eq!(store.begin("rapid"), BeginOutcome::Started);
+        assert_eq!(store.begin("rapid"), BeginOutcome::InProgress);
     }
 
     #[test]
     fn idempotency_store_accepts_after_ttl_expires() {
         let store = IdempotencyStore::new(Duration::from_millis(1), 100);
-        assert!(store.record_if_new("ttl-key"));
+        assert_eq!(store.begin("ttl-key"), BeginOutcome::Started);
         std::thread::sleep(Duration::from_millis(10));
-        assert!(store.record_if_new("ttl-key"));
+        assert_eq!(store.begin("ttl-key"), BeginOutcome::Started);
     }
 
     #[test]
     fn idempotency_store_eviction_preserves_newest() {
         let store = IdempotencyStore::new(Duration::from_secs(300), 1);
-        assert!(store.record_if_new("old-key"));
+        assert_eq!(store.begin("old-key"), BeginOutcome::Started);
         std::thread::sleep(Duration::from_millis(2));
-        assert!(store.record_if_new("new-key"));
+        assert_eq!(store.begin("new-key"), BeginOutcome::Started);
 
         let keys = store.keys.lock();
         assert_eq!(keys.len(), 1);
