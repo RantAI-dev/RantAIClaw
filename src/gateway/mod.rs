@@ -38,7 +38,7 @@ use axum::{
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -1149,6 +1149,16 @@ struct GatewayChatResult {
     denied_tools: Vec<String>,
 }
 
+// Compile-time-constant patterns — compiled once instead of on every
+// `extract_tool_calls_from_history` call.
+static TOOL_CALL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#).expect("valid regex")
+});
+static TOOL_RESULT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"<tool_result name="([^"]+)">\s*([\s\S]*?)\s*</tool_result>"#)
+        .expect("valid regex")
+});
+
 /// Extract structured tool call info from the conversation history that
 /// `run_tool_call_loop` built up during execution.
 ///
@@ -1156,12 +1166,6 @@ struct GatewayChatResult {
 /// and tool-result messages. We parse the XML from assistant messages and pair
 /// them with subsequent results.
 fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCall> {
-    let call_re =
-        regex::Regex::new(r#"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>"#).expect("valid regex");
-    let result_re =
-        regex::Regex::new(r#"<tool_result name="([^"]+)">\s*([\s\S]*?)\s*</tool_result>"#)
-            .expect("valid regex");
-
     let mut tool_calls = Vec::new();
     let mut call_index = 0u32;
 
@@ -1169,7 +1173,7 @@ fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCa
     let mut result_map: HashMap<String, Vec<String>> = HashMap::new();
     for msg in history {
         if (msg.role == "user" && msg.content.starts_with("[Tool results]")) || msg.role == "tool" {
-            for cap in result_re.captures_iter(&msg.content) {
+            for cap in TOOL_RESULT_RE.captures_iter(&msg.content) {
                 result_map
                     .entry(cap[1].to_string())
                     .or_default()
@@ -1199,7 +1203,7 @@ fn extract_tool_calls_from_history(history: &[ChatMessage]) -> Vec<WebhookToolCa
         if msg.role != "assistant" {
             continue;
         }
-        for cap in call_re.captures_iter(&msg.content) {
+        for cap in TOOL_CALL_RE.captures_iter(&msg.content) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cap[1]) {
                 let tool_name = parsed
                     .get("name")
@@ -2361,6 +2365,25 @@ mod tests {
         let missing = r#"{"other": "field"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn extract_tool_calls_from_history_parses_known() {
+        let history = vec![
+            ChatMessage::assistant(
+                r#"<tool_call>{"name": "shell", "arguments": {"cmd": "ls"}}</tool_call>"#,
+            ),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"shell\">files.txt</tool_result>",
+            ),
+        ];
+
+        let tool_calls = extract_tool_calls_from_history(&history);
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].tool_name, "shell");
+        assert_eq!(tool_calls[0].input, serde_json::json!({"cmd": "ls"}));
+        assert_eq!(tool_calls[0].output, "files.txt");
     }
 
     #[test]
