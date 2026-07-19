@@ -25,57 +25,20 @@ const TELEGRAM_CLAIM_COMMAND: &str = "/claim";
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
 /// The effective per-chunk limit is reduced to leave room for continuation markers.
-fn split_message_for_telegram(message: &str) -> Vec<String> {
-    if message.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
-        return vec![message.to_string()];
+/// Add the "(continued)" / "(continues...)" markers used for multi-chunk sends.
+/// `TELEGRAM_CONTINUATION_OVERHEAD` (30) covers this helper's 29-char worst case,
+/// so `format::split` budgets on `limit - overhead` and the decorated chunk never
+/// exceeds Telegram's cap.
+fn decorate_continuation(chunk: &str, index: usize, total: usize) -> String {
+    if total <= 1 {
+        chunk.to_string()
+    } else if index == 0 {
+        format!("{chunk}\n\n(continues...)")
+    } else if index + 1 == total {
+        format!("(continued)\n\n{chunk}")
+    } else {
+        format!("(continued)\n\n{chunk}\n\n(continues...)")
     }
-
-    let mut chunks = Vec::new();
-    let mut remaining = message;
-    let chunk_limit = TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD;
-
-    while !remaining.is_empty() {
-        // If the remainder fits within the full limit, take it all (last chunk
-        // or single chunk — continuation overhead is at most 14 chars).
-        if remaining.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
-            chunks.push(remaining.to_string());
-            break;
-        }
-
-        // Find the byte offset for the Nth character boundary.
-        let hard_split = remaining
-            .char_indices()
-            .nth(chunk_limit)
-            .map_or(remaining.len(), |(idx, _)| idx);
-
-        let chunk_end = if hard_split == remaining.len() {
-            hard_split
-        } else {
-            // Try to find a good break point (newline, then space)
-            let search_area = &remaining[..hard_split];
-
-            // Prefer splitting at newline
-            if let Some(pos) = search_area.rfind('\n') {
-                // Don't split if the newline is too close to the start
-                if search_area[..pos].chars().count() >= chunk_limit / 2 {
-                    pos + 1
-                } else {
-                    // Try space as fallback
-                    search_area.rfind(' ').unwrap_or(hard_split) + 1
-                }
-            } else if let Some(pos) = search_area.rfind(' ') {
-                pos + 1
-            } else {
-                // Hard split at character boundary
-                hard_split
-            }
-        };
-
-        chunks.push(remaining[..chunk_end].to_string());
-        remaining = &remaining[chunk_end..];
-    }
-
-    chunks
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1285,59 +1248,55 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         chat_id: &str,
         thread_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let chunks = split_message_for_telegram(message);
+        use crate::channels::format::{render_pair, split_paired, RenderTarget};
 
-        for (index, chunk) in chunks.iter().enumerate() {
-            let text = if chunks.len() > 1 {
-                if index == 0 {
-                    format!("{chunk}\n\n(continues...)")
-                } else if index == chunks.len() - 1 {
-                    format!("(continued)\n\n{chunk}")
-                } else {
-                    format!("(continued)\n\n{chunk}\n\n(continues...)")
-                }
-            } else {
-                chunk.to_string()
-            };
+        let limit = TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD;
+        // Primary target comes from the trait seam (one source of truth); the twin
+        // is always Plain — the universal fallback every platform accepts.
+        let (html_blocks, plain_blocks) =
+            render_pair(message, &self.render_target(), &RenderTarget::Plain);
+        let pairs = split_paired(&html_blocks, &plain_blocks, limit);
+        let total = pairs.len();
 
-            let mut markdown_body = serde_json::json!({
+        for (index, (html, plain)) in pairs.iter().enumerate() {
+            let decorated = decorate_continuation(html, index, total);
+            let mut html_body = serde_json::json!({
                 "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "Markdown"
+                "text": decorated,
+                "parse_mode": "HTML",
             });
-
-            // Add message_thread_id for forum topic support
             if let Some(tid) = thread_id {
-                markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+                html_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
 
-            let markdown_resp = self
+            let resp = self
                 .http_client()
                 .post(self.api_url("sendMessage"))
-                .json(&markdown_body)
+                .json(&html_body)
                 .send()
                 .await?;
 
-            if markdown_resp.status().is_success() {
-                if index < chunks.len() - 1 {
+            if resp.status().is_success() {
+                if index + 1 < total {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 continue;
             }
 
-            let markdown_status = markdown_resp.status();
-            let markdown_err = markdown_resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                status = ?markdown_status,
-                "Telegram sendMessage with Markdown failed; retrying without parse_mode"
-            );
+            let html_status = resp.status();
+            let html_err = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = ?html_status, "Telegram HTML send failed; retrying as plain");
+
+            // An empty twin means split_paired had no fallback for this chunk —
+            // never send the unrendered HTML.
+            if plain.is_empty() {
+                anyhow::bail!("Telegram sendMessage failed ({html_status}): {html_err}");
+            }
 
             let mut plain_body = serde_json::json!({
                 "chat_id": chat_id,
-                "text": text,
+                "text": decorate_continuation(plain, index, total),
             });
-
-            // Add message_thread_id for forum topic support
             if let Some(tid) = thread_id {
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
@@ -1347,24 +1306,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .json(&plain_body)
                 .send()
                 .await?;
-
             if !plain_resp.status().is_success() {
-                let plain_status = plain_resp.status();
-                let plain_err = plain_resp.text().await.unwrap_or_default();
-                anyhow::bail!(
-                    "Telegram sendMessage failed (markdown {}: {}; plain {}: {})",
-                    markdown_status,
-                    markdown_err,
-                    plain_status,
-                    plain_err
-                );
+                let status = plain_resp.status();
+                let err = plain_resp.text().await.unwrap_or_default();
+                anyhow::bail!("Telegram sendMessage failed ({status}): {err}");
             }
-
-            if index < chunks.len() - 1 {
+            if index + 1 < total {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-
         Ok(())
     }
 
@@ -1884,6 +1834,10 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
+    fn render_target(&self) -> crate::channels::format::RenderTarget {
+        crate::channels::format::RenderTarget::TelegramHtml
+    }
+
     fn supports_draft_updates(&self) -> bool {
         self.stream_mode != StreamMode::Off
     }
@@ -1953,19 +1907,24 @@ impl Channel for TelegramChannel {
             }
         }
 
-        // Truncate to Telegram limit for mid-stream edits (UTF-8 safe)
-        let display_text = if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+        // Stream Plain, never raw markdown or HTML: a mid-stream edit holds a
+        // partial response, and a half-open `**`/`<b>` would send unbalanced
+        // markup. Plain has no markup to leave open. Render first, THEN truncate,
+        // so the UTF-8-safe cut runs on exactly what is sent.
+        use crate::channels::format::{render_to_string, RenderTarget};
+        let rendered = render_to_string(text, &RenderTarget::Plain);
+        let display_text = if rendered.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
             let mut end = 0;
-            for (idx, ch) in text.char_indices() {
+            for (idx, ch) in rendered.char_indices() {
                 let next = idx + ch.len_utf8();
                 if next > TELEGRAM_MAX_MESSAGE_LENGTH {
                     break;
                 }
                 end = next;
             }
-            &text[..end]
+            &rendered[..end]
         } else {
-            text
+            &rendered
         };
 
         let message_id_parsed = match message_id.parse::<i64>() {
@@ -2014,8 +1973,15 @@ impl Channel for TelegramChannel {
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
 
-        // If text exceeds limit, delete draft and send as chunked messages
-        if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+        use crate::channels::format::{render_to_string, RenderTarget};
+        // Render BEFORE gating: the edit now sends HTML, which is strictly longer
+        // than the raw markdown, so a 4000-char reply can render past 4096 and get
+        // a 400. Gate on the rendered length in `chars` — the splitter's unit —
+        // not raw `len()` bytes. Target from the trait seam, twin always Plain.
+        let html = render_to_string(text, &self.render_target());
+
+        // If the rendered text exceeds the limit, delete draft and chunk-send.
+        if html.chars().count() > TELEGRAM_MAX_MESSAGE_LENGTH {
             let msg_id = match message_id.parse::<i64>() {
                 Ok(id) => id,
                 Err(e) => {
@@ -2053,12 +2019,12 @@ impl Channel for TelegramChannel {
             }
         };
 
-        // Try editing with Markdown formatting
+        // Edit with the rendered HTML.
         let body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": msg_id,
-            "text": text,
-            "parse_mode": "Markdown",
+            "text": html,
+            "parse_mode": "HTML",
         });
 
         let resp = self
@@ -2072,11 +2038,12 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        // Markdown failed — retry without parse_mode
+        // HTML rejected — retry with the Plain render, never the raw markdown.
+        let plain = render_to_string(text, &RenderTarget::Plain);
         let plain_body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": msg_id,
-            "text": text,
+            "text": plain,
         });
 
         let resp = self
@@ -3132,80 +3099,6 @@ mod tests {
 
     // ── Message splitting tests ─────────────────────────────────────
 
-    #[test]
-    fn telegram_split_short_message() {
-        let msg = "Hello, world!";
-        let chunks = split_message_for_telegram(msg);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], msg);
-    }
-
-    #[test]
-    fn telegram_split_exact_limit() {
-        let msg = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH);
-        let chunks = split_message_for_telegram(&msg);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), TELEGRAM_MAX_MESSAGE_LENGTH);
-    }
-
-    #[test]
-    fn telegram_split_over_limit() {
-        let msg = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 100);
-        let chunks = split_message_for_telegram(&msg);
-        assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].len() <= TELEGRAM_MAX_MESSAGE_LENGTH);
-        assert!(chunks[1].len() <= TELEGRAM_MAX_MESSAGE_LENGTH);
-    }
-
-    #[test]
-    fn telegram_split_at_word_boundary() {
-        let msg = format!(
-            "{} more text here",
-            "word ".repeat(TELEGRAM_MAX_MESSAGE_LENGTH / 5)
-        );
-        let chunks = split_message_for_telegram(&msg);
-        assert!(chunks.len() >= 2);
-        // First chunk should end with a complete word (space at the end)
-        for chunk in &chunks[..chunks.len() - 1] {
-            assert!(chunk.len() <= TELEGRAM_MAX_MESSAGE_LENGTH);
-        }
-    }
-
-    #[test]
-    fn telegram_split_at_newline() {
-        let text_block = "Line of text\n".repeat(TELEGRAM_MAX_MESSAGE_LENGTH / 13 + 1);
-        let chunks = split_message_for_telegram(&text_block);
-        assert!(chunks.len() >= 2);
-        for chunk in chunks {
-            assert!(chunk.len() <= TELEGRAM_MAX_MESSAGE_LENGTH);
-        }
-    }
-
-    #[test]
-    fn telegram_split_preserves_content() {
-        let msg = "test ".repeat(TELEGRAM_MAX_MESSAGE_LENGTH / 5 + 100);
-        let chunks = split_message_for_telegram(&msg);
-        let rejoined = chunks.join("");
-        assert_eq!(rejoined, msg);
-    }
-
-    #[test]
-    fn telegram_split_empty_message() {
-        let chunks = split_message_for_telegram("");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], "");
-    }
-
-    #[test]
-    fn telegram_split_very_long_message() {
-        let msg = "x".repeat(TELEGRAM_MAX_MESSAGE_LENGTH * 3);
-        let chunks = split_message_for_telegram(&msg);
-        assert!(chunks.len() >= 3);
-        for chunk in chunks {
-            assert!(chunk.len() <= TELEGRAM_MAX_MESSAGE_LENGTH);
-        }
-    }
-
     // ── Caption handling tests ──────────────────────────────────────
 
     #[tokio::test]
@@ -3541,6 +3434,35 @@ mod tests {
     }
 
     #[test]
+    fn telegram_render_target_is_html() {
+        // Assert on the CHANNEL, not just `format::*`: a test that only called
+        // the renderer would pass before this wiring existed and prove nothing.
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        assert_eq!(
+            ch.render_target(),
+            crate::channels::format::RenderTarget::TelegramHtml
+        );
+    }
+
+    #[test]
+    fn telegram_paired_chunks_have_plain_twins() {
+        use crate::channels::format::{render_pair, split_paired, RenderTarget};
+        let (html, plain) = render_pair(
+            "## Hi\n\n**bold**",
+            &RenderTarget::TelegramHtml,
+            &RenderTarget::Plain,
+        );
+        let pairs = split_paired(&html, &plain, 4096);
+        assert_eq!(pairs.len(), 1);
+        // Headings and bold render to <b>, not leak as ## / **.
+        assert!(pairs[0].0.contains("<b>Hi</b>"));
+        assert!(pairs[0].0.contains("<b>bold</b>"));
+        assert!(!pairs[0].0.contains("##"));
+        // The Plain twin covers the same blocks, ready as the 400 fallback.
+        assert_eq!(pairs[0].1, "HI\n\nbold");
+    }
+
+    #[test]
     fn parse_update_message_mention_only_group_strips_mention_and_drops_empty() {
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
         {
@@ -3614,108 +3536,5 @@ mod tests {
 
         let ch_disabled = TelegramChannel::new("token".into(), vec!["*".into()], false);
         assert!(!ch_disabled.mention_only);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // TG6: Channel platform limit edge cases for Telegram (4096 char limit)
-    // Prevents: Pattern 6 — issues #574, #499
-    // ─────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn telegram_split_code_block_at_boundary() {
-        let mut msg = String::new();
-        msg.push_str("```python\n");
-        msg.push_str(&"x".repeat(4085));
-        msg.push_str("\n```\nMore text after code block");
-        let parts = split_message_for_telegram(&msg);
-        assert!(
-            parts.len() >= 2,
-            "code block spanning boundary should split"
-        );
-        for part in &parts {
-            assert!(
-                part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,
-                "each part must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
-                part.len()
-            );
-        }
-    }
-
-    #[test]
-    fn telegram_split_single_long_word() {
-        let long_word = "a".repeat(5000);
-        let parts = split_message_for_telegram(&long_word);
-        assert!(parts.len() >= 2, "word exceeding limit must be split");
-        for part in &parts {
-            assert!(
-                part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,
-                "hard-split part must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
-                part.len()
-            );
-        }
-        let reassembled: String = parts.join("");
-        assert_eq!(reassembled, long_word);
-    }
-
-    #[test]
-    fn telegram_split_exactly_at_limit_no_split() {
-        let msg = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH);
-        let parts = split_message_for_telegram(&msg);
-        assert_eq!(parts.len(), 1, "message exactly at limit should not split");
-    }
-
-    #[test]
-    fn telegram_split_one_over_limit() {
-        let msg = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 1);
-        let parts = split_message_for_telegram(&msg);
-        assert!(parts.len() >= 2, "message 1 char over limit must split");
-    }
-
-    #[test]
-    fn telegram_split_many_short_lines() {
-        let msg: String = (0..1000).fold(String::new(), |mut s, i| {
-            use std::fmt::Write as _;
-            let _ = writeln!(s, "line {i}");
-            s
-        });
-        let parts = split_message_for_telegram(&msg);
-        for part in &parts {
-            assert!(
-                part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,
-                "short-line batch must be <= limit"
-            );
-        }
-    }
-
-    #[test]
-    fn telegram_split_only_whitespace() {
-        let msg = "   \n\n\t  ";
-        let parts = split_message_for_telegram(msg);
-        assert!(parts.len() <= 1);
-    }
-
-    #[test]
-    fn telegram_split_emoji_at_boundary() {
-        let mut msg = "a".repeat(4094);
-        msg.push_str("🎉🎊"); // 4096 chars total
-        let parts = split_message_for_telegram(&msg);
-        for part in &parts {
-            // The function splits on character count, not byte count
-            assert!(
-                part.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
-                "emoji boundary split must respect limit"
-            );
-        }
-    }
-
-    #[test]
-    fn telegram_split_consecutive_newlines() {
-        let mut msg = "a".repeat(4090);
-        msg.push_str("\n\n\n\n\n\n");
-        msg.push_str(&"b".repeat(100));
-        let parts = split_message_for_telegram(&msg);
-        for part in &parts {
-            assert!(part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH);
-        }
     }
 }

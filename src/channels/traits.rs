@@ -80,6 +80,16 @@ pub trait Channel: Send + Sync {
     /// Human-readable channel name
     fn name(&self) -> &str;
 
+    /// Which markup dialect this channel renders the agent's markdown into.
+    ///
+    /// Defaults to [`RenderTarget::Plain`](crate::channels::format::RenderTarget)
+    /// — strip markup to readable text — so a channel that has not opted in ships
+    /// the safe baseline rather than leaking `##`/`**`. Each channel overrides
+    /// this and calls `format::render*` in its own `send()`/`finalize_draft()`.
+    fn render_target(&self) -> crate::channels::format::RenderTarget {
+        crate::channels::format::RenderTarget::Plain
+    }
+
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
@@ -176,6 +186,17 @@ mod tests {
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
         }
+    }
+
+    #[test]
+    fn default_render_target_is_plain() {
+        // A channel that has not opted in must ship the safe baseline, not leak
+        // markup. Every one of the 17 production channels relies on this default
+        // until its own PR wires a specific target.
+        assert_eq!(
+            DummyChannel.render_target(),
+            crate::channels::format::RenderTarget::Plain
+        );
     }
 
     #[test]
