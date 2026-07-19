@@ -6492,12 +6492,16 @@ async fn run_loop(
             if let Ok(size) = terminal.size() {
                 let needed = app.needed_viewport_height(size.width);
                 if needed != app.composer_viewport_rows {
-                    let top = size.height.saturating_sub(app.composer_viewport_rows);
-                    let mut out = io::stdout();
-                    // Move to the top row of the current viewport (1-indexed)
-                    // and clear from there to the end of the screen.
-                    let _ = write!(out, "\x1b[{};1H\x1b[J", top + 1);
-                    let _ = out.flush();
+                    // Clear the OLD viewport at its true on-screen position before
+                    // recreating at the new height. ratatui tracks the inline
+                    // viewport's real position (`viewport_area`), which is NOT
+                    // always bottom-anchored — it drifts down as scrollback is
+                    // inserted. A hand-computed `size.height - rows` top row is
+                    // therefore wrong whenever the viewport sits above the screen
+                    // bottom, which left a ghost top-border on every resize.
+                    // `terminal.clear()` clears exactly the tracked viewport region.
+                    let _ = terminal.clear();
+                    let _ = io::stdout().flush();
                     app.composer_viewport_rows = needed;
                     *terminal = reinit_inline_terminal(needed)?;
                 }
