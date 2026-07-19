@@ -4482,7 +4482,7 @@ mod composer_body_tests {
     #[test]
     fn no_span_carries_a_raw_newline() {
         for buffer in ["a\nb", "one\ntwo\nthree", "trailing\n", "\nleading"] {
-            let text = composer_body(buffer);
+            let text = composer_body(buffer, 80);
             for line in &text.lines {
                 for span in &line.spans {
                     assert!(
@@ -4510,7 +4510,7 @@ mod composer_body_tests {
             "trailing\r",
             "\rleading",
         ] {
-            let text = composer_body(buffer);
+            let text = composer_body(buffer, 80);
             for line in &text.lines {
                 for span in &line.spans {
                     assert!(
@@ -4527,22 +4527,22 @@ mod composer_body_tests {
     /// produce a phantom empty line between the two halves.
     #[test]
     fn every_line_break_form_splits_the_same_way() {
-        assert_eq!(composer_body("a\nb").lines.len(), 2, "LF");
-        assert_eq!(composer_body("a\rb").lines.len(), 2, "CR");
-        assert_eq!(composer_body("a\r\nb").lines.len(), 2, "CRLF");
+        assert_eq!(composer_body("a\nb", 80).lines.len(), 2, "LF");
+        assert_eq!(composer_body("a\rb", 80).lines.len(), 2, "CR");
+        assert_eq!(composer_body("a\r\nb", 80).lines.len(), 2, "CRLF");
     }
 
     #[test]
     fn splits_one_line_per_logical_line() {
-        assert_eq!(composer_body("a\nb\nc").lines.len(), 3);
-        assert_eq!(composer_body("single").lines.len(), 1);
+        assert_eq!(composer_body("a\nb\nc", 80).lines.len(), 3);
+        assert_eq!(composer_body("single", 80).lines.len(), 1);
     }
 
     /// A trailing newline is where the cursor sits after `Ctrl+J`; dropping
     /// the empty final line (as `str::lines` would) hides it.
     #[test]
     fn trailing_newline_keeps_its_empty_final_line() {
-        let text = composer_body("body\n");
+        let text = composer_body("body\n", 80);
         assert_eq!(text.lines.len(), 2);
         let last: String = text.lines[1]
             .spans
@@ -4554,7 +4554,7 @@ mod composer_body_tests {
 
     #[test]
     fn empty_buffer_renders_the_placeholder_on_one_line() {
-        let text = composer_body("");
+        let text = composer_body("", 80);
         assert_eq!(text.lines.len(), 1);
         let rendered: String = text.lines[0]
             .spans
@@ -4568,7 +4568,7 @@ mod composer_body_tests {
     /// reorder content while splitting.
     #[test]
     fn content_survives_the_split_verbatim() {
-        let text = composer_body("first\nsecond\nthird");
+        let text = composer_body("first\nsecond\nthird", 80);
         let bodies: Vec<String> = text
             .lines
             .iter()
@@ -4582,6 +4582,15 @@ mod composer_body_tests {
             })
             .collect();
         assert_eq!(bodies, vec!["first", "second", "third"]);
+    }
+
+    /// A logical line longer than the inner width is split into multiple
+    /// display rows by our own wrapping (ratatui word-wrap is gone). Row 0
+    /// budget is inner_w - 2 (prefix); here inner_w=12 → 10 chars on row 0.
+    #[test]
+    fn a_long_line_wraps_into_multiple_display_rows() {
+        let text = super::composer_body("abcdefghijklmn", 12); // 14 chars
+        assert_eq!(text.lines.len(), 2);
     }
 }
 
@@ -4645,6 +4654,39 @@ mod composer_caret_tests {
             }
         }
     }
+
+    /// The caret cell must index a real position inside the rendered rows:
+    /// caret_col is a valid column of the caret_row that layout_composer
+    /// emits (accounting for the 2-cell prefix on row 0). This is the
+    /// invariant that failed when the caret used char-wrap and the renderer
+    /// used ratatui word-wrap.
+    #[test]
+    fn caret_indexes_a_real_cell_in_the_rendered_rows() {
+        use super::layout_composer;
+        let inner_w = 12u16;
+        // A logical line that must wrap (14 chars > inner_w-prefix=10).
+        let buf = "abcdefghijklmn";
+        for cursor in 0..=buf.chars().count() {
+            let l = layout_composer(buf, cursor, inner_w);
+            assert!(
+                (l.caret_row as usize) < l.rows.len(),
+                "cursor {cursor}: caret_row {} out of {} rows",
+                l.caret_row,
+                l.rows.len()
+            );
+            // Row 0 carries a 2-cell prefix, so its text width budget is
+            // inner_w-2; other rows use the full inner_w. caret_col must not
+            // exceed the row's used width.
+            let prefix = if l.caret_row == 0 { 2 } else { 0 };
+            let row_len = l.rows[l.caret_row as usize].chars().count() as u16;
+            assert!(
+                l.caret_col <= prefix + row_len,
+                "cursor {cursor}: caret_col {} beyond row width {}",
+                l.caret_col,
+                prefix + row_len
+            );
+        }
+    }
 }
 
 /// Collapse every line-break form to `\n`.
@@ -4662,31 +4704,73 @@ fn normalize_line_breaks(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Caret cell for `cursor_pos` as `(row, col)` inside the composer's inner
-/// area, before any scroll is applied.
+/// The composer laid out as terminal display rows plus the caret cell.
 ///
-/// Char-cell wrap model: each char (including the leading "▎ " prefix)
-/// consumes one terminal cell. Exact for ASCII, approximate for full-width
-/// and combining glyphs, and it hard-breaks at `inner_w` where ratatui's
-/// `Wrap` breaks on word boundaries — a pre-existing skew this preserves
-/// rather than fixes.
-fn composer_caret_cell(buffer: &str, cursor_pos: usize, inner_w: u16) -> (u16, u16) {
-    let prefix_cells: u16 = 2; // "▎ "
-    let mut col: u16 = prefix_cells.min(inner_w.saturating_sub(1));
-    let mut row: u16 = 0;
-    for ch in buffer.chars().take(cursor_pos) {
+/// Single source of truth: the renderer draws exactly `rows` and the
+/// terminal cursor is placed at `(caret_row, caret_col)`, both computed by
+/// one walk. Because render and caret share this function, the cursor can
+/// never drift off the real character — the skew that existed when the
+/// caret hard-wrapped at `inner_w` while ratatui word-wrapped is gone.
+pub struct ComposerLayout {
+    /// Display rows, prefix-free. The renderer prepends the `"▎ "` prefix to
+    /// row 0 only; continuation and wrapped rows start at column 0.
+    pub rows: Vec<String>,
+    pub caret_row: u16,
+    pub caret_col: u16,
+}
+
+/// Wrap `buffer` into display rows and locate the caret for `cursor_pos`.
+///
+/// Char-cell model: each char consumes one cell, hard-breaking at `inner_w`.
+/// Row 0 starts at column `prefix` (2 cells for `"▎ "`), so it holds
+/// `inner_w - prefix` chars before wrapping; every later row holds `inner_w`.
+/// Newlines (already normalised to `\n`) start a fresh row at column 0.
+pub fn layout_composer(buffer: &str, cursor_pos: usize, inner_w: u16) -> ComposerLayout {
+    let inner_w = inner_w.max(1);
+    let prefix: u16 = 2;
+    let normalized = normalize_line_breaks(buffer);
+
+    let mut rows: Vec<String> = vec![String::new()];
+    // Cells used on the current row, INCLUDING the prefix on row 0.
+    let mut col: u16 = prefix.min(inner_w.saturating_sub(1));
+    let mut caret_row: u16 = 0;
+    let mut caret_col: u16 = col;
+
+    for (i, ch) in normalized.chars().enumerate() {
+        if i == cursor_pos {
+            caret_row = (rows.len() - 1) as u16;
+            caret_col = col;
+        }
         if ch == '\n' {
+            rows.push(String::new());
             col = 0;
-            row = row.saturating_add(1);
         } else {
+            rows.last_mut().expect("rows always non-empty").push(ch);
             col = col.saturating_add(1);
             if col >= inner_w {
+                rows.push(String::new());
                 col = 0;
-                row = row.saturating_add(1);
             }
         }
     }
-    (row, col.min(inner_w.saturating_sub(1)))
+    if cursor_pos >= normalized.chars().count() {
+        caret_row = (rows.len() - 1) as u16;
+        caret_col = col;
+    }
+
+    ComposerLayout {
+        rows,
+        caret_row,
+        caret_col: caret_col.min(inner_w.saturating_sub(1)),
+    }
+}
+
+/// Caret cell for `cursor_pos` as `(row, col)` inside the composer's inner
+/// area, before any scroll is applied. Delegates to [`layout_composer`] so
+/// the caret and the renderer share one wrap model.
+fn composer_caret_cell(buffer: &str, cursor_pos: usize, inner_w: u16) -> (u16, u16) {
+    let l = layout_composer(buffer, cursor_pos, inner_w);
+    (l.caret_row, l.caret_col)
 }
 
 /// Vertical scroll that keeps `caret_row` inside an `inner_h`-row window.
@@ -4706,7 +4790,7 @@ fn composer_scroll(caret_row: u16, inner_h: u16) -> u16 {
 /// and bracketed paste both put literal `\n` in `input_buffer`, so split into
 /// one `Line` per logical line here rather than handing the raw buffer to
 /// `Span::raw`.
-fn composer_body(input_buffer: &str) -> Text<'static> {
+fn composer_body(input_buffer: &str, inner_w: u16) -> Text<'static> {
     let prefix = Span::styled(
         "▎ ",
         Style::default()
@@ -4724,23 +4808,13 @@ fn composer_body(input_buffer: &str) -> Text<'static> {
         ]));
     }
 
-    // `split('\n')` (not `lines()`) so a trailing newline keeps its empty
-    // final line — the cursor sits there and the user must see it.
-    //
-    // Continuation lines carry no indent: ratatui's own soft-wrap returns to
-    // column 0, and the caret walker below likewise resets `col` to 0 after a
-    // '\n'. Indenting here would make hard-broken lines disagree with both.
-    //
-    // Normalize defensively even though `Event::Paste` already does: this is
-    // the last hop before the bytes reach the terminal, and a single stray
-    // '\r' here is not a cosmetic bug — it returns the real cursor to column
-    // 0 and the rest of the line eats the border.
-    let normalized = normalize_line_breaks(input_buffer);
-    let lines: Vec<Line<'static>> = normalized
-        .split('\n')
+    // Same wrapping the caret walker uses (cursor_pos irrelevant here).
+    let rows = layout_composer(input_buffer, 0, inner_w).rows;
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
         .enumerate()
-        .map(|(i, logical)| {
-            let text = Span::raw(logical.to_string());
+        .map(|(i, row)| {
+            let text = Span::raw(row);
             if i == 0 {
                 Line::from(vec![prefix.clone(), text])
             } else {
@@ -4765,7 +4839,7 @@ fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
     let (caret_row, caret_col) = composer_caret_cell(&ctx.input_buffer, ctx.cursor_pos, inner_w);
     let scroll = composer_scroll(caret_row, inner_h);
 
-    let input = Paragraph::new(composer_body(&ctx.input_buffer))
+    let input = Paragraph::new(composer_body(&ctx.input_buffer, inner_w))
         .scroll((scroll, 0))
         .block(
             Block::default()
@@ -4782,8 +4856,7 @@ fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Rgb(94, 184, 255))),
-        )
-        .wrap(Wrap { trim: false });
+        );
     frame.render_widget(input, area);
 
     // Position the terminal cursor at the insertion point so the user
