@@ -307,6 +307,16 @@ impl Channel for WhatsAppChannel {
         "whatsapp"
     }
 
+    fn render_target(&self) -> crate::channels::format::RenderTarget {
+        // WhatsApp renders single-char markup (`*bold*`, `_italic_`, `~strike~`),
+        // not CommonMark, so `**bold**`/`[](url)`/tables leak. LightMarkup{Raw}
+        // converts them and renders links as `text (url)` (WhatsApp has no link
+        // markup) without HTML-entity escaping (WhatsApp shows entities literally).
+        crate::channels::format::RenderTarget::LightMarkup {
+            links: crate::channels::format::LinkStyle::Raw,
+        }
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // WhatsApp Cloud API: POST to /v18.0/{phone_number_id}/messages
         let url = format!(
@@ -320,6 +330,8 @@ impl Channel for WhatsAppChannel {
             .strip_prefix('+')
             .unwrap_or(&message.recipient);
 
+        let rendered =
+            crate::channels::format::render_to_string(&message.content, &self.render_target());
         let body = serde_json::json!({
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -327,7 +339,7 @@ impl Channel for WhatsAppChannel {
             "type": "text",
             "text": {
                 "preview_url": false,
-                "body": message.content
+                "body": rendered
             }
         });
 
@@ -392,6 +404,26 @@ impl Channel for WhatsAppChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whatsapp_render_target_is_lightmarkup_raw() {
+        assert_eq!(
+            make_channel().render_target(),
+            crate::channels::format::RenderTarget::LightMarkup {
+                links: crate::channels::format::LinkStyle::Raw
+            }
+        );
+    }
+
+    #[test]
+    fn whatsapp_converts_commonmark_to_single_char_markup() {
+        // `**bold**` (shown literally by WhatsApp) → `*bold*`; a link → `text (url)`.
+        let out = crate::channels::format::render_to_string(
+            "**bold** and [docs](https://x.io)",
+            &make_channel().render_target(),
+        );
+        assert_eq!(out, "*bold* and docs (https://x.io)");
+    }
 
     fn make_channel() -> WhatsAppChannel {
         WhatsAppChannel::new(
