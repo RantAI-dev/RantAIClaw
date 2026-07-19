@@ -5,6 +5,32 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2-alpha] — 2026-07-19
+
+Telegram replies now render as HTML instead of shipping raw markdown, so
+headings, rules, and tables stop leaking as literal text. This does change the
+Telegram channel's outbound behavior; it is versioned as a patch.
+
+### Changed
+
+- **Telegram renders replies as HTML.** `#`/`##`/`###` headings become bold,
+  `---` rules become a line, runs of blank lines collapse, and code blocks and
+  tables render as `<pre>` — instead of leaking `#`/`---`/`|` through Telegram's
+  legacy `parse_mode=Markdown`. Each chunk carries a plain-text twin that is
+  sent as a fallback if Telegram rejects the HTML, and streaming draft edits are
+  rendered as plain text mid-response.
+- The agent's markdown is now rendered per platform through a shared `format`
+  library, selected via a new `render_target()` method on the `Channel` trait.
+  Only Telegram is wired so far; every other channel keeps its current behavior
+  (the plain-text baseline default). Matrix wiring is written but held back until
+  `matrix-sdk` builds under `--all-features` again.
+
+### Notes
+
+- Not yet verified against a live Telegram bot at release time — the rendering
+  is covered by unit tests and CI, but the actual send has not been exercised
+  end-to-end. Verify on a real chat when installing this build.
+
 ## [0.8.1-alpha] — 2026-07-19
 
 A focused fix to the interactive TUI chat composer so paste and the input box
