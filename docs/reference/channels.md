@@ -120,6 +120,39 @@ If `[channels_config.matrix]` or `[channels_config.lark]` is present but the cor
 
 ---
 
+## 2a. Reply Formatting
+
+The agent replies in GitHub-Flavored Markdown. Because each platform renders a
+different markup dialect (or none), RantaiClaw parses the reply once and renders
+it per platform before sending, so `##` headings, `**bold**`, and tables no
+longer leak as literal text. Rendering is pure and deterministic; each channel
+picks its dialect and the output is split into platform-sized chunks without
+cutting a code fence.
+
+| Channel | Render dialect | What happens to the markup |
+|---|---|---|
+| Telegram | HTML (`parse_mode=HTML`) | headings → **bold**, rules → a line, code → `<pre>`, tables → `<pre>` ASCII; each chunk carries a plain-text twin sent if Telegram rejects the HTML |
+| Discord | StdMarkdown | keeps CommonMark; tables → aligned ASCII in a ``` fence (Discord renders no tables); `\*literal\*` escaped |
+| DingTalk | StdMarkdown | its `markdown` message type renders CommonMark; tables → ASCII fence |
+| Mattermost | StdMarkdown (native tables) | full GFM including pipe tables stays native |
+| Slack | LightMarkup (`<url\|text>`) | `**bold**` → `*bold*`, links → `<url\|text>`, tables → ASCII fence, `&`/`<`/`>` escaped per Slack's text field |
+| WhatsApp (Cloud + Web) | LightMarkup (`text (url)`) | `**bold**` → `*bold*`, links → `text (url)`, tables → ASCII fence |
+| Signal, QQ, Linq, IRC, iMessage, Nextcloud Talk, Lark, Email, CLI | Plain | all markup stripped to readable text: headings uppercased, emphasis removed, links → `text (url)`, tables → aligned ASCII |
+| Matrix | *(not wired)* | Matrix renders GFM natively today via matrix-sdk, so nothing leaks; a dedicated render target is deferred until `matrix-sdk` builds under `--all-features` again |
+
+Notes:
+
+- **Tables** become an aligned ASCII grid on every platform that has no native
+  table (all but Mattermost). Wide tables can scroll horizontally on narrow
+  screens — inherent to ASCII-in-monospace.
+- **Telegram streaming**: mid-response draft edits are rendered as plain text (a
+  half-open HTML tag would be rejected); the final message is sent as HTML.
+- **Lark, Email, Nextcloud Talk, Linq** are on the Plain baseline. Lark sends its
+  `text` message type (plain); richer Lark `post`/`interactive` rendering, and an
+  HTML email part, are deferred upgrades.
+
+---
+
 ## 3. Allowlist Semantics
 
 For channels with inbound sender allowlists:
