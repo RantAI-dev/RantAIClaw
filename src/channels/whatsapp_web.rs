@@ -316,6 +316,15 @@ impl Channel for WhatsAppWebChannel {
         "whatsapp"
     }
 
+    fn render_target(&self) -> crate::channels::format::RenderTarget {
+        // Same WhatsApp app as the Cloud channel: single-char markup, no
+        // CommonMark. LightMarkup{Raw} converts `**bold**`→`*bold*` etc. and
+        // renders links as `text (url)` without entity escaping.
+        crate::channels::format::RenderTarget::LightMarkup {
+            links: crate::channels::format::LinkStyle::Raw,
+        }
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let client = self.client.lock().clone();
         let Some(client) = client else {
@@ -335,8 +344,11 @@ impl Channel for WhatsAppWebChannel {
         }
 
         let to = self.recipient_to_jid(&message.recipient)?;
+        // `rendered`, not `outgoing`: `outgoing` is the wa-rs Message struct.
+        let rendered =
+            crate::channels::format::render_to_string(&message.content, &self.render_target());
         let outgoing = wa_rs_proto::whatsapp::Message {
-            conversation: Some(message.content.clone()),
+            conversation: Some(rendered),
             ..Default::default()
         };
 
@@ -863,6 +875,16 @@ mod tests {
 
     fn make_channel(allowed: Vec<String>) -> WhatsAppWebChannel {
         WhatsAppWebChannel::new("/tmp/wa-test.db".into(), None, None, allowed)
+    }
+
+    #[test]
+    fn whatsapp_web_render_target_is_lightmarkup_raw() {
+        assert_eq!(
+            make_channel(vec![]).render_target(),
+            crate::channels::format::RenderTarget::LightMarkup {
+                links: crate::channels::format::LinkStyle::Raw
+            }
+        );
     }
 
     #[test]
