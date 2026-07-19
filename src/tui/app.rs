@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Widget, Wrap},
     Terminal,
 };
 
@@ -1235,8 +1235,10 @@ impl TuiApp {
                     && self.list_picker.is_none()
                     && self.info_panel.is_none() =>
             {
-                let max = self.context.messages.len().saturating_sub(1);
-                self.context.scroll_offset = (self.context.scroll_offset + 3).min(max);
+                // Scroll up by one screenful of chat lines; render clamps the
+                // upper bound to the top of the buffer.
+                let page = self.context.last_chat_rows.max(1);
+                self.context.scroll_offset = self.context.scroll_offset.saturating_add(page);
             }
             KeyCode::PageDown
                 if self.setup_overlay.is_none()
@@ -1244,7 +1246,8 @@ impl TuiApp {
                     && self.list_picker.is_none()
                     && self.info_panel.is_none() =>
             {
-                self.context.scroll_offset = self.context.scroll_offset.saturating_sub(3);
+                let page = self.context.last_chat_rows.max(1);
+                self.context.scroll_offset = self.context.scroll_offset.saturating_sub(page);
             }
             // Esc — close the setup overlay or cancel the wizard.
             KeyCode::Esc if self.setup_overlay.is_some() || self.first_run_wizard.is_some() => {
@@ -4228,56 +4231,184 @@ fn render_header_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) 
     frame.render_widget(header, area);
 }
 
-fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
-    let theme = super::render::RenderTheme::default();
-    let mut items: Vec<ListItem> = Vec::with_capacity(ctx.messages.len() + 1);
+/// Split a string into ordered tokens, each token being either a run of
+/// non-space chars (a word) or a run of spaces. Used by [`wrap_styled_line`] to
+/// break lines on spaces while preserving the exact spacing.
+fn tokenize_words(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_is_space: Option<bool> = None;
+    for ch in s.chars() {
+        let is_sp = ch == ' ';
+        if cur_is_space == Some(is_sp) {
+            cur.push(ch);
+        } else {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+            cur_is_space = Some(is_sp);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
 
-    if ctx.messages.is_empty() && !matches!(state, AppState::Streaming { .. }) {
-        for line in render_splash_lines(ctx, area.width, area.height) {
-            items.push(ListItem::new(line));
+/// Word-wrap a styled `Line` to `width` columns, preserving each span's style.
+/// Breaks on spaces; a single word longer than `width` is hard-broken. Leading
+/// spaces created by a wrap are dropped. Always returns at least one line (an
+/// empty input line stays one empty line, so blank paragraph breaks survive).
+///
+/// Column accounting is one cell per `char` — the same simplification the
+/// composer's [`layout_composer`] uses, so wrap width stays consistent across
+/// the two panes. Rendering with a plain (non-wrapping) `Paragraph` afterwards
+/// means these pre-wrapped lines are never re-wrapped or clipped.
+fn wrap_styled_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+    // An inter-word space is held here until a following word confirms it stays
+    // on the same row, so a space never lands at a wrap point (no trailing
+    // spaces, no leading spaces on a wrapped row).
+    let mut pending_space: Option<(String, Style)> = None;
+
+    for span in &line.spans {
+        let style = span.style;
+        for tok in tokenize_words(&span.content) {
+            let tw = tok.chars().count();
+            if tok.starts_with(' ') {
+                if cur_w > 0 {
+                    pending_space = Some((tok, style));
+                }
+                continue;
+            }
+            let space_w = pending_space.as_ref().map_or(0, |(s, _)| s.chars().count());
+            if tw > width {
+                // A single word wider than the whole line: start it on a fresh
+                // row (dropping any pending space) and hard-break it.
+                if cur_w > 0 {
+                    out.push(Line::from(std::mem::take(&mut cur)));
+                    cur_w = 0;
+                }
+                pending_space = None;
+                for ch in tok.chars() {
+                    if cur_w == width {
+                        out.push(Line::from(std::mem::take(&mut cur)));
+                        cur_w = 0;
+                    }
+                    cur.push(Span::styled(ch.to_string(), style));
+                    cur_w += 1;
+                }
+            } else if cur_w + space_w + tw > width {
+                // Word doesn't fit: wrap, dropping the pending space.
+                out.push(Line::from(std::mem::take(&mut cur)));
+                cur_w = 0;
+                pending_space = None;
+                cur.push(Span::styled(tok, style));
+                cur_w += tw;
+            } else {
+                if let Some((s, s_style)) = pending_space.take() {
+                    cur_w += s.chars().count();
+                    cur.push(Span::styled(s, s_style));
+                }
+                cur.push(Span::styled(tok, style));
+                cur_w += tw;
+            }
+        }
+    }
+    // A pending space at end-of-line is intentionally dropped.
+    out.push(Line::from(cur));
+    out
+}
+
+fn render_chat_pane(
+    state: &AppState,
+    ctx: &mut TuiContext,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+) {
+    let theme = super::render::RenderTheme::default();
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let inner_h = (area.height.saturating_sub(2).max(1)) as usize;
+    ctx.last_chat_rows = inner_h;
+
+    // Flatten every message into individual, pre-wrapped display lines. A plain
+    // `List` renders NOTHING when a single item (one long message) is taller
+    // than the pane, so we can't hand it multi-line items; instead we build one
+    // flat line buffer, word-wrap it to the pane width (so long replies reflow
+    // instead of being clipped off the right edge), and window the bottom
+    // `inner_h` lines ourselves.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let streaming = matches!(state, AppState::Streaming { .. });
+
+    if ctx.messages.is_empty() && !streaming {
+        // The splash is ASCII art already sized to the pane width; don't
+        // re-wrap it (that would mangle the logo).
+        lines.extend(render_splash_lines(ctx, area.width, area.height));
+    } else {
+        for msg in &ctx.messages {
+            let persisted = msg
+                .tool_calls
+                .as_deref()
+                .map(super::render::parse_persisted_tool_calls)
+                .unwrap_or_default();
+            let raw = super::render::render_message_lines(
+                &msg.role,
+                &msg.content,
+                &persisted,
+                &[],
+                &theme,
+            );
+            for line in &raw {
+                lines.extend(wrap_styled_line(line, inner_w));
+            }
+        }
+
+        if let AppState::Streaming {
+            partial,
+            tool_blocks,
+            ..
+        } = state
+        {
+            let frame_idx = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as usize / 100)
+                .unwrap_or(0))
+                % SPINNER_FRAMES.len();
+            let spinner = SPINNER_FRAMES[frame_idx];
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{spinner} "),
+                    Style::default()
+                        .fg(Color::Rgb(94, 184, 255))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("thinking…", Style::default().fg(Color::Rgb(107, 114, 128))),
+            ]));
+            let raw =
+                super::render::render_message_lines("assistant", partial, &[], tool_blocks, &theme);
+            for line in &raw {
+                lines.extend(wrap_styled_line(line, inner_w));
+            }
         }
     }
 
-    for msg in &ctx.messages {
-        let persisted = msg
-            .tool_calls
-            .as_deref()
-            .map(super::render::parse_persisted_tool_calls)
-            .unwrap_or_default();
-        let lines =
-            super::render::render_message_lines(&msg.role, &msg.content, &persisted, &[], &theme);
-        items.push(ListItem::new(lines));
+    // Stick to the bottom: show the last `inner_h` lines. `scroll_offset` is how
+    // many lines up from the newest the user has paged with PgUp (0 = bottom).
+    // Clamp it here so it can never scroll past the top and PgDn always returns.
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(inner_h);
+    if ctx.scroll_offset > max_scroll {
+        ctx.scroll_offset = max_scroll;
     }
+    let end = total.saturating_sub(ctx.scroll_offset);
+    let start = end.saturating_sub(inner_h);
+    let visible: Vec<Line<'static>> = lines[start..end].to_vec();
 
-    if let AppState::Streaming {
-        partial,
-        tool_blocks,
-        ..
-    } = state
-    {
-        let frame_idx = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as usize / 100)
-            .unwrap_or(0))
-            % SPINNER_FRAMES.len();
-        let spinner = SPINNER_FRAMES[frame_idx];
-        let header = Line::from(vec![
-            Span::styled(
-                format!("{spinner} "),
-                Style::default()
-                    .fg(Color::Rgb(94, 184, 255))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("thinking…", Style::default().fg(Color::Rgb(107, 114, 128))),
-        ]);
-        items.push(ListItem::new(header));
-        let lines =
-            super::render::render_message_lines("assistant", partial, &[], tool_blocks, &theme);
-        items.push(ListItem::new(lines));
-    }
-
-    let item_count = items.len();
-    let list = List::new(items).block(
+    let para = Paragraph::new(visible).block(
         Block::default()
             .title(Line::from(vec![
                 Span::raw(" "),
@@ -4293,17 +4424,7 @@ fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Fra
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Rgb(40, 70, 140))),
     );
-    // Stick to the bottom by default (a plain `List` renders from the top,
-    // hiding recent output): select an item near the end so ratatui scrolls it
-    // into view. `scroll_offset` is how many items up from the newest the user
-    // has paged with PgUp (0 = stuck to the bottom). No highlight style is set,
-    // so selection only drives the scroll, not any visual marker.
-    let mut list_state = ListState::default();
-    if item_count > 0 {
-        let sel = (item_count - 1).saturating_sub(ctx.scroll_offset);
-        list_state.select(Some(sel));
-    }
-    frame.render_stateful_widget(list, area, &mut list_state);
+    frame.render_widget(para, area);
 }
 
 /// Commit a block of `Line`s to the terminal scrollback above the inline
@@ -4824,6 +4945,60 @@ mod composer_caret_tests {
         // Only one visual row → both directions return None (history fallback).
         assert_eq!(visual_cursor_move(buf, end, inner_w, true), None);
         assert_eq!(visual_cursor_move(buf, end, inner_w, false), None);
+    }
+
+    fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+        use super::wrap_styled_line;
+        let line = ratatui::text::Line::from(text.to_string());
+        wrap_styled_line(&line, width)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wrap_breaks_on_word_boundaries_within_width() {
+        let rows = wrap_plain("alpha bravo charlie", 12);
+        assert_eq!(rows, vec!["alpha bravo".to_string(), "charlie".to_string()]);
+        for r in &rows {
+            assert!(r.chars().count() <= 12, "row {r:?} exceeds width");
+        }
+    }
+
+    #[test]
+    fn wrap_hard_breaks_a_word_longer_than_width() {
+        // 10-char word into width 4 → 4 + 4 + 2.
+        let rows = wrap_plain("abcdefghij", 4);
+        assert_eq!(rows, vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn wrap_preserves_blank_and_short_lines_unchanged() {
+        assert_eq!(wrap_plain("", 10), vec![String::new()]);
+        assert_eq!(wrap_plain("fits", 10), vec!["fits".to_string()]);
+    }
+
+    #[test]
+    fn wrap_preserves_span_styles() {
+        use super::wrap_styled_line;
+        use ratatui::style::{Color, Style};
+        use ratatui::text::{Line, Span};
+        // A styled label span then plain body, forced to wrap.
+        let red = Style::default().fg(Color::Red);
+        let line = Line::from(vec![
+            Span::styled("Label: ".to_string(), red),
+            Span::raw("one two three four five".to_string()),
+        ]);
+        let rows = wrap_styled_line(&line, 10);
+        assert!(rows.len() > 1, "should wrap onto multiple rows");
+        // The label span keeps its colour on row 0.
+        assert_eq!(rows[0].spans[0].content.as_ref(), "Label:");
+        assert_eq!(rows[0].spans[0].style.fg, Some(Color::Red));
     }
 }
 
@@ -7186,6 +7361,63 @@ mod submit_tests {
             autonomy_hint_shown_this_turn: false,
             pending_approval: None,
         }
+    }
+
+    fn chat_pane_buffer_text(ctx: &mut TuiContext, w: u16, h: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_chat_pane(&AppState::Ready, ctx, f, area);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// Regression: a single message taller than the pane used to render the
+    /// chat area completely blank (ratatui `List` draws nothing when the
+    /// selected item is taller than the viewport). The flat line-window render
+    /// must show the BOTTOM of the long message (stick-to-bottom).
+    #[test]
+    fn chat_pane_shows_bottom_of_a_message_taller_than_the_pane() {
+        let (mut ctx, _r, _e) = TuiContext::test_context();
+        let long: String = (1..=200)
+            .map(|i| format!("answer line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ctx.append_assistant_message(&long).unwrap();
+        let text = chat_pane_buffer_text(&mut ctx, 80, 20);
+        assert!(
+            text.contains("answer line 200"),
+            "the newest (bottom) line must be visible, not a blank pane"
+        );
+        assert!(
+            !text.contains("answer line 1 "),
+            "the top of a too-tall message should be scrolled off, not shown"
+        );
+    }
+
+    /// Regression: a reply wider than the pane must WRAP (reflow) into the pane,
+    /// not be clipped off the right edge.
+    #[test]
+    fn chat_pane_wraps_a_line_wider_than_the_pane() {
+        let (mut ctx, _r, _e) = TuiContext::test_context();
+        // One long line, no newlines, far wider than a 40-col pane.
+        let wide = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike";
+        ctx.append_assistant_message(wide).unwrap();
+        let text = chat_pane_buffer_text(&mut ctx, 40, 12);
+        // Every word survives (wrapped onto later rows), including the last one
+        // that a non-wrapping renderer would have clipped.
+        assert!(text.contains("alpha"), "first word visible");
+        assert!(
+            text.contains("mike"),
+            "last word must wrap into view, not clip"
+        );
     }
 
     #[tokio::test]

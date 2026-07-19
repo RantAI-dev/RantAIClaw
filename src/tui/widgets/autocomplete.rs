@@ -116,12 +116,16 @@ impl Autocomplete {
         let max_visible = (area.height as usize).saturating_sub(2).max(1);
         let visible_count = self.suggestions.len().min(max_visible);
         let height: u16 = (visible_count + 2).try_into().unwrap_or(area.height);
+        let height = height.min(area.height);
 
+        // Bottom-anchor the (content-sized) dropdown inside the reserved area so
+        // it hugs the top of the composer instead of floating at the top of the
+        // area with a gap below it.
         let popup = Rect {
             x: area.x,
-            y: area.y,
+            y: area.y + area.height.saturating_sub(height),
             width: area.width,
-            height: height.min(area.height),
+            height,
         };
 
         let inner_w = popup.width.saturating_sub(2) as usize;
@@ -221,6 +225,37 @@ mod tests {
         ]);
         assert!(ac.is_visible());
         assert_eq!(ac.selected(), Some("/help"));
+    }
+
+    /// Regression: given a tall reserved area, the content-sized dropdown must
+    /// hug the BOTTOM of it (just above the composer), not float at the top
+    /// leaving an empty gap. With 1 suggestion in a 10-row area, the box (3
+    /// rows) must occupy the last rows.
+    #[test]
+    fn dropdown_bottom_anchors_within_a_tall_area() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+        let mut ac = Autocomplete::new();
+        ac.update(vec![("/clear".into(), "Start a new session".into())]);
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| {
+            ac.render(f, Rect::new(0, 0, 40, 10));
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let row_text = |y: u16| -> String { (0..40).map(|x| buf[(x, y)].symbol()).collect() };
+        // Top rows are blank; the box (border + item + border) is at the bottom.
+        assert!(
+            row_text(0).trim().is_empty(),
+            "top must be empty (no float)"
+        );
+        assert!(row_text(7).contains('╭'), "box top border at row 7");
+        assert!(row_text(8).contains("/clear"), "suggestion on row 8");
+        assert!(
+            row_text(9).contains('╰'),
+            "box bottom border at the last row"
+        );
     }
 
     #[test]
