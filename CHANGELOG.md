@@ -5,6 +5,30 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1-alpha] — 2026-07-19
+
+A focused fix to the interactive TUI chat composer so paste and the input box
+stay in sync, matching Claude-Code-style behavior. Patch bump — no runtime
+contract (config / CLI / provider / channel) changes.
+
+### Added
+
+- **Dynamic composer height.** The inline chat input now grows to fit its
+  content (1–6 text rows) and shrinks back, instead of a fixed 2-row box.
+
+### Fixed
+
+- **Cursor no longer drifts on wrapped lines.** Wrapping and caret placement now
+  derive from one shared layout pass, so the terminal cursor always sits on the
+  real character.
+- **Paste works under tmux.** Multi-line pastes are reconstructed from raw key
+  events when the terminal does not deliver bracketed paste, and collapse to a
+  `[Pasted text #N +M lines]` placeholder instead of splitting into many turns.
+- **No ghost composer box.** Resizing the inline viewport now clears the box at
+  its real tracked position, fixing duplicate top-borders that accumulated on
+  every grow/shrink.
+- A lone `Tab` in the composer no longer inserts a literal tab character.
+
 ## [0.8.0-alpha] — 2026-07-18
 
 A large accumulated batch spanning multiple review/hardening sprints since
