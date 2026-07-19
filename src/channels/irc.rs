@@ -385,11 +385,20 @@ impl Channel for IrcChannel {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("IRC not connected"))?;
 
+        // IRC renders no markup — strip to readable text, THEN feed the rendered
+        // string into IRC's own per-line PRIVMSG splitter (keep it: it enforces
+        // the 512-byte line limit, which format::split does not know about).
+        // Plain's four-space code indent (no fences) matches IRC style.
+        let rendered = crate::channels::format::render_to_string(
+            &message.content,
+            &crate::channels::format::RenderTarget::Plain,
+        );
+
         // Calculate safe payload size:
         // 512 - sender prefix (~64 bytes for :nick!user@host) - "PRIVMSG " - target - " :" - "\r\n"
         let overhead = SENDER_PREFIX_RESERVE + 10 + message.recipient.len() + 2;
         let max_payload = 512_usize.saturating_sub(overhead);
-        let chunks = split_message(&message.content, max_payload);
+        let chunks = split_message(&rendered, max_payload);
 
         for chunk in chunks {
             Self::send_raw(writer, &format!("PRIVMSG {} :{chunk}", message.recipient)).await?;

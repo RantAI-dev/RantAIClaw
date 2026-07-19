@@ -316,11 +316,18 @@ impl Channel for LinqChannel {
         // Otherwise create a new chat with the recipient phone number.
         let recipient = &message.recipient;
 
+        // Linq text parts render no markup — strip to readable text. Used by both
+        // the existing-chat and new-chat bind points.
+        let rendered = crate::channels::format::render_to_string(
+            &message.content,
+            &crate::channels::format::RenderTarget::Plain,
+        );
+
         let body = serde_json::json!({
             "message": {
                 "parts": [{
                     "type": "text",
-                    "value": message.content
+                    "value": rendered
                 }]
             }
         });
@@ -349,7 +356,7 @@ impl Channel for LinqChannel {
                 "message": {
                     "parts": [{
                         "type": "text",
-                        "value": message.content
+                        "value": rendered
                     }]
                 }
             });

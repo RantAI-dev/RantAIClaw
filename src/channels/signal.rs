@@ -382,15 +382,21 @@ impl Channel for SignalChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Signal renders no markup, so strip to readable text. Both the Direct
+        // and Group bind points use the same rendered string.
+        let rendered = crate::channels::format::render_to_string(
+            &message.content,
+            &crate::channels::format::RenderTarget::Plain,
+        );
         let params = match Self::parse_recipient_target(&message.recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "recipient": [number],
-                "message": &message.content,
+                "message": &rendered,
                 "account": &self.account,
             }),
             RecipientTarget::Group(group_id) => serde_json::json!({
                 "groupId": group_id,
-                "message": &message.content,
+                "message": &rendered,
                 "account": &self.account,
             }),
         };

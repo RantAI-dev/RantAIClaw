@@ -516,11 +516,18 @@ impl Channel for EmailChannel {
             ("RantaiClaw Message", message.content.as_str())
         };
 
+        // Render only the reply body (a text/plain part) — the Subject: and
+        // quote handling above operate on the raw content and stay untouched.
+        let rendered_body = crate::channels::format::render_to_string(
+            body,
+            &crate::channels::format::RenderTarget::Plain,
+        );
+
         let email = Message::builder()
             .from(self.config.from_address.parse()?)
             .to(message.recipient.parse()?)
             .subject(subject)
-            .singlepart(SinglePart::plain(body.to_string()))?;
+            .singlepart(SinglePart::plain(rendered_body))?;
 
         let transport = self.create_smtp_transport()?;
         transport.send(&email)?;

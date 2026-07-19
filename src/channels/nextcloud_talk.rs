@@ -307,8 +307,13 @@ impl Channel for NextcloudTalkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        self.send_to_room(&message.recipient, &message.content)
-            .await
+        // Nextcloud Talk renders no markup — strip to readable text. Rendered here
+        // (agent replies only); `send_to_room` also carries plain pairing messages.
+        let rendered = crate::channels::format::render_to_string(
+            &message.content,
+            &crate::channels::format::RenderTarget::Plain,
+        );
+        self.send_to_room(&message.recipient, &rendered).await
     }
 
     async fn listen(
