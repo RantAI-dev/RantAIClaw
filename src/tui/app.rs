@@ -4729,6 +4729,7 @@ mod paste_coalesce_tests {
     fn a_batch_is_a_paste_when_multi_char_or_has_a_newline() {
         assert!(batch_is_paste("ab")); // two chars
         assert!(batch_is_paste("a\nb")); // contains newline
+        assert!(batch_is_paste("\n")); // count()==1, isolates the contains('\n') clause
         assert!(!batch_is_paste("a")); // lone char is normal typing
         assert!(!batch_is_paste("")); // empty
     }
@@ -6537,21 +6538,36 @@ async fn run_loop(
                 } else {
                     let _ = terminal.clear();
                 }
-            } else if let Some(first) = leading_text_key(&ev) {
+            } else if alt.is_none()
+                && app.overlay.is_none()
+                && app.pending_approval.is_none()
+                && leading_text_key(&ev).is_some()
+            {
                 // Potential paste burst: a printable key with more input
                 // already queued. Drain the run of text keys into one batch;
                 // a batch that is multi-char or multi-line is a paste, so
                 // internal Enters become '\n' instead of submitting. A lone
                 // char (fast single keystroke) falls through to normal typing.
+                //
+                // Gated to when the chat composer actually owns the input:
+                // no full-screen modal (`alt` covers login gate, list
+                // picker, info panel, autocomplete dropdown, setup overlay,
+                // first-run wizard — see `want_alt` above), no `/help`
+                // overlay, and no pending-approval prompt. Those surfaces
+                // have their own key handling in `handle_key` (Tab-complete,
+                // picker install, overlay dismiss, Y/N/A approval) that a
+                // blind paste-coalescing intercept would otherwise shadow.
+                let first =
+                    leading_text_key(&ev).expect("guarded by leading_text_key(&ev).is_some()");
                 let mut batch = String::new();
                 push_text_key(&mut batch, first);
                 let mut trailing: Option<Event> = None;
                 while event::poll(std::time::Duration::from_millis(0))? {
                     let next = event::read()?;
-                    match (next.clone(), leading_or_inner_text_key(&next)) {
-                        (_, Some(tk)) => push_text_key(&mut batch, tk),
-                        (other, None) => {
-                            trailing = Some(other);
+                    match leading_or_inner_text_key(&next) {
+                        Some(tk) => push_text_key(&mut batch, tk),
+                        None => {
+                            trailing = Some(next);
                             break;
                         }
                     }
