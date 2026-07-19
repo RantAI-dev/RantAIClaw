@@ -172,6 +172,14 @@ impl Channel for DingTalkChannel {
         "dingtalk"
     }
 
+    fn render_target(&self) -> crate::channels::format::RenderTarget {
+        // DingTalk's `markdown` message type renders a CommonMark-ish subset but
+        // no tables, so `tables_native: false` sends tables as an ASCII grid.
+        crate::channels::format::RenderTarget::StdMarkdown {
+            tables_native: false,
+        }
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let webhooks = self.session_webhooks.read().await;
         let webhook_url = webhooks.get(&message.recipient).ok_or_else(|| {
@@ -183,11 +191,13 @@ impl Channel for DingTalkChannel {
         })?;
 
         let title = message.subject.as_deref().unwrap_or("RantaiClaw");
+        let rendered =
+            crate::channels::format::render_to_string(&message.content, &self.render_target());
         let body = serde_json::json!({
             "msgtype": "markdown",
             "markdown": {
                 "title": title,
-                "text": message.content,
+                "text": rendered,
             }
         });
 
@@ -374,6 +384,17 @@ impl Channel for DingTalkChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dingtalk_render_target_is_std_markdown() {
+        let ch = DingTalkChannel::new("id".into(), "secret".into(), vec![]);
+        assert_eq!(
+            ch.render_target(),
+            crate::channels::format::RenderTarget::StdMarkdown {
+                tables_native: false
+            }
+        );
+    }
 
     #[test]
     fn test_name() {

@@ -117,54 +117,6 @@ const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
 
-/// Split a message into chunks that respect Discord's 2000-character limit.
-/// Tries to split at word boundaries when possible.
-fn split_message_for_discord(message: &str) -> Vec<String> {
-    if message.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH {
-        return vec![message.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut remaining = message;
-
-    while !remaining.is_empty() {
-        // Find the byte offset for the 2000th character boundary.
-        // If there are fewer than 2000 chars left, we can emit the tail directly.
-        let hard_split = remaining
-            .char_indices()
-            .nth(DISCORD_MAX_MESSAGE_LENGTH)
-            .map_or(remaining.len(), |(idx, _)| idx);
-
-        let chunk_end = if hard_split == remaining.len() {
-            hard_split
-        } else {
-            // Try to find a good break point (newline, then space)
-            let search_area = &remaining[..hard_split];
-
-            // Prefer splitting at newline
-            if let Some(pos) = search_area.rfind('\n') {
-                // Don't split if the newline is too close to the end
-                if search_area[..pos].chars().count() >= DISCORD_MAX_MESSAGE_LENGTH / 2 {
-                    pos + 1
-                } else {
-                    // Try space as fallback
-                    search_area.rfind(' ').map_or(hard_split, |space| space + 1)
-                }
-            } else if let Some(pos) = search_area.rfind(' ') {
-                pos + 1
-            } else {
-                // Hard split at the limit
-                hard_split
-            }
-        };
-
-        chunks.push(remaining[..chunk_end].to_string());
-        remaining = &remaining[chunk_end..];
-    }
-
-    chunks
-}
-
 fn mention_tags(bot_user_id: &str) -> [String; 2] {
     [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")]
 }
@@ -246,8 +198,20 @@ impl Channel for DiscordChannel {
         "discord"
     }
 
+    fn render_target(&self) -> crate::channels::format::RenderTarget {
+        // Discord renders CommonMark markup but NOT tables, so `tables_native:
+        // false` turns tables into an aligned ASCII grid in a ``` fence (which
+        // Discord renders monospace) instead of leaking raw pipes.
+        crate::channels::format::RenderTarget::StdMarkdown {
+            tables_native: false,
+        }
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let chunks = split_message_for_discord(&message.content);
+        // Render per-platform, then split without cutting a code fence — replaces
+        // the naive char-count splitter that could cut a fenced block in half.
+        let blocks = crate::channels::format::render(&message.content, &self.render_target());
+        let chunks = crate::channels::format::split(&blocks, DISCORD_MAX_MESSAGE_LENGTH);
 
         for (i, chunk) in chunks.iter().enumerate() {
             let url = format!(
@@ -578,6 +542,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn discord_render_target_is_std_markdown_ascii_tables() {
+        // Assert on the CHANNEL, not just format::* — this fails against the
+        // pre-wiring `Plain` default and pins tables_native=false (Discord has
+        // no native tables).
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        assert_eq!(
+            ch.render_target(),
+            crate::channels::format::RenderTarget::StdMarkdown {
+                tables_native: false
+            }
+        );
+    }
+
+    #[test]
+    fn discord_renders_a_table_as_fenced_ascii() {
+        // The real win: a GFM table Discord cannot render becomes an aligned
+        // ASCII grid in a ``` fence (Discord renders fences monospace).
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let out = crate::channels::format::render_to_string(
+            "| A | B |\n|---|---|\n| 1 | 2 |",
+            &ch.render_target(),
+        );
+        assert!(out.contains("```"), "table not fenced: {out}");
+        assert!(!out.contains("| A | B |"), "raw pipe table leaked: {out}");
+    }
+
+    #[test]
     fn discord_channel_name() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
         assert_eq!(ch.name(), "discord");
@@ -705,155 +696,6 @@ mod tests {
         assert!(cleaned.is_none());
     }
 
-    // Message splitting tests
-
-    #[test]
-    fn split_empty_message() {
-        let chunks = split_message_for_discord("");
-        assert_eq!(chunks, vec![""]);
-    }
-
-    #[test]
-    fn split_short_message_under_limit() {
-        let msg = "Hello, world!";
-        let chunks = split_message_for_discord(msg);
-        assert_eq!(chunks, vec![msg]);
-    }
-
-    #[test]
-    fn split_message_exactly_2000_chars() {
-        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH);
-        let chunks = split_message_for_discord(&msg);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
-    }
-
-    #[test]
-    fn split_message_just_over_limit() {
-        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH + 1);
-        let chunks = split_message_for_discord(&msg);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
-        assert_eq!(chunks[1].chars().count(), 1);
-    }
-
-    #[test]
-    fn split_very_long_message() {
-        let msg = "word ".repeat(2000); // 10000 characters (5 chars per "word ")
-        let chunks = split_message_for_discord(&msg);
-        // Should split into 5 chunks of <= 2000 chars
-        assert_eq!(chunks.len(), 5);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH));
-        // Verify total content is preserved
-        let reconstructed = chunks.concat();
-        assert_eq!(reconstructed, msg);
-    }
-
-    #[test]
-    fn split_prefer_newline_break() {
-        let msg = format!("{}\n{}", "a".repeat(1500), "b".repeat(500));
-        let chunks = split_message_for_discord(&msg);
-        // Should split at the newline
-        assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].ends_with('\n'));
-        assert!(chunks[1].starts_with('b'));
-    }
-
-    #[test]
-    fn split_prefer_space_break() {
-        let msg = format!("{} {}", "a".repeat(1500), "b".repeat(600));
-        let chunks = split_message_for_discord(&msg);
-        assert_eq!(chunks.len(), 2);
-    }
-
-    #[test]
-    fn split_without_good_break_points_hard_split() {
-        // No spaces or newlines - should hard split at 2000
-        let msg = "a".repeat(5000);
-        let chunks = split_message_for_discord(&msg);
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
-        assert_eq!(chunks[1].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
-        assert_eq!(chunks[2].chars().count(), 1000);
-    }
-
-    #[test]
-    fn split_multiple_breaks() {
-        // Create a message with multiple newlines
-        let part1 = "a".repeat(900);
-        let part2 = "b".repeat(900);
-        let part3 = "c".repeat(900);
-        let msg = format!("{part1}\n{part2}\n{part3}");
-        let chunks = split_message_for_discord(&msg);
-        // Should split into 2 chunks (first two parts + third part)
-        assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].chars().count() <= DISCORD_MAX_MESSAGE_LENGTH);
-        assert!(chunks[1].chars().count() <= DISCORD_MAX_MESSAGE_LENGTH);
-    }
-
-    #[test]
-    fn split_preserves_content() {
-        let original = "Hello world! This is a test message with some content. ".repeat(200);
-        let chunks = split_message_for_discord(&original);
-        let reconstructed = chunks.concat();
-        assert_eq!(reconstructed, original);
-    }
-
-    #[test]
-    fn split_unicode_content() {
-        // Test with emoji and multi-byte characters
-        let msg = "🦀 Rust is awesome! ".repeat(500);
-        let chunks = split_message_for_discord(&msg);
-        // All chunks should be valid UTF-8
-        for chunk in &chunks {
-            assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
-            assert!(chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH);
-        }
-        // Reconstruct and verify
-        let reconstructed = chunks.concat();
-        assert_eq!(reconstructed, msg);
-    }
-
-    #[test]
-    fn split_newline_too_close_to_end() {
-        // If newline is in the first half, don't use it - use space instead or hard split
-        let msg = format!("{}\n{}", "a".repeat(1900), "b".repeat(500));
-        let chunks = split_message_for_discord(&msg);
-        // Should split at newline since it's in the second half of the window
-        assert_eq!(chunks.len(), 2);
-    }
-
-    #[test]
-    fn split_multibyte_only_content_without_panics() {
-        let msg = "🦀".repeat(2500);
-        let chunks = split_message_for_discord(&msg);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
-        assert_eq!(chunks[1].chars().count(), 500);
-        let reconstructed = chunks.concat();
-        assert_eq!(reconstructed, msg);
-    }
-
-    #[test]
-    fn split_chunks_always_within_discord_limit() {
-        let msg = "x".repeat(12_345);
-        let chunks = split_message_for_discord(&msg);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH));
-    }
-
-    #[test]
-    fn split_message_with_multiple_newlines() {
-        let msg = "Line 1\nLine 2\nLine 3\n".repeat(1000);
-        let chunks = split_message_for_discord(&msg);
-        assert!(chunks.len() > 1);
-        let reconstructed = chunks.concat();
-        assert_eq!(reconstructed, msg);
-    }
-
     #[test]
     fn typing_handles_start_empty() {
         let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
@@ -952,119 +794,6 @@ mod tests {
         assert!(id.starts_with("discord_"));
         // Should have UUID dashes
         assert!(id.contains('-'));
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // TG6: Channel platform limit edge cases for Discord (2000 char limit)
-    // Prevents: Pattern 6 — issues #574, #499
-    // ─────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn split_message_code_block_at_boundary() {
-        // Code block that spans the split boundary
-        let mut msg = String::new();
-        msg.push_str("```rust\n");
-        msg.push_str(&"x".repeat(1990));
-        msg.push_str("\n```\nMore text after code block");
-        let parts = split_message_for_discord(&msg);
-        assert!(
-            parts.len() >= 2,
-            "code block spanning boundary should split"
-        );
-        for part in &parts {
-            assert!(
-                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
-                "each part must be <= {DISCORD_MAX_MESSAGE_LENGTH}, got {}",
-                part.len()
-            );
-        }
-    }
-
-    #[test]
-    fn split_message_single_long_word_exceeds_limit() {
-        // A single word longer than 2000 chars must be hard-split
-        let long_word = "a".repeat(2500);
-        let parts = split_message_for_discord(&long_word);
-        assert!(parts.len() >= 2, "word exceeding limit must be split");
-        for part in &parts {
-            assert!(
-                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
-                "hard-split part must be <= {DISCORD_MAX_MESSAGE_LENGTH}, got {}",
-                part.len()
-            );
-        }
-        // Reassembled content should match original
-        let reassembled: String = parts.join("");
-        assert_eq!(reassembled, long_word);
-    }
-
-    #[test]
-    fn split_message_exactly_at_limit_no_split() {
-        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH);
-        let parts = split_message_for_discord(&msg);
-        assert_eq!(parts.len(), 1, "message exactly at limit should not split");
-        assert_eq!(parts[0].len(), DISCORD_MAX_MESSAGE_LENGTH);
-    }
-
-    #[test]
-    fn split_message_one_over_limit_splits() {
-        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH + 1);
-        let parts = split_message_for_discord(&msg);
-        assert!(parts.len() >= 2, "message 1 char over limit must split");
-    }
-
-    #[test]
-    fn split_message_many_short_lines() {
-        // Many short lines should be batched into chunks under the limit
-        let msg: String = (0..500).fold(String::new(), |mut s, i| {
-            use std::fmt::Write as _;
-            let _ = writeln!(s, "line {i}");
-            s
-        });
-        let parts = split_message_for_discord(&msg);
-        for part in &parts {
-            assert!(
-                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
-                "short-line batch must be <= limit"
-            );
-        }
-        // All content should be preserved
-        let reassembled: String = parts.join("");
-        assert_eq!(reassembled.trim(), msg.trim());
-    }
-
-    #[test]
-    fn split_message_only_whitespace() {
-        let msg = "   \n\n\t  ";
-        let parts = split_message_for_discord(msg);
-        // Should handle gracefully without panic
-        assert!(parts.len() <= 1);
-    }
-
-    #[test]
-    fn split_message_emoji_at_boundary() {
-        // Emoji are multi-byte; ensure we don't split mid-emoji
-        let mut msg = "a".repeat(1998);
-        msg.push_str("🎉🎊"); // 2 emoji at the boundary (2000 chars total)
-        let parts = split_message_for_discord(&msg);
-        for part in &parts {
-            // The function splits on character count, not byte count
-            assert!(
-                part.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH,
-                "emoji boundary split must respect limit"
-            );
-        }
-    }
-
-    #[test]
-    fn split_message_consecutive_newlines_at_boundary() {
-        let mut msg = "a".repeat(1995);
-        msg.push_str("\n\n\n\n\n");
-        msg.push_str(&"b".repeat(100));
-        let parts = split_message_for_discord(&msg);
-        for part in &parts {
-            assert!(part.len() <= DISCORD_MAX_MESSAGE_LENGTH);
-        }
     }
 
     // ── pairing (/bind, /claim) ──────────────────────────────

@@ -165,6 +165,15 @@ impl Channel for MattermostChannel {
         "mattermost"
     }
 
+    fn render_target(&self) -> crate::channels::format::RenderTarget {
+        // Mattermost renders full GFM including tables, so `tables_native: true`
+        // keeps pipe tables native. The wiring's real value here is escaping a
+        // user's `\*literal\*` and consistent output, not a leak fix.
+        crate::channels::format::RenderTarget::StdMarkdown {
+            tables_native: true,
+        }
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         // Mattermost supports threading via 'root_id'.
         // We pack 'channel_id:root_id' into recipient if it's a thread.
@@ -174,9 +183,11 @@ impl Channel for MattermostChannel {
             (message.recipient.as_str(), None)
         };
 
+        let rendered =
+            crate::channels::format::render_to_string(&message.content, &self.render_target());
         let mut body_map = serde_json::json!({
             "channel_id": channel_id,
-            "message": message.content
+            "message": rendered
         });
 
         if let Some(root) = root_id {
@@ -547,6 +558,24 @@ fn normalize_mattermost_content(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn mattermost_render_target_keeps_native_tables() {
+        // Mattermost renders GFM tables, so tables_native=true keeps pipes native.
+        let ch = make_channel(vec![], false);
+        assert_eq!(
+            ch.render_target(),
+            crate::channels::format::RenderTarget::StdMarkdown {
+                tables_native: true
+            }
+        );
+        // A pipe table stays native (not fenced to ASCII).
+        let out = crate::channels::format::render_to_string(
+            "| A | B |\n|---|---|\n| 1 | 2 |",
+            &ch.render_target(),
+        );
+        assert!(out.contains("| A | B |"), "native table lost: {out}");
+    }
 
     // Helper: create a channel with mention_only=false (legacy behavior).
     fn make_channel(allowed: Vec<String>, thread_replies: bool) -> MattermostChannel {
