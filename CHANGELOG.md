@@ -5,12 +5,13 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.3-alpha] — 2026-07-20
 
 The per-platform reply rendering that v0.8.2-alpha introduced for Telegram is now
 wired to the rest of the channels. Every channel except Matrix renders the
 agent's GitHub-Flavored Markdown into the platform's own dialect instead of
-leaking `**bold**`/`##`/tables as literal text.
+leaking `**bold**`/`##`/tables as literal text. This changes outbound behavior on
+twelve channels; it is versioned as a patch.
 
 ### Changed
 
