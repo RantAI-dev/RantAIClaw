@@ -228,6 +228,10 @@ pub struct TuiApp {
     /// Set by command handlers via `CommandResult::ClearTerminal` and
     /// consumed once the wipe is performed.
     pub clear_terminal_request: bool,
+    /// Height (rows) the inline viewport was last (re)created with. The
+    /// run-loop reconcile step recreates the terminal whenever the buffer's
+    /// needed height diverges from this, giving the composer its grow/shrink.
+    pub composer_viewport_rows: u16,
     /// First-run wizard. When `Some`, the app renders the wizard
     /// instead of the normal chat UI. Provisioner steps use the
     /// existing `setup_overlay` mechanism.
@@ -425,6 +429,7 @@ impl TuiApp {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
@@ -638,6 +643,13 @@ impl TuiApp {
         }
         self.context.exit_history_navigation();
         self.refresh_autocomplete();
+    }
+
+    /// Inline viewport height the composer currently needs for `term_width`:
+    /// text rows (1..=6) + top border + bottom border + one status row.
+    fn needed_viewport_height(&self, term_width: u16) -> u16 {
+        let inner_w = term_width.saturating_sub(2).max(1);
+        needed_composer_rows(&self.context.input_buffer, inner_w) + 3
     }
 
     /// Process a single terminal event, returning whether to continue or quit.
@@ -3453,17 +3465,21 @@ impl TuiApp {
         terminal.draw(|frame| {
             let area = frame.area();
 
-            // Tight 5-row layout: input + status. The pre-v0.6.50 layout
-            // also reserved a stream-preview row above the input box that
+            // Dynamic layout: input + status. The pre-v0.6.50 layout also
+            // reserved a stream-preview row above the input box that
             // duplicated the cancelling/thinking/streaming indicator
             // already shown in the status bar. Two indicators ticking at
             // once were noisy + confusing per tester feedback, so the
             // upper pane was removed and the status bar is now the
-            // canonical streaming surface.
+            // canonical streaming surface. The input pane's height tracks
+            // the buffer's wrapped row count (1..=6 text rows, see
+            // `needed_composer_rows`) so the composer grows/shrinks to fit.
+            let inner_w = area.width.saturating_sub(2).max(1);
+            let text_rows = needed_composer_rows(&context.input_buffer, inner_w);
             let _ = stream_committed_chars; // kept on App for future re-introduction
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(4), Constraint::Length(1)])
+                .constraints([Constraint::Length(text_rows + 2), Constraint::Length(1)])
                 .split(area);
 
             // When an approval is pending, the top row swaps from the
@@ -4687,6 +4703,17 @@ mod composer_caret_tests {
             );
         }
     }
+
+    #[test]
+    fn needed_rows_clamps_between_one_and_six() {
+        use super::needed_composer_rows;
+        assert_eq!(needed_composer_rows("", 40), 1, "empty is one row");
+        assert_eq!(needed_composer_rows("one line", 40), 1);
+        assert_eq!(needed_composer_rows("a\nb\nc", 40), 3);
+        // 20 logical lines clamp to the cap of 6.
+        let many = (0..20).map(|_| "x").collect::<Vec<_>>().join("\n");
+        assert_eq!(needed_composer_rows(&many, 40), 6);
+    }
 }
 
 #[cfg(test)]
@@ -4875,6 +4902,13 @@ pub fn layout_composer(buffer: &str, cursor_pos: usize, inner_w: u16) -> Compose
 fn composer_caret_cell(buffer: &str, cursor_pos: usize, inner_w: u16) -> (u16, u16) {
     let l = layout_composer(buffer, cursor_pos, inner_w);
     (l.caret_row, l.caret_col)
+}
+
+/// Number of composer TEXT rows the buffer needs, clamped to the 1..=6 cap.
+/// Drives the dynamic inline-viewport height.
+fn needed_composer_rows(buffer: &str, inner_w: u16) -> u16 {
+    let rows = layout_composer(buffer, 0, inner_w).rows.len() as u16;
+    rows.clamp(1, 6)
 }
 
 /// Vertical scroll that keeps `caret_row` inside an `inner_h`-row window.
@@ -5703,7 +5737,7 @@ pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     // auto-submits the prompt and the rest of the buffer becomes the
     // next turn(s). Terminals that don't understand the escape ignore
     // it and fall back to per-key delivery — same behavior as before.
-    reinit_inline_terminal()
+    reinit_inline_terminal(INLINE_VIEWPORT_LINES)
 }
 
 /// Build (or rebuild) the inline-viewport terminal AND re-arm bracketed paste.
@@ -5716,12 +5750,12 @@ pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 /// `$EDITOR`) pasted line breaks arrived as `Enter` again: a two-line paste
 /// submitted its first line and left the rest. Re-arm here so every rebuild
 /// carries the mode with it.
-fn reinit_inline_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+fn reinit_inline_terminal(height: u16) -> Result<Terminal<CrosstermBackend<Stdout>>> {
     let _ = execute!(io::stdout(), EnableBracketedPaste);
     Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions {
-            viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
+            viewport: Viewport::Inline(height),
         },
     )
     .map_err(Into::into)
@@ -5790,7 +5824,7 @@ fn run_external_editor(
     } else {
         // Inline mode: re-claim a fresh terminal so the inline viewport
         // is re-laid-out cleanly after the editor printed to the tty.
-        *terminal = reinit_inline_terminal()?;
+        *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
     }
 
     let result = match status {
@@ -5856,7 +5890,7 @@ pub fn swap_to_fullscreen(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> 
 pub fn swap_to_inline(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let _ = terminal.flush();
     execute!(io::stdout(), LeaveAlternateScreen)?;
-    *terminal = reinit_inline_terminal()?;
+    *terminal = reinit_inline_terminal(INLINE_VIEWPORT_LINES)?;
     Ok(())
 }
 
@@ -6403,7 +6437,7 @@ async fn run_loop(
             let mut out = io::stdout();
             let _ = out.write_all(b"\x1b[2J\x1b[H");
             let _ = out.flush();
-            *terminal = reinit_inline_terminal()?;
+            *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
         }
 
         // /new and /clear request a full screen+scrollback wipe so
@@ -6419,7 +6453,7 @@ async fn run_loop(
             let mut out = io::stdout();
             let _ = out.write_all(b"\x1b[3J\x1b[2J\x1b[H");
             let _ = out.flush();
-            *terminal = reinit_inline_terminal()?;
+            *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
             let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
         }
 
@@ -6432,6 +6466,27 @@ async fn run_loop(
             let pending: Vec<(String, String)> = std::mem::take(&mut app.scrollback_queue);
             for (role, content) in pending {
                 TuiApp::commit_message_to_scrollback(terminal, &role, &content)?;
+            }
+        }
+
+        // Dynamic composer height: recreate the inline viewport when the
+        // wrapped row count crosses a boundary. Edge-triggered so typing
+        // within a row band never churns the terminal. Local clear of the
+        // old viewport region (not a full-screen wipe, no history replay)
+        // prevents a duplicate "ghost" box from the previous height.
+        if alt.is_none() {
+            if let Ok(size) = terminal.size() {
+                let needed = app.needed_viewport_height(size.width);
+                if needed != app.composer_viewport_rows {
+                    let top = size.height.saturating_sub(app.composer_viewport_rows);
+                    let mut out = io::stdout();
+                    // Move to the top row of the current viewport (1-indexed)
+                    // and clear from there to the end of the screen.
+                    let _ = write!(out, "\x1b[{};1H\x1b[J", top + 1);
+                    let _ = out.flush();
+                    app.composer_viewport_rows = needed;
+                    *terminal = reinit_inline_terminal(needed)?;
+                }
             }
         }
 
@@ -6528,7 +6583,7 @@ async fn run_loop(
                     let mut out = io::stdout();
                     let _ = out.write_all(b"\x1bc\x1b[3J\x1b[2J\x1b[H");
                     let _ = out.flush();
-                    *terminal = reinit_inline_terminal()?;
+                    *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
                     let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
                     let messages = app.context.messages.clone();
                     for msg in messages {
@@ -6868,6 +6923,7 @@ mod tests {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
@@ -6971,6 +7027,7 @@ mod submit_tests {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
@@ -7088,6 +7145,7 @@ mod ctrl_c_tests {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
@@ -7246,6 +7304,7 @@ mod drain_tests {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
@@ -7415,6 +7474,7 @@ mod retry_tests {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
