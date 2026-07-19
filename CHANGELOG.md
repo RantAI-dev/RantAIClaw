@@ -5,6 +5,41 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The per-platform reply rendering that v0.8.2-alpha introduced for Telegram is now
+wired to the rest of the channels. Every channel except Matrix renders the
+agent's GitHub-Flavored Markdown into the platform's own dialect instead of
+leaking `**bold**`/`##`/tables as literal text.
+
+### Changed
+
+- **Discord, DingTalk, Mattermost** render replies as `StdMarkdown` — CommonMark
+  markup is kept; tables become an aligned ASCII grid in a fenced block on
+  Discord/DingTalk (which have no native tables) and stay native pipe tables on
+  Mattermost. Discord's naive char-count splitter (which could cut a code fence
+  in half) is replaced by the fence-aware splitter.
+- **Slack and WhatsApp (Cloud + Web)** render replies as `LightMarkup` — the
+  single-char markup these platforms actually use: `**bold**` → `*bold*`, links
+  → Slack's `<url|text>` or WhatsApp's `text (url)`, tables → an ASCII grid.
+  Slack output escapes `&`/`<`/`>` as its `text` field requires.
+- **Signal, QQ, Linq, IRC, iMessage, Nextcloud Talk, Lark, Email, CLI** strip
+  markup to readable `Plain` text (headings uppercased, emphasis removed, links
+  → `text (url)`, tables → aligned ASCII). IRC keeps its own 512-byte PRIVMSG
+  line splitter, now fed the rendered text.
+- See `docs/reference/channels.md` → "Reply Formatting" for the full matrix.
+
+### Notes
+
+- **Matrix is intentionally not wired** — it already renders GFM natively via
+  `matrix-sdk`, so nothing leaks, and the `channel-matrix` feature currently
+  cannot be built (`matrix-sdk 0.16` overflows the type-check recursion budget,
+  which is why CI omits `--all-features`). A render target is deferred until the
+  feature builds again.
+- DingTalk's `\*literal\*` escaping is not verified against a live DingTalk
+  client; if its markdown parser shows the backslash, that escaping will be
+  dropped in a follow-up.
+
 ## [0.8.2-alpha] — 2026-07-19
 
 Telegram replies now render as HTML instead of shipping raw markdown, so
