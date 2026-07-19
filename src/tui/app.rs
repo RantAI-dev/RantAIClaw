@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -686,6 +686,26 @@ impl TuiApp {
                     // Bracketed paste delivered as one payload — route through
                     // the shared helper (same path the key-burst coalescer uses).
                     self.apply_paste_text(&text);
+                }
+                Ok(EventResult::Continue)
+            }
+            // Mouse wheel scrolls the chat pane (same `scroll_offset` as
+            // PgUp/PgDn: up counts lines back from the newest, 0 sticks to the
+            // bottom; render clamps to the top). Only when the chat composer
+            // owns the screen — a modal/overlay/approval keeps its own view.
+            Event::Mouse(me)
+                if !self.modal_active()
+                    && self.overlay.is_none()
+                    && self.pending_approval.is_none() =>
+            {
+                match me.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.context.scroll_offset = self.context.scroll_offset.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.context.scroll_offset = self.context.scroll_offset.saturating_sub(3);
+                    }
+                    _ => {}
                 }
                 Ok(EventResult::Continue)
             }
@@ -4394,7 +4414,12 @@ fn render_chat_pane(
         // re-wrap it (that would mangle the logo).
         lines.extend(render_splash_lines(ctx, area.width, area.height));
     } else {
-        for msg in &ctx.messages {
+        for (i, msg) in ctx.messages.iter().enumerate() {
+            // A blank line between turns so a "You:" and the reply above it don't
+            // run together — one separator, never a trailing one.
+            if i > 0 {
+                lines.push(Line::from(""));
+            }
             let persisted = msg
                 .tool_calls
                 .as_deref()
@@ -4418,6 +4443,9 @@ fn render_chat_pane(
             ..
         } = state
         {
+            if !ctx.messages.is_empty() {
+                lines.push(Line::from(""));
+            }
             let frame_idx = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as usize / 100)
@@ -6316,7 +6344,15 @@ pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 /// clear, so it is re-armed on every (re)entry — multi-line pastes then arrive
 /// as one `Event::Paste` rather than per-key `\n` = `Enter` events.
 fn enter_fullscreen() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    let _ = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste);
+    // Mouse capture lets the wheel scroll the chat pane. Without it, terminals
+    // in alt-screen translate the wheel into Up/Down arrows, which the composer
+    // then treats as history recall — so scrolling silently rewrote the input.
+    let _ = execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    );
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
     Ok(terminal)
@@ -6362,9 +6398,10 @@ fn run_external_editor(
     let tmp_path = std::env::temp_dir().join(format!("rantaiclaw-prompt-{pid}-{nonce}.md"));
     std::fs::write(&tmp_path, &app.context.input_buffer)?;
 
-    // Suspend the TUI: leave the alternate screen, drop raw mode.
+    // Suspend the TUI: leave the alternate screen, drop raw mode. `enter_fullscreen`
+    // re-enables mouse capture + bracketed paste on return.
     let _ = terminal.flush();
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     let _ = io::stdout().flush();
 
@@ -6425,7 +6462,12 @@ fn which_program(name: &str) -> bool {
 /// paste, show the cursor, and drop raw mode.
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let _ = terminal.show_cursor();
-    let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     disable_raw_mode()?;
     let _ = io::stdout().flush();
     Ok(())
@@ -7422,6 +7464,91 @@ mod submit_tests {
             .flat_map(|y| (0..w).map(move |x| (x, y)))
             .map(|(x, y)| buf[(x, y)].symbol().to_string())
             .collect()
+    }
+
+    fn chat_pane_rows(ctx: &mut TuiContext, w: u16, h: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_chat_pane(&AppState::Ready, ctx, f, area);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Turns are separated by a blank line so a "You:" never butts up against
+    /// the reply above it.
+    #[test]
+    fn chat_pane_separates_turns_with_a_blank_line() {
+        let (mut ctx, _r, _e) = TuiContext::test_context();
+        ctx.append_user_message("first question").unwrap();
+        ctx.append_assistant_message("first answer").unwrap();
+        let rows = chat_pane_rows(&mut ctx, 60, 12);
+        let q = rows
+            .iter()
+            .position(|r| r.contains("first question"))
+            .unwrap();
+        let a = rows
+            .iter()
+            .position(|r| r.contains("first answer"))
+            .unwrap();
+        assert!(a > q + 1, "expected a blank row between the two turns");
+        // A separator row carries only the box borders and spaces — no text.
+        let is_blank = |r: &String| r.chars().all(|c| c == '│' || c == ' ');
+        assert!(
+            rows[q + 1..a].iter().any(is_blank),
+            "a blank separator row must sit between the turns"
+        );
+    }
+
+    /// Regression: the mouse wheel must scroll the chat pane, not fall through
+    /// to the composer. Before mouse capture, the terminal turned the wheel into
+    /// Up/Down arrows, which recalled history into the input buffer.
+    #[tokio::test]
+    async fn mouse_wheel_scrolls_chat_not_composer() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let (ctx, _r, _e) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        let wheel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.handle_event(wheel(MouseEventKind::ScrollUp))
+            .await
+            .unwrap();
+        app.handle_event(wheel(MouseEventKind::ScrollUp))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.context.scroll_offset, 6,
+            "two wheel-ups scroll six lines back"
+        );
+        app.handle_event(wheel(MouseEventKind::ScrollDown))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.context.scroll_offset, 3,
+            "wheel-down scrolls toward the bottom"
+        );
+        assert_eq!(
+            app.context.input_buffer, "",
+            "the wheel must not touch the composer"
+        );
     }
 
     /// Regression: a single message taller than the pane used to render the
