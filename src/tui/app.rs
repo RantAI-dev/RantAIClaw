@@ -4760,6 +4760,18 @@ mod paste_coalesce_tests {
         assert!(!batch_is_paste("a")); // lone char is normal typing
         assert!(!batch_is_paste("")); // empty
     }
+
+    #[test]
+    fn leading_text_key_excludes_enter_and_tab_but_keeps_chars() {
+        use super::leading_text_key;
+        use crossterm::event::Event;
+        // A leading Enter or Tab must NOT start a coalesce batch (they fall
+        // through to handle_key: Enter submits, Tab reaches nav/no-op).
+        assert!(leading_text_key(&Event::Key(k(KeyCode::Enter, KeyModifiers::NONE))).is_none());
+        assert!(leading_text_key(&Event::Key(k(KeyCode::Tab, KeyModifiers::NONE))).is_none());
+        // A plain printable char still starts a batch.
+        assert!(leading_text_key(&Event::Key(k(KeyCode::Char('x'), KeyModifiers::NONE))).is_some());
+    }
 }
 
 /// A key event reduced to the text it contributes to a paste batch.
@@ -4791,12 +4803,14 @@ fn batch_is_paste(batch: &str) -> bool {
     batch.chars().count() > 1 || batch.contains('\n')
 }
 
-/// Text key allowed to START a coalesced batch: a printable char or Tab, but
-/// NOT Enter — a lone Enter must reach the normal submit path.
+/// Text key allowed to START a coalesced batch: a printable char, but NOT
+/// Enter or Tab — a lone Enter must reach the normal submit path, and a lone
+/// Tab must reach `handle_key` (autocomplete/overlay nav or no-op) instead of
+/// being inserted as a literal `\t`.
 fn leading_text_key(ev: &Event) -> Option<TextKey> {
     match ev {
         Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Press => match key_to_text(k) {
-            Some(TextKey::Newline) => None,
+            Some(TextKey::Newline | TextKey::Tab) => None,
             other => other,
         },
         _ => None,
