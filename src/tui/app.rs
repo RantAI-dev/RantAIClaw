@@ -4389,6 +4389,28 @@ fn wrap_styled_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// A full-width dim horizontal rule for a Markdown thematic break (`---`).
+fn horizontal_rule_line(width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width.max(1)),
+        Style::default().fg(Color::Rgb(75, 85, 99)),
+    ))
+}
+
+/// Append the wrapped form of each rendered message line to `out`, drawing a
+/// Markdown horizontal rule (`---`/`***`/`___`) as a full-width rule instead of
+/// wrapping its literal characters.
+fn extend_wrapped(out: &mut Vec<Line<'static>>, raw: &[Line<'static>], inner_w: usize) {
+    for line in raw {
+        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        if super::render::is_horizontal_rule(&plain) {
+            out.push(horizontal_rule_line(inner_w));
+        } else {
+            out.extend(wrap_styled_line(line, inner_w));
+        }
+    }
+}
+
 fn render_chat_pane(
     state: &AppState,
     ctx: &mut TuiContext,
@@ -4432,9 +4454,7 @@ fn render_chat_pane(
                 &[],
                 &theme,
             );
-            for line in &raw {
-                lines.extend(wrap_styled_line(line, inner_w));
-            }
+            extend_wrapped(&mut lines, &raw, inner_w);
         }
 
         if let AppState::Streaming {
@@ -4463,9 +4483,7 @@ fn render_chat_pane(
             ]));
             let raw =
                 super::render::render_message_lines("assistant", partial, &[], tool_blocks, &theme);
-            for line in &raw {
-                lines.extend(wrap_styled_line(line, inner_w));
-            }
+            extend_wrapped(&mut lines, &raw, inner_w);
         }
     }
 
@@ -7485,6 +7503,25 @@ mod submit_tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// A Markdown `---` renders as a full-width rule, not literal dashes.
+    #[test]
+    fn chat_pane_renders_markdown_rule_not_literal_dashes() {
+        let (mut ctx, _r, _e) = TuiContext::test_context();
+        ctx.append_assistant_message("above the rule\n---\nbelow the rule")
+            .unwrap();
+        let text = chat_pane_buffer_text(&mut ctx, 50, 12);
+        assert!(text.contains("above the rule"));
+        assert!(text.contains("below the rule"));
+        assert!(
+            text.contains(&"─".repeat(10)),
+            "the --- line must render as a run of rule characters"
+        );
+        assert!(
+            !text.contains("---"),
+            "no literal triple-dash should remain"
+        );
     }
 
     /// Turns are separated by a blank line so a "You:" never butts up against
