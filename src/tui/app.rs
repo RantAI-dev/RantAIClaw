@@ -228,6 +228,10 @@ pub struct TuiApp {
     /// Set by command handlers via `CommandResult::ClearTerminal` and
     /// consumed once the wipe is performed.
     pub clear_terminal_request: bool,
+    /// Height (rows) the inline viewport was last (re)created with. The
+    /// run-loop reconcile step recreates the terminal whenever the buffer's
+    /// needed height diverges from this, giving the composer its grow/shrink.
+    pub composer_viewport_rows: u16,
     /// First-run wizard. When `Some`, the app renders the wizard
     /// instead of the normal chat UI. Provisioner steps use the
     /// existing `setup_overlay` mechanism.
@@ -425,6 +429,7 @@ impl TuiApp {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
@@ -624,6 +629,29 @@ impl TuiApp {
         }
     }
 
+    /// Route a paste (bracketed `Event::Paste` OR a coalesced key burst) into
+    /// the composer. Normalises line breaks, then collapses a tall paste to a
+    /// `[Pasted text #N +M lines]` placeholder (real content re-expanded at
+    /// submit) or lands a short paste inline.
+    fn apply_paste_text(&mut self, text: &str) {
+        let normalized = normalize_line_breaks(text);
+        if normalized.split('\n').count() > crate::tui::context::PASTE_PLACEHOLDER_MIN_LINES {
+            let marker = self.context.register_paste(normalized);
+            self.context.paste_at_cursor(&marker);
+        } else {
+            self.context.paste_at_cursor(&normalized);
+        }
+        self.context.exit_history_navigation();
+        self.refresh_autocomplete();
+    }
+
+    /// Inline viewport height the composer currently needs for `term_width`:
+    /// text rows (1..=6) + top border + bottom border + one status row.
+    fn needed_viewport_height(&self, term_width: u16) -> u16 {
+        let inner_w = term_width.saturating_sub(2).max(1);
+        needed_composer_rows(&self.context.input_buffer, inner_w) + 3
+    }
+
     /// Process a single terminal event, returning whether to continue or quit.
     pub async fn handle_event(&mut self, event: Event) -> Result<EventResult> {
         match event {
@@ -662,25 +690,9 @@ impl TuiApp {
                         o.push_str(&cleaned);
                     }
                 } else if self.first_run_wizard.is_none() {
-                    // Terminals transmit pasted line breaks as CR, so this
-                    // payload arrives as "a\rb" for a two-line paste. Land it
-                    // in the buffer as '\n': that is the invariant the caret
-                    // walker counts and the renderer splits on, and a raw '\r'
-                    // reaching the terminal wrecks the input box's border.
-                    let normalized = normalize_line_breaks(&text);
-                    // A tall paste is collapsed to a one-line placeholder; the
-                    // real content is held on the context and re-expanded at
-                    // submit. Short pastes land inline as before.
-                    if normalized.split('\n').count()
-                        > crate::tui::context::PASTE_PLACEHOLDER_MIN_LINES
-                    {
-                        let marker = self.context.register_paste(normalized);
-                        self.context.paste_at_cursor(&marker);
-                    } else {
-                        self.context.paste_at_cursor(&normalized);
-                    }
-                    self.context.exit_history_navigation();
-                    self.refresh_autocomplete();
+                    // Bracketed paste delivered as one payload — route through
+                    // the shared helper (same path the key-burst coalescer uses).
+                    self.apply_paste_text(&text);
                 }
                 Ok(EventResult::Continue)
             }
@@ -3453,17 +3465,21 @@ impl TuiApp {
         terminal.draw(|frame| {
             let area = frame.area();
 
-            // Tight 5-row layout: input + status. The pre-v0.6.50 layout
-            // also reserved a stream-preview row above the input box that
+            // Dynamic layout: input + status. The pre-v0.6.50 layout also
+            // reserved a stream-preview row above the input box that
             // duplicated the cancelling/thinking/streaming indicator
             // already shown in the status bar. Two indicators ticking at
             // once were noisy + confusing per tester feedback, so the
             // upper pane was removed and the status bar is now the
-            // canonical streaming surface.
+            // canonical streaming surface. The input pane's height tracks
+            // the buffer's wrapped row count (1..=6 text rows, see
+            // `needed_composer_rows`) so the composer grows/shrinks to fit.
+            let inner_w = area.width.saturating_sub(2).max(1);
+            let text_rows = needed_composer_rows(&context.input_buffer, inner_w);
             let _ = stream_committed_chars; // kept on App for future re-introduction
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(4), Constraint::Length(1)])
+                .constraints([Constraint::Length(text_rows + 2), Constraint::Length(1)])
                 .split(area);
 
             // When an approval is pending, the top row swaps from the
@@ -4482,7 +4498,7 @@ mod composer_body_tests {
     #[test]
     fn no_span_carries_a_raw_newline() {
         for buffer in ["a\nb", "one\ntwo\nthree", "trailing\n", "\nleading"] {
-            let text = composer_body(buffer);
+            let text = composer_body(buffer, 80);
             for line in &text.lines {
                 for span in &line.spans {
                     assert!(
@@ -4510,7 +4526,7 @@ mod composer_body_tests {
             "trailing\r",
             "\rleading",
         ] {
-            let text = composer_body(buffer);
+            let text = composer_body(buffer, 80);
             for line in &text.lines {
                 for span in &line.spans {
                     assert!(
@@ -4527,22 +4543,22 @@ mod composer_body_tests {
     /// produce a phantom empty line between the two halves.
     #[test]
     fn every_line_break_form_splits_the_same_way() {
-        assert_eq!(composer_body("a\nb").lines.len(), 2, "LF");
-        assert_eq!(composer_body("a\rb").lines.len(), 2, "CR");
-        assert_eq!(composer_body("a\r\nb").lines.len(), 2, "CRLF");
+        assert_eq!(composer_body("a\nb", 80).lines.len(), 2, "LF");
+        assert_eq!(composer_body("a\rb", 80).lines.len(), 2, "CR");
+        assert_eq!(composer_body("a\r\nb", 80).lines.len(), 2, "CRLF");
     }
 
     #[test]
     fn splits_one_line_per_logical_line() {
-        assert_eq!(composer_body("a\nb\nc").lines.len(), 3);
-        assert_eq!(composer_body("single").lines.len(), 1);
+        assert_eq!(composer_body("a\nb\nc", 80).lines.len(), 3);
+        assert_eq!(composer_body("single", 80).lines.len(), 1);
     }
 
     /// A trailing newline is where the cursor sits after `Ctrl+J`; dropping
     /// the empty final line (as `str::lines` would) hides it.
     #[test]
     fn trailing_newline_keeps_its_empty_final_line() {
-        let text = composer_body("body\n");
+        let text = composer_body("body\n", 80);
         assert_eq!(text.lines.len(), 2);
         let last: String = text.lines[1]
             .spans
@@ -4554,7 +4570,7 @@ mod composer_body_tests {
 
     #[test]
     fn empty_buffer_renders_the_placeholder_on_one_line() {
-        let text = composer_body("");
+        let text = composer_body("", 80);
         assert_eq!(text.lines.len(), 1);
         let rendered: String = text.lines[0]
             .spans
@@ -4568,7 +4584,7 @@ mod composer_body_tests {
     /// reorder content while splitting.
     #[test]
     fn content_survives_the_split_verbatim() {
-        let text = composer_body("first\nsecond\nthird");
+        let text = composer_body("first\nsecond\nthird", 80);
         let bodies: Vec<String> = text
             .lines
             .iter()
@@ -4582,6 +4598,15 @@ mod composer_body_tests {
             })
             .collect();
         assert_eq!(bodies, vec!["first", "second", "third"]);
+    }
+
+    /// A logical line longer than the inner width is split into multiple
+    /// display rows by our own wrapping (ratatui word-wrap is gone). Row 0
+    /// budget is inner_w - 2 (prefix); here inner_w=12 → 10 chars on row 0.
+    #[test]
+    fn a_long_line_wraps_into_multiple_display_rows() {
+        let text = super::composer_body("abcdefghijklmn", 12); // 14 chars
+        assert_eq!(text.lines.len(), 2);
     }
 }
 
@@ -4645,6 +4670,169 @@ mod composer_caret_tests {
             }
         }
     }
+
+    /// The caret cell must index a real position inside the rendered rows:
+    /// caret_col is a valid column of the caret_row that layout_composer
+    /// emits (accounting for the 2-cell prefix on row 0). This is the
+    /// invariant that failed when the caret used char-wrap and the renderer
+    /// used ratatui word-wrap.
+    #[test]
+    fn caret_indexes_a_real_cell_in_the_rendered_rows() {
+        use super::layout_composer;
+        let inner_w = 12u16;
+        // A logical line that must wrap (14 chars > inner_w-prefix=10).
+        let buf = "abcdefghijklmn";
+        for cursor in 0..=buf.chars().count() {
+            let l = layout_composer(buf, cursor, inner_w);
+            assert!(
+                (l.caret_row as usize) < l.rows.len(),
+                "cursor {cursor}: caret_row {} out of {} rows",
+                l.caret_row,
+                l.rows.len()
+            );
+            // Row 0 carries a 2-cell prefix, so its text width budget is
+            // inner_w-2; other rows use the full inner_w. caret_col must not
+            // exceed the row's used width.
+            let prefix = if l.caret_row == 0 { 2 } else { 0 };
+            let row_len =
+                u16::try_from(l.rows[l.caret_row as usize].chars().count()).unwrap_or(u16::MAX);
+            assert!(
+                l.caret_col <= prefix + row_len,
+                "cursor {cursor}: caret_col {} beyond row width {}",
+                l.caret_col,
+                prefix + row_len
+            );
+        }
+    }
+
+    #[test]
+    fn needed_rows_clamps_between_one_and_six() {
+        use super::needed_composer_rows;
+        assert_eq!(needed_composer_rows("", 40), 1, "empty is one row");
+        assert_eq!(needed_composer_rows("one line", 40), 1);
+        assert_eq!(needed_composer_rows("a\nb\nc", 40), 3);
+        // 20 logical lines clamp to the cap of 6.
+        let many = (0..20).map(|_| "x").collect::<Vec<_>>().join("\n");
+        assert_eq!(needed_composer_rows(&many, 40), 6);
+    }
+}
+
+#[cfg(test)]
+mod paste_coalesce_tests {
+    use super::{batch_is_paste, key_to_text, TextKey};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn k(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn plain_char_maps_to_text() {
+        assert!(matches!(
+            key_to_text(&k(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(TextKey::Ch('x'))
+        ));
+    }
+
+    #[test]
+    fn enter_and_tab_map_to_newline_and_tab() {
+        assert!(matches!(
+            key_to_text(&k(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TextKey::Newline)
+        ));
+        assert!(matches!(
+            key_to_text(&k(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(TextKey::Tab)
+        ));
+    }
+
+    #[test]
+    fn control_char_is_not_text() {
+        // Ctrl+C, Ctrl+J etc. must stay on the command path, never a paste.
+        assert!(key_to_text(&k(KeyCode::Char('c'), KeyModifiers::CONTROL)).is_none());
+        assert!(key_to_text(&k(KeyCode::Esc, KeyModifiers::NONE)).is_none());
+    }
+
+    #[test]
+    fn a_batch_is_a_paste_when_multi_char_or_has_a_newline() {
+        assert!(batch_is_paste("ab")); // two chars
+        assert!(batch_is_paste("a\nb")); // contains newline
+        assert!(batch_is_paste("\n")); // count()==1, isolates the contains('\n') clause
+        assert!(!batch_is_paste("a")); // lone char is normal typing
+        assert!(!batch_is_paste("")); // empty
+    }
+
+    #[test]
+    fn leading_text_key_excludes_enter_and_tab_but_keeps_chars() {
+        use super::leading_text_key;
+        use crossterm::event::Event;
+        // A leading Enter or Tab must NOT start a coalesce batch (they fall
+        // through to handle_key: Enter submits, Tab reaches nav/no-op).
+        assert!(leading_text_key(&Event::Key(k(KeyCode::Enter, KeyModifiers::NONE))).is_none());
+        assert!(leading_text_key(&Event::Key(k(KeyCode::Tab, KeyModifiers::NONE))).is_none());
+        // A plain printable char still starts a batch.
+        assert!(leading_text_key(&Event::Key(k(KeyCode::Char('x'), KeyModifiers::NONE))).is_some());
+    }
+}
+
+/// A key event reduced to the text it contributes to a paste batch.
+///
+/// Only unmodified printable input counts: `Char` without Ctrl (Shift/Alt
+/// carry real text and are kept), plus `Enter`/`Tab`. Everything else —
+/// Ctrl chords, arrows, Esc, function keys — is `None` so it stays on the
+/// command path and never gets swallowed into a paste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextKey {
+    Ch(char),
+    Newline,
+    Tab,
+}
+
+fn key_to_text(key: &crossterm::event::KeyEvent) -> Option<TextKey> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    match key.code {
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(TextKey::Ch(c)),
+        KeyCode::Enter => Some(TextKey::Newline),
+        KeyCode::Tab => Some(TextKey::Tab),
+        _ => None,
+    }
+}
+
+/// A drained key batch is a paste (route it through the paste path) when it
+/// carries more than one char or any newline. A lone char is ordinary typing.
+fn batch_is_paste(batch: &str) -> bool {
+    batch.chars().count() > 1 || batch.contains('\n')
+}
+
+/// Text key allowed to START a coalesced batch: a printable char, but NOT
+/// Enter or Tab — a lone Enter must reach the normal submit path, and a lone
+/// Tab must reach `handle_key` (autocomplete/overlay nav or no-op) instead of
+/// being inserted as a literal `\t`.
+fn leading_text_key(ev: &Event) -> Option<TextKey> {
+    match ev {
+        Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Press => match key_to_text(k) {
+            Some(TextKey::Newline | TextKey::Tab) => None,
+            other => other,
+        },
+        _ => None,
+    }
+}
+
+/// Text key allowed INSIDE a batch already started by a printable key: any
+/// text key, Enter included (it becomes '\n').
+fn leading_or_inner_text_key(ev: &Event) -> Option<TextKey> {
+    match ev {
+        Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Press => key_to_text(k),
+        _ => None,
+    }
+}
+
+fn push_text_key(buf: &mut String, tk: TextKey) {
+    match tk {
+        TextKey::Ch(c) => buf.push(c),
+        TextKey::Newline => buf.push('\n'),
+        TextKey::Tab => buf.push('\t'),
+    }
 }
 
 /// Collapse every line-break form to `\n`.
@@ -4662,31 +4850,83 @@ fn normalize_line_breaks(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Caret cell for `cursor_pos` as `(row, col)` inside the composer's inner
-/// area, before any scroll is applied.
+/// The composer laid out as terminal display rows plus the caret cell.
 ///
-/// Char-cell wrap model: each char (including the leading "▎ " prefix)
-/// consumes one terminal cell. Exact for ASCII, approximate for full-width
-/// and combining glyphs, and it hard-breaks at `inner_w` where ratatui's
-/// `Wrap` breaks on word boundaries — a pre-existing skew this preserves
-/// rather than fixes.
-fn composer_caret_cell(buffer: &str, cursor_pos: usize, inner_w: u16) -> (u16, u16) {
-    let prefix_cells: u16 = 2; // "▎ "
-    let mut col: u16 = prefix_cells.min(inner_w.saturating_sub(1));
-    let mut row: u16 = 0;
-    for ch in buffer.chars().take(cursor_pos) {
+/// Single source of truth: the renderer draws exactly `rows` and the
+/// terminal cursor is placed at `(caret_row, caret_col)`, both computed by
+/// one walk. Because render and caret share this function, the cursor can
+/// never drift off the real character — the skew that existed when the
+/// caret hard-wrapped at `inner_w` while ratatui word-wrapped is gone.
+pub struct ComposerLayout {
+    /// Display rows, prefix-free. The renderer prepends the `"▎ "` prefix to
+    /// row 0 only; continuation and wrapped rows start at column 0.
+    pub rows: Vec<String>,
+    pub caret_row: u16,
+    pub caret_col: u16,
+}
+
+/// Wrap `buffer` into display rows and locate the caret for `cursor_pos`.
+///
+/// Char-cell model: each char consumes one cell, hard-breaking at `inner_w`.
+/// Row 0 starts at column `prefix` (2 cells for `"▎ "`), so it holds
+/// `inner_w - prefix` chars before wrapping; every later row holds `inner_w`.
+/// Newlines (already normalised to `\n`) start a fresh row at column 0.
+pub fn layout_composer(buffer: &str, cursor_pos: usize, inner_w: u16) -> ComposerLayout {
+    let inner_w = inner_w.max(1);
+    let prefix: u16 = 2;
+    let normalized = normalize_line_breaks(buffer);
+
+    let mut rows: Vec<String> = vec![String::new()];
+    // Cells used on the current row, INCLUDING the prefix on row 0.
+    let mut col: u16 = prefix.min(inner_w.saturating_sub(1));
+    let mut caret_row: u16 = 0;
+    let mut caret_col: u16 = col;
+
+    for (i, ch) in normalized.chars().enumerate() {
+        if i == cursor_pos {
+            caret_row = u16::try_from(rows.len() - 1).unwrap_or(u16::MAX);
+            caret_col = col;
+        }
         if ch == '\n' {
+            rows.push(String::new());
             col = 0;
-            row = row.saturating_add(1);
         } else {
+            rows.last_mut().expect("rows always non-empty").push(ch);
             col = col.saturating_add(1);
             if col >= inner_w {
+                rows.push(String::new());
                 col = 0;
-                row = row.saturating_add(1);
             }
         }
     }
-    (row, col.min(inner_w.saturating_sub(1)))
+    if cursor_pos >= normalized.chars().count() {
+        caret_row = u16::try_from(rows.len() - 1).unwrap_or(u16::MAX);
+        caret_col = col;
+    }
+
+    ComposerLayout {
+        rows,
+        caret_row,
+        caret_col: caret_col.min(inner_w.saturating_sub(1)),
+    }
+}
+
+/// Caret cell for `cursor_pos` as `(row, col)` inside the composer's inner
+/// area, before any scroll is applied. Delegates to [`layout_composer`] so
+/// the caret and the renderer share one wrap model.
+fn composer_caret_cell(buffer: &str, cursor_pos: usize, inner_w: u16) -> (u16, u16) {
+    let l = layout_composer(buffer, cursor_pos, inner_w);
+    (l.caret_row, l.caret_col)
+}
+
+/// Number of composer TEXT rows the buffer needs, clamped to the 1..=6 cap.
+/// Drives the dynamic inline-viewport height.
+fn needed_composer_rows(buffer: &str, inner_w: u16) -> u16 {
+    let rows = layout_composer(buffer, 0, inner_w).rows.len();
+    // Clamp in `usize` first (result is 1..=6), so the narrowing `try_from`
+    // can never fail; `unwrap_or(6)` is a dead-safe fallback that also keeps
+    // clippy's pedantic cast lint happy.
+    u16::try_from(rows.clamp(1, 6)).unwrap_or(6)
 }
 
 /// Vertical scroll that keeps `caret_row` inside an `inner_h`-row window.
@@ -4706,7 +4946,7 @@ fn composer_scroll(caret_row: u16, inner_h: u16) -> u16 {
 /// and bracketed paste both put literal `\n` in `input_buffer`, so split into
 /// one `Line` per logical line here rather than handing the raw buffer to
 /// `Span::raw`.
-fn composer_body(input_buffer: &str) -> Text<'static> {
+fn composer_body(input_buffer: &str, inner_w: u16) -> Text<'static> {
     let prefix = Span::styled(
         "▎ ",
         Style::default()
@@ -4724,23 +4964,13 @@ fn composer_body(input_buffer: &str) -> Text<'static> {
         ]));
     }
 
-    // `split('\n')` (not `lines()`) so a trailing newline keeps its empty
-    // final line — the cursor sits there and the user must see it.
-    //
-    // Continuation lines carry no indent: ratatui's own soft-wrap returns to
-    // column 0, and the caret walker below likewise resets `col` to 0 after a
-    // '\n'. Indenting here would make hard-broken lines disagree with both.
-    //
-    // Normalize defensively even though `Event::Paste` already does: this is
-    // the last hop before the bytes reach the terminal, and a single stray
-    // '\r' here is not a cosmetic bug — it returns the real cursor to column
-    // 0 and the rest of the line eats the border.
-    let normalized = normalize_line_breaks(input_buffer);
-    let lines: Vec<Line<'static>> = normalized
-        .split('\n')
+    // Same wrapping the caret walker uses (cursor_pos irrelevant here).
+    let rows = layout_composer(input_buffer, 0, inner_w).rows;
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
         .enumerate()
-        .map(|(i, logical)| {
-            let text = Span::raw(logical.to_string());
+        .map(|(i, row)| {
+            let text = Span::raw(row);
             if i == 0 {
                 Line::from(vec![prefix.clone(), text])
             } else {
@@ -4765,7 +4995,7 @@ fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
     let (caret_row, caret_col) = composer_caret_cell(&ctx.input_buffer, ctx.cursor_pos, inner_w);
     let scroll = composer_scroll(caret_row, inner_h);
 
-    let input = Paragraph::new(composer_body(&ctx.input_buffer))
+    let input = Paragraph::new(composer_body(&ctx.input_buffer, inner_w))
         .scroll((scroll, 0))
         .block(
             Block::default()
@@ -4782,8 +5012,7 @@ fn render_input_pane(ctx: &TuiContext, frame: &mut ratatui::Frame, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Rgb(94, 184, 255))),
-        )
-        .wrap(Wrap { trim: false });
+        );
     frame.render_widget(input, area);
 
     // Position the terminal cursor at the insertion point so the user
@@ -5526,7 +5755,7 @@ pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     // auto-submits the prompt and the rest of the buffer becomes the
     // next turn(s). Terminals that don't understand the escape ignore
     // it and fall back to per-key delivery — same behavior as before.
-    reinit_inline_terminal()
+    reinit_inline_terminal(INLINE_VIEWPORT_LINES)
 }
 
 /// Build (or rebuild) the inline-viewport terminal AND re-arm bracketed paste.
@@ -5539,12 +5768,12 @@ pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 /// `$EDITOR`) pasted line breaks arrived as `Enter` again: a two-line paste
 /// submitted its first line and left the rest. Re-arm here so every rebuild
 /// carries the mode with it.
-fn reinit_inline_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+fn reinit_inline_terminal(height: u16) -> Result<Terminal<CrosstermBackend<Stdout>>> {
     let _ = execute!(io::stdout(), EnableBracketedPaste);
     Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions {
-            viewport: Viewport::Inline(INLINE_VIEWPORT_LINES),
+            viewport: Viewport::Inline(height),
         },
     )
     .map_err(Into::into)
@@ -5613,7 +5842,7 @@ fn run_external_editor(
     } else {
         // Inline mode: re-claim a fresh terminal so the inline viewport
         // is re-laid-out cleanly after the editor printed to the tty.
-        *terminal = reinit_inline_terminal()?;
+        *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
     }
 
     let result = match status {
@@ -5679,7 +5908,7 @@ pub fn swap_to_fullscreen(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> 
 pub fn swap_to_inline(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let _ = terminal.flush();
     execute!(io::stdout(), LeaveAlternateScreen)?;
-    *terminal = reinit_inline_terminal()?;
+    *terminal = reinit_inline_terminal(INLINE_VIEWPORT_LINES)?;
     Ok(())
 }
 
@@ -6226,7 +6455,7 @@ async fn run_loop(
             let mut out = io::stdout();
             let _ = out.write_all(b"\x1b[2J\x1b[H");
             let _ = out.flush();
-            *terminal = reinit_inline_terminal()?;
+            *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
         }
 
         // /new and /clear request a full screen+scrollback wipe so
@@ -6242,7 +6471,7 @@ async fn run_loop(
             let mut out = io::stdout();
             let _ = out.write_all(b"\x1b[3J\x1b[2J\x1b[H");
             let _ = out.flush();
-            *terminal = reinit_inline_terminal()?;
+            *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
             let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
         }
 
@@ -6255,6 +6484,31 @@ async fn run_loop(
             let pending: Vec<(String, String)> = std::mem::take(&mut app.scrollback_queue);
             for (role, content) in pending {
                 TuiApp::commit_message_to_scrollback(terminal, &role, &content)?;
+            }
+        }
+
+        // Dynamic composer height: recreate the inline viewport when the
+        // wrapped row count crosses a boundary. Edge-triggered so typing
+        // within a row band never churns the terminal. Local clear of the
+        // old viewport region (not a full-screen wipe, no history replay)
+        // prevents a duplicate "ghost" box from the previous height.
+        if alt.is_none() {
+            if let Ok(size) = terminal.size() {
+                let needed = app.needed_viewport_height(size.width);
+                if needed != app.composer_viewport_rows {
+                    // Clear the OLD viewport at its true on-screen position before
+                    // recreating at the new height. ratatui tracks the inline
+                    // viewport's real position (`viewport_area`), which is NOT
+                    // always bottom-anchored — it drifts down as scrollback is
+                    // inserted. A hand-computed `size.height - rows` top row is
+                    // therefore wrong whenever the viewport sits above the screen
+                    // bottom, which left a ghost top-border on every resize.
+                    // `terminal.clear()` clears exactly the tracked viewport region.
+                    let _ = terminal.clear();
+                    let _ = io::stdout().flush();
+                    app.composer_viewport_rows = needed;
+                    *terminal = reinit_inline_terminal(needed)?;
+                }
             }
         }
 
@@ -6351,7 +6605,7 @@ async fn run_loop(
                     let mut out = io::stdout();
                     let _ = out.write_all(b"\x1bc\x1b[3J\x1b[2J\x1b[H");
                     let _ = out.flush();
-                    *terminal = reinit_inline_terminal()?;
+                    *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
                     let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
                     let messages = app.context.messages.clone();
                     for msg in messages {
@@ -6360,6 +6614,56 @@ async fn run_loop(
                     }
                 } else {
                     let _ = terminal.clear();
+                }
+            } else if alt.is_none()
+                && app.overlay.is_none()
+                && app.pending_approval.is_none()
+                && leading_text_key(&ev).is_some()
+            {
+                // Potential paste burst: a printable key with more input
+                // already queued. Drain the run of text keys into one batch;
+                // a batch that is multi-char or multi-line is a paste, so
+                // internal Enters become '\n' instead of submitting. A lone
+                // char (fast single keystroke) falls through to normal typing.
+                //
+                // Gated to when the chat composer actually owns the input:
+                // no full-screen modal (`alt` covers login gate, list
+                // picker, info panel, autocomplete dropdown, setup overlay,
+                // first-run wizard — see `want_alt` above), no `/help`
+                // overlay, and no pending-approval prompt. Those surfaces
+                // have their own key handling in `handle_key` (Tab-complete,
+                // picker install, overlay dismiss, Y/N/A approval) that a
+                // blind paste-coalescing intercept would otherwise shadow.
+                let first =
+                    leading_text_key(&ev).expect("guarded by leading_text_key(&ev).is_some()");
+                let mut batch = String::new();
+                push_text_key(&mut batch, first);
+                let mut trailing: Option<Event> = None;
+                while event::poll(std::time::Duration::from_millis(0))? {
+                    let next = event::read()?;
+                    match leading_or_inner_text_key(&next) {
+                        Some(tk) => push_text_key(&mut batch, tk),
+                        None => {
+                            trailing = Some(next);
+                            break;
+                        }
+                    }
+                }
+                if batch_is_paste(&batch) {
+                    app.apply_paste_text(&batch);
+                } else {
+                    // Single char: normal typing path.
+                    if let Some(c) = batch.chars().next() {
+                        app.context.insert_char_at_cursor(c);
+                        app.context.exit_history_navigation();
+                        app.refresh_autocomplete();
+                    }
+                }
+                if let Some(other) = trailing {
+                    match app.handle_event(other).await? {
+                        EventResult::Quit => break,
+                        EventResult::Continue => {}
+                    }
                 }
             } else {
                 match app.handle_event(ev).await? {
@@ -6641,6 +6945,7 @@ mod tests {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
@@ -6744,6 +7049,7 @@ mod submit_tests {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
@@ -6861,6 +7167,7 @@ mod ctrl_c_tests {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
@@ -7019,6 +7326,7 @@ mod drain_tests {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
@@ -7188,6 +7496,7 @@ mod retry_tests {
             stream_header_committed: false,
             editor_request: false,
             clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
             login_gate: None,
             pending_approvals_rx: None,
