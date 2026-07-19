@@ -94,10 +94,22 @@ impl Channel for SlackChannel {
         "slack"
     }
 
+    fn render_target(&self) -> crate::channels::format::RenderTarget {
+        // Slack renders its own mrkdwn (`*bold*`, `_italic_`, `<url|text>`), not
+        // CommonMark, so the agent's `**bold**`/`[](url)`/tables leak today.
+        // LightMarkup{Slack} converts to mrkdwn and escapes `&`/`<`/`>` as Slack's
+        // text field requires.
+        crate::channels::format::RenderTarget::LightMarkup {
+            links: crate::channels::format::LinkStyle::Slack,
+        }
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let rendered =
+            crate::channels::format::render_to_string(&message.content, &self.render_target());
         let mut body = serde_json::json!({
             "channel": message.recipient,
-            "text": message.content
+            "text": rendered
         });
 
         if let Some(ref ts) = message.thread_ts {
@@ -279,6 +291,30 @@ impl Channel for SlackChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slack_render_target_is_lightmarkup_slack() {
+        // Assert on the CHANNEL — fails against the pre-wiring Plain default.
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        assert_eq!(
+            ch.render_target(),
+            crate::channels::format::RenderTarget::LightMarkup {
+                links: crate::channels::format::LinkStyle::Slack
+            }
+        );
+    }
+
+    #[test]
+    fn slack_converts_commonmark_to_mrkdwn() {
+        // The real fix: `**bold**` (which Slack shows literally) becomes `*bold*`
+        // (Slack mrkdwn), and a markdown link becomes Slack's `<url|text>`.
+        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let out = crate::channels::format::render_to_string(
+            "**bold** and [docs](https://x.io)",
+            &ch.render_target(),
+        );
+        assert_eq!(out, "*bold* and <https://x.io|docs>");
+    }
 
     #[test]
     fn slack_channel_name() {
