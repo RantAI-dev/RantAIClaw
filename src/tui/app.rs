@@ -635,7 +635,7 @@ impl TuiApp {
     /// submit) or lands a short paste inline.
     fn apply_paste_text(&mut self, text: &str) {
         let normalized = normalize_line_breaks(text);
-        if normalized.split('\n').count() > crate::tui::context::PASTE_PLACEHOLDER_MIN_LINES {
+        if estimated_paste_rows(&normalized) > crate::tui::context::PASTE_PLACEHOLDER_MIN_ROWS {
             let marker = self.context.register_paste(normalized);
             self.context.paste_at_cursor(&marker);
         } else {
@@ -1191,21 +1191,29 @@ impl TuiApp {
             KeyCode::Down if self.autocomplete.is_visible() => {
                 self.autocomplete.next();
             }
-            // Up/Down with no modal active recalls submitted prompts
-            // from history. Native terminal scrollback (mouse wheel /
+            // Up/Down move the cursor between lines of a multi-line composer
+            // (editor-style). Only when the cursor is already on the first line
+            // does Up recall an older submitted prompt; likewise Down on the
+            // last line recalls a newer one (restoring the stashed draft past
+            // the newest). A single-line input therefore still maps Up/Down
+            // straight to history. Native terminal scrollback (mouse wheel /
             // PgUp on the host terminal) handles chat scrolling.
             KeyCode::Up if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
-                if let Some(text) = self.context.history_recall_older() {
-                    self.context.input_buffer = text;
-                    self.context.cursor_to_end();
-                    self.refresh_autocomplete();
+                if !self.context.cursor_move_up() {
+                    if let Some(text) = self.context.history_recall_older() {
+                        self.context.input_buffer = text;
+                        self.context.cursor_to_end();
+                        self.refresh_autocomplete();
+                    }
                 }
             }
             KeyCode::Down if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
-                if let Some(text) = self.context.history_recall_newer() {
-                    self.context.input_buffer = text;
-                    self.context.cursor_to_end();
-                    self.refresh_autocomplete();
+                if !self.context.cursor_move_down() {
+                    if let Some(text) = self.context.history_recall_newer() {
+                        self.context.input_buffer = text;
+                        self.context.cursor_to_end();
+                        self.refresh_autocomplete();
+                    }
                 }
             }
             // Esc — close the setup overlay or cancel the wizard.
@@ -4762,6 +4770,33 @@ mod paste_coalesce_tests {
         assert!(!batch_is_paste("")); // empty
     }
 
+    /// Regression: the placeholder trigger must count WRAPPED rows, not raw
+    /// `\n`s. Three long prose paragraphs separated by blank lines are only 5
+    /// raw lines yet flood the composer; the old `split('\n').count() > 5`
+    /// check let them land inline with no `[Pasted text]` marker.
+    #[test]
+    fn estimated_rows_counts_wrapped_paragraphs_not_just_newlines() {
+        use super::estimated_paste_rows;
+        // Short note stays small → lands inline.
+        assert!(estimated_paste_rows("hi\nthere") <= 5);
+        // Three ~140-char paragraphs, blank-line separated: 5 raw lines but wide.
+        let para = "x".repeat(140);
+        let three_paras = format!("{para}\n\n{para}\n\n{para}");
+        assert_eq!(
+            three_paras.split('\n').count(),
+            5,
+            "raw line count is only 5"
+        );
+        assert!(
+            estimated_paste_rows(&three_paras) > 5,
+            "three long paragraphs must estimate > 5 wrapped rows"
+        );
+        // A single very long line is also large.
+        assert!(estimated_paste_rows(&"y".repeat(500)) > 5);
+        // Many short lines stay large (line-driven, unchanged behavior).
+        assert!(estimated_paste_rows("a\nb\nc\nd\ne\nf\ng\nh") > 5);
+    }
+
     #[test]
     fn leading_text_key_excludes_enter_and_tab_but_keeps_chars() {
         use super::leading_text_key;
@@ -4802,6 +4837,22 @@ fn key_to_text(key: &crossterm::event::KeyEvent) -> Option<TextKey> {
 /// carries more than one char or any newline. A lone char is ordinary typing.
 fn batch_is_paste(batch: &str) -> bool {
     batch.chars().count() > 1 || batch.contains('\n')
+}
+
+/// Estimate how many *wrapped* terminal rows a pasted block would occupy in the
+/// composer, wrapping each logical line at a nominal width. Deciding whether a
+/// paste is "large enough to collapse" by raw `\n` count alone misses a few
+/// very long paragraphs (lots of text, few newlines — the reported case: three
+/// prose paragraphs are only 5 raw lines yet wrap far past the composer's cap);
+/// estimating wrapped rows catches both tall (many lines) and wide (long lines)
+/// pastes. A nominal 80-col width is used because the real terminal width is not
+/// available on every paste path and the estimate only needs to be a threshold,
+/// not exact.
+fn estimated_paste_rows(text: &str) -> usize {
+    const NOMINAL_WIDTH: usize = 80;
+    text.split('\n')
+        .map(|line| line.chars().count().div_ceil(NOMINAL_WIDTH).max(1))
+        .sum()
 }
 
 /// Text key allowed to START a coalesced batch: a printable char, but NOT
