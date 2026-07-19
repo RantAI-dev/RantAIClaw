@@ -7205,6 +7205,35 @@ mod submit_tests {
         }
     }
 
+    /// End-to-end handler wiring: pressing Up on the last visual row of a
+    /// soft-wrapped single line moves the caret up one visual row (using the
+    /// width captured in `last_composer_width`) instead of falling through to
+    /// history. With no history in the test context, the old logical-line
+    /// behaviour would have left the caret untouched, so `after < before`
+    /// proves both the new movement and the handler plumbing.
+    #[tokio::test]
+    async fn arrow_up_moves_caret_across_wrapped_rows_via_handler() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        // 30 chars, no `\n`, wraps to 3 rows at inner_w 12 (10 on row 0 after
+        // the 2-cell prefix, then 12, then 8).
+        ctx.input_buffer = "abcdefghijklmnopqrstuvwxyz0123".chars().collect();
+        ctx.last_composer_width = 12;
+        ctx.cursor_pos = ctx.input_buffer.chars().count(); // end → last row
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Ready;
+
+        let before = app.context.cursor_pos;
+        let end_row = layout_composer(&app.context.input_buffer, before, 12).caret_row;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let after = app.context.cursor_pos;
+        assert!(after < before, "Up should move the caret up: {before} -> {after}");
+        let new_row = layout_composer(&app.context.input_buffer, after, 12).caret_row;
+        assert_eq!(new_row, end_row - 1, "Up should land one visual row above");
+    }
+
     #[tokio::test]
     async fn submit_input_streaming_state_queues_and_increments_counter() {
         let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
