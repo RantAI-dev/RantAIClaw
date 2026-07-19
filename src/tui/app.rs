@@ -4694,7 +4694,8 @@ mod composer_caret_tests {
             // inner_w-2; other rows use the full inner_w. caret_col must not
             // exceed the row's used width.
             let prefix = if l.caret_row == 0 { 2 } else { 0 };
-            let row_len = l.rows[l.caret_row as usize].chars().count() as u16;
+            let row_len =
+                u16::try_from(l.rows[l.caret_row as usize].chars().count()).unwrap_or(u16::MAX);
             assert!(
                 l.caret_col <= prefix + row_len,
                 "cursor {cursor}: caret_col {} beyond row width {}",
@@ -4883,7 +4884,7 @@ pub fn layout_composer(buffer: &str, cursor_pos: usize, inner_w: u16) -> Compose
 
     for (i, ch) in normalized.chars().enumerate() {
         if i == cursor_pos {
-            caret_row = (rows.len() - 1) as u16;
+            caret_row = u16::try_from(rows.len() - 1).unwrap_or(u16::MAX);
             caret_col = col;
         }
         if ch == '\n' {
@@ -4899,7 +4900,7 @@ pub fn layout_composer(buffer: &str, cursor_pos: usize, inner_w: u16) -> Compose
         }
     }
     if cursor_pos >= normalized.chars().count() {
-        caret_row = (rows.len() - 1) as u16;
+        caret_row = u16::try_from(rows.len() - 1).unwrap_or(u16::MAX);
         caret_col = col;
     }
 
@@ -4921,8 +4922,11 @@ fn composer_caret_cell(buffer: &str, cursor_pos: usize, inner_w: u16) -> (u16, u
 /// Number of composer TEXT rows the buffer needs, clamped to the 1..=6 cap.
 /// Drives the dynamic inline-viewport height.
 fn needed_composer_rows(buffer: &str, inner_w: u16) -> u16 {
-    let rows = layout_composer(buffer, 0, inner_w).rows.len() as u16;
-    rows.clamp(1, 6)
+    let rows = layout_composer(buffer, 0, inner_w).rows.len();
+    // Clamp in `usize` first (result is 1..=6), so the narrowing `try_from`
+    // can never fail; `unwrap_or(6)` is a dead-safe fallback that also keeps
+    // clippy's pedantic cast lint happy.
+    u16::try_from(rows.clamp(1, 6)).unwrap_or(6)
 }
 
 /// Vertical scroll that keeps `caret_row` inside an `inner_h`-row window.
