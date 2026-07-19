@@ -19,7 +19,13 @@ impl Channel for CliChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        println!("{}", message.content);
+        // Strip markup to readable text: a terminal renders no markdown, so
+        // `**bold**`/tables would show as literal syntax.
+        let rendered = crate::channels::format::render_to_string(
+            &message.content,
+            &crate::channels::format::RenderTarget::Plain,
+        );
+        println!("{rendered}");
         Ok(())
     }
 
@@ -70,6 +76,19 @@ mod tests {
     #[test]
     fn cli_channel_name() {
         assert_eq!(CliChannel::new().name(), "cli");
+    }
+
+    #[test]
+    fn plain_render_strips_markdown() {
+        // Contract lock for the whole Plain-baseline group (signal/qq/linq/lark/
+        // irc/imessage/nextcloud/email/cli): their send() routes content through
+        // this, so if plain.rs stopped stripping markup the wiring would silently
+        // ship `**bold**` again. Headings uppercase, `**bold**` -> `bold`.
+        let out = crate::channels::format::render_to_string(
+            "## Hi\n\n**bold**",
+            &crate::channels::format::RenderTarget::Plain,
+        );
+        assert_eq!(out, "HI\n\nbold");
     }
 
     #[tokio::test]

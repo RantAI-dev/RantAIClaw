@@ -229,13 +229,20 @@ impl Channel for QQChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_token().await?;
 
+        // QQ text bubbles render no markup — strip to readable text. Both the
+        // group and user bind points use the same rendered string.
+        let rendered = crate::channels::format::render_to_string(
+            &message.content,
+            &crate::channels::format::RenderTarget::Plain,
+        );
+
         // Determine if this is a group or private message based on recipient format
         // Format: "user:{openid}" or "group:{group_openid}"
         let (url, body) = if let Some(group_id) = message.recipient.strip_prefix("group:") {
             (
                 format!("{QQ_API_BASE}/v2/groups/{group_id}/messages"),
                 json!({
-                    "content": &message.content,
+                    "content": &rendered,
                     "msg_type": 0,
                 }),
             )
@@ -247,7 +254,7 @@ impl Channel for QQChannel {
             (
                 format!("{QQ_API_BASE}/v2/users/{user_id}/messages"),
                 json!({
-                    "content": &message.content,
+                    "content": &rendered,
                     "msg_type": 0,
                 }),
             )

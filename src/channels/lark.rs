@@ -979,7 +979,14 @@ impl Channel for LarkChannel {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let content = serde_json::json!({ "text": message.content }).to_string();
+        // This sends Lark's `text` msg_type, which renders plain — no markup — so
+        // strip the agent's markdown. (A future `post`/`interactive` rich type
+        // would need a different target; the Plain choice rests on `text` here.)
+        let rendered = crate::channels::format::render_to_string(
+            &message.content,
+            &crate::channels::format::RenderTarget::Plain,
+        );
+        let content = serde_json::json!({ "text": rendered }).to_string();
         let body = serde_json::json!({
             "receive_id": message.recipient,
             "msg_type": "text",

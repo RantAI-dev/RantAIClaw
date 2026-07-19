@@ -169,9 +169,16 @@ impl Channel for IMessageChannel {
             );
         }
 
+        // iMessage renders no markup — strip to readable text BEFORE the
+        // AppleScript escaping below.
+        let rendered = crate::channels::format::render_to_string(
+            &message.content,
+            &crate::channels::format::RenderTarget::Plain,
+        );
+
         // SECURITY: Escape both message AND target to prevent AppleScript injection
         // See: CWE-78 (OS Command Injection)
-        let escaped_msg = escape_applescript(&message.content);
+        let escaped_msg = escape_applescript(&rendered);
         let escaped_target = escape_applescript(&message.recipient);
 
         let script = format!(
