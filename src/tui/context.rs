@@ -298,15 +298,21 @@ impl TuiContext {
         self.input_buffer.chars().count()
     }
 
-    /// Convert a `cursor_pos` char index into the matching byte index
-    /// inside `input_buffer`. Returns `input_buffer.len()` when the
-    /// cursor sits at end-of-buffer.
-    fn cursor_byte_index(&self) -> usize {
+    /// Convert a char index into the matching byte index inside `input_buffer`.
+    /// Returns `input_buffer.len()` when `char_pos` is at or past end-of-buffer.
+    fn byte_index_of(&self, char_pos: usize) -> usize {
         self.input_buffer
             .char_indices()
-            .nth(self.cursor_pos)
+            .nth(char_pos)
             .map(|(b, _)| b)
             .unwrap_or(self.input_buffer.len())
+    }
+
+    /// Convert `cursor_pos` (a char index) into the matching byte index inside
+    /// `input_buffer`. Returns `input_buffer.len()` when the cursor sits at
+    /// end-of-buffer.
+    fn cursor_byte_index(&self) -> usize {
+        self.byte_index_of(self.cursor_pos)
     }
 
     /// Place the cursor at end-of-buffer. Call this any time
@@ -431,6 +437,92 @@ impl TuiContext {
     /// `cursor_to_end` named for keyboard symmetry with `cursor_home`.
     pub fn cursor_end(&mut self) {
         self.cursor_to_end();
+    }
+
+    /// Char index of the start of the logical line (split on `\n`) the cursor
+    /// sits on — just after the previous `\n`, or 0.
+    fn line_start_char(&self) -> usize {
+        let mut start = 0;
+        for (i, c) in self.input_buffer.chars().enumerate().take(self.cursor_pos) {
+            if c == '\n' {
+                start = i + 1;
+            }
+        }
+        start
+    }
+
+    /// Char index of the end of the logical line the cursor sits on — the next
+    /// `\n` at or after the cursor, or end-of-buffer.
+    fn line_end_char(&self) -> usize {
+        let mut end = self.input_char_count();
+        for (i, c) in self.input_buffer.chars().enumerate().skip(self.cursor_pos) {
+            if c == '\n' {
+                end = i;
+                break;
+            }
+        }
+        end
+    }
+
+    /// Ctrl+A: move the cursor to the start of the current logical line. This is
+    /// line-based (readline convention), unlike `cursor_home` (whole buffer).
+    pub fn cursor_line_start(&mut self) {
+        self.cursor_pos = self.line_start_char();
+    }
+
+    /// Ctrl+E: move the cursor to the end of the current logical line.
+    pub fn cursor_line_end(&mut self) {
+        self.cursor_pos = self.line_end_char();
+    }
+
+    /// Ctrl+U: delete from the start of the current logical line up to the
+    /// cursor. No-op when already at the line start.
+    pub fn kill_to_line_start(&mut self) {
+        let start = self.line_start_char();
+        if start == self.cursor_pos {
+            return;
+        }
+        let start_byte = self.byte_index_of(start);
+        let cursor_byte = self.cursor_byte_index();
+        self.input_buffer.replace_range(start_byte..cursor_byte, "");
+        self.cursor_pos = start;
+    }
+
+    /// Ctrl+K: delete from the cursor to the end of the current logical line.
+    /// No-op when already at the line end.
+    pub fn kill_to_line_end(&mut self) {
+        let end = self.line_end_char();
+        if end == self.cursor_pos {
+            return;
+        }
+        let cursor_byte = self.cursor_byte_index();
+        let end_byte = self.byte_index_of(end);
+        self.input_buffer.replace_range(cursor_byte..end_byte, "");
+    }
+
+    /// Ctrl+W: delete the whitespace-delimited word before the cursor, first
+    /// eating any run of whitespace (including newlines) immediately behind the
+    /// cursor, then the word itself. No-op at the start of the buffer.
+    pub fn delete_word_before(&mut self) {
+        if self.cursor_pos == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.input_buffer.chars().collect();
+        let is_ws = |c: char| c == ' ' || c == '\t' || c == '\n';
+        let mut start = self.cursor_pos;
+        while start > 0 && is_ws(chars[start - 1]) {
+            start -= 1;
+        }
+        while start > 0 && !is_ws(chars[start - 1]) {
+            start -= 1;
+        }
+        if start == self.cursor_pos {
+            return;
+        }
+        let start_byte = self.byte_index_of(start);
+        let cursor_byte = self.cursor_byte_index();
+        self.input_buffer.replace_range(start_byte..cursor_byte, "");
+        self.cursor_pos = start;
     }
 
     /// Build a `TuiContext` suitable for unit tests, returning the peer ends
@@ -793,6 +885,57 @@ mod tests {
         ctx.exit_history_navigation();
         assert!(ctx.input_history_pos.is_none());
         assert!(ctx.input_history_stash.is_none());
+    }
+
+    #[test]
+    fn ctrl_a_ctrl_e_move_to_logical_line_bounds() {
+        let mut ctx = in_memory_context("m");
+        ctx.input_buffer = "first\nsecond line\nthird".to_string();
+        // Put the cursor in the middle line ("seco|nd line") = index 6 + 4.
+        ctx.cursor_pos = 6 + 4;
+        ctx.cursor_line_start();
+        assert_eq!(ctx.cursor_pos, 6, "Ctrl+A → start of the middle line");
+        ctx.cursor_line_end();
+        assert_eq!(ctx.cursor_pos, 6 + 11, "Ctrl+E → end of the middle line");
+    }
+
+    #[test]
+    fn ctrl_u_kills_to_line_start_only() {
+        let mut ctx = in_memory_context("m");
+        ctx.input_buffer = "keep\ndelete this".to_string();
+        ctx.cursor_to_end(); // end of "delete this"
+        ctx.kill_to_line_start();
+        assert_eq!(
+            ctx.input_buffer, "keep\n",
+            "only the second line is cleared"
+        );
+        assert_eq!(ctx.cursor_pos, 5);
+    }
+
+    #[test]
+    fn ctrl_k_kills_to_line_end_only() {
+        let mut ctx = in_memory_context("m");
+        ctx.input_buffer = "chop here\nkeep".to_string();
+        ctx.cursor_pos = 4; // "chop| here"
+        ctx.kill_to_line_end();
+        assert_eq!(
+            ctx.input_buffer, "chop\nkeep",
+            "kills to the line end, not past the newline"
+        );
+        assert_eq!(ctx.cursor_pos, 4);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_word_behind_the_cursor() {
+        let mut ctx = in_memory_context("m");
+        ctx.input_buffer = "alpha beta gamma".to_string();
+        ctx.cursor_to_end();
+        ctx.delete_word_before();
+        assert_eq!(ctx.input_buffer, "alpha beta ");
+        assert_eq!(ctx.cursor_pos, 11);
+        // Trailing spaces are eaten before the word: "alpha beta " → "alpha ".
+        ctx.delete_word_before();
+        assert_eq!(ctx.input_buffer, "alpha ");
     }
 
     #[test]
