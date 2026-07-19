@@ -57,6 +57,11 @@ pub struct TuiContext {
     /// new buffer) whenever `input_buffer` is replaced wholesale.
     pub cursor_pos: usize,
     pub scroll_offset: usize,
+    /// Inner width (cells) of the composer at the last render, used so key
+    /// handlers can compute visual-row cursor movement (Up/Down) with the same
+    /// wrap width the renderer used. Updated every `render`; defaults to a sane
+    /// 80 so movement works before the first frame.
+    pub last_composer_width: u16,
     pub token_usage: TokenUsage,
     /// Total context window of the active model, in tokens. Used by the
     /// status bar to display a `used/window  pct%` meter. `None` when the
@@ -184,6 +189,7 @@ impl TuiContext {
             pending_pastes: Vec::new(),
             cursor_pos: 0,
             scroll_offset: 0,
+            last_composer_width: 80,
             token_usage: TokenUsage::default(),
             context_window: None,
             started_at: std::time::Instant::now(),
@@ -410,68 +416,6 @@ impl TuiContext {
         if self.cursor_pos < max {
             self.cursor_pos += 1;
         }
-    }
-
-    /// Move the cursor up one logical line (split on `\n`), keeping the same
-    /// column where possible. Returns `false` when the cursor is already on the
-    /// first line, so the caller can fall back to history recall. This gives
-    /// editor-style vertical movement in a multi-line composer while a
-    /// single-line input still maps Up straight to history.
-    pub fn cursor_move_up(&mut self) -> bool {
-        let chars: Vec<char> = self.input_buffer.chars().collect();
-        // Start of the line the cursor currently sits on.
-        let mut line_start = 0;
-        for (i, &c) in chars.iter().enumerate().take(self.cursor_pos) {
-            if c == '\n' {
-                line_start = i + 1;
-            }
-        }
-        if line_start == 0 {
-            return false; // already on the first line
-        }
-        let col = self.cursor_pos - line_start;
-        // The `\n` ending the previous line sits at `line_start - 1`.
-        let mut prev_start = 0;
-        for (i, &c) in chars.iter().enumerate().take(line_start - 1) {
-            if c == '\n' {
-                prev_start = i + 1;
-            }
-        }
-        let prev_len = (line_start - 1) - prev_start;
-        self.cursor_pos = prev_start + col.min(prev_len);
-        true
-    }
-
-    /// Move the cursor down one logical line, keeping the same column where
-    /// possible. Returns `false` when the cursor is already on the last line,
-    /// so the caller can fall back to history recall.
-    pub fn cursor_move_down(&mut self) -> bool {
-        let chars: Vec<char> = self.input_buffer.chars().collect();
-        let n = chars.len();
-        let mut line_start = 0;
-        for (i, &c) in chars.iter().enumerate().take(self.cursor_pos) {
-            if c == '\n' {
-                line_start = i + 1;
-            }
-        }
-        let col = self.cursor_pos - line_start;
-        // End of the current line = the next `\n` at or after `line_start`.
-        let Some(cur_end) = chars[line_start..]
-            .iter()
-            .position(|&c| c == '\n')
-            .map(|off| line_start + off)
-        else {
-            return false; // no newline after → already on the last line
-        };
-        let next_start = cur_end + 1;
-        let next_end = chars[next_start..]
-            .iter()
-            .position(|&c| c == '\n')
-            .map(|off| next_start + off)
-            .unwrap_or(n);
-        let next_len = next_end - next_start;
-        self.cursor_pos = next_start + col.min(next_len);
-        true
     }
 
     /// Jump the cursor to the beginning of the buffer (Home).
@@ -845,35 +789,6 @@ mod tests {
         ctx.exit_history_navigation();
         assert!(ctx.input_history_pos.is_none());
         assert!(ctx.input_history_stash.is_none());
-    }
-
-    #[test]
-    fn cursor_moves_between_logical_lines_keeping_column() {
-        let mut ctx = in_memory_context("m");
-        ctx.input_buffer = "abc\ndefgh\nij".to_string(); // 3 lines: len 3, 5, 2
-                                                         // Cursor at column 4 on the middle line ("defg|h").
-        ctx.cursor_pos = 4 + 4;
-        // Up → first line, column clamped to its length (3) = end of "abc".
-        assert!(ctx.cursor_move_up());
-        assert_eq!(ctx.cursor_pos, 3);
-        // Down → middle line at column min(3, 5) = 3 ("def|gh").
-        assert!(ctx.cursor_move_down());
-        assert_eq!(ctx.cursor_pos, 4 + 3);
-        // Down → last line "ij", column clamped to its length (2).
-        assert!(ctx.cursor_move_down());
-        assert_eq!(ctx.cursor_pos, 4 + 6 + 2);
-        // Down on the last line → false so the caller recalls newer history.
-        assert!(!ctx.cursor_move_down());
-    }
-
-    #[test]
-    fn single_line_input_defers_vertical_move_to_history() {
-        let mut ctx = in_memory_context("m");
-        ctx.input_buffer = "just one line".to_string();
-        ctx.cursor_to_end();
-        // No line above or below → both return false so Up/Down hit history.
-        assert!(!ctx.cursor_move_up());
-        assert!(!ctx.cursor_move_down());
     }
 
     #[test]

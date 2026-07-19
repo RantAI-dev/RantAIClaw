@@ -1184,28 +1184,44 @@ impl TuiApp {
             KeyCode::Down if self.autocomplete.is_visible() => {
                 self.autocomplete.next();
             }
-            // Up/Down move the cursor between lines of a multi-line composer
-            // (editor-style). Only when the cursor is already on the first line
-            // does Up recall an older submitted prompt; likewise Down on the
-            // last line recalls a newer one (restoring the stashed draft past
-            // the newest). A single-line input therefore still maps Up/Down
-            // straight to history. Native terminal scrollback (mouse wheel /
-            // PgUp on the host terminal) handles chat scrolling.
+            // Up/Down move the caret between VISUAL rows of a multi-line
+            // composer (editor-style), including soft-wrapped rows of a single
+            // long line. Only when the caret is already on the first/last row
+            // does Up/Down fall back to history: Up recalls an older submitted
+            // prompt, Down recalls a newer one (restoring the stashed draft past
+            // the newest). A single-row input therefore maps Up/Down straight to
+            // history. PgUp/PgDn scroll the chat pane.
             KeyCode::Up if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
-                if !self.context.cursor_move_up() {
-                    if let Some(text) = self.context.history_recall_older() {
-                        self.context.input_buffer = text;
-                        self.context.cursor_to_end();
-                        self.refresh_autocomplete();
+                match visual_cursor_move(
+                    &self.context.input_buffer,
+                    self.context.cursor_pos,
+                    self.context.last_composer_width,
+                    true,
+                ) {
+                    Some(pos) => self.context.cursor_pos = pos,
+                    None => {
+                        if let Some(text) = self.context.history_recall_older() {
+                            self.context.input_buffer = text;
+                            self.context.cursor_to_end();
+                            self.refresh_autocomplete();
+                        }
                     }
                 }
             }
             KeyCode::Down if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
-                if !self.context.cursor_move_down() {
-                    if let Some(text) = self.context.history_recall_newer() {
-                        self.context.input_buffer = text;
-                        self.context.cursor_to_end();
-                        self.refresh_autocomplete();
+                match visual_cursor_move(
+                    &self.context.input_buffer,
+                    self.context.cursor_pos,
+                    self.context.last_composer_width,
+                    false,
+                ) {
+                    Some(pos) => self.context.cursor_pos = pos,
+                    None => {
+                        if let Some(text) = self.context.history_recall_newer() {
+                            self.context.input_buffer = text;
+                            self.context.cursor_to_end();
+                            self.refresh_autocomplete();
+                        }
                     }
                 }
             }
@@ -3516,6 +3532,9 @@ impl TuiApp {
             // composer (dynamic 1..=6 text rows, `needed_composer_rows`), and
             // the status bar pinned at the very bottom.
             let inner_w = area.width.saturating_sub(2).max(1);
+            // Remember the wrap width so Up/Down key handling moves the caret by
+            // the same visual rows the renderer draws.
+            context.last_composer_width = inner_w;
             let text_rows = needed_composer_rows(&context.input_buffer, inner_w);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -4752,6 +4771,60 @@ mod composer_caret_tests {
         let many = (0..20).map(|_| "x").collect::<Vec<_>>().join("\n");
         assert_eq!(needed_composer_rows(&many, 40), 6);
     }
+
+    #[test]
+    fn visual_move_steps_between_logical_lines_keeping_column() {
+        use super::visual_cursor_move;
+        // 3 lines: "abc" (3), "defgh" (5), "ij" (2). Wide enough not to wrap.
+        let buf = "abc\ndefgh\nij";
+        let inner_w = 40u16;
+        // Caret on the middle line at screen cell 4 ("defg|h") = index 8
+        // (d..h occupy cells 0..4, no prefix on a continuation/lower line).
+        let mid = 4 + 4;
+        // Up → first line. Row 0 carries the 2-cell prefix, so screen cell 4
+        // there points between "ab" and "c" ("ab|c") = index 2. Same screen
+        // column, different char index — that is correct visual movement.
+        assert_eq!(visual_cursor_move(buf, mid, inner_w, true), Some(2));
+        // Down from that position → back onto the middle line at the same cell.
+        let up = visual_cursor_move(buf, mid, inner_w, true).unwrap();
+        assert_eq!(visual_cursor_move(buf, up, inner_w, false), Some(mid));
+        // Down from the middle line → last line "ij" (clamped to its length).
+        assert_eq!(
+            visual_cursor_move(buf, mid, inner_w, false),
+            Some(4 + 6 + 2)
+        );
+    }
+
+    #[test]
+    fn visual_move_navigates_soft_wrapped_rows_of_one_long_line() {
+        use super::{layout_composer, visual_cursor_move};
+        // One logical line, no `\n`, forced to wrap: inner_w 12 → 10 cells on
+        // row 0 (2-cell prefix) then 12 per row. 30 chars spans 3 visual rows.
+        let buf: String = "abcdefghijklmnopqrstuvwxyz0123".chars().collect();
+        let inner_w = 12u16;
+        // Caret at the end (row 2). Up must reach row 1 (a wrapped row), NOT
+        // bail to history — this is the whole point of visual-row movement.
+        let end = buf.chars().count();
+        let end_row = layout_composer(&buf, end, inner_w).caret_row;
+        assert!(end_row >= 2, "buffer should span >=3 rows, got {end_row}");
+        let up1 = visual_cursor_move(&buf, end, inner_w, true).expect("row above end");
+        assert_eq!(layout_composer(&buf, up1, inner_w).caret_row, end_row - 1);
+        let up2 = visual_cursor_move(&buf, up1, inner_w, true).expect("row 0");
+        assert_eq!(layout_composer(&buf, up2, inner_w).caret_row, 0);
+        // On the first visual row Up bails (None) so the caller hits history.
+        assert_eq!(visual_cursor_move(&buf, up2, inner_w, true), None);
+    }
+
+    #[test]
+    fn visual_move_single_row_defers_to_history() {
+        use super::visual_cursor_move;
+        let buf = "just one line";
+        let inner_w = 40u16;
+        let end = buf.chars().count();
+        // Only one visual row → both directions return None (history fallback).
+        assert_eq!(visual_cursor_move(buf, end, inner_w, true), None);
+        assert_eq!(visual_cursor_move(buf, end, inner_w, false), None);
+    }
 }
 
 #[cfg(test)]
@@ -4997,6 +5070,46 @@ pub fn layout_composer(buffer: &str, cursor_pos: usize, inner_w: u16) -> Compose
 fn composer_caret_cell(buffer: &str, cursor_pos: usize, inner_w: u16) -> (u16, u16) {
     let l = layout_composer(buffer, cursor_pos, inner_w);
     (l.caret_row, l.caret_col)
+}
+
+/// New cursor position after moving the caret one VISUAL row up (`up = true`)
+/// or down, keeping the target column as close as possible. Visual rows include
+/// soft-wrapped rows, so a single long line that wraps still navigates row by
+/// row — matching a normal terminal editor, not just movement between `\n`
+/// separated lines. Returns `None` when there is no row above/below the caret,
+/// so the caller falls back to history recall (Up on the first row recalls an
+/// older prompt; Down on the last row recalls a newer one).
+///
+/// Shares [`layout_composer`] as the single wrap model so caret placement here
+/// always agrees with what the renderer draws.
+fn visual_cursor_move(buffer: &str, cursor_pos: usize, inner_w: u16, up: bool) -> Option<usize> {
+    let cur = layout_composer(buffer, cursor_pos, inner_w);
+    let target_row = if up {
+        cur.caret_row.checked_sub(1)?
+    } else {
+        cur.caret_row.saturating_add(1)
+    };
+    let n = buffer.chars().count();
+    // caret_row is monotonic non-decreasing as `p` grows, so we can stop once we
+    // pass the target row. Pick the position on the target row whose column is
+    // closest to the current column.
+    let mut best: Option<(usize, u16)> = None;
+    for p in 0..=n {
+        let l = layout_composer(buffer, p, inner_w);
+        if l.caret_row == target_row {
+            let dist = l.caret_col.abs_diff(cur.caret_col);
+            let better = match best {
+                Some((_, best_dist)) => dist < best_dist,
+                None => true,
+            };
+            if better {
+                best = Some((p, dist));
+            }
+        } else if l.caret_row > target_row {
+            break;
+        }
+    }
+    best.map(|(p, _)| p)
 }
 
 /// Number of composer TEXT rows the buffer needs, clamped to the 1..=6 cap.
@@ -7093,6 +7206,38 @@ mod submit_tests {
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
         }
+    }
+
+    /// End-to-end handler wiring: pressing Up on the last visual row of a
+    /// soft-wrapped single line moves the caret up one visual row (using the
+    /// width captured in `last_composer_width`) instead of falling through to
+    /// history. With no history in the test context, the old logical-line
+    /// behaviour would have left the caret untouched, so `after < before`
+    /// proves both the new movement and the handler plumbing.
+    #[tokio::test]
+    async fn arrow_up_moves_caret_across_wrapped_rows_via_handler() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        // 30 chars, no `\n`, wraps to 3 rows at inner_w 12 (10 on row 0 after
+        // the 2-cell prefix, then 12, then 8).
+        ctx.input_buffer = "abcdefghijklmnopqrstuvwxyz0123".chars().collect();
+        ctx.last_composer_width = 12;
+        ctx.cursor_pos = ctx.input_buffer.chars().count(); // end → last row
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Ready;
+
+        let before = app.context.cursor_pos;
+        let end_row = layout_composer(&app.context.input_buffer, before, 12).caret_row;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let after = app.context.cursor_pos;
+        assert!(
+            after < before,
+            "Up should move the caret up: {before} -> {after}"
+        );
+        let new_row = layout_composer(&app.context.input_buffer, after, 12).caret_row;
+        assert_eq!(new_row, end_row - 1, "Up should land one visual row above");
     }
 
     #[tokio::test]
