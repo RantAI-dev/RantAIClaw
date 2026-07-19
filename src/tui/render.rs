@@ -103,6 +103,17 @@ impl Default for RenderTheme {
 /// strips ATX-style heading prefixes (`#`, `##`, `###`) and styles the
 /// remainder as a bold heading; recognises `- ` / `* ` bullets and styles
 /// the marker. Falls back to inline-markdown parsing for normal lines.
+/// True when `text` is a Markdown thematic break (horizontal rule): a line made
+/// only of three or more `-`, `*`, or `_` (ignoring surrounding whitespace).
+/// The renderer draws these as a full-width rule instead of literal dashes.
+pub fn is_horizontal_rule(text: &str) -> bool {
+    let t = text.trim();
+    t.len() >= 3
+        && (t.bytes().all(|b| b == b'-')
+            || t.bytes().all(|b| b == b'*')
+            || t.bytes().all(|b| b == b'_'))
+}
+
 pub fn render_block_line(text: &str, theme: &RenderTheme) -> Line<'static> {
     let stripped = text.trim_start_matches(' ');
     let leading_ws_len = text.len() - stripped.len();
@@ -426,6 +437,20 @@ mod tests {
         let spans = parse_inline_markdown("Hi 🦀 friend", &theme());
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "Hi 🦀 friend");
+    }
+
+    #[test]
+    fn is_horizontal_rule_matches_only_thematic_breaks() {
+        use super::is_horizontal_rule;
+        assert!(is_horizontal_rule("---"));
+        assert!(is_horizontal_rule("----------"));
+        assert!(is_horizontal_rule("***"));
+        assert!(is_horizontal_rule("___"));
+        assert!(is_horizontal_rule("  ---  "));
+        assert!(!is_horizontal_rule("--"), "fewer than three");
+        assert!(!is_horizontal_rule("- - -"), "spaced dashes are not a rule");
+        assert!(!is_horizontal_rule("-abc-"), "letters are not a rule");
+        assert!(!is_horizontal_rule(""), "empty");
     }
 
     #[test]
