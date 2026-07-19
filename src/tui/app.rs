@@ -16,8 +16,8 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Widget, Wrap},
-    Terminal, TerminalOptions, Viewport,
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    Terminal,
 };
 
 use tokio::sync::mpsc;
@@ -645,13 +645,6 @@ impl TuiApp {
         self.refresh_autocomplete();
     }
 
-    /// Inline viewport height the composer currently needs for `term_width`:
-    /// text rows (1..=6) + top border + bottom border + one status row.
-    fn needed_viewport_height(&self, term_width: u16) -> u16 {
-        let inner_w = term_width.saturating_sub(2).max(1);
-        needed_composer_rows(&self.context.input_buffer, inner_w) + 3
-    }
-
     /// Process a single terminal event, returning whether to continue or quit.
     pub async fn handle_event(&mut self, event: Event) -> Result<EventResult> {
         match event {
@@ -1215,6 +1208,27 @@ impl TuiApp {
                         self.refresh_autocomplete();
                     }
                 }
+            }
+            // PgUp/PgDn scroll the chat pane (in fullscreen the terminal's own
+            // scrollback is gone, so this is how older messages are reached).
+            // `scroll_offset` counts items up from the newest; 0 sticks to the
+            // bottom and is reset on submit/`/new`.
+            KeyCode::PageUp
+                if self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none()
+                    && self.list_picker.is_none()
+                    && self.info_panel.is_none() =>
+            {
+                let max = self.context.messages.len().saturating_sub(1);
+                self.context.scroll_offset = (self.context.scroll_offset + 3).min(max);
+            }
+            KeyCode::PageDown
+                if self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none()
+                    && self.list_picker.is_none()
+                    && self.info_panel.is_none() =>
+            {
+                self.context.scroll_offset = self.context.scroll_offset.saturating_sub(3);
             }
             // Esc — close the setup overlay or cancel the wizard.
             KeyCode::Esc if self.setup_overlay.is_some() || self.first_run_wizard.is_some() => {
@@ -3469,75 +3483,66 @@ impl TuiApp {
             ..
         } = self;
 
+        let _ = stream_committed_chars; // kept on App for future re-introduction
         let pending_approval_snapshot = self.pending_approval.clone();
         terminal.draw(|frame| {
             let area = frame.area();
 
-            // Dynamic layout: input + status. The pre-v0.6.50 layout also
-            // reserved a stream-preview row above the input box that
-            // duplicated the cancelling/thinking/streaming indicator
-            // already shown in the status bar. Two indicators ticking at
-            // once were noisy + confusing per tester feedback, so the
-            // upper pane was removed and the status bar is now the
-            // canonical streaming surface. The input pane's height tracks
-            // the buffer's wrapped row count (1..=6 text rows, see
-            // `needed_composer_rows`) so the composer grows/shrinks to fit.
+            // Full-screen modals own the entire screen. Priority order matches
+            // the old alt-screen path: login gate > setup overlay > first-run
+            // wizard > list picker > info panel. Each clears its own area.
+            if let Some(gate) = self.login_gate.as_ref() {
+                gate.render_fullscreen(frame, area);
+                return;
+            }
+            if let Some(overlay_state) = self.setup_overlay.as_mut() {
+                overlay_state.render(frame, area);
+                return;
+            }
+            if let Some(wizard) = self.first_run_wizard.as_mut() {
+                wizard.render_fullscreen(frame, area);
+                return;
+            }
+            if let Some(picker) = list_picker.as_mut() {
+                picker.render(frame, area);
+                return;
+            }
+            if let Some(panel) = info_panel.as_ref() {
+                panel.render(frame, area);
+                return;
+            }
+
+            // Base chat layout (fullscreen): a scrollable chat pane on top, the
+            // composer (dynamic 1..=6 text rows, `needed_composer_rows`), and
+            // the status bar pinned at the very bottom.
             let inner_w = area.width.saturating_sub(2).max(1);
             let text_rows = needed_composer_rows(&context.input_buffer, inner_w);
-            let _ = stream_committed_chars; // kept on App for future re-introduction
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(text_rows + 2), Constraint::Length(1)])
+                .constraints([
+                    Constraint::Min(1),                // 0: chat pane
+                    Constraint::Length(text_rows + 2), // 1: composer / approval prompt
+                    Constraint::Length(1),             // 2: status bar
+                ])
                 .split(area);
 
-            // When an approval is pending, the top row swaps from the
-            // input box to the styled approval prompt — same height so
-            // the status bar stays put. The key handler absorbs Y/A/N/
-            // Esc while the prompt is up; everything else falls through
-            // (so Ctrl+C still cancels, /quit still works, etc.).
-            if let Some(ref req) = pending_approval_snapshot {
-                render_approval_pane(req, frame, chunks[0]);
-            } else {
-                render_input_pane(context, frame, chunks[0]);
-            }
-            render_status_pane(context, state, frame, chunks[1]);
+            render_chat_pane(state, context, frame, chunks[0]);
 
-            // Modal overlay (e.g. /help) takes over the entire viewport.
+            // When an approval is pending, the composer row swaps for the styled
+            // approval prompt — same height so the status bar stays put.
+            if let Some(ref req) = pending_approval_snapshot {
+                render_approval_pane(req, frame, chunks[1]);
+            } else {
+                render_input_pane(context, frame, chunks[1]);
+            }
+            render_status_pane(context, state, frame, chunks[2]);
+
+            // /help modal overlays the chat pane but leaves the composer usable.
             if let Some(content) = overlay.as_ref() {
                 render_overlay_pane(content, frame, area);
             }
 
-            // Setup overlay — full terminal coverage while active. Drawn
-            // BEFORE the list picker so that when the wizard's skills
-            // step opens the install picker, the picker covers the
-            // overlay (ClawhubInstall hand-off path) — otherwise the
-            // user just sees the overlay's "Fetching…" log forever.
-            if let Some(overlay_state) = self.setup_overlay.as_mut() {
-                overlay_state.render(frame, area);
-            }
-
-            // List picker overlay — covers the entire 6-row viewport.
-            if let Some(picker) = list_picker.as_mut() {
-                picker.render(frame, area);
-            }
-
-            // Info panel overlay — read-only modal for /channels, /config,
-            // /doctor, /insights, /status, /usage, /skill (no args).
-            // Visually consistent with the list picker; same key dialect.
-            if let Some(panel) = info_panel.as_ref() {
-                panel.render(frame, area);
-            }
-
-            // First-run wizard — full terminal coverage, renders over everything.
-            if let Some(wizard) = &mut self.first_run_wizard {
-                wizard.render_fullscreen(frame, area);
-            }
-
-            // Note: the console login gate is a full-screen surface handled
-            // by the alt-screen render path (see `want_alt`), never inline.
-
-            // Slash-command dropdown — anchored just above the input box,
-            // clamped to stay strictly inside the inline viewport.
+            // Slash-command dropdown, anchored just above the composer.
             if autocomplete.is_visible() {
                 let input_area = chunks[1];
                 let space_above = input_area.y.saturating_sub(area.y);
@@ -3561,6 +3566,19 @@ impl TuiApp {
             }
         })?;
         Ok(())
+    }
+
+    /// True when a full-screen modal (login gate, list picker, info panel,
+    /// autocomplete dropdown, setup overlay, or first-run wizard) currently
+    /// owns keyboard input — used to gate paste-burst coalescing so a modal's
+    /// own key handling isn't shadowed.
+    fn modal_active(&self) -> bool {
+        self.login_gate.is_some()
+            || self.list_picker.is_some()
+            || self.info_panel.is_some()
+            || self.autocomplete.is_visible()
+            || self.setup_overlay.is_some()
+            || self.first_run_wizard.is_some()
     }
 
     /// Render path while the list picker is open. Uses the full
@@ -4239,6 +4257,7 @@ fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Fra
         items.push(ListItem::new(lines));
     }
 
+    let item_count = items.len();
     let list = List::new(items).block(
         Block::default()
             .title(Line::from(vec![
@@ -4255,7 +4274,17 @@ fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Fra
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Rgb(40, 70, 140))),
     );
-    frame.render_widget(list, area);
+    // Stick to the bottom by default (a plain `List` renders from the top,
+    // hiding recent output): select an item near the end so ratatui scrolls it
+    // into view. `scroll_offset` is how many items up from the newest the user
+    // has paged with PgUp (0 = stuck to the bottom). No highlight style is set,
+    // so selection only drives the scroll, not any visual marker.
+    let mut list_state = ListState::default();
+    if item_count > 0 {
+        let sel = (item_count - 1).saturating_sub(ctx.scroll_offset);
+        list_state.select(Some(sel));
+    }
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 /// Commit a block of `Line`s to the terminal scrollback above the inline
@@ -5933,46 +5962,31 @@ pub const INLINE_VIEWPORT_LINES: u16 = 4;
 /// `Constraint::Length(STREAM_PREVIEW_LINES)` back to the layout.
 pub const STREAM_PREVIEW_LINES: u16 = 0;
 
-/// Set up the terminal in **inline mode** — no alternate screen takeover.
+/// Set up the terminal in **fullscreen (alternate-screen) mode**.
 ///
-/// The bottom `INLINE_VIEWPORT_LINES` rows of the terminal are reserved
-/// for the TUI's live region (status bar + input box). Everything emitted
-/// via `terminal.insert_before(...)` or plain `println!` lands in the
-/// terminal's normal scrollback above that region. On exit the viewport
-/// is consumed and the terminal returns to its prompt.
-///
-/// This is the Hermes / Claude-Code-style flow: chat history is the
-/// terminal's own scrollback, not a ratatui List widget that fights it.
+/// The whole terminal is the app's canvas: `TuiApp::render` lays out a
+/// scrollable chat pane on top, the composer, and the status bar — with the
+/// composer pinned above the status bar at the very bottom on EVERY terminal
+/// (including Windows conhost, where the old inline viewport floated to the
+/// top). This matches how zeroclaw's `zerocode` and Claude Code work. On exit
+/// the alternate screen is left and the original shell screen is restored.
 pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
-    // Opt into bracketed paste so multi-line pastes arrive as a single
-    // `Event::Paste(text)` rather than a stream of `KeyCode::Char` + `\n` =
-    // `KeyCode::Enter` events. Without this the first newline in a paste
-    // auto-submits the prompt and the rest of the buffer becomes the
-    // next turn(s). Terminals that don't understand the escape ignore
-    // it and fall back to per-key delivery — same behavior as before.
-    reinit_inline_terminal(INLINE_VIEWPORT_LINES)
+    enter_fullscreen()
 }
 
-/// Build (or rebuild) the inline-viewport terminal AND re-arm bracketed paste.
+/// Enter the alternate screen, re-arm bracketed paste, and build a fullscreen
+/// ratatui terminal. Used at startup and after returning from `$EDITOR` (which
+/// leaves the alternate screen).
 ///
-/// Bracketed paste is a terminal *mode* (`ESC[?2004h`), not terminal state
-/// ratatui tracks. Anything that resets the terminal clears it — most sharply
-/// the RIS (`ESC c`) the resize handler emits — and `Terminal::with_options`
-/// does not re-issue it. It was enabled exactly once, in `setup_terminal`,
-/// against six `with_options` re-inits, so after a resize (or returning from
-/// `$EDITOR`) pasted line breaks arrived as `Enter` again: a two-line paste
-/// submitted its first line and left the rest. Re-arm here so every rebuild
-/// carries the mode with it.
-fn reinit_inline_terminal(height: u16) -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    let _ = execute!(io::stdout(), EnableBracketedPaste);
-    Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(height),
-        },
-    )
-    .map_err(Into::into)
+/// Bracketed paste is a terminal *mode* (`ESC[?2004h`) a screen switch can
+/// clear, so it is re-armed on every (re)entry — multi-line pastes then arrive
+/// as one `Event::Paste` rather than per-key `\n` = `Enter` events.
+fn enter_fullscreen() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    let _ = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste);
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    terminal.clear()?;
+    Ok(terminal)
 }
 
 /// Suspend the TUI, hand control to `$EDITOR` (or `EDITOR`/`VISUAL`,
@@ -6015,12 +6029,9 @@ fn run_external_editor(
     let tmp_path = std::env::temp_dir().join(format!("rantaiclaw-prompt-{pid}-{nonce}.md"));
     std::fs::write(&tmp_path, &app.context.input_buffer)?;
 
-    // Suspend the TUI: flush, leave alt-screen if needed, drop raw mode.
-    let was_fullscreen = app.list_picker.is_some() || app.info_panel.is_some();
-    if was_fullscreen {
-        execute!(io::stdout(), LeaveAlternateScreen)?;
-    }
+    // Suspend the TUI: leave the alternate screen, drop raw mode.
     let _ = terminal.flush();
+    execute!(io::stdout(), LeaveAlternateScreen)?;
     disable_raw_mode()?;
     let _ = io::stdout().flush();
 
@@ -6030,16 +6041,9 @@ fn run_external_editor(
     let args: Vec<&str> = parts.collect();
     let status = Command::new(bin).args(&args).arg(&tmp_path).status();
 
-    // Always restore raw mode + alt-screen (if we were in it).
+    // Restore raw mode + re-enter the alternate screen with a fresh terminal.
     enable_raw_mode()?;
-    if was_fullscreen {
-        execute!(io::stdout(), EnterAlternateScreen)?;
-        terminal.clear()?;
-    } else {
-        // Inline mode: re-claim a fresh terminal so the inline viewport
-        // is re-laid-out cleanly after the editor printed to the tty.
-        *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
-    }
+    *terminal = enter_fullscreen()?;
 
     let result = match status {
         Ok(s) if s.success() => {
@@ -6083,45 +6087,14 @@ fn which_program(name: &str) -> bool {
     false
 }
 
-/// Swap the terminal into alt-screen / fullscreen mode. Used while a
-/// list picker is open so it can claim the entire terminal height
-/// instead of fighting for space inside the 6-row inline viewport.
-/// The original scrollback is preserved by the terminal emulator and
-/// restored automatically on `swap_to_inline`.
-pub fn swap_to_fullscreen(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    let _ = terminal.flush();
-    execute!(io::stdout(), EnterAlternateScreen)?;
-    *terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    terminal.clear()?;
-    Ok(())
-}
-
-/// Swap the terminal back to the inline 6-row viewport after leaving the
-/// alt-screen picker. The inline viewport is re-created fresh; existing
-/// terminal scrollback (committed via `insert_before` before the picker
-/// opened) is automatically restored by the terminal when alt-screen is
-/// left.
-pub fn swap_to_inline(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    let _ = terminal.flush();
-    execute!(io::stdout(), LeaveAlternateScreen)?;
-    *terminal = reinit_inline_terminal(INLINE_VIEWPORT_LINES)?;
-    Ok(())
-}
-
-/// Restore the terminal to its original state. Inline mode means no
-/// alt-screen to leave; we just flush the viewport (so the cursor lands
-/// below it cleanly) and disable raw mode.
+/// Restore the terminal to its original state on exit: leave the alternate
+/// screen (which restores the shell's pre-launch screen), disarm bracketed
+/// paste, show the cursor, and drop raw mode.
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    // Move cursor to a fresh line below the viewport so the user's shell
-    // prompt doesn't print on top of our last frame.
-    terminal.clear()?;
     let _ = terminal.show_cursor();
-    // Pair with the EnableBracketedPaste in setup_terminal so the user's
-    // shell after we exit doesn't inherit the bracketed-paste mode.
-    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     disable_raw_mode()?;
     let _ = io::stdout().flush();
-    println!();
     Ok(())
 }
 
@@ -6569,11 +6542,8 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
 
     let mut terminal = setup_terminal()?;
 
-    // Splash banner — committed once to the terminal's scrollback before
-    // the inline viewport takes over. Becomes permanent history above the
-    // status bar / input region.
-    let _ = TuiApp::commit_splash_to_scrollback(&mut terminal, &app.context);
-
+    // The splash banner is rendered by `render_chat_pane` as the empty-chat
+    // state — no separate scrollback commit needed in fullscreen mode.
     let result = run_loop(&mut app, &mut terminal).await;
 
     // Always restore terminal, even on error.
@@ -6595,159 +6565,23 @@ async fn run_loop(
     app: &mut TuiApp,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
-    // Temporary fullscreen Terminal instantiated only while a list
-    // picker is open. The inline `terminal` (parameter) is NEVER
-    // dropped/recreated during alt-screen swaps — that's what caused
-    // the scrollback whitespace bug. Instead we send the alt-screen
-    // escape and use a separate Fullscreen Terminal sharing stdout for
-    // the duration. Returning to inline just drops `alt` and emits
-    // LeaveAlternateScreen — the original screen state (including the
-    // inline viewport rows) is restored by the terminal emulator.
-    let mut alt: Option<Terminal<CrosstermBackend<Stdout>>> = None;
     loop {
         // Drain any buffered agent events before rendering so the frame
         // reflects the latest streaming state.
         app.drain_events();
 
-        // Alt-screen entry/exit covers every full-screen surface — the
-        // console login gate, list picker, info panel, slash-autocomplete
-        // dropdown, setup overlay, and first-run wizard. Each needs the
-        // whole terminal instead of the ~5-row inline viewport. Edge-
-        // triggered via option presence so we don't churn buffers on
-        // every keystroke.
-        let want_alt = app.login_gate.is_some()
-            || app.list_picker.is_some()
-            || app.info_panel.is_some()
-            || app.autocomplete.is_visible()
-            || app.setup_overlay.is_some()
-            || app.first_run_wizard.is_some();
-        let in_alt = alt.is_some();
-        if want_alt && !in_alt {
-            execute!(io::stdout(), EnterAlternateScreen)?;
-            let mut t = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-            t.clear()?;
-            alt = Some(t);
-        } else if !want_alt && in_alt {
-            // Drop the temp fullscreen terminal first so its final flush
-            // happens INSIDE alt-screen, then leave alt-screen, then
-            // rebuild the inline terminal so its internal viewport-row
-            // tracking is reset.
-            //
-            // Pre-fix this path just called `terminal.clear()` and
-            // assumed the original screen state was restored cleanly by
-            // `LeaveAlternateScreen`. In practice the inline viewport's
-            // row anchor drifted across the swap — the next render drew
-            // the viewport at a new row while the previous frame stayed
-            // pinned in scrollback, producing duplicate input boxes and
-            // status bars after closing `/skills`, `/sessions`, etc.
-            //
-            // Wiping the visible screen with `\x1b[2J\x1b[H` and then
-            // recreating the inline Terminal forces ratatui to claim
-            // fresh viewport rows at the bottom of the now-empty screen.
-            // Scrollback contents above are untouched (no `\x1b[3J`).
-            drop(alt.take());
-            execute!(io::stdout(), LeaveAlternateScreen)?;
-            let _ = terminal.flush();
-            let mut out = io::stdout();
-            let _ = out.write_all(b"\x1b[2J\x1b[H");
-            let _ = out.flush();
-            *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
-        }
-
-        // /new and /clear request a full screen+scrollback wipe so
-        // the next session starts on a clean terminal — same intent
-        // as running `clear` at the shell. ESC[3J clears the xterm
-        // scrollback buffer; ESC[2J clears the visible screen; ESC[H
-        // homes the cursor. Then re-claim a fresh inline viewport and
-        // re-print the splash banner so the user lands on the same
-        // welcome screen as a cold launch (`./rantaiclaw`).
-        if app.clear_terminal_request && alt.is_none() {
+        // /new and /clear wipe the screen; the next render redraws a fresh
+        // chat pane from the (now-empty) message list.
+        if app.clear_terminal_request {
             app.clear_terminal_request = false;
-            let _ = terminal.flush();
-            let mut out = io::stdout();
-            let _ = out.write_all(b"\x1b[3J\x1b[2J\x1b[H");
-            let _ = out.flush();
-            *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
-            let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
+            let _ = terminal.clear();
         }
 
-        // Inline-only: stream completed lines into scrollback and flush
-        // any queued message commits ABOVE the viewport. Skipped while
-        // the picker has us in alt-screen — those commits would write
-        // into the alt buffer and be lost when we return.
-        if alt.is_none() {
-            app.flush_stream_to_scrollback(terminal)?;
-            let pending: Vec<(String, String)> = std::mem::take(&mut app.scrollback_queue);
-            for (role, content) in pending {
-                TuiApp::commit_message_to_scrollback(terminal, &role, &content)?;
-            }
-        }
-
-        // Dynamic composer height: recreate the inline viewport when the
-        // wrapped row count crosses a boundary. Edge-triggered so typing
-        // within a row band never churns the terminal. Local clear of the
-        // old viewport region (not a full-screen wipe, no history replay)
-        // prevents a duplicate "ghost" box from the previous height.
-        if alt.is_none() {
-            if let Ok(size) = terminal.size() {
-                let needed = app.needed_viewport_height(size.width);
-                if needed != app.composer_viewport_rows {
-                    // Clear the OLD viewport at its true on-screen position before
-                    // recreating at the new height. ratatui tracks the inline
-                    // viewport's real position (`viewport_area`), which is NOT
-                    // always bottom-anchored — it drifts down as scrollback is
-                    // inserted. A hand-computed `size.height - rows` top row is
-                    // therefore wrong whenever the viewport sits above the screen
-                    // bottom, which left a ghost top-border on every resize.
-                    // `terminal.clear()` clears exactly the tracked viewport region.
-                    let _ = terminal.clear();
-                    let _ = io::stdout().flush();
-                    app.composer_viewport_rows = needed;
-                    *terminal = reinit_inline_terminal(needed)?;
-                }
-            }
-        }
-
-        if let Some(ref mut alt_term) = alt {
-            // Render priority: the console login gate owns the screen
-            // above everything else until the password verifies.
-            if app.login_gate.is_some() {
-                alt_term.draw(|frame| {
-                    let area = frame.area();
-                    if let Some(gate) = app.login_gate.as_ref() {
-                        gate.render_fullscreen(frame, area);
-                    }
-                })?;
-            }
-            // Then setup_overlay. During the first-run wizard's
-            // RunningProvisioner phase BOTH wizard and overlay are active —
-            // the wizard intentionally renders nothing in that phase and
-            // delegates the screen to the overlay. If the wizard won the
-            // priority race, the screen would go black.
-            else if app.setup_overlay.is_some() {
-                alt_term.draw(|frame| {
-                    let area = frame.area();
-                    if let Some(o) = app.setup_overlay.as_mut() {
-                        o.render(frame, area);
-                    }
-                })?;
-            } else if app.first_run_wizard.is_some() {
-                alt_term.draw(|frame| {
-                    let area = frame.area();
-                    if let Some(w) = app.first_run_wizard.as_mut() {
-                        w.render_fullscreen(frame, area);
-                    }
-                })?;
-            } else if app.list_picker.is_some() {
-                app.render_fullscreen_picker(alt_term)?;
-            } else if app.info_panel.is_some() {
-                app.render_fullscreen_info_panel(alt_term)?;
-            } else {
-                app.render_fullscreen_autocomplete(alt_term)?;
-            }
-        } else {
-            app.render(terminal)?;
-        }
+        // One fullscreen frame: the scrollable chat pane, the composer, the
+        // status bar, and any active modal (login gate, wizard, setup overlay,
+        // list picker, info panel, `/help`, autocomplete dropdown) drawn
+        // over/instead of the base — all handled inside `render`.
+        app.render(terminal)?;
 
         // Tighten the poll interval during streaming so the live preview
         // updates fast enough to feel like word-by-word streaming. When
@@ -6796,22 +6630,8 @@ async fn run_loop(
                         break;
                     }
                 }
-                if alt.is_none() {
-                    let _ = terminal.flush();
-                    let mut out = io::stdout();
-                    let _ = out.write_all(b"\x1bc\x1b[3J\x1b[2J\x1b[H");
-                    let _ = out.flush();
-                    *terminal = reinit_inline_terminal(app.composer_viewport_rows)?;
-                    let _ = TuiApp::commit_splash_to_scrollback(terminal, &app.context);
-                    let messages = app.context.messages.clone();
-                    for msg in messages {
-                        let _ =
-                            TuiApp::commit_message_to_scrollback(terminal, &msg.role, &msg.content);
-                    }
-                } else {
-                    let _ = terminal.clear();
-                }
-            } else if alt.is_none()
+                let _ = terminal.clear();
+            } else if !app.modal_active()
                 && app.overlay.is_none()
                 && app.pending_approval.is_none()
                 && leading_text_key(&ev).is_some()
