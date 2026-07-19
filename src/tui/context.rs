@@ -62,6 +62,9 @@ pub struct TuiContext {
     /// wrap width the renderer used. Updated every `render`; defaults to a sane
     /// 80 so movement works before the first frame.
     pub last_composer_width: u16,
+    /// Inner height (rows) of the chat pane at the last render, so PgUp/PgDn can
+    /// page by a screenful. Updated every chat render; defaults to a sane 10.
+    pub last_chat_rows: usize,
     pub token_usage: TokenUsage,
     /// Total context window of the active model, in tokens. Used by the
     /// status bar to display a `used/window  pct%` meter. `None` when the
@@ -190,6 +193,7 @@ impl TuiContext {
             cursor_pos: 0,
             scroll_offset: 0,
             last_composer_width: 80,
+            last_chat_rows: 10,
             token_usage: TokenUsage::default(),
             context_window: None,
             started_at: std::time::Instant::now(),
