@@ -4789,7 +4789,10 @@ mod composer_caret_tests {
         let up = visual_cursor_move(buf, mid, inner_w, true).unwrap();
         assert_eq!(visual_cursor_move(buf, up, inner_w, false), Some(mid));
         // Down from the middle line → last line "ij" (clamped to its length).
-        assert_eq!(visual_cursor_move(buf, mid, inner_w, false), Some(4 + 6 + 2));
+        assert_eq!(
+            visual_cursor_move(buf, mid, inner_w, false),
+            Some(4 + 6 + 2)
+        );
     }
 
     #[test]
@@ -7229,7 +7232,10 @@ mod submit_tests {
             .await
             .unwrap();
         let after = app.context.cursor_pos;
-        assert!(after < before, "Up should move the caret up: {before} -> {after}");
+        assert!(
+            after < before,
+            "Up should move the caret up: {before} -> {after}"
+        );
         let new_row = layout_composer(&app.context.input_buffer, after, 12).caret_row;
         assert_eq!(new_row, end_row - 1, "Up should land one visual row above");
     }
