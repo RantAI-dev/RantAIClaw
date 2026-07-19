@@ -1129,14 +1129,59 @@ impl TuiApp {
                 self.context.exit_history_navigation();
                 self.refresh_autocomplete();
             }
+            // Readline editing chords (Claude-Code parity), line-based. These
+            // must precede the plain-Char arm below, which excludes CONTROL.
+            // Ctrl+A/E move to line start/end; Ctrl+U/K kill to line start/end;
+            // Ctrl+W deletes the word behind the cursor.
+            KeyCode::Char('a')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none() =>
+            {
+                self.context.cursor_line_start();
+            }
+            KeyCode::Char('e')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none() =>
+            {
+                self.context.cursor_line_end();
+            }
+            KeyCode::Char('u')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none() =>
+            {
+                self.context.kill_to_line_start();
+                self.context.exit_history_navigation();
+                self.refresh_autocomplete();
+            }
+            KeyCode::Char('k')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none() =>
+            {
+                self.context.kill_to_line_end();
+                self.context.exit_history_navigation();
+                self.refresh_autocomplete();
+            }
+            KeyCode::Char('w')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none() =>
+            {
+                self.context.delete_word_before();
+                self.context.exit_history_navigation();
+                self.refresh_autocomplete();
+            }
             // Regular character input — insert at the cursor.
             // Plain text input. The CONTROL check is load-bearing: crossterm
             // reports an unhandled chord like Ctrl+U as `Char('u')` with the
             // CONTROL modifier, so without it every readline chord the app
             // does not implement typed its own letter into the buffer
             // (Ctrl+A/E/W/K/U on `hello` produced `helloaewku`). Chords we do
-            // implement — Ctrl+C/D/J/G — match in arms above this one. SHIFT
-            // and ALT must still pass through: they carry real text.
+            // implement — Ctrl+C/D/J/G and the A/E/U/K/W arms above — match
+            // first. SHIFT and ALT must still pass through: they carry text.
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && self.setup_overlay.is_none()
@@ -7584,15 +7629,41 @@ mod ctrl_c_tests {
                 .await
                 .unwrap();
         }
-        // Standard readline chords the composer does not implement. Each one
-        // must be ignored, never inserted.
-        for c in ['a', 'e', 'w', 'k', 'u', 'b', 'f', 'l', 'n', 'p'] {
+        // Ctrl chords the composer does NOT implement (a/e/u/w/k ARE handled and
+        // tested separately). Each must be ignored, never inserted as a letter.
+        for c in ['b', 'f', 'l', 'n', 'o', 'p', 'r', 't', 'x', 'z'] {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
                 .await
                 .unwrap();
         }
 
         assert_eq!(app.context.input_buffer, "hello");
+    }
+
+    /// The implemented readline chords must act (not type their letter) through
+    /// the real key handler: Ctrl+W deletes the last word, Ctrl+U then clears
+    /// what remains of the line.
+    #[tokio::test]
+    async fn implemented_ctrl_chords_edit_through_handler() {
+        let (ctx, _req_rx, _events_tx) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        for c in "hello world".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.context.input_buffer, "hello ",
+            "Ctrl+W deletes the last word"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(app.context.input_buffer, "", "Ctrl+U clears to line start");
+        assert_eq!(app.context.cursor_pos, 0);
     }
 
     /// Ctrl+J is the composer's documented newline ("Ctrl+J newline" in the
