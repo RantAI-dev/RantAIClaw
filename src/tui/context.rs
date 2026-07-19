@@ -361,8 +361,27 @@ impl TuiContext {
 
     /// Delete the char immediately before the cursor (Backspace).
     /// No-op when the cursor is already at the start.
+    ///
+    /// Special case: if the text ending at the cursor is a whole pasted-text
+    /// placeholder (`[Pasted text #N +M lines]`), delete the ENTIRE marker and
+    /// drop its held content in one keystroke — matching Claude Code, where
+    /// backspacing a paste chip removes it whole rather than one char at a time.
     pub fn backspace_at_cursor(&mut self) {
         if self.cursor_pos == 0 {
+            return;
+        }
+        let cursor_byte = self.cursor_byte_index();
+        if let Some(idx) = self
+            .pending_pastes
+            .iter()
+            .position(|p| self.input_buffer[..cursor_byte].ends_with(&p.marker))
+        {
+            let marker_bytes = self.pending_pastes[idx].marker.len();
+            let marker_chars = self.pending_pastes[idx].marker.chars().count();
+            let start_byte = cursor_byte - marker_bytes;
+            self.input_buffer.replace_range(start_byte..cursor_byte, "");
+            self.cursor_pos -= marker_chars;
+            self.pending_pastes.remove(idx);
             return;
         }
         self.cursor_pos -= 1;
@@ -677,6 +696,33 @@ mod tests {
         assert!(!ctx.pending_pastes.is_empty());
         ctx.clear_session().unwrap();
         assert!(ctx.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn backspace_deletes_a_whole_pasted_placeholder_at_once() {
+        let mut ctx = in_memory_context("m");
+        let marker = ctx.register_paste(tall(40));
+        ctx.paste_at_cursor(&marker);
+        assert_eq!(ctx.input_buffer, marker);
+        assert_eq!(ctx.cursor_pos, marker.chars().count());
+        assert_eq!(ctx.pending_pastes.len(), 1);
+        // One Backspace removes the whole marker AND drops its held content.
+        ctx.backspace_at_cursor();
+        assert_eq!(ctx.input_buffer, "", "marker deleted whole, not per-char");
+        assert_eq!(ctx.cursor_pos, 0);
+        assert!(ctx.pending_pastes.is_empty(), "held content dropped too");
+    }
+
+    #[test]
+    fn backspace_not_after_a_placeholder_removes_one_char() {
+        let mut ctx = in_memory_context("m");
+        ctx.paste_at_cursor("hi ");
+        let marker = ctx.register_paste(tall(40));
+        ctx.paste_at_cursor(&marker);
+        ctx.paste_at_cursor(" bye"); // cursor now sits after "bye", not the marker
+        ctx.backspace_at_cursor();
+        assert_eq!(ctx.input_buffer, format!("hi {marker} by"));
+        assert_eq!(ctx.pending_pastes.len(), 1, "marker left intact");
     }
 
     #[test]
