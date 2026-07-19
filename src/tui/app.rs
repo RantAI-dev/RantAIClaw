@@ -3740,7 +3740,7 @@ impl TuiApp {
         // Splash already shows `Rantaiclaw v<x>` in the right pane;
         // append only the session identifier here so the same info
         // doesn't appear twice in scrollback.
-        let lines = render_splash_lines(ctx, size.width);
+        let lines = render_splash_lines(ctx, size.width, size.height);
         let session_short = ctx.session_id_short();
         let mut all_lines = lines;
         all_lines.push(Line::from(Span::styled(
@@ -3785,7 +3785,7 @@ impl TuiApp {
 
         // Empty-state splash — figlet wordmark + welcome line.
         if self.context.messages.is_empty() && !matches!(self.state, AppState::Streaming { .. }) {
-            for line in render_splash_lines(&self.context, area.width) {
+            for line in render_splash_lines(&self.context, area.width, area.height) {
                 items.push(ListItem::new(line));
             }
         }
@@ -4196,7 +4196,7 @@ fn render_chat_pane(state: &AppState, ctx: &TuiContext, frame: &mut ratatui::Fra
     let mut items: Vec<ListItem> = Vec::with_capacity(ctx.messages.len() + 1);
 
     if ctx.messages.is_empty() && !matches!(state, AppState::Streaming { .. }) {
-        for line in render_splash_lines(ctx, area.width) {
+        for line in render_splash_lines(ctx, area.width, area.height) {
             items.push(ListItem::new(line));
         }
     }
@@ -5256,7 +5256,18 @@ fn mascot_row(row: &str) -> Line<'static> {
 /// `MAX_RIGHT_WIDTH`) so it never bleeds onto the mascot's row.
 /// Because ratatui calls this once per frame with the current
 /// `area.width`, the splash re-flows live as the terminal resizes.
-fn render_splash_lines(ctx: &TuiContext, area_width: u16) -> Vec<Line<'static>> {
+fn render_splash_lines(ctx: &TuiContext, area_width: u16, area_height: u16) -> Vec<Line<'static>> {
+    // On a terminal too short to hold the full figlet+mascot banner ABOVE the
+    // composer, the top of the banner is pushed into scrollback ("run
+    // rantaiclaw and only the input box shows"). Below this height, render a
+    // compact 4-line banner instead so the whole thing fits on screen. The
+    // full banner is ~22 rows and the composer + status take ~5, so anything
+    // under ~26 rows can't show both.
+    const FULL_BANNER_MIN_HEIGHT: u16 = 26;
+    if area_height < FULL_BANNER_MIN_HEIGHT {
+        return render_splash_compact(ctx, area_width);
+    }
+
     let muted = Color::Rgb(107, 114, 128);
     let sky = Color::Rgb(94, 184, 255);
     let gold = Color::Rgb(234, 179, 8);
@@ -5442,6 +5453,137 @@ fn render_splash_lines(ctx: &TuiContext, area_width: u16) -> Vec<Line<'static>> 
     }
     out.push(Line::from(""));
     out
+}
+
+/// Join `items` with `, ` into a single line that fits `width` columns,
+/// replacing the overflow with a `+N` suffix. Used by the compact splash so
+/// the channel/skill list stays on one row on a short terminal.
+fn summarize_list(items: &[String], width: usize) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for name in items {
+        let sep = if out.is_empty() { "" } else { ", " };
+        let candidate = out.chars().count() + sep.len() + name.chars().count();
+        // Leave room for a possible `, +NN` overflow marker.
+        if shown > 0 && candidate + 6 > width {
+            break;
+        }
+        out.push_str(sep);
+        out.push_str(name);
+        shown += 1;
+    }
+    let remaining = items.len() - shown;
+    if remaining > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(out, ", +{remaining}");
+    }
+    out
+}
+
+/// A 4-line splash for terminals too short to hold the full figlet+mascot
+/// banner above the composer. Same brand/channels/skills/help content, on one
+/// row each, so nothing scrolls off on launch.
+fn render_splash_compact(ctx: &TuiContext, area_width: u16) -> Vec<Line<'static>> {
+    let muted = Color::Rgb(107, 114, 128);
+    let sky = Color::Rgb(94, 184, 255);
+    let gold = Color::Rgb(234, 179, 8);
+    let width = (area_width as usize).max(20);
+
+    let channels: Vec<String> = ctx
+        .channels_summary
+        .iter()
+        .filter(|(_, configured)| *configured)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let skills: Vec<String> = ctx
+        .available_skills
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+
+    // Label column ("Channels  ") is 10 cols; leave the rest for the value.
+    let value_width = width.saturating_sub(10);
+    let (ch_text, ch_muted) = if channels.is_empty() {
+        ("none — /setup channels".to_string(), true)
+    } else {
+        (summarize_list(&channels, value_width), false)
+    };
+    let (sk_text, sk_muted) = if skills.is_empty() {
+        ("none — /setup skills".to_string(), true)
+    } else {
+        (summarize_list(&skills, value_width), false)
+    };
+
+    vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Rantaiclaw",
+                Style::default().fg(sky).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  v{}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(muted),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Channels  ", Style::default().fg(gold)),
+            Span::styled(
+                ch_text,
+                Style::default().fg(if ch_muted { muted } else { sky }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Skills    ", Style::default().fg(gold)),
+            Span::styled(
+                sk_text,
+                Style::default().fg(if sk_muted { muted } else { sky }),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Type a message or /help for commands.",
+            Style::default().fg(muted),
+        )),
+        Line::from(""),
+    ]
+}
+
+#[cfg(test)]
+mod splash_compact_tests {
+    use super::summarize_list;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn summarize_list_fits_or_overflows_with_a_count() {
+        assert_eq!(summarize_list(&[], 40), "");
+        // Everything fits → full list.
+        assert_eq!(summarize_list(&v(&["a", "b", "c"]), 40), "a, b, c");
+        // Too narrow → keep what fits, mark the rest as +N.
+        let long = v(&[
+            "summarizer",
+            "scheduler-reminders",
+            "research-assistant",
+            "web-search",
+            "meeting-notes",
+        ]);
+        let out = summarize_list(&long, 24);
+        assert!(
+            out.contains('+'),
+            "expected a +N overflow marker, got {out:?}"
+        );
+        assert!(
+            out.chars().count() <= 24 + 4,
+            "compact list should stay near the width, got {out:?}"
+        );
+        // At least the first item always shows, even on an absurdly small width.
+        assert!(summarize_list(&long, 3).starts_with("summarizer"));
+    }
 }
 
 /// Word-wrap `text` at spaces so no output line exceeds `width`
@@ -5778,10 +5920,13 @@ fn format_duration_short(secs: u64) -> String {
 /// Lines reserved at the bottom of the terminal for the live inline
 /// viewport (status bar + input box + spinner room). Everything else flows
 /// into the terminal's native scrollback.
-/// Inline viewport height. Tight 5-row layout: 4 rows of input box +
-/// 1 row of status bar. v0.6.50 dropped the stream-preview row that
-/// used to duplicate the status bar's spinner/label.
-pub const INLINE_VIEWPORT_LINES: u16 = 5;
+/// Default inline viewport height — the size of an EMPTY composer: a 1-row
+/// input box (top border + 1 text row + bottom border = 3) + 1 status row = 4.
+/// The composer grows/shrinks from here via the dynamic-height reconcile, and
+/// `composer_viewport_rows` is seeded with this value so the FIRST rendered
+/// frame already matches (no startup `terminal.clear()` + recreate churn, which
+/// on some terminals — notably Windows conhost — displaced the composer).
+pub const INLINE_VIEWPORT_LINES: u16 = 4;
 /// Retained constant (= 0) so old call sites that used it as an offset
 /// keep type-checking. The stream-preview pane was removed in v0.6.50;
 /// re-introducing it means flipping this to `1` and adding the
