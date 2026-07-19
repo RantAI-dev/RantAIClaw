@@ -624,6 +624,22 @@ impl TuiApp {
         }
     }
 
+    /// Route a paste (bracketed `Event::Paste` OR a coalesced key burst) into
+    /// the composer. Normalises line breaks, then collapses a tall paste to a
+    /// `[Pasted text #N +M lines]` placeholder (real content re-expanded at
+    /// submit) or lands a short paste inline.
+    fn apply_paste_text(&mut self, text: &str) {
+        let normalized = normalize_line_breaks(text);
+        if normalized.split('\n').count() > crate::tui::context::PASTE_PLACEHOLDER_MIN_LINES {
+            let marker = self.context.register_paste(normalized);
+            self.context.paste_at_cursor(&marker);
+        } else {
+            self.context.paste_at_cursor(&normalized);
+        }
+        self.context.exit_history_navigation();
+        self.refresh_autocomplete();
+    }
+
     /// Process a single terminal event, returning whether to continue or quit.
     pub async fn handle_event(&mut self, event: Event) -> Result<EventResult> {
         match event {
@@ -662,25 +678,9 @@ impl TuiApp {
                         o.push_str(&cleaned);
                     }
                 } else if self.first_run_wizard.is_none() {
-                    // Terminals transmit pasted line breaks as CR, so this
-                    // payload arrives as "a\rb" for a two-line paste. Land it
-                    // in the buffer as '\n': that is the invariant the caret
-                    // walker counts and the renderer splits on, and a raw '\r'
-                    // reaching the terminal wrecks the input box's border.
-                    let normalized = normalize_line_breaks(&text);
-                    // A tall paste is collapsed to a one-line placeholder; the
-                    // real content is held on the context and re-expanded at
-                    // submit. Short pastes land inline as before.
-                    if normalized.split('\n').count()
-                        > crate::tui::context::PASTE_PLACEHOLDER_MIN_LINES
-                    {
-                        let marker = self.context.register_paste(normalized);
-                        self.context.paste_at_cursor(&marker);
-                    } else {
-                        self.context.paste_at_cursor(&normalized);
-                    }
-                    self.context.exit_history_navigation();
-                    self.refresh_autocomplete();
+                    // Bracketed paste delivered as one payload — route through
+                    // the shared helper (same path the key-burst coalescer uses).
+                    self.apply_paste_text(&text);
                 }
                 Ok(EventResult::Continue)
             }
@@ -4689,6 +4689,109 @@ mod composer_caret_tests {
     }
 }
 
+#[cfg(test)]
+mod paste_coalesce_tests {
+    use super::{batch_is_paste, key_to_text, TextKey};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn k(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn plain_char_maps_to_text() {
+        assert!(matches!(
+            key_to_text(&k(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(TextKey::Ch('x'))
+        ));
+    }
+
+    #[test]
+    fn enter_and_tab_map_to_newline_and_tab() {
+        assert!(matches!(
+            key_to_text(&k(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(TextKey::Newline)
+        ));
+        assert!(matches!(
+            key_to_text(&k(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(TextKey::Tab)
+        ));
+    }
+
+    #[test]
+    fn control_char_is_not_text() {
+        // Ctrl+C, Ctrl+J etc. must stay on the command path, never a paste.
+        assert!(key_to_text(&k(KeyCode::Char('c'), KeyModifiers::CONTROL)).is_none());
+        assert!(key_to_text(&k(KeyCode::Esc, KeyModifiers::NONE)).is_none());
+    }
+
+    #[test]
+    fn a_batch_is_a_paste_when_multi_char_or_has_a_newline() {
+        assert!(batch_is_paste("ab")); // two chars
+        assert!(batch_is_paste("a\nb")); // contains newline
+        assert!(!batch_is_paste("a")); // lone char is normal typing
+        assert!(!batch_is_paste("")); // empty
+    }
+}
+
+/// A key event reduced to the text it contributes to a paste batch.
+///
+/// Only unmodified printable input counts: `Char` without Ctrl (Shift/Alt
+/// carry real text and are kept), plus `Enter`/`Tab`. Everything else —
+/// Ctrl chords, arrows, Esc, function keys — is `None` so it stays on the
+/// command path and never gets swallowed into a paste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextKey {
+    Ch(char),
+    Newline,
+    Tab,
+}
+
+fn key_to_text(key: &crossterm::event::KeyEvent) -> Option<TextKey> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    match key.code {
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(TextKey::Ch(c)),
+        KeyCode::Enter => Some(TextKey::Newline),
+        KeyCode::Tab => Some(TextKey::Tab),
+        _ => None,
+    }
+}
+
+/// A drained key batch is a paste (route it through the paste path) when it
+/// carries more than one char or any newline. A lone char is ordinary typing.
+fn batch_is_paste(batch: &str) -> bool {
+    batch.chars().count() > 1 || batch.contains('\n')
+}
+
+/// Text key allowed to START a coalesced batch: a printable char or Tab, but
+/// NOT Enter — a lone Enter must reach the normal submit path.
+fn leading_text_key(ev: &Event) -> Option<TextKey> {
+    match ev {
+        Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Press => match key_to_text(k) {
+            Some(TextKey::Newline) => None,
+            other => other,
+        },
+        _ => None,
+    }
+}
+
+/// Text key allowed INSIDE a batch already started by a printable key: any
+/// text key, Enter included (it becomes '\n').
+fn leading_or_inner_text_key(ev: &Event) -> Option<TextKey> {
+    match ev {
+        Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Press => key_to_text(k),
+        _ => None,
+    }
+}
+
+fn push_text_key(buf: &mut String, tk: TextKey) {
+    match tk {
+        TextKey::Ch(c) => buf.push(c),
+        TextKey::Newline => buf.push('\n'),
+        TextKey::Tab => buf.push('\t'),
+    }
+}
+
 /// Collapse every line-break form to `\n`.
 ///
 /// The composer's buffer invariant is "line breaks are `\n`". Terminals do
@@ -6433,6 +6536,41 @@ async fn run_loop(
                     }
                 } else {
                     let _ = terminal.clear();
+                }
+            } else if let Some(first) = leading_text_key(&ev) {
+                // Potential paste burst: a printable key with more input
+                // already queued. Drain the run of text keys into one batch;
+                // a batch that is multi-char or multi-line is a paste, so
+                // internal Enters become '\n' instead of submitting. A lone
+                // char (fast single keystroke) falls through to normal typing.
+                let mut batch = String::new();
+                push_text_key(&mut batch, first);
+                let mut trailing: Option<Event> = None;
+                while event::poll(std::time::Duration::from_millis(0))? {
+                    let next = event::read()?;
+                    match (next.clone(), leading_or_inner_text_key(&next)) {
+                        (_, Some(tk)) => push_text_key(&mut batch, tk),
+                        (other, None) => {
+                            trailing = Some(other);
+                            break;
+                        }
+                    }
+                }
+                if batch_is_paste(&batch) {
+                    app.apply_paste_text(&batch);
+                } else {
+                    // Single char: normal typing path.
+                    if let Some(c) = batch.chars().next() {
+                        app.context.insert_char_at_cursor(c);
+                        app.context.exit_history_navigation();
+                        app.refresh_autocomplete();
+                    }
+                }
+                if let Some(other) = trailing {
+                    match app.handle_event(other).await? {
+                        EventResult::Quit => break,
+                        EventResult::Continue => {}
+                    }
                 }
             } else {
                 match app.handle_event(ev).await? {
