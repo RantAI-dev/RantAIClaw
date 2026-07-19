@@ -648,15 +648,24 @@ impl ListPicker {
         // Clamp selection to valid range against the filtered view.
         if self.selected >= visible_indices.len() {
             self.selected = visible_indices.len().saturating_sub(1);
-            self.list_state.select(Some(self.selected));
         }
+
+        // This render draws the WHOLE filtered view as one scrolling list, so
+        // both the highlight and ratatui's scroll state key off the ABSOLUTE
+        // index. `selected` is page-relative and `move_down` resets it to 0 when
+        // it crosses a page boundary — keying the highlight off `selected` alone
+        // snapped the cursor back to the top of the list once the user paged
+        // past the first screenful (reported as "↓ only reaches item 5").
+        let selected_abs = (self.page.saturating_mul(self.page_size()) + self.selected)
+            .min(visible_indices.len() - 1);
+        self.list_state.select(Some(selected_abs));
 
         let items: Vec<ListItem> = visible_indices
             .iter()
             .enumerate()
             .map(|(filtered_i, original_i)| {
                 let entry = &self.entries[*original_i];
-                let highlight = filtered_i == self.selected;
+                let highlight = filtered_i == selected_abs;
                 match entry {
                     ListPickerEntry::CategoryHeader {
                         label,
@@ -1137,6 +1146,58 @@ mod tests {
         assert_eq!(p.page_count(), 2);
         p.set_page_size_from_area(60);
         assert_eq!(p.page_count(), 1);
+    }
+
+    /// Repro for the `/sessions` report: pressing ↓ past the last item of the
+    /// first page must page forward and eventually reach the final entry, not
+    /// stall at page-size (item 5 of 12).
+    #[test]
+    fn repro_down_reaches_every_entry_across_pages() {
+        let mut p = picker((0..12).map(|i| item(&format!("s{i}"), "x")).collect());
+        p.set_page_size_from_area(15); // 5 per page, 3 pages
+        let abs = |p: &ListPicker| p.page * p.page_size() + p.selected;
+        let mut trail = Vec::new();
+        for _ in 0..20 {
+            p.move_down();
+            trail.push(abs(&p));
+        }
+        let max = *trail.iter().max().unwrap();
+        assert_eq!(
+            max, 11,
+            "should reach the last entry (11); reached {max}: {trail:?}"
+        );
+    }
+
+    /// The reported bug rendered: with the default page size of 5, pressing ↓
+    /// onto the second page must HIGHLIGHT the 6th entry, not snap the highlight
+    /// back to the top of the list.
+    #[test]
+    fn fullscreen_render_highlights_the_selected_entry_across_pages() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::style::Color;
+        use ratatui::Terminal;
+        let mut p = picker(
+            (0..12)
+                .map(|i| item(&format!("k{i}"), &format!("item-{i:02}")))
+                .collect(),
+        );
+        // page_size stays DEFAULT (5); six ↓ = focus + 0..4 + page-cross → index 5.
+        for _ in 0..6 {
+            p.move_down();
+        }
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| p.render(f, Rect::new(0, 0, 60, 20))).unwrap();
+        let buf = term.backend().buffer().clone();
+        let sky = Color::Rgb(94, 184, 255);
+        let highlighted = (0..20u16)
+            .find(|&y| (0..60u16).any(|x| buf[(x, y)].bg == sky))
+            .map(|y| (0..60u16).map(|x| buf[(x, y)].symbol()).collect::<String>());
+        let text = highlighted.expect("one row must carry the highlight background");
+        assert!(
+            text.contains("item-05"),
+            "6th ↓ must highlight item-05 (second page), got: {text:?}"
+        );
     }
 
     #[test]
