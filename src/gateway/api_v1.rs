@@ -69,14 +69,29 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Serialize)]
 struct AuthInfo {
     login_required: bool,
+    /// Seconds of inactivity after which the console must drop the session.
+    /// `0` = never. Reported so the browser runs the same policy as the TUI
+    /// instead of carrying its own copy of the setting.
+    idle_timeout_secs: u64,
 }
 
 /// GET /api/v1/auth/info — PUBLIC (no `check_auth`). Tells the console whether a
 /// username+password login is required. Deliberately does NOT expose the
 /// username (no enumeration leak); the user types it on the login form.
 async fn auth_info(State(state): State<AppState>) -> Json<AuthInfo> {
-    let login_required = state.config.lock().gateway.login.password_hash.is_some();
-    Json(AuthInfo { login_required })
+    let config = state.config.lock();
+    let login_required = config.gateway.login.password_hash.is_some();
+    // Report 0 when the gate is off so the console never starts an idle timer
+    // it has no session to act on.
+    let idle_timeout_secs = if login_required {
+        config.gateway.login.idle_timeout_secs
+    } else {
+        0
+    };
+    Json(AuthInfo {
+        login_required,
+        idle_timeout_secs,
+    })
 }
 
 fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<ErrorBody>)> {

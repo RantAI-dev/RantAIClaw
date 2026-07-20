@@ -6,6 +6,7 @@
 //!   1. Enable / disable (skip)
 //!   2. Username
 //!   3. Password + confirmation (argon2-hashed)
+//!   4. Idle auto-lock window (see [`IDLE_PRESETS`]; defaults to off)
 //!
 //! Mirrors [`super::knowledge`]. The provisioner only mutates
 //! `config.gateway.login.*`; the driver persists the config afterward. This is
@@ -16,6 +17,7 @@
 use super::traits::{ProvisionEvent, ProvisionIo, Severity, TuiProvisioner};
 use crate::config::Config;
 use crate::profile::Profile;
+use crate::security::login::IDLE_PRESETS;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -75,9 +77,12 @@ impl TuiProvisioner for LoginProvisioner {
         .await?;
         let selection = recv_selection(&mut responses).await?;
         if selection.first().copied().unwrap_or(0) == 1 {
-            // Disable: clear any stored credential so the gate turns off.
+            // Disable: clear any stored credential so the gate turns off, and
+            // drop the auto-lock window with it — it is meaningless with no
+            // credential to unlock.
             config.gateway.login.username = None;
             config.gateway.login.password_hash = None;
+            config.gateway.login.idle_timeout_secs = 0;
             send(
                 &events,
                 ProvisionEvent::Done {
@@ -135,14 +140,41 @@ impl TuiProvisioner for LoginProvisioner {
             .await;
         }
 
+        // Step 4 — idle auto-lock window. Offered here rather than defaulted on,
+        // so operators opt in knowingly; the shortest offer is 15 minutes
+        // because a single long turn generates no input of its own and would
+        // otherwise lock mid-answer.
+        send(
+            &events,
+            ProvisionEvent::Choose {
+                id: "idle_timeout".into(),
+                label: "Lock automatically after a stretch of inactivity?".into(),
+                options: IDLE_PRESETS.iter().map(|(l, _)| (*l).to_string()).collect(),
+                multi: false,
+            },
+        )
+        .await?;
+        let choice = recv_selection(&mut responses).await?;
+        let idle_secs = IDLE_PRESETS
+            .get(choice.first().copied().unwrap_or(0))
+            .map_or(0, |(_, secs)| *secs);
+
         config.gateway.login.username = Some(username);
         config.gateway.login.password_hash =
             Some(crate::security::login::hash_password(&password)?);
+        config.gateway.login.idle_timeout_secs = idle_secs;
+        let lock_note = if idle_secs == 0 {
+            "no auto-lock".to_string()
+        } else {
+            format!("auto-lock after {} min idle", idle_secs / 60)
+        };
         send(
             &events,
             ProvisionEvent::Done {
-                summary: "Console login configured (requires a claw-ui build with the login page)."
-                    .into(),
+                summary: format!(
+                    "Console login configured ({lock_note}); \
+                     requires a claw-ui build with the login page."
+                ),
             },
         )
         .await?;

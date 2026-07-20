@@ -295,6 +295,16 @@ up (or turn it off) with `rantaiclaw setup login`; do not hand-edit the hash.
 |---|---|---|
 | `username` | _(unset)_ | operator username, verified on login (not secret) |
 | `password_hash` | _(unset)_ | argon2 PHC hash of the password; **its presence enables the login gate** |
+| `idle_timeout_secs` | `0` | auto-lock after this many seconds without operator input; `0` disables it |
+
+Auto-lock is off by default, so an existing install keeps behaving exactly as
+before. `rantaiclaw setup login` offers 15 min / 30 min / 1 h / 4 h; the shortest
+is 15 minutes on purpose, because idleness is measured from operator *input* and
+a long-running turn produces none of its own. When the window lapses the TUI
+re-arms its login gate — masking the UI only, so an in-flight turn keeps
+streaming behind it and is intact once you unlock — and the web console expires
+its session. The gateway reports the value to the console over
+`GET /api/v1/auth/info`, so both surfaces run one setting rather than two copies.
 
 When enabled, the console and TUI require the password before use. `POST /login`
 (`{username, password}`) returns a bearer token that authenticates `/api/v1/*`,

@@ -8,6 +8,23 @@ use argon2::password_hash::{
 };
 use argon2::Argon2;
 
+/// Auto-lock windows offered by `rantaiclaw setup login`, as
+/// `(label, seconds)`. Index 0 is the "off" choice and must stay first — both
+/// setup paths fall back to it when a selection is missing.
+///
+/// Shared by the TUI provisioner and the dialoguer section so the two cannot
+/// drift into offering different options for the same setting. The shortest
+/// window is deliberately 15 minutes: idleness is measured from operator
+/// *input*, and a single long turn produces none of its own, so anything
+/// tighter would lock the operator out mid-answer.
+pub const IDLE_PRESETS: &[(&str, u64)] = &[
+    ("Never", 0),
+    ("15 minutes", 900),
+    ("30 minutes", 1_800),
+    ("1 hour", 3_600),
+    ("4 hours", 14_400),
+];
+
 /// Hash a plaintext password into an argon2id PHC string (random salt embedded).
 ///
 /// The returned string is safe to store verbatim in `config.toml` — it is

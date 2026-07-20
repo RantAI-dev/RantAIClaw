@@ -40,7 +40,7 @@ impl SetupSection for LoginSection {
 
     fn run(&self, ctx: &mut SetupContext) -> Result<()> {
         use dialoguer::theme::ColorfulTheme;
-        use dialoguer::{Confirm, Input, Password};
+        use dialoguer::{Confirm, Input, Password, Select};
 
         if !ctx.interactive {
             return Ok(());
@@ -53,9 +53,11 @@ impl SetupSection for LoginSection {
             .default(already)
             .interact()?;
         if !enable {
-            // Turn the gate off by clearing any stored credential.
+            // Turn the gate off by clearing any stored credential, and drop the
+            // auto-lock window with it — it is meaningless with no credential.
             ctx.config.gateway.login.username = None;
             ctx.config.gateway.login.password_hash = None;
+            ctx.config.gateway.login.idle_timeout_secs = 0;
             return Ok(());
         }
 
@@ -84,9 +86,27 @@ impl SetupSection for LoginSection {
             println!("  Passwords were empty or did not match — try again.");
         };
 
+        // Idle auto-lock window. Same presets as the TUI provisioner; the
+        // current setting is pre-selected so re-running setup does not silently
+        // reset it.
+        use crate::security::login::IDLE_PRESETS;
+        let labels: Vec<&str> = IDLE_PRESETS.iter().map(|(l, _)| *l).collect();
+        let current = ctx.config.gateway.login.idle_timeout_secs;
+        let default_idx = IDLE_PRESETS
+            .iter()
+            .position(|(_, secs)| *secs == current)
+            .unwrap_or(0);
+        let idle_idx = Select::with_theme(&theme)
+            .with_prompt("Lock automatically after a stretch of inactivity?")
+            .items(&labels)
+            .default(default_idx)
+            .interact()?;
+
         ctx.config.gateway.login.username = Some(username.trim().to_string());
         ctx.config.gateway.login.password_hash =
             Some(crate::security::login::hash_password(&password)?);
+        ctx.config.gateway.login.idle_timeout_secs =
+            IDLE_PRESETS.get(idle_idx).map_or(0, |(_, secs)| *secs);
         println!(
             "  ⚠ The web console requires a claw-ui build with the login page; \
              the TUI will prompt for this password on next launch."
