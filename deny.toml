@@ -71,6 +71,14 @@ allow = [
 ]
 unused-allowed-license = "allow"
 
+# RantaiClaw itself is AGPL-3.0-only (see LICENSE). It is scoped as a per-crate
+# exception rather than added to `allow` above, because `allow` governs what we
+# accept from *dependencies* — a copyleft entry there would let an AGPL crate
+# enter the tree unnoticed and bind downstream consumers.
+[[licenses.exceptions]]
+name = "rantaiclaw"
+allow = ["AGPL-3.0-only"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
