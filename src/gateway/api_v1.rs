@@ -1,10 +1,10 @@
 //! Control-plane API (`/api/v1/*`) — HTTP equivalents for the CLI/TUI surfaces
 //! that previously had no remote-driven access.
 //!
-//! Auth: bearer token verified against [`PairingGuard`]. When the gateway is
-//! configured with `require_pairing = false` (default for local dev) all
-//! requests are accepted; when `true`, every endpoint here requires
-//! `Authorization: Bearer <token>` issued by `POST /pair`.
+//! Auth: bearer token verified against [`PairingGuard`]. `require_pairing`
+//! defaults to `true`, so every endpoint here requires `Authorization: Bearer
+//! <token>` issued by `POST /pair`. Setting it to `false` accepts every
+//! request unauthenticated — an explicit opt-out, not the default.
 //!
 //! Endpoints intentionally mirror the CLI subcommand layout so a curl-driven
 //! test rig can exercise the same backend code paths the TUI hits via slash
@@ -69,14 +69,29 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Serialize)]
 struct AuthInfo {
     login_required: bool,
+    /// Seconds of inactivity after which the console must drop the session.
+    /// `0` = never. Reported so the browser runs the same policy as the TUI
+    /// instead of carrying its own copy of the setting.
+    idle_timeout_secs: u64,
 }
 
 /// GET /api/v1/auth/info — PUBLIC (no `check_auth`). Tells the console whether a
 /// username+password login is required. Deliberately does NOT expose the
 /// username (no enumeration leak); the user types it on the login form.
 async fn auth_info(State(state): State<AppState>) -> Json<AuthInfo> {
-    let login_required = state.config.lock().gateway.login.password_hash.is_some();
-    Json(AuthInfo { login_required })
+    let config = state.config.lock();
+    let login_required = config.gateway.login.password_hash.is_some();
+    // Report 0 when the gate is off so the console never starts an idle timer
+    // it has no session to act on.
+    let idle_timeout_secs = if login_required {
+        config.gateway.login.idle_timeout_secs
+    } else {
+        0
+    };
+    Json(AuthInfo {
+        login_required,
+        idle_timeout_secs,
+    })
 }
 
 fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<ErrorBody>)> {
@@ -151,6 +166,26 @@ fn open_session_store() -> anyhow::Result<crate::sessions::SessionStore> {
         std::fs::create_dir_all(parent)?;
     }
     crate::sessions::SessionStore::open(&path)
+}
+
+/// Resolve a `{id}` path segment — a full session id or a unique prefix — into
+/// a concrete id, mapping the outcome onto the API's error shapes.
+///
+/// Resolution happens in SQL over the whole table. It used to scan the 500 most
+/// recent sessions in memory, which left older ones unreachable even by full id
+/// and, because uniqueness was only checked inside that window, let `DELETE`
+/// remove a session other than the one named.
+fn resolve_session_id(
+    store: &crate::sessions::SessionStore,
+    id: &str,
+) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+    match store.resolve_id(id).map_err(err_500)? {
+        crate::sessions::SessionRef::One(found) => Ok(found),
+        crate::sessions::SessionRef::None => Err(err_404(format!("no session matches `{id}`"))),
+        crate::sessions::SessionRef::Ambiguous(n) => {
+            Err(err_400(format!("`{id}` is ambiguous ({n} matches)")))
+        }
+    }
 }
 
 /// Load a session's prior turns as `(role, content)` history so a
@@ -655,13 +690,11 @@ async fn sessions_get(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let store = open_session_store().map_err(err_500)?;
-    let sessions = store.list_sessions(500).map_err(err_500)?;
-    let matched: Vec<_> = sessions.iter().filter(|s| s.id.starts_with(&id)).collect();
-    let session = match matched.len() {
-        0 => return Err(err_404(format!("no session matches `{id}`"))),
-        1 => matched[0],
-        n => return Err(err_400(format!("`{id}` is ambiguous ({n} matches)"))),
-    };
+    let session_id = resolve_session_id(&store, &id)?;
+    let session = store
+        .get_session(&session_id)
+        .map_err(err_500)?
+        .ok_or_else(|| err_404(format!("no session matches `{id}`")))?;
     let messages = store.get_messages(&session.id).map_err(err_500)?;
     Ok(Json(serde_json::json!({
         "id": session.id,
@@ -726,13 +759,7 @@ async fn sessions_set_title(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let store = open_session_store().map_err(err_500)?;
-    let sessions = store.list_sessions(500).map_err(err_500)?;
-    let matched: Vec<_> = sessions.iter().filter(|s| s.id.starts_with(&id)).collect();
-    let session = match matched.len() {
-        0 => return Err(err_404(format!("no session matches `{id}`"))),
-        1 => matched[0],
-        n => return Err(err_400(format!("`{id}` is ambiguous ({n} matches)"))),
-    };
+    let session_id = resolve_session_id(&store, &id)?;
     // Normalise here too, so an unusable title is a 400 rather than the 500 the
     // store's own guard would surface. The store still checks — this is the
     // status-code shape, not the security boundary.
@@ -740,9 +767,9 @@ async fn sessions_set_title(
     if title.is_empty() {
         return Err(err_400("title is empty after normalisation"));
     }
-    store.set_title(&session.id, &title).map_err(err_500)?;
+    store.set_title(&session_id, &title).map_err(err_500)?;
     Ok(Json(
-        serde_json::json!({ "id": session.id, "title": title }),
+        serde_json::json!({ "id": session_id, "title": title }),
     ))
 }
 
@@ -753,13 +780,7 @@ async fn sessions_delete(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let mut store = open_session_store().map_err(err_500)?;
-    let sessions = store.list_sessions(500).map_err(err_500)?;
-    let matched: Vec<_> = sessions.iter().filter(|s| s.id.starts_with(&id)).collect();
-    let session_id = match matched.len() {
-        0 => return Err(err_404(format!("no session matches `{id}`"))),
-        1 => matched[0].id.clone(),
-        n => return Err(err_400(format!("`{id}` is ambiguous ({n} matches)"))),
-    };
+    let session_id = resolve_session_id(&store, &id)?;
     let deleted = store.delete_session(&session_id).map_err(err_500)?;
     Ok(Json(
         serde_json::json!({ "deleted": deleted, "id": session_id }),

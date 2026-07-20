@@ -318,6 +318,9 @@ fn setup_login() -> Result<crate::config::GatewayLoginConfig> {
     Ok(crate::config::GatewayLoginConfig {
         username: Some(username.trim().to_string()),
         password_hash: Some(crate::security::login::hash_password(&password)?),
+        // Auto-lock stays off out of the first-run wizard — it is already ten
+        // steps long, and `rantaiclaw setup login` offers the window presets.
+        ..Default::default()
     })
 }
 

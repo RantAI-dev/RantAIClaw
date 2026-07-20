@@ -8,7 +8,7 @@ A lightweight, complete, Rust-native AI agent runtime. Direct competitor to Open
 
 | You want to… | Read |
 |---|---|
-| Install and run RantaiClaw quickly | [start/install.md](start/install.md) · or root [README](../README.md#quick-start) |
+| Install and run RantaiClaw quickly | [start/install.md](start/install.md) · or root [README](../README.md#install) |
 | Understand what the product covers | [pillars/](pillars/) — one doc per surface |
 | Look up a CLI command | [reference/commands.md](reference/commands.md) |
 | Look up a config key | [reference/config.md](reference/config.md) |

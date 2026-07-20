@@ -224,6 +224,7 @@ mod login {
                 ProvisionResponse::Text("rantaiclaw_user".into()), // username
                 ProvisionResponse::Text("smoke-pass".into()),      // password
                 ProvisionResponse::Text("smoke-pass".into()),      // confirm (matches)
+                ProvisionResponse::Selection(vec![0]),             // idle auto-lock: never
             ],
         )
         .await

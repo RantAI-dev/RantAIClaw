@@ -70,6 +70,29 @@ pub fn normalize_set_title(raw: &str) -> String {
     collapsed.chars().take(MAX_SET_TITLE_CHARS).collect()
 }
 
+/// Outcome of resolving a session id or id prefix — see
+/// [`SessionStore::resolve_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRef {
+    /// Exactly one session matched; carries its full id.
+    One(String),
+    /// Nothing matched.
+    None,
+    /// The prefix matched several sessions; carries how many.
+    Ambiguous(usize),
+}
+
+/// Escape the LIKE wildcards in a user-supplied prefix.
+///
+/// Session ids are UUIDs, but the prefix is whatever the caller typed. Without
+/// this, `_` (LIKE's single-character wildcard) would silently over-match and a
+/// prefix could resolve to a session the operator never named.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// Persistent store for TUI sessions and messages backed by SQLite.
 pub struct SessionStore {
     conn: Connection,
@@ -152,6 +175,56 @@ impl SessionStore {
             Ok(session) => Ok(Some(session)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Resolve a full session id, or a unique prefix of one, against the whole
+    /// table.
+    ///
+    /// Callers used to do this themselves by scanning `list_sessions(500)` and
+    /// filtering on `starts_with`, which was wrong in two ways. A session
+    /// outside the 500 most recent was unreachable *even by its full id*, and —
+    /// worse — the uniqueness check only saw that window, so a prefix matching
+    /// one session inside it and another outside looked unambiguous. For
+    /// `delete` that meant silently removing a different session than the one
+    /// the operator named.
+    ///
+    /// An exact id match wins outright and short-circuits, so a full id is
+    /// never reported ambiguous just because it also prefixes another id.
+    pub fn resolve_id(&self, id_or_prefix: &str) -> Result<SessionRef> {
+        if id_or_prefix.is_empty() {
+            // An empty prefix would `LIKE '%'` its way to every row, and
+            // resolve to "the only session" on a single-session store.
+            return Ok(SessionRef::None);
+        }
+        if self.get_session(id_or_prefix)?.is_some() {
+            return Ok(SessionRef::One(id_or_prefix.to_string()));
+        }
+
+        // Two rows is all it takes to decide none/one/ambiguous.
+        let pattern = format!("{}%", escape_like(id_or_prefix));
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM sessions WHERE id LIKE ?1 ESCAPE '\\' LIMIT 2")?;
+        let ids: Vec<String> = stmt
+            .query_map(params![pattern], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+
+        match ids.len() {
+            0 => Ok(SessionRef::None),
+            1 => Ok(SessionRef::One(ids.into_iter().next().expect("len == 1"))),
+            _ => {
+                // Only now is the exact count worth a second query — it makes
+                // "use a longer prefix" concrete.
+                let total: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id LIKE ?1 ESCAPE '\\'",
+                    params![pattern],
+                    |row| row.get(0),
+                )?;
+                Ok(SessionRef::Ambiguous(
+                    usize::try_from(total).unwrap_or(2).max(2),
+                ))
+            }
         }
     }
 
@@ -626,6 +699,120 @@ mod tests {
         let results = s.search("quick", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("quick"));
+    }
+
+    /// Force a known id onto a session so prefix collisions can be constructed.
+    fn insert_with_id(store: &SessionStore, id: &str, started_at: i64) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (id, model, started_at, message_count, token_count, source) \
+                 VALUES (?1, 'test-model', ?2, 0, 0, 'tui')",
+                params![id, started_at],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn resolve_id_matches_a_full_id() {
+        let store = SessionStore::in_memory().unwrap();
+        let s = store.new_session("m", "tui").unwrap();
+        assert_eq!(store.resolve_id(&s.id).unwrap(), SessionRef::One(s.id));
+    }
+
+    #[test]
+    fn resolve_id_matches_a_unique_prefix() {
+        let store = SessionStore::in_memory().unwrap();
+        insert_with_id(&store, "abc12345", 1);
+        assert_eq!(
+            store.resolve_id("abc").unwrap(),
+            SessionRef::One("abc12345".into())
+        );
+    }
+
+    #[test]
+    fn resolve_id_reports_no_match() {
+        let store = SessionStore::in_memory().unwrap();
+        insert_with_id(&store, "abc12345", 1);
+        assert_eq!(store.resolve_id("zzz").unwrap(), SessionRef::None);
+    }
+
+    #[test]
+    fn resolve_id_reports_ambiguity_with_a_count() {
+        let store = SessionStore::in_memory().unwrap();
+        insert_with_id(&store, "abc11111", 1);
+        insert_with_id(&store, "abc22222", 2);
+        insert_with_id(&store, "abc33333", 3);
+        assert_eq!(store.resolve_id("abc").unwrap(), SessionRef::Ambiguous(3));
+    }
+
+    #[test]
+    fn resolve_id_prefers_an_exact_id_over_the_longer_ones_it_prefixes() {
+        // "abc" is both a complete id and a prefix of two others. Naming it
+        // exactly must address it, not report an ambiguity the operator has no
+        // way to resolve.
+        let store = SessionStore::in_memory().unwrap();
+        insert_with_id(&store, "abc", 1);
+        insert_with_id(&store, "abcdef", 2);
+        insert_with_id(&store, "abcxyz", 3);
+        assert_eq!(
+            store.resolve_id("abc").unwrap(),
+            SessionRef::One("abc".into())
+        );
+    }
+
+    #[test]
+    fn resolve_id_reaches_past_the_five_hundred_most_recent() {
+        // The regression this fix exists for: resolution used to scan
+        // `list_sessions(500)`, so an older session was unreachable even by its
+        // full id.
+        let store = SessionStore::in_memory().unwrap();
+        insert_with_id(&store, "oldest-session-id", 0);
+        for i in 1..=600 {
+            insert_with_id(&store, &format!("filler-{i:04}"), i64::from(i) + 1000);
+        }
+        assert_eq!(
+            store.resolve_id("oldest-session-id").unwrap(),
+            SessionRef::One("oldest-session-id".into())
+        );
+        assert_eq!(
+            store.resolve_id("oldest").unwrap(),
+            SessionRef::One("oldest-session-id".into())
+        );
+    }
+
+    #[test]
+    fn resolve_id_sees_ambiguity_that_straddles_the_old_window() {
+        // The dangerous case. Two sessions share a prefix; one is recent, the
+        // other is far outside the old 500-row window. The old scan saw a
+        // single match and reported success — for `delete`, that removed a
+        // session the operator had not named.
+        let store = SessionStore::in_memory().unwrap();
+        insert_with_id(&store, "dupe-old", 0);
+        for i in 1..=600 {
+            insert_with_id(&store, &format!("filler-{i:04}"), i64::from(i) + 1000);
+        }
+        insert_with_id(&store, "dupe-new", 9999);
+        assert_eq!(store.resolve_id("dupe").unwrap(), SessionRef::Ambiguous(2));
+    }
+
+    #[test]
+    fn resolve_id_rejects_an_empty_prefix() {
+        // `LIKE '%'` would match everything, and on a single-session store an
+        // empty prefix would resolve to that session.
+        let store = SessionStore::in_memory().unwrap();
+        store.new_session("m", "tui").unwrap();
+        assert_eq!(store.resolve_id("").unwrap(), SessionRef::None);
+    }
+
+    #[test]
+    fn resolve_id_does_not_treat_like_wildcards_as_wildcards() {
+        // `_` is LIKE's single-character wildcard; unescaped, "a_c" would match
+        // "abc" and address a session the operator never named.
+        let store = SessionStore::in_memory().unwrap();
+        insert_with_id(&store, "abc12345", 1);
+        assert_eq!(store.resolve_id("a_c").unwrap(), SessionRef::None);
+        assert_eq!(store.resolve_id("%").unwrap(), SessionRef::None);
     }
 
     #[test]

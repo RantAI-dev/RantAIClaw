@@ -7,7 +7,7 @@ name = "rantaiclaw"
 version = "0.8.3-alpha"
 edition = "2021"
 authors = ["theonlyhennygod"]
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
 repository = "https://github.com/RantAI-dev/RantAIClaw"
 readme = "README.md"
@@ -244,9 +244,11 @@ default = ["tui", "whatsapp-web", "remote-install", "kb"]
 # Anthropic/OpenAI/Gemini. Default off — those providers route
 # through `RigProvider` (src/providers/rig_native.rs). Build with
 # --features legacy-providers if rig misbehaves and you need to
-# fall back. The three modules are gated out of default builds (this
-# feature); actual deletion is a separate, maintainer-approved step —
-# see plans/016-legacy-providers-sunset.md.
+# fall back. Only `providers::openai` is gated behind this feature;
+# `anthropic` and `gemini` stay compiled in because they are the routed
+# backend for auth modes rig-core cannot serve (Anthropic setup-tokens,
+# Gemini CLI OAuth) — see the comment at src/providers/mod.rs:18 and
+# plans/025-rigprovider-auth-parity.md.
 legacy-providers = []
 tui = ["dep:ratatui", "dep:crossterm"]
 hardware = ["nusb", "tokio-serial"]

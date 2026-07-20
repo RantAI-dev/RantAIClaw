@@ -16,6 +16,26 @@ use ratatui::{
     Frame,
 };
 
+/// Whether an idle session should re-arm the login gate.
+///
+/// Split out from the event loop so the policy is testable on its own. A zero
+/// `idle_timeout` disables auto-lock; a session with no stored credential is
+/// never locked (nothing could unlock it); an already-armed gate is left alone
+/// so re-arming cannot wipe a half-typed password.
+///
+/// Note what counts as idleness: operator *input*, not agent output. A turn
+/// that streams for longer than the timeout with nobody touching the keyboard
+/// will lock — which is the intent, since the gate masks the UI only and the
+/// turn keeps running behind it.
+pub fn should_relock(
+    gate_armed: bool,
+    has_password_hash: bool,
+    idle_timeout: std::time::Duration,
+    idle_for: std::time::Duration,
+) -> bool {
+    !gate_armed && has_password_hash && !idle_timeout.is_zero() && idle_for >= idle_timeout
+}
+
 #[derive(Default)]
 pub struct LoginGateState {
     /// Current password buffer (rendered masked, never as plaintext).
@@ -113,6 +133,63 @@ impl LoginGateState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn relocks_once_the_idle_window_elapses() {
+        assert!(should_relock(
+            false,
+            true,
+            Duration::from_secs(900),
+            Duration::from_secs(900)
+        ));
+        assert!(should_relock(
+            false,
+            true,
+            Duration::from_secs(900),
+            Duration::from_secs(901)
+        ));
+    }
+
+    #[test]
+    fn does_not_relock_before_the_idle_window_elapses() {
+        assert!(!should_relock(
+            false,
+            true,
+            Duration::from_secs(900),
+            Duration::from_secs(899)
+        ));
+    }
+
+    #[test]
+    fn zero_timeout_never_relocks() {
+        assert!(!should_relock(
+            false,
+            true,
+            Duration::ZERO,
+            Duration::from_secs(86_400)
+        ));
+    }
+
+    #[test]
+    fn does_not_relock_without_a_stored_credential() {
+        assert!(!should_relock(
+            false,
+            false,
+            Duration::from_secs(900),
+            Duration::from_secs(3600)
+        ));
+    }
+
+    #[test]
+    fn does_not_rearm_an_already_armed_gate() {
+        assert!(!should_relock(
+            true,
+            true,
+            Duration::from_secs(900),
+            Duration::from_secs(3600)
+        ));
+    }
 
     #[test]
     fn check_matches_stored_hash() {
