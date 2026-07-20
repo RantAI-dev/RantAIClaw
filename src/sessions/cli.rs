@@ -6,7 +6,7 @@
 use anyhow::{bail, Result};
 use chrono::{TimeZone, Utc};
 
-use super::SessionStore;
+use super::{SessionRef, SessionStore};
 
 /// Resolve the same sessions.db path the TUI opens — the active profile's
 /// `profiles/<name>/sessions/sessions.db`.
@@ -49,16 +49,10 @@ pub fn list(limit: usize) -> Result<()> {
 
 pub fn get(id_prefix: &str, limit: usize) -> Result<()> {
     let store = open_store()?;
-    let sessions = store.list_sessions(500)?;
-    let matched: Vec<_> = sessions
-        .iter()
-        .filter(|s| s.id.starts_with(id_prefix))
-        .collect();
-    let session = match matched.len() {
-        0 => bail!("no session matches prefix `{id_prefix}`"),
-        1 => matched[0],
-        n => bail!("`{id_prefix}` is ambiguous ({n} matches); use a longer prefix"),
-    };
+    let session_id = resolve_id(&store, id_prefix)?;
+    let session = store
+        .get_session(&session_id)?
+        .ok_or_else(|| anyhow::anyhow!("no session matches prefix `{id_prefix}`"))?;
     let messages = store.get_messages(&session.id)?;
     println!("Session {}", session.id);
     println!(
@@ -111,19 +105,25 @@ pub fn search(query: &str, limit: usize) -> Result<()> {
 
 pub fn set_title(id_prefix: &str, title: &str) -> Result<()> {
     let store = open_store()?;
-    let sessions = store.list_sessions(500)?;
-    let matched: Vec<_> = sessions
-        .iter()
-        .filter(|s| s.id.starts_with(id_prefix))
-        .collect();
-    let session = match matched.len() {
-        0 => bail!("no session matches prefix `{id_prefix}`"),
-        1 => matched[0],
-        n => bail!("`{id_prefix}` is ambiguous ({n} matches); use a longer prefix"),
-    };
-    store.set_title(&session.id, title)?;
-    println!("Title set on {}: {title}", session.id);
+    let session_id = resolve_id(&store, id_prefix)?;
+    store.set_title(&session_id, title)?;
+    println!("Title set on {session_id}: {title}");
     Ok(())
+}
+
+/// Resolve a full session id or a unique prefix into a concrete id.
+///
+/// Resolution runs in SQL across the whole table. It used to scan the 500 most
+/// recent sessions in memory, which made anything older unaddressable even by
+/// its full id, and checked uniqueness only within that window.
+fn resolve_id(store: &SessionStore, id_prefix: &str) -> Result<String> {
+    match store.resolve_id(id_prefix)? {
+        SessionRef::One(id) => Ok(id),
+        SessionRef::None => bail!("no session matches prefix `{id_prefix}`"),
+        SessionRef::Ambiguous(n) => {
+            bail!("`{id_prefix}` is ambiguous ({n} matches); use a longer prefix")
+        }
+    }
 }
 
 /// Cumulative session/message stats — the headless equivalent of TUI `/insights`.

@@ -168,6 +168,26 @@ fn open_session_store() -> anyhow::Result<crate::sessions::SessionStore> {
     crate::sessions::SessionStore::open(&path)
 }
 
+/// Resolve a `{id}` path segment — a full session id or a unique prefix — into
+/// a concrete id, mapping the outcome onto the API's error shapes.
+///
+/// Resolution happens in SQL over the whole table. It used to scan the 500 most
+/// recent sessions in memory, which left older ones unreachable even by full id
+/// and, because uniqueness was only checked inside that window, let `DELETE`
+/// remove a session other than the one named.
+fn resolve_session_id(
+    store: &crate::sessions::SessionStore,
+    id: &str,
+) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+    match store.resolve_id(id).map_err(err_500)? {
+        crate::sessions::SessionRef::One(found) => Ok(found),
+        crate::sessions::SessionRef::None => Err(err_404(format!("no session matches `{id}`"))),
+        crate::sessions::SessionRef::Ambiguous(n) => {
+            Err(err_400(format!("`{id}` is ambiguous ({n} matches)")))
+        }
+    }
+}
+
 /// Load a session's prior turns as `(role, content)` history so a
 /// continued chat remembers the exchange. Empty/absent session → no
 /// history (a fresh conversation); store errors degrade to no history.
@@ -670,13 +690,11 @@ async fn sessions_get(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let store = open_session_store().map_err(err_500)?;
-    let sessions = store.list_sessions(500).map_err(err_500)?;
-    let matched: Vec<_> = sessions.iter().filter(|s| s.id.starts_with(&id)).collect();
-    let session = match matched.len() {
-        0 => return Err(err_404(format!("no session matches `{id}`"))),
-        1 => matched[0],
-        n => return Err(err_400(format!("`{id}` is ambiguous ({n} matches)"))),
-    };
+    let session_id = resolve_session_id(&store, &id)?;
+    let session = store
+        .get_session(&session_id)
+        .map_err(err_500)?
+        .ok_or_else(|| err_404(format!("no session matches `{id}`")))?;
     let messages = store.get_messages(&session.id).map_err(err_500)?;
     Ok(Json(serde_json::json!({
         "id": session.id,
@@ -741,16 +759,10 @@ async fn sessions_set_title(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let store = open_session_store().map_err(err_500)?;
-    let sessions = store.list_sessions(500).map_err(err_500)?;
-    let matched: Vec<_> = sessions.iter().filter(|s| s.id.starts_with(&id)).collect();
-    let session = match matched.len() {
-        0 => return Err(err_404(format!("no session matches `{id}`"))),
-        1 => matched[0],
-        n => return Err(err_400(format!("`{id}` is ambiguous ({n} matches)"))),
-    };
-    store.set_title(&session.id, &body.title).map_err(err_500)?;
+    let session_id = resolve_session_id(&store, &id)?;
+    store.set_title(&session_id, &body.title).map_err(err_500)?;
     Ok(Json(
-        serde_json::json!({ "id": session.id, "title": body.title }),
+        serde_json::json!({ "id": session_id, "title": body.title }),
     ))
 }
 
@@ -761,13 +773,7 @@ async fn sessions_delete(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let mut store = open_session_store().map_err(err_500)?;
-    let sessions = store.list_sessions(500).map_err(err_500)?;
-    let matched: Vec<_> = sessions.iter().filter(|s| s.id.starts_with(&id)).collect();
-    let session_id = match matched.len() {
-        0 => return Err(err_404(format!("no session matches `{id}`"))),
-        1 => matched[0].id.clone(),
-        n => return Err(err_400(format!("`{id}` is ambiguous ({n} matches)"))),
-    };
+    let session_id = resolve_session_id(&store, &id)?;
     let deleted = store.delete_session(&session_id).map_err(err_500)?;
     Ok(Json(
         serde_json::json!({ "deleted": deleted, "id": session_id }),
