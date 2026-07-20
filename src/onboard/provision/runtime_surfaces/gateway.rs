@@ -3,7 +3,6 @@
 use super::super::traits::{
     ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
 };
-use crate::config::schema::{GatewayConfig, GatewayLoginConfig};
 use crate::config::Config;
 use crate::profile::Profile;
 use anyhow::Result;
@@ -155,24 +154,23 @@ impl TuiProvisioner for GatewayProvisioner {
 
         let host_for_summary = host.clone();
 
-        config.gateway = GatewayConfig {
-            port,
-            host,
-            require_pairing,
-            allow_public_bind: false,
-            paired_tokens: vec![],
-            pair_rate_limit_per_minute: 10,
-            webhook_rate_limit_per_minute: 60,
-            trust_forwarded_headers: false,
-            rate_limit_max_keys: 10000,
-            idempotency_ttl_secs: 3600,
-            idempotency_max_keys: 10000,
-            request_timeout_secs: 300,
-            login: GatewayLoginConfig::default(),
-            // Anything this provisioner does not prompt for takes the schema
-            // default, so adding a gateway key does not require editing here.
-            ..GatewayConfig::default()
-        };
+        // Assign only what this provisioner actually asked about.
+        //
+        // It used to replace the whole `GatewayConfig` with a struct literal,
+        // which silently discarded every field it does not prompt for:
+        //
+        //   * `login` — reset to default, wiping the console username, password
+        //     hash, and idle timeout. Running `setup gateway` turned the login
+        //     gate off without saying so.
+        //   * `paired_tokens` — emptied, unpairing every device.
+        //   * the rate limits, key caps, and timeouts — reset to hardcoded
+        //     numbers, discarding any the operator had tuned.
+        //   * `allow_public_bind` — forced to `false`. Combined with choosing
+        //     `0.0.0.0` at the host prompt above, that leaves a config the
+        //     gateway then refuses to start from.
+        config.gateway.port = port;
+        config.gateway.host = host;
+        config.gateway.require_pairing = require_pairing;
 
         send(
             &events,
@@ -232,5 +230,82 @@ mod tests {
     #[test]
     fn provisioner_description_is_non_empty() {
         assert!(!GatewayProvisioner::new().description().is_empty());
+    }
+
+    /// Drive the provisioner through its four prompts with scripted answers.
+    async fn run_with(config: &mut Config, host: &str) -> Result<()> {
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(32);
+        // Drain events so the provisioner's sends never block.
+        tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+        resp_tx
+            .send(ProvisionResponse::Selection(vec![1]))
+            .await
+            .unwrap(); // enable = Yes
+        resp_tx
+            .send(ProvisionResponse::Text("9999".into()))
+            .await
+            .unwrap(); // port
+        resp_tx
+            .send(ProvisionResponse::Text(host.into()))
+            .await
+            .unwrap(); // host
+        resp_tx
+            .send(ProvisionResponse::Selection(vec![0]))
+            .await
+            .unwrap(); // pairing = Yes
+        let profile = Profile {
+            name: "default".into(),
+            root: std::path::PathBuf::from("/tmp"),
+        };
+        GatewayProvisioner::new()
+            .run(
+                config,
+                &profile,
+                ProvisionIo {
+                    events: events_tx,
+                    responses: resp_rx,
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn setup_gateway_preserves_everything_it_does_not_prompt_for() {
+        // Running `setup gateway` used to replace the whole GatewayConfig,
+        // silently turning off console login and unpairing every device.
+        let mut config = Config::default();
+        config.gateway.login.username = Some("rantaiclaw_operator".into());
+        config.gateway.login.password_hash = Some("$argon2id$v=19$m=1,t=1,p=1$a$b".into());
+        config.gateway.login.idle_timeout_secs = 900;
+        config.gateway.paired_tokens = vec!["hashed-token-a".into(), "hashed-token-b".into()];
+        config.gateway.pair_rate_limit_per_minute = 42;
+        config.gateway.allow_public_bind = true;
+
+        run_with(&mut config, "127.0.0.1").await.unwrap();
+
+        assert_eq!(config.gateway.port, 9999, "prompted field is applied");
+        assert_eq!(
+            config.gateway.login.username.as_deref(),
+            Some("rantaiclaw_operator"),
+            "console login survives"
+        );
+        assert!(config.gateway.login.password_hash.is_some());
+        assert_eq!(config.gateway.login.idle_timeout_secs, 900);
+        assert_eq!(config.gateway.paired_tokens.len(), 2, "devices stay paired");
+        assert_eq!(
+            config.gateway.pair_rate_limit_per_minute, 42,
+            "tuned limit kept"
+        );
+        assert!(config.gateway.allow_public_bind, "public-bind opt-in kept");
+    }
+
+    #[tokio::test]
+    async fn setup_gateway_applies_the_answers_it_did_prompt_for() {
+        let mut config = Config::default();
+        run_with(&mut config, "0.0.0.0").await.unwrap();
+        assert_eq!(config.gateway.host, "0.0.0.0");
+        assert_eq!(config.gateway.port, 9999);
+        assert!(config.gateway.require_pairing);
     }
 }
