@@ -320,8 +320,17 @@ impl SessionStore {
     /// Insert a message into the store and increment the session's `message_count`.
     ///
     /// Returns the assigned row ID of the new message.
+    /// Append a message and bump the session's counter.
+    ///
+    /// Both statements run in one transaction. Separately, a failure on the
+    /// `UPDATE` left the message stored with `message_count` never incremented
+    /// — and since the counter is only ever adjusted by `+1` here, the drift is
+    /// permanent: nothing recomputes it from the messages table.
     pub fn append_message(&self, msg: &Message) -> Result<i64> {
-        self.conn.execute(
+        // `unchecked_transaction` takes `&self`, so atomicity here does not
+        // force `&mut` on every caller holding the store behind a shared ref.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -333,12 +342,13 @@ impl SessionStore {
             ],
         )?;
 
-        let row_id = self.conn.last_insert_rowid();
+        let row_id = tx.last_insert_rowid();
 
-        self.conn.execute(
+        tx.execute(
             "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?1",
             params![msg.session_id],
         )?;
+        tx.commit()?;
 
         Ok(row_id)
     }
@@ -538,9 +548,14 @@ impl SessionStore {
     ///
     /// The new session's `parent_session_id` is set to `session_id`, and
     /// `summary` is inserted as the first message with role `"system"`.
+    /// End `session_id` and open a child session carrying `summary` as its
+    /// first message.
+    ///
+    /// All four writes — end the parent, insert the child, insert the summary,
+    /// set the child's counter — run in one transaction. Run separately, a
+    /// failure part-way left the parent ended with no child to continue into,
+    /// or a child with no summary, and the operator had no way to tell which.
     pub fn split_session(&self, session_id: &str, summary: &str, model: &str) -> Result<Session> {
-        self.end_session(session_id)?;
-
         let source = self
             .get_session(session_id)?
             .map(|s| s.source)
@@ -548,22 +563,34 @@ impl SessionStore {
 
         let new_id = Uuid::new_v4().to_string();
         let started_at = chrono::Utc::now().timestamp();
+        let ended_at = chrono::Utc::now().timestamp();
 
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE sessions SET ended_at = ?1 WHERE id = ?2",
+            params![ended_at, session_id],
+        )?;
+        tx.execute(
             "INSERT INTO sessions (id, parent_session_id, model, started_at, source) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![new_id, session_id, model, started_at, source],
         )?;
-
-        let summary_msg = Message {
-            id: 0,
-            session_id: new_id.clone(),
-            role: "system".to_string(),
-            content: summary.to_string(),
-            tool_calls: None,
-            timestamp: started_at,
-        };
-        self.append_message(&summary_msg)?;
+        tx.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                new_id,
+                "system",
+                summary,
+                Option::<String>::None,
+                started_at
+            ],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?1",
+            params![new_id],
+        )?;
+        tx.commit()?;
 
         Ok(Session {
             id: new_id,
@@ -894,6 +921,58 @@ mod tests {
         let derived = derive_session_title("\u{1b}[2Khidden real question");
         assert!(!derived.chars().any(char::is_control));
         assert_eq!(derived, "[2Khidden real question");
+    }
+
+    #[test]
+    fn message_count_tracks_the_messages_actually_stored() {
+        // `message_count` is only ever adjusted by `+1` in `append_message` —
+        // nothing recomputes it from the messages table — so a write that
+        // stored the row but skipped the increment would drift permanently.
+        let s = store();
+        let sess = s.new_session("gpt-4o", "tui").unwrap();
+        for i in 0..5 {
+            s.append_message(&Message::user(&sess.id, &format!("m{i}")))
+                .unwrap();
+        }
+        let stored = s.get_session(&sess.id).unwrap().unwrap();
+        assert_eq!(stored.message_count, 5);
+        assert_eq!(s.get_messages(&sess.id).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn split_session_leaves_a_consistent_pair() {
+        // The parent must be ended *and* the child must exist with its summary
+        // and a matching counter — the four writes are one unit.
+        let s = store();
+        let parent = s.new_session("gpt-4o", "tui").unwrap();
+        s.append_message(&Message::user(&parent.id, "before split"))
+            .unwrap();
+
+        let child = s
+            .split_session(&parent.id, "context summary", "gpt-4o")
+            .unwrap();
+
+        let parent_row = s.get_session(&parent.id).unwrap().unwrap();
+        let child_row = s.get_session(&child.id).unwrap().unwrap();
+        assert!(parent_row.ended_at.is_some(), "parent ended");
+        assert_eq!(parent_row.message_count, 1, "parent counter untouched");
+        assert_eq!(
+            child_row.parent_session_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(child_row.message_count, 1, "child counter includes summary");
+        assert_eq!(s.get_messages(&child.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn split_session_reports_the_counter_it_actually_stored() {
+        // The returned Session used to hard-code `message_count: 1` while the
+        // row was written by a separate statement; assert the two agree.
+        let s = store();
+        let parent = s.new_session("gpt-4o", "tui").unwrap();
+        let child = s.split_session(&parent.id, "summary", "gpt-4o").unwrap();
+        let stored = s.get_session(&child.id).unwrap().unwrap();
+        assert_eq!(child.message_count, stored.message_count);
     }
 
     #[test]
