@@ -169,6 +169,9 @@ impl TuiProvisioner for GatewayProvisioner {
             idempotency_max_keys: 10000,
             request_timeout_secs: 300,
             login: GatewayLoginConfig::default(),
+            // Anything this provisioner does not prompt for takes the schema
+            // default, so adding a gateway key does not require editing here.
+            ..GatewayConfig::default()
         };
 
         send(

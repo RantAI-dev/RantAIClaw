@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 14;
+pub const CURRENT_VERSION: u32 = 15;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -216,8 +216,18 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive default-only field)
     }
 
-    // Future migrations (v15, v16, …) inserted here in order.
-    // if from < 15 { migrate_v15(raw)?; }
+    // v14 → v15: `[gateway].api_rate_limit_per_minute` (u32, default 600) was
+    // added — a per-client cap on `/api/v1/*`, which previously had none while
+    // `/pair` and `/webhook` did. Additive field with a serde default, so
+    // existing configs deserialise fine and gain the default on next write;
+    // nothing to transform. Burns a version slot so the schema_drift
+    // fingerprint is accepted with intent.
+    if from < 15 {
+        // (no transformation; additive default-only field)
+    }
+
+    // Future migrations (v16, v17, …) inserted here in order.
+    // if from < 16 { migrate_v16(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -281,6 +291,20 @@ mod tests {
                 .and_then(|g| g.get("port"))
                 .and_then(|p| p.as_integer()),
             Some(3000)
+        );
+    }
+
+    #[test]
+    fn v14_to_v15_is_additive_noop() {
+        let mut raw = parse("schema_version = 14\n[gateway]\nport = 9393\n");
+        let changed = migrate(&mut raw).unwrap();
+        assert!(changed, "stamps the new version");
+        assert_eq!(version_of(&raw), Some(CURRENT_VERSION.into()));
+        let gw = raw.get("gateway").expect("gateway table survives");
+        assert_eq!(gw.get("port").and_then(toml::Value::as_integer), Some(9393));
+        assert!(
+            gw.get("api_rate_limit_per_minute").is_none(),
+            "migration must not write the new key; the serde default supplies it"
         );
     }
 
