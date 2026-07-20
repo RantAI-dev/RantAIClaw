@@ -529,13 +529,32 @@ impl SessionStore {
 
     /// List recent sessions ordered by `started_at` descending.
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionMeta>> {
+        self.list_sessions_paged(limit, 0)
+    }
+
+    /// Total number of stored sessions — what a client needs to know how many
+    /// pages [`Self::list_sessions_paged`] has.
+    pub fn count_sessions(&self) -> Result<usize> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
+        Ok(usize::try_from(total).unwrap_or(0))
+    }
+
+    /// One page of sessions, newest first, skipping `offset` rows.
+    ///
+    /// Without an offset the API could only ever show the newest 500 sessions;
+    /// anything older was invisible in the console with no way to reach it.
+    pub fn list_sessions_paged(&self, limit: usize, offset: usize) -> Result<Vec<SessionMeta>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, model, started_at, message_count \
-             FROM sessions ORDER BY started_at DESC LIMIT ?1",
+             FROM sessions ORDER BY started_at DESC LIMIT ?1 OFFSET ?2",
         )?;
 
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
         let sessions = stmt
-            .query_map(params![limit as i64], |row| {
+            .query_map(params![limit, offset], |row| {
                 Ok(SessionMeta {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -824,6 +843,53 @@ mod tests {
         ));
         assert!(!is_uuid_shaped("zf2504e0-4f89-41d3-9a0c-0305e82c3301"));
         assert!(!is_uuid_shaped("3f2504e04f8941d39a0c0305e82c3301"));
+    }
+
+    #[test]
+    fn list_sessions_paged_walks_past_the_first_page() {
+        // Without an offset the API could only ever show the newest N; older
+        // sessions were invisible with no way to reach them.
+        let store = SessionStore::in_memory().unwrap();
+        for i in 0..25 {
+            insert_with_id(&store, &format!("s-{i:03}"), i64::from(i));
+        }
+        assert_eq!(store.count_sessions().unwrap(), 25);
+
+        let page1 = store.list_sessions_paged(10, 0).unwrap();
+        let page2 = store.list_sessions_paged(10, 10).unwrap();
+        let page3 = store.list_sessions_paged(10, 20).unwrap();
+        assert_eq!(page1.len(), 10);
+        assert_eq!(page2.len(), 10);
+        assert_eq!(page3.len(), 5, "last page is partial");
+
+        // Newest first, and no row appears twice across the pages.
+        assert_eq!(page1[0].id, "s-024");
+        assert_eq!(page3[4].id, "s-000");
+        let seen: std::collections::HashSet<_> = page1
+            .iter()
+            .chain(page2.iter())
+            .chain(page3.iter())
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(seen.len(), 25, "pages must not overlap or skip");
+    }
+
+    #[test]
+    fn list_sessions_paged_past_the_end_is_empty_not_an_error() {
+        let store = SessionStore::in_memory().unwrap();
+        insert_with_id(&store, "only-one", 1);
+        assert!(store.list_sessions_paged(10, 99).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_still_returns_the_first_page() {
+        // The old signature is now a zero-offset call; existing callers unchanged.
+        let store = SessionStore::in_memory().unwrap();
+        for i in 0..5 {
+            insert_with_id(&store, &format!("t-{i}"), i64::from(i));
+        }
+        assert_eq!(store.list_sessions(3).unwrap().len(), 3);
+        assert_eq!(store.list_sessions(3).unwrap()[0].id, "t-4");
     }
 
     #[test]

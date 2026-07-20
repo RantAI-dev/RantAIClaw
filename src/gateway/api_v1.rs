@@ -684,6 +684,10 @@ impl Drop for CancelOnDrop {
 struct ListQuery {
     #[serde(default)]
     limit: Option<usize>,
+    /// Rows to skip, newest first. Shared with `/api/v1/memory`, which ignores
+    /// it — only the sessions list pages.
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 async fn sessions_list(
@@ -693,8 +697,13 @@ async fn sessions_list(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let store = open_session_store().map_err(err_500)?;
+    // `limit` still caps a single response at 500 rows, but `offset` means that
+    // is now a page size rather than a ceiling on what exists — sessions older
+    // than the newest 500 used to be unreachable from the API entirely.
     let limit = q.limit.unwrap_or(50).min(500);
-    let sessions = store.list_sessions(limit).map_err(err_500)?;
+    let offset = q.offset.unwrap_or(0);
+    let sessions = store.list_sessions_paged(limit, offset).map_err(err_500)?;
+    let total = store.count_sessions().map_err(err_500)?;
     let json: Vec<_> = sessions
         .iter()
         .map(|s| {
@@ -707,9 +716,12 @@ async fn sessions_list(
             })
         })
         .collect();
-    Ok(Json(
-        serde_json::json!({ "sessions": json, "count": json.len() }),
-    ))
+    Ok(Json(serde_json::json!({
+        "sessions": json,
+        "count": json.len(),
+        "offset": offset,
+        "total": total,
+    })))
 }
 
 async fn sessions_get(
