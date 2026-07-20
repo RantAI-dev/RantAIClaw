@@ -765,9 +765,16 @@ async fn sessions_set_title(
     check_auth(&state, &headers)?;
     let store = open_session_store().map_err(err_500)?;
     let session_id = resolve_session_id(&store, &id)?;
-    store.set_title(&session_id, &body.title).map_err(err_500)?;
+    // Normalise here too, so an unusable title is a 400 rather than the 500 the
+    // store's own guard would surface. The store still checks — this is the
+    // status-code shape, not the security boundary.
+    let title = crate::sessions::normalize_set_title(&body.title);
+    if title.is_empty() {
+        return Err(err_400("title is empty after normalisation"));
+    }
+    store.set_title(&session_id, &title).map_err(err_500)?;
     Ok(Json(
-        serde_json::json!({ "id": session_id, "title": body.title }),
+        serde_json::json!({ "id": session_id, "title": title }),
     ))
 }
 

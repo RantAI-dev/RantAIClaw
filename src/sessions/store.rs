@@ -10,17 +10,48 @@ use super::types::{Message, SearchResult, Session, SessionMeta};
 /// Maximum displayable length of an auto-derived session title.
 const MAX_AUTO_TITLE_CHARS: usize = 50;
 
+/// Maximum stored length of a caller-supplied session title. Roomier than the
+/// auto-derived cap — a hand-written title is a deliberate choice — but still
+/// bounded so one row cannot swamp a listing.
+const MAX_SET_TITLE_CHARS: usize = 200;
+
+/// Strip control characters from a title.
+///
+/// Titles are printed straight to the operator's terminal by
+/// `rantaiclaw sessions list` (`sessions/cli.rs`), so an `ESC` that survives to
+/// storage is an escape sequence executing on their terminal later: cursor
+/// moves that overwrite neighbouring rows, or an OSC 52 clipboard write on
+/// terminals that permit it. Whitespace collapsing alone does not catch this —
+/// `ESC` (0x1B) is not whitespace.
+///
+/// `char::is_control` covers both C0 (0x00–0x1F, 0x7F) and C1 (0x80–0x9F), so
+/// the 8-bit CSI introducer is handled along with the familiar `ESC [` form.
+///
+/// Knowingly *not* handled: bidirectional overrides (U+202A–U+202E, U+2066–
+/// U+2069), which can reorder how a title displays without any control
+/// character. That is a rendering-spoof class rather than terminal control, and
+/// stripping it needs care not to break legitimate right-to-left titles.
+fn strip_control(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Derive a session title from a user message: pick the first non-empty
-/// line, collapse whitespace, truncate to `MAX_AUTO_TITLE_CHARS` chars,
-/// and append `…` when truncated. Returns an empty string for content
-/// that has no usable text.
+/// line, drop control characters, collapse whitespace, truncate to
+/// `MAX_AUTO_TITLE_CHARS` chars, and append `…` when truncated. Returns an
+/// empty string for content that has no usable text.
+///
+/// This path matters more than the explicit setter: it runs on a session's
+/// first message, so anything that can put a message into a session — an
+/// inbound channel message included — can decide a title without anyone
+/// calling the title API.
 pub fn derive_session_title(content: &str) -> String {
     let first_line = content
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = strip_control(first_line);
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     let count = collapsed.chars().count();
     if count <= MAX_AUTO_TITLE_CHARS {
         collapsed
@@ -28,6 +59,15 @@ pub fn derive_session_title(content: &str) -> String {
         let truncated: String = collapsed.chars().take(MAX_AUTO_TITLE_CHARS).collect();
         format!("{truncated}…")
     }
+}
+
+/// Normalise a caller-supplied title: drop control characters, collapse
+/// whitespace, cap the length. Returns an empty string when nothing usable is
+/// left, which [`SessionStore::set_title`] treats as an error.
+pub fn normalize_set_title(raw: &str) -> String {
+    let cleaned = strip_control(raw);
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(MAX_SET_TITLE_CHARS).collect()
 }
 
 /// Outcome of resolving a session id or id prefix — see
@@ -199,7 +239,24 @@ impl SessionStore {
     }
 
     /// Update the human-readable title of a session.
+    ///
+    /// The title is normalised first (see [`normalize_set_title`]) so every
+    /// caller — the HTTP API, the CLI, and the TUI's `/title` — gets the same
+    /// treatment. Normalising here rather than at each surface is deliberate:
+    /// this is the single point every write goes through, and a per-surface
+    /// guard is one new entry point away from being bypassed.
+    ///
+    /// Errors when nothing usable is left, rather than storing a blank. A
+    /// caller asking to set an all-whitespace or all-control-character title
+    /// has made a mistake, and reporting success while storing nothing hides
+    /// it (CLAUDE.md §3.5). `backfill_titles` does treat `''` as untitled and
+    /// would recover such a row, so this is about honest feedback rather than
+    /// data recovery.
     pub fn set_title(&self, id: &str, title: &str) -> Result<()> {
+        let title = normalize_set_title(title);
+        if title.is_empty() {
+            anyhow::bail!("session title is empty after normalisation");
+        }
         self.conn.execute(
             "UPDATE sessions SET title = ?1 WHERE id = ?2",
             params![title, id],
@@ -767,6 +824,76 @@ mod tests {
 
         let updated = s.get_session(&sess.id).unwrap().unwrap();
         assert_eq!(updated.title.as_deref(), Some("My conversation"));
+    }
+
+    #[test]
+    fn set_title_strips_terminal_escape_sequences() {
+        // `sessions list` prints titles straight to the operator's terminal, so
+        // a stored ESC is an escape sequence executing on their machine later.
+        let s = store();
+        let sess = s.new_session("gpt-4o", "tui").unwrap();
+
+        s.set_title(
+            &sess.id,
+            "\u{1b}[2K\u{1b}[Ashadowed\u{1b}]52;c;cGVybmc\u{7}",
+        )
+        .unwrap();
+
+        let stored = s.get_session(&sess.id).unwrap().unwrap().title.unwrap();
+        assert!(
+            !stored.chars().any(char::is_control),
+            "control characters survived: {stored:?}"
+        );
+        assert_eq!(stored, "[2K[Ashadowed]52;c;cGVybmc");
+    }
+
+    #[test]
+    fn set_title_strips_the_eight_bit_csi_introducer() {
+        // C1 controls reach the same terminal behaviour without a literal ESC.
+        let s = store();
+        let sess = s.new_session("gpt-4o", "tui").unwrap();
+        s.set_title(&sess.id, "before\u{9b}31mafter").unwrap();
+        let stored = s.get_session(&sess.id).unwrap().unwrap().title.unwrap();
+        assert_eq!(stored, "before31mafter");
+    }
+
+    #[test]
+    fn set_title_collapses_whitespace_and_newlines() {
+        let s = store();
+        let sess = s.new_session("gpt-4o", "tui").unwrap();
+        s.set_title(&sess.id, "  spread \n\n over \t lines  ")
+            .unwrap();
+        let stored = s.get_session(&sess.id).unwrap().unwrap().title.unwrap();
+        assert_eq!(stored, "spread over lines");
+    }
+
+    #[test]
+    fn set_title_caps_length() {
+        let s = store();
+        let sess = s.new_session("gpt-4o", "tui").unwrap();
+        s.set_title(&sess.id, &"x".repeat(500)).unwrap();
+        let stored = s.get_session(&sess.id).unwrap().unwrap().title.unwrap();
+        assert_eq!(stored.chars().count(), 200);
+    }
+
+    #[test]
+    fn set_title_rejects_a_title_with_nothing_usable_left() {
+        let s = store();
+        let sess = s.new_session("gpt-4o", "tui").unwrap();
+        assert!(s.set_title(&sess.id, "   ").is_err());
+        assert!(s.set_title(&sess.id, "\u{1b}\u{7}\u{9b}").is_err());
+        // The session keeps whatever it had rather than gaining a blank.
+        assert!(s.get_session(&sess.id).unwrap().unwrap().title.is_none());
+    }
+
+    #[test]
+    fn derived_titles_are_stripped_too() {
+        // The auto-title path is the more reachable one: it runs on a session's
+        // first message, so an inbound channel message can decide a title
+        // without anyone calling the title API.
+        let derived = derive_session_title("\u{1b}[2Khidden real question");
+        assert!(!derived.chars().any(char::is_control));
+        assert_eq!(derived, "[2Khidden real question");
     }
 
     #[test]
