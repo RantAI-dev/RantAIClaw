@@ -82,6 +82,24 @@ pub enum SessionRef {
     Ambiguous(usize),
 }
 
+/// Whether a caller-supplied session id has the canonical UUID shape
+/// (`8-4-4-4-12` lowercase-or-uppercase hex).
+///
+/// Deliberately a shape check, not a parse: it only needs to keep arbitrary
+/// strings out of the primary key so ids stay uniform with the ones
+/// [`Uuid::new_v4`] mints. Anything else falls back to a server-generated id.
+fn is_uuid_shaped(s: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let mut parts = s.split('-');
+    for want in groups {
+        match parts.next() {
+            Some(p) if p.len() == want && p.chars().all(|c| c.is_ascii_hexdigit()) => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none()
+}
+
 /// Escape the LIKE wildcards in a user-supplied prefix.
 ///
 /// Session ids are UUIDs, but the prefix is whatever the caller typed. Without
@@ -417,7 +435,25 @@ impl SessionStore {
         let (id, is_new) = match existing {
             Some(id) => (id, false),
             None => {
-                let id = Uuid::new_v4().to_string();
+                // Honour a caller-supplied id when it is UUID-shaped, instead of
+                // discarding it and minting a different one.
+                //
+                // The console needs an id it can use *before* the first turn:
+                // chat attachments are ingested into the KB under a per-
+                // conversation category at upload time, which is before any
+                // session exists. Previously the client invented its own key,
+                // the gateway assigned a different one, and reopening the
+                // session looked under the gateway's key — where the documents
+                // were not. Letting the client name the session up front gives
+                // one id end to end.
+                //
+                // Shape is enforced so a caller cannot litter the table with
+                // arbitrary primary keys. A supplied id that already exists is
+                // handled above (the turn continues that session), which is the
+                // pre-existing behaviour.
+                let id = session_id
+                    .filter(|sid| is_uuid_shaped(sid))
+                    .map_or_else(|| Uuid::new_v4().to_string(), str::to_string);
                 let started_at = chrono::Utc::now().timestamp();
                 tx.execute(
                     "INSERT INTO sessions (id, model, started_at, source) VALUES (?1, ?2, ?3, ?4)",
@@ -711,6 +747,56 @@ mod tests {
                 params![id, started_at],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn record_api_turn_adopts_a_uuid_shaped_client_id() {
+        // The console picks the id before the first turn so it can use the same
+        // value as the KB category for attachments uploaded before send.
+        let mut s = SessionStore::in_memory().unwrap();
+        let chosen = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+        let got = s
+            .record_api_turn("m", Some(chosen), "question", "answer")
+            .unwrap();
+        assert_eq!(got, chosen);
+        assert!(s.get_session(chosen).unwrap().is_some());
+    }
+
+    #[test]
+    fn record_api_turn_reuses_the_adopted_id_on_the_next_turn() {
+        // Second turn must continue the same session, not start another.
+        let mut s = SessionStore::in_memory().unwrap();
+        let chosen = "3f2504e0-4f89-41d3-9a0c-0305e82c3302";
+        s.record_api_turn("m", Some(chosen), "one", "a").unwrap();
+        let second = s.record_api_turn("m", Some(chosen), "two", "b").unwrap();
+        assert_eq!(second, chosen);
+        assert_eq!(s.list_sessions(10).unwrap().len(), 1);
+        assert_eq!(s.get_messages(chosen).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn record_api_turn_rejects_a_non_uuid_client_id() {
+        // Anything not UUID-shaped falls back to a server-minted id, so callers
+        // cannot put arbitrary strings into the primary key.
+        let mut s = SessionStore::in_memory().unwrap();
+        for junk in ["c-3-8471", "../../etc/passwd", "", "not-a-uuid", "3f2504e0"] {
+            let got = s.record_api_turn("m", Some(junk), "q", "a").unwrap();
+            assert_ne!(got, junk, "junk id {junk:?} was adopted");
+            assert!(is_uuid_shaped(&got));
+        }
+    }
+
+    #[test]
+    fn uuid_shape_check_accepts_generated_ids_and_rejects_near_misses() {
+        assert!(is_uuid_shaped(&Uuid::new_v4().to_string()));
+        assert!(is_uuid_shaped("3F2504E0-4F89-41D3-9A0C-0305E82C3301"));
+        // Wrong group lengths, non-hex, missing and extra groups.
+        assert!(!is_uuid_shaped("3f2504e0-4f89-41d3-9a0c-0305e82c330"));
+        assert!(!is_uuid_shaped(
+            "3f2504e0-4f89-41d3-9a0c-0305e82c3301-extra"
+        ));
+        assert!(!is_uuid_shaped("zf2504e0-4f89-41d3-9a0c-0305e82c3301"));
+        assert!(!is_uuid_shaped("3f2504e04f8941d39a0c0305e82c3301"));
     }
 
     #[test]

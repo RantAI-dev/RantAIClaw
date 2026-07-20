@@ -188,6 +188,13 @@ tokens, session ids, or paths.
     "session_id": "optional — continue this session; absent/empty starts a new one"
   }
   ```
+- **Choosing the session id**: `session_id` may name a session that does not
+  exist yet. If it is UUID-shaped (`8-4-4-4-12` hex), the turn is persisted
+  under exactly that id; anything else is ignored and the server mints one. This
+  lets a client settle on an id *before* its first turn — the web console needs
+  one at attachment-upload time, which happens before any session exists, so
+  that the KB category and the session id are the same value. A supplied id that
+  already exists continues that session, as before.
 - **Streaming vs sync**: this single route serves both modes from the same
   handler. It streams via Server-Sent Events when either the request has
   `Accept: text/event-stream`, or the query string has
