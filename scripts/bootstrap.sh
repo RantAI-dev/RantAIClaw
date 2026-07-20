@@ -16,6 +16,7 @@ else
   step()    { printf '\n[%s] %s\n' "$1" "${*:2}"; }
   print_banner()         { printf '== RantaiClaw Installer ==\n'; }
   print_success_banner() { printf '== Installation Complete ==\n'; for s in "$@"; do printf '  - %s\n' "$s"; done; }
+  print_action_required() { printf '\n== ACTION REQUIRED: %s ==\n' "$1"; shift; for l in "$@"; do printf '  %s\n' "$l"; done; printf '\n'; }
   spinner_start()       { info "$*…"; }
   spinner_stop()        { success "$*"; }
   spinner_stop_fail()   { error "$*"; }
