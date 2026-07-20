@@ -2,9 +2,14 @@
 //! that previously had no remote-driven access.
 //!
 //! Auth: bearer token verified against [`PairingGuard`]. `require_pairing`
-//! defaults to `true`, so every endpoint here requires `Authorization: Bearer
-//! <token>` issued by `POST /pair`. Setting it to `false` accepts every
-//! request unauthenticated — an explicit opt-out, not the default.
+//! defaults to `true`, and every endpoint here then requires
+//! `Authorization: Bearer <token>` issued by `POST /pair`. Setting it to `false`
+//! accepts **all** requests unconditionally — see [`check_auth`], which returns
+//! early before ever looking at the header.
+//!
+//! Note what this check does *not* consult: `[gateway.login]`. The console
+//! password gates the claw-ui/TUI surfaces, not this API, so `require_pairing =
+//! false` opens every route here even when a login is configured.
 //!
 //! Endpoints intentionally mirror the CLI subcommand layout so a curl-driven
 //! test rig can exercise the same backend code paths the TUI hits via slash
