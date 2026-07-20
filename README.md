@@ -164,13 +164,16 @@ rantaiclaw ui path        # where it was installed
 
 Two processes, two ports: the Rust binary serves the API on the gateway port, Node serves the console on `3939`. The console authenticates at its own edge and holds the gateway bearer token server-side — the browser never sees it. Requires Node.js ≥ 18.18.
 
-Protect it with a username/password gate (Argon2id, verified at `POST /login`):
+Protect it with a username/password gate (Argon2id, verified at `POST /login`), and optionally auto-lock an unattended session:
 
 ```toml
 [gateway.login]
 username = "operator"
 password_hash = "$argon2id$..."   # written by `rantaiclaw setup login`
+idle_timeout_secs = 1800          # 0 (default) = never auto-lock
 ```
+
+`rantaiclaw setup login` offers 15m / 30m / 1h / 4h. Idleness is measured from operator input, so a long agent turn does not by itself keep the session alive — the TUI re-arms its login gate once the window lapses, and the console expires its session cookie. The gate masks the UI only: a turn in flight keeps streaming behind it. With no `password_hash` set there is nothing to unlock with, so the timeout is ignored.
 
 ### Multi-Provider Intelligence
 
@@ -390,7 +393,7 @@ rantaiclaw --help              # All commands
 RantaiClaw uses TOML configuration at `~/.rantaiclaw/config.toml`. The values below are the real shipped defaults:
 
 ```toml
-schema_version = 13
+schema_version = 14
 
 # Model
 default_provider = "openrouter"
@@ -437,6 +440,7 @@ allow_public_bind = false   # read docs/operations/network-deployment.md before 
 # Web console auth (optional)
 [gateway.login]
 username = "operator"
+idle_timeout_secs = 0       # 0 = never auto-lock; presets 900 / 1800 / 3600 / 14400
 
 # Web console host
 [ui]
