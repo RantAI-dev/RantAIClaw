@@ -411,12 +411,27 @@ async fn agent_chat_sync(
     // `agent.turn` already returned Err on failure; skip persisting an empty
     // answer so a no-op turn doesn't create or append to a session.
     if !text.trim().is_empty() {
-        if let Ok(mut store) = open_session_store() {
-            match store.record_api_turn(&model, body.session_id.as_deref(), &body.message, &text) {
-                Ok(id) => session_id = id,
-                Err(err) => {
-                    tracing::warn!(error = %err, "api agent chat session persistence failed");
+        // Log an open failure too. It used to be swallowed by a bare
+        // `if let Ok(..)`, so a sessions.db that could not be opened — bad
+        // permissions, a profile root that vanished — silently stopped
+        // persisting every turn with nothing in the log to say so, while the
+        // adjacent `record_api_turn` failure was reported.
+        match open_session_store() {
+            Ok(mut store) => {
+                match store.record_api_turn(
+                    &model,
+                    body.session_id.as_deref(),
+                    &body.message,
+                    &text,
+                ) {
+                    Ok(id) => session_id = id,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "api agent chat session persistence failed");
+                    }
                 }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "api agent chat could not open the session store");
             }
         }
     }
@@ -546,19 +561,28 @@ async fn agent_chat_stream(
                     // errored, and with a non-empty answer. Failed/empty turns
                     // would otherwise pollute history and create titled sessions.
                     if !cancelled && !errored && !persisted_text.trim().is_empty() {
-                        if let Ok(mut store) = open_session_store() {
-                            match store.record_api_turn(
-                                &model,
-                                req_session_id.as_deref(),
-                                &user_message,
-                                &persisted_text,
-                            ) {
-                                Ok(id) => session_id = id,
-                                Err(err) => tracing::warn!(
-                                    error = %err,
-                                    "api agent chat stream session persistence failed"
-                                ),
+                        // See the sync handler above: an open failure was
+                        // swallowed here too, leaving an empty `session_id` in
+                        // the `done` event with nothing logged to explain it.
+                        match open_session_store() {
+                            Ok(mut store) => {
+                                match store.record_api_turn(
+                                    &model,
+                                    req_session_id.as_deref(),
+                                    &user_message,
+                                    &persisted_text,
+                                ) {
+                                    Ok(id) => session_id = id,
+                                    Err(err) => tracing::warn!(
+                                        error = %err,
+                                        "api agent chat stream session persistence failed"
+                                    ),
+                                }
                             }
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                "api agent chat stream could not open the session store"
+                            ),
                         }
                     }
                     serde_json::json!({
@@ -1272,6 +1296,34 @@ mod tests {
         }
     }
 
+    /// Point `HOME` at a temp dir and put the previous value back on drop, so a
+    /// panicking test does not leak it into the next one.
+    ///
+    /// `HOME` is the right lever: the profile root is
+    /// `home_dir()/.rantaiclaw/profiles/<name>` (`profile/paths.rs`), so
+    /// `RANTAICLAW_CONFIG_DIR` does **not** move `sessions.db` — pinning that
+    /// instead left the test still writing to the shared profile.
+    ///
+    /// Only meaningful while `test_env::ENV_LOCK` is held.
+    struct HomeGuard(Option<String>);
+
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let prev = std::env::var("HOME").ok();
+            std::env::set_var("HOME", path);
+            Self(prev)
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(prev) => std::env::set_var("HOME", prev),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     fn test_state() -> AppState {
         let mut config = crate::config::Config::default();
         config.default_provider = Some("test-sse".to_string());
@@ -1388,6 +1440,31 @@ mod tests {
 
     #[tokio::test]
     async fn sse_chat_emits_chunk_then_done() {
+        // This test drives a handler that persists through `open_session_store`,
+        // which resolves the ACTIVE PROFILE from process-global env
+        // (`RANTAICLAW_CONFIG_DIR`, `HOME`). `cargo test --lib` runs everything
+        // in one process, so a sibling test swapping those mid-run made the
+        // store open fail here — the handler skipped persistence and emitted an
+        // empty `session_id`, failing the assertion below roughly one run in
+        // six. Take the crate-wide lock and pin the env to a temp dir so this
+        // test owns its own sessions.db.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        // Prove the pin took, rather than trusting it. This assertion is what
+        // caught the first attempt at this fix pinning the wrong variable
+        // (`RANTAICLAW_CONFIG_DIR`), which left the test on the shared profile
+        // and still flaky — with nothing pointing at why.
+        let db = crate::profile::ProfileManager::active()
+            .expect("active profile")
+            .sessions_db_path();
+        assert!(
+            db.starts_with(tmp.path()),
+            "test must own its sessions.db; resolved {db:?} outside {:?}",
+            tmp.path()
+        );
+
         let mut headers = HeaderMap::new();
         headers.insert("accept", "text/event-stream".parse().unwrap());
 
