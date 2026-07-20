@@ -1,10 +1,10 @@
 //! Control-plane API (`/api/v1/*`) — HTTP equivalents for the CLI/TUI surfaces
 //! that previously had no remote-driven access.
 //!
-//! Auth: bearer token verified against [`PairingGuard`]. When the gateway is
-//! configured with `require_pairing = false` (default for local dev) all
-//! requests are accepted; when `true`, every endpoint here requires
-//! `Authorization: Bearer <token>` issued by `POST /pair`.
+//! Auth: bearer token verified against [`PairingGuard`]. `require_pairing`
+//! defaults to `true`, so every endpoint here requires `Authorization: Bearer
+//! <token>` issued by `POST /pair`. Setting it to `false` accepts every
+//! request unauthenticated — an explicit opt-out, not the default.
 //!
 //! Endpoints intentionally mirror the CLI subcommand layout so a curl-driven
 //! test rig can exercise the same backend code paths the TUI hits via slash
