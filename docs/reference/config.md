@@ -288,6 +288,13 @@ Notes:
 | `pair_rate_limit_per_minute` | `10` | max `/pair` + `/login` attempts per minute per client |
 | `webhook_rate_limit_per_minute` | `60` | max `/webhook` requests per minute per client |
 | `api_rate_limit_per_minute` | `600` | max `/api/v1/*` requests per minute per client |
+| `paired_tokens` | `[]` | SHA-256 hashes of issued bearer tokens; managed by `POST /pair` |
+
+**Revoking a token.** Delete its hash from `paired_tokens` and save — the
+running gateway picks the change up on the next config reload and that token
+stops authenticating. Emptying the list revokes everything. (Before this was
+wired up, editing the file did nothing to the running process *and* the next
+successful pair wrote the deleted hash back.)
 
 `api_rate_limit_per_minute` exists because `POST /api/v1/agent/chat` drives real
 provider inference — an unbounded caller is a direct cost-amplification path
