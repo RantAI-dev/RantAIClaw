@@ -253,7 +253,12 @@ resolves normally, `2+` matches return `400` ("ambiguous").
 ### GET /api/v1/sessions
 
 - **Auth**: bearer-gated.
-- **Query params**: `limit` — optional, default `50`, capped at `500`.
+- **Query params**:
+  - `limit` — optional, default `50`, capped at `500`. This is a **page size**,
+    not a ceiling on what exists.
+  - `offset` — optional, default `0`. Rows to skip, newest first. Without it the
+    API could only ever return the newest 500 sessions and anything older was
+    unreachable. Page with `offset += limit` until `offset + count >= total`.
 - **Response** `200`:
   ```json
   {
@@ -266,11 +271,15 @@ resolves normally, `2+` matches return `400` ("ambiguous").
         "message_count": 4
       }
     ],
-    "count": 1
+    "count": 1,
+    "offset": 0,
+    "total": 1
   }
   ```
-  `started_at` is a Unix epoch second integer (`i64`); `message_count` counts
-  stored messages, `title` is nullable (unset until the store derives one).
+  `count` is the rows in *this* page; `total` is how many sessions exist, so a
+  client can tell whether more pages remain. `started_at` is a Unix epoch second
+  integer (`i64`); `message_count` counts stored messages, `title` is nullable
+  (unset until the store derives one).
 - **Status codes**: `200`, `401`.
 
 ### POST /api/v1/sessions/search
