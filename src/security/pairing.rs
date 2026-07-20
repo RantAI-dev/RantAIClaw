@@ -193,6 +193,47 @@ impl PairingGuard {
         tokens.iter().cloned().collect()
     }
 
+    /// Replace the paired-token set with the one in `config.toml`.
+    ///
+    /// This is what makes revocation possible at all. Until it existed there
+    /// was no removal path anywhere — the set only ever grew — and the obvious
+    /// workaround did not work either: the running guard is built once at
+    /// startup, so deleting a hash from `config.toml` changed nothing, and the
+    /// next successful `/pair` wrote the whole in-memory set back over the file
+    /// (`persist_pairing_tokens`), restoring the hash the operator had just
+    /// removed. The file looked clean while the token kept working.
+    ///
+    /// Called from the config hot-reloader, which makes `config.toml` the
+    /// authority. Every token the gateway issues is persisted before the
+    /// response is sent, so a live token survives a reload. The one exception
+    /// is a pair whose persistence *failed* — that response already tells the
+    /// client `"persisted": false` and "paired for this process", and such a
+    /// token now ends at the next reload rather than at restart.
+    ///
+    /// Accepts plaintext or already-hashed entries, matching [`Self::new`].
+    pub fn sync_tokens(&self, tokens: &[String]) {
+        let next: HashSet<String> = tokens
+            .iter()
+            .map(|t| {
+                if is_token_hash(t) {
+                    t.clone()
+                } else {
+                    hash_token(t)
+                }
+            })
+            .collect();
+        let mut current = self.paired_tokens.lock();
+        if *current != next {
+            tracing::info!(
+                target: "gateway",
+                was = current.len(),
+                now = next.len(),
+                "paired tokens re-synced from config.toml"
+            );
+            *current = next;
+        }
+    }
+
     /// Issue a fresh bearer token *unconditionally* — without matching the
     /// startup pairing code — and store its hash. Used when the code was
     /// validated out-of-band (e.g. consumed from the on-disk
@@ -602,6 +643,58 @@ mod tests {
             err >= PAIR_LOCKOUT_SECS - 1,
             "Remaining lockout should be ~{PAIR_LOCKOUT_SECS}s, got {err}s"
         );
+    }
+
+    #[test]
+    async fn sync_tokens_revokes_one_removed_from_config() {
+        // The point of the whole change: deleting a hash from config.toml must
+        // actually stop that token working. There was no removal path at all
+        // before, and the guard was built once at startup.
+        let guard = PairingGuard::new(true, &[]);
+        let a = guard.issue_token();
+        let b = guard.issue_token();
+        assert!(guard.is_authenticated(&a));
+        assert!(guard.is_authenticated(&b));
+
+        // Operator edits config.toml, leaving only b's hash.
+        guard.sync_tokens(&[hash_token(&b)]);
+
+        assert!(
+            !guard.is_authenticated(&a),
+            "removed token must stop working"
+        );
+        assert!(guard.is_authenticated(&b), "kept token must still work");
+    }
+
+    #[test]
+    async fn sync_tokens_adds_tokens_present_only_in_config() {
+        // Another process (CLI pairing) may have written a token to the file.
+        let guard = PairingGuard::new(true, &[]);
+        let outside = "zc_a_token_issued_elsewhere";
+        assert!(!guard.is_authenticated(outside));
+        guard.sync_tokens(&[hash_token(outside)]);
+        assert!(guard.is_authenticated(outside));
+    }
+
+    #[test]
+    async fn sync_tokens_accepts_plaintext_or_hashed_entries() {
+        // Mirrors PairingGuard::new, which tolerates both shapes.
+        let guard = PairingGuard::new(true, &[]);
+        let plain = "zc_plaintext_token_value";
+        guard.sync_tokens(&[plain.to_string()]);
+        assert!(guard.is_authenticated(plain));
+        guard.sync_tokens(&[hash_token(plain)]);
+        assert!(guard.is_authenticated(plain), "hashed form is equivalent");
+    }
+
+    #[test]
+    async fn sync_tokens_with_an_empty_config_revokes_everything() {
+        let guard = PairingGuard::new(true, &[]);
+        let t = guard.issue_token();
+        assert!(guard.is_authenticated(&t));
+        guard.sync_tokens(&[]);
+        assert!(!guard.is_authenticated(&t));
+        assert!(guard.tokens().is_empty());
     }
 
     #[test]
