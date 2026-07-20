@@ -38,6 +38,12 @@ permissions:
     packages: write
     actions: read
     id-token: write # Required for cosign keyless signing via OIDC
+    # Required for GitHub's immutable-release attestation policy. Without it the
+    # release step aborts mid-upload with "Error creating policy" and leaves a
+    # draft with only some assets (v0.8.3-alpha's first two attempts: 18/20 then
+    # 4/20). v0.8.2-alpha predates the immutable-releases rollout, which is why
+    # the same pinned workflow published fine hours earlier.
+    attestations: write
 
 env:
     CARGO_TERM_COLOR: always
