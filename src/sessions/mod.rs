@@ -4,5 +4,5 @@ mod store;
 mod types;
 
 pub use migrations::run_migrations;
-pub use store::{derive_session_title, SessionStore};
+pub use store::{derive_session_title, SessionRef, SessionStore};
 pub use types::{messages_to_turns, Message, SearchResult, Session, SessionMeta};
