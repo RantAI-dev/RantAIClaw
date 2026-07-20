@@ -191,9 +191,13 @@ impl CommandHandler for TitleCommand {
         };
         ctx.session_store.set_title(&sid, title)?;
 
+        // Echo what was actually stored, not what was typed — `set_title`
+        // normalises (control characters dropped, whitespace collapsed, length
+        // capped), so reporting the raw input could show a title that is not
+        // the one on the session.
         Ok(CommandResult::Message(format!(
             "Session title set to: {}",
-            title
+            crate::sessions::normalize_set_title(title)
         )))
     }
 }

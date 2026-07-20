@@ -733,9 +733,16 @@ async fn sessions_set_title(
         1 => matched[0],
         n => return Err(err_400(format!("`{id}` is ambiguous ({n} matches)"))),
     };
-    store.set_title(&session.id, &body.title).map_err(err_500)?;
+    // Normalise here too, so an unusable title is a 400 rather than the 500 the
+    // store's own guard would surface. The store still checks — this is the
+    // status-code shape, not the security boundary.
+    let title = crate::sessions::normalize_set_title(&body.title);
+    if title.is_empty() {
+        return Err(err_400("title is empty after normalisation"));
+    }
+    store.set_title(&session.id, &title).map_err(err_500)?;
     Ok(Json(
-        serde_json::json!({ "id": session.id, "title": body.title }),
+        serde_json::json!({ "id": session.id, "title": title }),
     ))
 }
 
