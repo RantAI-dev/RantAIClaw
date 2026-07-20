@@ -740,6 +740,7 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
         state.config.clone(),
         state.config_fingerprint.clone(),
         config.config_path.clone(),
+        state.pairing.clone(),
     );
 
     // Build router with middleware
@@ -1147,6 +1148,7 @@ fn spawn_config_reloader(
     config: Arc<Mutex<Config>>,
     config_fingerprint: Arc<Mutex<String>>,
     config_path: std::path::PathBuf,
+    pairing: Arc<PairingGuard>,
 ) {
     tokio::spawn(async move {
         let mut watcher = match crate::config::watcher::ConfigWatcher::watch(&config_path) {
@@ -1159,6 +1161,11 @@ fn spawn_config_reloader(
         while watcher.reload_rx.recv().await.is_some() {
             match Config::load_or_init().await {
                 Ok(fresh) => {
+                    // Re-sync the pairing guard so `config.toml` is actually the
+                    // authority on which tokens are valid. Without this the
+                    // guard is whatever it was built with at startup, and
+                    // deleting a token hash from the file revoked nothing.
+                    pairing.sync_tokens(&fresh.gateway.paired_tokens);
                     *config.lock() = fresh;
                     *config_fingerprint.lock() =
                         crate::config::fingerprint::fingerprint_file(&config_path);
