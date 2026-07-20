@@ -296,11 +296,23 @@ up (or turn it off) with `rantaiclaw setup login`; do not hand-edit the hash.
 | `username` | _(unset)_ | operator username, verified on login (not secret) |
 | `password_hash` | _(unset)_ | argon2 PHC hash of the password; **its presence enables the login gate** |
 
-When enabled, the console and TUI require the password before use. `POST /login`
-(`{username, password}`) returns a bearer token that authenticates `/api/v1/*`,
-and `ui start` stops auto-injecting a token so the browser prompts for it.
-Enabling this requires a claw-ui build that ships the login page. When
-`password_hash` is unset, behavior is unchanged (pairing/auto-pair as before).
+When enabled, the console and TUI require the password before use. Enabling it
+requires a claw-ui build that ships the login page. When `password_hash` is
+unset, behavior is unchanged (pairing/auto-pair as before).
+
+**`POST /login` is verify-only.** It takes `{username, password}` and returns
+`{"ok": true}` — no token. The console (the claw-ui BFF) authenticates at its
+own edge and keeps the gateway bearer token server-side; the gateway never hands
+a token to the browser.
+
+> **This login does not protect the HTTP API.** `/api/v1/*` is gated by
+> `[gateway].require_pairing` and a paired bearer token, and nothing in that
+> check consults `[gateway.login]`. Setting `require_pairing = false` therefore
+> opens every `/api/v1/*` route — including `agent/chat`, session deletion, and
+> the config/secrets surface — to anyone who can reach the port, **even with a
+> console password configured**. The login page still appears, so the surface
+> looks protected when it is not. Leave `require_pairing = true` unless the
+> gateway is unreachable from anywhere but the local process.
 
 ## `[ui]`
 
