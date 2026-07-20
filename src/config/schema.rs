@@ -3930,6 +3930,36 @@ impl Config {
             anyhow::bail!("gateway.host must not be empty");
         }
 
+        // Console login: the two fields are independently settable, but the
+        // gate keys "is login enabled" on `password_hash` alone while the
+        // comparison needs a username. A hash without one makes every login
+        // attempt fail with "Invalid username or password" — unfalsifiable from
+        // the login form — and burns a brute-force lockout slot each try. Fail
+        // at load rather than let the operator debug an unwinnable prompt.
+        let login = &self.gateway.login;
+        let has_hash = login
+            .password_hash
+            .as_deref()
+            .is_some_and(|h| !h.trim().is_empty());
+        let has_user = login
+            .username
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty());
+        if has_hash && !has_user {
+            anyhow::bail!(
+                "gateway.login.password_hash is set but gateway.login.username is empty — \
+                 every login attempt would fail. Run `rantaiclaw setup login` to set both, \
+                 or clear password_hash to turn the gate off."
+            );
+        }
+        if has_user && !has_hash {
+            anyhow::bail!(
+                "gateway.login.username is set but gateway.login.password_hash is empty — \
+                 the login gate is off, so the username has no effect. Run \
+                 `rantaiclaw setup login` to finish enabling it, or clear username."
+            );
+        }
+
         // Autonomy
         if self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
@@ -6152,6 +6182,50 @@ default_temperature = 0.7
         assert!(error.to_string().contains(
             "default_model uses ':cloud' with provider 'ollama', but api_url is local or unset"
         ));
+    }
+
+    #[test]
+    async fn validate_rejects_password_hash_without_username() {
+        // The gate keys "enabled" on password_hash alone, but the comparison
+        // needs a username — so a hash without one is an unwinnable prompt.
+        let mut config = Config::default();
+        config.gateway.login.password_hash = Some("$argon2id$v=19$m=1,t=1,p=1$a$b".into());
+        let error = config.validate().expect_err("expected validation to fail");
+        assert!(
+            error.to_string().contains("username is empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_username_without_password_hash() {
+        let mut config = Config::default();
+        config.gateway.login.username = Some("rantaiclaw_operator".into());
+        let error = config.validate().expect_err("expected validation to fail");
+        assert!(
+            error.to_string().contains("password_hash is empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_both_set_or_neither() {
+        // Default (gate off) and a fully configured gate both pass.
+        assert!(Config::default().validate().is_ok());
+
+        let mut config = Config::default();
+        config.gateway.login.username = Some("rantaiclaw_operator".into());
+        config.gateway.login.password_hash = Some("$argon2id$v=19$m=1,t=1,p=1$a$b".into());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn validate_treats_whitespace_only_login_fields_as_unset() {
+        // A blank string is not a credential; it must not look like one.
+        let mut config = Config::default();
+        config.gateway.login.username = Some("   ".into());
+        config.gateway.login.password_hash = Some("$argon2id$v=19$m=1,t=1,p=1$a$b".into());
+        assert!(config.validate().is_err());
     }
 
     #[test]
