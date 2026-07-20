@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 13;
+pub const CURRENT_VERSION: u32 = 14;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -207,8 +207,17 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive default-only field)
     }
 
-    // Future migrations (v14, v15, …) inserted here in order.
-    // if from < 14 { migrate_v14(raw)?; }
+    // v13 → v14: `[gateway.login].idle_timeout_secs` (u64, default 0) was added
+    // — auto-lock after N seconds without operator input, `0` meaning never.
+    // The default is inert, so existing configs keep behaving exactly as before
+    // and there is nothing to transform. Burns a version slot so the
+    // schema_drift fingerprint is accepted with intent.
+    if from < 14 {
+        // (no transformation; additive default-only field)
+    }
+
+    // Future migrations (v15, v16, …) inserted here in order.
+    // if from < 15 { migrate_v15(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -272,6 +281,30 @@ mod tests {
                 .and_then(|g| g.get("port"))
                 .and_then(|p| p.as_integer()),
             Some(3000)
+        );
+    }
+
+    #[test]
+    fn v13_to_v14_is_additive_noop_preserving_login_credential() {
+        let mut raw = parse(
+            "schema_version = 13\n[gateway.login]\nusername = \"rantaiclaw_user\"\npassword_hash = \"$argon2id$v=19$m=1,t=1,p=1$a$b\"\n",
+        );
+        let changed = migrate(&mut raw).unwrap();
+        assert!(changed, "stamps the new version");
+        assert_eq!(version_of(&raw), Some(CURRENT_VERSION.into()));
+        // The stored credential survives untouched, and the new key is left
+        // absent so the inert serde default (0 = never lock) applies.
+        let login = raw
+            .get("gateway")
+            .and_then(|g| g.get("login"))
+            .expect("login table survives");
+        assert_eq!(
+            login.get("username").and_then(|u| u.as_str()),
+            Some("rantaiclaw_user")
+        );
+        assert!(
+            login.get("idle_timeout_secs").is_none(),
+            "migration must not write the new key; the serde default supplies it"
         );
     }
 

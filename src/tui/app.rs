@@ -6958,10 +6958,33 @@ async fn run_loop(
     app: &mut TuiApp,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
+    // Auto-lock clock. Local to the loop on purpose: the gate is re-armed from
+    // right here and nothing else needs to read it, so this stays off `App` and
+    // out of its five test fixtures. Any terminal event counts as operator
+    // presence (keys, mouse, resize, focus).
+    let mut last_input_at = std::time::Instant::now();
+
     loop {
         // Drain any buffered agent events before rendering so the frame
         // reflects the latest streaming state.
         app.drain_events();
+
+        // Re-arm the login gate after an idle stretch, so an unattended
+        // terminal does not stay unlocked. Config is re-read every iteration
+        // rather than captured once, so a reload that changes the timeout (or
+        // removes the credential entirely) takes effect without a restart.
+        // The gate masks the UI only — an in-flight turn keeps streaming behind
+        // it and is intact when the operator unlocks.
+        if crate::tui::widgets::login_gate::should_relock(
+            app.login_gate.is_some(),
+            app.config.gateway.login.password_hash.is_some(),
+            std::time::Duration::from_secs(app.config.gateway.login.idle_timeout_secs),
+            last_input_at.elapsed(),
+        ) {
+            app.login_gate = Some(crate::tui::LoginGateState::new(
+                app.config.gateway.login.username.clone(),
+            ));
+        }
 
         // /new and /clear wipe the screen; the next render redraws a fresh
         // chat pane from the (now-empty) message list.
@@ -6990,6 +7013,10 @@ async fn run_loop(
         };
         if event::poll(std::time::Duration::from_millis(poll_ms))? {
             let ev = event::read()?;
+            // Operator is present — push the auto-lock deadline out. Done for
+            // every event kind, including the ones consumed by the gate itself,
+            // so typing a password can never race the clock that armed it.
+            last_input_at = std::time::Instant::now();
             // Inline mode pins a 6-row viewport to the bottom of the
             // terminal. When the terminal is resized, ratatui repaints
             // the viewport at the new bottom row, but the previous

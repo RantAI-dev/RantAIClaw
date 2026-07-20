@@ -892,6 +892,14 @@ pub struct GatewayLoginConfig {
     /// verbatim (NOT routed through the reversible secret-encryption pass).
     #[serde(default)]
     pub password_hash: Option<String>,
+    /// Auto-lock after this many seconds without operator input. `0` (the
+    /// default) disables it, preserving the historical behaviour where a
+    /// session stays unlocked until the operator quits. The TUI re-arms its
+    /// login gate; the web console expires its session cookie. Only meaningful
+    /// alongside `password_hash` — with no credential there is nothing to
+    /// unlock with, so the timeout is ignored.
+    #[serde(default)]
+    pub idle_timeout_secs: u64,
 }
 
 /// Gateway server configuration (`[gateway]` section).
@@ -4479,6 +4487,7 @@ mod tests {
         let g = GatewayConfig::default();
         assert!(g.login.username.is_none());
         assert!(g.login.password_hash.is_none());
+        assert_eq!(g.login.idle_timeout_secs, 0, "auto-lock is off by default");
     }
 
     #[tokio::test]
@@ -4486,10 +4495,22 @@ mod tests {
         let mut g = GatewayConfig::default();
         g.login.username = Some("op".into());
         g.login.password_hash = Some("$argon2id$v=19$m=1,t=1,p=1$abc$def".into());
+        g.login.idle_timeout_secs = 900;
         let s = toml::to_string(&g).unwrap();
         let back: GatewayConfig = toml::from_str(&s).unwrap();
         assert_eq!(back.login.username.as_deref(), Some("op"));
         assert_eq!(back.login.password_hash, g.login.password_hash);
+        assert_eq!(back.login.idle_timeout_secs, 900);
+    }
+
+    #[tokio::test]
+    async fn gateway_login_idle_timeout_is_optional_in_toml() {
+        // Configs written before the key existed must still deserialise, and
+        // must land on the inert default rather than picking up an auto-lock
+        // nobody asked for.
+        let back: GatewayConfig =
+            toml::from_str("[login]\nusername = \"op\"\n").expect("legacy config parses");
+        assert_eq!(back.login.idle_timeout_secs, 0);
     }
 
     #[tokio::test]
