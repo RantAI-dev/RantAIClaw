@@ -931,6 +931,15 @@ pub struct GatewayConfig {
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit_per_minute: u32,
 
+    /// Max `/api/v1/*` requests per minute per client key.
+    ///
+    /// Generous by default — the console polls `/status` every 15 s and
+    /// refreshes several panels — but bounded, because `POST /api/v1/agent/chat`
+    /// drives real provider inference and an unbounded caller is a direct
+    /// cost-amplification path against the operator's provider billing.
+    #[serde(default = "default_api_rate_limit")]
+    pub api_rate_limit_per_minute: u32,
+
     /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
     /// Disabled by default; enable only behind a trusted reverse proxy.
     #[serde(default)]
@@ -1000,6 +1009,13 @@ fn default_webhook_rate_limit() -> u32 {
     60
 }
 
+/// 600/min ≈ 10/s. The bundled console's own traffic (a 15 s `/status` poll
+/// plus panel refreshes) sits far under this, so the limit only bites on
+/// something looping.
+fn default_api_rate_limit() -> u32 {
+    600
+}
+
 fn default_idempotency_ttl_secs() -> u64 {
     300
 }
@@ -1030,6 +1046,7 @@ impl Default for GatewayConfig {
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
+            api_rate_limit_per_minute: default_api_rate_limit(),
             trust_forwarded_headers: false,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
@@ -5692,6 +5709,7 @@ channel_id = "C123"
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
+            api_rate_limit_per_minute: 900,
             trust_forwarded_headers: true,
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,

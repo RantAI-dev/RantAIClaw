@@ -157,14 +157,21 @@ impl SlidingWindowRateLimiter {
 pub struct GatewayRateLimiter {
     pair: SlidingWindowRateLimiter,
     webhook: SlidingWindowRateLimiter,
+    api: SlidingWindowRateLimiter,
 }
 
 impl GatewayRateLimiter {
-    pub fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
+    pub fn new(
+        pair_per_minute: u32,
+        webhook_per_minute: u32,
+        api_per_minute: u32,
+        max_keys: usize,
+    ) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
             webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
+            api: SlidingWindowRateLimiter::new(api_per_minute, window, max_keys),
         }
     }
 
@@ -175,6 +182,53 @@ impl GatewayRateLimiter {
     fn allow_webhook(&self, key: &str) -> bool {
         self.webhook.allow(key)
     }
+
+    fn allow_api(&self, key: &str) -> bool {
+        self.api.allow(key)
+    }
+}
+
+/// Per-client rate limit for the `/api/v1/*` control plane.
+///
+/// `/pair` and `/login` have had brute-force limits since they shipped; the
+/// routes that actually spend money did not. `POST /api/v1/agent/chat` drives
+/// real provider inference and spawns an agent per call, so an unbounded caller
+/// — a runaway script as easily as a hostile one — is a direct cost-amplification
+/// path against the operator's provider billing.
+///
+/// Applied to the `api_v1` and `config_api` routers before they are merged, so
+/// it covers those routes and leaves the KB router's own body/timeout tuning
+/// alone.
+/// `ConnectInfo` is `Option`al on purpose. `run_gateway` serves the router via
+/// `into_make_service_with_connect_info`, so the peer address is present in
+/// production — but a caller that mounts the router without it (the integration
+/// tests do) would otherwise get a `500` from the extractor on every request.
+/// Falling back matches `client_key_from_request`'s own `"unknown"` bucket.
+async fn api_rate_limit(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // Read the peer out of the extensions rather than extracting it, so a
+    // missing `ConnectInfo` degrades to the shared `"unknown"` bucket instead of
+    // rejecting the request.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    let key = client_key_from_request(peer, req.headers(), state.trust_forwarded_headers);
+    if state.rate_limiter.allow_api(&key) {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, RATE_LIMIT_WINDOW_SECS.to_string())],
+        Json(serde_json::json!({
+            "error": "rate_limited",
+            "detail": "Too many requests to /api/v1. Raise [gateway].api_rate_limit_per_minute if this is legitimate traffic.",
+        })),
+    )
+        .into_response()
 }
 
 /// Idempotency key lifecycle: `InProgress` while the request is being
@@ -616,6 +670,7 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
     let rate_limiter = Arc::new(GatewayRateLimiter::new(
         config.gateway.pair_rate_limit_per_minute,
         config.gateway.webhook_rate_limit_per_minute,
+        config.gateway.api_rate_limit_per_minute,
         rate_limit_max_keys,
     ));
     let idempotency_max_keys = normalize_max_keys(
@@ -719,8 +774,16 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
             get(task_handlers::handle_list_comments).post(task_handlers::handle_add_comment),
         )
         .route("/tasks/{id}/events", get(task_handlers::handle_list_events))
-        .merge(api_v1::router())
-        .merge(config_api::router())
+        .merge(api_v1::router().layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api_rate_limit,
+        )))
+        .merge(
+            config_api::router().layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_rate_limit,
+            )),
+        )
         // The 64 KiB body cap and 120 s timeout apply to webhook + api_v1
         // routes (small JSON bodies, fast handlers). They are deliberately NOT
         // applied to the KB router below, which sets its own larger upload
@@ -2415,7 +2478,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -2465,7 +2528,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -2490,10 +2553,39 @@ mod tests {
 
     #[test]
     fn gateway_rate_limiter_blocks_after_limit() {
-        let limiter = GatewayRateLimiter::new(2, 2, 100);
+        let limiter = GatewayRateLimiter::new(2, 2, 2, 100);
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(!limiter.allow_pair("127.0.0.1"));
+    }
+
+    #[test]
+    fn api_rate_limiter_blocks_after_limit() {
+        let limiter = GatewayRateLimiter::new(100, 100, 2, 100);
+        assert!(limiter.allow_api("127.0.0.1"));
+        assert!(limiter.allow_api("127.0.0.1"));
+        assert!(!limiter.allow_api("127.0.0.1"));
+    }
+
+    #[test]
+    fn api_rate_limit_is_per_client_and_independent_of_pair_and_webhook() {
+        // Separate windows: exhausting one surface must not lock the others,
+        // and one noisy client must not lock a different one out.
+        let limiter = GatewayRateLimiter::new(1, 1, 1, 100);
+        assert!(limiter.allow_api("client-a"));
+        assert!(
+            !limiter.allow_api("client-a"),
+            "client-a exhausted its window"
+        );
+        assert!(
+            limiter.allow_api("client-b"),
+            "a different client is unaffected"
+        );
+        assert!(limiter.allow_pair("client-a"), "the pair window is its own");
+        assert!(
+            limiter.allow_webhook("client-a"),
+            "the webhook window is its own"
+        );
     }
 
     #[test]
@@ -2702,7 +2794,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(true, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -2959,7 +3051,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -3024,7 +3116,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -3101,7 +3193,7 @@ mod tests {
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -3150,7 +3242,7 @@ mod tests {
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -3204,7 +3296,7 @@ mod tests {
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -3263,7 +3355,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -3318,7 +3410,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -3376,7 +3468,7 @@ mod tests {
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,

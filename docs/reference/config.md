@@ -285,6 +285,16 @@ Notes:
 | `port` | `9393` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
+| `pair_rate_limit_per_minute` | `10` | max `/pair` + `/login` attempts per minute per client |
+| `webhook_rate_limit_per_minute` | `60` | max `/webhook` requests per minute per client |
+| `api_rate_limit_per_minute` | `600` | max `/api/v1/*` requests per minute per client |
+
+`api_rate_limit_per_minute` exists because `POST /api/v1/agent/chat` drives real
+provider inference — an unbounded caller is a direct cost-amplification path
+against your provider billing, and `/pair` had brute-force protection while the
+routes that spend money had none. The default (≈10/s) sits far above the
+bundled console's own traffic, so it only bites on something looping. Over the
+limit returns `429` with `Retry-After`.
 
 ### `[gateway.login]`
 
