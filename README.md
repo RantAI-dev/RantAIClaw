@@ -5,7 +5,7 @@
 <h3 align="center">Multi-Agent Runtime for Production AI Employees</h3>
 
 <p align="center">
-  <strong>100% Rust</strong> · Zero overhead · Multi-channel · Live config · ClawHub compatible
+  <strong>100% Rust</strong> · Single binary · 17 channels · Live config API · ClawHub compatible
 </p>
 
 <p align="center">
@@ -17,12 +17,14 @@
 
 <p align="center">
   <a href="#install"><strong>Install</strong></a> ·
-  <a href="https://clawhub.ai">ClawHub Skills</a> ·
+  <a href="docs/README.md">Docs</a> ·
+  <a href="docs/reference/commands.md">Commands</a> ·
   <a href="docs/reference/config.md">Config</a> ·
   <a href="docs/reference/channels.md">Channels</a> ·
   <a href="docs/reference/providers.md">Providers</a> ·
+  <a href="docs/reference/api-v1.md">HTTP API</a> ·
   <a href="docs/start/troubleshooting.md">Troubleshooting</a> ·
-  <a href="CONTRIBUTING.md">Contributing</a>
+  <a href="docs/contributing/pr-workflow.md">Contributing</a>
 </p>
 
 <p align="center">
@@ -48,7 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/
 iwr https://raw.githubusercontent.com/RantAI-dev/RantAIClaw/main/scripts/install.ps1 -UseBasicParsing | iex
 ```
 
-Both installers detect your arch, download the matching prebuilt binary, verify SHA-256, amend `PATH`, and end by launching the **full guided setup wizard** (`rantaiclaw setup --force` — provider, approvals, channels, persona, skills, MCP). Pass `--skip-setup` / `-SkipSetup` (or set `RANTAICLAW_SKIP_SETUP=1`) to install only. **Windows alternative (WSL2):** install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the Linux one-liner above from inside the Ubuntu shell.
+Both installers detect your arch, download the matching prebuilt binary, verify SHA-256, amend `PATH`, and end by launching the **full guided setup wizard** (`rantaiclaw setup --force` — provider, approvals, channels, persona, skills, MCP, login, knowledge). Pass `--skip-setup` / `-SkipSetup` (or set `RANTAICLAW_SKIP_SETUP=1`) to install only. **Windows alternative (WSL2):** install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the Linux one-liner above from inside the Ubuntu shell.
 
 | Method | Command |
 |---|---|
@@ -57,6 +59,8 @@ Both installers detect your arch, download the matching prebuilt binary, verify 
 | From source | `git clone https://github.com/RantAI-dev/RantAIClaw.git && cd RantAIClaw && ./bootstrap.sh --from-source` |
 | Manual | [Pick a release archive](https://github.com/RantAI-dev/RantAIClaw/releases/latest), verify against `SHA256SUMS`, extract, move into `PATH` |
 | Homebrew *(planned)* | `brew install rantaiclaw` |
+
+Every release ships cosign-signed archives plus SBOMs (`rantaiclaw.cdx.json`, `rantaiclaw.spdx.json`).
 
 > **Step-by-step per-platform tutorial** (macOS Gatekeeper, Linux distro notes, Windows PowerShell, Raspberry Pi, Docker compose, cosign verify) is published with every release — see the latest [release notes](https://github.com/RantAI-dev/RantAIClaw/releases/latest). Long-form reference: [`docs/start/install.md`](docs/start/install.md) · [Troubleshooting](docs/start/troubleshooting.md).
 
@@ -69,7 +73,7 @@ rantaiclaw --version
 rantaiclaw setup         # re-walk any unconfigured sections
 rantaiclaw setup --force # re-walk every section from scratch
 rantaiclaw doctor        # validate the install
-rantaiclaw chat          # launch the TUI and start chatting
+rantaiclaw chat          # launch the TUI (also the default with no subcommand)
 ```
 
 ### Update / Rollback / Uninstall
@@ -77,146 +81,119 @@ rantaiclaw chat          # launch the TUI and start chatting
 ```bash
 rantaiclaw update             # self-replace from the latest release
 rantaiclaw rollback           # restore the pre-update binary snapshot
+rantaiclaw uninstall          # remove profile data, optionally the binary
 
-# Full uninstall
-rm -f ~/.cargo/bin/rantaiclaw ~/.local/bin/rantaiclaw
+# Manual removal — the installer picks the first writable dir on PATH, so check all of them
+rm -f ~/.cargo/bin/rantaiclaw ~/.local/bin/rantaiclaw /usr/local/bin/rantaiclaw
 rm -rf ~/.rantaiclaw          # config + workspace (back up first if needed)
 ```
+
+On Windows the PowerShell installer writes to `%LOCALAPPDATA%\Programs\rantaiclaw` — remove that directory and its `PATH` entry. If you set `RANTAICLAW_INSTALL_DIR` at install time, remove the binary from there instead.
 
 ---
 
 ## What is RantaiClaw?
 
-RantaiClaw is a **production-grade multi-agent runtime** written in Rust. It powers autonomous AI employees that communicate across channels (Discord, Slack, Telegram, WhatsApp), execute tools, manage memories, and run skills — all from a single binary.
+RantaiClaw is a **production-grade multi-agent runtime** written in Rust. It powers autonomous AI employees that talk across chat channels, execute tools, manage memories, query a local knowledge base, and run skills — all from a single binary.
 
 Built for **RantAI's digital employee platform**, RantaiClaw runs inside Docker containers as the execution engine for AI agents that operate 24/7 with real-world integrations.
 
-### Why Rust?
+### Measured footprint
 
-| Metric | RantaiClaw | Python alternatives |
-|--------|-----------|-------------------|
-| Cold start | **< 200ms** | 2-5s |
-| Memory (idle) | **~15 MB** | 200-500 MB |
-| Binary size | **~12 MB** | N/A (runtime + deps) |
-| Concurrent channels | **Thousands** | Hundreds |
+Measured against the published `v0.8.3-alpha` `x86_64-unknown-linux-gnu` release artifact:
 
-No garbage collector. No runtime overhead. Just async Rust with `tokio`.
+| Metric | Value |
+|--------|-------|
+| Binary size (uncompressed) | ~32.5 MB |
+| Release archive (download) | ~13.1 MB |
+| `rantaiclaw --version` cold start | < 10 ms |
+| Resident memory, trivial invocation | ~14 MB |
+
+Steady-state daemon memory depends on which channels, providers, and MCP servers you enable — measure it for your own configuration rather than trusting a headline number. No garbage collector, no interpreter startup: async Rust on `tokio`.
 
 ---
 
 ## Key Features
 
+### Interactive TUI
+
+`rantaiclaw chat` (or bare `rantaiclaw`) opens a fullscreen terminal chat with a bottom-pinned composer:
+
+- **Readline chords** — `Ctrl+A` / `Ctrl+E` / `Ctrl+U` / `Ctrl+K` / `Ctrl+W` in the composer.
+- **Mouse and keyboard scroll** — wheel, `PgUp` / `PgDn`; the view sticks to the bottom while streaming.
+- **Soft-wrap aware caret** — `Up` / `Down` move by visual row, not logical line.
+- **`Shift+Tab`** cycles the approval-policy preset in place; `/autonomy` opens the picker.
+- **Slash commands** — `/skill`, `/cron`, `/setup`, `/autonomy` and more; `/help` lists them.
+
 ### Multi-Channel Communication
-Connect your agent to any combination of channels simultaneously:
 
-| Channel | Status | Protocol |
-|---------|--------|----------|
-| Telegram | Stable | Long-poll API |
-| Discord | Stable | WebSocket gateway |
-| Slack | Stable | Socket Mode / Web API |
-| WhatsApp Web | Stable | Multi-device protocol |
-| WhatsApp Cloud | Stable | Cloud API |
-| Matrix (E2EE) | Feature-gated | Matrix SDK |
-| Mattermost | Stable | WebSocket |
-| Signal | Stable | signal-cli REST |
-| Email (IMAP/SMTP) | Stable | IMAP + SMTP |
-| IRC | Stable | IRC protocol |
-| DingTalk | Stable | WebSocket |
-| Lark/Feishu | Feature-gated | WebSocket |
-| CLI | Built-in | stdin/stdout |
+Connect your agent to any combination of channels simultaneously. Each channel renders the model's Markdown into whatever the target platform actually understands, so replies do not leak raw CommonMark:
 
-Each channel runs independently with its own lifecycle — add, remove, or update channels at runtime without restarting.
+| Channel | Build gate | Reply rendering |
+|---------|-----------|-----------------|
+| Telegram | built in | HTML |
+| Discord | built in | Markdown (fenced-code aware splitting) |
+| Slack | built in | mrkdwn (single-char markup + Slack links) |
+| Mattermost | built in | Markdown (native tables) |
+| DingTalk | built in | Markdown |
+| WhatsApp Cloud | built in | single-char markup |
+| WhatsApp Web | `whatsapp-web` *(default on)* | single-char markup |
+| Signal | built in | plain text |
+| Email (IMAP/SMTP) | built in | plain text |
+| IRC | built in | plain text |
+| QQ | built in | plain text |
+| Linq | built in | plain text |
+| Nextcloud Talk | built in | plain text |
+| iMessage | built in | plain text |
+| Lark/Feishu | `channel-lark` | plain text |
+| Matrix (E2EE) | `channel-matrix` | Markdown via matrix-sdk *(not yet on the shared renderer)* |
+| CLI | built in | plain text |
 
-### Live Config API
-Update any configuration at runtime via HTTP:
+Each channel runs independently with its own lifecycle — add, remove, or update channels at runtime without restarting. Per-platform setup: [`docs/reference/channels.md`](docs/reference/channels.md).
+
+### Web Console
+
+The console is a **separate Next.js app** ([claw-ui](https://github.com/RantAI-dev/claw-ui)), deliberately not bundled into the binary. The CLI fetches a pinned prebuilt release, checks SHA-256, and verifies the cosign signature when `cosign` is on `PATH` — it refuses outright if the signature bundle is missing, and warns and continues on SHA-256 alone if `cosign` is not installed. Install `cosign` first if you want signature verification enforced.
 
 ```bash
-# Hot-swap model without restart
-curl -X PATCH http://localhost:8080/config/model \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"provider": "anthropic", "model": "claude-sonnet-4-20250514"}'
-
-# Add a Discord channel while running
-curl -X PATCH http://localhost:8080/config/channels \
-  -d '{"discord": {"bot_token": "...", "guild_id": "..."}}'
-
-# Remove a channel gracefully
-curl -X PATCH http://localhost:8080/config/channels \
-  -d '{"telegram": null}'
-
-# Start an MCP server for GitHub tools
-curl -X PATCH http://localhost:8080/config/mcp-servers \
-  -d '{"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "..."}}}'
+rantaiclaw ui install     # download + verify the pinned claw-ui release
+rantaiclaw ui start       # serve the console on http://127.0.0.1:3939
+rantaiclaw ui stop
+rantaiclaw ui path        # where it was installed
 ```
 
-Changes persist to `config.runtime.toml` and survive restarts.
+Two processes, two ports: the Rust binary serves the API on the gateway port, Node serves the console on `3939`. The console authenticates at its own edge and holds the gateway bearer token server-side — the browser never sees it. Requires Node.js ≥ 18.18.
+
+Protect it with a username/password gate (Argon2id, verified at `POST /login`):
+
+```toml
+[gateway.login]
+username = "operator"
+password_hash = "$argon2id$..."   # written by `rantaiclaw setup login`
+```
 
 ### Multi-Provider Intelligence
-Route to any LLM provider with automatic fallback:
 
-- **OpenRouter** — access 200+ models through one API
-- **OpenAI** — GPT-4o, o1, o3
-- **Anthropic** — Claude Sonnet, Opus, Haiku
-- **Google Gemini** — Gemini 2.5 Pro/Flash
-- **Copilot** — GitHub Copilot models
-- **ZAI GLM** — Chinese language models
-- Custom OpenAI-compatible endpoints
+Route to any LLM provider with automatic fallback. 33 providers ship built in (many with several alias keys), including:
 
-### ClawHub Skills Ecosystem
-Install community skills from [ClawHub](https://clawhub.ai):
+- **Aggregators** — OpenRouter, Vercel AI Gateway, Cloudflare AI Gateway, OpenCode Zen
+- **Frontier** — Anthropic, OpenAI (plus Codex subscription auth), Google Gemini, xAI, Mistral, Cohere
+- **Fast inference** — Groq, Together AI, Fireworks AI, Perplexity, NVIDIA NIM
+- **Open / regional** — DeepSeek, Qwen/DashScope, Z.AI, GLM/Zhipu, MiniMax, Moonshot/Kimi, Doubao, Qianfan
+- **Local** — Ollama, LM Studio, llama.cpp
+- **Cloud** — AWS Bedrock, GitHub Copilot
+- **Custom** — any OpenAI-compatible endpoint via `custom:<url>`, or `anthropic-custom:<url>`
 
 ```bash
-rantaiclaw skill install deploy-checker
-rantaiclaw skill install code-reviewer
-rantaiclaw skill install meeting-summarizer
+rantaiclaw providers          # list every supported key
+rantaiclaw models refresh     # refresh model catalogs
+rantaiclaw auth login --provider openai-codex   # OAuth; Codex is the only login provider
+rantaiclaw auth setup-token   # Anthropic subscription tokens (paste-token / paste-redirect too)
 ```
 
-Skills are workspace-scoped markdown files with embedded tools and instructions. Create your own:
+Full matrix with base URLs and auth notes: [`docs/reference/providers.md`](docs/reference/providers.md).
 
-```markdown
-# SKILL.md — deploy-checker
-
-## Description
-Validates deployment readiness before release.
-
-## Tools
-- name: run_checks
-  kind: shell
-  command: ./scripts/pre-deploy.sh
-
-## Instructions
-- Always run pre-deploy checks before approving a release
-- Report any failing checks with specific remediation steps
-```
-
-### MCP Server Management
-Run Model Context Protocol servers inside the container for tool integrations:
-
-- **GitHub** — repositories, issues, PRs, code search
-- **Slack** — channels, messages, users
-- **Notion** — pages, databases, blocks
-- **Linear** — issues, projects, cycles
-- **Custom** — any MCP-compatible server
-
-MCP servers are supervised with automatic restart on crash (exponential backoff, max 5 retries).
-
-### Agentic Tool System
-Built-in tools with security boundaries:
-
-| Tool | Description |
-|------|-------------|
-| `shell` | Execute commands (sandboxed, allowlist-controlled) |
-| `file_read` | Read files from workspace |
-| `file_write` | Write files to workspace |
-| `web_search` | Search the web |
-| `memory_store` | Persist facts to long-term memory |
-| `memory_recall` | Query memory by semantic similarity |
-| `cron_schedule` | Create/manage scheduled tasks |
-| `send_message` | Message coworkers |
-| `browser` | Web automation (optional, feature-gated) |
-| `composio` | 150+ app integrations via Composio |
-
-### Autonomy
+### Autonomy and Approvals
 
 Two layers — the **runtime enum** the approval gate branches on, and the **four named presets** the setup wizard writes to disk.
 
@@ -224,74 +201,210 @@ Two layers — the **runtime enum** the approval gate branches on, and the **fou
 
 | Value | Behavior |
 |-------|----------|
-| `read_only` | Observe only; no shell, no writes |
+| `readonly` | Observe only; no shell, no writes |
 | `supervised` (default) | Boot allowlist + runtime allowlist; unknown shell commands trigger an interactive approval prompt instead of hard-failing |
 | `full` | Bypass the shell allowlist entirely (forbidden paths and `block_high_risk_commands` still apply) |
 
-**Setup wizard presets** (write the right runtime enum + command_allowlist + forbidden_paths bundle):
+**Setup wizard presets** (each writes a runtime enum + `allowed_commands` + `forbidden_paths` bundle):
 
 | Preset | Wizard label | Maps to |
 |---|---|---|
 | **Manual** | prompt for every tool call (safest) | `supervised` + empty allowlist |
-| **Smart** | prompt only for writes and system changes (recommended) | `supervised` + curated read-only allowlist |
-| **Strict** | deny-by-default, allow read-only | `supervised` + strict mode + read-only allowlist |
-| **Off** | autonomous execution, no prompts | `full` autonomy (CI / trusted environments only) |
+| **Smart** | safe read-only commands pre-allowed (recommended) | `supervised` + curated read-only allowlist |
+| **Strict** | deny-by-default, no prompts (unattended agents) | `supervised` + strict mode + reads plus safe-write bookkeeping (`memory_write`, `skill_install`, `cron_*`, `session_*`) |
+| **Off** | no gating at all (CI / fully-trusted only) | `full` autonomy |
 
-**v0.6.50+ approval UX** (Claude Code-style):
+Approval UX **in the TUI**:
 
-- **Inline single-key prompt.** When the agent attempts a command not on the allowlist, a boxed widget replaces the input row: `[Y] yes once` · `[A] always (persist)` · `[N] no` · `[Esc] deny`. No `/allow X` slash command required (it still works as a fallback for non-TUI channels).
-- **Indefinite wait.** The prompt sits until you act — no auto-deny clock. Matches CC's pause semantics so the LLM doesn't time out and try alternatives behind your back.
-- **Deny cancels the whole turn.** Saying no doesn't just reject the call — it cancels the entire LLM turn. One decision, one outcome; no loop on alternative commands.
+- **Inline single-key prompt.** When the agent attempts a command not on the allowlist, a boxed widget replaces the input row: `[Y] yes once` · `[A] always (persist)` · `[N] no` · `[Esc] deny`.
+- **Indefinite wait.** The prompt sits until you act — no auto-deny clock, so the model does not time out and try alternatives behind your back.
+- **Deny cancels the whole turn.** Saying no rejects the call *and* cancels the LLM turn. One decision, one outcome.
 - **Cascading approvals.** Commands like `cd … && python3 …` prompt for each blocking basename in the chain, capped at 6 per call.
-- **Strict preset = plan mode.** Under Strict the `shell` tool is **unregistered** from the model's tool list. The agent describes what commands the user could run, but doesn't try to execute them. CC plan-mode analog.
-- **Switch fast.** `Shift+Tab` cycles presets in the TUI; `/autonomy` opens the picker; `rantaiclaw autonomy <preset>` flips from the shell.
+
+On **chat channels and the gateway** the same gate applies with different ergonomics: approvals auto-deny after 300 s, and a denial fails that single tool call rather than cancelling the turn — the model may try something else. Use the `/allow X` slash command to persist an allowlist entry from those surfaces.
+- **Strict preset = plan mode.** Under Strict the `shell` tool is **unregistered** from the model's tool list — the agent describes what you could run instead of trying to run it.
+- **Switch fast.** `Shift+Tab` cycles presets in the TUI; `/autonomy` opens the picker; `rantaiclaw autonomy <preset>` flips it from the shell.
+
+### Agentic Tool System
+
+Roughly 45 tools are registered, gated by config and by the active preset:
+
+| Group | Tools |
+|-------|-------|
+| Shell and files | `shell`, `file_read`, `file_write`, `glob_search` |
+| Memory | `memory_store`, `memory_recall`, `memory_forget` |
+| Web | `web_search_tool`, `http_request`, `browser`, `browser_open` |
+| Scheduling | `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs`, `schedule` |
+| Tasks | `create_task`, `list_tasks`, `get_task`, `update_task_status`, `create_subtask`, `complete_subtask`, `review_task`, `add_comment`, `read_comments` |
+| Skills | `skills_list`, `skills_search`, `skill_view`, `skills_install`, `skills_install_deps`, `author_skill` |
+| Ops | `git_operations`, `proxy_config`, `ssh`, `pty`, `screenshot`, `image_info`, `pdf_read`, `pushover` |
+| Multi-agent | `delegate` |
+| Owner-only | `manage_permissions`, `issue_pairing_code` |
+| Integrations | `composio` (1000+ apps) |
+
+`ssh` and `pty` require the `remote-install` feature (on by default) and sit on the `always_ask` list. `browser`, `http_request`, and `web_search_tool` follow their config sections. Skills contribute their own `skill_<name>_<tool>` adapters at load time.
+
+### Knowledge Base
+
+A local, embedded RAG store (`kb` feature, **on by default**) with hybrid search, drift detection, and an entity/relation graph:
+
+```bash
+rantaiclaw kb ingest ./handbook.pdf     # PDF; Office documents with `kb-office`
+rantaiclaw kb search "refund policy"
+rantaiclaw kb list
+rantaiclaw kb drift                     # find stale embeddings
+rantaiclaw kb re-embed
+rantaiclaw kb graph                     # entity/relation view
+```
+
+Also exposed over HTTP under `/api/v1/kb/*`. See [`docs/reference/kb.md`](docs/reference/kb.md) and [`docs/reference/kb-tuning.md`](docs/reference/kb-tuning.md).
+
+### Cron and Scheduling
+
+Jobs added from the CLI run a **shell command** on a schedule (not an agent prompt):
+
+```bash
+rantaiclaw cron add "0 9 * * 1-5" "./scripts/daily-report.sh"   # cron expression
+rantaiclaw cron add-at "2026-08-01T09:00:00Z" "./scripts/launch.sh"  # RFC3339, one-shot
+rantaiclaw cron add-every 1800000 "./scripts/check-queue.sh"    # interval in MILLISECONDS
+rantaiclaw cron once 30m "./scripts/backup.sh"                  # relative delay: s/m/h/d
+rantaiclaw cron list
+rantaiclaw cron pause <id>    # also: resume, update, remove
+```
+
+The daemon runs the scheduler. Agent-prompt jobs are created by the agent itself through the `cron_*` and `schedule` tools. Cron is CLI/TUI/tool-driven today — there is no cron HTTP endpoint yet.
+
+### MCP Server Management
+
+Run Model Context Protocol servers as stdio subprocesses and expose their tools to the agent — GitHub, Slack, Notion, Linear, or any MCP-compatible server. Configure them in `config.toml` under `[mcp_servers.*]`, through `rantaiclaw setup mcp`, or live over the API.
+
+Servers are spawned once when the agent is constructed; a server that dies stays down until the agent is rebuilt (the gateway builds a fresh agent per chat request, so API-added servers take effect on the next call). Automatic respawn with backoff exists in the codebase but is not wired into the live path yet.
+
+**Known limitation:** MCP tools currently reach the TUI and the gateway (web console, `/api/v1/agent/chat`) only. Chat channels assemble their own tool list and do not include MCP tools, so an agent reached over Telegram, Discord, Slack, and the rest cannot call them.
+
+### ClawHub Skills Ecosystem
+
+Install community skills from [ClawHub](https://clawhub.ai):
+
+```bash
+rantaiclaw skills install deploy-checker
+rantaiclaw skills list
+rantaiclaw skills inspect deploy-checker
+```
+
+Skills are workspace-scoped. A `SKILL.md` carries instructions (metadata in YAML frontmatter); a `SKILL.toml` manifest is what registers executable tools. Create your own:
+
+```toml
+# SKILL.toml — deploy-checker
+prompts = ["Always run pre-deploy checks before approving a release."]
+
+[skill]
+name = "deploy-checker"
+description = "Validates deployment readiness before release."
+version = "0.1.0"
+
+[[tools]]
+name = "run_checks"
+description = "Run the pre-deploy validation script."
+kind = "shell"                     # shell | http | script
+command = "./scripts/pre-deploy.sh"
+```
 
 ### Memory System
+
 Multiple backends for persistent agent memory:
 
-- **SQLite** (default) — zero-config, file-based
+- **SQLite** (default) — zero-config, file-based, isolated per profile
 - **Markdown** — human-readable memory files
-- **PostgreSQL** — shared memory across agents (optional)
+- **PostgreSQL** — shared memory across agents (`memory-postgres` feature; use the exact key `postgres`)
 
-Memory supports semantic search via embeddings for context-aware recall.
+Recall is keyword-based (FTS5/BM25) out of the box: `embedding_provider` defaults to `"none"`. Set it to a real embedding provider to enable semantic vector recall on the SQLite backend. Past conversations are browsable with `rantaiclaw session list|search|get`.
+
+### Live Config API
+
+The gateway serves a versioned control plane on `127.0.0.1:9393` — localhost-only and pairing-gated by default. Pair once to get a bearer token, then:
+
+```bash
+TOKEN=...   # issued by `rantaiclaw channel pair` / POST /pair
+
+# Read the running config (secrets redacted)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9393/api/v1/config
+
+# Hot-swap the model without restarting
+curl -X PUT http://127.0.0.1:9393/api/v1/config/model \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"provider":"anthropic","model":"claude-sonnet-4.6","temperature":0.7}'
+
+# Tighten autonomy on the fly
+curl -X PUT http://127.0.0.1:9393/api/v1/config/autonomy \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"level":"readonly"}'
+
+# Add an MCP server while running
+curl -X POST http://127.0.0.1:9393/api/v1/config/mcp_servers/github \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"command":"npx","args":["-y","@modelcontextprotocol/server-github"]}'
+```
+
+Other surfaces: `/api/v1/status`, `/api/v1/doctor`, `/api/v1/agent/chat` (SSE or JSON), `/api/v1/sessions*`, `/api/v1/skills*`, `/api/v1/memory*`, `/api/v1/channels`, `/api/v1/providers*`, `/api/v1/secrets`, `/api/v1/kb/*`. Unauthenticated operational roots: `/health`, `/readyz`, `/metrics`. Inbound webhooks: `/webhook`, `/whatsapp`, `/linq`, `/nextcloud-talk`, `/triggers/*`.
+
+Changes persist to `config.runtime.toml` and survive restarts. Full endpoint reference: [`docs/reference/api-v1.md`](docs/reference/api-v1.md) · streaming details: [`docs/reference/api-v1-streaming.md`](docs/reference/api-v1-streaming.md).
 
 ---
 
-## Getting Started
+## Commands
 
 ```bash
-rantaiclaw chat                # Interactive TUI chat session
-rantaiclaw setup               # Guided wizard (or `rantaiclaw setup <topic>` for a single section)
+rantaiclaw chat                # Interactive TUI chat (default with no subcommand)
+rantaiclaw setup [topic]       # Guided wizard; topics: provider approvals channels
+                               #   persona skills mcp login knowledge
 rantaiclaw doctor              # Diagnostics: config, policy, daemon, system deps
-rantaiclaw daemon              # Run gateway: HTTP API + multi-channel listeners
-rantaiclaw skill install <id>  # Install a community skill from ClawHub
-rantaiclaw profile list        # Manage multi-profile configs (v0.5.0+)
+rantaiclaw daemon              # Gateway + channel listeners + scheduler + heartbeat
+rantaiclaw gateway             # Gateway server only (webhooks, HTTP API)
+rantaiclaw service install     # Run as an OS service (systemd/launchd)
+rantaiclaw autonomy <preset>   # Switch approval policy
+rantaiclaw channel list        # also: add, remove, pair, doctor, start
+rantaiclaw skills install <id> # Install a community skill from ClawHub
+rantaiclaw kb search "<query>" # Query the knowledge base
+rantaiclaw cron list           # Scheduled tasks
+rantaiclaw ui start            # Launch the web console
+rantaiclaw auth login --provider openai-codex
+                               # OAuth login (Codex only); see `auth --help` for token modes
+rantaiclaw session list        # Browse past sessions
+rantaiclaw memory list         # Inspect agent memory (also: get, stats, clear)
+rantaiclaw profile list        # Multi-profile configs
+rantaiclaw permissions show    # Per-role channel permissions
 rantaiclaw migrate --from auto # Import config from a legacy OpenClaw / ZeroClaw install
 rantaiclaw status              # Verify install and show config health
-rantaiclaw config get|set      # Inspect/update runtime config
+rantaiclaw config schema       # Dump the config JSON schema
+rantaiclaw completions <shell> # Shell completion script
 rantaiclaw --help              # All commands
 ```
 
-📖 **[Full install reference →](docs/start/install.md)** · **[Troubleshooting →](docs/start/troubleshooting.md)** · **[Releases →](https://github.com/RantAI-dev/RantAIClaw/releases)**
+📖 **[Full command reference →](docs/reference/commands.md)** · **[Install guide →](docs/start/install.md)** · **[Troubleshooting →](docs/start/troubleshooting.md)** · **[Releases →](https://github.com/RantAI-dev/RantAIClaw/releases)**
 
 ---
 
 ## Configuration
 
-RantaiClaw uses TOML configuration at `~/.rantaiclaw/config.toml`:
+RantaiClaw uses TOML configuration at `~/.rantaiclaw/config.toml`. The values below are the real shipped defaults:
 
 ```toml
-# Model configuration
+schema_version = 13
+
+# Model
 default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4-20250514"
+default_model = "anthropic/claude-sonnet-4.6"
 default_temperature = 0.7
 
 # Autonomy
 [autonomy]
 level = "supervised"
-auto_approve = ["file_read", "memory_recall", "web_search"]
+auto_approve = ["file_read", "memory_recall"]
+always_ask = ["ssh", "pty"]
 workspace_only = true
-max_actions_per_hour = 100
+max_actions_per_hour = 200
+block_high_risk_commands = false
 
 # Channels
 [channels_config]
@@ -300,13 +413,13 @@ cli = true
 [channels_config.discord]
 bot_token = "..."
 guild_id = "..."
-mention_only = true
+mention_only = false
 
 [channels_config.telegram]
 bot_token = "..."
 allowed_users = ["*"]
 
-# MCP Servers
+# MCP servers
 [mcp_servers.github]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
@@ -314,40 +427,54 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 [mcp_servers.github.env]
 GITHUB_PERSONAL_ACCESS_TOKEN = "ghp_..."
 
-# Gateway
+# Gateway — localhost-only and pairing-gated by default
 [gateway]
-enabled = true
-port = 8080
-allow_public_bind = false   # localhost-only by default; see docs/operations/network-deployment.md to expose on a LAN
+host = "127.0.0.1"
+port = 9393
+require_pairing = true
+allow_public_bind = false   # read docs/operations/network-deployment.md before exposing on a LAN
+
+# Web console auth (optional)
+[gateway.login]
+username = "operator"
+
+# Web console host
+[ui]
+host = "127.0.0.1"
 ```
 
-See [Config Reference](docs/reference/config.md) for all options.
+Local capability tools (`web_search`, `http_request`, `browser`) ship **enabled** so a fresh install is useful immediately; network *exposure* stays deny-by-default. See the [Config Reference](docs/reference/config.md) for every option and [`docs/security/README.md`](docs/security/README.md) for the threat model.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    RantaiClaw Binary                 │
-├──────────┬──────────┬───────────┬───────────────────┤
-│ Channels │  Tools   │   MCP     │    Gateway        │
-│ Registry │ Registry │ Registry  │  (Config API)     │
-├──────────┼──────────┼───────────┼───────────────────┤
-│Telegram  │ shell    │ github    │ GET  /config      │
-│Discord   │ file_*   │ notion    │ PATCH /config/*   │
-│Slack     │ memory_* │ linear    │ GET  /health      │
-│WhatsApp  │ cron_*   │ slack     │ POST /webhook     │
-│Matrix    │ browser  │ custom    │ GET  /config/     │
-│...       │ composio │           │      channels     │
-├──────────┴──────────┴───────────┴───────────────────┤
-│              Agent Loop (src/agent/)                 │
-│     System Prompt → LLM → Tool Calls → Response     │
-├─────────────────────────────────────────────────────┤
-│           Provider Layer (OpenRouter/Anthropic/...)   │
-├─────────────────────────────────────────────────────┤
-│           Memory (SQLite/Markdown/PostgreSQL)         │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                      RantaiClaw Binary                        │
+├──────────┬──────────┬───────────┬────────┬───────────────────┤
+│ Channels │  Tools   │   MCP     │   KB   │     Gateway       │
+│ Registry │ Registry │ Registry  │ Store  │   (HTTP API)      │
+├──────────┼──────────┼───────────┼────────┼───────────────────┤
+│Telegram  │ shell    │ github    │ search │ GET  /health      │
+│Discord   │ file_*   │ notion    │ ingest │ POST /pair        │
+│Slack     │ memory_* │ linear    │ drift  │ GET  /api/v1/*    │
+│WhatsApp  │ cron_*   │ slack     │ graph  │ PUT  /api/v1/     │
+│Matrix    │ browser  │ custom    │        │        config/*   │
+│QQ, IRC…  │ delegate │           │        │ POST /webhook     │
+├──────────┴──────────┴───────────┴────────┴───────────────────┤
+│                  Agent Loop (src/agent/)                      │
+│        System Prompt → LLM → Tool Calls → Response            │
+├──────────────────────────────────────────────────────────────┤
+│      Provider Layer (OpenRouter / Anthropic / local / …)      │
+├──────────────────────────────────────────────────────────────┤
+│         Memory (SQLite / Markdown / PostgreSQL)               │
+└──────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ bearer token, held server-side
+                    ┌─────────┴──────────┐
+                    │  claw-ui console   │ separate Next.js process, :3939
+                    └────────────────────┘
 ```
 
 ### Key Modules
@@ -355,42 +482,59 @@ See [Config Reference](docs/reference/config.md) for all options.
 | Module | Path | Responsibility |
 |--------|------|----------------|
 | Agent | `src/agent/` | Orchestration loop, prompt construction |
-| Channels | `src/channels/` | Multi-channel communication |
+| Channels | `src/channels/` | Multi-channel transport + reply rendering |
 | Tools | `src/tools/` | Tool execution with security boundaries |
 | MCP | `src/mcp/` | MCP server process management |
-| Gateway | `src/gateway/` | HTTP server, Config API, webhooks |
-| Config | `src/config/` | Schema, runtime persistence |
+| Gateway | `src/gateway/` | HTTP server, config API, webhooks |
+| Config | `src/config/` | Schema, migrations, runtime persistence |
 | Memory | `src/memory/` | Multi-backend memory system |
-| Security | `src/security/` | Policy engine, pairing, secrets |
+| KB | `src/kb/` | Knowledge base, embeddings, entity graph |
+| Security | `src/security/` | Policy engine, pairing, secrets, console login |
 | Providers | `src/providers/` | LLM provider adapters |
 | Skills | `src/skills/` | Skill loading and execution |
+| TUI | `src/tui/` | Fullscreen terminal chat |
+| Peripherals | `src/peripherals/` | Hardware boards (STM32, RPi GPIO) |
 
 ---
 
 ## Feature Flags
 
+Default features: `tui`, `whatsapp-web`, `remote-install`, `kb`.
+
 ```bash
-# Default build (all common channels + tools)
+# Default build
 cargo build --release
 
-# With WhatsApp Web support
-cargo build --release --features whatsapp-web
+# Matrix E2EE / Lark
+cargo build --release --features "channel-matrix,channel-lark"
 
-# With Matrix E2EE support
-cargo build --release --features channel-matrix
+# Hardware peripherals (RPi GPIO, Arduino, STM32 probe)
+cargo build --release --features "hardware,peripheral-rpi,probe"
 
-# With hardware peripherals (RPi GPIO, Arduino)
-cargo build --release --features hardware
+# Browser automation, PostgreSQL memory, OpenTelemetry
+cargo build --release --features "browser-native,memory-postgres,observability-otel"
 
-# With browser automation
-cargo build --release --features browser-native
+# Office / OCR document ingestion for the KB
+cargo build --release --features "kb-office,kb-ocr"
 
-# With OpenTelemetry observability
-cargo build --release --features observability-otel
-
-# Kitchen sink
-cargo build --release --features "whatsapp-web,channel-matrix,browser-native,observability-otel"
+# Minimal: drops TUI, WhatsApp Web, KB — and remote-install, so no `ssh`/`pty` tools
+cargo build --release --no-default-features
 ```
+
+| Feature | Default | Enables |
+|---|---|---|
+| `tui` | ✅ | Fullscreen terminal chat |
+| `whatsapp-web` | ✅ | WhatsApp multi-device backend |
+| `remote-install` | ✅ | `ssh` / `pty` tools, remote provisioning |
+| `kb` | ✅ | Knowledge base, vector search, PDF ingest |
+| `channel-matrix` | — | Matrix (E2EE) channel |
+| `channel-lark` | — | Lark/Feishu channel |
+| `hardware`, `peripheral-rpi`, `probe` | — | USB/serial boards, RPi GPIO, STM32 flashing |
+| `browser-native` | — | Fantoccini-backed browser automation |
+| `memory-postgres` | — | PostgreSQL memory backend |
+| `observability-otel` | — | OpenTelemetry export |
+| `kb-office`, `kb-ocr` | — | Office-document / OCR ingestion |
+| `legacy-providers` | — | Hand-rolled OpenAI provider path |
 
 ---
 
@@ -406,9 +550,11 @@ cargo clippy --all-targets -- -D warnings
 # Test
 cargo test
 
-# Full CI check
+# Full CI check (Docker-based, recommended before opening a PR)
 ./dev/ci.sh all
 ```
+
+Read [`CLAUDE.md`](CLAUDE.md) for the engineering protocol, [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md) for the PR flow, and [`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md) if you are reviewing.
 
 ---
 
@@ -417,13 +563,16 @@ cargo test
 RantaiClaw is built on the foundation of [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw), an open-source AI agent runtime. We extend our gratitude to the ZeroClaw community for their pioneering work in Rust-native agent systems.
 
 **RantaiClaw adds on top of ZeroClaw:**
-- **Live Config API** — runtime configuration changes via HTTP endpoints
+- **Live Config API** — versioned `/api/v1` control plane for runtime configuration
 - **Channel Registry** — per-channel lifecycle with graceful shutdown via CancellationToken
+- **Per-platform reply rendering** — Markdown translated into each channel's native markup
 - **MCP Server Management** — stdio-based process supervision with exponential backoff
-- **Multi-agent orchestration** — team communication, cross-employee task delegation and review
+- **Knowledge Base** — embedded hybrid-search RAG store with drift detection and an entity graph
+- **Multi-agent orchestration** — cross-employee task delegation and review
 - **ClawHub integration** — skill marketplace discovery and installation
-- **Digital employee platform** — dashboard UI, integration management, deployment automation
+- **Web console** — cosign-verified prebuilt claw-ui behind an Argon2id password gate
 - **Autonomy presets (Manual / Smart / Strict / Off)** — configurable agent independence with tool-level permissions
+- **Profile isolation** — per-profile config, sessions, and knowledge base
 - **Runtime config persistence** — `config.runtime.toml` overlay preserving base config
 
 ---
