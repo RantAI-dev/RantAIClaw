@@ -60,7 +60,15 @@ impl Tool for CronAddTool {
     }
 
     fn description(&self) -> &str {
-        "Create a scheduled cron job (shell or agent) with cron/at/every schedules"
+        "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
+For an agent job whose output should be SENT to the user, set `delivery` = \
+{mode:'announce', channel, to}; the channel system prompt provides the correct \
+channel + address when the request comes from a chat channel. Without `delivery`, \
+the job still runs on schedule but its output is only recorded in run history \
+(visible in the Schedules view) — it is NOT pushed anywhere. If the user asks to \
+be messaged but you have no delivery address (e.g. the web console or TUI, which \
+have no push channel), say the output will appear in the Schedules run history, or \
+ask which configured channel to deliver to — do not imply a message will arrive."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
