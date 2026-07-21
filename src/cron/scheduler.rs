@@ -221,13 +221,15 @@ async fn persist_job_result(
         duration_ms,
     );
 
-    if is_one_shot_auto_delete(job) {
-        if success {
+    if is_one_shot(job) {
+        if job.delete_after_run && success {
             if let Err(e) = remove_job(config, &job.id) {
                 tracing::warn!("Failed to remove one-shot cron job after success: {e}");
             }
         } else {
-            let _ = record_last_run(config, &job.id, finished_at, false, output);
+            // Not opted into auto-delete (or it failed): keep the row for history
+            // but disable it so the poller can't re-fire this already-past `At`.
+            let _ = record_last_run(config, &job.id, finished_at, success, output);
             if let Err(e) = update_job(
                 config,
                 &job.id,
@@ -236,7 +238,7 @@ async fn persist_job_result(
                     ..CronJobPatch::default()
                 },
             ) {
-                tracing::warn!("Failed to disable failed one-shot cron job: {e}");
+                tracing::warn!("Failed to disable one-shot cron job: {e}");
             }
         }
         return success;
@@ -249,8 +251,13 @@ async fn persist_job_result(
     success
 }
 
-fn is_one_shot_auto_delete(job: &CronJob) -> bool {
-    job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
+/// An `At` job fires exactly once — there is no "next" occurrence, so it must
+/// never be rescheduled (its next_run would be the same, now-past, instant,
+/// which the poller would re-select every cycle → infinite re-fire). After it
+/// runs we either delete it (`delete_after_run` opt-in, on success) or disable
+/// it (keeping the row for its run history).
+fn is_one_shot(job: &CronJob) -> bool {
+    matches!(job.schedule, Schedule::At { .. })
 }
 
 fn warn_if_high_frequency_agent_job(job: &CronJob) {
@@ -844,6 +851,46 @@ mod tests {
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_disables_shell_one_shot_instead_of_refiring() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        // Shell one-shot as created by CLI `add-at`/`once`: delete_after_run = false.
+        let job = cron::add_shell_job(
+            &config,
+            Some("one-shot-shell".into()),
+            crate::cron::Schedule::At { at },
+            "echo hi",
+        )
+        .unwrap();
+        assert!(
+            !job.delete_after_run,
+            "shell one-shot has delete_after_run=false"
+        );
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        // Must survive (user did NOT opt into auto-delete) …
+        let stored = cron::get_job(&config, &job.id).unwrap();
+        // … but be DISABLED so it never re-fires. Regression: it used to reschedule
+        // next_run to the past `at` instant and re-run on every poll cycle forever.
+        assert!(
+            !stored.enabled,
+            "a fired one-shot At job must be disabled, not rescheduled"
+        );
+        assert_eq!(stored.last_status.as_deref(), Some("ok"));
+        // And it must not be selected as due again.
+        let due = cron::due_jobs(&config, Utc::now() + ChronoDuration::days(365)).unwrap();
+        assert!(
+            due.iter().all(|j| j.id != job.id),
+            "disabled one-shot must not be due"
+        );
     }
 
     #[tokio::test]
