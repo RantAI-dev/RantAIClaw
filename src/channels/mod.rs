@@ -352,7 +352,41 @@ the runtime has already authorized them for owner-privileged actions. When they 
 owner-only tool (for example manage_permissions or issue_pairing_code), use it on their behalf — do \
 NOT refuse on the grounds that the tool is owner-only.";
 
-fn build_channel_system_prompt(base_prompt: &str, channel_name: &str, is_owner: bool) -> String {
+/// Announce-capable channels — the set `deliver_if_configured`
+/// (`src/cron/scheduler.rs`) can push a scheduled agent job's output to. Keep in
+/// sync with that match.
+fn channel_supports_announce_delivery(channel_name: &str) -> bool {
+    matches!(
+        channel_name,
+        "telegram" | "discord" | "slack" | "mattermost"
+    )
+}
+
+/// Guidance so the agent, when the user asks for a scheduled/recurring message or
+/// reminder, creates a `cron_add` agent job whose `delivery` routes the output
+/// back to THIS chat — and nowhere else. Only emitted for channels the scheduler
+/// can actually deliver to.
+fn channel_cron_delivery_instructions(channel_name: &str, reply_target: &str) -> Option<String> {
+    if !channel_supports_announce_delivery(channel_name) {
+        return None;
+    }
+    Some(format!(
+        "You are talking to this user on the '{channel_name}' channel (their delivery \
+address is '{reply_target}'). When they ask you to send them a message, reminder, or \
+report on a schedule (e.g. \"message me every morning\"), create it with the cron_add \
+tool as an agent job and set delivery to route the output back to THEM here: \
+delivery = {{ \"mode\": \"announce\", \"channel\": \"{channel_name}\", \"to\": \"{reply_target}\" }}. \
+The scheduled output is delivered only to this chat — it does not appear anywhere else. \
+Do not ask the user for their chat id; use the address above."
+    ))
+}
+
+fn build_channel_system_prompt(
+    base_prompt: &str,
+    channel_name: &str,
+    reply_target: &str,
+    is_owner: bool,
+) -> String {
     let mut prompt = if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if base_prompt.is_empty() {
             instructions.to_string()
@@ -362,6 +396,13 @@ fn build_channel_system_prompt(base_prompt: &str, channel_name: &str, is_owner: 
     } else {
         base_prompt.to_string()
     };
+
+    if let Some(cron) = channel_cron_delivery_instructions(channel_name, reply_target) {
+        if !prompt.is_empty() {
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(&cron);
+    }
 
     if is_owner {
         if !prompt.is_empty() {
@@ -1751,8 +1792,12 @@ async fn process_channel_message(
         &runtime_defaults.approval_owners,
         msg.sender_identities(),
     );
-    let system_prompt =
-        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, sender_is_owner);
+    let system_prompt = build_channel_system_prompt(
+        ctx.system_prompt.as_str(),
+        &msg.channel,
+        &msg.reply_target,
+        sender_is_owner,
+    );
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -3697,8 +3742,8 @@ mod tests {
     /// not. The base prompt is preserved either way.
     #[test]
     fn channel_system_prompt_marks_owner_turns_only() {
-        let owner = build_channel_system_prompt("BASE-PROMPT", "telegram", true);
-        let guest = build_channel_system_prompt("BASE-PROMPT", "telegram", false);
+        let owner = build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", true);
+        let guest = build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", false);
 
         assert!(
             owner.to_lowercase().contains("verified owner"),
@@ -3709,6 +3754,35 @@ mod tests {
             "guest turn must NOT grant owner context; got: {guest}"
         );
         assert!(owner.contains("BASE-PROMPT") && guest.contains("BASE-PROMPT"));
+    }
+
+    #[test]
+    fn cron_delivery_instruction_present_for_announce_channels() {
+        let p = build_channel_system_prompt("BASE", "telegram", "123456789", false);
+        assert!(p.contains("BASE"));
+        assert!(
+            p.contains("cron_add"),
+            "must tell the agent how to schedule a delivered message"
+        );
+        assert!(
+            p.contains("123456789"),
+            "must carry the reply target as delivery.to"
+        );
+        assert!(p.contains("telegram"), "must name the origin channel");
+    }
+
+    #[test]
+    fn no_cron_delivery_instruction_for_unsupported_channel() {
+        // A channel the scheduler can't deliver to must NOT promise delivery.
+        let p = build_channel_system_prompt("BASE", "irc", "#room", false);
+        assert!(
+            !p.contains("route the output back"),
+            "irc has no announce delivery"
+        );
+        assert!(
+            !p.contains("\"mode\": \"announce\""),
+            "irc must not get a delivery template"
+        );
     }
 
     /// Build a saveable `Config` whose Telegram allowlist is `users`, backed by
