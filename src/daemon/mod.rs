@@ -16,6 +16,14 @@ const STATUS_FLUSH_SECONDS: u64 = 5;
 /// so the whole stop (drain + `stop_all`) stays inside the unit's window.
 const GATEWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// The background scheduler runs only when BOTH the cron feature master switch
+/// (`[cron].enabled`) and the scheduler-loop switch (`[scheduler].enabled`) are
+/// on. Previously only `[cron].enabled` was honored, leaving `[scheduler].enabled`
+/// dead config.
+fn scheduler_enabled(config: &Config) -> bool {
+    config.cron.enabled && config.scheduler.enabled
+}
+
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
@@ -114,7 +122,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
-    if config.cron.enabled {
+    if scheduler_enabled(&config) {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
@@ -128,7 +136,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     } else {
         crate::health::mark_component_ok("scheduler");
-        tracing::info!("Cron disabled; scheduler supervisor not started");
+        tracing::info!("Scheduler disabled (cron.enabled/scheduler.enabled); supervisor not started");
     }
 
     println!("🧠 RantaiClaw daemon started");
@@ -373,6 +381,17 @@ mod tests {
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
+    }
+
+    #[test]
+    fn scheduler_enabled_requires_both_cron_and_scheduler_flags() {
+        let mut c = crate::config::Config::default();
+        assert!(scheduler_enabled(&c), "both flags default to true");
+        c.scheduler.enabled = false;
+        assert!(!scheduler_enabled(&c), "scheduler.enabled=false disables it");
+        c.scheduler.enabled = true;
+        c.cron.enabled = false;
+        assert!(!scheduler_enabled(&c), "cron.enabled=false disables it");
     }
 
     #[test]
