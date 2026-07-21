@@ -42,6 +42,9 @@ pub enum ListPickerKind {
     /// Selecting a row force-writes the policy files for that preset —
     /// same write path as Shift+Tab and `rantaiclaw autonomy <preset>`.
     Autonomy,
+    /// Scheduled-jobs browser opened via `/cron` (no arg). Enter opens a detail
+    /// panel whose action-keys run/pause/delete the selected job.
+    Cron,
 }
 
 /// One row in the picker. `key` is opaque (provider:model, session id,

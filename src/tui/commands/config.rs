@@ -270,6 +270,35 @@ impl CommandHandler for DoctorCommand {
             s
         };
 
+        // Scheduler health — read from the daemon's cross-process state file
+        // (the scheduler runs in the daemon, not this TUI process).
+        let scheduler_section = {
+            let path = tokio::runtime::Handle::try_current().ok().map(|h| {
+                tokio::task::block_in_place(|| {
+                    h.block_on(async {
+                        crate::config::Config::load_or_init()
+                            .await
+                            .map(|c| crate::daemon::state_file_path(&c))
+                    })
+                })
+            });
+            let mut s = InfoSection::new("Scheduler");
+            match path {
+                Some(Ok(p)) => {
+                    let (k, m) = scheduler_diag(&p);
+                    s = s.status_with(k, "Cron scheduler", m);
+                }
+                _ => {
+                    s = s.status_with(
+                        StatusKind::Warn,
+                        "Cron scheduler",
+                        "could not resolve state file",
+                    );
+                }
+            }
+            s
+        };
+
         // Roll up the verdict from the rows actually rendered.
         //
         // This was `let any_fail = false;` with the comment "probes above
@@ -278,7 +307,13 @@ impl CommandHandler for DoctorCommand {
         // store, an unset model, a missing ~/.rantaiclaw and a missing
         // profiles/ dir. The footer therefore printed "all checks ok" in the
         // same frame as a red ✗.
-        let sections = [&core, &channels, &skills_section, &workspace_section];
+        let sections = [
+            &core,
+            &channels,
+            &skills_section,
+            &workspace_section,
+            &scheduler_section,
+        ];
         let any_fail = sections.iter().any(|s| s.has_fail());
         let any_warn = sections.iter().any(|s| s.has_warn());
         let footer = if any_fail {
@@ -295,7 +330,8 @@ impl CommandHandler for DoctorCommand {
             .section(core)
             .section(channels)
             .section(skills_section)
-            .section(workspace_section);
+            .section(workspace_section)
+            .section(scheduler_section);
         Ok(CommandResult::OpenInfoPanel(panel))
     }
 }
@@ -434,6 +470,33 @@ impl CommandHandler for ChannelsCommand {
     }
 }
 
+/// Read the daemon's scheduler-component health from its cross-process state
+/// file. Absent file → the daemon isn't running (Warn, not Fail — matches the
+/// keyless-provider convention).
+fn scheduler_diag(state_file: &std::path::Path) -> (StatusKind, String) {
+    let Ok(raw) = std::fs::read_to_string(state_file) else {
+        return (
+            StatusKind::Warn,
+            "daemon not running (start `rantaiclaw daemon` for scheduled jobs)".to_string(),
+        );
+    };
+    let status = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            v.get("components")?
+                .get("scheduler")?
+                .get("status")?
+                .as_str()
+                .map(str::to_string)
+        });
+    match status.as_deref() {
+        Some("ok") => (StatusKind::Ok, "healthy".to_string()),
+        Some("error") => (StatusKind::Fail, "unhealthy — see daemon logs".to_string()),
+        Some(other) => (StatusKind::Warn, other.to_string()),
+        None => (StatusKind::Warn, "not tracked yet".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,5 +546,26 @@ mod tests {
 
         assert_eq!(ctx.model, "new-model");
         assert!(matches!(result, CommandResult::Message(_)));
+    }
+
+    #[test]
+    fn scheduler_diag_reads_state_file() {
+        use super::scheduler_diag;
+        use crate::tui::widgets::StatusKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon_state.json");
+        assert!(matches!(scheduler_diag(&path).0, StatusKind::Warn)); // absent → daemon down
+        std::fs::write(
+            &path,
+            serde_json::json!({"components":{"scheduler":{"status":"ok"}}}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(scheduler_diag(&path).0, StatusKind::Ok));
+        std::fs::write(
+            &path,
+            serde_json::json!({"components":{"scheduler":{"status":"error"}}}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(scheduler_diag(&path).0, StatusKind::Fail));
     }
 }
