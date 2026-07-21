@@ -17,6 +17,7 @@ use tokio::time::{self, Duration};
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+const AGENT_JOB_TIMEOUT_SECS: u64 = 600;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 
 pub async fn run(config: Config) -> Result<()> {
@@ -65,7 +66,13 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => run_agent_job(config, security, job).await,
+            JobType::Agent => {
+                with_timeout(
+                    Duration::from_secs(AGENT_JOB_TIMEOUT_SECS),
+                    run_agent_job(config, security, job),
+                )
+                .await
+            }
         };
         last_output = output;
 
@@ -422,6 +429,22 @@ fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<S
     }
 
     None
+}
+
+/// Apply a wall-clock timeout to a job future, returning a uniform timed-out
+/// result. Used to bound agent jobs (which call `crate::agent::run` and have no
+/// inner timeout of their own, unlike shell jobs).
+async fn with_timeout(
+    timeout: Duration,
+    fut: impl std::future::Future<Output = (bool, String)>,
+) -> (bool, String) {
+    match time::timeout(timeout, fut).await {
+        Ok(result) => result,
+        Err(_) => (
+            false,
+            format!("agent job timed out after {}s", timeout.as_secs_f64()),
+        ),
+    }
 }
 
 async fn run_job_command(
@@ -851,6 +874,25 @@ mod tests {
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn with_timeout_reports_timeout_for_slow_job() {
+        let (ok, msg) = with_timeout(Duration::from_millis(20), async {
+            time::sleep(Duration::from_secs(30)).await;
+            (true, "should not finish".to_string())
+        })
+        .await;
+        assert!(!ok);
+        assert!(msg.contains("timed out"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn with_timeout_passes_through_fast_job() {
+        let (ok, msg) =
+            with_timeout(Duration::from_secs(5), async { (true, "quick".to_string()) }).await;
+        assert!(ok);
+        assert_eq!(msg, "quick");
     }
 
     #[tokio::test]
