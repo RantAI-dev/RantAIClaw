@@ -139,6 +139,23 @@ Notes:
 - Mutating schedule/cron actions require `cron.enabled = true`.
 - Shell command payloads for schedule creation (`create` / `add` / `once`) are validated by security command policy before job persistence.
 
+#### HTTP control (`/api/v1/cron*`)
+
+The same schedules are controllable from the web console over the gateway API
+(this is what powers the console's Schedules panel):
+
+- `GET /api/v1/cron` — list jobs; `POST /api/v1/cron` — create (agent job via
+  `prompt`, shell job via `command`)
+- `PUT /api/v1/cron/{id}` — edit; `DELETE /api/v1/cron/{id}` — remove
+- `POST /api/v1/cron/{id}/run?approved=<bool>` — force-run now (records run
+  history; does not reschedule) — same manual-run semantics as the `cron_run` tool
+- `GET /api/v1/cron/{id}/runs?limit=<n>` — run history
+
+Exposure: every route is auth-gated exactly like the rest of `/api/v1` (bearer
+token when pairing is required). Shell commands supplied over HTTP are
+security-checked (`is_command_allowed`) before persistence — the same policy the
+CLI/tool enforce, applied up-front for the HTTP surface's blast radius.
+
 ### `models`
 
 - `rantaiclaw models refresh`
