@@ -218,14 +218,19 @@ async fn run_agent_job(
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            crate::agent::run(
+            // Box the agent future: `crate::agent::run` is a ~27KB future and is
+            // awaited transitively across the whole cron execution chain
+            // (execute_job_with_retry → execute_job_now/run_job_manual/
+            // execute_and_persist_job). Boxing it once here keeps every enclosing
+            // future off the poll-loop stack (clippy::large_futures).
+            Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prefixed_prompt),
                 None,
                 model_override,
                 config.default_temperature,
                 vec![],
-            )
+            ))
             .await
         }
     };
