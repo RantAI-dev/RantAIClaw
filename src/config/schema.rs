@@ -2397,8 +2397,7 @@ impl Default for ReliabilityConfig {
 /// Scheduler configuration for periodic task execution (`[scheduler]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchedulerConfig {
-    /// Enable the background scheduler loop. Both this and `[cron].enabled` must
-    /// be true for the daemon to run the scheduler.
+    /// Enable the built-in scheduler loop.
     #[serde(default = "default_scheduler_enabled")]
     pub enabled: bool,
     /// Maximum number of persisted scheduled tasks.
