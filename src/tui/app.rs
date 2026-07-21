@@ -992,6 +992,33 @@ impl TuiApp {
                 self.info_panel = None;
                 return Ok(EventResult::Continue);
             }
+            KeyCode::Char('r' | 'R')
+                if self
+                    .info_panel
+                    .as_ref()
+                    .is_some_and(|p| p.cron_job_id.is_some()) =>
+            {
+                self.cron_panel_action('r');
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Char('p' | 'P')
+                if self
+                    .info_panel
+                    .as_ref()
+                    .is_some_and(|p| p.cron_job_id.is_some()) =>
+            {
+                self.cron_panel_action('p');
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Char('d' | 'D')
+                if self
+                    .info_panel
+                    .as_ref()
+                    .is_some_and(|p| p.cron_job_id.is_some()) =>
+            {
+                self.cron_panel_action('d');
+                return Ok(EventResult::Continue);
+            }
             _ if self.info_panel.is_some() => {
                 // Info panel open — swallow everything else (read-only).
                 return Ok(EventResult::Continue);
@@ -2858,6 +2885,165 @@ impl TuiApp {
                     self.scrollback_queue.push(("system".into(), w.to_string()));
                 }
             }
+            ListPickerKind::Cron => match Self::load_config_for_cron() {
+                Ok(config) => match Self::build_cron_detail_panel(&config, &key) {
+                    Some(panel) => self.info_panel = Some(panel),
+                    None => self.cron_system_msg(&format!("Cron job {key} not found.")),
+                },
+                Err(e) => self.cron_system_msg(&format!("Could not load config: {e}")),
+            },
+        }
+    }
+
+    /// Load the running config for `/cron` store calls (brief file read via
+    /// `block_in_place`). Associated fn so it can run while `self.info_panel` is
+    /// being reassigned without a borrow conflict.
+    fn load_config_for_cron() -> anyhow::Result<crate::config::Config> {
+        let h = tokio::runtime::Handle::try_current()?;
+        tokio::task::block_in_place(|| {
+            h.block_on(async { crate::config::Config::load_or_init().await })
+        })
+    }
+
+    /// Append a `/cron` system message to the chat + scrollback.
+    fn cron_system_msg(&mut self, msg: &str) {
+        let _ = self.context.append_system_message(msg);
+        self.scrollback_queue
+            .push(("system".into(), msg.to_string()));
+    }
+
+    /// Build the cron-job detail panel (used by the picker dispatch + the
+    /// pause action to rebuild after a state change). Associated fn (no `self`)
+    /// so it can be called while `self.info_panel` is reassigned.
+    fn build_cron_detail_panel(
+        config: &crate::config::Config,
+        job_id: &str,
+    ) -> Option<super::widgets::InfoPanel> {
+        use super::widgets::{InfoPanel, InfoSection, StatusKind};
+        let job = crate::cron::get_job(config, job_id).ok()?;
+        let mut detail = InfoSection::new("Job")
+            .status_with(
+                if job.enabled {
+                    StatusKind::Ok
+                } else {
+                    StatusKind::Warn
+                },
+                "State",
+                if job.enabled { "enabled" } else { "paused" },
+            )
+            .status_with(StatusKind::Info, "Schedule", job.expression.clone())
+            .status_with(StatusKind::Info, "Next run", job.next_run.to_rfc3339())
+            .status_with(
+                StatusKind::Info,
+                "Last run",
+                job.last_run.map_or("never".to_string(), |d| d.to_rfc3339()),
+            )
+            .status_with(
+                match job.last_status.as_deref() {
+                    Some("ok") => StatusKind::Ok,
+                    Some("error") => StatusKind::Fail,
+                    _ => StatusKind::Info,
+                },
+                "Last status",
+                job.last_status.clone().unwrap_or_else(|| "n/a".into()),
+            );
+        let what = if job.command.is_empty() {
+            job.prompt.clone().unwrap_or_default()
+        } else {
+            job.command.clone()
+        };
+        detail = detail.status_with(
+            StatusKind::Info,
+            if job.command.is_empty() {
+                "Prompt"
+            } else {
+                "Command"
+            },
+            what,
+        );
+
+        let mut history = InfoSection::new("Recent runs");
+        match crate::cron::list_runs(config, job_id, 5) {
+            Ok(runs) if runs.is_empty() => {
+                history = history.status_with(StatusKind::Info, "—", "no runs yet");
+            }
+            Ok(runs) => {
+                for r in runs {
+                    history = history.status_with(
+                        if r.status == "ok" {
+                            StatusKind::Ok
+                        } else {
+                            StatusKind::Fail
+                        },
+                        r.started_at.to_rfc3339(),
+                        format!("{} ({}ms)", r.status, r.duration_ms.unwrap_or(0)),
+                    );
+                }
+            }
+            Err(e) => history = history.status_with(StatusKind::Fail, "history", e.to_string()),
+        }
+        Some(
+            InfoPanel::new("Cron Job")
+                .with_subtitle(&job_id[..job_id.len().min(8)])
+                .with_footer("[r] run · [p] pause/resume · [d] delete · Esc close")
+                .with_cron_actions(job_id)
+                .section(detail)
+                .section(history),
+        )
+    }
+
+    /// Handle a cron detail-panel action-key (run / pause-resume / delete).
+    fn cron_panel_action(&mut self, action: char) {
+        let Some(id) = self.info_panel.as_ref().and_then(|p| p.cron_job_id.clone()) else {
+            return;
+        };
+        let config = match Self::load_config_for_cron() {
+            Ok(c) => c,
+            Err(e) => {
+                self.cron_system_msg(&format!("Could not load config: {e}"));
+                return;
+            }
+        };
+        match action {
+            'r' => {
+                // Run DETACHED — a shell job (up to 120s) or agent job (up to
+                // 600s) must NOT block the render loop. `run_job_manual` records
+                // to run history; the user reopens the job to see the result.
+                let job = match crate::cron::get_job(&config, &id) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        self.cron_system_msg(&format!("✗ {e}"));
+                        return;
+                    }
+                };
+                let cfg = config.clone();
+                tokio::spawn(async move {
+                    let _ = crate::cron::scheduler::run_job_manual(&cfg, &job).await;
+                });
+                self.cron_system_msg(&format!(
+                    "▶ Started run of cron job {id} — reopen the job for the result."
+                ));
+            }
+            'p' => {
+                let enabled = crate::cron::get_job(&config, &id).is_ok_and(|j| j.enabled);
+                let r = if enabled {
+                    crate::cron::pause_job(&config, &id)
+                } else {
+                    crate::cron::resume_job(&config, &id)
+                };
+                match r {
+                    Ok(_) => self.info_panel = Self::build_cron_detail_panel(&config, &id),
+                    Err(e) => self.cron_system_msg(&format!("✗ {e}")),
+                }
+            }
+            'd' => match crate::cron::remove_job(&config, &id) {
+                Ok(()) => {
+                    self.info_panel = None;
+                    self.cron_system_msg(&format!("🗑 Removed cron job {id}"));
+                }
+                Err(e) => self.cron_system_msg(&format!("✗ {e}")),
+            },
+            _ => {}
         }
     }
 

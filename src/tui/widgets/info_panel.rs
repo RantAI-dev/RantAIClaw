@@ -216,6 +216,9 @@ pub struct InfoPanel {
     /// `scroll_up` / `scroll_down` in response to ↑/↓ when no chat input
     /// has focus.
     pub scroll_offset: u16,
+    /// When set, this panel is a cron-job detail: the app's info-panel key
+    /// handler enables run/pause/delete action-keys for this job id.
+    pub cron_job_id: Option<String>,
 }
 
 impl InfoPanel {
@@ -226,11 +229,19 @@ impl InfoPanel {
             sections: Vec::new(),
             footer_hint: None,
             scroll_offset: 0,
+            cron_job_id: None,
         }
     }
 
     pub fn with_subtitle<S: Into<String>>(mut self, subtitle: S) -> Self {
         self.subtitle = Some(subtitle.into());
+        self
+    }
+
+    /// Mark this panel as a cron-job detail so the app enables its
+    /// run/pause/delete action-keys for `job_id`.
+    pub fn with_cron_actions<S: Into<String>>(mut self, job_id: S) -> Self {
+        self.cron_job_id = Some(job_id.into());
         self
     }
 
