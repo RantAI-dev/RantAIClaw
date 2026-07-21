@@ -57,6 +57,30 @@ pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     execute_job_with_retry(config, &security, job).await
 }
 
+/// Force-run a job now: execute + record run history + update
+/// `last_run`/`last_status`/`last_output`. Unlike the scheduled path this does
+/// NOT reschedule, auto-delete one-shots, or run delivery — a manual run is for
+/// testing and must not shift the schedule or consume a one-shot. Callers must
+/// enforce their own security/approval gate before calling.
+pub async fn run_job_manual(config: &Config, job: &CronJob) -> (bool, String) {
+    let started_at = Utc::now();
+    let (success, output) = execute_job_now(config, job).await;
+    let finished_at = Utc::now();
+    let duration_ms = (finished_at - started_at).num_milliseconds();
+    let status = if success { "ok" } else { "error" };
+    let _ = record_run(
+        config,
+        &job.id,
+        started_at,
+        finished_at,
+        status,
+        Some(&output),
+        duration_ms,
+    );
+    let _ = record_last_run(config, &job.id, finished_at, success, &output);
+    (success, output)
+}
+
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
@@ -921,6 +945,25 @@ mod tests {
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn run_job_manual_records_without_rescheduling() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let before = cron::get_job(&config, &job.id).unwrap().next_run;
+
+        let (ok, _) = run_job_manual(&config, &job).await;
+        assert!(ok);
+
+        let after = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(
+            after.next_run, before,
+            "a manual run must NOT reschedule the job"
+        );
+        assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
+        assert_eq!(after.last_status.as_deref(), Some("ok"));
     }
 
     #[tokio::test]
