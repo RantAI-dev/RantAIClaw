@@ -58,43 +58,53 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             expression,
             tz,
             command,
+            agent,
+            model,
         } => {
             let schedule = Schedule::Cron {
                 expr: expression,
                 tz,
             };
-            let job = add_shell_job(config, None, schedule, &command)?;
-            println!("✅ Added cron job {}", job.id);
-            println!("  Expr: {}", job.expression);
-            println!("  Next: {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            let job = add_scheduled(config, schedule, &command, agent, model, false)?;
+            print_added(&job);
             Ok(())
         }
-        crate::CronCommands::AddAt { at, command } => {
+        crate::CronCommands::AddAt {
+            at,
+            command,
+            agent,
+            model,
+        } => {
             let at = chrono::DateTime::parse_from_rfc3339(&at)
                 .map_err(|e| anyhow::anyhow!("Invalid RFC3339 timestamp for --at: {e}"))?
                 .with_timezone(&chrono::Utc);
             let schedule = Schedule::At { at };
-            let job = add_shell_job(config, None, schedule, &command)?;
-            println!("✅ Added one-shot cron job {}", job.id);
-            println!("  At  : {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            // Agent one-shots auto-delete on success (matching the cron_add tool);
+            // shell one-shots stay (026 disables them after firing).
+            let job = add_scheduled(config, schedule, &command, agent, model, agent)?;
+            print_added(&job);
             Ok(())
         }
-        crate::CronCommands::AddEvery { every_ms, command } => {
+        crate::CronCommands::AddEvery {
+            every_ms,
+            command,
+            agent,
+            model,
+        } => {
             let schedule = Schedule::Every { every_ms };
-            let job = add_shell_job(config, None, schedule, &command)?;
-            println!("✅ Added interval cron job {}", job.id);
-            println!("  Every(ms): {every_ms}");
-            println!("  Next     : {}", job.next_run.to_rfc3339());
-            println!("  Cmd      : {}", job.command);
+            let job = add_scheduled(config, schedule, &command, agent, model, false)?;
+            print_added(&job);
             Ok(())
         }
-        crate::CronCommands::Once { delay, command } => {
-            let job = add_once(config, &delay, &command)?;
-            println!("✅ Added one-shot cron job {}", job.id);
-            println!("  At  : {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+        crate::CronCommands::Once {
+            delay,
+            command,
+            agent,
+            model,
+        } => {
+            let at = chrono::Utc::now() + parse_delay(&delay)?;
+            let job = add_scheduled(config, Schedule::At { at }, &command, agent, model, agent)?;
+            print_added(&job);
             Ok(())
         }
         crate::CronCommands::Update {
@@ -160,7 +170,92 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             println!("▶️  Resumed cron job {id}");
             Ok(())
         }
+        crate::CronCommands::Run { id } => {
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| anyhow::anyhow!("cron run must execute inside the tokio runtime"))?;
+            let report =
+                tokio::task::block_in_place(|| handle.block_on(run_job_report(config, &id)))?;
+            println!("{report}");
+            Ok(())
+        }
+        crate::CronCommands::Runs { id, limit } => {
+            println!("{}", runs_report(config, &id, limit)?);
+            Ok(())
+        }
     }
+}
+
+/// Create a shell or agent job from a resolved schedule. `delete_after_run`
+/// applies to agent one-shots (`At`); shell jobs ignore it (store limitation).
+fn add_scheduled(
+    config: &Config,
+    schedule: Schedule,
+    payload: &str,
+    agent: bool,
+    model: Option<String>,
+    delete_after_run: bool,
+) -> Result<CronJob> {
+    if agent {
+        add_agent_job(
+            config,
+            None,
+            schedule,
+            payload,
+            SessionTarget::Isolated,
+            model,
+            None,
+            delete_after_run,
+        )
+    } else {
+        add_shell_job(config, None, schedule, payload)
+    }
+}
+
+fn print_added(job: &CronJob) {
+    println!("✅ Added cron job {}", job.id);
+    // Schedule-aware line — `job.expression` is "" for At/Every, so don't print
+    // an empty `Expr:`.
+    match &job.schedule {
+        Schedule::Cron { expr, .. } => println!("  Expr: {expr}"),
+        Schedule::At { at } => println!("  At  : {}", at.to_rfc3339()),
+        Schedule::Every { every_ms } => println!("  Every(ms): {every_ms}"),
+    }
+    println!("  Next: {}", job.next_run.to_rfc3339());
+}
+
+/// Force-run a job and return a human report. Reuses the shared manual-run path
+/// (records run history; does not reschedule/deliver) — same semantics as the
+/// `cron_run` tool and the web `POST /cron/{id}/run`. NOTE: keep this NON-`pub`
+/// (only `handle_command` + the in-module test call it); a `pub` fn returning
+/// `Result` would trip `clippy::missing_errors_doc` under the pedantic gate.
+async fn run_job_report(config: &Config, id: &str) -> Result<String> {
+    let job = get_job(config, id)?;
+    let (ok, output) = crate::cron::scheduler::run_job_manual(config, &job).await;
+    Ok(format!(
+        "{} cron job {id} ({})\n{}",
+        if ok { "✅" } else { "✗" },
+        if ok { "ok" } else { "error" },
+        output.trim(),
+    ))
+}
+
+fn runs_report(config: &Config, id: &str, limit: usize) -> Result<String> {
+    use std::fmt::Write as _;
+    let runs = list_runs(config, id, limit)?;
+    if runs.is_empty() {
+        return Ok(format!("No run history for cron job {id}."));
+    }
+    let mut out = format!("Run history for {id} ({}):\n", runs.len());
+    for r in runs {
+        let _ = writeln!(
+            out,
+            "  {} · {} · {}ms",
+            r.started_at.to_rfc3339(),
+            r.status,
+            r.duration_ms.unwrap_or(0),
+        );
+    }
+    Ok(out)
 }
 
 pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
@@ -224,6 +319,7 @@ fn parse_delay(input: &str) -> Result<chrono::Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -412,5 +508,65 @@ mod tests {
 
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         assert!(security.is_command_allowed("echo safe"));
+    }
+
+    #[test]
+    fn add_agent_job_via_handler() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "0 9 * * *".into(),
+                tz: None,
+                command: "Summarize overnight emails".into(),
+                agent: true,
+                model: Some("claude-opus-4-8".into()),
+            },
+            &config,
+        )
+        .unwrap();
+        let job = &list_jobs(&config).unwrap()[0];
+        assert_eq!(job.job_type, JobType::Agent);
+        assert_eq!(job.prompt.as_deref(), Some("Summarize overnight emails"));
+        assert_eq!(job.model.as_deref(), Some("claude-opus-4-8"));
+        assert!(job.command.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cli_run_reports_and_records() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo cli-run",
+        )
+        .unwrap();
+        let out = run_job_report(&config, &job.id).await.unwrap();
+        assert!(out.contains("ok") || out.contains("cli-run"), "{out}");
+        assert_eq!(list_runs(&config, &job.id, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cli_runs_lists_history() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo x",
+        )
+        .unwrap();
+        record_run(&config, &job.id, Utc::now(), Utc::now(), "ok", Some("x"), 3).unwrap();
+        let text = runs_report(&config, &job.id, 10).unwrap();
+        assert!(text.contains(&job.id) || text.contains("ok"), "{text}");
     }
 }

@@ -982,6 +982,12 @@ enum CronCommands {
         tz: Option<String>,
         /// Command to run
         command: String,
+        /// Create an AGENT job (the positional is the prompt, not a shell command).
+        #[arg(long)]
+        agent: bool,
+        /// Model override for an agent job (ignored for shell jobs).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Add a one-shot scheduled task at an RFC3339 timestamp
     AddAt {
@@ -989,6 +995,12 @@ enum CronCommands {
         at: String,
         /// Command to run
         command: String,
+        /// Create an AGENT job (the positional is the prompt, not a shell command).
+        #[arg(long)]
+        agent: bool,
+        /// Model override for an agent job (ignored for shell jobs).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Add a fixed-interval scheduled task
     AddEvery {
@@ -996,6 +1008,12 @@ enum CronCommands {
         every_ms: u64,
         /// Command to run
         command: String,
+        /// Create an AGENT job (the positional is the prompt, not a shell command).
+        #[arg(long)]
+        agent: bool,
+        /// Model override for an agent job (ignored for shell jobs).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
     Once {
@@ -1003,6 +1021,12 @@ enum CronCommands {
         delay: String,
         /// Command to run
         command: String,
+        /// Create an AGENT job (the positional is the prompt, not a shell command).
+        #[arg(long)]
+        agent: bool,
+        /// Model override for an agent job (ignored for shell jobs).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Remove a scheduled task
     Remove {
@@ -1035,6 +1059,19 @@ enum CronCommands {
     Resume {
         /// Task ID
         id: String,
+    },
+    /// Force-run a scheduled task now and record the run.
+    Run {
+        /// Job id
+        id: String,
+    },
+    /// Show recent run history for a scheduled task.
+    Runs {
+        /// Job id
+        id: String,
+        /// Max rows to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
 }
 
