@@ -17,6 +17,7 @@ use tokio::time::{self, Duration};
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+const AGENT_JOB_TIMEOUT_SECS: u64 = 600;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 
 pub async fn run(config: Config) -> Result<()> {
@@ -27,6 +28,9 @@ pub async fn run(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
+
+    let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
@@ -44,13 +48,37 @@ pub async fn run(config: Config) -> Result<()> {
             }
         };
 
-        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
+        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT, &in_flight).await;
     }
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
     execute_job_with_retry(config, &security, job).await
+}
+
+/// Force-run a job now: execute + record run history + update
+/// `last_run`/`last_status`/`last_output`. Unlike the scheduled path this does
+/// NOT reschedule, auto-delete one-shots, or run delivery — a manual run is for
+/// testing and must not shift the schedule or consume a one-shot. Callers must
+/// enforce their own security/approval gate before calling.
+pub async fn run_job_manual(config: &Config, job: &CronJob) -> (bool, String) {
+    let started_at = Utc::now();
+    let (success, output) = execute_job_now(config, job).await;
+    let finished_at = Utc::now();
+    let duration_ms = (finished_at - started_at).num_milliseconds();
+    let status = if success { "ok" } else { "error" };
+    let _ = record_run(
+        config,
+        &job.id,
+        started_at,
+        finished_at,
+        status,
+        Some(&output),
+        duration_ms,
+    );
+    let _ = record_last_run(config, &job.id, finished_at, success, &output);
+    (success, output)
 }
 
 async fn execute_job_with_retry(
@@ -65,7 +93,13 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
-            JobType::Agent => run_agent_job(config, security, job).await,
+            JobType::Agent => {
+                with_timeout(
+                    Duration::from_secs(AGENT_JOB_TIMEOUT_SECS),
+                    run_agent_job(config, security, job),
+                )
+                .await
+            }
         };
         last_output = output;
 
@@ -93,25 +127,42 @@ async fn process_due_jobs(
     security: &Arc<SecurityPolicy>,
     jobs: Vec<CronJob>,
     component: &str,
+    in_flight: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight =
-        stream::iter(
-            jobs.into_iter().map(|job| {
-                let config = config.clone();
-                let security = Arc::clone(security);
-                let component = component.to_owned();
-                async move {
-                    execute_and_persist_job(&config, security.as_ref(), &job, &component).await
+    let mut in_flight_stream = stream::iter(jobs.into_iter().map(|job| {
+        let config = config.clone();
+        let security = Arc::clone(security);
+        let component = component.to_owned();
+        let in_flight = Arc::clone(in_flight);
+        async move {
+            // Claim the job; skip if a previous (long-running) invocation is still
+            // going, so a job slower than the poll interval isn't run concurrently.
+            {
+                let mut guard = in_flight.lock().expect("in-flight lock poisoned");
+                if !guard.insert(job.id.clone()) {
+                    tracing::warn!(
+                        "Scheduler job '{}' still running from a previous tick; skipping this cycle",
+                        job.id
+                    );
+                    return (job.id.clone(), true);
                 }
-            }),
-        )
-        .buffer_unordered(max_concurrent);
+            }
+            let result =
+                execute_and_persist_job(&config, security.as_ref(), &job, &component).await;
+            in_flight
+                .lock()
+                .expect("in-flight lock poisoned")
+                .remove(&job.id);
+            result
+        }
+    }))
+    .buffer_unordered(max_concurrent);
 
-    while let Some((job_id, success)) = in_flight.next().await {
+    while let Some((job_id, success)) = in_flight_stream.next().await {
         if !success {
             tracing::warn!("Scheduler job '{job_id}' failed");
         }
@@ -167,14 +218,19 @@ async fn run_agent_job(
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            crate::agent::run(
+            // Box the agent future: `crate::agent::run` is a ~27KB future and is
+            // awaited transitively across the whole cron execution chain
+            // (execute_job_with_retry → execute_job_now/run_job_manual/
+            // execute_and_persist_job). Boxing it once here keeps every enclosing
+            // future off the poll-loop stack (clippy::large_futures).
+            Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prefixed_prompt),
                 None,
                 model_override,
                 config.default_temperature,
                 vec![],
-            )
+            ))
             .await
         }
     };
@@ -221,13 +277,15 @@ async fn persist_job_result(
         duration_ms,
     );
 
-    if is_one_shot_auto_delete(job) {
-        if success {
+    if is_one_shot(job) {
+        if job.delete_after_run && success {
             if let Err(e) = remove_job(config, &job.id) {
                 tracing::warn!("Failed to remove one-shot cron job after success: {e}");
             }
         } else {
-            let _ = record_last_run(config, &job.id, finished_at, false, output);
+            // Not opted into auto-delete (or it failed): keep the row for history
+            // but disable it so the poller can't re-fire this already-past `At`.
+            let _ = record_last_run(config, &job.id, finished_at, success, output);
             if let Err(e) = update_job(
                 config,
                 &job.id,
@@ -236,7 +294,7 @@ async fn persist_job_result(
                     ..CronJobPatch::default()
                 },
             ) {
-                tracing::warn!("Failed to disable failed one-shot cron job: {e}");
+                tracing::warn!("Failed to disable one-shot cron job: {e}");
             }
         }
         return success;
@@ -249,8 +307,13 @@ async fn persist_job_result(
     success
 }
 
-fn is_one_shot_auto_delete(job: &CronJob) -> bool {
-    job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
+/// An `At` job fires exactly once — there is no "next" occurrence, so it must
+/// never be rescheduled (its next_run would be the same, now-past, instant,
+/// which the poller would re-select every cycle → infinite re-fire). After it
+/// runs we either delete it (`delete_after_run` opt-in, on success) or disable
+/// it (keeping the row for its run history).
+fn is_one_shot(job: &CronJob) -> bool {
+    matches!(job.schedule, Schedule::At { .. })
 }
 
 fn warn_if_high_frequency_agent_job(job: &CronJob) {
@@ -415,6 +478,22 @@ fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<S
     }
 
     None
+}
+
+/// Apply a wall-clock timeout to a job future, returning a uniform timed-out
+/// result. Used to bound agent jobs (which call `crate::agent::run` and have no
+/// inner timeout of their own, unlike shell jobs).
+async fn with_timeout(
+    timeout: Duration,
+    fut: impl std::future::Future<Output = (bool, String)>,
+) -> (bool, String) {
+    match time::timeout(timeout, fut).await {
+        Ok(result) => result,
+        Err(_) => (
+            false,
+            format!("agent job timed out after {}s", timeout.as_secs_f64()),
+        ),
+    }
 }
 
 async fn run_job_command(
@@ -750,7 +829,8 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, &security, Vec::new(), &component).await;
+        let in_flight = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        process_due_jobs(&config, &security, Vec::new(), &component, &in_flight).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -771,11 +851,44 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, &security, vec![job], &component).await;
+        let in_flight = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        process_due_jobs(&config, &security, vec![job], &component, &in_flight).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
         assert_eq!(entry["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_skips_job_already_in_flight() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // Pretend the job is still running from a previous tick.
+        in_flight.lock().unwrap().insert(job.id.clone());
+        let component = unique_component("scheduler-inflight");
+
+        process_due_jobs(
+            &config,
+            &security,
+            vec![job.clone()],
+            &component,
+            &in_flight,
+        )
+        .await;
+
+        // It must have been skipped → no run recorded.
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert!(
+            runs.is_empty(),
+            "an in-flight job must be skipped, not executed"
+        );
     }
 
     #[tokio::test]
@@ -844,6 +957,86 @@ mod tests {
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn run_job_manual_records_without_rescheduling() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let before = cron::get_job(&config, &job.id).unwrap().next_run;
+
+        let (ok, _) = run_job_manual(&config, &job).await;
+        assert!(ok);
+
+        let after = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(
+            after.next_run, before,
+            "a manual run must NOT reschedule the job"
+        );
+        assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
+        assert_eq!(after.last_status.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn with_timeout_reports_timeout_for_slow_job() {
+        let (ok, msg) = with_timeout(Duration::from_millis(20), async {
+            time::sleep(Duration::from_secs(30)).await;
+            (true, "should not finish".to_string())
+        })
+        .await;
+        assert!(!ok);
+        assert!(msg.contains("timed out"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn with_timeout_passes_through_fast_job() {
+        let (ok, msg) = with_timeout(Duration::from_secs(5), async {
+            (true, "quick".to_string())
+        })
+        .await;
+        assert!(ok);
+        assert_eq!(msg, "quick");
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_disables_shell_one_shot_instead_of_refiring() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        // Shell one-shot as created by CLI `add-at`/`once`: delete_after_run = false.
+        let job = cron::add_shell_job(
+            &config,
+            Some("one-shot-shell".into()),
+            crate::cron::Schedule::At { at },
+            "echo hi",
+        )
+        .unwrap();
+        assert!(
+            !job.delete_after_run,
+            "shell one-shot has delete_after_run=false"
+        );
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        // Must survive (user did NOT opt into auto-delete) …
+        let stored = cron::get_job(&config, &job.id).unwrap();
+        // … but be DISABLED so it never re-fires. Regression: it used to reschedule
+        // next_run to the past `at` instant and re-run on every poll cycle forever.
+        assert!(
+            !stored.enabled,
+            "a fired one-shot At job must be disabled, not rescheduled"
+        );
+        assert_eq!(stored.last_status.as_deref(), Some("ok"));
+        // And it must not be selected as due again.
+        let due = cron::due_jobs(&config, Utc::now() + ChronoDuration::days(365)).unwrap();
+        assert!(
+            due.iter().all(|j| j.id != job.id),
+            "disabled one-shot must not be due"
+        );
     }
 
     #[tokio::test]

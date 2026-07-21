@@ -3,7 +3,6 @@ use crate::config::Config;
 use crate::cron::{self, JobType};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
-use chrono::Utc;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -121,29 +120,14 @@ impl Tool for CronRunTool {
             });
         }
 
-        let started_at = Utc::now();
-        let (success, output) = cron::scheduler::execute_job_now(&self.config, &job).await;
-        let finished_at = Utc::now();
-        let duration_ms = (finished_at - started_at).num_milliseconds();
+        let (success, output) = cron::scheduler::run_job_manual(&self.config, &job).await;
         let status = if success { "ok" } else { "error" };
-
-        let _ = cron::record_run(
-            &self.config,
-            &job.id,
-            started_at,
-            finished_at,
-            status,
-            Some(&output),
-            duration_ms,
-        );
-        let _ = cron::record_last_run(&self.config, &job.id, finished_at, success, &output);
 
         Ok(ToolResult {
             success,
             output: serde_json::to_string_pretty(&json!({
                 "job_id": job.id,
                 "status": status,
-                "duration_ms": duration_ms,
                 "output": output
             }))?,
             error: if success {
