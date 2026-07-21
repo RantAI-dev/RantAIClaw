@@ -136,7 +136,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     } else {
         crate::health::mark_component_ok("scheduler");
-        tracing::info!("Scheduler disabled (cron.enabled/scheduler.enabled); supervisor not started");
+        tracing::info!(
+            "Scheduler disabled (cron.enabled/scheduler.enabled); supervisor not started"
+        );
     }
 
     println!("🧠 RantaiClaw daemon started");
@@ -388,7 +390,10 @@ mod tests {
         let mut c = crate::config::Config::default();
         assert!(scheduler_enabled(&c), "both flags default to true");
         c.scheduler.enabled = false;
-        assert!(!scheduler_enabled(&c), "scheduler.enabled=false disables it");
+        assert!(
+            !scheduler_enabled(&c),
+            "scheduler.enabled=false disables it"
+        );
         c.scheduler.enabled = true;
         c.cron.enabled = false;
         assert!(!scheduler_enabled(&c), "cron.enabled=false disables it");

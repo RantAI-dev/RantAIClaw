@@ -869,7 +869,14 @@ mod tests {
         in_flight.lock().unwrap().insert(job.id.clone());
         let component = unique_component("scheduler-inflight");
 
-        process_due_jobs(&config, &security, vec![job.clone()], &component, &in_flight).await;
+        process_due_jobs(
+            &config,
+            &security,
+            vec![job.clone()],
+            &component,
+            &in_flight,
+        )
+        .await;
 
         // It must have been skipped → no run recorded.
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -979,8 +986,10 @@ mod tests {
 
     #[tokio::test]
     async fn with_timeout_passes_through_fast_job() {
-        let (ok, msg) =
-            with_timeout(Duration::from_secs(5), async { (true, "quick".to_string()) }).await;
+        let (ok, msg) = with_timeout(Duration::from_secs(5), async {
+            (true, "quick".to_string())
+        })
+        .await;
         assert!(ok);
         assert_eq!(msg, "quick");
     }
