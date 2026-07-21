@@ -29,6 +29,9 @@ pub async fn run(config: Config) -> Result<()> {
         &config.workspace_dir,
     ));
 
+    let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
     loop {
@@ -45,7 +48,7 @@ pub async fn run(config: Config) -> Result<()> {
             }
         };
 
-        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
+        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT, &in_flight).await;
     }
 }
 
@@ -100,25 +103,42 @@ async fn process_due_jobs(
     security: &Arc<SecurityPolicy>,
     jobs: Vec<CronJob>,
     component: &str,
+    in_flight: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight =
-        stream::iter(
-            jobs.into_iter().map(|job| {
-                let config = config.clone();
-                let security = Arc::clone(security);
-                let component = component.to_owned();
-                async move {
-                    execute_and_persist_job(&config, security.as_ref(), &job, &component).await
+    let mut in_flight_stream = stream::iter(jobs.into_iter().map(|job| {
+        let config = config.clone();
+        let security = Arc::clone(security);
+        let component = component.to_owned();
+        let in_flight = Arc::clone(in_flight);
+        async move {
+            // Claim the job; skip if a previous (long-running) invocation is still
+            // going, so a job slower than the poll interval isn't run concurrently.
+            {
+                let mut guard = in_flight.lock().expect("in-flight lock poisoned");
+                if !guard.insert(job.id.clone()) {
+                    tracing::warn!(
+                        "Scheduler job '{}' still running from a previous tick; skipping this cycle",
+                        job.id
+                    );
+                    return (job.id.clone(), true);
                 }
-            }),
-        )
-        .buffer_unordered(max_concurrent);
+            }
+            let result =
+                execute_and_persist_job(&config, security.as_ref(), &job, &component).await;
+            in_flight
+                .lock()
+                .expect("in-flight lock poisoned")
+                .remove(&job.id);
+            result
+        }
+    }))
+    .buffer_unordered(max_concurrent);
 
-    while let Some((job_id, success)) = in_flight.next().await {
+    while let Some((job_id, success)) = in_flight_stream.next().await {
         if !success {
             tracing::warn!("Scheduler job '{job_id}' failed");
         }
@@ -780,7 +800,8 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, &security, Vec::new(), &component).await;
+        let in_flight = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        process_due_jobs(&config, &security, Vec::new(), &component, &in_flight).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -801,11 +822,37 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, &security, vec![job], &component).await;
+        let in_flight = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        process_due_jobs(&config, &security, vec![job], &component, &in_flight).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
         assert_eq!(entry["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_skips_job_already_in_flight() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // Pretend the job is still running from a previous tick.
+        in_flight.lock().unwrap().insert(job.id.clone());
+        let component = unique_component("scheduler-inflight");
+
+        process_due_jobs(&config, &security, vec![job.clone()], &component, &in_flight).await;
+
+        // It must have been skipped → no run recorded.
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert!(
+            runs.is_empty(),
+            "an in-flight job must be skipped, not executed"
+        );
     }
 
     #[tokio::test]
