@@ -126,16 +126,20 @@ Install and run the optional web console ([claw-ui](https://github.com/RantAI-de
 ### `cron`
 
 - `rantaiclaw cron list`
-- `rantaiclaw cron add <expr> [--tz <IANA_TZ>] <command>`
-- `rantaiclaw cron add-at <rfc3339_timestamp> <command>`
-- `rantaiclaw cron add-every <every_ms> <command>`
-- `rantaiclaw cron once <delay> <command>`
+- `rantaiclaw cron add <expr> [--tz <IANA_TZ>] [--agent] [--model <name>] <command|prompt>`
+- `rantaiclaw cron add-at <rfc3339_timestamp> [--agent] [--model <name>] <command|prompt>`
+- `rantaiclaw cron add-every <every_ms> [--agent] [--model <name>] <command|prompt>`
+- `rantaiclaw cron once <delay> [--agent] [--model <name>] <command|prompt>`
+- `rantaiclaw cron run <id>` — force-run now and record the run (does not reschedule)
+- `rantaiclaw cron runs <id> [--limit <n>]` — print recent run history
 - `rantaiclaw cron remove <id>`
 - `rantaiclaw cron pause <id>`
 - `rantaiclaw cron resume <id>`
 
 Notes:
 
+- `--agent` creates an AGENT job — the positional is the prompt, not a shell command. `--model` overrides the model for an agent job (ignored for shell jobs). Example: `rantaiclaw cron add --agent '0 9 * * *' 'Summarize overnight emails' --model claude-opus-4-8`.
+- `cron run` reuses the same manual-run path as the `cron_run` tool and the web `POST /api/v1/cron/{id}/run`: it records to run history but does not shift the schedule or consume a one-shot.
 - Mutating schedule/cron actions require `cron.enabled = true`.
 - Shell command payloads for schedule creation (`create` / `add` / `once`) are validated by security command policy before job persistence.
 
