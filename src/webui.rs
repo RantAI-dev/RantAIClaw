@@ -20,7 +20,7 @@ const DEFAULT_PORT: u16 = 3939;
 
 /// Pinned claw-ui release tag `ui install` fetches by default. Bump this to
 /// roll the console forward; overridable per-invocation with `--ref`.
-const CLAW_UI_RELEASE: &str = "v0.3.4";
+const CLAW_UI_RELEASE: &str = "v0.3.5";
 const CLAW_UI_REPO: &str = "https://github.com/RantAI-dev/claw-ui";
 /// Expected cosign signing identity for claw-ui releases — its `release.yml`
 /// workflow on a tag ref. Passed to the shared `lifecycle::artifact::verify_cosign`.
