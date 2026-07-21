@@ -10,6 +10,7 @@
 pub mod api_v1;
 pub mod channel_approval;
 pub mod config_api;
+pub mod cron_api;
 pub mod task_handlers;
 pub mod web_approval;
 
@@ -781,6 +782,12 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
         )))
         .merge(
             config_api::router().layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_rate_limit,
+            )),
+        )
+        .merge(
+            cron_api::router().layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 api_rate_limit,
             )),
