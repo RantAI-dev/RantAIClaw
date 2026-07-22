@@ -5,6 +5,49 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0-alpha] — 2026-07-22
+
+Scheduled tasks ("cron") become a first-class, cross-surface feature: create and
+manage recurring or one-shot jobs — shell **or** agent — from the HTTP API, the
+CLI, the TUI, the web console, and conversationally from a chat channel, with the
+agent's scheduled output delivered back to the chat it was asked in. Minor bump:
+new runtime-contract surfaces (API routes, CLI flags, TUI command) plus one agent
+tool removed.
+
+### Added
+
+- **Gateway** — `/api/v1/cron*` HTTP API: list / create / update / delete a job,
+  force-run (`POST /cron/{id}/run`), and read run history (`GET /cron/{id}/runs`).
+  Auth-gated like the rest of `/api/v1`.
+- **CLI** — `rantaiclaw cron add|add-at|add-every|once` gain `--agent` (create an
+  agent job; the positional is the prompt) and `--model`; new `cron run <id>`
+  (force-run + record) and `cron runs <id> [--limit]`.
+- **TUI** — `/cron` opens an interactive jobs picker; a job's detail panel exposes
+  `[r]` run · `[p]` pause/resume · `[d]` delete; `/doctor` reports scheduler health.
+- **Web console (claw-ui)** — a Schedules panel: create shell/agent jobs, edit,
+  pause/resume, run-now, and view run history (requires the paired claw-ui release).
+- **Channels** — conversational scheduling: when asked on an announce-capable
+  channel (Telegram/Discord/Slack/Mattermost) to send a recurring message, the
+  agent creates a `cron_add` agent job whose output is delivered back to that chat.
+
+### Changed
+
+- Cron engine fixes: one-shot shell jobs no longer re-fire; in-flight guard against
+  overlapping runs; agent-job timeout; `[scheduler].enabled` gate honored.
+
+### Removed
+
+- The redundant `schedule` agent tool (shell-only, no delivery) is removed in favor
+  of the delivery-capable `cron_add` (+ `cron_list/remove/update/run/runs`). Both
+  wrote the same store; keeping the weaker one caused models to schedule jobs that
+  never delivered. Migration: use `cron_add`.
+
+### Fixed
+
+- Deterministic channel delivery: a `cron_add` from an announce-capable channel now
+  defaults `delivery` to the origin chat even when the model omits it, so scheduled
+  messages reliably arrive instead of landing only in run history.
+
 ## [0.8.3-alpha] — 2026-07-20
 
 The per-platform reply rendering that v0.8.2-alpha introduced for Telegram is now
