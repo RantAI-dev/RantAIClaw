@@ -60,7 +60,6 @@ pub mod proxy_config;
 #[cfg(feature = "remote-install")]
 pub mod pty;
 pub mod pushover;
-pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
@@ -112,7 +111,6 @@ pub use proxy_config::ProxyConfigTool;
 #[cfg(feature = "remote-install")]
 pub use pty::PtyTool;
 pub use pushover::PushoverTool;
-pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
@@ -287,7 +285,6 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
-        Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
         // Owner-only: manage channel owners + the non-owner capability ceiling
         // from chat. The per-turn GuestGate hard-denies it for non-owners
@@ -723,7 +720,9 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
-        assert!(names.contains(&"schedule"));
+        // The retired `schedule` tool is gone; scheduling now lives in the
+        // delivery-capable `cron_add` (+ cron_list/remove/update/run/runs).
+        assert!(names.contains(&"cron_add"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
     }

@@ -60,7 +60,10 @@ impl Tool for CronAddTool {
     }
 
     fn description(&self) -> &str {
-        "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
+        "Schedule a task, reminder, or recurring/repeating message — THE tool for any \
+'remind me', 'schedule', 'every morning/day/hour', 'daily', 'each week', or 'in N \
+minutes' request (this powers the Schedules feature). \
+Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
 For an agent job whose output should be SENT to the user, set `delivery` = \
 {mode:'announce', channel, to}; the channel system prompt provides the correct \
 channel + address when the request comes from a chat channel. Without `delivery`, \
