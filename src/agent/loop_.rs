@@ -1018,6 +1018,7 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        None, // internal helper — no origin chat
         None,
         None,
         multimodal_config,
@@ -1059,6 +1060,54 @@ fn should_execute_tools_in_parallel(
 //   • the LLM returns no tool calls (final answer), or
 //   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
+
+/// Code-level safety net under the 031 prompt guidance: when an agent turn comes
+/// from an announce-capable chat channel (telegram/discord/slack/mattermost) and
+/// the model calls `cron_add` WITHOUT a real `delivery`, default `delivery` to
+/// announce-back-to-this-chat so the scheduled output actually reaches the user
+/// instead of silently landing in run history only. A weak model that forgets to
+/// set `delivery` (the observed MiniMax failure mode) is thus covered
+/// deterministically; an explicit non-"none" `delivery` the model DID set is
+/// always preserved. Returns `Some(modified_call)` only when it injects; `None`
+/// means "leave the original call unchanged" (non-chat surfaces, non-cron_add
+/// tools, non-announce channels, or an already-set delivery).
+fn maybe_inject_channel_delivery(
+    call: &ParsedToolCall,
+    channel_name: &str,
+    reply_target: Option<&str>,
+) -> Option<ParsedToolCall> {
+    let reply_target = reply_target?;
+    if call.name != "cron_add" {
+        return None;
+    }
+    if !crate::channels::channel_supports_announce_delivery(channel_name) {
+        return None;
+    }
+    let has_real_delivery = call
+        .arguments
+        .get("delivery")
+        .and_then(|d| d.get("mode"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|mode| mode != "none");
+    if has_real_delivery {
+        return None;
+    }
+    let mut arguments = call.arguments.clone();
+    let obj = arguments.as_object_mut()?;
+    obj.insert(
+        "delivery".to_string(),
+        serde_json::json!({
+            "mode": "announce",
+            "channel": channel_name,
+            "to": reply_target,
+        }),
+    );
+    Some(ParsedToolCall {
+        name: call.name.clone(),
+        arguments,
+        tool_call_id: call.tool_call_id.clone(),
+    })
+}
 
 /// Execute a single parsed tool call and return a structured result. Emits
 /// paired Start/End events, records observer events, and races the tool against
@@ -1185,6 +1234,10 @@ pub(crate) async fn execute_tool_calls_collecting(
     observer: &dyn Observer,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    // Origin chat's reply target when this turn came from an announce-capable
+    // channel; enables the `cron_add` delivery safety net. `None` on non-chat
+    // surfaces (CLI/TUI/web console/delegate).
+    channel_reply_target: Option<&str>,
     approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
     // Per-role capability ceiling for a non-owner ("guest") turn. `None` ⇒ owner
     // / CLI / console — no restriction.
@@ -1196,7 +1249,16 @@ pub(crate) async fn execute_tool_calls_collecting(
     // A guest turn must run serially so every call passes the gate below; the
     // parallel fast-path skips per-call checks.
     if parallel && guest_gate.is_none() {
-        let futures = calls.iter().map(|call| {
+        // Materialize any channel-delivery injection so the owned modified calls
+        // outlive the joined futures (which borrow them).
+        let effective: Vec<ParsedToolCall> = calls
+            .iter()
+            .map(|call| {
+                maybe_inject_channel_delivery(call, channel_name, channel_reply_target)
+                    .unwrap_or_else(|| call.clone())
+            })
+            .collect();
+        let futures = effective.iter().map(|call| {
             execute_one_tool_structured(call, tools_registry, observer, cancellation_token, events)
         });
         return futures_util::future::try_join_all(futures).await;
@@ -1309,9 +1371,19 @@ pub(crate) async fn execute_tool_calls_collecting(
             }
         }
 
+        // Inject the origin-chat delivery default for a bare channel `cron_add`
+        // (gating/approval above intentionally ran on the original call).
+        let injected = maybe_inject_channel_delivery(call, channel_name, channel_reply_target);
+        let exec_call = injected.as_ref().unwrap_or(call);
         results.push(
-            execute_one_tool_structured(call, tools_registry, observer, cancellation_token, events)
-                .await?,
+            execute_one_tool_structured(
+                exec_call,
+                tools_registry,
+                observer,
+                cancellation_token,
+                events,
+            )
+            .await?,
         );
     }
     Ok(results)
@@ -1403,6 +1475,9 @@ pub(crate) async fn run_structured_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    // Origin chat's reply target (announce-capable channels only) for the
+    // `cron_add` delivery safety net; `None` on non-chat surfaces.
+    channel_reply_target: Option<&str>,
     // Surface-specific inline approval backend. `None` ⇒ derive from
     // `channel_name` (CLI prompts, every other surface auto-denies). `Some`
     // injects a richer backend — e.g. the channel in-chat owner relay.
@@ -1620,6 +1695,7 @@ pub(crate) async fn run_structured_loop(
             observer,
             approval,
             channel_name,
+            channel_reply_target,
             approval_backend,
             guest_gate,
             should_parallel,
@@ -1743,6 +1819,9 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    // Origin chat's reply target (announce-capable channels only) for the
+    // `cron_add` delivery safety net; `None` on non-chat surfaces.
+    channel_reply_target: Option<&str>,
     approval_backend: Option<&dyn crate::approval::ApprovalBackend>,
     guest_gate: Option<&crate::approval::GuestGate>,
     multimodal_config: &crate::config::MultimodalConfig,
@@ -1773,6 +1852,7 @@ pub(crate) async fn run_tool_call_loop(
         silent,
         approval,
         channel_name,
+        channel_reply_target,
         approval_backend,
         guest_gate,
         multimodal_config,
@@ -2256,6 +2336,7 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            None, // CLI — no origin chat
             None,
             None,
             &config.multimodal,
@@ -2403,6 +2484,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                None, // CLI — no origin chat
                 None,
                 None,
                 &config.multimodal,
@@ -2658,6 +2740,70 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    fn cron_add_call(args: serde_json::Value) -> ParsedToolCall {
+        ParsedToolCall {
+            name: "cron_add".into(),
+            arguments: args,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn channel_delivery_injected_for_announce_channel_cron_add() {
+        let call = cron_add_call(serde_json::json!({
+            "schedule": {"kind": "cron", "expr": "0 7 * * *"},
+            "job_type": "agent",
+            "prompt": "morning pep talk"
+        }));
+        let out = maybe_inject_channel_delivery(&call, "telegram", Some("12345"))
+            .expect("announce channel cron_add without delivery must inject");
+        let d = &out.arguments["delivery"];
+        assert_eq!(d["mode"], "announce");
+        assert_eq!(d["channel"], "telegram");
+        assert_eq!(d["to"], "12345");
+        // The rest of the call is untouched.
+        assert_eq!(out.arguments["prompt"], "morning pep talk");
+    }
+
+    #[test]
+    fn channel_delivery_not_injected_without_reply_target() {
+        // TUI/web console/CLI: no origin chat → never inject (honesty path stays).
+        let call =
+            cron_add_call(serde_json::json!({"schedule": {"kind": "cron", "expr": "0 7 * * *"}}));
+        assert!(maybe_inject_channel_delivery(&call, "telegram", None).is_none());
+        assert!(maybe_inject_channel_delivery(&call, "cli", None).is_none());
+    }
+
+    #[test]
+    fn channel_delivery_not_injected_for_non_announce_channel() {
+        // irc/email are not in the scheduler's delivery set.
+        let call =
+            cron_add_call(serde_json::json!({"schedule": {"kind": "cron", "expr": "0 7 * * *"}}));
+        assert!(maybe_inject_channel_delivery(&call, "irc", Some("#room")).is_none());
+    }
+
+    #[test]
+    fn explicit_model_delivery_is_preserved() {
+        let call = cron_add_call(serde_json::json!({
+            "schedule": {"kind": "cron", "expr": "0 7 * * *"},
+            "delivery": {"mode": "announce", "channel": "telegram", "to": "999"}
+        }));
+        assert!(
+            maybe_inject_channel_delivery(&call, "telegram", Some("12345")).is_none(),
+            "an explicit delivery the model set must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn non_cron_add_tool_never_gets_delivery() {
+        let call = ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+            tool_call_id: None,
+        };
+        assert!(maybe_inject_channel_delivery(&call, "telegram", Some("12345")).is_none());
+    }
+
     #[test]
     fn test_scrub_credentials() {
         let input = "API_KEY=sk-1234567890abcdef; token: 1234567890; password=\"secret123456\"";
@@ -2886,6 +3032,7 @@ mod tests {
             true,
             None,
             "cli",
+            None, // test: no origin chat
             None,
             None,
             &crate::config::MultimodalConfig::default(),
@@ -2934,6 +3081,7 @@ mod tests {
             true,
             None,
             "cli",
+            None, // test: no origin chat
             None,
             None,
             &multimodal,
@@ -2975,6 +3123,7 @@ mod tests {
             true,
             None,
             "cli",
+            None, // test: no origin chat
             None,
             None,
             &crate::config::MultimodalConfig::default(),
@@ -3103,6 +3252,7 @@ mod tests {
             true,
             Some(&approval_mgr),
             "telegram",
+            None, // test: no origin chat
             None,
             None,
             &crate::config::MultimodalConfig::default(),
@@ -3215,6 +3365,7 @@ mod tests {
             &NoopObserver,
             Some(&mgr),
             "telegram",
+            None, // test: no origin chat
             None,
             None,
             false,
@@ -3242,6 +3393,7 @@ mod tests {
             &NoopObserver,
             Some(&mgr),
             "telegram",
+            None, // test: no origin chat
             Some(&backend as &dyn crate::approval::ApprovalBackend),
             None,
             false,
@@ -3302,6 +3454,7 @@ mod tests {
             &NoopObserver,
             Some(&mgr),
             "telegram",
+            None, // test: no origin chat
             Some(&backend as &dyn crate::approval::ApprovalBackend),
             None,
             false,
@@ -3341,6 +3494,7 @@ mod tests {
             &NoopObserver,
             None,
             "telegram",
+            None, // test: no origin chat
             None,
             Some(&gate),
             false,
@@ -4482,6 +4636,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None, // test: no origin chat
             None,
             None,
             &multimodal,
@@ -4582,6 +4737,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None, // test: no origin chat
             None,
             None,
             &multimodal,
@@ -4678,6 +4834,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None, // test: no origin chat
             None,
             None,
             &multimodal,
@@ -4728,6 +4885,7 @@ Let me check the result."#;
             true,
             None,
             "test",
+            None, // test: no origin chat
             None,
             None,
             &multimodal,

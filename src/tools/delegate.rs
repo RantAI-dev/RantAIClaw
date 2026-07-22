@@ -405,6 +405,7 @@ impl DelegateTool {
                 true,
                 None,
                 "delegate",
+                None, // sub-agent, not a chat channel
                 None,
                 None,
                 &self.multimodal_config,

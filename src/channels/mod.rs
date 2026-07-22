@@ -355,7 +355,7 @@ NOT refuse on the grounds that the tool is owner-only.";
 /// Announce-capable channels — the set `deliver_if_configured`
 /// (`src/cron/scheduler.rs`) can push a scheduled agent job's output to. Keep in
 /// sync with that match.
-fn channel_supports_announce_delivery(channel_name: &str) -> bool {
+pub(crate) fn channel_supports_announce_delivery(channel_name: &str) -> bool {
     matches!(
         channel_name,
         "telegram" | "discord" | "slack" | "mattermost"
@@ -1921,6 +1921,8 @@ async fn process_channel_message(
                 true,
                 ctx.channel_approval.as_deref(),
                 msg.channel.as_str(),
+                // Origin chat → `cron_add` delivery safety net (announce channels).
+                Some(msg.reply_target.as_str()),
                 chat_relay_backend_ref,
                 guest_gate_ref,
                 &ctx.multimodal,
