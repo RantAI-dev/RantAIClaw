@@ -920,6 +920,7 @@ impl Agent {
             true,
             self.approval_manager.as_deref(),
             "cli",
+            None, // interactive/console agent — no origin chat
             self.approval_backend.as_deref(),
             // No guest gate on the interactive/console agent — the local or
             // authenticated user is the owner.
