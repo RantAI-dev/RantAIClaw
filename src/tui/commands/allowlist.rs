@@ -4,8 +4,10 @@
 //!   allowlist (session only by default; with `--persist`, also write
 //!   to `<policy_dir>/runtime_allowlist.toml`). Resolves a matching
 //!   pending approval request if one is queued.
-//! - `/deny <basename>` — explicitly deny a pending approval request
-//!   for this basename. Does not mutate the allowlist.
+//! - `/deny <basename>` — explicitly deny a pending approval request for
+//!   this basename and cancel the in-flight turn (same "stop, don't explore
+//!   alternatives" semantics as the inline N/Esc key). Does not mutate the
+//!   allowlist.
 //! - `/allowlist` — show the current allowlist (boot + runtime) and
 //!   any pending approval requests.
 //!
@@ -130,8 +132,11 @@ impl CommandHandler for DenyCommand {
         };
 
         match pending.resolve_by_basename(basename, Decision::Deny) {
-            Some(_) => Ok(CommandResult::Message(format!(
-                "Denied pending approval for `{basename}`. The agent's tool call will fail."
+            // Resolve the deny AND cancel the turn — same "stop, don't
+            // explore alternatives" semantics as the inline N/Esc key, so
+            // `/deny` and the keystroke behave identically.
+            Some(_) => Ok(CommandResult::CancelTurnWithMessage(format!(
+                "Denied pending approval for `{basename}` — turn cancelled."
             ))),
             None => Ok(CommandResult::Message(format!(
                 "No pending approval for `{basename}` (or more than one queued — wait for resolution)."
@@ -294,5 +299,48 @@ mod tests {
             CommandResult::Message(m) => assert!(m.contains("No pending approval")),
             _ => panic!("expected Message"),
         }
+    }
+
+    /// A `/deny` that actually resolves a queued approval must signal turn
+    /// cancellation (not a plain Message) so it behaves like the inline
+    /// N/Esc key — "stop, don't let the LLM explore alternatives".
+    #[tokio::test]
+    async fn deny_resolves_pending_and_signals_turn_cancel() {
+        use std::time::Duration;
+        let mut ctx = ctx_with_security();
+        let pending = Arc::new(crate::security::PendingApprovals::new(Some(
+            Duration::from_secs(5),
+        )));
+        ctx.security.as_ref().unwrap().set_pending(pending.clone());
+
+        // Model a blocked shell call awaiting a decision on `brew`.
+        let waiter = pending.clone();
+        let task = tokio::spawn(async move {
+            waiter
+                .request_decision("brew", "brew install x", "tui")
+                .await
+        });
+        for _ in 0..100 {
+            if !pending.list().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(pending.list().len(), 1, "request should be registered");
+
+        let result = DenyCommand.execute("brew", &mut ctx).unwrap();
+        assert!(
+            matches!(result, CommandResult::CancelTurnWithMessage(_)),
+            "a resolved /deny must signal turn cancellation, not a plain Message"
+        );
+        assert_eq!(
+            task.await.unwrap(),
+            Decision::Deny,
+            "the shell call unblocks with Deny"
+        );
+        assert!(
+            pending.list().is_empty(),
+            "registry cleaned up after resolve"
+        );
     }
 }

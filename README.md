@@ -219,7 +219,7 @@ Two layers — the **runtime enum** the approval gate branches on, and the **fou
 
 Approval UX **in the TUI**:
 
-- **Inline single-key prompt.** When the agent attempts a command not on the allowlist, a boxed widget replaces the input row: `[Y] yes once` · `[A] always (persist)` · `[N] no` · `[Esc] deny`.
+- **Inline single-key prompt.** When the agent attempts a command not on the allowlist, a boxed widget replaces the input row: `[Y] yes (session)` · `[A] always (persist)` · `[N] no` · `[Esc] deny`.
 - **Indefinite wait.** The prompt sits until you act — no auto-deny clock, so the model does not time out and try alternatives behind your back.
 - **Deny cancels the whole turn.** Saying no rejects the call *and* cancels the LLM turn. One decision, one outcome.
 - **Cascading approvals.** Commands like `cd … && python3 …` prompt for each blocking basename in the chain, capped at 6 per call.

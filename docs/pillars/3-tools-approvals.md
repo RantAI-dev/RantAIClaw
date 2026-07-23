@@ -17,7 +17,7 @@ The blast radius surface. Every tool call routes through one approval gate befor
 
 When the agent attempts a shell command not on the active preset's allowlist:
 
-1. **Boxed inline prompt** replaces the input row — amber border, command preview, action chips (`[Y]` yes once · `[A]` always (persist) · `[N]` no · `[Esc]` deny). Single keypress resolves.
+1. **Boxed inline prompt** replaces the input row — amber border, command preview, action chips (`[Y]` yes (session) · `[A]` always (persist) · `[N]` no · `[Esc]` deny). Single keypress resolves.
 2. **No auto-deny timeout** — the prompt sits indefinitely until you act. Matches CC's pause semantics; the LLM is genuinely frozen while waiting.
 3. **Deny cancels the entire turn**, not just the tool call. Stops the LLM from trying alternative commands behind your back.
 4. **Cascading approvals** walk `&&` chains — approving `cd` then re-prompts for the next blocking basename (e.g. `python3`), capped at 6 prompts per call.

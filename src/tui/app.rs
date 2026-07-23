@@ -618,6 +618,22 @@ impl TuiApp {
         };
         let _ = self.context.append_system_message(&msg);
         self.scrollback_queue.push(("system".into(), msg));
+
+        // Concurrent blocked calls: an approve keeps the turn running, so pull
+        // the next still-queued request into the box instead of leaving it
+        // stranded off-screen. Skip the basename we just resolved — its
+        // snapshot entry is cleared asynchronously (when its awaiting future
+        // unwinds), so `list()` can still report it for a tick. A Deny cancels
+        // the whole turn (dropping the other blocked calls), so don't resurface
+        // anything there.
+        if resolved
+            && matches!(
+                decision,
+                crate::security::Decision::Session | crate::security::Decision::Persist
+            )
+        {
+            self.pending_approval = pending.list().into_iter().find(|r| r.basename != basename);
+        }
     }
 
     /// Replace the input buffer with the highlighted command name.
@@ -1774,15 +1790,19 @@ impl TuiApp {
                         );
                         let _ = self.context.append_system_message(&line);
                         self.scrollback_queue.push(("system".into(), line));
-                        // Stash the latest pending request so the key
-                        // handler can resolve it inline via single
-                        // keystroke without the user typing /allow X.
-                        // Replacing an earlier unresolved request is
-                        // fine — the inner registry tracks all of them
-                        // by id, and the user only sees the newest in
-                        // the prompt. Older ones still auto-deny on
-                        // timeout.
-                        self.pending_approval = Some(req);
+                        // Surface this request in the boxed prompt only when
+                        // none is already open — clobbering a still-unresolved
+                        // one would strand it off-screen. The agent loop can run
+                        // tool calls in parallel, so several shell commands may
+                        // block at once; the extras stay in the registry and pop
+                        // into the box as each is resolved (see
+                        // resolve_pending_approval's advance step). `/allowlist`
+                        // lists everything queued meanwhile. The TUI registry has
+                        // no timeout (PendingApprovals::default), so nothing
+                        // auto-denies — the queue drains only by user action.
+                        if self.pending_approval.is_none() {
+                            self.pending_approval = Some(req);
+                        }
                     }
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
@@ -2669,6 +2689,20 @@ impl TuiApp {
                             .to_string();
                     let _ = self.context.append_system_message(&msg);
                     self.scrollback_queue.push(("system".to_string(), msg));
+                }
+            }
+            CmdResult::CancelTurnWithMessage(msg) => {
+                // `/deny` resolved a pending approval as Deny. Mirror the
+                // inline N/Esc path (resolve_pending_approval): show the
+                // note, then cancel the turn so the LLM doesn't react to
+                // the tool error by trying alternative commands.
+                let _ = self.context.append_system_message(&msg);
+                self.scrollback_queue.push(("system".to_string(), msg));
+                if let AppState::Streaming { cancelling, .. } = &mut self.state {
+                    *cancelling = true;
+                }
+                if let Err(e) = self.context.req_tx.send(TurnRequest::Cancel).await {
+                    self.context.last_error = Some(format!("cancel failed: {e}"));
                 }
             }
             CmdResult::OpenFirstRunWizard => {
@@ -4853,7 +4887,7 @@ fn render_stream_preview_pane(
 /// ╭ 🔒 Approval needed · cd ────────────────────────────╮
 /// │ cd /home/.../skills/stocks && .venv/bin/python …   │
 /// │                                                     │
-/// │ [Y] yes once   [A] always   [N] no   [Esc] deny    │
+/// │ [Y] yes (session)   [A] always   [N] no   [Esc] deny │
 /// ╰─────────────────────────────────────────────────────╯
 /// ```
 fn render_approval_pane(
@@ -4900,7 +4934,7 @@ fn render_approval_pane(
     }
 
     let mut chip_spans: Vec<Span<'static>> = Vec::new();
-    chip_spans.extend(chip("Y", "yes once", key_bg, key_fg, muted));
+    chip_spans.extend(chip("Y", "yes (session)", key_bg, key_fg, muted));
     chip_spans.extend(chip("A", "always (persist)", key_bg, key_fg, muted));
     chip_spans.extend(chip("N", "no", key_bg, key_fg, muted));
     chip_spans.extend(chip("Esc", "deny", key_bg, key_fg, muted));
@@ -7679,6 +7713,61 @@ mod submit_tests {
             autonomy_hint_shown_this_turn: false,
             pending_approval: None,
         }
+    }
+
+    /// When several shell calls block at once (parallel tool execution),
+    /// approving the one shown in the box must advance the box to the next
+    /// still-queued request — not leave it blank, stranding the other blocked
+    /// call off-screen where the agent looks frozen.
+    #[tokio::test]
+    async fn approving_one_of_several_pending_advances_the_box_to_the_next() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (mut ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let registry = Arc::new(crate::security::PendingApprovals::new(Some(
+            Duration::from_secs(5),
+        )));
+        security.set_pending(registry.clone());
+        ctx.security = Some(security);
+
+        // Two shell calls blocked concurrently on distinct basenames.
+        let r1 = registry.clone();
+        let t1 = tokio::spawn(async move { r1.request_decision("aa", "aa --x", "tui").await });
+        let r2 = registry.clone();
+        let t2 = tokio::spawn(async move { r2.request_decision("bb", "bb --y", "tui").await });
+        for _ in 0..200 {
+            if registry.list().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(registry.list().len(), 2, "both requests registered");
+
+        let mut app = make_app_with_context(ctx);
+        // The box currently shows one of them; approve it.
+        let shown_first = registry.list().into_iter().next().unwrap();
+        let resolved_name = shown_first.basename.clone();
+        app.pending_approval = Some(shown_first);
+        app.resolve_pending_approval(crate::security::Decision::Session);
+
+        // The box must now show the OTHER, still-live request — not go blank
+        // and not re-show the one just resolved.
+        let advanced = app
+            .pending_approval
+            .as_ref()
+            .map(|r| r.basename.clone())
+            .expect("box must advance to the remaining queued approval, not go blank");
+        assert_ne!(
+            advanced, resolved_name,
+            "the box must not re-show the just-resolved request"
+        );
+
+        // Clean up the spawned waiters so the test doesn't leak tasks.
+        registry.resolve_by_basename(&advanced, crate::security::Decision::Session);
+        let _ = t1.await;
+        let _ = t2.await;
     }
 
     fn chat_pane_buffer_text(ctx: &mut TuiContext, w: u16, h: u16) -> String {
