@@ -60,6 +60,11 @@ pub enum CommandResult {
     /// Cancel the in-flight turn — the same TurnRequest::Cancel that Esc
     /// sends. The dispatcher owns the async send.
     CancelTurn,
+    /// Append `String` as a system message AND cancel the in-flight turn.
+    /// Used by `/deny`: rejecting a pending shell approval should stop the
+    /// turn (so the LLM doesn't retry alternative commands) — the same
+    /// "stop, don't explore" semantics the inline N/Esc key already has.
+    CancelTurnWithMessage(String),
     OpenFirstRunWizard,
     /// Fetch the ClawHub catalogue and open an interactive install picker.
     /// Mirrors the `/sessions` pattern (search + paginate via ListPicker)
