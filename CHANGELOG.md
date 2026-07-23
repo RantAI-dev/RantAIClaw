@@ -5,6 +5,37 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1-alpha] — 2026-07-23
+
+Tool-approval UX is made honest and consistent across the TUI and the web
+console, and the web console can now approve shell commands instead of hanging.
+Patch bump: behavior/label fixes plus a backward-compatible `always` field on the
+approvals API.
+
+### Fixed
+
+- **TUI approval** — the `[Y]` chip now reads "yes (session)" (Y allowlists the
+  basename for the whole session, not "once"); `/deny` cancels the entire turn
+  like the inline `N`/`Esc` key; and concurrent blocked commands no longer strand
+  an approval off-screen (the box advances to the next still-queued request).
+  Corrected a stale "auto-deny on timeout" comment and dropped inert cascade code.
+- **Web console** — a Supervised `shell` command not on the allowlist no longer
+  hangs the turn: its command-level approval is surfaced through the same
+  in-browser modal + `POST /api/v1/approvals/{id}`, mirroring the TUI (one modal
+  per command; cascading `a && b` prompts per blocker).
+
+### Added
+
+- **Web-console approval parity with the TUI** — the tool-approval modal gains an
+  **Always** option (`POST /api/v1/approvals/{id}` accepts `{ approve, always }`;
+  back-compatible — `{ approve }` still works), a Deny that cancels the turn, and
+  an "Always" grant that persists across the conversation's messages.
+
+### Notes
+
+- Requires claw-ui **v0.3.8** for the console "Always" button (the pinned default
+  `ui install` fetches).
+
 ## [0.9.0-alpha] — 2026-07-22
 
 Scheduled tasks ("cron") become a first-class, cross-surface feature: create and
