@@ -1164,6 +1164,35 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether `dir` (an existing skill directory named `slug`) is something
+/// `skills update` may safely delete-and-refetch from ClawHub.
+///
+/// Skills carry no persisted origin marker, so this is a heuristic over the
+/// two signals we do have (see plan 035 "Maintenance notes" — replace with a
+/// durable origin field if one is ever added, and delete this inference):
+///   - a **symlink** in `profile.skills_dir()` is a local-path install
+///     (`skills install <path>`, `:1354-1376`) — its target lives elsewhere
+///     and `update` has nothing to fetch from ClawHub for it.
+///   - a directory matching a bundled `CORE_PACK`/`STARTER_PACK` slug has no
+///     ClawHub origin and would 404 on fetch.
+///
+/// Both cases must be skipped, not deleted — `git pull`/reinstall those
+/// manually per the `Update` help text (`src/main.rs:1261-1266`).
+fn is_clawhub_managed_skill(dir: &Path, slug: &str) -> bool {
+    let is_bundled = crate::skills::bundled::CORE_PACK
+        .iter()
+        .chain(crate::skills::bundled::STARTER_PACK.iter())
+        .any(|entry| entry.slug == slug);
+    if is_bundled {
+        return false;
+    }
+    // symlink_metadata (not metadata) so we classify by the entry itself,
+    // not by following it — a dangling symlink is still a local install.
+    std::fs::symlink_metadata(dir)
+        .map(|meta| !meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 /// Handle the `skills` CLI command
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_command(
@@ -1513,10 +1542,29 @@ pub(crate) fn handle_command(
         crate::SkillCommands::Update { slug, all } => {
             let profile =
                 crate::profile::ProfileManager::active().context("resolve active profile")?;
-            let skills = load_skills_with_config(workspace_dir, config);
 
             let targets: Vec<String> = if all {
-                skills.iter().map(|s| s.name.clone()).collect()
+                // Enumerate real installed **slug directories** under
+                // `profile.skills_dir()` — the only place `install_one`
+                // writes to, and the same key the per-slug lookup below
+                // joins against. (Previously this read the loaded
+                // manifest's `skill.name`, which can differ from the
+                // on-disk slug and made the "not installed locally" check
+                // below false — silently skipping skills whose manifest
+                // name didn't match their directory name.)
+                let dir = profile.skills_dir();
+                let mut slugs = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.join("SKILL.toml").exists() || path.join("SKILL.md").exists() {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                slugs.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+                slugs
             } else if let Some(s) = slug {
                 vec![s]
             } else {
@@ -1542,18 +1590,69 @@ pub(crate) fn handle_command(
                         skipped += 1;
                         continue;
                     }
-                    if let Err(e) = std::fs::remove_dir_all(&dir) {
-                        println!("  ✗ {slug}: failed to clear old install: {e}");
+                    if !is_clawhub_managed_skill(&dir, slug) {
+                        println!("  ⊘ {slug}: not a ClawHub skill — skipping");
+                        skipped += 1;
+                        continue;
+                    }
+
+                    // Non-destructive swap. `install_one` skips-if-exists
+                    // and only cleans up *its own* partial dir on failure
+                    // (`clawhub.rs:368-386`) — it never restores what a
+                    // caller deleted beforehand. So instead of removing
+                    // `dir` up front (the old, data-losing sequence), stage
+                    // it aside first: rename it out of the way (into a
+                    // sibling of `skills/`, not inside it, so the skill
+                    // loader — which only scans `profile.skills_dir()` and
+                    // the two workspace-relative skill roots, see
+                    // `load_workspace_skills`, `:298-346` — never sees the
+                    // backup as a phantom skill mid-swap), let
+                    // `install_one` write a fresh `dir` from scratch, and
+                    // only discard the backup once that fetch has proven
+                    // good. On any failure the backup is renamed back, so
+                    // the prior install is never lost (Reversibility,
+                    // CLAUDE.md §3.8) — the core fix for the "404 wipes the
+                    // skill" data-loss bug.
+                    let backup_root = profile.root.join(".skills-update-tmp");
+                    if let Err(e) = std::fs::create_dir_all(&backup_root) {
+                        println!("  ✗ {slug}: failed to prepare backup dir: {e}");
                         failed += 1;
                         continue;
                     }
+                    let backup = backup_root.join(slug);
+                    // Clear any stale backup left by a prior crashed run
+                    // before staging this one.
+                    let _ = std::fs::remove_dir_all(&backup);
+
+                    if let Err(e) = std::fs::rename(&dir, &backup) {
+                        println!("  ✗ {slug}: failed to stage update: {e}");
+                        failed += 1;
+                        continue;
+                    }
+
                     match rt.block_on(crate::skills::clawhub::install_one(&profile, slug)) {
                         Ok(()) => {
+                            let _ = std::fs::remove_dir_all(&backup);
                             println!("  {} {slug}: updated", console::style("✓").green().bold());
                             updated += 1;
                         }
                         Err(e) => {
-                            println!("  ✗ {slug}: {e}");
+                            // Restore the backup. `install_one` already
+                            // cleans up its own partial dir on error, but
+                            // guard against any leftover before swapping
+                            // the backup back into place.
+                            let _ = std::fs::remove_dir_all(&dir);
+                            match std::fs::rename(&backup, &dir) {
+                                Ok(()) => {
+                                    println!("  ✗ {slug}: {e} (kept existing version)");
+                                }
+                                Err(re) => {
+                                    println!(
+                                        "  ✗ {slug}: {e} (restore failed: {re} — prior version backed up at {})",
+                                        backup.display()
+                                    );
+                                }
+                            }
                             failed += 1;
                         }
                     }
@@ -2472,6 +2571,290 @@ description = "Bare minimum"
         assert!(
             open_skills_dir.join("custom-skill.md").exists(),
             "nothing should have been deleted"
+        );
+    }
+
+    // --- `skills update` non-destructive swap tests (plan 035) -----------
+
+    /// Minimal blocking mock ClawHub server for `update_*` tests. Serves the
+    /// three endpoints `install_one` walks (`GET /skills/<slug>`, `GET
+    /// /skills/<slug>/versions/<v>`, `GET /skills/<slug>/file?...`, modeled
+    /// on `tests/onboard_skills_section.rs`'s `spawn_mock_clawhub_full`).
+    /// When `fail_detail` is set, the detail endpoint always 404s (models a
+    /// failed fetch) so `install_one` never gets past step 1.
+    ///
+    /// Runs on its own dedicated OS thread with a plain blocking
+    /// `std::net::TcpListener` rather than a tokio task on the test's own
+    /// runtime: the `Update` arm under test spawns *its own* fresh tokio
+    /// runtime on a *different* OS thread (see `handle_command`'s `Update`
+    /// arm), and these tests call `handle_command` directly from a plain
+    /// `#[test]` with no runtime of its own — a std thread with a blocking
+    /// listener sidesteps any risk of one runtime starving another's accept
+    /// loop.
+    fn spawn_mock_clawhub(body: Vec<u8>, body_sha: String, fail_detail: bool) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = match sock.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+
+                let (status, ctype, resp_body): (&str, &str, Vec<u8>) = if fail_detail {
+                    ("404 Not Found", "text/plain", b"not found".to_vec())
+                } else if path.contains("/file?") {
+                    ("200 OK", "text/markdown", body.clone())
+                } else if path.contains("/versions/") {
+                    let manifest = serde_json::json!({
+                        "version": {
+                            "version": "1.0.0",
+                            "files": [{
+                                "path": "SKILL.md",
+                                "size": body.len(),
+                                "sha256": body_sha,
+                                "contentType": "text/markdown",
+                            }]
+                        }
+                    });
+                    (
+                        "200 OK",
+                        "application/json",
+                        manifest.to_string().into_bytes(),
+                    )
+                } else {
+                    let detail = serde_json::json!({
+                        "skill": {"slug": "demo"},
+                        "latestVersion": {"version": "1.0.0"}
+                    });
+                    (
+                        "200 OK",
+                        "application/json",
+                        detail.to_string().into_bytes(),
+                    )
+                };
+
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp_body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(&resp_body);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex::encode(hasher.finalize())
+    }
+
+    #[test]
+    fn update_success_swaps_new_version() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        write_fake_skill(&profile.skills_dir(), "demo", None);
+
+        let new_body = b"# demo skill\n\nUpdated content from ClawHub.\n".to_vec();
+        let new_sha = sha256_hex(&new_body);
+        let base = spawn_mock_clawhub(new_body.clone(), new_sha, false);
+        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+
+        let result = handle_command(
+            crate::SkillCommands::Update {
+                slug: Some("demo".to_string()),
+                all: false,
+            },
+            &config,
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        let content = fs::read(profile.skills_dir().join("demo").join("SKILL.md")).unwrap();
+        assert_eq!(
+            content, new_body,
+            "SKILL.md must be swapped to the newly fetched content"
+        );
+        assert!(
+            !profile
+                .root
+                .join(".skills-update-tmp")
+                .join("demo")
+                .exists(),
+            "backup dir must be cleaned up after a successful update"
+        );
+    }
+
+    #[test]
+    fn update_failure_preserves_old_dir() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        let profile_skills = profile.skills_dir();
+        write_fake_skill(&profile_skills, "demo", None);
+        let original_content = fs::read(profile_skills.join("demo").join("SKILL.md")).unwrap();
+
+        // 404s the detail endpoint — models a failed fetch (upstream gone,
+        // transient network error, or a bundled/non-ClawHub slug that
+        // somehow slipped past the origin guard).
+        let base = spawn_mock_clawhub(Vec::new(), String::new(), true);
+        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+
+        let result = handle_command(
+            crate::SkillCommands::Update {
+                slug: Some("demo".to_string()),
+                all: false,
+            },
+            &config,
+        );
+        assert!(
+            result.is_err(),
+            "a failed fetch must be reported as a failure, not silently swallowed"
+        );
+
+        // The regression this plan fixes: the original directory must be
+        // present and byte-identical to before the update attempt — never
+        // deleted before a successful fetch.
+        assert!(
+            profile_skills.join("demo").exists(),
+            "the original skill directory must survive a failed update"
+        );
+        let restored = fs::read(profile_skills.join("demo").join("SKILL.md")).unwrap();
+        assert_eq!(
+            restored, original_content,
+            "original skill content must be byte-identical after a failed update"
+        );
+        assert!(
+            !profile
+                .root
+                .join(".skills-update-tmp")
+                .join("demo")
+                .exists(),
+            "backup dir must be restored, not left behind, after a failed update"
+        );
+    }
+
+    #[test]
+    fn update_all_skips_non_clawhub() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        let profile_skills = profile.skills_dir();
+
+        // Bundled skill — a CORE_PACK slug, no ClawHub origin, would 404.
+        let bundled_slug = crate::skills::bundled::CORE_PACK[0].slug;
+        write_fake_skill(&profile_skills, bundled_slug, None);
+        let bundled_content = fs::read(profile_skills.join(bundled_slug).join("SKILL.md")).unwrap();
+
+        // Local-path install — a real symlink into an external dir, as
+        // `skills install <path>` creates (`:1354-1376`).
+        #[cfg(unix)]
+        let outside_dir = {
+            let outside_dir = workspace_dir.parent().unwrap().join("outside-local-skill");
+            fs::create_dir_all(&outside_dir).unwrap();
+            fs::write(outside_dir.join("SKILL.md"), "# Local\nLocal skill.\n").unwrap();
+            std::os::unix::fs::symlink(&outside_dir, profile_skills.join("local-skill")).unwrap();
+            outside_dir
+        };
+
+        // Point CLAWHUB_BASE_URL_ENV at a dead port — if the origin guard
+        // is ever bypassed, the resulting network attempt fails fast and
+        // loud instead of silently succeeding or hanging.
+        let _clawhub = EnvVarGuard::set(
+            crate::skills::clawhub::CLAWHUB_BASE_URL_ENV,
+            "http://127.0.0.1:1",
+        );
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+
+        let result = handle_command(
+            crate::SkillCommands::Update {
+                slug: None,
+                all: true,
+            },
+            &config,
+        );
+        assert!(
+            result.is_ok(),
+            "skipped non-ClawHub skills must not count as failures, got {result:?}"
+        );
+
+        let after_bundled = fs::read(profile_skills.join(bundled_slug).join("SKILL.md")).unwrap();
+        assert_eq!(
+            after_bundled, bundled_content,
+            "bundled skill must not be modified by `update --all`"
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                std::fs::symlink_metadata(profile_skills.join("local-skill"))
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false),
+                "local-path symlink must survive `update --all`"
+            );
+            assert!(
+                outside_dir.join("SKILL.md").exists(),
+                "local-path symlink target must be untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn update_all_keys_by_slug_dir() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let profile = crate::profile::ProfileManager::active().unwrap();
+        let profile_skills = profile.skills_dir();
+
+        // On-disk slug differs from the manifest `name:` — the keying bug
+        // this fixes: `--all` used to build its target list from
+        // `skill.name` ("Weather Reporter"), which never matched the
+        // `profile.skills_dir().join(slug)` lookup keyed on the directory
+        // name, so the skill was falsely reported "not installed locally"
+        // and silently skipped.
+        write_fake_skill(&profile_skills, "weather-dir", Some("Weather Reporter"));
+
+        let new_body = b"# weather-dir\n\nUpdated via --all.\n".to_vec();
+        let new_sha = sha256_hex(&new_body);
+        let base = spawn_mock_clawhub(new_body.clone(), new_sha, false);
+        let _clawhub = EnvVarGuard::set(crate::skills::clawhub::CLAWHUB_BASE_URL_ENV, &base);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+
+        let result = handle_command(
+            crate::SkillCommands::Update {
+                slug: None,
+                all: true,
+            },
+            &config,
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        let content = fs::read(profile_skills.join("weather-dir").join("SKILL.md")).unwrap();
+        assert_eq!(
+            content, new_body,
+            "`--all` must target the on-disk slug dir, not the manifest name"
         );
     }
 }
