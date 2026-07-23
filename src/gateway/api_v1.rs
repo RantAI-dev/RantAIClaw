@@ -497,9 +497,16 @@ async fn agent_chat_stream(
                 let mut approval_for_harvest: Option<
                     std::sync::Arc<crate::approval::ApprovalManager>,
                 > = None;
+                let mut shell_approval_forwarder: Option<tokio::task::JoinHandle<()>> = None;
                 if gate_tools {
+                    // Exempt `shell` from the Layer-A tool-gate: the shell tool has
+                    // its own command-level gate (Layer-B, handled below), so gating
+                    // it here too would mean two modals for one command. Every other
+                    // tool stays on the Layer-A modal.
+                    let mut autonomy = config.autonomy.clone();
+                    crate::gateway::web_approval::exempt_shell_from_tool_gate(&mut autonomy);
                     let manager = std::sync::Arc::new(
-                        crate::approval::ApprovalManager::from_config(&config.autonomy),
+                        crate::approval::ApprovalManager::from_config(&autonomy),
                     );
                     // Carry "Always" grants from earlier messages in this
                     // conversation so they persist across turns (TUI parity —
@@ -511,13 +518,49 @@ async fn agent_chat_stream(
                     }
                     let backend = std::sync::Arc::new(
                         crate::gateway::web_approval::WebModalApprovalBackend::new(
-                            web_approvals,
+                            web_approvals.clone(),
                             events_tx.clone(),
                             cancel_for_backend,
                         ),
                     );
                     approval_for_harvest = Some(manager.clone());
                     agent.set_approval(Some(manager), Some(backend));
+
+                    // Route the shell tool's command-level (Layer-B) approvals through
+                    // the same web modal + `POST /approvals/{id}` endpoint. Point the
+                    // security registry at the shared `web_approvals` so the shell
+                    // cascade registers there, and forward its requests (tagged with an
+                    // empty channel, unlike the Layer-A "console" ones) as
+                    // `approval_request` SSE events keyed by the command basename.
+                    // Without this a Supervised shell command not on the allowlist
+                    // blocks forever — no UI is subscribed to resolve it.
+                    if let Some(sec) = agent.security() {
+                        sec.set_pending(web_approvals.clone());
+                    }
+                    let mut shell_rx = web_approvals.subscribe();
+                    let fwd_tx = events_tx.clone();
+                    shell_approval_forwarder = Some(tokio::spawn(async move {
+                        loop {
+                            match shell_rx.recv().await {
+                                Ok(req) if req.channel.is_empty() => {
+                                    let _ = fwd_tx
+                                        .send(crate::agent::AgentEvent::ApprovalRequest {
+                                            id: req.basename.clone(),
+                                            tool: "shell".to_string(),
+                                            args: serde_json::json!({
+                                                "command": req.full_command,
+                                            }),
+                                        })
+                                        .await;
+                                }
+                                // Layer-A (non-shell) requests emit their own
+                                // modal; a lagged receiver just skips ahead.
+                                Ok(_)
+                                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    }));
                 }
                 // Re-feed prior turns so a continued conversation has context.
                 let prior = load_session_history(history_session_id.as_deref());
@@ -531,6 +574,12 @@ async fn agent_chat_stream(
                         Some(cancel_for_agent),
                     )
                     .await;
+                // Turn is done — stop forwarding shell approvals (the shared
+                // `web_approvals` broadcast never closes, so the task would
+                // otherwise leak).
+                if let Some(h) = shell_approval_forwarder.take() {
+                    h.abort();
+                }
                 // Persist tools approved "Always" this turn so the next message
                 // in the conversation keeps them allowlisted (TUI session parity).
                 if let (Some(mgr), Some(sid)) =
