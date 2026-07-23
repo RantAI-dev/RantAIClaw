@@ -494,10 +494,21 @@ async fn agent_chat_stream(
                 // agent pauses, emits `AgentEvent::ApprovalRequest` over this
                 // SSE stream, and waits for `POST /approvals/{id}`. Off when
                 // `autonomous_tools` is set (run unattended).
+                let mut approval_for_harvest: Option<
+                    std::sync::Arc<crate::approval::ApprovalManager>,
+                > = None;
                 if gate_tools {
                     let manager = std::sync::Arc::new(
                         crate::approval::ApprovalManager::from_config(&config.autonomy),
                     );
+                    // Carry "Always" grants from earlier messages in this
+                    // conversation so they persist across turns (TUI parity —
+                    // each SSE turn otherwise rebuilds a fresh manager).
+                    if let Some(sid) = history_session_id.as_deref() {
+                        manager.seed_session_allowlist(
+                            crate::gateway::web_approval::session_granted_tools(sid),
+                        );
+                    }
                     let backend = std::sync::Arc::new(
                         crate::gateway::web_approval::WebModalApprovalBackend::new(
                             web_approvals,
@@ -505,6 +516,7 @@ async fn agent_chat_stream(
                             cancel_for_backend,
                         ),
                     );
+                    approval_for_harvest = Some(manager.clone());
                     agent.set_approval(Some(manager), Some(backend));
                 }
                 // Re-feed prior turns so a continued conversation has context.
@@ -519,6 +531,16 @@ async fn agent_chat_stream(
                         Some(cancel_for_agent),
                     )
                     .await;
+                // Persist tools approved "Always" this turn so the next message
+                // in the conversation keeps them allowlisted (TUI session parity).
+                if let (Some(mgr), Some(sid)) =
+                    (approval_for_harvest.as_ref(), history_session_id.as_deref())
+                {
+                    crate::gateway::web_approval::record_session_grants(
+                        sid,
+                        &mgr.session_allowlist(),
+                    );
+                }
             }
             Err(err) => {
                 let _ = events_tx

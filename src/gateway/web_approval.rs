@@ -17,7 +17,10 @@
 //! (the API token is the approver). Absent a resolution, the request times out
 //! to deny — secure by default.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
+
+use parking_lot::Mutex;
 
 use crate::agent::{AgentEvent, AgentEventSender};
 use crate::approval::{
@@ -112,6 +115,48 @@ pub fn resolve(relay: &PendingApprovals, id: &str, approve: bool, always: bool) 
         Decision::Once
     };
     relay.resolve_by_basename(id, decision).is_some()
+}
+
+/// Per-session "Always"-granted tool names for the web console. Each SSE turn
+/// rebuilds a fresh `ApprovalManager`, so without this an "Always" grant would
+/// reset every message; keying grants by the conversation's session id lets the
+/// grant persist across the conversation (parity with the TUI's session-scoped
+/// allowlist). Process-scoped and bounded — the gateway is one process, and a
+/// convenience grant is safe to drop under memory pressure (it just re-prompts).
+static SESSION_GRANTS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Cap on distinct sessions holding grants, so a long-lived gateway can't grow
+/// the map without bound. A new session past the cap simply won't persist grants
+/// (it re-prompts each turn — safe degradation).
+const MAX_GRANT_SESSIONS: usize = 1000;
+
+/// Tools this session has granted "Always" — used to seed a new turn's manager.
+pub fn session_granted_tools(session_id: &str) -> Vec<String> {
+    SESSION_GRANTS
+        .lock()
+        .get(session_id)
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Merge a turn's "Always" grants into the session's persistent set. No-op when
+/// empty, and bounded: a brand-new session past `MAX_GRANT_SESSIONS` is skipped
+/// rather than evicting an existing one.
+pub fn record_session_grants<S: std::hash::BuildHasher>(
+    session_id: &str,
+    tools: &HashSet<String, S>,
+) {
+    if tools.is_empty() {
+        return;
+    }
+    let mut map = SESSION_GRANTS.lock();
+    if !map.contains_key(session_id) && map.len() >= MAX_GRANT_SESSIONS {
+        return;
+    }
+    map.entry(session_id.to_string())
+        .or_default()
+        .extend(tools.iter().cloned());
 }
 
 #[cfg(test)]
@@ -224,5 +269,20 @@ mod tests {
     async fn resolve_unknown_id_is_false() {
         let relay = PendingApprovals::new(Some(Duration::from_secs(10)));
         assert!(!resolve(&relay, "no-such-id", true, false));
+    }
+
+    #[test]
+    fn session_grants_accumulate_and_empty_is_noop() {
+        // Unique session id so this never collides with the process-global store.
+        let sid = "sess-grants-roundtrip-3f9c";
+        assert!(session_granted_tools(sid).is_empty());
+        record_session_grants(sid, &HashSet::from(["http_request".to_string()]));
+        record_session_grants(sid, &HashSet::new()); // empty is a no-op
+        record_session_grants(sid, &HashSet::from(["browser".to_string()])); // accumulates
+        let got: HashSet<String> = session_granted_tools(sid).into_iter().collect();
+        assert_eq!(
+            got,
+            HashSet::from(["http_request".to_string(), "browser".to_string()])
+        );
     }
 }
