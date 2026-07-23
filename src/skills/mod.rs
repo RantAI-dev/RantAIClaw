@@ -1638,6 +1638,12 @@ mod tests {
             std::env::remove_var(key);
             Self { key, original }
         }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -1648,6 +1654,96 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
+    }
+
+    /// Isolated fake-profile + workspace harness for tests that exercise
+    /// `load_skills_with_config`/`load_skills_with_status`, which call
+    /// `ProfileManager::active()` (root 1, see `load_workspace_skills`) and
+    /// so read the process-global `HOME`/`RANTAICLAW_PROFILE` env vars.
+    /// Holds `crate::test_env::ENV_LOCK` for its entire lifetime — keep the
+    /// returned harness alive for the whole test body — so no other test
+    /// thread can observe or clobber these vars concurrently; both vars are
+    /// restored on drop (same save/restore pattern as `EnvVarGuard`).
+    struct FakeProfileEnv {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+        _home: EnvVarGuard,
+        _profile: EnvVarGuard,
+        // Kept alive only so the backing directory isn't deleted early;
+        // never read again after `new()` computes `workspace_dir` from it.
+        _tempdir: tempfile::TempDir,
+    }
+
+    impl FakeProfileEnv {
+        /// Point `HOME` at a fresh, empty tempdir (so root 1,
+        /// `~/.rantaiclaw/profiles/<name>/skills`, has nothing in it) and
+        /// unset `RANTAICLAW_PROFILE` so profile resolution falls back to
+        /// `"default"`. Returns the harness plus the (not yet created)
+        /// `<tempdir>/workspace` dir to use as `config.workspace_dir`.
+        fn new() -> (Self, PathBuf) {
+            let lock = crate::test_env::ENV_LOCK.blocking_lock();
+            let tempdir = tempfile::tempdir().unwrap();
+            let home = EnvVarGuard::set("HOME", &tempdir.path().to_string_lossy());
+            let profile = EnvVarGuard::unset("RANTAICLAW_PROFILE");
+            let workspace_dir = tempdir.path().join("workspace");
+            let harness = Self {
+                _lock: lock,
+                _home: home,
+                _profile: profile,
+                _tempdir: tempdir,
+            };
+            (harness, workspace_dir)
+        }
+    }
+
+    /// Write `<root>/<dirname>/SKILL.md`. `dirname` is the on-disk slug;
+    /// `frontmatter_name`, when given, becomes the manifest `name:` in the
+    /// SKILL.md frontmatter — independently of `dirname` (`load_skill_md`
+    /// falls back to `dirname` when frontmatter has no `name:`). Kept
+    /// settable so tests can express `dirname != name`.
+    fn write_fake_skill(root: &Path, dirname: &str, frontmatter_name: Option<&str>) {
+        let skill_dir = root.join(dirname);
+        fs::create_dir_all(&skill_dir).unwrap();
+        let body = match frontmatter_name {
+            Some(name) => format!("---\nname: {name}\n---\n# {dirname}\nA test skill.\n"),
+            None => format!("# {dirname}\nA test skill.\n"),
+        };
+        fs::write(skill_dir.join("SKILL.md"), body).unwrap();
+    }
+
+    #[test]
+    fn disable_filter_excludes_config_disabled_skill() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let skills_root = workspace_dir.join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+
+        write_fake_skill(&skills_root, "skill-a", None);
+        write_fake_skill(&skills_root, "skill-b", None);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+        config.skills.entries.insert(
+            "skill-b".to_string(),
+            crate::config::SkillEntryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let active = load_skills_with_config(&workspace_dir, &config);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].name, "skill-a");
+
+        let with_status = load_skills_with_status(&workspace_dir, &config);
+        assert_eq!(with_status.len(), 2);
+        let (_, b_reasons) = with_status
+            .iter()
+            .find(|(s, _)| s.name == "skill-b")
+            .expect("skill-b present in load_skills_with_status output");
+        assert_eq!(
+            b_reasons.first().map(String::as_str),
+            Some("disabled in config.toml")
+        );
     }
 
     #[test]
