@@ -159,6 +159,19 @@ pub fn record_session_grants<S: std::hash::BuildHasher>(
         .extend(tools.iter().cloned());
 }
 
+/// Exempt the `shell` tool from the Layer-A tool-gate on the web console. The
+/// shell tool has its own command-level gate (Layer-B), which the console now
+/// resolves via the modal, so gating `shell` at Layer-A too would mean two
+/// modals for one command. Remove it from `always_ask` (which would otherwise
+/// force a Layer-A prompt regardless of `auto_approve`) and add it to
+/// `auto_approve`.
+pub fn exempt_shell_from_tool_gate(autonomy: &mut crate::config::AutonomyConfig) {
+    autonomy.always_ask.retain(|t| t != "shell");
+    if !autonomy.auto_approve.iter().any(|t| t == "shell") {
+        autonomy.auto_approve.push("shell".to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +296,29 @@ mod tests {
         assert_eq!(
             got,
             HashSet::from(["http_request".to_string(), "browser".to_string()])
+        );
+    }
+
+    #[test]
+    fn exempt_shell_removes_it_from_layer_a_even_when_always_ask() {
+        // Even if `shell` is on always_ask (which normally forces a Layer-A
+        // prompt regardless of auto_approve), the console exemption must make
+        // needs_approval("shell") false — otherwise the user sees two modals
+        // (Layer-A tool + Layer-B command). Other tools stay gated.
+        let mut autonomy = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Supervised,
+            always_ask: vec!["shell".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        exempt_shell_from_tool_gate(&mut autonomy);
+        let mgr = crate::approval::ApprovalManager::from_config(&autonomy);
+        assert!(
+            !mgr.needs_approval("shell"),
+            "shell must be exempt from Layer-A"
+        );
+        assert!(
+            mgr.needs_approval("http_request"),
+            "other tools stay gated at Layer-A"
         );
     }
 }
