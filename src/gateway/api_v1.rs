@@ -313,8 +313,13 @@ async fn agent_chat(
 
 #[derive(serde::Deserialize)]
 struct ApprovalDecisionBody {
-    /// `true` = approve (run the tool once), `false` = deny.
+    /// `true` = approve, `false` = deny (deny cancels the whole turn).
     approve: bool,
+    /// When approving, `true` allowlists the tool for the rest of the session
+    /// (no more prompts); `false` (default) approves this one call. Ignored on
+    /// deny. Optional for back-compat with `{ "approve": … }` clients.
+    #[serde(default)]
+    always: bool,
 }
 
 /// Resolve an in-browser tool-approval modal raised during an SSE chat turn.
@@ -328,11 +333,12 @@ async fn resolve_approval(
     Json(body): Json<ApprovalDecisionBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    if crate::gateway::web_approval::resolve(&state.web_approvals, &id, body.approve) {
+    if crate::gateway::web_approval::resolve(&state.web_approvals, &id, body.approve, body.always) {
         Ok(Json(serde_json::json!({
             "resolved": true,
             "id": id,
             "approved": body.approve,
+            "always": body.approve && body.always,
         })))
     } else {
         Err(err_404("no pending approval with that id"))
@@ -471,6 +477,9 @@ async fn agent_chat_stream(
     let cancel = CancellationToken::new();
     let cancel_for_agent = cancel.clone();
     let cancel_for_stream = cancel.clone();
+    // The web-modal backend fires this on a Deny so the whole turn cancels
+    // (TUI parity), same token the SSE-drop guard and the agent loop share.
+    let cancel_for_backend = cancel.clone();
     // Registry shared with `POST /api/v1/approvals/{id}`; only used when
     // tool-gating is on (default — unless `autonomous_tools`).
     let web_approvals = state.web_approvals.clone();
@@ -485,16 +494,29 @@ async fn agent_chat_stream(
                 // agent pauses, emits `AgentEvent::ApprovalRequest` over this
                 // SSE stream, and waits for `POST /approvals/{id}`. Off when
                 // `autonomous_tools` is set (run unattended).
+                let mut approval_for_harvest: Option<
+                    std::sync::Arc<crate::approval::ApprovalManager>,
+                > = None;
                 if gate_tools {
                     let manager = std::sync::Arc::new(
                         crate::approval::ApprovalManager::from_config(&config.autonomy),
                     );
+                    // Carry "Always" grants from earlier messages in this
+                    // conversation so they persist across turns (TUI parity —
+                    // each SSE turn otherwise rebuilds a fresh manager).
+                    if let Some(sid) = history_session_id.as_deref() {
+                        manager.seed_session_allowlist(
+                            crate::gateway::web_approval::session_granted_tools(sid),
+                        );
+                    }
                     let backend = std::sync::Arc::new(
                         crate::gateway::web_approval::WebModalApprovalBackend::new(
                             web_approvals,
                             events_tx.clone(),
+                            cancel_for_backend,
                         ),
                     );
+                    approval_for_harvest = Some(manager.clone());
                     agent.set_approval(Some(manager), Some(backend));
                 }
                 // Re-feed prior turns so a continued conversation has context.
@@ -509,6 +531,16 @@ async fn agent_chat_stream(
                         Some(cancel_for_agent),
                     )
                     .await;
+                // Persist tools approved "Always" this turn so the next message
+                // in the conversation keeps them allowlisted (TUI session parity).
+                if let (Some(mgr), Some(sid)) =
+                    (approval_for_harvest.as_ref(), history_session_id.as_deref())
+                {
+                    crate::gateway::web_approval::record_session_grants(
+                        sid,
+                        &mgr.session_allowlist(),
+                    );
+                }
             }
             Err(err) => {
                 let _ = events_tx
@@ -1581,7 +1613,10 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Path("modal-1".to_string()),
-            Json(ApprovalDecisionBody { approve: true }),
+            Json(ApprovalDecisionBody {
+                approve: true,
+                always: false,
+            }),
         )
         .await
         .expect("resolve ok");
@@ -1597,7 +1632,10 @@ mod tests {
             State(state),
             HeaderMap::new(),
             Path("does-not-exist".to_string()),
-            Json(ApprovalDecisionBody { approve: false }),
+            Json(ApprovalDecisionBody {
+                approve: false,
+                always: false,
+            }),
         )
         .await
         .expect_err("unknown id should 404");

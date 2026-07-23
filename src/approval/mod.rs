@@ -151,6 +151,15 @@ impl ApprovalManager {
         self.session_allowlist.lock().clone()
     }
 
+    /// Pre-seed the session allowlist with tools already granted "Always"
+    /// earlier in the same conversation. The web console rebuilds a fresh
+    /// `ApprovalManager` per SSE turn, so seeding from a per-session store lets
+    /// an "Always" grant persist across messages (parity with the TUI's
+    /// session-scoped grant) instead of resetting every turn.
+    pub fn seed_session_allowlist(&self, tools: impl IntoIterator<Item = String>) {
+        self.session_allowlist.lock().extend(tools);
+    }
+
     /// Prompt the user on the CLI and return their decision.
     ///
     /// For non-CLI channels, returns `Yes` automatically (interactive
@@ -408,6 +417,24 @@ mod tests {
         let mgr = ApprovalManager::from_config(&supervised_config());
         assert!(mgr.needs_approval("file_write"));
         assert!(mgr.needs_approval("http_request"));
+    }
+
+    #[test]
+    fn seeded_session_allowlist_skips_the_prompt() {
+        // A tool granted "Always" earlier in the conversation is re-seeded onto a
+        // fresh per-turn manager and must no longer prompt (web session-grant
+        // parity with the TUI).
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(mgr.needs_approval("http_request"), "prompts before seeding");
+        mgr.seed_session_allowlist(["http_request".to_string()]);
+        assert!(
+            !mgr.needs_approval("http_request"),
+            "a seeded tool must not prompt again"
+        );
+        assert!(
+            mgr.needs_approval("file_write"),
+            "unrelated tools still prompt"
+        );
     }
 
     #[test]
