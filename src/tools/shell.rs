@@ -307,7 +307,6 @@ impl Tool for ShellTool {
         // command validates or the user denies. Cap at 6 prompts per
         // call so an adversarial command can't spin forever.
         const MAX_CASCADING_APPROVALS: usize = 6;
-        let mut last_reason: Option<String> = None;
         let mut iters = 0;
         loop {
             match self.security.validate_command_execution(command, approved) {
@@ -347,7 +346,6 @@ impl Tool for ShellTool {
                             if let Err(e) = self.security.add_runtime_command(&basename, false) {
                                 tracing::warn!(target: "shell", error = %e, "add_runtime_command failed");
                             }
-                            last_reason = Some(reason);
                             continue;
                         }
                         Decision::Persist => {
@@ -359,20 +357,18 @@ impl Tool for ShellTool {
                                 );
                                 let _ = self.security.add_runtime_command(&basename, false);
                             }
-                            last_reason = Some(reason);
                             continue;
                         }
                         Decision::Deny => {
-                            // Explicit user deny: keep the LAST error
-                            // (the one that triggered this prompt) so
-                            // the message accurately names the blocker
-                            // the user just rejected — not the very
-                            // first one from before any approvals.
-                            let final_reason = last_reason.unwrap_or(reason);
+                            // Explicit user deny → fail the call with the gate's
+                            // rejection. The allowlist-rejection message embeds
+                            // the full command string and is identical across
+                            // cascade iterations, so there is no per-blocker
+                            // "last error" to preserve.
                             return Ok(ToolResult {
                                 success: false,
                                 output: String::new(),
-                                error: Some(final_reason),
+                                error: Some(reason),
                             });
                         }
                     }
@@ -1148,6 +1144,120 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_millis(40),
             "structural rejection must skip the approval timeout"
+        );
+    }
+
+    /// The cascade: a chained command (`a && b`) whose segments hit DISTINCT
+    /// unallowed basenames must prompt once PER blocker. The gate rejects on
+    /// the first unallowed name; approving it re-validates and surfaces the
+    /// next, walking the whole chain until it validates. Exercises the
+    /// `MAX_CASCADING_APPROVALS` loop in `execute`, which the single-prompt
+    /// tests above never reach.
+    #[tokio::test]
+    async fn shell_cascading_approval_prompts_for_each_distinct_blocked_basename() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            // Empty boot allowlist → both `true` and `echo` are blocked,
+            // forcing a two-step cascade.
+            allowed_commands: vec![],
+            ..SecurityPolicy::default()
+        });
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        // Simulated user: approve (Session) each prompt as it arrives,
+        // recording the basename so we can assert the walk order.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_task = seen.clone();
+        let resolver = approvals.clone();
+        let mut rx = approvals.subscribe();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok(req) = rx.recv().await else { break };
+                let id = req.id;
+                seen_task.lock().unwrap().push(req.basename);
+                resolver.resolve(id, Decision::Session);
+            }
+        });
+
+        let result = tool
+            .execute(json!({"command": "true && echo cascade_ok"}))
+            .await
+            .expect("cascade should resolve to a result");
+
+        assert!(
+            result.success,
+            "both approvals should unblock the chain: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("cascade_ok"),
+            "the fully-approved chain must actually run: {:?}",
+            result.output
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["true".to_string(), "echo".to_string()],
+            "each distinct blocked basename must prompt once, in chain order"
+        );
+        let allow = security.runtime_allowlist_snapshot();
+        assert!(
+            allow.contains(&"true".to_string()) && allow.contains(&"echo".to_string()),
+            "every session-approved basename lands on the runtime allowlist: {allow:?}"
+        );
+    }
+
+    /// Denying a LATER blocker in the cascade fails the whole command, while
+    /// the EARLIER basename the user already approved stays on the runtime
+    /// allowlist — the grant applies the moment it's given and is not rolled
+    /// back by a subsequent deny.
+    #[tokio::test]
+    async fn shell_cascading_approval_deny_midway_returns_error_and_keeps_prior_grant() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec![],
+            ..SecurityPolicy::default()
+        });
+        let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(approvals.clone());
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        let resolver = approvals.clone();
+        let mut rx = approvals.subscribe();
+        tokio::spawn(async move {
+            // Approve the first blocker (`true`), deny the second (`echo`).
+            let req1 = rx.recv().await.expect("first prompt");
+            resolver.resolve(req1.id, Decision::Session);
+            let req2 = rx.recv().await.expect("second prompt");
+            resolver.resolve(req2.id, Decision::Deny);
+        });
+
+        let result = tool
+            .execute(json!({"command": "true && echo cascade_ok"}))
+            .await
+            .expect("cascade should resolve to a result");
+
+        assert!(!result.success, "a mid-cascade deny must fail the command");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not allowed"),
+            "denied command surfaces the allowlist rejection: {:?}",
+            result.error
+        );
+        let allow = security.runtime_allowlist_snapshot();
+        assert!(
+            allow.contains(&"true".to_string()),
+            "the pre-deny Session grant persists: {allow:?}"
+        );
+        assert!(
+            !allow.contains(&"echo".to_string()),
+            "the denied basename must NOT be allowlisted: {allow:?}"
         );
     }
 
