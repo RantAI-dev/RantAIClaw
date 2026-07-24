@@ -1087,6 +1087,12 @@ enum ModelCommands {
         #[arg(long)]
         force: bool,
     },
+    /// List the cached/curated model catalog for a provider
+    List {
+        /// Provider name (defaults to configured default provider)
+        #[arg(long)]
+        provider: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1886,6 +1892,14 @@ async fn main() -> Result<()> {
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("models refresh task failed: {e}"))?
+            }
+            ModelCommands::List { provider } => {
+                let config_for_list = config.clone();
+                tokio::task::spawn_blocking(move || {
+                    onboard::list_models(&config_for_list, provider.as_deref())
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("models list task failed: {e}"))?
             }
         },
 

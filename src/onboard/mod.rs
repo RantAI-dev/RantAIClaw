@@ -6,7 +6,9 @@ pub mod wizard;
 pub mod ui;
 
 #[allow(unused_imports)]
-pub use wizard::{run_channels_repair_wizard, run_models_refresh, run_quick_setup, run_wizard};
+pub use wizard::{
+    list_models, run_channels_repair_wizard, run_models_refresh, run_quick_setup, run_wizard,
+};
 
 #[cfg(test)]
 mod tests {
