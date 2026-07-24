@@ -848,6 +848,8 @@ Examples:
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
+    /// Show the active configuration as JSON, with all secrets redacted
+    Show,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2131,6 +2133,22 @@ async fn main() -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
+                );
+                Ok(())
+            }
+            ConfigCommands::Show => {
+                // Reuse the canonical secret redactor from the gateway config API
+                // (single source of truth for what counts as a secret): the typed
+                // pass (Layer A) then the recursive key-name backstop (Layer B),
+                // exactly as `GET /config` does. The in-memory config holds
+                // decrypted plaintext secrets, so redaction MUST run before print.
+                let mut cfg = config.clone();
+                gateway::config_api::redact_config_secrets(&mut cfg);
+                let mut val = serde_json::to_value(&cfg)?;
+                gateway::config_api::redact_secrets_in_json(&mut val);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&val).expect("failed to serialize config JSON")
                 );
                 Ok(())
             }
