@@ -1,9 +1,11 @@
 //! Skills provisioner — implements [`TuiProvisioner`] for in-TUI skills setup.
 //!
-//! Mirrors the legacy flow in [`crate::onboard::section::skills`]:
-//!   1. Confirm starter pack install
-//!   2. Optionally browse ClawHub top-20 and multi-select
-//!   3. Install selected skills
+//! `run` does two things:
+//!   1. Offer to install the bundled 5-skill starter pack.
+//!   2. Point the user at `/skills install` (the live ClawHub search/install
+//!      picker) for anything beyond the starter pack — that flow doesn't fit
+//!      the provisioner's request-response `Choose`/`Prompt` protocol, so
+//!      this provisioner doesn't attempt a wizard-embedded multi-select.
 //!
 //! Config writes: none (skills live in `<profile>/skills/`)
 

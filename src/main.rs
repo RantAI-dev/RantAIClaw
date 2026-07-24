@@ -1248,6 +1248,18 @@ enum SkillCommands {
         /// Skill name (case-insensitive)
         name: String,
     },
+    /// Enable a skill that was previously disabled (writes
+    /// `[skills.entries.<name>] enabled = true`).
+    Enable {
+        /// Skill name (case-insensitive; matches the name shown by `skills list`).
+        name: String,
+    },
+    /// Disable a skill so it is not loaded into the agent's context (writes
+    /// `[skills.entries.<name>] enabled = false`).
+    Disable {
+        /// Skill name (case-insensitive; matches the name shown by `skills list`).
+        name: String,
+    },
     /// Install a skill from a GitHub URL or local path
     Install {
         /// GitHub URL or local path
@@ -2871,12 +2883,6 @@ async fn run_provisioner_headless(
                     let _ = response_tx
                         .send(onboard::provision::ProvisionResponse::Selection(vec![0]))
                         .await;
-                }
-                ProvisionEvent::OpenSkillInstallPicker { label } => {
-                    eprintln!(
-                        "[headless] install picker '{label}' — skipped in headless mode \
-                         (use the TUI for live ClawHub search/install)"
-                    );
                 }
             }
         }

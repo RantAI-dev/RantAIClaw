@@ -207,6 +207,21 @@ fn default_version() -> String {
     "0.1.0".to_string()
 }
 
+/// Case-insensitive lookup into `skills.entries`. Every other skill lookup
+/// (`show`, install-deps, TUI `/skill`) matches case-insensitively; the two
+/// load-time filters used to match exactly, so `[skills.entries.Weather]`
+/// silently failed to disable a skill named `weather`. Match on the canonical
+/// `skill.name` but compare case-insensitively.
+fn entry_for<'a>(
+    entries: &'a std::collections::HashMap<String, crate::config::SkillEntryConfig>,
+    skill_name: &str,
+) -> Option<&'a crate::config::SkillEntryConfig> {
+    entries
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(skill_name))
+        .map(|(_, v)| v)
+}
+
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
     load_skills_with_open_skills_config(workspace_dir, None, None)
@@ -230,7 +245,7 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
     );
     raw.into_iter()
         .filter(|s| {
-            if let Some(entry) = config.skills.entries.get(&s.name) {
+            if let Some(entry) = entry_for(&config.skills.entries, &s.name) {
                 if !entry.enabled {
                     tracing::debug!(skill = %s.name, "skipped: disabled in config.toml");
                     return false;
@@ -266,7 +281,7 @@ pub fn load_skills_with_status(
         .into_iter()
         .map(|s| {
             let mut reasons = s.requires.unmet();
-            if let Some(entry) = config.skills.entries.get(&s.name) {
+            if let Some(entry) = entry_for(&config.skills.entries, &s.name) {
                 if !entry.enabled {
                     reasons.insert(0, "disabled in config.toml".to_string());
                 }
@@ -276,6 +291,61 @@ pub fn load_skills_with_status(
         .collect();
     out.sort_by_key(|(_, reasons)| !reasons.is_empty());
     out
+}
+
+/// Resolve `name` to a loaded skill (case-insensitive, same as `skills show`),
+/// then return a clone of `config` with `skills.entries.<canonical>.enabled`
+/// set to `enabled`, keyed by the skill's canonical `skill.name`. The returned
+/// `String` is that canonical name (for user-facing messages). Preserves any
+/// existing `api_key`/`env`/`config` on the entry via `entry(..).or_default()`.
+///
+/// Errors if no loaded skill matches `name` (so a typo fails loudly instead of
+/// writing an orphan `entries` key).
+///
+/// Kept pure/no-I/O so both the sync CLI (`skills enable`/`skills disable`)
+/// and the async TUI in-picker toggle can persist the returned config with
+/// their own idiom.
+///
+/// Resolves against [`load_skills_with_status`], **not**
+/// [`load_skills_with_config`]: the latter filters out skills already
+/// disabled via `entries.<name>.enabled = false`, which would make
+/// `skills enable <name>` unable to find (and thus unable to re-enable) the
+/// very skill it's being asked to enable. `load_skills_with_status` returns
+/// every disk-loaded skill regardless of current gating/disable state, which
+/// is what name resolution needs here.
+pub(crate) fn set_skill_enabled(
+    config: &crate::config::Config,
+    name: &str,
+    enabled: bool,
+) -> Result<(crate::config::Config, String)> {
+    let skills = load_skills_with_status(&config.workspace_dir, config);
+    let canonical = skills
+        .iter()
+        .find(|(s, _)| s.name.eq_ignore_ascii_case(name))
+        .map(|(s, _)| s.name.clone())
+        .ok_or_else(|| anyhow::anyhow!("No skill named '{name}'. Run `rantaiclaw skills list`."))?;
+
+    let mut updated = config.clone();
+    // Collapse any pre-existing case-variant key onto the canonical key so we
+    // don't leave both `[skills.entries.Weather]` and `[skills.entries.weather]`.
+    let existing_variant_key = updated
+        .skills
+        .entries
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(&canonical) && *k != &canonical)
+        .cloned();
+    if let Some(old_key) = existing_variant_key {
+        if let Some(entry) = updated.skills.entries.remove(&old_key) {
+            updated.skills.entries.insert(canonical.clone(), entry);
+        }
+    }
+    updated
+        .skills
+        .entries
+        .entry(canonical.clone())
+        .or_default()
+        .enabled = enabled;
+    Ok((updated, canonical))
 }
 
 fn load_skills_with_open_skills_config(
@@ -1313,6 +1383,8 @@ pub(crate) fn handle_command(
                 None => anyhow::bail!("No skill named '{name}'. Run `rantaiclaw skills list`."),
             }
         }
+        crate::SkillCommands::Enable { name } => set_enabled_and_report(config, &name, true),
+        crate::SkillCommands::Disable { name } => set_enabled_and_report(config, &name, false),
         crate::SkillCommands::Install { source } => {
             println!("Installing skill from: {source}");
 
@@ -1762,6 +1834,28 @@ pub(crate) fn handle_command(
             Ok(())
         }
     }
+}
+
+/// Resolves `name`, flips its `enabled` flag via [`set_skill_enabled`], and
+/// persists the change through `Config::save()`.
+///
+/// `Config::save()` is async; `handle_command` is sync but called from
+/// inside `#[tokio::main]`, so `Runtime::new().block_on` would panic here
+/// ("Cannot start a runtime from within a runtime"). Persist on a fresh
+/// OS-thread runtime instead — mirrors the `Install` arm above.
+fn set_enabled_and_report(config: &crate::config::Config, name: &str, enabled: bool) -> Result<()> {
+    let (updated, canonical) = set_skill_enabled(config, name, enabled)?;
+    let join = std::thread::spawn(move || -> Result<()> {
+        let rt = tokio::runtime::Runtime::new()
+            .context("build tokio runtime for skills enable/disable save")?;
+        rt.block_on(updated.save()).context("save config")?;
+        Ok(())
+    });
+    join.join()
+        .map_err(|_| anyhow::anyhow!("skills enable/disable save thread panicked"))??;
+    let state = if enabled { "enabled" } else { "disabled" };
+    println!("✓ {canonical} {state}. Restart the agent (or reload) for it to take effect.");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2855,6 +2949,267 @@ description = "Bare minimum"
         assert_eq!(
             content, new_body,
             "`--all` must target the on-disk slug dir, not the manifest name"
+        );
+    }
+
+    // --- `skills enable`/`skills disable` tests (plan 037) ---------------
+
+    /// Re-parse a config previously written by `Config::save()`, restoring
+    /// the `#[serde(skip)]` `workspace_dir`/`config_path` fields (which
+    /// deserialize to empty `PathBuf`s otherwise) from the values the test
+    /// used to write it. Mirrors what `Config::load_or_init()` does for
+    /// real — resolve paths out-of-band, then deserialize the rest — without
+    /// re-resolving from process-global env vars.
+    fn reload_config(config_path: &Path, workspace_dir: &Path) -> crate::config::Config {
+        let raw = fs::read_to_string(config_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display()));
+        let mut reloaded: crate::config::Config =
+            toml::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", config_path.display()));
+        reloaded.workspace_dir = workspace_dir.to_path_buf();
+        reloaded.config_path = config_path.to_path_buf();
+        reloaded
+    }
+
+    #[test]
+    fn disable_writes_entry_enabled_false_and_persists() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let skills_root = workspace_dir.join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        write_fake_skill(&skills_root, "weather", None);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.config_path = workspace_dir.parent().unwrap().join("config.toml");
+        config.skills.open_skills_enabled = false;
+
+        let result = handle_command(
+            crate::SkillCommands::Disable {
+                name: "weather".to_string(),
+            },
+            &config,
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        let reloaded = reload_config(&config.config_path, &workspace_dir);
+        let entry = reloaded
+            .skills
+            .entries
+            .get("weather")
+            .expect("weather entry persisted");
+        assert!(!entry.enabled);
+    }
+
+    #[test]
+    fn enable_reverses_a_disabled_entry_and_persists() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let skills_root = workspace_dir.join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        write_fake_skill(&skills_root, "weather", None);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.config_path = workspace_dir.parent().unwrap().join("config.toml");
+        config.skills.open_skills_enabled = false;
+
+        handle_command(
+            crate::SkillCommands::Disable {
+                name: "weather".to_string(),
+            },
+            &config,
+        )
+        .expect("disable should succeed");
+
+        let disabled = reload_config(&config.config_path, &workspace_dir);
+        assert!(
+            !disabled.skills.entries.get("weather").unwrap().enabled,
+            "sanity: weather must be disabled before testing re-enable"
+        );
+
+        // Regression: `set_skill_enabled` must resolve against
+        // `load_skills_with_status`, not `load_skills_with_config` — the
+        // latter filters out already-disabled skills, which would make
+        // `enable` unable to find (and thus unable to re-enable) the very
+        // skill it's being asked to enable.
+        let result = handle_command(
+            crate::SkillCommands::Enable {
+                name: "weather".to_string(),
+            },
+            &disabled,
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        let reenabled = reload_config(&config.config_path, &workspace_dir);
+        let entry = reenabled
+            .skills
+            .entries
+            .get("weather")
+            .expect("weather entry persisted");
+        assert!(entry.enabled);
+    }
+
+    #[test]
+    fn disable_then_load_excludes_skill() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let skills_root = workspace_dir.join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        write_fake_skill(&skills_root, "weather", None);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.config_path = workspace_dir.parent().unwrap().join("config.toml");
+        config.skills.open_skills_enabled = false;
+
+        handle_command(
+            crate::SkillCommands::Disable {
+                name: "weather".to_string(),
+            },
+            &config,
+        )
+        .expect("disable should succeed");
+
+        let reloaded = reload_config(&config.config_path, &workspace_dir);
+        let active = load_skills_with_config(&reloaded.workspace_dir, &reloaded);
+        assert!(
+            active.iter().all(|s| s.name != "weather"),
+            "disabled skill must be excluded from the active skill set"
+        );
+    }
+
+    #[test]
+    fn case_insensitive_entry_disables_skill() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let skills_root = workspace_dir.join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        write_fake_skill(&skills_root, "weather", None);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+        // Mixed-case key — the bug: the pre-fix exact-match lookup never
+        // matched the canonical lowercase `skill.name`, so this silently
+        // failed to disable the skill.
+        config.skills.entries.insert(
+            "Weather".to_string(),
+            crate::config::SkillEntryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let active = load_skills_with_config(&workspace_dir, &config);
+        assert!(
+            active.iter().all(|s| s.name != "weather"),
+            "mixed-case `[skills.entries.Weather]` must disable a skill named `weather`"
+        );
+    }
+
+    #[test]
+    fn disable_unknown_name_errors() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        fs::create_dir_all(workspace_dir.join("skills")).unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.config_path = workspace_dir.parent().unwrap().join("config.toml");
+        config.skills.open_skills_enabled = false;
+
+        let result = handle_command(
+            crate::SkillCommands::Disable {
+                name: "nope".to_string(),
+            },
+            &config,
+        );
+        let err = result.expect_err("expected Err for a nonexistent skill");
+        assert!(err.to_string().contains("nope"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn disable_preserves_existing_entry_fields() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let skills_root = workspace_dir.join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        write_fake_skill(&skills_root, "weather", None);
+
+        let mut env_map = std::collections::HashMap::new();
+        env_map.insert("API_REGION".to_string(), "us-east".to_string());
+        let mut config_map = std::collections::HashMap::new();
+        config_map.insert(
+            "endpoint".to_string(),
+            serde_json::json!("https://example.com"),
+        );
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.config_path = workspace_dir.parent().unwrap().join("config.toml");
+        config.skills.open_skills_enabled = false;
+        config.skills.entries.insert(
+            "weather".to_string(),
+            crate::config::SkillEntryConfig {
+                enabled: true,
+                api_key: None,
+                env: env_map.clone(),
+                config: config_map.clone(),
+            },
+        );
+
+        handle_command(
+            crate::SkillCommands::Disable {
+                name: "weather".to_string(),
+            },
+            &config,
+        )
+        .expect("disable should succeed");
+
+        let reloaded = reload_config(&config.config_path, &workspace_dir);
+        let entry = reloaded.skills.entries.get("weather").unwrap();
+        assert!(!entry.enabled);
+        assert_eq!(entry.env, env_map);
+        assert_eq!(entry.config, config_map);
+    }
+
+    #[test]
+    fn disable_save_round_trip_preserves_config_secret() {
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let skills_root = workspace_dir.join("skills");
+        fs::create_dir_all(&skills_root).unwrap();
+        write_fake_skill(&skills_root, "weather", None);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.config_path = workspace_dir.parent().unwrap().join("config.toml");
+        config.skills.open_skills_enabled = false;
+        config.api_key = Some("plaintext-test-secret".to_string());
+
+        handle_command(
+            crate::SkillCommands::Disable {
+                name: "weather".to_string(),
+            },
+            &config,
+        )
+        .expect("disable should succeed");
+
+        let raw = fs::read_to_string(&config.config_path).unwrap();
+        let reloaded: crate::config::Config = toml::from_str(&raw).unwrap();
+
+        let entry = reloaded.skills.entries.get("weather").unwrap();
+        assert!(
+            !entry.enabled,
+            "disable must still take effect alongside a config-level secret"
+        );
+
+        let stored = reloaded
+            .api_key
+            .clone()
+            .expect("api_key must round-trip through save(), not be dropped");
+        assert!(
+            crate::security::SecretStore::is_encrypted(&stored),
+            "config-level secret must be encrypted at rest, got: {stored}"
+        );
+        let store = crate::security::SecretStore::new(config.config_path.parent().unwrap(), true);
+        let decrypted = store.decrypt(&stored).unwrap();
+        assert_eq!(
+            decrypted, "plaintext-test-secret",
+            "secret must decrypt back to its original plaintext"
         );
     }
 }
