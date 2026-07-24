@@ -549,8 +549,10 @@ fn verify_sha256(body: &[u8], expected_hex: &str) -> Result<()> {
 }
 
 /// Slug guard — keep this aligned with ClawHub's own `^[a-z0-9-]+$` rule plus
-/// the path-traversal carve-outs we've always had.
-fn validate_slug(slug: &str) -> Result<()> {
+/// the path-traversal carve-outs we've always had. `pub(crate)` so the
+/// gateway's `/api/v1/skills/*` mutating routes can reuse it as their
+/// `{name}`/`slug` guard instead of re-implementing traversal rejection.
+pub(crate) fn validate_slug(slug: &str) -> Result<()> {
     if slug.is_empty() {
         anyhow::bail!("empty slug");
     }

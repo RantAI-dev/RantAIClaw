@@ -379,6 +379,17 @@ resolves normally, `2+` matches return `400` ("ambiguous").
 
 ## Skills
 
+The three mutating endpoints below (`install`, `enabled`, uninstall) are
+**owner-scoped mutations equivalent to the local CLI** (`skills
+install`/`enable`/`disable`/`remove`) — they let the same
+pairing-authenticated principal do the same thing over the console instead of
+a terminal. `install` additionally **stages community code** fetched from
+ClawHub onto the operator's machine, so a compromised pairing token now also
+grants remote skill install/enable/disable/uninstall; see CLAUDE.md §3.6 for
+the exposure-boundary tradeoff. None of the four routes work when
+`gateway.require_pairing = false` opens the whole `/api/v1/*` surface, same
+as every other handler here.
+
 ### GET /api/v1/skills
 
 - **Auth**: bearer-gated.
@@ -392,13 +403,23 @@ resolves normally, `2+` matches return `400` ("ambiguous").
         "version": "...",
         "description": "...",
         "tags": ["..."],
-        "tools": ["tool_name_a", "tool_name_b"]
+        "tools": ["tool_name_a", "tool_name_b"],
+        "enabled": true,
+        "active": true,
+        "reasons": []
       }
     ],
     "count": 1
   }
   ```
-  `tools` here is just the tool **names** the skill exposes.
+  `tools` here is just the tool **names** the skill exposes. `enabled`
+  reflects only `[skills.entries.<name>] enabled` in `config.toml` (default
+  `true`) — it's what the `PUT .../enabled` route below flips. `active` is
+  `true` only when the skill is both enabled **and** its `requires` gates
+  (binaries on `$PATH`, env vars, OS) are met; `reasons` lists why it isn't,
+  with `"disabled in config.toml"` first when the config flag is off.
+  Disabled/gated skills are still included in this list (previously they were
+  silently dropped, which is why the console's toggle always looked "on").
 - **Status codes**: `200`, `401`.
 
 ### GET /api/v1/skills/{name}
@@ -412,11 +433,65 @@ resolves normally, `2+` matches return `400` ("ambiguous").
     "version": "...",
     "description": "...",
     "tags": ["..."],
-    "tools": [{ "name": "...", "description": "..." }]
+    "tools": [{ "name": "...", "description": "..." }],
+    "enabled": true,
+    "active": true,
+    "reasons": []
   }
   ```
   Unlike the list endpoint, `tools` here includes each tool's description.
+  `enabled`/`active`/`reasons` have the same meaning as on the list endpoint.
 - **Status codes**: `200`, `404` (no skill with that name), `401`.
+
+### POST /api/v1/skills/install
+
+- **Auth**: bearer-gated.
+- **Request**:
+  ```json
+  { "slug": "weather" }
+  ```
+  `slug` is validated against ClawHub's slug charset (`[a-z0-9-_]`, no `/`,
+  `\`, or `..`) before anything is fetched.
+- **Response** `200`:
+  ```json
+  { "slug": "weather", "installed": true }
+  ```
+  Installing an already-installed slug is idempotent and still returns
+  `installed: true` — it *is* installed, nothing was re-fetched.
+- **Status codes**: `200`, `400` (invalid slug), `401`, `500` (ClawHub
+  fetch/hash/install failure).
+
+### PUT /api/v1/skills/{name}/enabled
+
+- **Auth**: bearer-gated.
+- **Path param**: `name` — matched case-insensitively.
+- **Request**:
+  ```json
+  { "enabled": false }
+  ```
+- **Response** `200`:
+  ```json
+  { "name": "weather", "enabled": false }
+  ```
+  Writes `[skills.entries.<name>] enabled` (an existing config key — see
+  `docs/reference/config.md`) and persists it, the same as `rantaiclaw skills
+  enable`/`disable`.
+- **Status codes**: `200`, `400` (invalid name), `401`, `404` (no skill with
+  that name), `500`.
+
+### DELETE /api/v1/skills/{name}
+
+- **Auth**: bearer-gated.
+- **Path param**: `name` — matched case-insensitively.
+- **Response** `200`:
+  ```json
+  { "name": "weather", "removed": true }
+  ```
+  Uninstalls the same way `rantaiclaw skills remove` does, including its
+  path-traversal reject and 3-root containment gate (the removed directory
+  must resolve under one of the known skill roots).
+- **Status codes**: `200`, `400` (invalid name), `401`, `404` (no skill with
+  that name), `500`.
 
 ---
 
