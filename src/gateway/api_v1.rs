@@ -51,7 +51,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/sessions/{id}/title", put(sessions_set_title))
         .route("/api/v1/insights", get(insights))
         .route("/api/v1/skills", get(skills_list))
-        .route("/api/v1/skills/{name}", get(skills_show))
+        .route("/api/v1/skills/install", post(skills_install))
+        .route(
+            "/api/v1/skills/{name}",
+            get(skills_show).delete(skills_uninstall),
+        )
+        .route("/api/v1/skills/{name}/enabled", put(skills_set_enabled))
         .route("/api/v1/memory", get(memory_list))
         .route("/api/v1/memory/stats", get(memory_stats))
         .route(
@@ -940,24 +945,44 @@ async fn insights(
 // skills
 // ────────────────────────────────────────────────────────────────────────────
 
+/// `enabled` reflects ONLY the `[skills.entries.<name>] enabled` config flag
+/// (what the console's toggle drives); `reasons` (from
+/// `load_skills_with_status`) is why the skill is not fully active — first
+/// entry is `"disabled in config.toml"` when the flag is off, followed by any
+/// unmet `requires` gates. `active` is `reasons.is_empty()`.
+fn skill_status_json(
+    cfg: &crate::config::Config,
+    skill: &crate::skills::Skill,
+    reasons: &[String],
+) -> serde_json::Value {
+    let enabled = cfg
+        .skills
+        .entries
+        .get(&skill.name)
+        .map(|e| e.enabled)
+        .unwrap_or(true);
+    serde_json::json!({
+        "name": skill.name,
+        "version": skill.version,
+        "description": skill.description,
+        "tags": skill.tags,
+        "tools": skill.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+        "enabled": enabled,
+        "active": reasons.is_empty(),
+        "reasons": reasons,
+    })
+}
+
 async fn skills_list(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let cfg = state.config.lock().clone();
-    let skills = crate::skills::load_skills_with_config(&cfg.workspace_dir, &cfg);
+    let skills = crate::skills::load_skills_with_status(&cfg.workspace_dir, &cfg);
     let json: Vec<_> = skills
         .iter()
-        .map(|s| {
-            serde_json::json!({
-                "name": s.name,
-                "version": s.version,
-                "description": s.description,
-                "tags": s.tags,
-                "tools": s.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
-            })
-        })
+        .map(|(s, reasons)| skill_status_json(&cfg, s, reasons))
         .collect();
     Ok(Json(
         serde_json::json!({ "skills": json, "count": json.len() }),
@@ -971,21 +996,121 @@ async fn skills_show(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let cfg = state.config.lock().clone();
-    let skills = crate::skills::load_skills_with_config(&cfg.workspace_dir, &cfg);
-    let s = skills
+    let skills = crate::skills::load_skills_with_status(&cfg.workspace_dir, &cfg);
+    let (s, reasons) = skills
         .iter()
-        .find(|s| s.name.eq_ignore_ascii_case(&name))
+        .find(|(s, _)| s.name.eq_ignore_ascii_case(&name))
         .ok_or_else(|| err_404(format!("skill `{name}` not found")))?;
-    Ok(Json(serde_json::json!({
-        "name": s.name,
-        "version": s.version,
-        "description": s.description,
-        "tags": s.tags,
-        "tools": s.tools.iter().map(|t| serde_json::json!({
+    let mut json = skill_status_json(&cfg, s, reasons);
+    // `skills_show` keeps the richer per-tool `{name, description}` shape
+    // (the list endpoint only needs tool names) — overwrite the `tools` field
+    // `skill_status_json` set with the compact shape.
+    json["tools"] = serde_json::json!(s
+        .tools
+        .iter()
+        .map(|t| serde_json::json!({
             "name": t.name,
             "description": t.description,
-        })).collect::<Vec<_>>(),
-    })))
+        }))
+        .collect::<Vec<_>>());
+    Ok(Json(json))
+}
+
+#[derive(Deserialize)]
+struct SkillEnabledBody {
+    enabled: bool,
+}
+
+/// Map a skill-lookup failure from `set_skill_enabled`/`remove_skill` to 404
+/// when the failure is "no such skill" (a client error) and 500 otherwise
+/// (an unexpected I/O/containment failure). Both functions raise a plain
+/// `anyhow::Error` rather than a typed enum, so this matches on their known
+/// "not found" message prefixes instead of introducing a new error type for
+/// two call sites.
+fn err_for_skill_lookup(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
+    let msg = format!("{e:#}");
+    if msg.starts_with("No skill named") || msg.starts_with("Skill not found") {
+        err_404(msg)
+    } else {
+        err_500(e)
+    }
+}
+
+/// `PUT /api/v1/skills/{name}/enabled` — owner-scoped (see [`check_auth`]).
+/// Flips `[skills.entries.<name>] enabled` via the pure `set_skill_enabled`
+/// writer (plan 037), then persists through `Config::save()` — the same
+/// public save primitive the TUI's `Ctrl+E` skill toggle already calls — and
+/// swaps the result into the running `state.config`. Deliberately does NOT
+/// reuse or re-implement `config_api.rs`'s own read-modify-write helpers
+/// (private to that module, guarding its own set of mutation routes with
+/// their own write lock): this route touches a disjoint config subtree and
+/// follows the writer's own (lock-free) contract instead, matching how the
+/// CLI/TUI already call it.
+async fn skills_set_enabled(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<SkillEnabledBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    crate::skills::clawhub::validate_slug(&name).map_err(|e| err_400(format!("{e:#}")))?;
+    let cfg = state.config.lock().clone();
+    let (updated, canonical) = crate::skills::set_skill_enabled(&cfg, &name, body.enabled)
+        .map_err(err_for_skill_lookup)?;
+    updated.save().await.map_err(err_500)?;
+    *state.config.lock() = updated;
+    Ok(Json(
+        serde_json::json!({ "name": canonical, "enabled": body.enabled }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SkillInstallBody {
+    slug: String,
+}
+
+/// `POST /api/v1/skills/install` — owner-scoped (see [`check_auth`]). Stages a
+/// ClawHub skill onto the operator's machine via the existing
+/// `clawhub::install_one`. This is an EXPOSURE widening (CLAUDE.md §3.6):
+/// remote-code staging becomes reachable over the pairing-authenticated API,
+/// not just the local CLI/TUI. Accepted because the caller is the same
+/// owner-scoped principal that already has this capability locally, and
+/// `install_one` is all-or-nothing with partial-dir cleanup on failure.
+async fn skills_install(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SkillInstallBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let slug = body.slug.trim().to_string();
+    crate::skills::clawhub::validate_slug(&slug).map_err(|e| err_400(format!("{e:#}")))?;
+    let profile = crate::profile::ProfileManager::active().map_err(err_500)?;
+    crate::skills::clawhub::install_one(&profile, &slug)
+        .await
+        .map_err(err_500)?;
+    // `install_one` is idempotent (a slug already present returns `Ok(())`
+    // without re-fetching) — reporting `installed: true` for an
+    // already-present skill is correct: it is installed.
+    Ok(Json(serde_json::json!({ "slug": slug, "installed": true })))
+}
+
+/// `DELETE /api/v1/skills/{name}` — owner-scoped (see [`check_auth`]). Reuses
+/// `skills::remove_skill` (plan 034's uninstall, extracted so this route and
+/// `skills remove` share one containment-checked removal path) rather than
+/// re-implementing directory removal here.
+async fn skills_uninstall(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    crate::skills::clawhub::validate_slug(&name).map_err(|e| err_400(format!("{e:#}")))?;
+    let cfg = state.config.lock().clone();
+    let canonical = crate::skills::remove_skill(&cfg.workspace_dir, &cfg, &name)
+        .map_err(err_for_skill_lookup)?;
+    Ok(Json(
+        serde_json::json!({ "name": canonical, "removed": true }),
+    ))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1740,5 +1865,267 @@ mod tests {
             .await
             .expect("open in local dev");
         assert!(resp.0["providers"].is_array());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // skills management API (plan 039)
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Write `<root>/<name>/SKILL.md` with no frontmatter — `load_skill_md`
+    /// falls back to the directory name and an extracted `# ` heading, which
+    /// is all these tests need.
+    fn write_skill_fixture(root: &std::path::Path, name: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("create skill dir");
+        std::fs::write(dir.join("SKILL.md"), format!("# {name}\nA test skill.\n"))
+            .expect("write SKILL.md");
+    }
+
+    /// A `Config` pointed at an isolated `workspace_dir`/`config_path`, with
+    /// `open_skills_enabled` off so skill loading never tries to clone/pull
+    /// the open-skills repo over the network. Callers must already hold
+    /// `crate::test_env::ENV_LOCK` and a `HomeGuard` for the lifetime of the
+    /// returned config, since `load_skills_with_status`/`_config` resolve
+    /// `ProfileManager::active()` from the process-global `HOME`.
+    fn skills_test_config(workspace_dir: &std::path::Path) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.to_path_buf();
+        config.config_path = workspace_dir
+            .parent()
+            .expect("workspace_dir has a parent")
+            .join("config.toml");
+        config.skills.open_skills_enabled = false;
+        config
+    }
+
+    #[tokio::test]
+    async fn skills_list_reports_disabled_skill_with_reasons_and_stays_visible() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        let skills_root = workspace_dir.join("skills");
+        std::fs::create_dir_all(&skills_root).expect("create skills dir");
+        write_skill_fixture(&skills_root, "weather");
+        write_skill_fixture(&skills_root, "clock");
+
+        let mut config = skills_test_config(&workspace_dir);
+        config.skills.entries.insert(
+            "weather".to_string(),
+            crate::config::SkillEntryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let state = test_state();
+        *state.config.lock() = config;
+
+        let resp = skills_list(State(state), HeaderMap::new())
+            .await
+            .expect("skills_list should succeed");
+        let skills = resp.0["skills"].as_array().expect("skills array");
+
+        let weather = skills
+            .iter()
+            .find(|s| s["name"] == "weather")
+            .expect("disabled skill must still be present in the list");
+        assert_eq!(weather["enabled"], false);
+        assert_eq!(weather["active"], false);
+        assert!(
+            weather["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "disabled in config.toml"),
+            "reasons must explain the disable: {weather:?}"
+        );
+
+        let clock = skills
+            .iter()
+            .find(|s| s["name"] == "clock")
+            .expect("unrelated active skill must be present");
+        assert_eq!(clock["enabled"], true);
+        assert_eq!(clock["active"], true);
+        assert_eq!(clock["reasons"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn skills_mutating_routes_reject_without_pairing_token() {
+        // Boundary/auth test: every mutating skills route must call
+        // `check_auth` before touching disk/network, exactly like the
+        // existing GET handlers.
+        let state = paired_state("tok");
+
+        let install_err = skills_install(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SkillInstallBody {
+                slug: "demo".to_string(),
+            }),
+        )
+        .await
+        .expect_err("install must require auth");
+        assert_eq!(install_err.0, StatusCode::UNAUTHORIZED);
+
+        let enable_err = skills_set_enabled(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("demo".to_string()),
+            Json(SkillEnabledBody { enabled: false }),
+        )
+        .await
+        .expect_err("enable/disable must require auth");
+        assert_eq!(enable_err.0, StatusCode::UNAUTHORIZED);
+
+        let uninstall_err =
+            skills_uninstall(State(state), HeaderMap::new(), Path("demo".to_string()))
+                .await
+                .expect_err("uninstall must require auth");
+        assert_eq!(uninstall_err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn skills_mutating_routes_reject_invalid_slug() {
+        let install_err = skills_install(
+            State(test_state()),
+            HeaderMap::new(),
+            Json(SkillInstallBody {
+                slug: "../evil".to_string(),
+            }),
+        )
+        .await
+        .expect_err("traversal slug must be rejected");
+        assert_eq!(install_err.0, StatusCode::BAD_REQUEST);
+
+        let enable_err = skills_set_enabled(
+            State(test_state()),
+            HeaderMap::new(),
+            Path("../evil".to_string()),
+            Json(SkillEnabledBody { enabled: false }),
+        )
+        .await
+        .expect_err("traversal name must be rejected");
+        assert_eq!(enable_err.0, StatusCode::BAD_REQUEST);
+
+        let uninstall_err = skills_uninstall(
+            State(test_state()),
+            HeaderMap::new(),
+            Path("../evil".to_string()),
+        )
+        .await
+        .expect_err("traversal name must be rejected");
+        assert_eq!(uninstall_err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn skills_set_enabled_toggle_persists_and_reflected_in_list() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        let skills_root = workspace_dir.join("skills");
+        std::fs::create_dir_all(&skills_root).expect("create skills dir");
+        write_skill_fixture(&skills_root, "weather");
+
+        let config = skills_test_config(&workspace_dir);
+        let state = test_state();
+        *state.config.lock() = config;
+
+        let resp = skills_set_enabled(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("weather".to_string()),
+            Json(SkillEnabledBody { enabled: false }),
+        )
+        .await
+        .expect("disable should succeed");
+        assert_eq!(resp.0["name"], "weather");
+        assert_eq!(resp.0["enabled"], false);
+
+        let list_resp = skills_list(State(state.clone()), HeaderMap::new())
+            .await
+            .expect("list should succeed after disable");
+        let weather = list_resp.0["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "weather")
+            .expect("weather present");
+        assert_eq!(weather["enabled"], false);
+
+        // Flip back on and confirm the round trip is reflected too.
+        let resp2 = skills_set_enabled(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("weather".to_string()),
+            Json(SkillEnabledBody { enabled: true }),
+        )
+        .await
+        .expect("re-enable should succeed");
+        assert_eq!(resp2.0["enabled"], true);
+
+        let list_resp2 = skills_list(State(state), HeaderMap::new())
+            .await
+            .expect("list should succeed after re-enable");
+        let weather2 = list_resp2.0["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "weather")
+            .expect("weather present");
+        assert_eq!(weather2["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn skills_uninstall_unknown_skill_returns_not_found() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace_dir.join("skills")).expect("create skills dir");
+
+        let config = skills_test_config(&workspace_dir);
+        let state = test_state();
+        *state.config.lock() = config;
+
+        let err = skills_uninstall(
+            State(state),
+            HeaderMap::new(),
+            Path("nonexistent".to_string()),
+        )
+        .await
+        .expect_err("unknown skill should 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn skills_uninstall_removes_installed_skill_directory() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        let skills_root = workspace_dir.join("skills");
+        std::fs::create_dir_all(&skills_root).expect("create skills dir");
+        write_skill_fixture(&skills_root, "weather");
+        assert!(skills_root.join("weather").exists());
+
+        let config = skills_test_config(&workspace_dir);
+        let state = test_state();
+        *state.config.lock() = config;
+
+        let resp = skills_uninstall(State(state), HeaderMap::new(), Path("weather".to_string()))
+            .await
+            .expect("uninstall should succeed");
+        assert_eq!(resp.0["name"], "weather");
+        assert_eq!(resp.0["removed"], true);
+        assert!(
+            !skills_root.join("weather").exists(),
+            "skill directory must be removed"
+        );
     }
 }

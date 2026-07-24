@@ -348,6 +348,91 @@ pub(crate) fn set_skill_enabled(
     Ok((updated, canonical))
 }
 
+/// Remove an installed skill by name, enforcing the same traversal-reject +
+/// 3-root containment gate as the original `skills remove` implementation
+/// (034). Shared by the CLI `skills remove` command (the arm below) and the
+/// gateway `DELETE /api/v1/skills/{name}` route, so both surfaces enforce
+/// identical removal-safety guarantees instead of one of them re-implementing
+/// the containment check. Returns the skill's canonical (manifest) name on
+/// success. Errors with a message starting `"Skill not found"` when `name`
+/// does not resolve to a loaded skill — callers that need to distinguish
+/// "not found" from other failures (e.g. to pick an HTTP status) match on
+/// that prefix rather than a typed error, since this mirrors the plain
+/// `anyhow` error style already used throughout this module.
+pub(crate) fn remove_skill(
+    workspace_dir: &Path,
+    config: &crate::config::Config,
+    name: &str,
+) -> Result<String> {
+    // Reject path traversal attempts
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        anyhow::bail!("Invalid skill name: {name}");
+    }
+
+    // Resolve by loaded identity — the same rule `show`/`list` use —
+    // instead of joining `name` as a directory under a single root.
+    // The primary install paths (ClawHub, bundled starter/core packs)
+    // write to `profile.skills_dir()` (root 1), which a bare
+    // `skills_dir(workspace_dir)` join never reaches, and a skill's
+    // on-disk directory name can differ from the manifest `name:`
+    // shown by `list`/`show`.
+    let skills = load_skills_with_config(workspace_dir, config);
+    let skill = skills
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| anyhow::anyhow!("Skill not found: {name}. Run `rantaiclaw skills list`."))?;
+
+    let manifest = skill
+        .location
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Skill '{name}' has no on-disk location"))?;
+    let skill_dir = manifest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Skill '{name}' manifest has no parent directory"))?;
+
+    // Containment gate: `skill_dir`'s parent must canonicalize to one
+    // of the three known skill roots (mirrors `load_workspace_skills`,
+    // `:298-346`). Canonicalize each *root*, not `skill_dir` itself, so
+    // a legit `skills install /tmp/foo` symlink (whose target lives
+    // outside the workspace) stays removable — this is the same
+    // "canonicalize the parent, not the symlink target" property the
+    // pre-fix single-root check relied on.
+    let mut candidate_roots: Vec<PathBuf> = Vec::new();
+    if let Ok(profile) = crate::profile::ProfileManager::active() {
+        candidate_roots.push(profile.skills_dir());
+    }
+    if let Some(profile_root) = workspace_dir.parent() {
+        candidate_roots.push(profile_root.join("skills"));
+    }
+    candidate_roots.push(skills_dir(workspace_dir));
+
+    let dir_parent = skill_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Skill path escapes known skills roots: {name}"))?;
+    let canonical_dir_parent = dir_parent
+        .canonicalize()
+        .unwrap_or_else(|_| dir_parent.to_path_buf());
+    let contained = candidate_roots.iter().any(|root| {
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        canonical_root == canonical_dir_parent
+    });
+    if !contained {
+        anyhow::bail!("Skill path escapes known skills roots: {name}");
+    }
+
+    // Use symlink_metadata so we don't fail on dangling symlinks.
+    let meta = std::fs::symlink_metadata(skill_dir)
+        .map_err(|_| anyhow::anyhow!("Skill not found: {name}"))?;
+
+    if meta.file_type().is_symlink() {
+        std::fs::remove_file(skill_dir)?;
+    } else {
+        std::fs::remove_dir_all(skill_dir)?;
+    }
+
+    Ok(skill.name.clone())
+}
+
 fn load_skills_with_open_skills_config(
     workspace_dir: &Path,
     config_open_skills_enabled: Option<bool>,
@@ -1520,73 +1605,7 @@ pub(crate) fn handle_command(
             Ok(())
         }
         crate::SkillCommands::Remove { name } => {
-            // Reject path traversal attempts
-            if name.contains("..") || name.contains('/') || name.contains('\\') {
-                anyhow::bail!("Invalid skill name: {name}");
-            }
-
-            // Resolve by loaded identity — the same rule `show`/`list` use —
-            // instead of joining `name` as a directory under a single root.
-            // The primary install paths (ClawHub, bundled starter/core packs)
-            // write to `profile.skills_dir()` (root 1), which a bare
-            // `skills_dir(workspace_dir)` join never reaches, and a skill's
-            // on-disk directory name can differ from the manifest `name:`
-            // shown by `list`/`show`.
-            let skills = load_skills_with_config(workspace_dir, config);
-            let skill = skills
-                .iter()
-                .find(|s| s.name.eq_ignore_ascii_case(&name))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Skill not found: {name}. Run `rantaiclaw skills list`.")
-                })?;
-
-            let manifest = skill
-                .location
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Skill '{name}' has no on-disk location"))?;
-            let skill_dir = manifest.parent().ok_or_else(|| {
-                anyhow::anyhow!("Skill '{name}' manifest has no parent directory")
-            })?;
-
-            // Containment gate: `skill_dir`'s parent must canonicalize to one
-            // of the three known skill roots (mirrors `load_workspace_skills`,
-            // `:298-346`). Canonicalize each *root*, not `skill_dir` itself, so
-            // a legit `skills install /tmp/foo` symlink (whose target lives
-            // outside the workspace) stays removable — this is the same
-            // "canonicalize the parent, not the symlink target" property the
-            // pre-fix single-root check relied on.
-            let mut candidate_roots: Vec<PathBuf> = Vec::new();
-            if let Ok(profile) = crate::profile::ProfileManager::active() {
-                candidate_roots.push(profile.skills_dir());
-            }
-            if let Some(profile_root) = workspace_dir.parent() {
-                candidate_roots.push(profile_root.join("skills"));
-            }
-            candidate_roots.push(skills_dir(workspace_dir));
-
-            let dir_parent = skill_dir
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("Skill path escapes known skills roots: {name}"))?;
-            let canonical_dir_parent = dir_parent
-                .canonicalize()
-                .unwrap_or_else(|_| dir_parent.to_path_buf());
-            let contained = candidate_roots.iter().any(|root| {
-                let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-                canonical_root == canonical_dir_parent
-            });
-            if !contained {
-                anyhow::bail!("Skill path escapes known skills roots: {name}");
-            }
-
-            // Use symlink_metadata so we don't fail on dangling symlinks.
-            let meta = std::fs::symlink_metadata(skill_dir)
-                .map_err(|_| anyhow::anyhow!("Skill not found: {name}"))?;
-
-            if meta.file_type().is_symlink() {
-                std::fs::remove_file(skill_dir)?;
-            } else {
-                std::fs::remove_dir_all(skill_dir)?;
-            }
+            let canonical = remove_skill(workspace_dir, config, &name)?;
 
             // Bundled/core skills (starter pack + owner-permissions) are
             // re-seeded on the next setup/channel-config run by design
@@ -1595,19 +1614,19 @@ pub(crate) fn handle_command(
             let is_bundled = crate::skills::bundled::CORE_PACK
                 .iter()
                 .chain(crate::skills::bundled::STARTER_PACK.iter())
-                .any(|entry| skill_dir.file_name().and_then(|n| n.to_str()) == Some(entry.slug));
+                .any(|entry| entry.slug.eq_ignore_ascii_case(&canonical));
             if is_bundled {
                 println!(
                     "  {} '{}' is a bundled skill and may be re-installed by a future `setup`/channel-config run.",
                     console::style("⚠").yellow().bold(),
-                    name
+                    canonical
                 );
             }
 
             println!(
                 "  {} Skill '{}' removed.",
                 console::style("✓").green().bold(),
-                name
+                canonical
             );
             Ok(())
         }
