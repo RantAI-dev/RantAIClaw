@@ -128,7 +128,9 @@ fn render_skill_md(
             .filter(|t| !t.is_empty())
             .collect();
         if !clean.is_empty() {
-            out.push_str(&format!("tags: [{}]\n", clean.join(", ")));
+            out.push_str("tags: [");
+            out.push_str(&clean.join(", "));
+            out.push_str("]\n");
         }
     }
     out.push_str("---\n\n");
