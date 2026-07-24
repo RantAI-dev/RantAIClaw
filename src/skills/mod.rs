@@ -101,6 +101,12 @@ pub struct SkillInstallRecipe {
     /// `~/.rantaiclaw/tools/<skill-slug>/`.
     #[serde(default)]
     pub target_dir: Option<String>,
+    /// Optional hex-encoded SHA-256 for `kind = download`. When present,
+    /// the downloaded bytes are verified against it before anything is
+    /// written to disk; a mismatch fails the recipe. `None` = no
+    /// integrity check (legacy behaviour, matches how recipes ship today).
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 impl SkillInstallRecipe {
@@ -904,6 +910,10 @@ fn parse_skill_metadata(
                                 .map(|n| n as usize);
                             recipe.target_dir = entry
                                 .get("targetDir")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            recipe.sha256 = entry
+                                .get("sha256")
                                 .and_then(|v| v.as_str())
                                 .map(String::from);
                             if !recipe.kind.is_empty() {

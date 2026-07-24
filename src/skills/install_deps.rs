@@ -316,20 +316,52 @@ fn run_go(recipe: &SkillInstallRecipe) -> Result<()> {
     run_subprocess("go", &["install", module])
 }
 
+/// Resolve the directory a `download` recipe may write into.
+///
+/// The base is always `<data>/tools/<slug>/` (the historical default). A
+/// recipe MAY narrow to a subdirectory by supplying a **relative**
+/// `target_dir` with no parent (`..`) components; an absolute path or any
+/// `..` is rejected so an untrusted recipe cannot escape the base (e.g.
+/// dropping an executable into `~/.local/bin` to hijack `$PATH`).
+fn resolve_target_dir(target_dir: Option<&str>, slug: &str) -> Result<PathBuf> {
+    let base = directories::ProjectDirs::from("", "", "rantaiclaw")
+        .map(|d| d.data_dir().join("tools").join(slug))
+        .unwrap_or_else(|| PathBuf::from(format!(".rantaiclaw/tools/{slug}")));
+
+    let Some(raw) = target_dir else {
+        return Ok(base);
+    };
+    let rel = Path::new(raw);
+    if rel.is_absolute() {
+        bail!("download recipe target_dir must be relative, got absolute `{raw}`");
+    }
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => bail!("download recipe target_dir `{raw}` has a forbidden path component"),
+        }
+    }
+    Ok(base.join(rel))
+}
+
+/// Verify a body against its hex-encoded SHA-256. Comparison is case-insensitive.
+fn verify_sha256(body: &[u8], expected_hex: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(body);
+    let actual = hex::encode(hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected_hex) {
+        anyhow::bail!("sha256 mismatch: got {actual}, expected {expected_hex}");
+    }
+    Ok(())
+}
+
 fn run_download(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
     let url = recipe
         .url
         .as_ref()
         .ok_or_else(|| anyhow!("download recipe missing `url`"))?;
-    let target_dir = recipe
-        .target_dir
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            directories::ProjectDirs::from("", "", "rantaiclaw")
-                .map(|d| d.data_dir().join("tools").join(slug))
-                .unwrap_or_else(|| PathBuf::from(format!(".rantaiclaw/tools/{slug}")))
-        });
+    let target_dir = resolve_target_dir(recipe.target_dir.as_deref(), slug)?;
     std::fs::create_dir_all(&target_dir)
         .with_context(|| format!("create target dir {}", target_dir.display()))?;
 
@@ -345,6 +377,13 @@ fn run_download(recipe: &SkillInstallRecipe, slug: &str) -> Result<()> {
         .context("download HTTP status")?
         .bytes()
         .context("download body")?;
+
+    if let Some(expected) = recipe.sha256.as_deref() {
+        if !expected.is_empty() {
+            verify_sha256(&bytes, expected)
+                .with_context(|| format!("integrity check failed for {url}"))?;
+        }
+    }
 
     match recipe.archive.as_deref() {
         Some("tar.gz" | "tgz") => {
@@ -691,6 +730,40 @@ mod tests {
         assert!(validate_archive_entries(&["../tool".to_string()]).is_err());
         assert!(validate_archive_entries(&["/tmp/tool".to_string()]).is_err());
         assert!(validate_archive_entries(&["bin/../tool".to_string()]).is_err());
+    }
+
+    #[test]
+    fn target_dir_absolute_is_rejected() {
+        assert!(resolve_target_dir(Some("/home/x/.local/bin"), "demo").is_err());
+        assert!(resolve_target_dir(Some("/etc/cron.d"), "demo").is_err());
+    }
+
+    #[test]
+    fn target_dir_parent_escape_is_rejected() {
+        assert!(resolve_target_dir(Some("../../bin"), "demo").is_err());
+        assert!(resolve_target_dir(Some("sub/../../escape"), "demo").is_err());
+    }
+
+    #[test]
+    fn target_dir_default_and_relative_subdir_are_allowed() {
+        let base = resolve_target_dir(None, "demo").unwrap();
+        assert!(base.ends_with("tools/demo") || base.ends_with("demo"));
+        let sub = resolve_target_dir(Some("bin"), "demo").unwrap();
+        assert!(sub.ends_with("demo/bin"));
+    }
+
+    #[test]
+    fn raw_download_sha256_mismatch_fails() {
+        // Wrong hash for "abc" must be rejected.
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(verify_sha256(b"abc", wrong).is_err());
+    }
+
+    #[test]
+    fn raw_download_sha256_match_succeeds() {
+        // SHA-256 of "abc".
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        verify_sha256(b"abc", abc).unwrap();
     }
 
     #[test]
