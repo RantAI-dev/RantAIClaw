@@ -1684,17 +1684,26 @@ async fn main() -> Result<()> {
         let profile = profile::ProfileManager::active()?;
         match preset.as_deref().map(str::trim) {
             None | Some("") => {
+                // The runtime approval gate reads `config.autonomy.level`, not the
+                // policy-dir preset marker, so report the enforced level as the
+                // authoritative value and warn if the marker has drifted from it.
+                let enforced = Config::load_or_init().await?.autonomy.level;
                 let current = policy_writer::read_active_preset(&profile.policy_dir());
                 match current {
-                    Some(p) => println!(
-                        "Current autonomy preset: {} ({}, level={:?})",
-                        p.label(),
-                        p.id(),
-                        p.autonomy_level()
-                    ),
+                    Some(p) => println!("Current autonomy preset: {} ({})", p.label(), p.id()),
                     None => println!(
-                        "No approval policy provisioned yet — run `rantaiclaw setup approvals`."
+                        "No approval policy preset provisioned — run `rantaiclaw setup approvals`."
                     ),
+                }
+                println!("Enforced autonomy level: {enforced:?} (from config.toml)");
+                if let Some(p) = current {
+                    if p.autonomy_level() != enforced {
+                        println!(
+                            "  ⚠ preset marker implies {:?} but the runtime enforces {enforced:?}; run `rantaiclaw autonomy {}` to resync.",
+                            p.autonomy_level(),
+                            p.id()
+                        );
+                    }
                 }
                 println!("\nAvailable presets:");
                 for p in PolicyPreset::ALL {
