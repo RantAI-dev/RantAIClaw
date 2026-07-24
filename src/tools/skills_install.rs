@@ -4,9 +4,8 @@
 //! Two tools registered for the LLM:
 //!
 //! - `skills_install` → installs a ClawHub skill by slug. Wraps
-//!   `clawhub::install_one`. Requires user approval (the LLM must pass
-//!   `approved: true` and the supervised-mode approval manager
-//!   intercepts to ask the user).
+//!   `clawhub::install_one`. Approval-gated in supervised mode (see
+//!   below); the model does not self-confirm.
 //! - `skills_install_deps` → runs the install recipe for an already-
 //!   installed-but-gated skill (brew/uv/npm/go/download). Wraps
 //!   `install_deps_for_with_prefs`. Same approval gate.
@@ -60,11 +59,6 @@ impl Tool for SkillsInstallTool {
                 "slug": {
                     "type": "string",
                     "description": "ClawHub skill slug (e.g. `weather`)."
-                },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set to true to confirm the install in supervised mode.",
-                    "default": false
                 }
             },
             "required": ["slug"]
@@ -104,16 +98,22 @@ impl Tool for SkillsInstallTool {
         let slug_owned = slug.to_string();
         let result = crate::skills::clawhub::install_one(&profile, &slug_owned).await;
         match result {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!(
-                    "Installed `{slug_owned}` from ClawHub into {}. \
-                     The agent will see it on the next turn — call \
-                     `skills_list` if you need to confirm.",
-                    profile.skills_dir().display()
-                ),
-                error: None,
-            }),
+            Ok(()) => {
+                tracing::info!(
+                    skill = %slug_owned,
+                    dir = %profile.skills_dir().display(),
+                    "installed clawhub skill"
+                );
+                Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "Installed `{slug_owned}` from ClawHub into the active \
+                         profile's skills directory. The agent will see it on the \
+                         next turn — call `skills_list` if you need to confirm."
+                    ),
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -168,11 +168,6 @@ impl Tool for SkillsInstallDepsTool {
                     "description": "Skill name (case-insensitive). \
                                     Must already be installed; use \
                                     `skills_install` first if not."
-                },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set to true to confirm the install in supervised mode.",
-                    "default": false
                 }
             },
             "required": ["name"]
@@ -402,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn install_tools_have_stable_names_and_advertise_approved_arg() {
+    fn install_tools_have_stable_names_and_no_approved_arg() {
         let profile = crate::profile::Profile {
             name: "t".into(),
             root: std::env::temp_dir().join("rantaiclaw_install_names"),
@@ -410,13 +405,15 @@ mod tests {
         let install = SkillsInstallTool::new(profile, test_security());
         assert_eq!(install.name(), "skills_install");
         let schema = install.parameters_schema();
-        assert!(schema["properties"]["approved"].is_object());
+        assert!(schema["properties"]["approved"].is_null());
+        assert!(schema["properties"]["slug"].is_object());
 
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path().to_path_buf());
         let deps = SkillsInstallDepsTool::new(tmp.path().to_path_buf(), config, test_security());
         assert_eq!(deps.name(), "skills_install_deps");
         let schema2 = deps.parameters_schema();
-        assert!(schema2["properties"]["approved"].is_object());
+        assert!(schema2["properties"]["approved"].is_null());
+        assert!(schema2["properties"]["name"].is_object());
     }
 }

@@ -321,12 +321,12 @@ impl Tool for AuthorSkillTool {
         } else {
             "Created"
         };
+        tracing::info!(skill = %slug, path = %skill_md.display(), "authored skill");
         Ok(ToolResult {
             success: true,
             output: format!(
-                "{verb} skill `{slug}` at {}. It will be available on the next turn \
-                 (restart channel runtimes to pick it up immediately).",
-                skill_md.display()
+                "{verb} skill `{slug}`. It will be available on the next turn \
+                 (restart channel runtimes to pick it up immediately)."
             ),
             error: None,
         })
@@ -544,6 +544,19 @@ mod tests {
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("name: Weather Reporter"));
         assert!(body.contains("Ask for the city first."));
+    }
+
+    #[tokio::test]
+    async fn execute_success_output_does_not_leak_absolute_path() {
+        let tmp = TempDir::new().unwrap();
+        let tool = tool_in(&tmp);
+        let res = tool
+            .execute(json!({ "name": "Weather Reporter", "description": "Reports the weather." }))
+            .await
+            .unwrap();
+        assert!(res.success, "error: {:?}", res.error);
+        // Host path must not appear in model-facing output; it goes to tracing.
+        assert!(!res.output.contains(tmp.path().to_str().unwrap()));
     }
 
     #[tokio::test]
