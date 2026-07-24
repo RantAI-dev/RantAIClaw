@@ -364,6 +364,7 @@ struct VersionFile {
 /// the partially-written directory is removed so the install is all-or-nothing.
 pub async fn install_one(profile: &Profile, slug: &str) -> Result<()> {
     validate_slug(slug)?;
+    ensure_base_url_safe()?;
     let dir = profile.skills_dir().join(slug);
     if dir.exists() {
         // Idempotent — leave existing user state alone. Callers wanting a
@@ -421,6 +422,9 @@ async fn install_one_inner(
         .context("parse version.files")?
         .unwrap_or_default();
 
+    let version_obj = version_body.get("version").unwrap_or(&version_body);
+    ensure_scan_allows(slug, version_obj)?;
+
     if files.is_empty() {
         anyhow::bail!("clawhub: version {version} of {slug} has no files");
     }
@@ -456,6 +460,7 @@ async fn install_one_inner(
         // succeeds. This was the v0.6.1-alpha "Clawhub Error Install" bug
         // — a stale README.md reference broke the entire install.
         let is_required = file.path.eq_ignore_ascii_case("SKILL.md");
+        ensure_required_hash(is_required, &file.sha256)?;
         let resp = match fetch_with_retry(client, &file_url).await {
             Ok(r) => r,
             Err(e) if !is_required => {
@@ -546,6 +551,84 @@ fn verify_sha256(body: &[u8], expected_hex: &str) -> Result<()> {
         anyhow::bail!("sha256 mismatch: got {actual}, expected {expected_hex}");
     }
     Ok(())
+}
+
+/// Read `(status, has_warnings)` out of a manifest's `version.security` block.
+/// Returns `("", false)` when no scan info is present (unknown, not blocking).
+fn scan_status(version: &serde_json::Value) -> (String, bool) {
+    match version.get("security") {
+        Some(sec) => {
+            let status = sec
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let warnings = sec
+                .get("hasWarnings")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (status, warnings)
+        }
+        None => (String::new(), false),
+    }
+}
+
+/// A `fail` verdict blocks the install. Unknown / `pass` / empty do not.
+fn is_blocking_status(status: &str) -> bool {
+    status.eq_ignore_ascii_case("fail")
+}
+
+/// Fail-closed gate: bail on a blocking scan verdict; warn (non-fatal) when the
+/// scan reports warnings. `version` is the manifest's `version` object.
+fn ensure_scan_allows(slug: &str, version: &serde_json::Value) -> Result<()> {
+    let (status, warnings) = scan_status(version);
+    if is_blocking_status(&status) {
+        anyhow::bail!(
+            "clawhub: refusing to install `{slug}` — security scan verdict is `{status}`. \
+             Vet it with `rantaiclaw skills inspect {slug}` before installing."
+        );
+    }
+    if warnings {
+        tracing::warn!(
+            slug,
+            status = status.as_str(),
+            "clawhub: skill has security-scan warnings; installing anyway"
+        );
+    }
+    Ok(())
+}
+
+/// Required files (SKILL.md) must ship a verifiable hash. Optional files may
+/// omit it (best-effort, unchanged).
+fn ensure_required_hash(is_required: bool, sha256: &str) -> Result<()> {
+    if is_required && sha256.is_empty() {
+        anyhow::bail!(
+            "clawhub: required file has no sha256 in the manifest — refusing to write it unverified"
+        );
+    }
+    Ok(())
+}
+
+/// Reject a `RANTAICLAW_CLAWHUB_BASE_URL` override that is not https, unless it
+/// targets loopback (127.0.0.1 / [::1] / localhost) — loopback is how the mock
+/// server tests point the client locally and carries no MITM exposure.
+fn ensure_base_url_safe() -> Result<()> {
+    let Ok(url) = std::env::var(CLAWHUB_BASE_URL_ENV) else {
+        return Ok(());
+    };
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    let is_loopback = lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://[::1]")
+        || lower.starts_with("http://localhost");
+    if is_loopback {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing insecure {CLAWHUB_BASE_URL_ENV}=`{url}` — clawhub installs require https (loopback http allowed for tests)"
+    );
 }
 
 /// Slug guard — keep this aligned with ClawHub's own `^[a-z0-9-]+$` rule plus
@@ -687,6 +770,47 @@ mod tests {
     fn verify_sha256_is_case_insensitive() {
         let upper = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
         verify_sha256(b"abc", upper).unwrap();
+    }
+
+    #[test]
+    fn scan_fail_verdict_blocks_install() {
+        let v = serde_json::json!({ "security": { "status": "fail", "hasWarnings": true } });
+        assert!(is_blocking_status(&scan_status(&v).0));
+        assert!(ensure_scan_allows("evil-skill", &v).is_err());
+    }
+
+    #[test]
+    fn scan_pass_and_warnings_do_not_block() {
+        let pass = serde_json::json!({ "security": { "status": "pass" } });
+        assert!(ensure_scan_allows("ok", &pass).is_ok());
+        let warn = serde_json::json!({ "security": { "status": "pass", "hasWarnings": true } });
+        assert!(ensure_scan_allows("ok", &warn).is_ok()); // warns, does not fail
+        let none = serde_json::json!({});
+        assert!(ensure_scan_allows("ok", &none).is_ok()); // no scan info: not blocking
+    }
+
+    #[test]
+    fn required_file_without_hash_is_rejected() {
+        assert!(ensure_required_hash(true, "").is_err()); // SKILL.md, empty hash
+        assert!(ensure_required_hash(true, "abc123").is_ok());
+        assert!(ensure_required_hash(false, "").is_ok()); // optional file, ok
+    }
+
+    #[test]
+    fn non_https_non_loopback_base_url_is_rejected() {
+        let _guard = crate::test_env::ENV_LOCK.blocking_lock();
+        let prev = std::env::var(CLAWHUB_BASE_URL_ENV).ok();
+        std::env::set_var(CLAWHUB_BASE_URL_ENV, "http://evil.example/api/v1");
+        assert!(ensure_base_url_safe().is_err());
+        std::env::set_var(CLAWHUB_BASE_URL_ENV, "http://127.0.0.1:8080/api/v1");
+        assert!(ensure_base_url_safe().is_ok()); // loopback allowed for tests
+        std::env::set_var(CLAWHUB_BASE_URL_ENV, "https://clawhub.ai/api/v1");
+        assert!(ensure_base_url_safe().is_ok());
+        // restore
+        match prev {
+            Some(v) => std::env::set_var(CLAWHUB_BASE_URL_ENV, v),
+            None => std::env::remove_var(CLAWHUB_BASE_URL_ENV),
+        }
     }
 
     #[tokio::test]
