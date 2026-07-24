@@ -69,8 +69,35 @@ pub struct IntegrationEntry {
 /// Handle the `integrations` CLI command
 pub fn handle_command(command: crate::IntegrationCommands, config: &Config) -> Result<()> {
     match command {
+        crate::IntegrationCommands::List => list_integrations(config),
         crate::IntegrationCommands::Info { name } => show_integration_info(config, &name),
     }
+}
+
+/// Print every registered integration, grouped by category, with a live status
+/// icon. Backs the default `integrations` / `integrations list` browse view.
+fn list_integrations(config: &Config) -> Result<()> {
+    let entries = registry::all_integrations();
+    println!();
+    println!(
+        "  {} integrations across {} categories — `integrations info <name>` for setup",
+        entries.len(),
+        IntegrationCategory::all().len()
+    );
+    for category in IntegrationCategory::all() {
+        println!();
+        println!("  {}", console::style(category.label()).white().bold());
+        for entry in entries.iter().filter(|e| e.category == *category) {
+            let icon = match (entry.status_fn)(config) {
+                IntegrationStatus::Active => "✅",
+                IntegrationStatus::Available => "⚪",
+                IntegrationStatus::ComingSoon => "🔜",
+            };
+            println!("    {icon} {} — {}", entry.name, entry.description);
+        }
+    }
+    println!();
+    Ok(())
 }
 
 fn show_integration_info(config: &Config, name: &str) -> Result<()> {
@@ -223,5 +250,12 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Unknown integration"));
+    }
+
+    #[test]
+    fn handle_command_list_lists_all_integrations() {
+        let config = Config::default();
+        let result = handle_command(crate::IntegrationCommands::List, &config);
+        assert!(result.is_ok());
     }
 }
