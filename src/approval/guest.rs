@@ -40,7 +40,7 @@ impl GuestGate {
 
     /// Tools that are **owner-only**, no matter what `guest_allowed_tools`
     /// says — even if an owner adds one by mistake. Checked before the allowlist.
-    /// Two reasons a tool lands here:
+    /// Three reasons a tool lands here:
     ///   * it mutates authority itself (`manage_permissions` — who owns the bot;
     ///     `issue_pairing_code` — mints a code that can promote its recipient to
     ///     owner, so a guest minting one would be an authority escalation);
@@ -49,13 +49,23 @@ impl GuestGate {
     ///       - `delegate` spawns a sub-agent loop with NO guest gate, so any tool
     ///         the sub-agent is allowed runs unconstrained — a full bypass;
     ///       - `ssh` / `pty` run arbitrary commands on a remote host / live tmux
-    ///         session and don't carry a glob-checkable single command.
+    ///         session and don't carry a glob-checkable single command;
+    ///   * it injects instructions into the system prompt for every later turn,
+    ///     which this per-turn gate can't later constrain:
+    ///       - `author_skill` / `skills_install` write a new skill (local
+    ///         authoring or an arbitrary ClawHub download) that the agent picks
+    ///         up on the next turn — a persistent prompt-injection primitive;
+    ///       - `skills_install_deps` shells out to a package manager
+    ///         (brew/uv/npm/go) on the skill's behalf.
     pub const OWNER_ONLY_TOOLS: &'static [&'static str] = &[
         "manage_permissions",
         "issue_pairing_code",
         "delegate",
         "ssh",
         "pty",
+        "author_skill",
+        "skills_install",
+        "skills_install_deps",
     ];
 
     /// Whether a guest may invoke `tool` at all. Owner-only tools are always
@@ -231,6 +241,27 @@ mod tests {
             "pty",
         ] {
             assert!(!g.tool_permitted(tool), "{tool} must stay owner-only");
+            let reason = g.deny_reason(tool, &json!({})).unwrap();
+            assert!(reason.contains("owner-only"), "{tool}: {reason}");
+        }
+    }
+
+    #[test]
+    fn guest_denied_skill_write_tools_even_when_allowlisted() {
+        // Owner explicitly (mis)configured these into guest_allowed_tools.
+        let g = GuestGate::new(
+            std::iter::empty::<String>(),
+            &[
+                "skills_install".to_string(),
+                "author_skill".to_string(),
+                "skills_install_deps".to_string(),
+            ],
+            &[],
+        );
+        assert!(!g.tool_permitted("skills_install"));
+        assert!(!g.tool_permitted("author_skill"));
+        assert!(!g.tool_permitted("skills_install_deps"));
+        for tool in ["skills_install", "author_skill", "skills_install_deps"] {
             let reason = g.deny_reason(tool, &json!({})).unwrap();
             assert!(reason.contains("owner-only"), "{tool}: {reason}");
         }

@@ -28,11 +28,13 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use super::traits::{Tool, ToolResult};
+use crate::security::SecurityPolicy;
 
 /// Maximum slug length. Keeps directory names sane and predictable.
 const MAX_SLUG_LEN: usize = 64;
@@ -43,11 +45,15 @@ pub struct AuthorSkillTool {
     /// from the active profile at construction so this stays trivially testable
     /// (point it at a temp dir).
     skills_dir: PathBuf,
+    security: Arc<SecurityPolicy>,
 }
 
 impl AuthorSkillTool {
-    pub fn new(skills_dir: PathBuf) -> Self {
-        Self { skills_dir }
+    pub fn new(skills_dir: PathBuf, security: Arc<SecurityPolicy>) -> Self {
+        Self {
+            skills_dir,
+            security,
+        }
     }
 }
 
@@ -245,6 +251,15 @@ impl Tool for AuthorSkillTool {
             return Ok(fail("`description` is required and must not be empty."));
         }
 
+        if !self.security.can_act() {
+            return Ok(fail("Action blocked: autonomy is read-only"));
+        }
+        if !self.security.record_action() {
+            return Ok(fail(
+                "Rate limit exceeded: too many actions in the last hour.",
+            ));
+        }
+
         let slug = slugify(name);
         if slug.is_empty() {
             return Ok(fail(format!(
@@ -300,7 +315,22 @@ impl Tool for AuthorSkillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::AutonomyLevel;
     use tempfile::TempDir;
+
+    /// Permissive policy (Supervised autonomy, default rate budget) so
+    /// existing happy-path tests still exercise the real behaviour.
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
+
+    /// Read-only autonomy — the tool must refuse before writing anything.
+    fn readonly_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        })
+    }
 
     // ── slugify ──────────────────────────────────────────────────────────
 
@@ -400,7 +430,7 @@ mod tests {
     // ── execute ──────────────────────────────────────────────────────────
 
     fn tool_in(tmp: &TempDir) -> AuthorSkillTool {
-        AuthorSkillTool::new(tmp.path().join("skills"))
+        AuthorSkillTool::new(tmp.path().join("skills"), test_security())
     }
 
     #[tokio::test]
@@ -520,7 +550,7 @@ mod tests {
         // body (instructions) made it into the prompt.
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("workspace");
-        let tool = AuthorSkillTool::new(workspace.join("skills"));
+        let tool = AuthorSkillTool::new(workspace.join("skills"), test_security());
         let res = tool
             .execute(json!({
                 "name": "Roundtrip Probe Skill",
@@ -550,5 +580,18 @@ mod tests {
     fn name_is_stable() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(tool_in(&tmp).name(), "author_skill");
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_author_skill() {
+        let tmp = TempDir::new().unwrap();
+        let tool = AuthorSkillTool::new(tmp.path().join("skills"), readonly_security());
+        let res = tool
+            .execute(json!({ "name": "Should Not Exist", "description": "blocked" }))
+            .await
+            .unwrap();
+        assert!(!res.success);
+        assert!(res.error.as_deref().unwrap_or("").contains("read-only"));
+        assert!(!tmp.path().join("skills/should-not-exist/SKILL.md").exists());
     }
 }

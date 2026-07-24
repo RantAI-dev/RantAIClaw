@@ -399,14 +399,17 @@ pub fn all_tools_with_runtime(
         // Approval-gated by name like skills_install.
         tool_arcs.push(Arc::new(author_skill::AuthorSkillTool::new(
             active_profile.skills_dir(),
+            security.clone(),
         )));
         tool_arcs.push(Arc::new(skills_install::SkillsInstallTool::new(
             active_profile,
+            security.clone(),
         )));
     }
     tool_arcs.push(Arc::new(skills_install::SkillsInstallDepsTool::new(
         workspace_dir.to_path_buf(),
         config.clone(),
+        security.clone(),
     )));
 
     if let Some(key) = composio_key {

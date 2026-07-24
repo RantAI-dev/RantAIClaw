@@ -24,15 +24,17 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::traits::{Tool, ToolResult};
+use crate::security::SecurityPolicy;
 
 /// `skills_install` — install a ClawHub skill from chat. Approval-gated.
 pub struct SkillsInstallTool {
     profile: crate::profile::Profile,
+    security: Arc<SecurityPolicy>,
 }
 
 impl SkillsInstallTool {
-    pub fn new(profile: crate::profile::Profile) -> Self {
-        Self { profile }
+    pub fn new(profile: crate::profile::Profile, security: Arc<SecurityPolicy>) -> Self {
+        Self { profile, security }
     }
 }
 
@@ -83,6 +85,21 @@ impl Tool for SkillsInstallTool {
             });
         }
 
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Action blocked: autonomy is read-only".into()),
+            });
+        }
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour.".into()),
+            });
+        }
+
         let profile = self.profile.clone();
         let slug_owned = slug.to_string();
         let result = crate::skills::clawhub::install_one(&profile, &slug_owned).await;
@@ -111,13 +128,19 @@ impl Tool for SkillsInstallTool {
 pub struct SkillsInstallDepsTool {
     workspace_dir: PathBuf,
     config: Arc<crate::config::Config>,
+    security: Arc<SecurityPolicy>,
 }
 
 impl SkillsInstallDepsTool {
-    pub fn new(workspace_dir: PathBuf, config: Arc<crate::config::Config>) -> Self {
+    pub fn new(
+        workspace_dir: PathBuf,
+        config: Arc<crate::config::Config>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
         Self {
             workspace_dir,
             config,
+            security,
         }
     }
 }
@@ -161,6 +184,21 @@ impl Tool for SkillsInstallDepsTool {
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'name' parameter"))?;
+
+        if !self.security.can_act() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Action blocked: autonomy is read-only".into()),
+            });
+        }
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour.".into()),
+            });
+        }
 
         let with_status = crate::skills::load_skills_with_status(&self.workspace_dir, &self.config);
         let skill = match with_status
@@ -251,6 +289,7 @@ impl Tool for SkillsInstallDepsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::AutonomyLevel;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -268,13 +307,28 @@ mod tests {
         })
     }
 
+    /// Permissive policy (Supervised autonomy, default rate budget) so
+    /// existing happy-path tests still exercise the real behaviour.
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
+
+    /// Read-only autonomy — every write-side skill tool must refuse before
+    /// touching the filesystem or network.
+    fn readonly_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[tokio::test]
     async fn skills_install_rejects_empty_slug() {
         let profile = crate::profile::Profile {
             name: "test".into(),
             root: std::env::temp_dir().join("rantaiclaw_install_tool_test"),
         };
-        let tool = SkillsInstallTool::new(profile);
+        let tool = SkillsInstallTool::new(profile, test_security());
         let result = tool.execute(json!({"slug": ""})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("non-empty"));
@@ -286,7 +340,7 @@ mod tests {
             name: "test".into(),
             root: std::env::temp_dir().join("rantaiclaw_install_tool_test_missing"),
         };
-        let tool = SkillsInstallTool::new(profile);
+        let tool = SkillsInstallTool::new(profile, test_security());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
@@ -297,7 +351,7 @@ mod tests {
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(workspace.join("skills")).unwrap();
         let config = test_config(workspace.clone());
-        let tool = SkillsInstallDepsTool::new(workspace, config);
+        let tool = SkillsInstallDepsTool::new(workspace, config, test_security());
         let result = tool.execute(json!({"name": "nonexistent"})).await.unwrap();
         assert!(!result.success);
         let err = result.error.as_deref().unwrap_or("");
@@ -316,11 +370,35 @@ mod tests {
             "---\nname: greeter\ndescription: hi\nversion: 1.0\n---\n# Greeter\n",
         );
         let config = test_config(workspace.clone());
-        let tool = SkillsInstallDepsTool::new(workspace, config);
+        let tool = SkillsInstallDepsTool::new(workspace, config, test_security());
         let result = tool.execute(json!({"name": "greeter"})).await.unwrap();
         assert!(!result.success);
         let err = result.error.as_deref().unwrap_or("");
         assert!(err.contains("no install recipes"));
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_skills_install_deps() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("skills")).unwrap();
+        let config = test_config(workspace.clone());
+        let tool = SkillsInstallDepsTool::new(workspace, config, readonly_security());
+        let result = tool.execute(json!({"name": "anything"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_skills_install() {
+        let profile = crate::profile::Profile {
+            name: "test".into(),
+            root: std::env::temp_dir().join("rantaiclaw_install_tool_test_readonly"),
+        };
+        let tool = SkillsInstallTool::new(profile, readonly_security());
+        let result = tool.execute(json!({"slug": "weather"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
     }
 
     #[test]
@@ -329,14 +407,14 @@ mod tests {
             name: "t".into(),
             root: std::env::temp_dir().join("rantaiclaw_install_names"),
         };
-        let install = SkillsInstallTool::new(profile);
+        let install = SkillsInstallTool::new(profile, test_security());
         assert_eq!(install.name(), "skills_install");
         let schema = install.parameters_schema();
         assert!(schema["properties"]["approved"].is_object());
 
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path().to_path_buf());
-        let deps = SkillsInstallDepsTool::new(tmp.path().to_path_buf(), config);
+        let deps = SkillsInstallDepsTool::new(tmp.path().to_path_buf(), config, test_security());
         assert_eq!(deps.name(), "skills_install_deps");
         let schema2 = deps.parameters_schema();
         assert!(schema2["properties"]["approved"].is_object());
