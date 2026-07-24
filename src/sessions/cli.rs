@@ -145,7 +145,7 @@ pub fn insights() -> Result<()> {
     if let Some(latest) = sessions.first() {
         println!(
             "  Latest session:  {} ({})",
-            &latest.id[..8],
+            &latest.id[..latest.id.len().min(8)],
             fmt_ts(latest.started_at)
         );
     }
