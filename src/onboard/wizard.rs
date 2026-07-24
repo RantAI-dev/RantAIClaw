@@ -1941,6 +1941,44 @@ fn print_model_preview(models: &[String]) {
     }
 }
 
+/// Print the model catalog for a provider from the local cache (or the curated
+/// fallback), without any network call. Backs `rantaiclaw models list`.
+pub fn list_models(config: &Config, provider_override: Option<&str>) -> Result<()> {
+    let provider_name = provider_override
+        .or(config.default_provider.as_deref())
+        .unwrap_or("openrouter")
+        .trim()
+        .to_string();
+
+    if provider_name.is_empty() {
+        anyhow::bail!("Provider name cannot be empty");
+    }
+
+    let catalog = provider_model_catalog(&config.workspace_dir, &provider_name);
+    let source_label = match catalog.source {
+        "cache" => match catalog.age_secs {
+            Some(age) => format!("cached, updated {} ago", humanize_age(age)),
+            None => "cached".to_string(),
+        },
+        _ => "curated — run `rantaiclaw models refresh` to fetch live".to_string(),
+    };
+
+    println!(
+        "Models for '{}' ({}, {} total):",
+        provider_name,
+        source_label,
+        catalog.models.len()
+    );
+    for model in &catalog.models {
+        if *model == catalog.default_model {
+            println!("  - {model} (default)");
+        } else {
+            println!("  - {model}");
+        }
+    }
+    Ok(())
+}
+
 pub fn run_models_refresh(
     config: &Config,
     provider_override: Option<&str>,
