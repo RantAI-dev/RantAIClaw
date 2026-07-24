@@ -397,9 +397,15 @@ pub(crate) fn remove_skill(
     // `skills_dir(workspace_dir)` join never reaches, and a skill's
     // on-disk directory name can differ from the manifest `name:`
     // shown by `list`/`show`.
-    let skills = load_skills_with_config(workspace_dir, config);
+    // Use `load_skills_with_status` (not `_with_config`): the config loader
+    // filters out `enabled = false` skills, so uninstalling a skill you had
+    // previously disabled would 404 ("Skill not found") even though it's on
+    // disk. `_with_status` returns every disk-loaded skill (annotated but not
+    // filtered) — the correct resolution source regardless of enable state.
+    let skills = load_skills_with_status(workspace_dir, config);
     let skill = skills
         .iter()
+        .map(|(s, _)| s)
         .find(|s| s.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| anyhow::anyhow!("Skill not found: {name}. Run `rantaiclaw skills list`."))?;
 
@@ -2854,6 +2860,42 @@ description = "Bare minimum"
         );
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         assert!(!workspace_skills.join("local-skill").exists());
+    }
+
+    #[test]
+    fn remove_disabled_skill_succeeds() {
+        // Regression: uninstalling a skill currently disabled via
+        // `[skills.entries.<name>] enabled = false` must still work. The
+        // resolver previously used `load_skills_with_config`, which filters
+        // disabled skills out, so `skills remove` / the gateway DELETE route
+        // 404'd for a skill you had disabled.
+        let (_env, workspace_dir) = FakeProfileEnv::new();
+        let workspace_skills = workspace_dir.join("skills");
+        fs::create_dir_all(&workspace_skills).unwrap();
+        write_fake_skill(&workspace_skills, "gone-skill", None);
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = false;
+        config.skills.entries.insert(
+            "gone-skill".to_string(),
+            crate::config::SkillEntryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let result = handle_command(
+            crate::SkillCommands::Remove {
+                name: "gone-skill".to_string(),
+            },
+            &config,
+        );
+        assert!(
+            result.is_ok(),
+            "a disabled skill should still uninstall, got {result:?}"
+        );
+        assert!(!workspace_skills.join("gone-skill").exists());
     }
 
     #[test]
