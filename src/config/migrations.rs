@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 15;
+pub const CURRENT_VERSION: u32 = 16;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -226,8 +226,27 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive default-only field)
     }
 
-    // Future migrations (v16, v17, …) inserted here in order.
-    // if from < 16 { migrate_v16(raw)?; }
+    // v15 → v16: remote-skill trust boundary (plan 045). `[skills].open_skills_ref`
+    // (Option<String>, default unset) was added — pins the community
+    // open-skills repo to a specific commit/tag instead of auto-advancing on
+    // every periodic `git pull --ff-only`. Two fingerprinted DEFAULT changes
+    // ride along: remote-origin skills (open-skills, ClawHub) now default to
+    // compact prompt injection instead of verbatim `Full` injection
+    // (SECURITY-01 — a remote body is no longer treated as an authoritative
+    // instruction), and `source = "literal"` skill API keys are now routed
+    // through the secret store on save/load like every other credential
+    // (DX-01) instead of round-tripping as plaintext. None of this is a
+    // structural rename/re-type: the new key is additive with a serde
+    // default, and the literal-key encryption happens transparently on the
+    // next `save()`. Nothing to transform here; this arm burns a version
+    // slot so the schema_drift fingerprint (which embeds both the new field
+    // and the changed injection default) is accepted with intent.
+    if from < 16 {
+        // (no transformation; additive field + default/injection-behavior change)
+    }
+
+    // Future migrations (v17, v18, …) inserted here in order.
+    // if from < 17 { migrate_v17(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -305,6 +324,42 @@ mod tests {
         assert!(
             gw.get("api_rate_limit_per_minute").is_none(),
             "migration must not write the new key; the serde default supplies it"
+        );
+    }
+
+    #[test]
+    fn v15_to_v16_is_additive_noop_preserving_skill_entries() {
+        // v15 → v16 (plan 045) only added `[skills].open_skills_ref`
+        // (additive, unset default) plus two DEFAULT-only behavior changes
+        // (remote-skill compact injection, literal skill-key encryption) that
+        // have no on-disk shape at all. A v15 config migrates to v16 with all
+        // existing `[skills.entries.*]` content intact and without the
+        // migration injecting `open_skills_ref`.
+        let mut raw = parse(
+            "schema_version = 15\n[skills.entries.weather]\nenabled = true\n\
+             [skills.entries.weather.api_key]\nsource = \"literal\"\nvalue = \"placeholder\"\n",
+        );
+        let changed = migrate(&mut raw).unwrap();
+        assert!(changed, "v15 bump should be reported as transformed");
+        assert_eq!(version_of(&raw), Some(i64::from(CURRENT_VERSION)));
+        let skills = raw.get("skills").expect("skills table survives");
+        assert!(
+            skills.get("open_skills_ref").is_none(),
+            "migration must not inject open_skills_ref; serde default handles it"
+        );
+        let entry = skills
+            .get("entries")
+            .and_then(|e| e.get("weather"))
+            .expect("skill entry survives");
+        assert_eq!(entry.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            entry
+                .get("api_key")
+                .and_then(|k| k.get("value"))
+                .and_then(|v| v.as_str()),
+            Some("placeholder"),
+            "migration itself must not touch the literal value; encryption \
+             happens on the next Config::save(), not during schema migration"
         );
     }
 

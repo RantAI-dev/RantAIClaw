@@ -345,6 +345,7 @@ mod tests {
             location: None,
             requires: Default::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
         let tools = skill_tools_from_skills(&skills);
         assert_eq!(tools.len(), 2);

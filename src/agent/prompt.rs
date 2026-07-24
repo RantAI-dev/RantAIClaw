@@ -859,6 +859,7 @@ mod tests {
             location: None,
             requires: Default::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
 
         let ctx = PromptContext {
@@ -903,6 +904,7 @@ mod tests {
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
             requires: Default::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
 
         let ctx = PromptContext {
@@ -973,6 +975,7 @@ mod tests {
             location: None,
             requires: Default::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
