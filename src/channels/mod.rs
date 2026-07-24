@@ -6261,6 +6261,7 @@ BTC is currently around $65,000 based on latest tool output."#
             location: None,
             requires: Default::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
@@ -6298,6 +6299,7 @@ BTC is currently around $65,000 based on latest tool output."#
             location: None,
             requires: Default::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
 
         let prompt = build_system_prompt_with_mode(
@@ -6341,6 +6343,7 @@ BTC is currently around $65,000 based on latest tool output."#
             location: None,
             requires: Default::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
 
         let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);

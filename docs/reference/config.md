@@ -165,7 +165,7 @@ WEATHER_UNITS = "metric"
 
 [skills.entries.weather.api_key]
 source = "env"
-value = "WEATHER_API_KEY"
+id = "WEATHER_API_KEY"
 
 [skills.entries.weather.config]
 region = "us"

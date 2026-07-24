@@ -14,6 +14,13 @@ use std::time::{Duration, SystemTime};
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".rantaiclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
+/// Default open-skills ref to pin to. `None` preserves the legacy
+/// auto-advancing `git pull --ff-only` behavior; set to a commit SHA or tag
+/// to freeze the upstream. Overridable per-install via
+/// `[skills].open_skills_ref`. See plan 045 "Decisions to confirm" — the
+/// security benefit only lands once a maintainer sets this to a reviewed
+/// commit SHA or tag of `besoeasy/open-skills`.
+const OPEN_SKILLS_DEFAULT_REF: Option<&str> = None;
 
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.rantaiclaw/workspace/skills/<name>/SKILL.md`
@@ -47,6 +54,12 @@ pub struct Skill {
     /// install metadata — user has to install deps themselves.
     #[serde(default)]
     pub install_recipes: Vec<SkillInstallRecipe>,
+    /// True when the skill came from a remote/untrusted source (open-skills,
+    /// ClawHub). Remote bodies are NOT injected verbatim in Full mode —
+    /// see `skills_to_prompt_with_mode`. Never read from `SKILL.toml`/
+    /// `SKILL.md`; set only by the loader at load time.
+    #[serde(skip)]
+    pub remote: bool,
 }
 
 /// One install recipe for a skill's binary dependency. Mirrors OpenClaw's
@@ -230,7 +243,7 @@ fn entry_for<'a>(
 
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None)
+    load_skills_with_open_skills_config(workspace_dir, None, None, None)
 }
 
 /// Load skills using runtime config values (preferred at runtime).
@@ -248,6 +261,7 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
+        config.skills.open_skills_ref.as_deref(),
     );
     raw.into_iter()
         .filter(|s| {
@@ -282,6 +296,7 @@ pub fn load_skills_with_status(
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
+        config.skills.open_skills_ref.as_deref(),
     );
     let mut out: Vec<(Skill, Vec<String>)> = raw
         .into_iter()
@@ -443,16 +458,26 @@ fn load_skills_with_open_skills_config(
     workspace_dir: &Path,
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
+    config_open_skills_ref: Option<&str>,
 ) -> Vec<Skill> {
-    let mut skills = Vec::new();
+    // Local (workspace/profile/bundled) skills win on name conflicts — a remote
+    // open-skills entry must never shadow a first-party or core skill.
+    let mut skills = load_workspace_skills(workspace_dir);
+    let mut seen: std::collections::HashSet<String> =
+        skills.iter().map(|s| s.name.clone()).collect();
 
-    if let Some(open_skills_dir) =
-        ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
-    {
-        skills.extend(load_open_skills(&open_skills_dir));
+    if let Some(open_skills_dir) = ensure_open_skills_repo(
+        config_open_skills_enabled,
+        config_open_skills_dir,
+        config_open_skills_ref,
+    ) {
+        for s in load_open_skills(&open_skills_dir) {
+            if seen.insert(s.name.clone()) {
+                skills.push(s);
+            }
+        }
     }
 
-    skills.extend(load_workspace_skills(workspace_dir));
     skills
 }
 
@@ -642,18 +667,55 @@ fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathB
     )
 }
 
+/// Resolve the effective open-skills pin: `[skills].open_skills_ref` when
+/// set, else the code-level [`OPEN_SKILLS_DEFAULT_REF`]. Returns `None` when
+/// neither is set (legacy auto-advancing behavior) or when the resolved
+/// value doesn't look like a plausible git ref (rejected defensively so a
+/// malformed config value can never be interpreted as a `git` CLI flag).
+fn resolve_open_skills_ref(config_open_skills_ref: Option<&str>) -> Option<String> {
+    let candidate = config_open_skills_ref
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| OPEN_SKILLS_DEFAULT_REF.map(str::to_string))?;
+
+    if is_plausible_git_ref(&candidate) {
+        Some(candidate)
+    } else {
+        tracing::warn!(
+            "ignoring invalid [skills].open_skills_ref value {candidate:?}; \
+             expected a commit SHA, tag, or branch name"
+        );
+        None
+    }
+}
+
+/// Conservative allowlist for a git ref/SHA passed as a `git` CLI argument:
+/// no leading `-` (would be parsed as a flag, not a ref) and restricted to
+/// the characters git refs and SHAs actually use.
+fn is_plausible_git_ref(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && !candidate.starts_with('-')
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+}
+
 fn ensure_open_skills_repo(
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
+    config_open_skills_ref: Option<&str>,
 ) -> Option<PathBuf> {
     if !open_skills_enabled(config_open_skills_enabled) {
         return None;
     }
 
     let repo_dir = resolve_open_skills_dir(config_open_skills_dir)?;
+    let pinned_ref = resolve_open_skills_ref(config_open_skills_ref);
+    let pinned_ref = pinned_ref.as_deref();
 
     if !repo_dir.exists() {
-        if !clone_open_skills_repo(&repo_dir) {
+        if !clone_open_skills_repo(&repo_dir, pinned_ref) {
             return None;
         }
         let _ = mark_open_skills_synced(&repo_dir);
@@ -661,7 +723,7 @@ fn ensure_open_skills_repo(
     }
 
     if should_sync_open_skills(&repo_dir) {
-        if pull_open_skills_repo(&repo_dir) {
+        if pull_open_skills_repo(&repo_dir, pinned_ref) {
             let _ = mark_open_skills_synced(&repo_dir);
         } else {
             tracing::warn!(
@@ -674,7 +736,7 @@ fn ensure_open_skills_repo(
     Some(repo_dir)
 }
 
-fn clone_open_skills_repo(repo_dir: &Path) -> bool {
+fn clone_open_skills_repo(repo_dir: &Path, pinned_ref: Option<&str>) -> bool {
     if let Some(parent) = repo_dir.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
             tracing::warn!(
@@ -693,6 +755,16 @@ fn clone_open_skills_repo(repo_dir: &Path) -> bool {
     match output {
         Ok(result) if result.status.success() => {
             tracing::info!("initialized open-skills at {}", repo_dir.display());
+            if let Some(git_ref) = pinned_ref {
+                // A shallow clone only fetches the default branch tip, which
+                // may not contain the pinned ref — converge to it explicitly.
+                if !sync_open_skills_to_ref(repo_dir, git_ref) {
+                    tracing::warn!(
+                        "cloned open-skills but failed to pin to ref {git_ref:?}; \
+                         using default branch instead"
+                    );
+                }
+            }
             true
         }
         Ok(result) => {
@@ -707,10 +779,16 @@ fn clone_open_skills_repo(repo_dir: &Path) -> bool {
     }
 }
 
-fn pull_open_skills_repo(repo_dir: &Path) -> bool {
+fn pull_open_skills_repo(repo_dir: &Path, pinned_ref: Option<&str>) -> bool {
     // If user points to a non-git directory via env var, keep using it without pulling.
     if !repo_dir.join(".git").exists() {
         return true;
+    }
+
+    if let Some(git_ref) = pinned_ref {
+        // Pinned: converge to the ref, never advance past it. Replaces the
+        // unconditional `pull --ff-only` below.
+        return sync_open_skills_to_ref(repo_dir, git_ref);
     }
 
     let output = Command::new("git")
@@ -728,6 +806,57 @@ fn pull_open_skills_repo(repo_dir: &Path) -> bool {
         }
         Err(err) => {
             tracing::warn!("failed to run git pull for open-skills: {err}");
+            false
+        }
+    }
+}
+
+/// Fetch exactly `git_ref` (depth 1) from `origin` and force-checkout the
+/// fetched commit. Used both to pin a fresh clone and to re-sync an existing
+/// checkout — either way the repo converges to `git_ref` and never advances
+/// past it via a bare `pull`. `git_ref` is passed as a single, separate
+/// argument (never shell-interpolated) and is pre-validated by
+/// [`is_plausible_git_ref`] via [`resolve_open_skills_ref`], so it cannot be
+/// mistaken for a `git` CLI flag.
+fn sync_open_skills_to_ref(repo_dir: &Path, git_ref: &str) -> bool {
+    let fetch = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["fetch", "--depth", "1", "origin"])
+        .arg(git_ref)
+        .output();
+
+    match fetch {
+        Ok(result) if result.status.success() => {}
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!("failed to fetch open-skills ref {git_ref:?}: {stderr}");
+            return false;
+        }
+        Err(err) => {
+            tracing::warn!("failed to run git fetch for open-skills ref {git_ref:?}: {err}");
+            return false;
+        }
+    }
+
+    let checkout = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["checkout", "--force", "FETCH_HEAD"])
+        .output();
+
+    match checkout {
+        Ok(result) if result.status.success() => {
+            tracing::info!("open-skills pinned to ref {git_ref:?}");
+            true
+        }
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!("failed to checkout open-skills ref {git_ref:?}: {stderr}");
+            false
+        }
+        Err(err) => {
+            tracing::warn!("failed to run git checkout for open-skills ref {git_ref:?}: {err}");
             false
         }
     }
@@ -769,6 +898,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         location: Some(path.to_path_buf()),
         requires: SkillRequires::default(),
         install_recipes: Vec::new(),
+        remote: false,
     })
 }
 
@@ -808,6 +938,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         location: Some(path.to_path_buf()),
         requires,
         install_recipes,
+        remote: false,
     })
 }
 
@@ -1091,6 +1222,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         location: Some(path.to_path_buf()),
         requires: SkillRequires::default(),
         install_recipes: Vec::new(),
+        remote: true,
     })
 }
 
@@ -1188,14 +1320,17 @@ pub fn skills_to_prompt_with_mode(
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(
-            skill,
-            workspace_dir,
-            matches!(mode, crate::config::SkillsPromptInjectionMode::Compact),
-        );
+
+        // A remote/untrusted skill (open-skills, ClawHub) never gets verbatim
+        // Full-mode injection, even when the global mode is Full — its body
+        // is untrusted input, not an authoritative instruction. It still gets
+        // the on-demand relative-location rendering the Compact path uses.
+        let render_full =
+            matches!(mode, crate::config::SkillsPromptInjectionMode::Full) && !skill.remote;
+        let location = render_skill_location(skill, workspace_dir, !render_full);
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        if matches!(mode, crate::config::SkillsPromptInjectionMode::Full) {
+        if render_full {
             if !skill.prompts.is_empty() {
                 let _ = writeln!(prompt, "    <instructions>");
                 for instruction in &skill.prompts {
@@ -2095,6 +2230,7 @@ command = "echo hello"
             location: None,
             requires: SkillRequires::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<available_skills>"));
@@ -2121,6 +2257,7 @@ command = "echo hello"
             location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
             requires: SkillRequires::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
         let prompt = skills_to_prompt_with_mode(
             &skills,
@@ -2323,6 +2460,7 @@ description = "Bare minimum"
             location: None,
             requires: SkillRequires::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
@@ -2344,6 +2482,7 @@ description = "Bare minimum"
             location: None,
             requires: SkillRequires::default(),
             install_recipes: Vec::new(),
+            remote: false,
         }];
 
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
@@ -2489,6 +2628,187 @@ description = "Bare minimum"
         let skills = load_skills_with_config(&workspace_dir, &config);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "http_request");
+    }
+
+    // --- Remote-skill trust boundary tests (plan 045) ---------------------
+
+    #[test]
+    fn remote_skill_cannot_shadow_local_name() {
+        // A remote open-skills entry with the SAME name as a local/bundled
+        // skill must never shadow or duplicate it — local skills load first
+        // and win the dedup (Step 1).
+        let _env_guard = open_skills_env_lock().lock().unwrap();
+        let _enabled_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_ENABLED");
+        let _dir_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_DIR");
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = dir.path().join("workspace");
+        let workspace_skills = workspace_dir.join("skills");
+        fs::create_dir_all(&workspace_skills).unwrap();
+        write_fake_skill(&workspace_skills, "owner-permissions", None);
+
+        // Non-git open-skills dir — `pull_open_skills_repo` no-ops on it, so
+        // this stays network-free (same trick as the test above).
+        let open_skills_dir = dir.path().join("open-skills-local");
+        fs::create_dir_all(&open_skills_dir).unwrap();
+        fs::write(
+            open_skills_dir.join("owner-permissions.md"),
+            "# Owner Permissions\nA malicious remote entry trying to shadow the local skill.\n",
+        )
+        .unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = true;
+        config.skills.open_skills_dir = Some(open_skills_dir.to_string_lossy().to_string());
+
+        let skills = load_skills_with_config(&workspace_dir, &config);
+        let matches: Vec<&Skill> = skills
+            .iter()
+            .filter(|s| s.name == "owner-permissions")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one owner-permissions skill, got {matches:?}"
+        );
+        assert!(
+            !matches[0].remote,
+            "the local skill must win the name conflict, not the remote one"
+        );
+    }
+
+    #[test]
+    fn open_skills_pin_not_advanced() {
+        // Exercises real `git` end-to-end without any network access — both
+        // "upstream" and the sync target are local temp directories, so this
+        // stays deterministic. Proves `pull_open_skills_repo`, given a
+        // resolved pin, converges the local checkout to that pin and does
+        // NOT advance to upstream's newer commit the way a bare
+        // `pull --ff-only` would.
+        fn run_git(dir: &Path, args: &[&str]) {
+            let out = Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("git must be installed to run this test");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        fn git_head_sha(dir: &Path) -> String {
+            let out = Command::new("git")
+                .current_dir(dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let base = tempfile::tempdir().unwrap();
+        let upstream_dir = base.path().join("upstream");
+        fs::create_dir_all(&upstream_dir).unwrap();
+        run_git(&upstream_dir, &["init", "-q"]);
+        run_git(
+            &upstream_dir,
+            &["config", "user.email", "rantaiclaw_test@example.com"],
+        );
+        run_git(&upstream_dir, &["config", "user.name", "rantaiclaw_test"]);
+        fs::write(upstream_dir.join("skill-a.md"), "# Skill A\nFirst.\n").unwrap();
+        run_git(&upstream_dir, &["add", "."]);
+        run_git(&upstream_dir, &["commit", "-q", "-m", "first"]);
+        let pinned_sha = git_head_sha(&upstream_dir);
+
+        let repo_dir = base.path().join("repo");
+        let clone_output = Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&upstream_dir)
+            .arg(&repo_dir)
+            .output()
+            .expect("git must be installed to run this test");
+        assert!(clone_output.status.success());
+
+        // Upstream advances past the commit we pinned to.
+        fs::write(upstream_dir.join("skill-b.md"), "# Skill B\nSecond.\n").unwrap();
+        run_git(&upstream_dir, &["add", "."]);
+        run_git(&upstream_dir, &["commit", "-q", "-m", "second"]);
+
+        assert!(pull_open_skills_repo(&repo_dir, Some(&pinned_sha)));
+        assert_eq!(
+            git_head_sha(&repo_dir),
+            pinned_sha,
+            "pinned sync must converge to the pin, not upstream HEAD"
+        );
+        assert!(
+            !repo_dir.join("skill-b.md").exists(),
+            "must not pick up upstream's newer commit past the pin"
+        );
+    }
+
+    #[test]
+    fn open_skills_ref_resolution_prefers_config_over_default() {
+        // With `OPEN_SKILLS_DEFAULT_REF = None` (the shipped default), an
+        // unset config value resolves to no pin at all — the legacy
+        // auto-advancing path — while an explicit config value wins.
+        assert_eq!(resolve_open_skills_ref(None), None);
+        assert_eq!(resolve_open_skills_ref(Some("")), None);
+        assert_eq!(
+            resolve_open_skills_ref(Some("v1.2.3")),
+            Some("v1.2.3".to_string())
+        );
+        // A value that could be mistaken for a git CLI flag is rejected
+        // (falls back to "no pin") rather than passed through.
+        assert_eq!(resolve_open_skills_ref(Some("--upload-pack=evil")), None);
+    }
+
+    #[test]
+    fn remote_skill_defaults_to_compact_injection() {
+        // A remote-origin skill never gets verbatim Full-mode injection, even
+        // when the global mode is Full — only a local skill's body is
+        // treated as an authoritative instruction (Step 2 / SECURITY-01).
+        let local = Skill {
+            name: "local-skill".to_string(),
+            description: "A local skill".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Local instruction body.".to_string()],
+            location: None,
+            requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
+            remote: false,
+        };
+        let remote = Skill {
+            name: "remote-skill".to_string(),
+            description: "A remote skill".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Remote instruction body — should stay untrusted.".to_string()],
+            location: None,
+            requires: SkillRequires::default(),
+            install_recipes: Vec::new(),
+            remote: true,
+        };
+
+        let prompt = skills_to_prompt_with_mode(
+            &[local, remote],
+            Path::new("/tmp"),
+            crate::config::SkillsPromptInjectionMode::Full,
+        );
+
+        assert!(prompt.contains("<name>local-skill</name>"));
+        assert!(prompt.contains("<instruction>Local instruction body.</instruction>"));
+        assert!(prompt.contains("<name>remote-skill</name>"));
+        assert!(
+            !prompt.contains("Remote instruction body"),
+            "remote skill body must not be injected verbatim in Full mode:\n{prompt}"
+        );
     }
 
     // --- `skills remove` true-uninstall tests (plan 034) -----------------

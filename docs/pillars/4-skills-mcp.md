@@ -78,16 +78,19 @@ The TUI surfaces a one-shot deprecation toast at boot when it detects an existin
 ## CLI / config
 
 ```bash
-rantaiclaw skill list
-rantaiclaw skill install <source>      # ClawHub URL or local path
-rantaiclaw skill remove <name>
+rantaiclaw skills list
+rantaiclaw skills install <source>      # ClawHub slug, git remote, or local path
+rantaiclaw skills remove <name>
 rantaiclaw setup skills                # multi-select picker
 rantaiclaw setup mcp                   # 9-server curated picker
 ```
 
 ```toml
-[skills]
-enabled = ["web-search", "summarizer"]
+[skills.entries.web-search]
+enabled = true
+
+[skills.entries.summarizer]
+enabled = false          # same as `rantaiclaw skills disable summarizer`
 
 [mcp.<server-name>]
 command = "npx"

@@ -195,6 +195,14 @@ fn redact_config_secrets(cfg: &mut crate::config::Config) {
     // Knowledge Base keys are encrypted at rest like `api_key`; redact them too.
     cfg.knowledge.embedding_api_key = None;
     cfg.knowledge.vision_api_key = None;
+    // Skill literal API keys are encrypted at rest like `api_key` too (plan
+    // 045); redact them so a `source = "literal"` value never leaves the
+    // config API even after it's decrypted into memory.
+    for entry in cfg.skills.entries.values_mut() {
+        if let Some(api_key) = entry.api_key.as_mut() {
+            api_key.value = None;
+        }
+    }
 }
 
 // ── PUT /config/model ────────────────────────────────────────────────────────
@@ -927,6 +935,38 @@ mod tests {
         assert!(!json.contains("sk-openai-secret"), "leaked in:\n{json}");
         assert!(!json.contains("mm-secret"), "leaked in:\n{json}");
         assert!(cfg.provider_api_keys.is_empty());
+    }
+
+    #[test]
+    fn config_api_redacts_skill_literal_value() {
+        // A `source = "literal"` skill API key is decrypted into memory on
+        // load (plan 045) and must never leak back out through the config
+        // API response, same as every other credential this redactor clears.
+        let mut cfg = Config::default();
+        cfg.skills.entries.insert(
+            "x".into(),
+            crate::config::SkillEntryConfig {
+                api_key: Some(crate::config::SkillApiKey {
+                    source: "literal".into(),
+                    id: None,
+                    value: Some("neutral-test-skill-key-value".into()),
+                }),
+                ..Default::default()
+            },
+        );
+        redact_config_secrets(&mut cfg);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !json.contains("neutral-test-skill-key-value"),
+            "leaked in:\n{json}"
+        );
+        assert!(cfg
+            .skills
+            .entries
+            .get("x")
+            .and_then(|e| e.api_key.as_ref())
+            .and_then(|k| k.value.as_ref())
+            .is_none());
     }
 
     #[test]

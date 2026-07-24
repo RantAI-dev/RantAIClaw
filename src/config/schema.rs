@@ -471,6 +471,14 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
+    /// Pin the community open-skills repository to a specific commit SHA,
+    /// tag, or branch instead of auto-advancing on every periodic
+    /// `git pull --ff-only`. When unset, falls back to the binary's built-in
+    /// default pin (unset by default — see plan 045). Setting this closes
+    /// off a remote author landing new instructions upstream and having them
+    /// silently picked up on the next sync.
+    #[serde(default)]
+    pub open_skills_ref: Option<String>,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
@@ -586,6 +594,11 @@ pub struct SkillApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// When `source = "literal"`, the API key value. **Avoid** — prefer env.
+    /// Encrypted at rest via the secret store when `secrets.encrypt = true`
+    /// (the default), same as `config.api_key` and every other provider
+    /// credential — see the encrypt/decrypt loops in `Config::save` /
+    /// `Config::load_or_init`. `literal` is still accepted for compat with
+    /// OpenClaw-style configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
 }
@@ -3901,6 +3914,19 @@ impl Config {
                 )?;
                 tg.bot_token = wrapped.unwrap_or_default();
             }
+            // Decrypt skill literal API keys symmetrically with `save()` so
+            // `src/tools/mod.rs` still reads a plaintext value in memory.
+            for (name, entry) in &mut config.skills.entries {
+                if let Some(api_key) = entry.api_key.as_mut() {
+                    if api_key.source == "literal" {
+                        decrypt_optional_secret(
+                            &store,
+                            &mut api_key.value,
+                            &format!("config.skills.entries.{name}.api_key.value"),
+                        )?;
+                    }
+                }
+            }
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -4404,6 +4430,22 @@ impl Config {
                 "config.channels_config.telegram.bot_token",
             )?;
             tg.bot_token = wrapped.unwrap_or_default();
+        }
+
+        // Skill literal API keys are secrets too — encrypt them symmetrically
+        // with every other credential above instead of writing plaintext.
+        // `env`-sourced keys have no `value` to encrypt (skip_serializing_if
+        // already keeps them out of the file); only `literal` entries apply.
+        for (name, entry) in &mut config_to_save.skills.entries {
+            if let Some(api_key) = entry.api_key.as_mut() {
+                if api_key.source == "literal" {
+                    encrypt_optional_secret(
+                        &store,
+                        &mut api_key.value,
+                        &format!("config.skills.entries.{name}.api_key.value"),
+                    )?;
+                }
+            }
         }
 
         let toml_str =
@@ -5173,6 +5215,65 @@ tool_dispatcher = "xml"
         );
         // The allowlist is not a secret — it must stay readable.
         assert_eq!(tg.allowed_users, vec!["alice".to_string()]);
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn literal_skill_api_key_not_plaintext_in_serialized_config() {
+        // A `source = "literal"` skill API key is a credential like any
+        // other and must round-trip through the secret store exactly the
+        // way `config.api_key` / the Telegram bot token do (plan 045,
+        // SECURITY DX-01) — never written to disk as plaintext.
+        let dir = std::env::temp_dir().join(format!(
+            "rantaiclaw_test_skill_literal_key_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let plaintext = "neutral-test-skill-key-value";
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.secrets.encrypt = true;
+        config.skills.entries.insert(
+            "x".into(),
+            SkillEntryConfig {
+                api_key: Some(SkillApiKey {
+                    source: "literal".into(),
+                    id: None,
+                    value: Some(plaintext.into()),
+                }),
+                ..Default::default()
+            },
+        );
+
+        config.save().await.unwrap();
+
+        let contents = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            !contents.contains(plaintext),
+            "literal skill api_key value leaked into config.toml as plaintext:\n{contents}"
+        );
+
+        let stored: Config = toml::from_str(&contents).unwrap();
+        let store = crate::security::SecretStore::new(&dir, true);
+        let encrypted_value = stored
+            .skills
+            .entries
+            .get("x")
+            .and_then(|e| e.api_key.as_ref())
+            .and_then(|k| k.value.as_deref())
+            .expect("literal api_key.value survives serialization (encrypted)");
+        assert!(
+            crate::security::SecretStore::is_encrypted(encrypted_value),
+            "expected an enc2:/enc: prefixed value, got {encrypted_value:?}"
+        );
+        // Symmetric with the load path in `Config::load_or_init` — proves
+        // `src/tools/mod.rs` still receives the plaintext value at runtime.
+        assert_eq!(store.decrypt(encrypted_value).unwrap(), plaintext);
 
         let _ = fs::remove_dir_all(&dir).await;
     }

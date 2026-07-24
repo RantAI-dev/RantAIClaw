@@ -200,11 +200,16 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 ### `skills`
 
 - `rantaiclaw skills list`
+- `rantaiclaw skills show <name>`
+- `rantaiclaw skills enable <name>`
+- `rantaiclaw skills disable <name>`
 - `rantaiclaw skills install <source>`
 - `rantaiclaw skills install-deps [<slug> | --all]`
 - `rantaiclaw skills inspect <slug>`
 - `rantaiclaw skills update [<slug> | --all]`
 - `rantaiclaw skills remove <name>`
+
+`skills enable <name>` / `skills disable <name>` write `[skills.entries.<name>] enabled = true` / `enabled = false` in `config.toml` — the same key documented in `docs/reference/config.md`, which is also toggleable at runtime via the gateway's `PUT /api/v1/skills/{name}/enabled`.
 
 `<source>` accepts a ClawHub slug, git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`), or a local filesystem path.
 
