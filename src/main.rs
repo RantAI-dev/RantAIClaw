@@ -507,7 +507,7 @@ Targets: owner | tool | command (aliases: owners, tools, commands, cmd).")]
     /// Browse 50+ integrations
     Integrations {
         #[command(subcommand)]
-        integration_command: IntegrationCommands,
+        integration_command: Option<IntegrationCommands>,
     },
 
     /// Manage skills (user-defined capabilities)
@@ -1333,6 +1333,8 @@ enum MemoryCommands {
 
 #[derive(Subcommand, Debug)]
 enum IntegrationCommands {
+    /// List all integrations grouped by category (default)
+    List,
     /// Show details about a specific integration
     Info {
         /// Integration name
@@ -2008,7 +2010,10 @@ async fn main() -> Result<()> {
 
         Some(Commands::Integrations {
             integration_command,
-        }) => integrations::handle_command(integration_command, &config),
+        }) => integrations::handle_command(
+            integration_command.unwrap_or(IntegrationCommands::List),
+            &config,
+        ),
 
         Some(Commands::Skills { skill_command }) => skills::handle_command(skill_command, &config),
 

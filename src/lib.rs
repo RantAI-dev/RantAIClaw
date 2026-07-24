@@ -460,6 +460,8 @@ pub enum MemoryCommands {
 /// Integration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum IntegrationCommands {
+    /// List all integrations grouped by category (default)
+    List,
     /// Show details about a specific integration
     Info {
         /// Integration name
