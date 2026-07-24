@@ -2604,6 +2604,35 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
+/// Canonical channel roster: `(display label, configured?)` for every channel
+/// type in a stable order. Single source of truth shared by `channel list` and
+/// `status` so the two surfaces can never disagree on which channels exist.
+/// Matrix/Lark are additionally gated on their build features.
+pub(crate) fn channel_roster(config: &Config) -> [(&'static str, bool); 16] {
+    let c = &config.channels_config;
+    [
+        ("Telegram", c.telegram.is_some()),
+        ("Discord", c.discord.is_some()),
+        ("Slack", c.slack.is_some()),
+        ("Mattermost", c.mattermost.is_some()),
+        ("Webhook", c.webhook.is_some()),
+        ("iMessage", c.imessage.is_some()),
+        (
+            "Matrix",
+            cfg!(feature = "channel-matrix") && c.matrix.is_some(),
+        ),
+        ("Signal", c.signal.is_some()),
+        ("WhatsApp", c.whatsapp.is_some()),
+        ("Linq", c.linq.is_some()),
+        ("Nextcloud Talk", c.nextcloud_talk.is_some()),
+        ("Email", c.email.is_some()),
+        ("IRC", c.irc.is_some()),
+        ("Lark", cfg!(feature = "channel-lark") && c.lark.is_some()),
+        ("DingTalk", c.dingtalk.is_some()),
+        ("QQ", c.qq.is_some()),
+    ]
+}
+
 pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
         crate::ChannelCommands::Start => {
@@ -2618,33 +2647,7 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         crate::ChannelCommands::List => {
             println!("Channels:");
             println!("  ✅ CLI (always available)");
-            for (name, configured) in [
-                ("Telegram", config.channels_config.telegram.is_some()),
-                ("Discord", config.channels_config.discord.is_some()),
-                ("Slack", config.channels_config.slack.is_some()),
-                ("Mattermost", config.channels_config.mattermost.is_some()),
-                ("Webhook", config.channels_config.webhook.is_some()),
-                ("iMessage", config.channels_config.imessage.is_some()),
-                (
-                    "Matrix",
-                    cfg!(feature = "channel-matrix") && config.channels_config.matrix.is_some(),
-                ),
-                ("Signal", config.channels_config.signal.is_some()),
-                ("WhatsApp", config.channels_config.whatsapp.is_some()),
-                ("Linq", config.channels_config.linq.is_some()),
-                (
-                    "Nextcloud Talk",
-                    config.channels_config.nextcloud_talk.is_some(),
-                ),
-                ("Email", config.channels_config.email.is_some()),
-                ("IRC", config.channels_config.irc.is_some()),
-                (
-                    "Lark",
-                    cfg!(feature = "channel-lark") && config.channels_config.lark.is_some(),
-                ),
-                ("DingTalk", config.channels_config.dingtalk.is_some()),
-                ("QQ", config.channels_config.qq.is_some()),
-            ] {
+            for (name, configured) in channel_roster(config) {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
             if !cfg!(feature = "channel-matrix") {

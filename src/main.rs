@@ -1839,16 +1839,10 @@ async fn main() -> Result<()> {
             );
             println!();
             println!("Channels:");
-            println!("  CLI:      ✅ always");
-            for (name, configured) in [
-                ("Telegram", config.channels_config.telegram.is_some()),
-                ("Discord", config.channels_config.discord.is_some()),
-                ("Slack", config.channels_config.slack.is_some()),
-                ("Webhook", config.channels_config.webhook.is_some()),
-                ("Nextcloud", config.channels_config.nextcloud_talk.is_some()),
-            ] {
+            println!("  {:15} ✅ always", "CLI");
+            for (name, configured) in channels::channel_roster(&config) {
                 println!(
-                    "  {name:9} {}",
+                    "  {name:15} {}",
                     if configured {
                         "✅ configured"
                     } else {
