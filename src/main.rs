@@ -1516,8 +1516,12 @@ async fn main() -> Result<()> {
         tracing::subscriber::set_global_default(subscriber)
             .expect("setting default subscriber failed");
     } else {
+        // Non-TTY (piped/CI) or `RANTAICLAW_LOG_STDERR=1`: write logs to stderr so
+        // stdout stays clean for piped/scripted output. `fmt`'s default writer is
+        // stdout, which would otherwise corrupt piped command output.
         let subscriber = fmt::Subscriber::builder()
             .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
             .finish();
         tracing::subscriber::set_global_default(subscriber)
             .expect("setting default subscriber failed");
