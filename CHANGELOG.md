@@ -5,6 +5,50 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0-alpha] — 2026-07-24
+
+Full skills lifecycle across every surface. `install`/`enable`/`disable`/`update`/
+`remove` now behave consistently in the CLI, the TUI, and the gateway API; remote
+skills carry an explicit trust boundary; and several install-path hardenings land.
+Minor bump: new CLI subcommands, new gateway skill-management routes, and a config
+schema bump (15 → 16).
+
+### Added
+
+- **`skills enable` / `skills disable` CLI commands** — flip a skill on or off
+  without editing config by hand; skill entries now match case-insensitively.
+- **Gateway skills management API** — `install`, `enable`, `disable`, and
+  `uninstall` routes (`POST`/`PUT`/`DELETE /api/v1/skills*`) plus read-side status
+  fields, so the web console's skills panel drives real actions instead of a
+  read-only list.
+- **TUI skills lifecycle parity** — enable/disable toggle with live reload,
+  unified name matching, and a gated-row UX for skills blocked by policy.
+- **Remote-skill trust boundary** — the open-skills source is pinned to an
+  explicit ref, remote entries are de-duplicated and shown compactly, and provider
+  `api_key` is stored at rest (config schema **15 → 16**).
+
+### Fixed
+
+- **`skills remove` is a true uninstall** — removes across all roots (bundled,
+  ClawHub, and `install`ed), and no longer 404s when the target skill was
+  previously disabled.
+- **`skills update` is non-destructive** — atomic swap that never deletes the
+  existing copy before the fetch succeeds, so a failed update can't leave a skill
+  missing.
+
+### Security
+
+- **Install-path hardening** — `install-deps` downloads are anchored to the target
+  directory and sha256-verified; ClawHub installs enforce the security scan and
+  require sha256 + an HTTPS base URL.
+- **Skill write-tools gated** — authoring/write tools require the matching autonomy
+  level, are rate-limited, and are owner-only; `author_skill` frontmatter list
+  values are sanitized to prevent injection.
+
+### Notes
+
+- Pins claw-ui **v0.3.8** (unchanged) for `ui install`.
+
 ## [0.9.1-alpha] — 2026-07-23
 
 Tool-approval UX is made honest and consistent across the TUI and the web
