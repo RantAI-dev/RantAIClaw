@@ -1129,16 +1129,35 @@ enum ChannelCommands {
     Run,
     /// Run health checks for configured channels
     Doctor,
-    /// Add a new channel
+    /// Add a new channel (currently redirects to `onboard` — see long help)
+    #[command(long_about = "\
+Add a channel configuration.
+
+NOTE: CLI `channel add` is not yet implemented. It prints the requested type \
+and directs you to the interactive setup. Configure channels with:
+  rantaiclaw onboard          # guided channel setup (recommended)
+or edit ~/.rantaiclaw/config.toml directly.
+
+Supported channel types: telegram, discord, slack, mattermost, webhook, \
+imessage, matrix, signal, whatsapp, linq, nextcloud_talk, email, irc, lark, \
+dingtalk, qq.")]
     Add {
-        /// Channel type
+        /// Channel type (telegram, discord, slack, mattermost, webhook, imessage,
+        /// matrix, signal, whatsapp, linq, nextcloud_talk, email, irc, lark,
+        /// dingtalk, qq)
         channel_type: String,
         /// Configuration JSON
         config: String,
     },
-    /// Remove a channel
+    /// Remove a channel (currently redirects to config edit — see long help)
+    #[command(long_about = "\
+Remove a channel configuration.
+
+NOTE: CLI `channel remove` is not yet implemented. It directs you to edit \
+~/.rantaiclaw/config.toml directly (delete the channel's \
+[channels_config.<name>] section) or re-run `rantaiclaw onboard`.")]
     Remove {
-        /// Channel name
+        /// Channel name to remove
         name: String,
     },
     /// Bind a Telegram identity (username or numeric user ID) into allowlist

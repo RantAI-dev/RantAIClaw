@@ -120,25 +120,33 @@ pub(crate) enum ChannelCommands {
     Run,
     /// Run health checks for configured channels (handled in main.rs for async)
     Doctor,
-    /// Add a new channel configuration
+    /// Add a new channel (currently redirects to `onboard` — see long help)
     #[command(long_about = "\
-Add a new channel configuration.
+Add a channel configuration.
 
-Provide the channel type and a JSON object with the required \
-configuration keys for that channel type.
+NOTE: CLI `channel add` is not yet implemented. It prints the requested type \
+and directs you to the interactive setup. Configure channels with:
+  rantaiclaw onboard          # guided channel setup (recommended)
+or edit ~/.rantaiclaw/config.toml directly.
 
-Supported types: telegram, discord, slack, whatsapp, matrix, imessage, email.
-
-Examples:
-  rantaiclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
-  rantaiclaw channel add discord '{\"bot_token\":\"...\",\"name\":\"my-discord\"}'")]
+Supported channel types: telegram, discord, slack, mattermost, webhook, \
+imessage, matrix, signal, whatsapp, linq, nextcloud_talk, email, irc, lark, \
+dingtalk, qq.")]
     Add {
-        /// Channel type (telegram, discord, slack, whatsapp, matrix, imessage, email)
+        /// Channel type (telegram, discord, slack, mattermost, webhook, imessage,
+        /// matrix, signal, whatsapp, linq, nextcloud_talk, email, irc, lark,
+        /// dingtalk, qq)
         channel_type: String,
         /// Optional configuration as JSON
         config: String,
     },
-    /// Remove a channel configuration
+    /// Remove a channel (currently redirects to config edit — see long help)
+    #[command(long_about = "\
+Remove a channel configuration.
+
+NOTE: CLI `channel remove` is not yet implemented. It directs you to edit \
+~/.rantaiclaw/config.toml directly (delete the channel's \
+[channels_config.<name>] section) or re-run `rantaiclaw onboard`.")]
     Remove {
         /// Channel name to remove
         name: String,
