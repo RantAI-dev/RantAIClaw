@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use super::{CommandHandler, CommandResult};
+use super::{normalise_skill_name, CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
 use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 
@@ -112,14 +112,25 @@ impl CommandHandler for SkillsCommand {
         // to build the picker with `preselect_key: None`, so the arg vanished
         // without a word — one letter away from `/skill <name>`, which opens
         // that skill's detail panel. Same word, silently different outcomes.
-        // A name that matches nothing preselects nothing and the picker opens
-        // as before.
-        let preselect = (!trimmed.is_empty()).then_some(trimmed);
+        // The picker matches `preselect_key` against `ListPickerItem.key`
+        // (the exact `s.name`), so resolve the arg through
+        // `normalise_skill_name` to the matching skill's exact name first —
+        // otherwise `/skills Image-Lab` wouldn't preselect a skill named
+        // `image-lab`. A name that matches nothing falls back to the raw
+        // arg, which preselects nothing (today's behaviour, preserved).
+        let preselect = (!trimmed.is_empty()).then(|| {
+            let key = normalise_skill_name(trimmed);
+            status
+                .iter()
+                .find(|(s, _)| normalise_skill_name(&s.name) == key)
+                .map(|(s, _)| s.name.clone())
+                .unwrap_or_else(|| trimmed.to_string())
+        });
         let picker = ListPicker::new(
             ListPickerKind::Skill,
             "Skills",
             items,
-            preselect,
+            preselect.as_deref(),
             "No skills loaded. Drop a SKILL.md in ~/.rantaiclaw/profiles/<profile>/skills/<name>/, or run `/setup skills`.",
         );
         Ok(CommandResult::OpenListPicker(picker))
@@ -182,13 +193,27 @@ impl CommandHandler for SkillCommand {
             return Ok(CommandResult::OpenListPicker(picker));
         }
 
-        // With a name arg, find it and render its detail in an InfoPanel.
+        // With a name arg, find it — routed through `normalise_skill_name` so
+        // `/skill Image_Lab` matches a skill named `image-lab`. Search
+        // `available_skills` (active) first; a gated/disabled skill won't
+        // be there (it's excluded by `load_skills_with_config`), so fall
+        // back to `available_skills_with_status` — which carries every
+        // disk-loaded skill plus its gating reasons — so a gated skill can
+        // still be inspected instead of returning "No skill named". Only
+        // the not-found message is returned when it appears in neither.
+        let key = normalise_skill_name(name);
         let found = ctx
             .available_skills
             .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(name));
+            .find(|s| normalise_skill_name(&s.name) == key)
+            .map(|s| (s.clone(), Vec::new()))
+            .or_else(|| {
+                active_skill_status_from_context(ctx)
+                    .into_iter()
+                    .find(|(s, _)| normalise_skill_name(&s.name) == key)
+            });
         match found {
-            Some(s) => {
+            Some((s, reasons)) => {
                 let mut panel = InfoPanel::new(format!("Skill · {}", s.name))
                     .with_subtitle(if s.version.is_empty() {
                         "no version".to_string()
@@ -199,6 +224,9 @@ impl CommandHandler for SkillCommand {
                 let mut sec = InfoSection::new("Detail");
                 if !s.description.is_empty() {
                     sec = sec.plain(s.description.clone());
+                }
+                if !reasons.is_empty() {
+                    sec = sec.spacer().key_value("Gated", reasons.join("; "));
                 }
                 if !s.tags.is_empty() {
                     sec = sec.spacer().key_value("Tags", s.tags.join(", "));

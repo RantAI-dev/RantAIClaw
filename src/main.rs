@@ -2884,12 +2884,6 @@ async fn run_provisioner_headless(
                         .send(onboard::provision::ProvisionResponse::Selection(vec![0]))
                         .await;
                 }
-                ProvisionEvent::OpenSkillInstallPicker { label } => {
-                    eprintln!(
-                        "[headless] install picker '{label}' — skipped in headless mode \
-                         (use the TUI for live ClawHub search/install)"
-                    );
-                }
             }
         }
     };

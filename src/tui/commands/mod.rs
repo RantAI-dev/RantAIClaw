@@ -19,6 +19,16 @@ use std::collections::HashMap;
 
 use super::context::TuiContext;
 
+/// Canonical skill-name key for command matching: lowercase, and treat `-`
+/// and `_` as equivalent. Used by `/skill <name>`, `/skills <name>`
+/// preselect, and the `/<skill>` direct-invoke fallback so all three accept
+/// the same spellings — pre-fix each entrypoint had a subtly different rule
+/// (exact-match, case-only, case+dash/underscore), so a name that worked in
+/// one silently failed in another.
+pub(crate) fn normalise_skill_name(s: &str) -> String {
+    s.to_lowercase().replace('-', "_")
+}
+
 /// Result of executing a command
 #[derive(Debug)]
 pub enum CommandResult {
@@ -204,11 +214,10 @@ impl CommandRegistry {
         // prompt the user can tweak before submitting. Mirrors Hermes'
         // `/<skill>` shortcut without committing to broader Hermes
         // alignment — purely a UX win on top of the existing /skills flow.
-        let normalised = |s: &str| s.to_lowercase().replace('-', "_");
         if let Some(skill) = ctx
             .available_skills
             .iter()
-            .find(|s| normalised(&s.name) == normalised(&cmd_name))
+            .find(|s| normalise_skill_name(&s.name) == normalise_skill_name(&cmd_name))
         {
             let prefill = if args.is_empty() {
                 format!("Use the {} skill: ", skill.name)

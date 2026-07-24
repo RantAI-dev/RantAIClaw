@@ -192,15 +192,6 @@ pub struct TuiApp {
     /// `restart_channels` — newly-configured channels start polling and the
     /// rebuilt system prompt picks up new skills without closing the TUI.
     pub channel_supervisor: Option<ChannelSupervisor>,
-    /// True while the install picker was opened from inside the first-run
-    /// wizard's skills step. On picker close (Esc), we send
-    /// `ProvisionResponse::InstalledSkills(installed_slugs)` back to the
-    /// wizard's response channel so the wizard can advance.
-    pub wizard_install_in_progress: bool,
-    /// Slugs successfully installed during the current install-picker
-    /// session. Reset when the picker opens; consumed when it closes
-    /// during a wizard install step.
-    pub wizard_installed_slugs: Vec<String>,
     /// Read-only info panel (channels / config / doctor / insights / status
     /// / usage / skill). Mutually exclusive with `list_picker` and
     /// `setup_overlay` — the key handler refuses to open one while another
@@ -422,8 +413,6 @@ impl TuiApp {
             skills_watcher: None,
             config_watcher: None,
             channel_supervisor: None,
-            wizard_install_in_progress: false,
-            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -930,6 +919,15 @@ impl TuiApp {
                 }) =>
             {
                 self.spawn_skill_deps_install();
+                return Ok(EventResult::Continue);
+            }
+            KeyCode::Char('e')
+                if self.list_picker.as_ref().is_some_and(|p| {
+                    p.kind == crate::tui::widgets::ListPickerKind::Skill
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                }) =>
+            {
+                self.toggle_selected_skill().await;
                 return Ok(EventResult::Continue);
             }
             KeyCode::Tab
@@ -1817,37 +1815,9 @@ impl TuiApp {
             }
         }
         if let Some(rx) = &mut self.setup_event_rx {
-            // Two-phase drain: first sweep events into a buffer so we can
-            // intercept OpenSkillInstallPicker (which the overlay shouldn't
-            // see — it hands off to the install picker, not the choose
-            // render). Other events forward to setup_overlay as before.
-            let mut buffered = Vec::new();
             while let Ok(ev) = rx.try_recv() {
-                buffered.push(ev);
-            }
-            for ev in buffered {
-                match ev {
-                    crate::onboard::provision::ProvisionEvent::OpenSkillInstallPicker {
-                        ..
-                    } => {
-                        // Hand off to the live install picker. We track that
-                        // we're in "wizard install" mode so the picker's
-                        // close path knows to send InstalledSkills back to
-                        // the wizard's response channel.
-                        self.wizard_install_in_progress = true;
-                        self.wizard_installed_slugs.clear();
-                        // Fire-and-forget: open_clawhub_install_picker is
-                        // async, but we're inside drain_events (sync). Use
-                        // a tiny future-now: spawn the prep that doesn't
-                        // need awaiting (state init), defer the network
-                        // fetch to drain_clawhub_search_results.
-                        self.open_clawhub_install_picker_sync(None);
-                    }
-                    other => {
-                        if let Some(overlay) = &mut self.setup_overlay {
-                            overlay.handle_event(other);
-                        }
-                    }
+                if let Some(o) = &mut self.setup_overlay {
+                    o.handle_event(ev);
                 }
             }
         }
@@ -2187,6 +2157,13 @@ impl TuiApp {
             self.scrollback_queue.push(("system".to_string(), msg));
         }
         self.config = config.clone();
+        // Config reload can flip `skills.entries.<name>.enabled` (CLI
+        // `skills enable/disable`, an external edit, or the in-picker
+        // toggle). Refresh the cached skill lists so `/skills`,
+        // autocomplete, and the next agent turn reflect the new set —
+        // model/providers/channels are already refreshed above; skills
+        // were the missing surface.
+        self.refresh_available_skills();
         if channels_changed {
             self.restart_channels();
         }
@@ -2820,11 +2797,33 @@ impl TuiApp {
                 self.scrollback_queue.push(("system".to_string(), msg));
             }
             ListPickerKind::Skill => {
-                // Pre-fill an invocation prompt into the input buffer.
-                // The user can edit, append context, and Enter to send.
-                self.context.input_buffer = format!("Use the {key} skill: ");
-                self.context.cursor_to_end();
-                self.refresh_autocomplete();
+                // A gated/disabled row (non-empty reasons in
+                // `available_skills_with_status`) isn't in the agent's
+                // context — `load_skills_with_config` excluded it — so
+                // prefilling `Use the X skill: ` would send a request the
+                // agent can't fulfil. Show the gating reason instead.
+                let gated = self
+                    .context
+                    .available_skills_with_status
+                    .iter()
+                    .find(|(s, _)| s.name == key)
+                    .map(|(_, reasons)| reasons.clone())
+                    .filter(|r| !r.is_empty());
+                if let Some(reasons) = gated {
+                    let msg = format!(
+                        "'{key}' is not active — {}. Enable it with `rantaiclaw skills enable {key}` \
+                         (or Ctrl+I to install missing deps), then reload.",
+                        reasons.join("; ")
+                    );
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".to_string(), msg));
+                } else {
+                    // Pre-fill an invocation prompt into the input buffer.
+                    // The user can edit, append context, and Enter to send.
+                    self.context.input_buffer = format!("Use the {key} skill: ");
+                    self.context.cursor_to_end();
+                    self.refresh_autocomplete();
+                }
             }
             ListPickerKind::Help => {
                 // Pre-fill `/<command> ` into the input buffer so the
@@ -3079,6 +3078,76 @@ impl TuiApp {
             },
             _ => {}
         }
+    }
+
+    /// Toggle the highlighted `/skills` picker row's enabled/disabled state
+    /// (Ctrl+E). Persists via `skills::set_skill_enabled` — the same writer
+    /// `rantaiclaw skills enable`/`disable` uses (plan 037) — so both
+    /// surfaces stay in sync. Refreshes the cached skill lists and rebuilds
+    /// the picker items in place so the `✗` glyph flips live, then pushes
+    /// the updated config to the agent actor so the running turn picks up
+    /// the change without a relaunch.
+    async fn toggle_selected_skill(&mut self) {
+        let Some(key) = self
+            .list_picker
+            .as_ref()
+            .and_then(|p| p.current().map(|item| item.key.clone()))
+        else {
+            return;
+        };
+        let currently_enabled = !self
+            .context
+            .available_skills_with_status
+            .iter()
+            .find(|(s, _)| s.name == key)
+            .is_some_and(|(_, reasons)| reasons.iter().any(|r| r == "disabled in config.toml"));
+        let (updated, canonical) =
+            match crate::skills::set_skill_enabled(&self.config, &key, !currently_enabled) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.context.last_error = Some(format!("skill toggle failed: {e}"));
+                    return;
+                }
+            };
+        if let Err(e) = updated.save().await {
+            self.context.last_error = Some(format!("failed to save config: {e}"));
+            return;
+        }
+        self.config = updated;
+        self.refresh_available_skills();
+        let items = self.skill_picker_items();
+        // Rebuild (rather than `set_items`, which resets the cursor to the
+        // top) so the picker reopens with the just-toggled row still
+        // highlighted — mirrors the install-tick rebuild at
+        // `tick_clawhub_install`.
+        if let Some(p) = self.list_picker.as_mut() {
+            if p.kind == crate::tui::widgets::ListPickerKind::Skill {
+                let title = p.title.clone();
+                let empty_hint = p.empty_hint.clone();
+                *p = crate::tui::widgets::ListPicker::new(
+                    crate::tui::widgets::ListPickerKind::Skill,
+                    title,
+                    items,
+                    Some(&canonical),
+                    empty_hint,
+                );
+            }
+        }
+        let new_state = if currently_enabled {
+            "disabled"
+        } else {
+            "enabled"
+        };
+        let msg = format!("✓ {canonical} {new_state}. Reloading agent…");
+        let _ = self.context.append_system_message(&msg);
+        self.scrollback_queue.push(("system".to_string(), msg));
+        let req_tx = self.context.req_tx.clone();
+        let config = self.config.clone();
+        tokio::spawn(async move {
+            let _ = req_tx
+                .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                .await;
+        });
     }
 
     /// Open the ClawHub install picker. Empty query → top-by-stars listing.
@@ -3462,9 +3531,6 @@ impl TuiApp {
                 // Reload skills so the new one is visible to /skills and
                 // to the next agent turn.
                 self.refresh_available_skills();
-                if self.wizard_install_in_progress {
-                    self.wizard_installed_slugs.push(installed_slug.clone());
-                }
 
                 // Swap the ClawhubInstall picker for the standard Skill
                 // picker, preselecting the freshly-installed slug — this
@@ -3565,27 +3631,6 @@ impl TuiApp {
         // task's send to a since-dropped tx is a no-op AND if the user
         // reopens the picker mid-flight, fresh searches don't collide
         // with old version numbers.
-
-        // If this picker was opened from inside the first-run wizard's
-        // skills step, the wizard is awaiting an InstalledSkills response.
-        // Send it now (with whatever was installed during the session)
-        // so the wizard can advance to the next provisioner.
-        if self.wizard_install_in_progress {
-            self.wizard_install_in_progress = false;
-            let installed = std::mem::take(&mut self.wizard_installed_slugs);
-            if let Some(tx) = self.setup_response_tx.as_ref() {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(
-                            crate::onboard::provision::ProvisionResponse::InstalledSkills(
-                                installed,
-                            ),
-                        )
-                        .await;
-                });
-            }
-        }
     }
 
     fn close_skill_deps_install_state(&mut self) {
@@ -7594,8 +7639,6 @@ mod tests {
             skills_watcher: None,
             config_watcher: None,
             channel_supervisor: None,
-            wizard_install_in_progress: false,
-            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -7698,8 +7741,6 @@ mod submit_tests {
             skills_watcher: None,
             config_watcher: None,
             channel_supervisor: None,
-            wizard_install_in_progress: false,
-            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -8064,8 +8105,6 @@ mod ctrl_c_tests {
             skills_watcher: None,
             config_watcher: None,
             channel_supervisor: None,
-            wizard_install_in_progress: false,
-            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -8249,8 +8288,6 @@ mod drain_tests {
             skills_watcher: None,
             config_watcher: None,
             channel_supervisor: None,
-            wizard_install_in_progress: false,
-            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
@@ -8419,8 +8456,6 @@ mod retry_tests {
             skills_watcher: None,
             config_watcher: None,
             channel_supervisor: None,
-            wizard_install_in_progress: false,
-            wizard_installed_slugs: Vec::new(),
             info_panel: None,
             stream_committed_chars: 0,
             stream_header_committed: false,
