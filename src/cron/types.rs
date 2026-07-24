@@ -74,6 +74,19 @@ pub enum Schedule {
     },
 }
 
+impl std::fmt::Display for Schedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cron { expr, tz } => match tz {
+                Some(tz) => write!(f, "{expr} ({tz})"),
+                None => write!(f, "{expr}"),
+            },
+            Self::At { at } => write!(f, "at {}", at.to_rfc3339()),
+            Self::Every { every_ms } => write!(f, "every {every_ms}ms"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliveryConfig {
     #[serde(default)]
@@ -162,5 +175,31 @@ mod tests {
     fn job_type_try_from_rejects_invalid_values() {
         assert!(JobType::try_from("").is_err());
         assert!(JobType::try_from("unknown").is_err());
+    }
+
+    #[test]
+    fn schedule_display_is_clean_per_variant() {
+        use super::Schedule;
+        use chrono::{TimeZone, Utc};
+
+        let cron = Schedule::Cron {
+            expr: "*/5 * * * *".to_string(),
+            tz: None,
+        };
+        assert_eq!(cron.to_string(), "*/5 * * * *");
+
+        let cron_tz = Schedule::Cron {
+            expr: "0 9 * * *".to_string(),
+            tz: Some("America/Los_Angeles".to_string()),
+        };
+        assert_eq!(cron_tz.to_string(), "0 9 * * * (America/Los_Angeles)");
+
+        let at = Schedule::At {
+            at: Utc.with_ymd_and_hms(2026, 7, 24, 9, 0, 0).unwrap(),
+        };
+        assert_eq!(at.to_string(), "at 2026-07-24T09:00:00+00:00");
+
+        let every = Schedule::Every { every_ms: 5000 };
+        assert_eq!(every.to_string(), "every 5000ms");
     }
 }

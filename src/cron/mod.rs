@@ -38,7 +38,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     .map_or_else(|| "never".into(), |d| d.to_rfc3339());
                 let last_status = job.last_status.unwrap_or_else(|| "n/a".into());
                 println!(
-                    "- {} | {:?} | next={} | last={} ({})",
+                    "- {} | {} | next={} | last={} ({})",
                     job.id,
                     job.schedule,
                     job.next_run.to_rfc3339(),
