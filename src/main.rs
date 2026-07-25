@@ -1504,9 +1504,15 @@ async fn main() -> Result<()> {
         // runtime; calling it directly inside `#[tokio::main]` panics with
         // "Cannot drop a runtime in a context where blocking is not allowed".
         // Run it on a blocking thread, mirroring the onboard wizard below.
-        return tokio::task::spawn_blocking(move || rantaiclaw::lifecycle::update::run(opts))
+        let res = tokio::task::spawn_blocking(move || rantaiclaw::lifecycle::update::run(opts))
             .await
             .map_err(|e| anyhow::anyhow!("update task panicked: {e}"))?;
+        res?;
+        // A successful update may have swapped in a binary that pins a newer
+        // claw-ui; ask that (now-installed) binary whether the console — if the
+        // user has one — has an update. Best-effort, never fails the update.
+        webui::post_update_ui_notice();
+        return Ok(());
     }
     if let Some(Commands::Rollback {
         list,

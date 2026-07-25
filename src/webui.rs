@@ -8,6 +8,7 @@
 //! extract) and `node` (to run the standalone server) are required.
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -712,6 +713,52 @@ fn update(dir: Option<PathBuf>, check: bool, force: bool) -> Result<()> {
     install(Some(dir), None, true)
 }
 
+/// At `ui start`: if the installed console lags this binary's pinned
+/// `CLAW_UI_RELEASE`, offer to update. Interactive y/N only when both stdin and
+/// stdout are a TTY; otherwise a passive one-line notice. Never blocks or
+/// auto-downloads non-interactively, and stays quiet when the installed version
+/// is unknown (pre-marker installs).
+fn maybe_offer_ui_update(dir: &Path) {
+    let Some(installed) = installed_ui_version(dir) else {
+        return;
+    };
+    let pin = CLAW_UI_RELEASE;
+    if installed == pin {
+        return;
+    }
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let update_now = dialoguer::Confirm::new()
+            .with_prompt(format!(
+                "Web console {pin} available (installed: {installed}). Update now?"
+            ))
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        if update_now {
+            if let Err(e) = update(Some(dir.to_path_buf()), false, false) {
+                eprintln!("⚠ web console update failed: {e} — starting the current version");
+            }
+        }
+    } else {
+        println!(
+            "🖥  Web console {pin} available (installed: {installed}). Update: rantaiclaw ui update"
+        );
+    }
+}
+
+/// After a successful `rantaiclaw update`, surface a web-console update notice
+/// by asking the freshly-swapped binary (which carries the new claw-ui pin) via
+/// `ui update --check`. Best-effort; only runs when a console is installed.
+pub fn post_update_ui_notice() {
+    if !default_dir().join("server.js").exists() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = Command::new(exe).args(["ui", "update", "--check"]).status();
+}
+
 /// Environment for the standalone console process. `HOSTNAME` sets the bind
 /// address: `127.0.0.1` (the default) keeps the Next.js standalone server
 /// loopback-only; a `[ui] host` / `--host` of `0.0.0.0` (or a specific address)
@@ -750,6 +797,9 @@ fn start(
             dir.display()
         );
     }
+    // If the installed console lags this binary's pinned release, offer (TTY)
+    // or note (non-TTY) an update before serving the current one.
+    maybe_offer_ui_update(&dir);
     if !has_binary("node") {
         bail!(
             "`node` is required to run the web console (Node >= 18.18) — install Node.js and retry"
