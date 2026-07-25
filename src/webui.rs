@@ -21,6 +21,9 @@ const DEFAULT_PORT: u16 = 3939;
 /// Pinned claw-ui release tag `ui install` fetches by default. Bump this to
 /// roll the console forward; overridable per-invocation with `--ref`.
 const CLAW_UI_RELEASE: &str = "v0.3.8";
+/// Filename in the install dir recording the claw-ui tag last installed, so
+/// `ui update`/`ui start` can detect drift against `CLAW_UI_RELEASE`.
+const UI_VERSION_FILE: &str = ".version";
 const CLAW_UI_REPO: &str = "https://github.com/RantAI-dev/claw-ui";
 /// Expected cosign signing identity for claw-ui releases — its `release.yml`
 /// workflow on a tag ref. Passed to the shared `lifecycle::artifact::verify_cosign`.
@@ -298,6 +301,17 @@ mod tests {
     }
 
     #[test]
+    fn installed_ui_version_reads_marker_or_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert_eq!(installed_ui_version(dir), None);
+        std::fs::write(dir.join(UI_VERSION_FILE), "v0.3.8\n").unwrap();
+        assert_eq!(installed_ui_version(dir).as_deref(), Some("v0.3.8"));
+        std::fs::write(dir.join(UI_VERSION_FILE), "  \n").unwrap();
+        assert_eq!(installed_ui_version(dir), None);
+    }
+
+    #[test]
     fn console_env_binds_the_given_host_and_passes_secrets() {
         let env = console_env(3939, "127.0.0.1", "http://127.0.0.1:4939", "tok", "sec");
         assert_eq!(env.get("HOSTNAME").map(String::as_str), Some("127.0.0.1"));
@@ -541,6 +555,7 @@ pub fn handle_command(command: &crate::UiCommands, config: &crate::config::Confi
             config,
         ),
         crate::UiCommands::Stop { dir } => stop(dir.clone()),
+        crate::UiCommands::Update { dir, check, force } => update(dir.clone(), *check, *force),
         crate::UiCommands::Path { dir } => {
             println!("{}", dir.clone().unwrap_or_else(default_dir).display());
             Ok(())
@@ -643,9 +658,58 @@ fn install(dir: Option<PathBuf>, git_ref: Option<String>, force: bool) -> Result
     let _ = std::fs::remove_dir_all(&work);
     result?;
 
+    // Record the installed tag so `ui update`/`ui start` can detect drift
+    // against the binary's pinned CLAW_UI_RELEASE. Best-effort.
+    let _ = std::fs::write(dir.join(UI_VERSION_FILE), tag);
+
     println!("\n✅ Web console installed at {}", dir.display());
     println!("   Start it with:  rantaiclaw ui start");
     Ok(())
+}
+
+/// The claw-ui tag recorded at the last `install`/`update`, if any. `None` when
+/// the console isn't installed or predates version tracking.
+fn installed_ui_version(dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join(UI_VERSION_FILE)).ok()?;
+    let v = raw.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// `rantaiclaw ui update` — refresh the console to this binary's pinned
+/// `CLAW_UI_RELEASE`. Idempotent: a no-op (with a note) when already current
+/// unless `--force`. `--check` only reports availability without downloading.
+fn update(dir: Option<PathBuf>, check: bool, force: bool) -> Result<()> {
+    let dir = dir.unwrap_or_else(default_dir);
+    if !dir.join("server.js").exists() {
+        bail!("web console not installed — run `rantaiclaw ui install` first");
+    }
+    let installed = installed_ui_version(&dir);
+    let pin = CLAW_UI_RELEASE;
+    let up_to_date = installed.as_deref() == Some(pin);
+
+    if check {
+        // Print only when an update is available, so callers (e.g. the
+        // post-`update` notice) stay quiet when the console is current.
+        if !up_to_date {
+            println!(
+                "🖥  Web console {pin} available (installed: {}). Update: rantaiclaw ui update",
+                installed.as_deref().unwrap_or("unknown")
+            );
+        }
+        return Ok(());
+    }
+
+    if up_to_date && !force {
+        println!("✓ Web console already up to date ({pin})");
+        return Ok(());
+    }
+
+    // Re-fetch the pinned release into the managed dir (writes the marker).
+    install(Some(dir), None, true)
 }
 
 /// Environment for the standalone console process. `HOSTNAME` sets the bind

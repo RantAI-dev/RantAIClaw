@@ -187,6 +187,18 @@ enum UiCommands {
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
     },
+    /// Update the web console to this build's pinned claw-ui release
+    Update {
+        /// Install directory (default: ~/.rantaiclaw/ui)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Only report whether an update is available; don't download
+        #[arg(long)]
+        check: bool,
+        /// Re-download even if already up to date
+        #[arg(long)]
+        force: bool,
+    },
     /// Print the install directory
     Path {
         /// Install directory (default: ~/.rantaiclaw/ui)
