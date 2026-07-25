@@ -32,16 +32,19 @@ pub fn list(limit: usize) -> Result<()> {
         println!("No sessions yet.");
         return Ok(());
     }
-    println!("Sessions ({}):", sessions.len());
-    println!();
+    crate::cli_style::section(&format!("sessions ({})", sessions.len()));
     for s in &sessions {
         let short = &s.id[..s.id.len().min(8)];
         let title = s.title.as_deref().unwrap_or("(untitled)");
+        println!("  {short}  {title}");
         println!(
-            "  {short}  {date}  {msgs:>4} msgs  {model}  {title}",
-            date = fmt_ts(s.started_at),
-            msgs = s.message_count,
-            model = s.model,
+            "            {}",
+            crate::cli_style::dim(&format!(
+                "{}  ·  {} msgs  ·  {}",
+                fmt_ts(s.started_at),
+                s.message_count,
+                s.model
+            ))
         );
     }
     Ok(())
@@ -137,16 +140,20 @@ pub fn insights() -> Result<()> {
     } else {
         0.0
     };
-    println!("RantaiClaw Insights");
-    println!("───────────────────");
-    println!("  Sessions:         {total_sessions}");
-    println!("  Messages:         {total_messages}");
-    println!("  Avg msgs/session: {avg:.1}");
+    const W: usize = 11;
+    crate::cli_style::section("insights");
+    crate::cli_style::field("Sessions", W, &total_sessions.to_string());
+    crate::cli_style::field("Messages", W, &total_messages.to_string());
+    crate::cli_style::field("Avg/session", W, &format!("{avg:.1}"));
     if let Some(latest) = sessions.first() {
-        println!(
-            "  Latest session:  {} ({})",
-            &latest.id[..latest.id.len().min(8)],
-            fmt_ts(latest.started_at)
+        crate::cli_style::field(
+            "Latest",
+            W,
+            &format!(
+                "{}  ·  {}",
+                &latest.id[..latest.id.len().min(8)],
+                fmt_ts(latest.started_at)
+            ),
         );
     }
     Ok(())

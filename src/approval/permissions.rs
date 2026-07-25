@@ -169,8 +169,7 @@ pub fn render(config: &Config, safe_tools: &[String]) -> String {
 
     let cc = &config.channels_config;
     let mut out = String::new();
-    out.push_str("Per-role permissions\n");
-    out.push_str("────────────────────\n");
+    let _ = writeln!(out, "{}", crate::cli_style::heading("permissions"));
 
     // Owners.
     out.push_str("Owners (full toolset, may approve):\n");

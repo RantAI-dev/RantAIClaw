@@ -1520,12 +1520,11 @@ pub(crate) fn handle_command(
                 let active_count = with_status.iter().filter(|(_, r)| r.is_empty()).count();
                 let gated_count = with_status.len() - active_count;
                 if gated_count == 0 {
-                    println!("Installed skills ({active_count}):");
+                    crate::cli_style::section(&format!("installed skills ({active_count})"));
                 } else {
-                    println!(
-                        "Installed skills ({} active, {} gated out):",
-                        active_count, gated_count
-                    );
+                    crate::cli_style::section(&format!(
+                        "installed skills ({active_count} active · {gated_count} gated)"
+                    ));
                 }
                 println!();
                 for (skill, reasons) in &with_status {
