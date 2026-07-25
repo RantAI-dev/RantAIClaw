@@ -5,6 +5,48 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0-alpha] — 2026-07-25
+
+CLI usability and polish. Three new read commands (`integrations list`, `models
+list`, `config show`), a batch of display and honesty fixes across the command
+surface, and a consistent minimal-mono restyle of the main read commands. Minor
+bump: new CLI subcommands (runtime-contract additions). No config schema change
+(stays 16).
+
+### Added
+
+- **`integrations list`** — browse all integrations grouped by category; the bare
+  `integrations` command now defaults to this instead of erroring with a usage
+  message.
+- **`models list [--provider <ID>]`** — view a provider's cached/curated model
+  catalog (default model marked) with no network call.
+- **`config show`** — print the active configuration as JSON with every secret
+  redacted, reusing the gateway's two-layer secret scrubber.
+
+### Fixed
+
+- **Logs no longer pollute stdout** — on non-TTY/piped runs the tracing subscriber
+  writes to stderr, so `rantaiclaw <cmd> | …` output stays clean for scripts.
+- **`status` lists all 16 channels** — driven by a shared roster so it can no
+  longer disagree with `channel list`; unconfigured channels show a neutral `○`
+  instead of a red `❌`.
+- **`cron list` renders schedules cleanly** — a `Display` impl for `Schedule`
+  replaces the raw `Cron { … }` debug dump.
+- **`autonomy` (no-arg) reports the enforced level** from `config.toml` (matching
+  `status`/`doctor`) and warns when the preset marker has drifted — display only;
+  enforcement was always driven by `config.autonomy.level`.
+- **`insights` can't panic** on a short or non-ASCII latest-session id.
+- **`channel add`/`remove` help is honest** — states that CLI add/remove redirect
+  to `onboard`/config-edit and lists all 16 channel types.
+
+### Changed
+
+- **Minimal-mono CLI restyle** — a shared `cli_style` layer gives `status`,
+  `autonomy`, `cron list`, `models list`, `channel list`, `insights`,
+  `session list`, `skills list`, and `permissions show` consistent dim section
+  headers, aligned fields, and `●`/`○` status dots. Color is applied only on a
+  TTY; piped output stays ANSI-free.
+
 ## [0.10.0-alpha] — 2026-07-24
 
 Full skills lifecycle across every surface. `install`/`enable`/`disable`/`update`/
