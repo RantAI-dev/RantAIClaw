@@ -17,10 +17,15 @@ pub(crate) fn title(name: &str, version: &str) {
     );
 }
 
+/// Dim uppercase heading string (no surrounding blank line). Used by `section`
+/// and by String-building renderers that can't call `println!` directly.
+pub(crate) fn heading(name: &str) -> String {
+    style(name.to_uppercase()).dim().bold().to_string()
+}
+
 /// Dim uppercase section header, preceded by a blank line.
 pub(crate) fn section(name: &str) {
-    println!();
-    println!("{}", style(name.to_uppercase()).dim().bold());
+    println!("\n{}", heading(name));
 }
 
 /// Two-column field row: dim label left-padded to `width`, then the value.
