@@ -52,6 +52,7 @@ mod agent;
 mod approval;
 mod auth;
 mod channels;
+mod cli_style;
 mod rag {
     pub use rantaiclaw::rag::*;
 }
@@ -1825,80 +1826,87 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Status) => {
-            println!("🦀 RantaiClaw Status");
-            println!();
-            println!("Version:     {}", env!("CARGO_PKG_VERSION"));
-            println!("Workspace:   {}", config.workspace_dir.display());
-            println!("Config:      {}", config.config_path.display());
-            println!();
-            println!(
-                "🤖 Provider:      {}",
-                config.default_provider.as_deref().unwrap_or("openrouter")
+            const W: usize = 10;
+            const CH_W: usize = 14;
+            cli_style::title("RantaiClaw", env!("CARGO_PKG_VERSION"));
+            cli_style::field("workspace", W, &config.workspace_dir.display().to_string());
+            cli_style::field("config", W, &config.config_path.display().to_string());
+
+            cli_style::section("config");
+            let provider = config.default_provider.as_deref().unwrap_or("openrouter");
+            let model = config.default_model.as_deref().unwrap_or("(default)");
+            cli_style::field("Provider", W, &format!("{provider} · {model}"));
+            cli_style::field("Observ.", W, &config.observability.backend.to_string());
+            cli_style::field("Autonomy", W, &format!("{:?}", config.autonomy.level));
+            cli_style::field("Runtime", W, &config.runtime.kind.to_string());
+            cli_style::field(
+                "Heartbeat",
+                W,
+                &if config.heartbeat.enabled {
+                    format!("every {}min", config.heartbeat.interval_minutes)
+                } else {
+                    "disabled".to_string()
+                },
             );
-            println!(
-                "   Model:         {}",
-                config.default_model.as_deref().unwrap_or("(default)")
-            );
-            println!("📊 Observability:  {}", config.observability.backend);
-            println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
-            println!("⚙️  Runtime:       {}", config.runtime.kind);
             let effective_memory_backend = memory::effective_memory_backend_name(
                 &config.memory.backend,
                 Some(&config.storage.provider.config),
             );
-            println!(
-                "💓 Heartbeat:      {}",
-                if config.heartbeat.enabled {
-                    format!("every {}min", config.heartbeat.interval_minutes)
-                } else {
-                    "disabled".into()
-                }
-            );
-            println!(
-                "🧠 Memory:         {} (auto-save: {})",
-                effective_memory_backend,
-                if config.memory.auto_save { "on" } else { "off" }
+            cli_style::field(
+                "Memory",
+                W,
+                &format!(
+                    "{effective_memory_backend} · auto-save {}",
+                    if config.memory.auto_save { "on" } else { "off" }
+                ),
             );
 
-            println!();
-            println!("Security:");
-            println!("  Workspace only:    {}", config.autonomy.workspace_only);
-            println!(
-                "  Allowed commands:  {}",
-                config.autonomy.allowed_commands.join(", ")
-            );
-            println!(
-                "  Max actions/hour:  {}",
-                config.autonomy.max_actions_per_hour
-            );
-            println!(
-                "  Max cost/day:      ${:.2}",
-                f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
-            );
-            println!();
-            println!("Channels:");
-            println!("  {:15} ✅ always", "CLI");
+            cli_style::section("channels");
+            cli_style::status_row(true, "CLI", CH_W, "always");
             for (name, configured) in channels::channel_roster(&config) {
-                println!(
-                    "  {name:15} {}",
+                cli_style::status_row(
+                    configured,
+                    name,
+                    CH_W,
                     if configured {
-                        "✅ configured"
+                        "configured"
                     } else {
-                        "❌ not configured"
-                    }
+                        "not configured"
+                    },
                 );
             }
-            println!();
-            println!("Peripherals:");
-            println!(
-                "  Enabled:   {}",
-                if config.peripherals.enabled {
-                    "yes"
+
+            cli_style::section("security");
+            cli_style::field(
+                "Workspace",
+                W,
+                if config.autonomy.workspace_only {
+                    "confined"
                 } else {
-                    "no"
-                }
+                    "unrestricted"
+                },
             );
-            println!("  Boards:    {}", config.peripherals.boards.len());
+            cli_style::field("Commands", W, &config.autonomy.allowed_commands.join(", "));
+            cli_style::field(
+                "Actions/hr",
+                W,
+                &config.autonomy.max_actions_per_hour.to_string(),
+            );
+            cli_style::field(
+                "Cost/day",
+                W,
+                &format!(
+                    "${:.2}",
+                    f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
+                ),
+            );
+
+            cli_style::section("peripherals");
+            if config.peripherals.enabled {
+                cli_style::field("Boards", W, &config.peripherals.boards.len().to_string());
+            } else {
+                cli_style::field("Boards", W, "none (disabled)");
+            }
 
             Ok(())
         }
