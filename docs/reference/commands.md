@@ -17,13 +17,13 @@ Last verified: **July 12, 2026**.
 | `doctor` | Run diagnostics and freshness checks |
 | `status` | Print current configuration and system summary |
 | `cron` | Manage scheduled tasks |
-| `models` | Refresh provider model catalogs |
+| `models` | List and refresh provider model catalogs |
 | `providers` | List provider IDs, aliases, and active provider |
 | `channel` | Manage channels and channel health checks |
-| `integrations` | Inspect integration details |
+| `integrations` | Browse and inspect integrations |
 | `skills` | List/install/remove skills |
 | `migrate` | Import from external runtimes (currently OpenClaw) |
-| `config` | Export machine-readable config schema |
+| `config` | Show the active config (redacted) or export its JSON schema |
 | `completions` | Generate shell completion scripts to stdout |
 | `hardware` | Discover and introspect USB hardware |
 | `peripheral` | Configure and flash peripherals |
@@ -34,7 +34,7 @@ Last verified: **July 12, 2026**.
 
 ### `autonomy`
 
-- `rantaiclaw autonomy` — print the currently-active preset + the four options
+- `rantaiclaw autonomy` — print the active preset, the enforced autonomy level from `config.toml`, and the four options (warns when the preset marker has drifted from the enforced level)
 - `rantaiclaw autonomy <preset>` — switch to `manual`, `smart`, `strict`, `off`, or `full` (alias for `off`)
 
 Profile-level operation. Writes `<profile>/policy/{autonomy,command_allowlist,forbidden_paths}.toml` from the bundled preset AND mirrors `[autonomy].level` + `[autonomy].allowed_commands` into `config.toml` so the runtime gate actually consumes the change. `runtime_allowlist.toml` (from `/allow X --persist`) is preserved across preset switches.
@@ -165,6 +165,9 @@ CLI/tool enforce, applied up-front for the HTTP surface's blast radius.
 - `rantaiclaw models refresh`
 - `rantaiclaw models refresh --provider <ID>`
 - `rantaiclaw models refresh --force`
+- `rantaiclaw models list [--provider <ID>]`
+
+`models list` prints the cached model catalog for a provider (falling back to a curated list when uncached), marking the default model — no network call. Defaults to the configured default provider.
 
 `models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
 
@@ -195,6 +198,8 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 
 ### `integrations`
 
+- `rantaiclaw integrations` — browse every integration grouped by category (default)
+- `rantaiclaw integrations list` — same as the bare command
 - `rantaiclaw integrations info <name>`
 
 ### `skills`
@@ -232,8 +237,11 @@ with `Accept: text/event-stream` or `?stream=1`; see
 ### `config`
 
 - `rantaiclaw config schema`
+- `rantaiclaw config show`
 
 `config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
+
+`config show` prints the **active** configuration as JSON with all secrets redacted (provider/API keys, channel tokens, tunnel tokens, the gateway login hash, paired tokens, etc.).
 
 ### `completions`
 
