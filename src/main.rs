@@ -1716,35 +1716,48 @@ async fn main() -> Result<()> {
                 // policy-dir preset marker, so report the enforced level as the
                 // authoritative value and warn if the marker has drifted from it.
                 let enforced = Config::load_or_init().await?.autonomy.level;
+                const W: usize = 9;
                 let current = policy_writer::read_active_preset(&profile.policy_dir());
+                cli_style::section("autonomy");
                 match current {
-                    Some(p) => println!("Current autonomy preset: {} ({})", p.label(), p.id()),
-                    None => println!(
-                        "No approval policy preset provisioned — run `rantaiclaw setup approvals`."
+                    Some(p) => {
+                        cli_style::field("Preset", W, &format!("{} ({})", p.label(), p.id()));
+                    }
+                    None => cli_style::field(
+                        "Preset",
+                        W,
+                        "not provisioned — run `rantaiclaw setup approvals`",
                     ),
                 }
-                println!("Enforced autonomy level: {enforced:?} (from config.toml)");
+                cli_style::field("Enforced", W, &format!("{enforced:?}  (config.toml)"));
                 if let Some(p) = current {
                     if p.autonomy_level() != enforced {
                         println!(
-                            "  ⚠ preset marker implies {:?} but the runtime enforces {enforced:?}; run `rantaiclaw autonomy {}` to resync.",
-                            p.autonomy_level(),
-                            p.id()
+                            "  {}",
+                            cli_style::warn(&format!(
+                                "⚠ preset marker implies {:?} but the runtime enforces {enforced:?}; run `rantaiclaw autonomy {}` to resync.",
+                                p.autonomy_level(),
+                                p.id()
+                            ))
                         );
                     }
                 }
-                println!("\nAvailable presets:");
+                cli_style::section("presets");
                 for p in PolicyPreset::ALL {
-                    let marker = if current == Some(p) { "›" } else { " " };
-                    println!(
-                        "  {marker} {:<8} ({})  level={:?}",
+                    cli_style::status_row(
+                        current == Some(p),
                         p.label(),
-                        p.id(),
-                        p.autonomy_level()
+                        8,
+                        &format!("{:?}", p.autonomy_level()),
                     );
                 }
-                println!("\nSwitch with: rantaiclaw autonomy <preset>");
-                println!("Inside the TUI: Shift+Tab to cycle, /autonomy to pick.");
+                println!();
+                println!(
+                    "  {}",
+                    cli_style::dim(
+                        "switch: rantaiclaw autonomy <preset>  ·  TUI: Shift+Tab or /autonomy"
+                    )
+                );
             }
             Some(arg) => {
                 let target = PolicyPreset::from_str_ci(arg)?;

@@ -1963,18 +1963,21 @@ pub fn list_models(config: &Config, provider_override: Option<&str>) -> Result<(
         _ => "curated — run `rantaiclaw models refresh` to fetch live".to_string(),
     };
 
+    crate::cli_style::section(&format!("models · {provider_name}"));
     println!(
-        "Models for '{}' ({}, {} total):",
-        provider_name,
-        source_label,
-        catalog.models.len()
+        "  {}",
+        crate::cli_style::dim(&format!(
+            "{source_label}  ·  {} total",
+            catalog.models.len()
+        ))
     );
     for model in &catalog.models {
-        if *model == catalog.default_model {
-            println!("  - {model} (default)");
+        let mark = if *model == catalog.default_model {
+            crate::cli_style::dim("  (default)")
         } else {
-            println!("  - {model}");
-        }
+            String::new()
+        };
+        println!("  {} {model}{mark}", crate::cli_style::dim("·"));
     }
     Ok(())
 }

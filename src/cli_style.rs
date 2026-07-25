@@ -41,3 +41,13 @@ pub(crate) fn dot(active: bool) -> String {
 pub(crate) fn status_row(active: bool, name: &str, width: usize, note: &str) {
     println!("  {} {:<width$} {}", dot(active), name, style(note).dim());
 }
+
+/// Dim secondary text (e.g. hints, timestamps).
+pub(crate) fn dim(s: &str) -> String {
+    style(s).dim().to_string()
+}
+
+/// Yellow warning text.
+pub(crate) fn warn(s: &str) -> String {
+    style(s).yellow().to_string()
+}
