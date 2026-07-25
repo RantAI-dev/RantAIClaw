@@ -2645,24 +2645,43 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             anyhow::bail!("Doctor must be handled in main.rs (requires async runtime)")
         }
         crate::ChannelCommands::List => {
-            println!("Channels:");
-            println!("  ✅ CLI (always available)");
+            crate::cli_style::section("channels");
+            crate::cli_style::status_row(true, "CLI", 14, "always");
             for (name, configured) in channel_roster(config) {
-                println!("  {} {name}", if configured { "✅" } else { "❌" });
+                crate::cli_style::status_row(
+                    configured,
+                    name,
+                    14,
+                    if configured {
+                        "configured"
+                    } else {
+                        "not configured"
+                    },
+                );
             }
             if !cfg!(feature = "channel-matrix") {
                 println!(
-                    "  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`)."
+                    "  {}",
+                    crate::cli_style::dim(
+                        "Matrix support is disabled in this build (enable `channel-matrix`)."
+                    )
                 );
             }
             if !cfg!(feature = "channel-lark") {
                 println!(
-                    "  ℹ️ Lark channel support is disabled in this build (enable `channel-lark`)."
+                    "  {}",
+                    crate::cli_style::dim(
+                        "Lark support is disabled in this build (enable `channel-lark`)."
+                    )
                 );
             }
-            println!("\nTo start channels: rantaiclaw channel start");
-            println!("To check health:    rantaiclaw channel doctor");
-            println!("To configure:      rantaiclaw onboard");
+            println!();
+            println!(
+                "  {}",
+                crate::cli_style::dim(
+                    "start: rantaiclaw channel start  ·  health: channel doctor  ·  setup: onboard"
+                )
+            );
             Ok(())
         }
         crate::ChannelCommands::Add {

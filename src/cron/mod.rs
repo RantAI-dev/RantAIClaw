@@ -31,26 +31,33 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 return Ok(());
             }
 
-            println!("🕒 Scheduled jobs ({}):", jobs.len());
+            crate::cli_style::section(&format!("scheduled jobs ({})", jobs.len()));
             for job in jobs {
                 let last_run = job
                     .last_run
                     .map_or_else(|| "never".into(), |d| d.to_rfc3339());
                 let last_status = job.last_status.unwrap_or_else(|| "n/a".into());
+                let short = &job.id[..job.id.len().min(8)];
                 println!(
-                    "- {} | {} | next={} | last={} ({})",
-                    job.id,
-                    job.schedule,
-                    job.next_run.to_rfc3339(),
-                    last_run,
-                    last_status,
+                    "  {} {short}  {}",
+                    crate::cli_style::dot(job.enabled),
+                    job.schedule
                 );
-                if !job.command.is_empty() {
-                    println!("    cmd: {}", job.command);
+                let payload = if job.command.is_empty() {
+                    job.prompt.clone().unwrap_or_default()
+                } else {
+                    job.command.clone()
+                };
+                if !payload.is_empty() {
+                    println!("       {}", crate::cli_style::dim(&payload));
                 }
-                if let Some(prompt) = &job.prompt {
-                    println!("    prompt: {prompt}");
-                }
+                println!(
+                    "       {}",
+                    crate::cli_style::dim(&format!(
+                        "next {}  ·  last {last_run} ({last_status})",
+                        job.next_run.to_rfc3339()
+                    ))
+                );
             }
             Ok(())
         }
