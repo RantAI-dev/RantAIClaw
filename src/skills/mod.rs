@@ -2160,6 +2160,11 @@ mod tests {
 
     #[test]
     fn load_empty_skills_dir() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills = load_skills(dir.path());
         assert!(skills.is_empty());
@@ -2167,6 +2172,11 @@ mod tests {
 
     #[test]
     fn load_skill_from_toml() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
         let skill_dir = skills_dir.join("test-skill");
@@ -2199,6 +2209,11 @@ command = "echo hello"
 
     #[test]
     fn load_skill_from_md() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
         let skill_dir = skills_dir.join("md-skill");
@@ -2296,6 +2311,11 @@ command = "echo hello"
 
     #[test]
     fn load_nonexistent_dir() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("nonexistent");
         let skills = load_skills(&fake);
@@ -2304,6 +2324,11 @@ command = "echo hello"
 
     #[test]
     fn load_ignores_files_in_skills_dir() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
         fs::create_dir_all(&skills_dir).unwrap();
@@ -2315,6 +2340,11 @@ command = "echo hello"
 
     #[test]
     fn load_ignores_dir_without_manifest() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
         let empty_skill = skills_dir.join("empty-skill");
@@ -2326,6 +2356,11 @@ command = "echo hello"
 
     #[test]
     fn load_multiple_skills() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
 
@@ -2345,6 +2380,11 @@ command = "echo hello"
 
     #[test]
     fn toml_skill_with_multiple_tools() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
         let skill_dir = skills_dir.join("multi-tool");
@@ -2396,6 +2436,11 @@ command = "https://api.example.com/deploy"
 
     #[test]
     fn toml_skill_minimal() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
         let skill_dir = skills_dir.join("minimal");
@@ -2421,6 +2466,11 @@ description = "Bare minimum"
 
     #[test]
     fn toml_skill_invalid_syntax_skipped() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
         let skill_dir = skills_dir.join("broken");
@@ -2434,6 +2484,11 @@ description = "Bare minimum"
 
     #[test]
     fn md_skill_heading_only() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
         let skill_dir = skills_dir.join("heading-only");
@@ -2546,6 +2601,11 @@ description = "Bare minimum"
 
     #[test]
     fn toml_prefers_over_md() {
+        // `load_skills` also reads the ACTIVE PROFILE's skills dir
+        // (root 1 in `load_workspace_skills`), which resolves through the
+        // process-global `HOME`. Without pinning it, this test counts the
+        // developer's real installed skills alongside its own fixture.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
         let dir = tempfile::tempdir().unwrap();
         let skills_dir = dir.path().join("skills");
         let skill_dir = skills_dir.join("dual");
@@ -2611,6 +2671,11 @@ description = "Bare minimum"
         let _env_guard = open_skills_env_lock().lock().unwrap();
         let _enabled_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_ENABLED");
         let _dir_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_DIR");
+        // Pin `HOME` too: `load_skills_with_config` reads the active
+        // profile's skills dir (root 1). Acquired AFTER the open-skills
+        // lock to match the order `remove_out_of_root_path_is_rejected`
+        // uses — taking these two in opposite orders can deadlock.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
 
         let dir = tempfile::tempdir().unwrap();
         let workspace_dir = dir.path().join("workspace");
@@ -2645,6 +2710,11 @@ description = "Bare minimum"
         let _env_guard = open_skills_env_lock().lock().unwrap();
         let _enabled_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_ENABLED");
         let _dir_guard = EnvVarGuard::unset("RANTAICLAW_OPEN_SKILLS_DIR");
+        // Pin `HOME` too: `load_skills_with_config` reads the active
+        // profile's skills dir (root 1). Acquired AFTER the open-skills
+        // lock to match the order `remove_out_of_root_path_is_rejected`
+        // uses — taking these two in opposite orders can deadlock.
+        let (_env, _unused_ws) = FakeProfileEnv::new();
 
         let dir = tempfile::tempdir().unwrap();
         let workspace_dir = dir.path().join("workspace");
