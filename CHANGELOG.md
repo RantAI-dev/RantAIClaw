@@ -5,6 +5,67 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0-alpha] — 2026-07-27
+
+Make the autonomy preset mean the same thing on every surface. A preset
+switched in the TUI was invisible in the web console because the two wrote
+the same four-rung ladder into `config.toml` with different encodings. Minor
+bump: `strict` now enforces `readonly` rather than `supervised`, which is a
+real change in what that preset blocks. No config schema change (stays 16);
+the claw-ui pin moves to `v0.3.9`.
+
+### Fixed
+
+- **Autonomy preset encoding is now shared between the TUI/CLI and the web
+  console.** `rantaiclaw autonomy <preset>`, the TUI's `/autonomy` and
+  Shift+Tab now write `[autonomy].always_ask` alongside `level`, which is the
+  pair the console reads. Previously `manual`, `smart`, and `strict` all
+  collapsed onto `supervised` with `always_ask` untouched, so the console
+  resolved every TUI-set preset to "Manual" and a switch made there produced
+  no visible change at all.
+- **`strict` enforces read-only.** It maps to `AutonomyLevel::ReadOnly`
+  instead of `Supervised`, so every tool gated on `can_act()` is refused —
+  file writes, `http_request`, browser, cron, tasks, `memory_store`, ssh,
+  pty, skill installs — not just `shell` being unregistered. This matches
+  what the preset already claimed, what the docs described, and what the web
+  console has always sent for that rung.
+- **The Strict system prompt describes the whole refusal.** It previously
+  mentioned only `shell`, so the model kept offering writes and fetches the
+  policy then refused. It also no longer asserts `shell` is absent from the
+  tool list — a preset switched mid-session can leave it listed while every
+  command is denied.
+- **Setup now applies the approval preset it asked you to pick.** Both
+  onboarding paths wrote `<profile>/policy/*.toml` and stopped; the runtime
+  gate reads `config.autonomy`, so a fresh install that chose Strict, Manual,
+  or Off ran under the default `supervised`. The marker is now mirrored into
+  the config, read back from disk so an existing policy file wins over the
+  offered preset.
+- **The gateway's webhook path follows autonomy changes without a restart.**
+  Its tool registry was built once at startup, pinning every tool's
+  `SecurityPolicy` to the boot level. Because `ApprovalManager` treats
+  `readonly` as blocked elsewhere, the strictest setting failed *open* — no
+  approval prompt and a boot-pinned `can_act()` that still said yes. The
+  registry is now built per turn, matching the console chat path, which
+  already constructed a fresh agent per request and was never affected.
+
+### Changed
+
+- `[autonomy].always_ask` is now written by preset switches and by
+  `rantaiclaw setup approvals`. `smart` clears it, which drops the default
+  `ssh`/`pty` always-ask pair — the encoding the web console has always
+  written for that rung.
+- Documented `[autonomy]` defaults for `auto_approve` and `always_ask`
+  corrected; both were listed as `[]`.
+
+### Notes
+
+- Existing installs keep their current `config.toml` until the next preset
+  switch or `setup approvals` run; nothing is rewritten on upgrade.
+- Operators parked on `strict` who relied on file writes or network tools
+  should move to `smart`.
+- The companion console fix ships in claw-ui `v0.3.9`; run
+  `rantaiclaw ui update` to pick it up.
+
 ## [0.12.0-alpha] — 2026-07-25
 
 Keep the optional web console (claw-ui) in sync with the binary — without
