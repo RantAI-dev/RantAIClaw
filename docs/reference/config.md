@@ -362,8 +362,8 @@ Web console (`rantaiclaw ui start`) settings.
 | `max_cost_per_day_cents` | `500` | per-policy daily cost ceiling (cents); tracked for reporting only — not enforced as a hard stop |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
-| `auto_approve` | `[]` | tool operations always auto-approved |
-| `always_ask` | `[]` | tool operations that always require approval |
+| `auto_approve` | `["file_read", "memory_recall"]` | tool operations always auto-approved |
+| `always_ask` | `["ssh", "pty"]` | tool operations that always require approval, even after an "Always". Also the Manual-vs-Smart discriminator — `rantaiclaw autonomy <preset>` and the web console both rewrite this field (see [commands](commands.md#autonomy)) |
 
 Notes:
 

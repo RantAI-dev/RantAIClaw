@@ -52,6 +52,11 @@ impl SetupSection for ApprovalsSection {
         if let Some(warning) = policy_writer::write_policy_files(ctx.profile, preset, false)? {
             eprintln!("{warning}");
         }
+        // The gate reads `config.autonomy`, not the marker. Without this the
+        // preset chosen here was cosmetic: a fresh install that picked Strict
+        // ran under the default `supervised` until the user re-ran `rantaiclaw
+        // autonomy <preset>`. The wizard saves the config after each section.
+        policy_writer::sync_config_to_active_preset(&ctx.profile.policy_dir(), ctx.config);
         Ok(())
     }
 
@@ -183,6 +188,58 @@ mod tests {
             let autonomy =
                 std::fs::read_to_string(profile.policy_dir().join("autonomy.toml")).unwrap();
             assert!(autonomy.contains("preset = \"smart\""));
+        });
+    }
+
+    #[test]
+    fn run_mirrors_the_preset_into_config_autonomy() {
+        with_home(|| {
+            let profile = ProfileManager::ensure("rt-approvals-mirror").unwrap();
+            let mut config = Config::default();
+            // Default carries the `ssh`/`pty` always-ask pair; Smart clears it,
+            // so this is an observable change rather than a coincidence with
+            // the default level.
+            assert!(!config.autonomy.always_ask.is_empty());
+
+            let mut ctx = SetupContext {
+                profile: &profile,
+                config: &mut config,
+                interactive: false,
+            };
+            ApprovalsSection.run(&mut ctx).unwrap();
+
+            // The runtime gate reads config.autonomy — if setup leaves it at the
+            // default, the preset the user picked never takes effect.
+            assert!(
+                config.autonomy.always_ask.is_empty(),
+                "expected the Smart encoding in config, got {:?}",
+                config.autonomy.always_ask
+            );
+        });
+    }
+
+    #[test]
+    fn run_mirrors_the_marker_on_disk_not_the_offered_preset() {
+        with_home(|| {
+            let profile = ProfileManager::ensure("rt-approvals-existing").unwrap();
+            // Pre-existing policy: Strict. `write_policy_files(force = false)`
+            // will leave it alone, so the headless Smart default is NOT what
+            // ends up active — the config must follow the marker, not the offer.
+            policy_writer::write_policy_files(&profile, PolicyPreset::Strict, false).unwrap();
+
+            let mut config = Config::default();
+            let mut ctx = SetupContext {
+                profile: &profile,
+                config: &mut config,
+                interactive: false,
+            };
+            ApprovalsSection.run(&mut ctx).unwrap();
+
+            assert_eq!(
+                config.autonomy.level,
+                crate::security::AutonomyLevel::ReadOnly,
+                "config should track the Strict marker left on disk"
+            );
         });
     }
 }
