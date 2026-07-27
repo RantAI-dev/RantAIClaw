@@ -1557,7 +1557,7 @@ mod tests {
             temperature: 0.0,
             mem: Arc::new(MockMemory),
             auto_save: false,
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
             webhook_secret_hash: None,
             pairing: Arc::new(crate::security::pairing::PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,

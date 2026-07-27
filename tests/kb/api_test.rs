@@ -137,7 +137,7 @@ fn build_state(require_pairing: bool, tokens: &[String]) -> AppState {
         temperature: 0.0,
         mem: Arc::new(MockMemory),
         auto_save: false,
-        tools_registry: Arc::new(Vec::new()),
+        tools_factory: Arc::new(|_: &Config| Vec::new()),
         webhook_secret_hash: None,
         pairing: Arc::new(PairingGuard::new(require_pairing, tokens)),
         channel_approvals: Arc::new(
