@@ -238,6 +238,13 @@ async fn status(
         "model": cfg.default_model.clone().unwrap_or_default(),
         "memory_backend": cfg.memory.backend,
         "autonomy": format!("{:?}", cfg.autonomy.level),
+        // The level alone cannot name the active preset: Manual and Smart are
+        // both `Supervised` and differ only in `always_ask`. Consumers that
+        // showed the level were therefore stuck reporting "Smart" while Manual
+        // was in force. Resolve the preset here — same inverse the config API
+        // uses to keep the on-disk marker in step — and leave `autonomy` alone
+        // so an older console keeps working.
+        "autonomy_preset": crate::approval::policy_writer::preset_for_autonomy(&cfg.autonomy).id(),
         "workspace_dir": cfg.workspace_dir.display().to_string(),
         "paired": state.pairing.is_paired(),
         "runtime": crate::health::snapshot_json(),
@@ -1825,6 +1832,38 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).expect("json body");
         assert_eq!(json["config_fingerprint"], "abc123");
         assert_eq!(json["name"], "rantaiclaw");
+    }
+
+    #[tokio::test]
+    async fn status_names_the_preset_the_level_alone_cannot() {
+        // Manual and Smart are both `Supervised`; only `always_ask` tells them
+        // apart. A consumer reading `autonomy` therefore reported "Smart" while
+        // Manual was in force — `autonomy_preset` is what disambiguates.
+        let state = test_state();
+        {
+            let mut cfg = state.config.lock();
+            cfg.autonomy.level = crate::security::AutonomyLevel::Supervised;
+            cfg.autonomy.always_ask = vec!["shell".to_string()];
+        }
+        let response = status(State(state.clone()), HeaderMap::new())
+            .await
+            .expect("status ok")
+            .into_response();
+        let json: serde_json::Value =
+            serde_json::from_str(&response_text(response).await).expect("json body");
+        assert_eq!(json["autonomy"], "Supervised");
+        assert_eq!(json["autonomy_preset"], "manual");
+
+        // Clearing always_ask is the whole difference between the two rungs.
+        state.config.lock().autonomy.always_ask.clear();
+        let response = status(State(state.clone()), HeaderMap::new())
+            .await
+            .expect("status ok")
+            .into_response();
+        let json: serde_json::Value =
+            serde_json::from_str(&response_text(response).await).expect("json body");
+        assert_eq!(json["autonomy"], "Supervised", "level must not change");
+        assert_eq!(json["autonomy_preset"], "smart");
     }
 
     /// Build a state fixture with pairing enabled and one known token.
