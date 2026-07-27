@@ -37,14 +37,16 @@ Last verified: **July 12, 2026**.
 - `rantaiclaw autonomy` — print the active preset, the enforced autonomy level from `config.toml`, and the four options (warns when the preset marker has drifted from the enforced level)
 - `rantaiclaw autonomy <preset>` — switch to `manual`, `smart`, `strict`, `off`, or `full` (alias for `off`)
 
-Profile-level operation. Writes `<profile>/policy/{autonomy,command_allowlist,forbidden_paths}.toml` from the bundled preset AND mirrors `[autonomy].level` + `[autonomy].allowed_commands` into `config.toml` so the runtime gate actually consumes the change. `runtime_allowlist.toml` (from `/allow X --persist`) is preserved across preset switches.
+Profile-level operation. Writes `<profile>/policy/{autonomy,command_allowlist,forbidden_paths}.toml` from the bundled preset AND mirrors `[autonomy].level`, `[autonomy].always_ask`, and `[autonomy].allowed_commands` into `config.toml` so the runtime gate actually consumes the change. `runtime_allowlist.toml` (from `/allow X --persist`) is preserved across preset switches.
 
-| Preset | Behaviour |
-|---|---|
-| `manual` | Every shell call prompts. Read-only file/memory tools not gated. |
-| `smart` | Read-only and safe shell builtins pre-allowed (`ls`, `cd`, `echo`, `git status`, `which`, etc.). Writes prompt with an inline `[Y/A/N/Esc]` widget. |
-| `strict` | `shell` tool removed from the model's registry entirely. Agent describes commands the user can run, doesn't execute. CC plan-mode analog. |
-| `off` / `full` | No gating. Forbidden paths still enforced. CI / trusted-env only. |
+The preset is encoded in `config.toml` as a `level` + `always_ask` pair — the same encoding the web console reads and writes — so a preset switched here is visible in the console (and vice versa) without a restart.
+
+| Preset | `[autonomy].level` | `[autonomy].always_ask` | Behaviour |
+|---|---|---|---|
+| `manual` | `supervised` | every built-in tool | Every shell call prompts. Read-only file/memory tools not gated. |
+| `smart` | `supervised` | empty | Read-only and safe shell builtins pre-allowed (`ls`, `cd`, `echo`, `git status`, `which`, etc.). Writes prompt with an inline `[Y/A/N/Esc]` widget. |
+| `strict` | `readonly` | unchanged | `shell` tool removed from the model's registry entirely, and every acting tool is refused by the autonomy gate. Agent describes commands the user can run, doesn't execute. CC plan-mode analog. |
+| `off` / `full` | `full` | unchanged | No gating. Forbidden paths still enforced. CI / trusted-env only. |
 
 Inside the TUI: `Shift+Tab` cycles · `/autonomy` opens an interactive picker · `/autonomy <preset>` skips the picker.
 

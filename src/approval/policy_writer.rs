@@ -105,10 +105,12 @@ impl PolicyPreset {
     /// Map preset to the runtime [`crate::security::AutonomyLevel`].
     ///
     /// `Off` short-circuits to `Full` so `SecurityPolicy::is_command_allowed`
-    /// skips every approval check. The other three presets all run under
-    /// `Supervised` — they differ in their `command_allowlist.toml` /
-    /// `forbidden_paths.toml` contents (which the shell tool reads),
-    /// not in their autonomy level.
+    /// skips every approval check. `Strict` is deny-by-default — it maps to
+    /// `ReadOnly`, which blocks every acting tool outright rather than
+    /// relying on its (deliberately bare) `command_allowlist.toml` to deny
+    /// each command individually. `Manual` and `Smart` both run under
+    /// `Supervised` and differ in `always_ask` (see
+    /// [`apply_preset_to_config`]) plus their allowlist contents.
     ///
     /// This is the bridge between the preset bundle (a human-facing
     /// configuration knob) and the `Config.autonomy.level` field that
@@ -119,7 +121,8 @@ impl PolicyPreset {
     pub fn autonomy_level(self) -> crate::security::AutonomyLevel {
         use crate::security::AutonomyLevel;
         match self {
-            Self::Manual | Self::Smart | Self::Strict => AutonomyLevel::Supervised,
+            Self::Manual | Self::Smart => AutonomyLevel::Supervised,
+            Self::Strict => AutonomyLevel::ReadOnly,
             Self::Off => AutonomyLevel::Full,
         }
     }
@@ -145,11 +148,38 @@ impl PolicyPreset {
     }
 }
 
-/// Apply `preset` to the in-memory `Config`. Updates two fields:
+/// Every built-in tool the agent can be granted or denied. `Manual` forces
+/// each of them through an interactive approval by writing this list into
+/// `autonomy.always_ask`.
+///
+/// Mirrors the web console's `BUILTIN_TOOLS` (claw-ui `src/lib/console.ts`).
+/// The two lists are the shared vocabulary between the surfaces; keep them
+/// in step when a built-in tool is added or renamed.
+const BUILTIN_TOOLS: [&str; 9] = [
+    "shell",
+    "file_read",
+    "file_write",
+    "web_search",
+    "memory_store",
+    "memory_recall",
+    "send_message",
+    "cron_schedule",
+    "browser",
+];
+
+/// Apply `preset` to the in-memory `Config`. Updates three fields:
 ///
 /// 1. `config.autonomy.level` — drives `SecurityPolicy.autonomy`
-///    (Manual/Smart/Strict → Supervised, Off → Full).
-/// 2. `config.autonomy.allowed_commands` — basenames extracted from
+///    (Manual/Smart → Supervised, Strict → ReadOnly, Off → Full).
+/// 2. `config.autonomy.always_ask` — the Manual/Smart discriminator. Both
+///    presets are `Supervised`, so the level alone cannot tell them apart:
+///    Manual forces every built-in tool to prompt, Smart forces none. This
+///    is the same encoding the web console writes and reads
+///    (`rungToAutonomyPayload` / `levelToRung`), and [`preset_for_autonomy`]
+///    is its inverse. Before v0.12 the TUI/CLI left this field untouched, so
+///    a preset switched in the TUI was invisible in the console — the level
+///    never moved and the console's discriminator never moved either.
+/// 3. `config.autonomy.allowed_commands` — basenames extracted from
 ///    the preset bundle's `[command_allowlist].patterns`. This bridges
 ///    the bundle (a write-only TOML file before v0.6.51) into the
 ///    list the runtime gate actually consults. Without this step, the
@@ -162,6 +192,24 @@ impl PolicyPreset {
 /// rebuilds its `SecurityPolicy` with the new lists.
 pub fn apply_preset_to_config(config: &mut crate::config::Config, preset: PolicyPreset) {
     config.autonomy.level = preset.autonomy_level();
+    match preset {
+        // Keep whatever the config already forces to always-ask (the default
+        // is the high-blast-radius `ssh`/`pty` pair) and add every built-in on
+        // top, so the strictest supervised preset never *loosens* a gate.
+        PolicyPreset::Manual => {
+            for tool in BUILTIN_TOOLS {
+                if !config.autonomy.always_ask.iter().any(|t| t == tool) {
+                    config.autonomy.always_ask.push(tool.to_string());
+                }
+            }
+        }
+        // Smart means "nothing is forced to prompt"; an empty list is also
+        // what marks it as Smart rather than Manual on the way back out.
+        PolicyPreset::Smart => config.autonomy.always_ask.clear(),
+        // Strict and Off are already unambiguous from `level` alone, so their
+        // always-ask entries are left exactly as the operator configured them.
+        PolicyPreset::Strict | PolicyPreset::Off => {}
+    }
     if let Ok(bundle) = toml::from_str::<PolicyBundle>(preset.bundle()) {
         let mut basenames: Vec<String> = bundle
             .command_allowlist
@@ -528,6 +576,26 @@ mod tests {
     }
 
     #[test]
+    fn preset_round_trips_through_config_encoding() {
+        // The TUI/CLI switch autonomy by preset name; the web console reads
+        // the same setting back out of `level` + `always_ask` (its
+        // `levelToRung`, mirrored here by `preset_for_autonomy`). If the two
+        // encodings disagree, a preset switched on one surface is invisible
+        // on the other — Manual/Smart/Strict all collapsed to `supervised`
+        // with an untouched `always_ask`, so the console saw no change.
+        for preset in PolicyPreset::ALL {
+            let mut config = crate::config::Config::default();
+            apply_preset_to_config(&mut config, preset);
+            assert_eq!(
+                preset_for_autonomy(&config.autonomy),
+                preset,
+                "preset {} did not survive the config round-trip",
+                preset.id()
+            );
+        }
+    }
+
+    #[test]
     fn id_round_trip() {
         for p in [
             PolicyPreset::Manual,
@@ -606,10 +674,11 @@ mod tests {
     }
 
     #[test]
-    fn non_off_presets_map_to_supervised() {
+    fn each_preset_maps_to_its_enforcement_level() {
         use crate::security::AutonomyLevel;
-        // Manual / Smart / Strict all need the gate to actually run —
-        // they differ only in their command_allowlist contents.
+        // Manual / Smart need the gate to actually run and differ in
+        // `always_ask`; Strict is deny-by-default, so it blocks acting tools
+        // outright rather than denying them one allowlist entry at a time.
         assert_eq!(
             PolicyPreset::Manual.autonomy_level(),
             AutonomyLevel::Supervised
@@ -620,8 +689,9 @@ mod tests {
         );
         assert_eq!(
             PolicyPreset::Strict.autonomy_level(),
-            AutonomyLevel::Supervised
+            AutonomyLevel::ReadOnly
         );
+        assert_eq!(PolicyPreset::Off.autonomy_level(), AutonomyLevel::Full);
     }
 
     #[test]
