@@ -422,6 +422,9 @@ fn load_webhook_routes(config_dir: &std::path::Path) -> Vec<WebhookRoute> {
 }
 
 /// Shared state for all axum handlers
+/// Builds one turn's tool registry from the `Config` in force at that moment.
+pub type ToolsFactory = Arc<dyn Fn(&Config) -> Vec<Box<dyn Tool>> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Mutex<Config>>,
@@ -433,8 +436,19 @@ pub struct AppState {
     pub temperature: f64,
     pub mem: Arc<dyn Memory>,
     pub auto_save: bool,
-    /// Full tool registry for agentic webhook execution.
-    pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    /// Builds the tool registry for one webhook / channel-relay turn. See
+    /// [`ToolsFactory`].
+    ///
+    /// A factory rather than a prebuilt registry: the registry encodes the
+    /// autonomy policy (`SecurityPolicy` clones inside each tool, and the
+    /// Strict preset's `shell` removal), so a prebuilt one is pinned to the
+    /// autonomy level the gateway booted with. Changing autonomy from the
+    /// console or the TUI then had no effect on this path until restart — and
+    /// because `ApprovalManager` treats `ReadOnly` as "blocked elsewhere", the
+    /// strictest setting failed *open*. Building per turn also matches the
+    /// console chat path, which already constructs a fresh `Agent` (and so a
+    /// fresh registry) per request.
+    pub tools_factory: ToolsFactory,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
@@ -461,6 +475,54 @@ pub struct AppState {
     /// `WebModalApprovalBackend` registers + awaits here; `POST /api/v1/approvals/{id}`
     /// resolves it. Separate from the channel/shell registries.
     pub web_approvals: Arc<crate::security::PendingApprovals>,
+}
+
+/// Build the closure stored in [`AppState::tools_factory`].
+///
+/// `runtime` and `mem` are process-wide handles built once at boot; everything
+/// else — the `SecurityPolicy`, the Strict preset's `shell` removal, the skill
+/// tools — is derived from the `Config` passed in, so each turn gets a registry
+/// that matches the autonomy policy in force *now* rather than at boot.
+fn build_tools_factory(
+    runtime: Arc<dyn runtime::RuntimeAdapter>,
+    mem: Arc<dyn Memory>,
+) -> ToolsFactory {
+    Arc::new(move |config: &Config| {
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let (composio_key, composio_entity_id) = if config.composio.enabled {
+            (
+                config.composio.api_key.as_deref(),
+                Some(config.composio.entity_id.as_str()),
+            )
+        } else {
+            (None, None)
+        };
+        let mut tools = tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            Arc::clone(&runtime),
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.workspace_dir,
+            &config.agents,
+            config.api_key.as_deref(),
+            config,
+        );
+        // Strict preset parity: drop `shell` on the gateway path too.
+        tools::apply_preset_tool_filter(&mut tools);
+
+        // Skills define [[tools]] blocks in SKILL.toml that become real
+        // callable shell/http tools.
+        let skills = skills::load_skills_with_config(&config.workspace_dir, config);
+        tools.extend(tools::skill_tools_from_skills(&skills));
+        tools
+    })
 }
 
 /// Build the full gateway [`AppState`] and [`Router`] from `config`, using the
@@ -506,53 +568,7 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
     )?);
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
-
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-
-    let mut base_tools = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    );
-    // Strict preset parity (PR3b): drop `shell` on the gateway path too.
-    tools::apply_preset_tool_filter(&mut base_tools);
-
-    // Load skill tools from workspace and register them as real callable tools.
-    // Skills define [[tools]] blocks in SKILL.toml that become shell/http tools.
-    let startup_skills = skills::load_skills_with_config(&config.workspace_dir, &config);
-    let skill_tools = tools::skill_tools_from_skills(&startup_skills);
-    if !skill_tools.is_empty() {
-        tracing::info!(
-            "[Gateway] Registered {} skill tools from {} skills",
-            skill_tools.len(),
-            startup_skills
-                .iter()
-                .filter(|s| !s.tools.is_empty())
-                .count()
-        );
-        base_tools.extend(skill_tools);
-    }
-    let tools_registry = Arc::new(base_tools);
+    let tools_factory = build_tools_factory(runtime, Arc::clone(&mem));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -711,7 +727,7 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
         temperature,
         mem,
         auto_save: config.memory.auto_save,
-        tools_registry,
+        tools_factory,
         webhook_secret_hash,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
@@ -1349,9 +1365,16 @@ async fn run_gateway_chat_with_multimodal(
         skills::load_skills_with_config(&config_guard.workspace_dir, &config_guard)
     };
 
+    // Build this turn's tool registry from the config as it stands now. The
+    // registry carries the autonomy policy, so a prebuilt one would pin this
+    // path to the level the gateway booted with — see `AppState::tools_factory`.
+    let tools_registry = {
+        let config_guard = state.config.lock();
+        (state.tools_factory)(&config_guard)
+    };
+
     // Convert tool registry to (name, description) pairs for system prompt.
-    let tool_descs: Vec<(&str, &str)> = state
-        .tools_registry
+    let tool_descs: Vec<(&str, &str)> = tools_registry
         .iter()
         .map(|t| (t.name(), t.description()))
         .collect();
@@ -1370,7 +1393,7 @@ async fn run_gateway_chat_with_multimodal(
     };
 
     // Append tool use protocol and tool descriptions so the LLM knows how to call them.
-    system_prompt.push_str(&build_tool_instructions(&state.tools_registry));
+    system_prompt.push_str(&build_tool_instructions(&tools_registry));
 
     let mut history = Vec::with_capacity(2 + prior_history.len());
     history.push(ChatMessage::system(system_prompt));
@@ -1424,7 +1447,7 @@ async fn run_gateway_chat_with_multimodal(
     let response = run_tool_call_loop(
         state.provider.as_ref(),
         &mut history,
-        &state.tools_registry,
+        &tools_registry,
         state.observer.as_ref(),
         provider_label,
         &state.model,
@@ -2505,7 +2528,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2555,7 +2578,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2821,7 +2844,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         }
     }
 
@@ -3078,7 +3101,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -3143,7 +3166,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
         let headers = HeaderMap::new();
@@ -3220,7 +3243,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
         let response = handle_webhook(
@@ -3269,7 +3292,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -3323,7 +3346,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -3382,7 +3405,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -3437,7 +3460,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -3495,7 +3518,7 @@ mod tests {
             webhook_routes: Arc::new(Vec::new()),
             channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
             web_approvals: Arc::new(crate::security::PendingApprovals::default()),
-            tools_registry: Arc::new(Vec::new()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
         };
 
         let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
@@ -3748,5 +3771,57 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert!(!keys.contains_key("old-key"));
         assert!(keys.contains_key("new-key"));
+    }
+
+    /// The webhook / channel-relay path used to run against a registry built at
+    /// gateway boot, so every tool's `SecurityPolicy` kept the autonomy level
+    /// the process started with. Because `ApprovalManager::needs_approval`
+    /// returns `false` for `ReadOnly` — "blocked elsewhere" — the *strictest*
+    /// setting was the one that failed open: no approval prompt, and a
+    /// boot-pinned `can_act()` that still said yes.
+    ///
+    /// Asserts behaviour, not structure: the same factory must produce a
+    /// refusing `file_write` when handed a read-only config.
+    #[tokio::test]
+    async fn tools_factory_tracks_the_autonomy_level_of_the_config_it_is_given() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = ws.path().to_path_buf();
+
+        let runtime: Arc<dyn runtime::RuntimeAdapter> =
+            Arc::from(runtime::create_runtime(&config.runtime).unwrap());
+        let factory = build_tools_factory(runtime, Arc::new(MockMemory));
+
+        let args = serde_json::json!({ "path": "note.txt", "content": "hi" });
+
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        let tools = factory(&config);
+        let writer = tools
+            .iter()
+            .find(|t| t.name() == "file_write")
+            .expect("file_write should be registered under Supervised");
+        let out = writer.execute(args.clone()).await.unwrap();
+        assert!(
+            out.success,
+            "supervised should allow a workspace write: {:?}",
+            out.error
+        );
+
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        let tools = factory(&config);
+        let writer = tools
+            .iter()
+            .find(|t| t.name() == "file_write")
+            .expect("file_write is still registered read-only; it just refuses");
+        let out = writer.execute(args).await.unwrap();
+        assert!(
+            !out.success,
+            "read-only must refuse the write, got success with {:?}",
+            out.output
+        );
+        assert!(
+            out.error.unwrap_or_default().contains("read-only"),
+            "refusal should name the autonomy level"
+        );
     }
 }
