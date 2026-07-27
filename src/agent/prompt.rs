@@ -350,20 +350,31 @@ impl PromptSection for SafetySection {
 
         match ctx.autonomy_preset {
             Some(PolicyPreset::Strict) => {
-                // Plan-mode analog: shell is unavailable to the model in
-                // this preset (filtered out at registration). Tell the
-                // model so it doesn't waste tokens describing shell
-                // sequences — it should plan with read-only tools only.
+                // Plan-mode analog. Strict maps to `AutonomyLevel::ReadOnly`, so
+                // the refusal is much broader than shell: every tool that gates
+                // on `can_act()` is refused. Naming that up front is the
+                // difference between the model planning around the limit and
+                // the model promising a file write it cannot perform.
                 out.push_str(
                     "**Active approval policy: Strict (read-only).**\n\n\
-                     - The `shell` tool is **NOT registered** in this session — \
-                     do not attempt to call it; it is not in your tool list.\n\
-                     - You may read files (`file_read`), search memory \
-                     (`memory_*`), inspect the workspace, and reason.\n\
+                     - Nothing that changes state will run. Writing files, \
+                     fetching URLs, driving the browser, scheduling jobs, \
+                     storing or forgetting memory, sending messages, opening \
+                     SSH/PTY sessions, and installing skills are all refused by \
+                     policy — not gated behind a prompt, refused. Do not offer \
+                     to do them.\n\
+                     - The `shell` tool is normally removed from your tool list \
+                     in this preset. If it is still listed — the policy can \
+                     change mid-session, and the list you were handed may \
+                     predate that — do not call it; every command is denied.\n\
+                     - You can still read files (`file_read`), search the \
+                     workspace, recall memory (`memory_recall`), search the \
+                     web, inspect tasks, and reason.\n\
                      - For any task that would normally require running a \
-                     command, describe what you would do — list the exact \
-                     commands a user would run — but do not call shell. \
-                     The user reviews and runs them manually.\n\
+                     command or writing a file, describe what you would do — \
+                     the exact commands or the exact file content — and let the \
+                     user apply it. Say plainly that the policy blocked you; \
+                     never report an action as done when it was refused.\n\
                      - To leave Strict mode the user types `/autonomy smart` \
                      or `/autonomy off`. Don't suggest it unless they ask.\n",
                 );
@@ -782,6 +793,47 @@ mod tests {
         assert!(
             !out.contains("ls *"),
             "channel must not print shell allowlist: {out}"
+        );
+    }
+
+    #[test]
+    fn safety_section_strict_states_the_full_read_only_refusal() {
+        use crate::approval::policy_writer::PolicyPreset;
+        // Strict enforces `AutonomyLevel::ReadOnly`, so `can_act()` refuses far
+        // more than shell. A prompt that only mentions shell leaves the model
+        // offering file writes and fetches it cannot perform.
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Strict),
+            allowed_commands: &[],
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(
+            out.contains("Writing files"),
+            "must name writes as refused, not just shell: {out}"
+        );
+        assert!(
+            out.contains("refused by policy"),
+            "must say refused rather than prompted: {out}"
+        );
+        // The registry filter runs at startup, so a mid-session switch can leave
+        // `shell` listed. The text must not assert it is absent.
+        assert!(
+            !out.contains("it is not in your tool list"),
+            "must not claim shell is definitely absent: {out}"
+        );
+        assert!(
+            out.contains("still listed"),
+            "must cover the stale-registration case: {out}"
         );
     }
 
