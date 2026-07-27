@@ -42,7 +42,7 @@ impl TuiProvisioner for ApprovalsProvisioner {
         APPROVALS_DESC
     }
 
-    async fn run(&self, _config: &mut Config, profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(&self, config: &mut Config, profile: &Profile, io: ProvisionIo) -> Result<()> {
         let ProvisionIo {
             events,
             mut responses,
@@ -116,6 +116,11 @@ impl TuiProvisioner for ApprovalsProvisioner {
             )
             .await?;
         }
+
+        // Mirror the marker into `config.autonomy` — the runtime gate reads the
+        // config, so without this the preset selected here never took effect.
+        // The wizard saves the config after each provisioner returns.
+        policy_writer::sync_config_to_active_preset(&profile.policy_dir(), config);
 
         send(
             &events,
