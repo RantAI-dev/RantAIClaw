@@ -5,6 +5,28 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0-alpha] — 2026-07-25
+
+Keep the optional web console (claw-ui) in sync with the binary — without
+forcing it. Adds a proper `ui update` command and non-intrusive "a newer
+console is available" notices. Minor bump: new `ui update` CLI subcommand
+(runtime-contract addition). No config schema change (stays 16); the claw-ui
+pin is unchanged (v0.3.8).
+
+### Added
+
+- **`rantaiclaw ui update`** — refresh the web console to this binary's pinned
+  claw-ui release. Idempotent (a no-op "already up to date" when the installed
+  version matches the pin) unless `--force`; `--check` reports availability
+  without downloading. Clearer than re-running `ui install` to update.
+- **Web-console version marker** — `ui install`/`ui update` record the installed
+  claw-ui tag in a `.version` file, so drift against the binary's pin is
+  detectable.
+- **Freshness notices (non-forcing)** — `ui start` offers to update a lagging
+  console (an interactive `[y/N]` prompt on a TTY, a one-line notice otherwise),
+  and a successful `rantaiclaw update` reports when a newer console is available.
+  Neither auto-installs — updating is always an explicit `ui update`.
+
 ## [0.11.0-alpha] — 2026-07-25
 
 CLI usability and polish. Three new read commands (`integrations list`, `models
