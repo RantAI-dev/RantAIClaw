@@ -235,6 +235,23 @@ pub fn apply_preset_to_config(config: &mut crate::config::Config, preset: Policy
     }
 }
 
+/// Bring `config.autonomy` into line with the preset marker already on disk.
+///
+/// [`write_policy_files`] leaves existing policy files alone unless `force` is
+/// set, so the preset a caller *chose* is not always the preset that ends up in
+/// `<policy_dir>/autonomy.toml`. Reading the marker back and applying that is
+/// what keeps the two from disagreeing — and a disagreement here is not
+/// cosmetic: the runtime gate reads `config.autonomy`, so a marker the config
+/// never learned about is a preset the user selected and never got.
+///
+/// No-op when the policy dir has no readable marker (nothing to mirror yet).
+/// The caller persists the config.
+pub fn sync_config_to_active_preset(policy_dir: &Path, config: &mut crate::config::Config) {
+    if let Some(preset) = read_active_preset(policy_dir) {
+        apply_preset_to_config(config, preset);
+    }
+}
+
 /// Read the currently-active preset from `<policy_dir>/autonomy.toml`.
 ///
 /// Returns `None` if the file is missing, unparseable, or the
