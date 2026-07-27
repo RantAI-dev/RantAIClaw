@@ -662,13 +662,14 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     // the success path meant `rantaiclaw autonomy off` bundled with a broken
     // provider silently never applied.
     //
-    // `add_runtime_command` is idempotent (dedup via a HashSet); the runtime
-    // allowlist only ever grows here, so command *removals* from config still
-    // require a restart — an acceptable limitation for a security boundary we only
-    // ever widen at runtime, never silently narrow.
-    for cmd in next_defaults.allowed_commands.iter() {
-        let _ = ctx.security.add_runtime_command(cmd, false);
-    }
+    // Replace the config allowlist outright rather than folding it into the
+    // runtime set. The old loop used `add_runtime_command`, which has no removal
+    // path, so a reload could only ever *widen* the boundary: switching to a
+    // stricter preset left every previously-allowed command allowed until the
+    // daemon was restarted. `set_allowed_commands` applies the new list in both
+    // directions and leaves `/allow <cmd> --persist` operator grants alone.
+    ctx.security
+        .set_allowed_commands(next_defaults.allowed_commands.as_ref().clone());
     // The autonomy level is a deliberate operator setting, applied verbatim so
     // `rantaiclaw autonomy off`/`strict`/etc. takes effect on the running daemon
     // at the next message, no restart required.

@@ -118,6 +118,17 @@ pub struct SecurityPolicy {
     /// config hot-reload so `rantaiclaw autonomy <preset>` (e.g. Off → Full)
     /// takes effect without a restart. Read through `effective_autonomy`.
     pub autonomy_runtime: Arc<RwLock<Option<AutonomyLevel>>>,
+    /// Live override for the shell allowlist, shared across clones like
+    /// [`Self::autonomy_runtime`]. `None` means "use the boot-time
+    /// `allowed_commands` above". Read through
+    /// [`Self::effective_allowed_commands`].
+    ///
+    /// Exists because the config hot-reload previously pushed the new
+    /// allowlist into [`Self::runtime_allowlist`], which has no removal path —
+    /// so a reload could only ever *widen* the boundary and a switch to a
+    /// stricter preset left every previously-allowed command allowed until
+    /// restart. This replaces the list outright, in both directions.
+    pub allowed_commands_runtime: Arc<RwLock<Option<Vec<String>>>>,
 }
 
 impl Default for SecurityPolicy {
@@ -172,6 +183,7 @@ impl Default for SecurityPolicy {
             policy_dir: None,
             pending: Arc::new(RwLock::new(None)),
             autonomy_runtime: Arc::new(RwLock::new(None)),
+            allowed_commands_runtime: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -634,6 +646,26 @@ impl SecurityPolicy {
         *self.autonomy_runtime.write() = Some(level);
     }
 
+    /// The shell allowlist in force now: the hot-reloaded list if one has been
+    /// set, else the boot-time `allowed_commands`.
+    pub fn effective_allowed_commands(&self) -> Vec<String> {
+        self.allowed_commands_runtime
+            .read()
+            .clone()
+            .unwrap_or_else(|| self.allowed_commands.clone())
+    }
+
+    /// Replace the shell allowlist on a running policy, shared across every
+    /// clone via the inner `Arc` so tools already holding one observe it.
+    ///
+    /// Unlike [`Self::add_runtime_command`] this is a full replacement, so it
+    /// **narrows** as well as widens — the point of it. Operator grants in
+    /// `runtime_allowlist` (`/allow <cmd> --persist`) are deliberate decisions
+    /// rather than config state and are left untouched.
+    pub fn set_allowed_commands(&self, commands: Vec<String>) {
+        *self.allowed_commands_runtime.write() = Some(commands);
+    }
+
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.effective_autonomy() == AutonomyLevel::ReadOnly {
             return false;
@@ -691,12 +723,20 @@ impl SecurityPolicy {
                 continue;
             }
 
-            let on_boot_list = self.allowed_commands.iter().any(|a| a == base_cmd);
-            let on_runtime_list = !on_boot_list && {
+            // The config list is read through the override so a hot-reloaded
+            // allowlist can drop entries, not only add them.
+            let on_config_list = {
+                let guard = self.allowed_commands_runtime.read();
+                match guard.as_ref() {
+                    Some(list) => list.iter().any(|a| a == base_cmd),
+                    None => self.allowed_commands.iter().any(|a| a == base_cmd),
+                }
+            };
+            let on_runtime_list = !on_config_list && {
                 let set = self.runtime_allowlist.read();
                 set.contains(base_cmd)
             };
-            if !on_boot_list && !on_runtime_list {
+            if !on_config_list && !on_runtime_list {
                 return false;
             }
 
@@ -944,6 +984,7 @@ impl SecurityPolicy {
             policy_dir,
             pending: Arc::new(RwLock::new(None)),
             autonomy_runtime: Arc::new(RwLock::new(None)),
+            allowed_commands_runtime: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1114,6 +1155,47 @@ mod tests {
         daemon.set_autonomy(AutonomyLevel::ReadOnly);
         assert!(!tool.can_act());
         assert!(!tool.is_command_allowed("ls"));
+    }
+
+    #[test]
+    fn set_allowed_commands_narrows_across_clones() {
+        // The channel/daemon hot-reload could only ever *widen* the shell
+        // allowlist: it pushed config entries into `runtime_allowlist`, which
+        // has no removal path, so switching to a stricter preset left every
+        // previously-allowed command allowed until a restart. Tightening has to
+        // reach a tool that already holds its own clone.
+        let daemon = default_policy();
+        let tool = daemon.clone();
+        assert!(tool.is_command_allowed("ls -la"));
+
+        daemon.set_allowed_commands(vec!["echo".to_string()]);
+        assert!(
+            !tool.is_command_allowed("ls -la"),
+            "a command dropped from the allowlist must stop being allowed"
+        );
+        assert!(tool.is_command_allowed("echo hi"));
+
+        // Widening still works through the same override.
+        daemon.set_allowed_commands(vec!["echo".to_string(), "ls".to_string()]);
+        assert!(tool.is_command_allowed("ls -la"));
+    }
+
+    #[test]
+    fn set_allowed_commands_leaves_operator_grants_intact() {
+        // `/allow <cmd> --persist` grants live in `runtime_allowlist` and are a
+        // deliberate operator decision, not config state — a preset switch must
+        // not silently revoke them.
+        let daemon = default_policy();
+        daemon.add_runtime_command("kubectl", false).unwrap();
+        daemon.set_allowed_commands(vec!["echo".to_string()]);
+        assert!(daemon.is_command_allowed("kubectl get pods"));
+        assert!(!daemon.is_command_allowed("ls -la"));
+    }
+
+    #[test]
+    fn effective_allowed_commands_falls_back_to_boot_list() {
+        let p = default_policy();
+        assert_eq!(p.effective_allowed_commands(), p.allowed_commands);
     }
 
     #[test]
