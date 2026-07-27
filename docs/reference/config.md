@@ -6,9 +6,19 @@ Last verified: **May 9, 2026**.
 
 Config path resolution at startup:
 
-1. `RANTAICLAW_WORKSPACE` override (if set)
-2. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present)
-3. default `~/.rantaiclaw/config.toml`
+1. `RANTAICLAW_CONFIG_DIR` override (if set) — the whole config directory; the workspace becomes `<dir>/workspace`
+2. `RANTAICLAW_WORKSPACE` override (if set)
+3. persisted `~/.rantaiclaw/active_workspace.toml` marker (if present)
+4. default `~/.rantaiclaw/config.toml`
+
+`RANTAICLAW_CONFIG_DIR` moves **config and workspace only**. The profile root —
+`~/.rantaiclaw/profiles/<name>/`, which holds `policy/`, session and KB
+databases, and the persona — is keyed on `$HOME` and is deliberately unaffected.
+Setting only `RANTAICLAW_CONFIG_DIR` therefore gives you a split state: config
+from the custom directory, approval policy and profile data from the real home.
+
+To isolate a run completely — a scratch test, a throwaway profile — set `HOME`
+instead. That moves both halves together.
 
 RantaiClaw logs the resolved config on startup at `INFO` level:
 
