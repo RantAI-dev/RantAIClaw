@@ -8,7 +8,7 @@
 //!   this basename and cancel the in-flight turn (same "stop, don't explore
 //!   alternatives" semantics as the inline N/Esc key). Does not mutate the
 //!   allowlist.
-//! - `/allowlist` — show the current allowlist (boot + runtime) and
+//! - `/allowlist` — show the current allowlist (config + runtime) and
 //!   any pending approval requests.
 //!
 //! All three rely on `TuiContext.security` being `Some`, which is the
@@ -17,6 +17,7 @@
 //! "security policy not available" message.
 
 use anyhow::Result;
+use std::fmt::Write as _;
 
 use super::{CommandHandler, CommandResult};
 use crate::security::Decision;
@@ -167,21 +168,25 @@ impl CommandHandler for AllowlistCommand {
             ));
         };
 
-        let boot = &security.allowed_commands;
+        // Show the list actually in force, not the one loaded at boot: a
+        // config reload can narrow it, and an inspection surface that reports
+        // a stale wider list is worse than none.
+        let config_allowed = security.effective_allowed_commands();
         let runtime = security.runtime_allowlist_snapshot();
         let pending: Vec<crate::security::PendingRequest> =
             security.pending().map(|p| p.list()).unwrap_or_default();
 
         let mut out = String::new();
-        out.push_str(&format!(
-            "Boot allowlist ({}): {}\n",
-            boot.len(),
-            if boot.is_empty() {
+        let _ = writeln!(
+            out,
+            "Config allowlist ({}): {}",
+            config_allowed.len(),
+            if config_allowed.is_empty() {
                 "(none)".to_string()
             } else {
-                boot.join(", ")
+                config_allowed.join(", ")
             }
-        ));
+        );
         out.push_str(&format!(
             "Runtime allowlist ({}): {}\n",
             runtime.len(),
@@ -278,7 +283,7 @@ mod tests {
         let result = AllowlistCommand.execute("", &mut ctx).unwrap();
         match result {
             CommandResult::Message(m) => {
-                assert!(m.contains("Boot allowlist"));
+                assert!(m.contains("Config allowlist"));
                 assert!(m.contains("Runtime allowlist"));
                 assert!(m.contains("rg"));
                 assert!(m.contains("Pending approvals"));
