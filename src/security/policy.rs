@@ -73,15 +73,6 @@ impl ActionTracker {
     }
 }
 
-impl Clone for ActionTracker {
-    fn clone(&self) -> Self {
-        let actions = self.actions.lock();
-        Self {
-            actions: Mutex::new(actions.clone()),
-        }
-    }
-}
-
 /// Security policy enforced on all tool executions
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
@@ -95,7 +86,10 @@ pub struct SecurityPolicy {
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
-    pub tracker: ActionTracker,
+    /// Rate-limit window. Shared by handle: a caller that rebuilds its policy
+    /// per turn must carry the same tracker forward, or the hourly budget
+    /// silently restarts every turn.
+    pub tracker: Arc<ActionTracker>,
     /// Runtime allowlist — user-approved basenames added during the
     /// session. Cloned by handle, so all `SecurityPolicy` clones share
     /// the same set. Optionally backed by a persisted overlay file
@@ -178,7 +172,7 @@ impl Default for SecurityPolicy {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: false,
-            tracker: ActionTracker::new(),
+            tracker: Arc::new(ActionTracker::new()),
             runtime_allowlist: Arc::new(RwLock::new(HashSet::new())),
             policy_dir: None,
             pending: Arc::new(RwLock::new(None)),
@@ -944,6 +938,23 @@ impl SecurityPolicy {
         Self::from_config_with_policy_dir(autonomy_config, workspace_dir, None)
     }
 
+    /// Build from config while REUSING an existing action tracker.
+    ///
+    /// The rate-limit window is process state, not config state: a caller that
+    /// rebuilds its policy per turn (the gateway tool factory) must carry the
+    /// same tracker forward or the hourly budget silently restarts every turn.
+    pub fn from_config_with_shared_tracker(
+        autonomy_config: &crate::config::AutonomyConfig,
+        workspace_dir: &Path,
+        policy_dir: Option<PathBuf>,
+        tracker: Arc<ActionTracker>,
+    ) -> Self {
+        Self {
+            tracker,
+            ..Self::from_config_with_policy_dir(autonomy_config, workspace_dir, policy_dir)
+        }
+    }
+
     /// Build from config sections and bind to a `policy_dir`. If the dir
     /// contains a `runtime_allowlist.toml`, its basenames are loaded into
     /// the in-memory runtime set. Subsequent `add_runtime_command(_, true)`
@@ -979,7 +990,7 @@ impl SecurityPolicy {
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
-            tracker: ActionTracker::new(),
+            tracker: Arc::new(ActionTracker::new()),
             runtime_allowlist: Arc::new(RwLock::new(runtime_set)),
             policy_dir,
             pending: Arc::new(RwLock::new(None)),
@@ -1643,15 +1654,65 @@ mod tests {
     }
 
     #[test]
-    fn action_tracker_clone_is_independent() {
-        let tracker = ActionTracker::new();
-        tracker.record();
-        tracker.record();
-        let cloned = tracker.clone();
-        assert_eq!(cloned.count(), 2);
-        tracker.record();
-        assert_eq!(tracker.count(), 3);
-        assert_eq!(cloned.count(), 2); // clone is independent
+    fn action_tracker_is_shared_across_policy_clones() {
+        let policy_a = SecurityPolicy::default();
+        let policy_b = policy_a.clone();
+        policy_a.record_action();
+        policy_a.record_action();
+        // The clone observes the original's actions: the rate-limit window is
+        // process state, not per-handle state.
+        assert_eq!(policy_b.tracker.count(), 2);
+        policy_b.record_action();
+        assert_eq!(policy_a.tracker.count(), 3);
+    }
+
+    #[test]
+    fn shared_tracker_accumulates_across_rebuilt_policies() {
+        // The gateway rebuilds its policy every turn so config stays fresh.
+        // The rate-limit window must NOT restart with it, or
+        // `max_actions_per_hour` is unenforceable on that path.
+        let mut cfg = crate::config::AutonomyConfig::default();
+        cfg.max_actions_per_hour = 3;
+        let workspace = PathBuf::from("/tmp/rantaiclaw-shared-tracker");
+        let tracker = Arc::new(ActionTracker::new());
+
+        let turn_one = SecurityPolicy::from_config_with_shared_tracker(
+            &cfg,
+            &workspace,
+            None,
+            Arc::clone(&tracker),
+        );
+        let turn_two = SecurityPolicy::from_config_with_shared_tracker(
+            &cfg,
+            &workspace,
+            None,
+            Arc::clone(&tracker),
+        );
+
+        assert!(turn_one.record_action());
+        assert!(turn_one.record_action());
+        assert!(turn_two.record_action());
+        assert!(
+            !turn_two.record_action(),
+            "the fourth action must exhaust a budget of 3 even though it lands \
+             on a policy rebuilt after the first two"
+        );
+    }
+
+    #[test]
+    fn independent_policies_do_not_share_a_tracker() {
+        // Surfaces that legitimately want their own window still get one.
+        let mut cfg = crate::config::AutonomyConfig::default();
+        cfg.max_actions_per_hour = 2;
+        let workspace = PathBuf::from("/tmp/rantaiclaw-independent-tracker");
+
+        let a = SecurityPolicy::from_config(&cfg, &workspace);
+        let b = SecurityPolicy::from_config(&cfg, &workspace);
+
+        assert!(a.record_action());
+        assert!(a.record_action());
+        assert!(!a.record_action(), "a exhausted its own budget");
+        assert!(b.record_action(), "b must be unaffected by a's budget");
     }
 
     // ── Edge cases: command injection ────────────────────────
