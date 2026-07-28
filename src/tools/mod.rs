@@ -223,33 +223,6 @@ pub fn all_tools(
     )
 }
 
-/// Drop tools forbidden by the active autonomy preset from a registry.
-///
-/// Currently the **Strict** (read-only) preset removes `shell` so the model
-/// cannot even attempt a call — a plan-mode analog. Extracted so every surface
-/// applies the *same* filter: previously only `Agent::from_config` (TUI) did,
-/// leaving `shell` registered on channels in Strict mode, so "Strict" meant
-/// different things on different surfaces. Keep this the single place that
-/// encodes preset → tool-registry effects.
-pub fn apply_preset_tool_filter(tools: &mut Vec<Box<dyn crate::tools::traits::Tool>>) {
-    let strict = matches!(
-        crate::profile::ProfileManager::active()
-            .ok()
-            .and_then(|p| crate::approval::policy_writer::read_active_preset(&p.policy_dir())),
-        Some(crate::approval::policy_writer::PolicyPreset::Strict)
-    );
-    if strict {
-        let before = tools.len();
-        tools.retain(|t| t.name() != "shell");
-        if tools.len() < before {
-            tracing::info!(
-                target: "tools",
-                "Strict preset active — `shell` tool removed from registry"
-            );
-        }
-    }
-}
-
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools_with_runtime(
@@ -607,6 +580,30 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         }
+    }
+
+    /// Characterization: what Strict actually guarantees, independent of
+    /// whether `shell` is in the registry. Strict maps to `ReadOnly`, and the
+    /// gate refuses there regardless of the allowlist. Removing the tool from
+    /// the registry was never what enforced this — these must keep passing.
+    #[test]
+    fn strict_refuses_an_allowlisted_command() {
+        let policy = crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::ReadOnly,
+            ..crate::security::SecurityPolicy::default()
+        };
+        // `ls` is on the default allowlist; ReadOnly refuses it anyway.
+        assert!(policy.allowed_commands.iter().any(|c| c == "ls"));
+        assert!(!policy.is_command_allowed("ls -la"));
+    }
+
+    #[test]
+    fn strict_cannot_act() {
+        let policy = crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::ReadOnly,
+            ..crate::security::SecurityPolicy::default()
+        };
+        assert!(!policy.can_act());
     }
 
     #[test]
