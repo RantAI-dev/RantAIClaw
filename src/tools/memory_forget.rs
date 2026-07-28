@@ -141,10 +141,7 @@ mod tests {
         mem.store("temp", "temporary", MemoryCategory::Conversation, None)
             .await
             .unwrap();
-        let readonly = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
+        let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
         let tool = MemoryForgetTool::new(mem.clone(), readonly);
         let result = tool.execute(json!({"key": "temp"})).await.unwrap();
         assert!(!result.success);
@@ -162,10 +159,7 @@ mod tests {
         mem.store("temp", "temporary", MemoryCategory::Conversation, None)
             .await
             .unwrap();
-        let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
+        let limited = Arc::new(SecurityPolicy::default().with_max_actions_per_hour(0));
         let tool = MemoryForgetTool::new(mem.clone(), limited);
         let result = tool.execute(json!({"key": "temp"})).await.unwrap();
         assert!(!result.success);

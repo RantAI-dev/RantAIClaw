@@ -255,11 +255,11 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn test_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        })
+        Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Full)
+                .with_workspace_dir(std::env::temp_dir()),
+        )
     }
 
     #[test]

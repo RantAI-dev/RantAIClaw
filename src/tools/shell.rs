@@ -608,11 +608,11 @@ mod tests {
     use crate::security::{AutonomyLevel, PendingApprovals, SecurityPolicy};
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        })
+        Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(autonomy)
+                .with_workspace_dir(std::env::temp_dir()),
+        )
     }
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
@@ -802,12 +802,12 @@ mod tests {
     }
 
     fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["env".into(), "echo".into()],
-            ..SecurityPolicy::default()
-        })
+        Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_workspace_dir(std::env::temp_dir())
+                .with_allowed_commands(vec!["env".into(), "echo".into()]),
+        )
     }
 
     /// RAII guard that restores an environment variable to its original state on drop,
@@ -907,12 +907,12 @@ mod tests {
 
     #[tokio::test]
     async fn shell_requires_approval_for_medium_risk_command() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["touch".into()],
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        });
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_allowed_commands(vec!["touch".into()])
+                .with_workspace_dir(std::env::temp_dir()),
+        );
 
         let tool = ShellTool::new(security.clone(), test_runtime());
         let denied = tool
@@ -1009,12 +1009,12 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_rate_limited() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            max_actions_per_hour: 0,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        });
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_max_actions_per_hour(0)
+                .with_workspace_dir(std::env::temp_dir()),
+        );
         let tool = ShellTool::new(security, test_runtime());
         let result = tool
             .execute(json!({"command": "echo test"}))
@@ -1027,12 +1027,12 @@ mod tests {
     // ── approval-driven runtime allowlist ───────────────────
 
     fn supervised_security_only_echo() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["echo".into()],
-            ..SecurityPolicy::default()
-        })
+        Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_workspace_dir(std::env::temp_dir())
+                .with_allowed_commands(vec!["echo".into()]),
+        )
     }
 
     #[tokio::test]
@@ -1155,14 +1155,14 @@ mod tests {
     /// tests above never reach.
     #[tokio::test]
     async fn shell_cascading_approval_prompts_for_each_distinct_blocked_basename() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: std::env::temp_dir(),
-            // Empty boot allowlist → both `true` and `echo` are blocked,
-            // forcing a two-step cascade.
-            allowed_commands: vec![],
-            ..SecurityPolicy::default()
-        });
+        // Empty config allowlist → both `true` and `echo` are blocked, forcing
+        // a two-step cascade.
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_workspace_dir(std::env::temp_dir())
+                .with_allowed_commands(vec![]),
+        );
         let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
         security.set_pending(approvals.clone());
         let tool = ShellTool::new(security.clone(), test_runtime());
@@ -1215,12 +1215,12 @@ mod tests {
     /// back by a subsequent deny.
     #[tokio::test]
     async fn shell_cascading_approval_deny_midway_returns_error_and_keeps_prior_grant() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec![],
-            ..SecurityPolicy::default()
-        });
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_workspace_dir(std::env::temp_dir())
+                .with_allowed_commands(vec![]),
+        );
         let approvals = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
         security.set_pending(approvals.clone());
         let tool = ShellTool::new(security.clone(), test_runtime());

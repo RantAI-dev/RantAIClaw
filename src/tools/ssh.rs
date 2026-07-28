@@ -252,10 +252,7 @@ mod tests {
     use crate::security::AutonomyLevel;
 
     fn tool(level: AutonomyLevel) -> SshTool {
-        SshTool::new(Arc::new(SecurityPolicy {
-            autonomy: level,
-            ..SecurityPolicy::default()
-        }))
+        SshTool::new(Arc::new(SecurityPolicy::default().with_autonomy(level)))
     }
 
     #[test]

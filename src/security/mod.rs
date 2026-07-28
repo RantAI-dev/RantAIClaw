@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn reexported_policy_and_pairing_types_are_usable() {
         let policy = SecurityPolicy::default();
-        assert_eq!(policy.autonomy, AutonomyLevel::Supervised);
+        assert_eq!(policy.fields().autonomy, AutonomyLevel::Supervised);
 
         let guard = PairingGuard::new(false, &[]);
         assert!(!guard.require_pairing());

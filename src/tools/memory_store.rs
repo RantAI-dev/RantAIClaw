@@ -183,10 +183,7 @@ mod tests {
     #[tokio::test]
     async fn store_blocked_in_readonly_mode() {
         let (_tmp, mem) = test_mem();
-        let readonly = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
+        let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
         let tool = MemoryStoreTool::new(mem.clone(), readonly);
         let result = tool
             .execute(json!({"key": "lang", "content": "Prefers Rust"}))
@@ -204,10 +201,7 @@ mod tests {
     #[tokio::test]
     async fn store_blocked_when_rate_limited() {
         let (_tmp, mem) = test_mem();
-        let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
+        let limited = Arc::new(SecurityPolicy::default().with_max_actions_per_hour(0));
         let tool = MemoryStoreTool::new(mem.clone(), limited);
         let result = tool
             .execute(json!({"key": "lang", "content": "Prefers Rust"}))

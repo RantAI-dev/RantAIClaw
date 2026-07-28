@@ -311,10 +311,7 @@ mod tests {
     /// Read-only autonomy — every write-side skill tool must refuse before
     /// touching the filesystem or network.
     fn readonly_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        })
+        Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly))
     }
 
     #[tokio::test]

@@ -1203,10 +1203,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_blocked_in_readonly_mode() {
-        let readonly = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
+        let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
         let tool = ComposioTool::new("test-key", None, readonly);
         let result = tool
             .execute(json!({
@@ -1225,10 +1222,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_blocked_when_rate_limited() {
-        let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
+        let limited = Arc::new(SecurityPolicy::default().with_max_actions_per_hour(0));
         let tool = ComposioTool::new("test-key", None, limited);
         let result = tool
             .execute(json!({

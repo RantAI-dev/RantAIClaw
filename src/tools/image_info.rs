@@ -234,13 +234,13 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn test_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            workspace_dir: std::env::temp_dir(),
-            workspace_only: false,
-            forbidden_paths: vec![],
-            ..SecurityPolicy::default()
-        })
+        Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Full)
+                .with_workspace_dir(std::env::temp_dir())
+                .with_workspace_only(false)
+                .with_forbidden_paths(vec![]),
+        )
     }
 
     #[test]
