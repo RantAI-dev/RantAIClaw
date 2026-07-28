@@ -3720,9 +3720,14 @@ pub async fn start_channels_with_cancellation(
         channel_approval: if config.channels_config.autonomous_tools {
             None
         } else {
-            Some(Arc::new(crate::approval::ApprovalManager::from_config(
-                &config.autonomy,
-            )))
+            // Attach the same policy the tools hold, so a config reload that
+            // changes autonomy also moves the approval gate. Built once at
+            // startup, this manager would otherwise stay pinned to the level
+            // that was on disk at boot.
+            Some(Arc::new(
+                crate::approval::ApprovalManager::from_config(&config.autonomy)
+                    .with_policy(Arc::clone(&security)),
+            ))
         },
         approval_owners: Arc::clone(&approval_owners),
         // 5-minute deadline: an unanswered in-chat approval auto-denies so a

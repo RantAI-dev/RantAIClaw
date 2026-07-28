@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -66,6 +67,11 @@ pub struct ApprovalManager {
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    /// Live autonomy source. When set, `needs_approval` reads through this
+    /// instead of the boot-time `autonomy_level`, so a config hot-reload that
+    /// tightens autonomy also tightens the approval gate. `None` keeps the
+    /// snapshot behaviour for callers that rebuild per turn anyway.
+    policy: Option<Arc<crate::security::SecurityPolicy>>,
 }
 
 impl ApprovalManager {
@@ -77,6 +83,23 @@ impl ApprovalManager {
             autonomy_level: config.level,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            policy: None,
+        }
+    }
+
+    /// Attach a live policy so the autonomy level is read at decision time.
+    #[must_use]
+    pub fn with_policy(mut self, policy: Arc<crate::security::SecurityPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Autonomy level to gate on: the live policy when one is attached,
+    /// otherwise the level captured at construction.
+    fn effective_autonomy(&self) -> AutonomyLevel {
+        match &self.policy {
+            Some(p) => p.effective_autonomy(),
+            None => self.autonomy_level,
         }
     }
 
@@ -84,13 +107,15 @@ impl ApprovalManager {
     ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
+        let autonomy = self.effective_autonomy();
+
         // Full autonomy never prompts.
-        if self.autonomy_level == AutonomyLevel::Full {
+        if autonomy == AutonomyLevel::Full {
             return false;
         }
 
         // ReadOnly blocks everything — handled elsewhere; no prompt needed.
-        if self.autonomy_level == AutonomyLevel::ReadOnly {
+        if autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
 
@@ -338,6 +363,64 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::AutonomyConfig;
+
+    /// The manager is built once when channels start. Before this, it cached
+    /// the boot autonomy level, so tightening autonomy at runtime left the
+    /// channel approval gate open — fail-open on the exact path that matters.
+    #[test]
+    fn needs_approval_follows_a_live_autonomy_tightening() {
+        let policy = Arc::new(crate::security::SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            ..crate::security::SecurityPolicy::default()
+        });
+        let mgr = ApprovalManager::from_config(&full_config()).with_policy(Arc::clone(&policy));
+
+        assert!(
+            !mgr.needs_approval("shell"),
+            "full autonomy should not prompt"
+        );
+
+        policy.set_autonomy(AutonomyLevel::Supervised);
+        assert!(
+            mgr.needs_approval("shell"),
+            "tightening autonomy at runtime must close the approval gate"
+        );
+    }
+
+    #[test]
+    fn needs_approval_follows_a_live_autonomy_loosening() {
+        let policy = Arc::new(crate::security::SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..crate::security::SecurityPolicy::default()
+        });
+        let mgr =
+            ApprovalManager::from_config(&supervised_config()).with_policy(Arc::clone(&policy));
+
+        assert!(
+            mgr.needs_approval("shell"),
+            "supervised should prompt for shell"
+        );
+
+        policy.set_autonomy(AutonomyLevel::Full);
+        assert!(
+            !mgr.needs_approval("shell"),
+            "loosening autonomy at runtime must open the gate"
+        );
+    }
+
+    /// Callers that rebuild per turn are unaffected: with no policy attached
+    /// the manager keeps reading its construction-time snapshot.
+    #[test]
+    fn needs_approval_without_a_policy_uses_the_snapshot() {
+        assert!(!ApprovalManager::from_config(&full_config()).needs_approval("shell"));
+        assert!(ApprovalManager::from_config(&supervised_config()).needs_approval("shell"));
+
+        let read_only = AutonomyConfig {
+            level: AutonomyLevel::ReadOnly,
+            ..AutonomyConfig::default()
+        };
+        assert!(!ApprovalManager::from_config(&read_only).needs_approval("shell"));
+    }
 
     fn supervised_config() -> AutonomyConfig {
         AutonomyConfig {
