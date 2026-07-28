@@ -520,8 +520,6 @@ fn build_tools_factory(
             config.api_key.as_deref(),
             config,
         );
-        // Strict preset parity: drop `shell` on the gateway path too.
-        tools::apply_preset_tool_filter(&mut tools);
 
         // Skills define [[tools]] blocks in SKILL.toml that become real
         // callable shell/http tools.

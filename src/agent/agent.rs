@@ -424,12 +424,6 @@ impl Agent {
             config,
         );
 
-        // Strict preset filter: when the active policy is Strict, drop the
-        // `shell` tool so the model can't even attempt a call (plan-mode
-        // analog). Shared with the channels runtime via `apply_preset_tool_filter`
-        // so Strict means the same thing on every surface.
-        tools::apply_preset_tool_filter(&mut tools);
-
         // MCP discovery — spawn each configured server, query
         // `tools/list`, splice each tool into the registry as an
         // `McpTool`. Failures are non-fatal (logged); the agent

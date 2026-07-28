@@ -362,12 +362,21 @@ impl PromptSection for SafetySection {
                      storing or forgetting memory, sending messages, opening \
                      SSH/PTY sessions, and installing skills are all refused by \
                      policy — not gated behind a prompt, refused. Do not offer \
-                     to do them.\n\
-                     - The `shell` tool is normally removed from your tool list \
-                     in this preset. If it is still listed — the policy can \
-                     change mid-session, and the list you were handed may \
-                     predate that — do not call it; every command is denied.\n\
-                     - You can still read files (`file_read`), search the \
+                     to do them.\n",
+                );
+                // Derived from the registry actually handed to this turn, so
+                // the prompt states what is true instead of hedging about a
+                // list that might be stale.
+                if ctx.tools.iter().any(|t| t.name() == "shell") {
+                    out.push_str(
+                        "- `shell` is listed but every command is refused under \
+                         this policy. Do not call it.\n",
+                    );
+                } else {
+                    out.push_str("- The shell tool is not available in this session.\n");
+                }
+                out.push_str(
+                    "- You can still read files (`file_read`), search the \
                      workspace, recall memory (`memory_recall`), search the \
                      web, inspect tasks, and reason.\n\
                      - For any task that would normally require running a \
@@ -796,6 +805,39 @@ mod tests {
         );
     }
 
+    /// Strict now refuses at the gate rather than unregistering the tool, so
+    /// `shell` really is in the list. The prompt must say that plainly —
+    /// telling the model a listed tool is absent invites it to report the
+    /// wrong reason for a refusal.
+    #[test]
+    fn safety_section_strict_names_shell_as_listed_but_refused() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> =
+            vec![Box::new(DescriptorTool::new("shell", "run a command"))];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: Some(PolicyPreset::Strict),
+            allowed_commands: &[],
+        };
+        let out = SafetySection.build(&ctx).unwrap();
+        assert!(
+            out.contains("is listed but every command is refused"),
+            "with shell in the registry the text must own that: {out}"
+        );
+        assert!(
+            !out.contains("not available in this session"),
+            "must not claim shell is absent when it is listed: {out}"
+        );
+    }
+
     #[test]
     fn safety_section_strict_states_the_full_read_only_refusal() {
         use crate::approval::policy_writer::PolicyPreset;
@@ -825,15 +867,11 @@ mod tests {
             out.contains("refused by policy"),
             "must say refused rather than prompted: {out}"
         );
-        // The registry filter runs at startup, so a mid-session switch can leave
-        // `shell` listed. The text must not assert it is absent.
+        // This context has an empty tool list, so the text must say so
+        // outright rather than hedge about a registration that may be stale.
         assert!(
-            !out.contains("it is not in your tool list"),
-            "must not claim shell is definitely absent: {out}"
-        );
-        assert!(
-            out.contains("still listed"),
-            "must cover the stale-registration case: {out}"
+            out.contains("shell tool is not available in this session"),
+            "with no shell in the registry the text must say so plainly: {out}"
         );
     }
 
