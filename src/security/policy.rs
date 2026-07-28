@@ -1074,6 +1074,11 @@ impl SecurityPolicy {
         {
             return None;
         }
+        // Read through the override, matching `is_command_allowed`. Reading the
+        // boot field directly would name a command the live policy no longer
+        // blocks — or stay silent about one it now does.
+        // Hoisted: the accessor clones a Vec and this loop runs per segment.
+        let config_allowed = self.effective_allowed_commands();
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
             let mut words = cmd_part.split_whitespace();
@@ -1084,12 +1089,12 @@ impl SecurityPolicy {
             if base_cmd.is_empty() {
                 continue;
             }
-            let on_boot = self.allowed_commands.iter().any(|a| a == base_cmd);
-            let on_runtime = !on_boot && {
+            let on_config_list = config_allowed.iter().any(|a| a == base_cmd);
+            let on_runtime = !on_config_list && {
                 let set = self.runtime_allowlist.read();
                 set.contains(base_cmd)
             };
-            if !on_boot && !on_runtime {
+            if !on_config_list && !on_runtime {
                 return Some(base_cmd.to_string());
             }
         }
@@ -1166,6 +1171,57 @@ mod tests {
         daemon.set_autonomy(AutonomyLevel::ReadOnly);
         assert!(!tool.can_act());
         assert!(!tool.is_command_allowed("ls"));
+    }
+
+    /// `first_unallowed_basename` feeds the approval prompt. It read the boot
+    /// list directly while `is_command_allowed` read through the override, so
+    /// after a reload that narrowed the allowlist the two disagreed.
+    #[test]
+    fn first_unallowed_basename_names_a_command_dropped_by_a_reload() {
+        let policy = default_policy();
+        assert_eq!(policy.first_unallowed_basename("git status"), None);
+
+        policy.set_allowed_commands(vec!["echo".to_string()]);
+        assert_eq!(
+            policy.first_unallowed_basename("git status"),
+            Some("git".to_string()),
+            "a command dropped by a reload must be named as unallowed"
+        );
+    }
+
+    /// The invariant that matters: the prompt must name the command the gate
+    /// actually rejected. Pre-fix this named `brew` — the wrong one — because
+    /// `git` still looked allowed on the stale boot list.
+    #[test]
+    fn first_unallowed_basename_matches_is_command_allowed_after_narrowing() {
+        let policy = default_policy();
+        let cmd = "git status && brew install x";
+
+        policy.set_allowed_commands(vec!["echo".to_string()]);
+        assert!(!policy.is_command_allowed(cmd));
+        assert_eq!(
+            policy.first_unallowed_basename(cmd),
+            Some("git".to_string()),
+            "the prompt must name the same command the gate rejected"
+        );
+    }
+
+    /// Runtime grants (`/allow`) stay a separate, still-working layer.
+    #[test]
+    fn first_unallowed_basename_still_honours_runtime_grants() {
+        let policy = default_policy();
+        policy.set_allowed_commands(vec!["echo".to_string()]);
+        assert_eq!(
+            policy.first_unallowed_basename("git status"),
+            Some("git".to_string())
+        );
+
+        policy.add_runtime_command("git", false).unwrap();
+        assert_eq!(
+            policy.first_unallowed_basename("git status"),
+            None,
+            "a runtime grant must still satisfy the check"
+        );
     }
 
     #[test]
