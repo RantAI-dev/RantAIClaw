@@ -487,10 +487,16 @@ fn build_tools_factory(
     runtime: Arc<dyn runtime::RuntimeAdapter>,
     mem: Arc<dyn Memory>,
 ) -> ToolsFactory {
+    // One tracker for the process. The registry is rebuilt per turn so policy
+    // stays fresh, but the rate-limit window must NOT restart with it — that is
+    // what made `max_actions_per_hour` unenforceable on this path.
+    let tracker = Arc::new(crate::security::policy::ActionTracker::new());
     Arc::new(move |config: &Config| {
-        let security = Arc::new(SecurityPolicy::from_config(
+        let security = Arc::new(SecurityPolicy::from_config_with_shared_tracker(
             &config.autonomy,
             &config.workspace_dir,
+            None,
+            Arc::clone(&tracker),
         ));
         let (composio_key, composio_entity_id) = if config.composio.enabled {
             (
@@ -3780,6 +3786,59 @@ mod tests {
     /// setting was the one that failed open: no approval prompt, and a
     /// boot-pinned `can_act()` that still said yes.
     ///
+    /// The registry is rebuilt per turn so config stays fresh. The rate-limit
+    /// window is process state and must survive that rebuild, or
+    /// `max_actions_per_hour` is unenforceable on the gateway path.
+    ///
+    /// Asserts behaviour, not structure: `Tool` exposes no accessor to its
+    /// policy, so the budget is probed through `file_write`, which calls
+    /// `record_action()`.
+    #[tokio::test]
+    async fn tools_factory_shares_one_action_tracker_across_turns() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = ws.path().to_path_buf();
+        config.autonomy.max_actions_per_hour = 2;
+
+        let runtime: Arc<dyn runtime::RuntimeAdapter> =
+            Arc::from(runtime::create_runtime(&config.runtime).unwrap());
+        let factory = build_tools_factory(runtime, Arc::new(MockMemory));
+
+        let args = |n: u32| serde_json::json!({ "path": format!("n{n}.txt"), "content": "hi" });
+
+        // Turn one: spend the whole budget.
+        let tools_one = factory(&config);
+        let writer_one = tools_one
+            .iter()
+            .find(|t| t.name() == "file_write")
+            .expect("file_write should be registered");
+        for n in 0..2 {
+            let out = writer_one.execute(args(n)).await.unwrap();
+            assert!(
+                out.success,
+                "action {n} should be within budget: {:?}",
+                out.error
+            );
+        }
+
+        // Turn two: a freshly built registry must see the budget already spent.
+        let tools_two = factory(&config);
+        let writer_two = tools_two
+            .iter()
+            .find(|t| t.name() == "file_write")
+            .expect("file_write should be registered");
+        let out = writer_two.execute(args(2)).await.unwrap();
+        assert!(
+            !out.success,
+            "a rebuilt registry must NOT reset the hourly budget, got success with {:?}",
+            out.output
+        );
+        assert!(
+            out.error.unwrap_or_default().contains("Rate limit"),
+            "refusal should name the rate limit"
+        );
+    }
+
     /// Asserts behaviour, not structure: the same factory must produce a
     /// refusing `file_write` when handed a read-only config.
     #[tokio::test]
