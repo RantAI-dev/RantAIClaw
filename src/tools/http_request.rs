@@ -497,10 +497,7 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn test_tool(allowed_domains: Vec<&str>) -> HttpRequestTool {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            ..SecurityPolicy::default()
-        });
+        let security = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::Supervised));
         HttpRequestTool::new(
             security,
             allowed_domains.into_iter().map(String::from).collect(),
@@ -775,10 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_blocks_readonly_mode() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
+        let security = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
         let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
@@ -790,10 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_blocks_when_rate_limited() {
-        let security = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
+        let security = Arc::new(SecurityPolicy::default().with_max_actions_per_hour(0));
         let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
         let result = tool
             .execute(json!({"url": "https://example.com"}))

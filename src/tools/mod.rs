@@ -588,21 +588,17 @@ mod tests {
     /// the registry was never what enforced this — these must keep passing.
     #[test]
     fn strict_refuses_an_allowlisted_command() {
-        let policy = crate::security::SecurityPolicy {
-            autonomy: crate::security::AutonomyLevel::ReadOnly,
-            ..crate::security::SecurityPolicy::default()
-        };
+        let policy = crate::security::SecurityPolicy::default()
+            .with_autonomy(crate::security::AutonomyLevel::ReadOnly);
         // `ls` is on the default allowlist; ReadOnly refuses it anyway.
-        assert!(policy.allowed_commands.iter().any(|c| c == "ls"));
+        assert!(policy.fields().allowed_commands.iter().any(|c| c == "ls"));
         assert!(!policy.is_command_allowed("ls -la"));
     }
 
     #[test]
     fn strict_cannot_act() {
-        let policy = crate::security::SecurityPolicy {
-            autonomy: crate::security::AutonomyLevel::ReadOnly,
-            ..crate::security::SecurityPolicy::default()
-        };
+        let policy = crate::security::SecurityPolicy::default()
+            .with_autonomy(crate::security::AutonomyLevel::ReadOnly);
         assert!(!policy.can_act());
     }
 

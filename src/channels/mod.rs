@@ -613,7 +613,9 @@ fn decrypt_optional_secret_for_runtime_reload(
     Ok(())
 }
 
-async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
+async fn load_runtime_defaults_from_config_file(
+    path: &Path,
+) -> Result<(ChannelRuntimeDefaults, crate::config::AutonomyConfig)> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -627,7 +629,10 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     }
 
     parsed.apply_env_overrides();
-    Ok(runtime_defaults_from_config(&parsed))
+    // Hand back the whole `[autonomy]` section, not just the two fields the
+    // couriers used to carry: `apply_config` refreshes all eight at once.
+    let autonomy = parsed.autonomy.clone();
+    Ok((runtime_defaults_from_config(&parsed), autonomy))
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -650,7 +655,8 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
+    let (next_defaults, next_autonomy) =
+        load_runtime_defaults_from_config_file(&config_path).await?;
     // Snapshot the currently-applied defaults BEFORE we overwrite the store, so we
     // can tell whether the operator actually changed the provider/model.
     let prev_defaults = runtime_defaults_snapshot(ctx);
@@ -662,18 +668,14 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     // the success path meant `rantaiclaw autonomy off` bundled with a broken
     // provider silently never applied.
     //
-    // Replace the config allowlist outright rather than folding it into the
-    // runtime set. The old loop used `add_runtime_command`, which has no removal
-    // path, so a reload could only ever *widen* the boundary: switching to a
-    // stricter preset left every previously-allowed command allowed until the
-    // daemon was restarted. `set_allowed_commands` applies the new list in both
-    // directions and leaves `/allow <cmd> --persist` operator grants alone.
-    ctx.security
-        .set_allowed_commands(next_defaults.allowed_commands.as_ref().clone());
-    // The autonomy level is a deliberate operator setting, applied verbatim so
-    // `rantaiclaw autonomy off`/`strict`/etc. takes effect on the running daemon
-    // at the next message, no restart required.
-    ctx.security.set_autonomy(next_defaults.autonomy_level);
+    // Swap the whole config half in one write. This previously patched only two
+    // of the eight `[autonomy]` fields, via per-field override slots; the other
+    // six — forbidden_paths, workspace_only, block_high_risk_commands,
+    // require_approval_for_medium_risk, and the two budgets — stayed frozen at
+    // whatever was on disk when the daemon started. Operator grants in
+    // `runtime_allowlist` (`/allow <cmd> --persist`), the rate-limit window and
+    // the approval registry are process state and are deliberately untouched.
+    ctx.security.apply_config(&next_autonomy);
 
     let next_default_provider = match providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
@@ -5201,16 +5203,21 @@ BTC is currently around $65,000 based on latest tool output."#
         let temp = tempfile::TempDir::new().expect("temp dir");
         let config_path = temp.path().join("config.toml");
 
-        let write_config = |provider: &str, level: crate::security::AutonomyLevel| {
-            let mut config = crate::config::Config::default();
-            config.default_provider = Some(provider.to_string());
-            config.autonomy.level = level;
-            let toml = toml::to_string(&config).expect("serialize config");
-            std::fs::write(&config_path, toml).expect("write config");
-        };
+        let write_config =
+            |provider: &str, level: crate::security::AutonomyLevel, forbidden: Vec<String>| {
+                let mut config = crate::config::Config::default();
+                config.default_provider = Some(provider.to_string());
+                config.autonomy.level = level;
+                config.autonomy.workspace_only = false;
+                if !forbidden.is_empty() {
+                    config.autonomy.forbidden_paths = forbidden;
+                }
+                let toml = toml::to_string(&config).expect("serialize config");
+                std::fs::write(&config_path, toml).expect("write config");
+            };
 
         // Initial: a buildable provider at Full autonomy.
-        write_config("openrouter", crate::security::AutonomyLevel::Full);
+        write_config("openrouter", crate::security::AutonomyLevel::Full, vec![]);
 
         let mut channels_by_name = HashMap::new();
         let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
@@ -5268,6 +5275,7 @@ BTC is currently around $65,000 based on latest tool output."#
         write_config(
             "totally-unknown-provider-xyz",
             crate::security::AutonomyLevel::ReadOnly,
+            vec![],
         );
 
         maybe_apply_runtime_config_update(&ctx)
@@ -5284,6 +5292,29 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.security.effective_autonomy(),
             crate::security::AutonomyLevel::ReadOnly,
             "autonomy downgrade must apply even when the new provider can't be built"
+        );
+
+        // A reload must refresh the WHOLE `[autonomy]` section, not just the two
+        // fields the old override slots carried. `forbidden_paths` was frozen at
+        // whatever was on disk when the daemon started, so this phase fails on
+        // pre-fix code. Autonomy is back at Full so the assertion cannot pass
+        // vacuously through the read-only short-circuit.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_config(
+            "openrouter",
+            crate::security::AutonomyLevel::Full,
+            vec!["/newly-forbidden".to_string()],
+        );
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("third apply");
+        assert_eq!(
+            ctx.security.effective_autonomy(),
+            crate::security::AutonomyLevel::Full
+        );
+        assert!(
+            !ctx.security.is_path_allowed("/newly-forbidden/secret.txt"),
+            "a forbidden path added by a reload must be enforced without a restart"
         );
 
         {

@@ -73,19 +73,47 @@ impl ActionTracker {
     }
 }
 
+/// The config-derived half of a policy, swapped as one unit on reload.
+///
+/// Everything here comes from `[autonomy]` in `config.toml`. Process state —
+/// the rate-limit window, operator-granted allowlist, approval registry —
+/// deliberately lives on [`SecurityPolicy`] itself and is NOT part of this
+/// struct, because a refresh must not reset it.
+#[derive(Debug, Clone)]
+pub struct PolicyFields {
+    pub autonomy: AutonomyLevel,
+    pub allowed_commands: Vec<String>,
+    pub forbidden_paths: Vec<String>,
+    pub workspace_only: bool,
+    pub block_high_risk_commands: bool,
+    pub require_approval_for_medium_risk: bool,
+    pub max_actions_per_hour: u32,
+    pub max_cost_per_day_cents: u32,
+}
+
+impl PolicyFields {
+    fn from_config(c: &crate::config::AutonomyConfig) -> Self {
+        Self {
+            autonomy: c.level,
+            allowed_commands: c.allowed_commands.clone(),
+            forbidden_paths: c.forbidden_paths.clone(),
+            workspace_only: c.workspace_only,
+            block_high_risk_commands: c.block_high_risk_commands,
+            require_approval_for_medium_risk: c.require_approval_for_medium_risk,
+            max_actions_per_hour: c.max_actions_per_hour,
+            max_cost_per_day_cents: c.max_cost_per_day_cents,
+        }
+    }
+}
+
 /// Security policy enforced on all tool executions
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
-    pub autonomy: AutonomyLevel,
+    /// Config half, swapped wholesale on reload. Private: every reader goes
+    /// through [`Self::fields`], so the compiler enforces that nothing reads a
+    /// stale snapshot.
+    fields: Arc<RwLock<Arc<PolicyFields>>>,
     pub workspace_dir: PathBuf,
-    pub workspace_only: bool,
-    /// Boot-time allowlist from config (immutable after load — auditable).
-    pub allowed_commands: Vec<String>,
-    pub forbidden_paths: Vec<String>,
-    pub max_actions_per_hour: u32,
-    pub max_cost_per_day_cents: u32,
-    pub require_approval_for_medium_risk: bool,
-    pub block_high_risk_commands: bool,
     /// Rate-limit window. Shared by handle: a caller that rebuilds its policy
     /// per turn must carry the same tracker forward, or the hourly budget
     /// silently restarts every turn.
@@ -106,30 +134,16 @@ pub struct SecurityPolicy {
     /// attached after construction (`Default::default()` leaves it
     /// `None`).
     pub pending: Arc<RwLock<Option<Arc<PendingApprovals>>>>,
-    /// Live override for the autonomy level, shared across clones via the
-    /// inner `Arc` (mirrors `runtime_allowlist`). `None` means "use the
-    /// boot-time `autonomy` field above". A running daemon writes this on
-    /// config hot-reload so `rantaiclaw autonomy <preset>` (e.g. Off → Full)
-    /// takes effect without a restart. Read through `effective_autonomy`.
-    pub autonomy_runtime: Arc<RwLock<Option<AutonomyLevel>>>,
-    /// Live override for the shell allowlist, shared across clones like
-    /// [`Self::autonomy_runtime`]. `None` means "use the boot-time
-    /// `allowed_commands` above". Read through
-    /// [`Self::effective_allowed_commands`].
-    ///
-    /// Exists because the config hot-reload previously pushed the new
-    /// allowlist into [`Self::runtime_allowlist`], which has no removal path —
-    /// so a reload could only ever *widen* the boundary and a switch to a
-    /// stricter preset left every previously-allowed command allowed until
-    /// restart. This replaces the list outright, in both directions.
-    pub allowed_commands_runtime: Arc<RwLock<Option<Vec<String>>>>,
 }
 
 impl Default for SecurityPolicy {
     fn default() -> Self {
-        Self {
+        // Values preserved verbatim from before `PolicyFields` existed. Do NOT
+        // rebuild this from `AutonomyConfig::default()`: that uses
+        // `max_actions_per_hour: 200` and a different allowlist, which would
+        // silently change the budget under dozens of tool tests.
+        let fields = PolicyFields {
             autonomy: AutonomyLevel::Supervised,
-            workspace_dir: PathBuf::from("."),
             workspace_only: true,
             allowed_commands: vec![
                 "git".into(),
@@ -172,12 +186,14 @@ impl Default for SecurityPolicy {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: false,
+        };
+        Self {
+            fields: Arc::new(RwLock::new(Arc::new(fields))),
+            workspace_dir: PathBuf::from("."),
             tracker: Arc::new(ActionTracker::new()),
             runtime_allowlist: Arc::new(RwLock::new(HashSet::new())),
             policy_dir: None,
             pending: Arc::new(RwLock::new(None)),
-            autonomy_runtime: Arc::new(RwLock::new(None)),
-            allowed_commands_runtime: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -586,7 +602,7 @@ impl SecurityPolicy {
         let risk = self.command_risk_level(command);
 
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands {
+            if self.fields().block_high_risk_commands {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.effective_autonomy() == AutonomyLevel::Supervised && !approved {
@@ -599,7 +615,7 @@ impl SecurityPolicy {
 
         if risk == CommandRiskLevel::Medium
             && self.effective_autonomy() == AutonomyLevel::Supervised
-            && self.require_approval_for_medium_risk
+            && self.fields().require_approval_for_medium_risk
             && !approved
         {
             return Err(
@@ -615,6 +631,85 @@ impl SecurityPolicy {
     // per-segment allowlist check. Each gate targets a specific bypass
     // technique. If any gate rejects, the whole command is blocked.
 
+    /// The autonomy level currently in force. Reads the live config half, so a
+    /// hot-reloaded level takes effect on `SecurityPolicy` clones already held
+    /// by running tools.
+    pub fn effective_autonomy(&self) -> AutonomyLevel {
+        self.fields().autonomy
+    }
+
+    /// Cheap snapshot of the config half. Never hold the guard — this clones
+    /// an `Arc` and releases immediately.
+    #[must_use]
+    pub fn fields(&self) -> Arc<PolicyFields> {
+        Arc::clone(&self.fields.read())
+    }
+
+    /// Apply a config change to this running policy. Shared across every clone
+    /// via the inner `Arc`, so tools already built observe it. Process state —
+    /// the rate-limit window, operator grants, the approval registry — is
+    /// untouched by design.
+    pub fn apply_config(&self, config: &crate::config::AutonomyConfig) {
+        *self.fields.write() = Arc::new(PolicyFields::from_config(config));
+    }
+
+    /// Builder helper. Installs a **new** slot rather than writing through the
+    /// existing one: `base.clone().with_autonomy(x)` must not mutate `base`.
+    /// Use [`Self::apply_config`] when you do want every clone to observe it.
+    fn with_fields(mut self, mutate: impl FnOnce(&mut PolicyFields)) -> Self {
+        let mut next = (*self.fields()).clone();
+        mutate(&mut next);
+        self.fields = Arc::new(RwLock::new(Arc::new(next)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_autonomy(self, level: AutonomyLevel) -> Self {
+        self.with_fields(|f| f.autonomy = level)
+    }
+
+    #[must_use]
+    pub fn with_allowed_commands(self, cmds: Vec<String>) -> Self {
+        self.with_fields(|f| f.allowed_commands = cmds)
+    }
+
+    #[must_use]
+    pub fn with_forbidden_paths(self, paths: Vec<String>) -> Self {
+        self.with_fields(|f| f.forbidden_paths = paths)
+    }
+
+    #[must_use]
+    pub fn with_workspace_only(self, on: bool) -> Self {
+        self.with_fields(|f| f.workspace_only = on)
+    }
+
+    #[must_use]
+    pub fn with_block_high_risk_commands(self, on: bool) -> Self {
+        self.with_fields(|f| f.block_high_risk_commands = on)
+    }
+
+    #[must_use]
+    pub fn with_require_approval_for_medium_risk(self, on: bool) -> Self {
+        self.with_fields(|f| f.require_approval_for_medium_risk = on)
+    }
+
+    #[must_use]
+    pub fn with_max_actions_per_hour(self, n: u32) -> Self {
+        self.with_fields(|f| f.max_actions_per_hour = n)
+    }
+
+    #[must_use]
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = dir;
+        self
+    }
+
+    /// The shell allowlist in force now: the hot-reloaded list if one has been
+    /// set, else the boot-time `allowed_commands`.
+    pub fn effective_allowed_commands(&self) -> Vec<String> {
+        self.fields().allowed_commands.clone()
+    }
+
     /// Check if a shell command is allowed.
     ///
     /// Validates the **entire** command string, not just the first word:
@@ -624,42 +719,6 @@ impl SecurityPolicy {
     /// - Blocks single `&` background chaining (`&&` remains supported)
     /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
-    /// The autonomy level currently in force: the live override applied via
-    /// [`set_autonomy`] if present, else the boot-time `autonomy` field. All
-    /// gate checks read through this so a hot-reloaded level takes effect on
-    /// `SecurityPolicy` clones already held by running tools.
-    pub fn effective_autonomy(&self) -> AutonomyLevel {
-        self.autonomy_runtime.read().unwrap_or(self.autonomy)
-    }
-
-    /// Hot-swap the autonomy level on a running policy. Shared across every
-    /// clone via the inner `Arc`, so tools holding their own `SecurityPolicy`
-    /// clone observe the change immediately — used by the channel config
-    /// hot-reload so `rantaiclaw autonomy <preset>` applies without a restart.
-    pub fn set_autonomy(&self, level: AutonomyLevel) {
-        *self.autonomy_runtime.write() = Some(level);
-    }
-
-    /// The shell allowlist in force now: the hot-reloaded list if one has been
-    /// set, else the boot-time `allowed_commands`.
-    pub fn effective_allowed_commands(&self) -> Vec<String> {
-        self.allowed_commands_runtime
-            .read()
-            .clone()
-            .unwrap_or_else(|| self.allowed_commands.clone())
-    }
-
-    /// Replace the shell allowlist on a running policy, shared across every
-    /// clone via the inner `Arc` so tools already holding one observe it.
-    ///
-    /// Unlike [`Self::add_runtime_command`] this is a full replacement, so it
-    /// **narrows** as well as widens — the point of it. Operator grants in
-    /// `runtime_allowlist` (`/allow <cmd> --persist`) are deliberate decisions
-    /// rather than config state and are left untouched.
-    pub fn set_allowed_commands(&self, commands: Vec<String>) {
-        *self.allowed_commands_runtime.write() = Some(commands);
-    }
-
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.effective_autonomy() == AutonomyLevel::ReadOnly {
             return false;
@@ -717,15 +776,9 @@ impl SecurityPolicy {
                 continue;
             }
 
-            // The config list is read through the override so a hot-reloaded
-            // allowlist can drop entries, not only add them.
-            let on_config_list = {
-                let guard = self.allowed_commands_runtime.read();
-                match guard.as_ref() {
-                    Some(list) => list.iter().any(|a| a == base_cmd),
-                    None => self.allowed_commands.iter().any(|a| a == base_cmd),
-                }
-            };
+            // Read the live config half so a hot-reloaded allowlist can drop
+            // entries, not only add them.
+            let on_config_list = self.fields().allowed_commands.iter().any(|a| a == base_cmd);
             let on_runtime_list = !on_config_list && {
                 let set = self.runtime_allowlist.read();
                 set.contains(base_cmd)
@@ -843,13 +896,13 @@ impl SecurityPolicy {
         };
 
         // Block absolute paths when workspace_only is set
-        if self.workspace_only && Path::new(&expanded).is_absolute() {
+        if self.fields().workspace_only && Path::new(&expanded).is_absolute() {
             return false;
         }
 
         // Block forbidden paths using path-component-aware matching
         let expanded_path = Path::new(&expanded);
-        for forbidden in &self.forbidden_paths {
+        for forbidden in &self.fields().forbidden_paths {
             let forbidden_expanded = if let Some(stripped) = forbidden.strip_prefix("~/") {
                 if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
                     home.join(stripped).to_string_lossy().to_string()
@@ -922,12 +975,12 @@ impl SecurityPolicy {
     /// Returns `true` if the action is allowed, `false` if rate-limited.
     pub fn record_action(&self) -> bool {
         let count = self.tracker.record();
-        count <= self.max_actions_per_hour as usize
+        count <= self.fields().max_actions_per_hour as usize
     }
 
     /// Check if the rate limit would be exceeded without recording.
     pub fn is_rate_limited(&self) -> bool {
-        self.tracker.count() >= self.max_actions_per_hour as usize
+        self.tracker.count() >= self.fields().max_actions_per_hour as usize
     }
 
     /// Build from config sections.
@@ -936,23 +989,6 @@ impl SecurityPolicy {
         workspace_dir: &Path,
     ) -> Self {
         Self::from_config_with_policy_dir(autonomy_config, workspace_dir, None)
-    }
-
-    /// Build from config while REUSING an existing action tracker.
-    ///
-    /// The rate-limit window is process state, not config state: a caller that
-    /// rebuilds its policy per turn (the gateway tool factory) must carry the
-    /// same tracker forward or the hourly budget silently restarts every turn.
-    pub fn from_config_with_shared_tracker(
-        autonomy_config: &crate::config::AutonomyConfig,
-        workspace_dir: &Path,
-        policy_dir: Option<PathBuf>,
-        tracker: Arc<ActionTracker>,
-    ) -> Self {
-        Self {
-            tracker,
-            ..Self::from_config_with_policy_dir(autonomy_config, workspace_dir, policy_dir)
-        }
     }
 
     /// Build from config sections and bind to a `policy_dir`. If the dir
@@ -981,21 +1017,14 @@ impl SecurityPolicy {
         };
 
         Self {
-            autonomy: autonomy_config.level,
+            fields: Arc::new(RwLock::new(Arc::new(PolicyFields::from_config(
+                autonomy_config,
+            )))),
             workspace_dir: workspace_dir.to_path_buf(),
-            workspace_only: autonomy_config.workspace_only,
-            allowed_commands: autonomy_config.allowed_commands.clone(),
-            forbidden_paths: autonomy_config.forbidden_paths.clone(),
-            max_actions_per_hour: autonomy_config.max_actions_per_hour,
-            max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
-            require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
-            block_high_risk_commands: autonomy_config.block_high_risk_commands,
             tracker: Arc::new(ActionTracker::new()),
             runtime_allowlist: Arc::new(RwLock::new(runtime_set)),
             policy_dir,
             pending: Arc::new(RwLock::new(None)),
-            autonomy_runtime: Arc::new(RwLock::new(None)),
-            allowed_commands_runtime: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1111,17 +1140,11 @@ mod tests {
     }
 
     fn readonly_policy() -> SecurityPolicy {
-        SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        }
+        SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly)
     }
 
     fn full_policy() -> SecurityPolicy {
-        SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            ..SecurityPolicy::default()
-        }
+        SecurityPolicy::default().with_autonomy(AutonomyLevel::Full)
     }
 
     // ── AutonomyLevel ────────────────────────────────────────
@@ -1151,37 +1174,108 @@ mod tests {
         assert!(default_policy().can_act());
     }
 
+    /// The gap this whole change exists to close: only `autonomy` and
+    /// `allowed_commands` could be refreshed, via per-field override slots. The
+    /// other six stayed frozen at whatever was on disk when the process
+    /// started. This asserts all eight move together.
     #[test]
-    fn set_autonomy_hot_swaps_across_clones() {
-        // A running daemon shares its SecurityPolicy by clone; the autonomy
-        // level must hot-swap through the shared `autonomy_runtime` Arc so a
-        // tool holding its own clone sees the new level without being rebuilt
-        // — the channel config hot-reload relies on exactly this.
-        let daemon = default_policy(); // Supervised + default allowlist
+    fn apply_config_swaps_every_config_field() {
+        let policy = SecurityPolicy::default();
+        let next = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Full,
+            allowed_commands: vec!["docker".to_string()],
+            forbidden_paths: vec!["/secret".to_string()],
+            workspace_only: false,
+            block_high_risk_commands: true,
+            require_approval_for_medium_risk: false,
+            max_actions_per_hour: 99,
+            max_cost_per_day_cents: 4242,
+            ..crate::config::AutonomyConfig::default()
+        };
+        policy.apply_config(&next);
+
+        let f = policy.fields();
+        assert_eq!(f.autonomy, AutonomyLevel::Full);
+        assert_eq!(f.allowed_commands, vec!["docker".to_string()]);
+        assert_eq!(f.forbidden_paths, vec!["/secret".to_string()]);
+        assert!(!f.workspace_only);
+        assert!(f.block_high_risk_commands);
+        assert!(!f.require_approval_for_medium_risk);
+        assert_eq!(f.max_actions_per_hour, 99);
+        // No production reader today, so this assertion is its only coverage.
+        assert_eq!(f.max_cost_per_day_cents, 4242);
+    }
+
+    /// Replaces `set_autonomy_hot_swaps_across_clones`. Tools clone the policy
+    /// at construction, so a refresh has to reach through the inner `Arc` or it
+    /// reaches nothing that matters.
+    #[test]
+    fn apply_config_is_visible_through_a_clone() {
+        let daemon = default_policy();
         let tool = daemon.clone();
-        // Supervised: a non-allowlisted command is blocked for the tool.
-        assert!(!tool.is_command_allowed("kubectl get pods"));
-        // Operator flips autonomy to Full on the daemon's policy handle.
-        daemon.set_autonomy(AutonomyLevel::Full);
-        // The clone observes it immediately via the shared override Arc.
-        assert_eq!(tool.effective_autonomy(), AutonomyLevel::Full);
-        assert!(tool.is_command_allowed("kubectl get pods"));
-        // Tightening back propagates too (the level is a deliberate setting,
-        // applied verbatim — not append-only like the allowlist).
-        daemon.set_autonomy(AutonomyLevel::ReadOnly);
-        assert!(!tool.can_act());
-        assert!(!tool.is_command_allowed("ls"));
+        assert!(tool.is_command_allowed("ls -la"));
+
+        daemon.apply_config(&crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            allowed_commands: vec!["echo".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
+
+        assert_eq!(tool.effective_autonomy(), AutonomyLevel::Supervised);
+        assert!(
+            !tool.is_command_allowed("ls -la"),
+            "a clone must observe an allowlist narrowed on the original"
+        );
+        assert!(tool.is_command_allowed("echo hi"));
+    }
+
+    /// Process state, not config state: refreshing config must not hand the
+    /// caller a fresh hourly budget.
+    #[test]
+    fn apply_config_keeps_the_action_budget() {
+        let policy = SecurityPolicy::default();
+        policy.record_action();
+        policy.record_action();
+        assert_eq!(policy.tracker.count(), 2);
+
+        policy.apply_config(&crate::config::AutonomyConfig::default());
+        assert_eq!(
+            policy.tracker.count(),
+            2,
+            "the rate-limit window must survive a config refresh"
+        );
+    }
+
+    /// `/allow <cmd>` is a deliberate operator decision, not config state.
+    #[test]
+    fn apply_config_keeps_operator_granted_commands() {
+        let policy = default_policy();
+        policy.add_runtime_command("brew", false).unwrap();
+        assert!(policy.is_command_allowed("brew install x"));
+
+        policy.apply_config(&crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            allowed_commands: vec!["echo".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
+        assert!(
+            policy.is_command_allowed("brew install x"),
+            "an operator grant must survive a config refresh"
+        );
     }
 
     /// `first_unallowed_basename` feeds the approval prompt. It read the boot
-    /// list directly while `is_command_allowed` read through the override, so
-    /// after a reload that narrowed the allowlist the two disagreed.
+    /// list directly while `is_command_allowed` read the live list, so after a
+    /// reload that narrowed the allowlist the two disagreed.
     #[test]
     fn first_unallowed_basename_names_a_command_dropped_by_a_reload() {
         let policy = default_policy();
         assert_eq!(policy.first_unallowed_basename("git status"), None);
 
-        policy.set_allowed_commands(vec!["echo".to_string()]);
+        policy.apply_config(&crate::config::AutonomyConfig {
+            allowed_commands: vec!["echo".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
         assert_eq!(
             policy.first_unallowed_basename("git status"),
             Some("git".to_string()),
@@ -1197,7 +1291,10 @@ mod tests {
         let policy = default_policy();
         let cmd = "git status && brew install x";
 
-        policy.set_allowed_commands(vec!["echo".to_string()]);
+        policy.apply_config(&crate::config::AutonomyConfig {
+            allowed_commands: vec!["echo".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
         assert!(!policy.is_command_allowed(cmd));
         assert_eq!(
             policy.first_unallowed_basename(cmd),
@@ -1210,7 +1307,10 @@ mod tests {
     #[test]
     fn first_unallowed_basename_still_honours_runtime_grants() {
         let policy = default_policy();
-        policy.set_allowed_commands(vec!["echo".to_string()]);
+        policy.apply_config(&crate::config::AutonomyConfig {
+            allowed_commands: vec!["echo".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
         assert_eq!(
             policy.first_unallowed_basename("git status"),
             Some("git".to_string())
@@ -1222,54 +1322,6 @@ mod tests {
             None,
             "a runtime grant must still satisfy the check"
         );
-    }
-
-    #[test]
-    fn set_allowed_commands_narrows_across_clones() {
-        // The channel/daemon hot-reload could only ever *widen* the shell
-        // allowlist: it pushed config entries into `runtime_allowlist`, which
-        // has no removal path, so switching to a stricter preset left every
-        // previously-allowed command allowed until a restart. Tightening has to
-        // reach a tool that already holds its own clone.
-        let daemon = default_policy();
-        let tool = daemon.clone();
-        assert!(tool.is_command_allowed("ls -la"));
-
-        daemon.set_allowed_commands(vec!["echo".to_string()]);
-        assert!(
-            !tool.is_command_allowed("ls -la"),
-            "a command dropped from the allowlist must stop being allowed"
-        );
-        assert!(tool.is_command_allowed("echo hi"));
-
-        // Widening still works through the same override.
-        daemon.set_allowed_commands(vec!["echo".to_string(), "ls".to_string()]);
-        assert!(tool.is_command_allowed("ls -la"));
-    }
-
-    #[test]
-    fn set_allowed_commands_leaves_operator_grants_intact() {
-        // `/allow <cmd> --persist` grants live in `runtime_allowlist` and are a
-        // deliberate operator decision, not config state — a preset switch must
-        // not silently revoke them.
-        let daemon = default_policy();
-        daemon.add_runtime_command("kubectl", false).unwrap();
-        daemon.set_allowed_commands(vec!["echo".to_string()]);
-        assert!(daemon.is_command_allowed("kubectl get pods"));
-        assert!(!daemon.is_command_allowed("ls -la"));
-    }
-
-    #[test]
-    fn effective_allowed_commands_falls_back_to_boot_list() {
-        let p = default_policy();
-        assert_eq!(p.effective_allowed_commands(), p.allowed_commands);
-    }
-
-    #[test]
-    fn effective_autonomy_falls_back_to_boot_level() {
-        // With no override set, effective_autonomy returns the boot field.
-        let p = default_policy();
-        assert_eq!(p.effective_autonomy(), AutonomyLevel::Supervised);
     }
 
     #[test]
@@ -1296,10 +1348,7 @@ mod tests {
 
     #[test]
     fn enforce_tool_operation_act_uses_rate_budget() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..default_policy()
-        };
+        let p = default_policy().with_max_actions_per_hour(0);
         let err = p
             .enforce_tool_operation(ToolOperation::Act, "memory_store")
             .unwrap_err();
@@ -1376,10 +1425,8 @@ mod tests {
 
     #[test]
     fn custom_allowlist() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["docker".into(), "kubectl".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default()
+            .with_allowed_commands(vec!["docker".into(), "kubectl".into()]);
         assert!(p.is_command_allowed("docker ps"));
         assert!(p.is_command_allowed("kubectl get pods"));
         assert!(!p.is_command_allowed("ls"));
@@ -1388,10 +1435,7 @@ mod tests {
 
     #[test]
     fn empty_allowlist_blocks_everything() {
-        let p = SecurityPolicy {
-            allowed_commands: vec![],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_allowed_commands(vec![]);
         assert!(!p.is_command_allowed("ls"));
         assert!(!p.is_command_allowed("echo hello"));
     }
@@ -1405,10 +1449,7 @@ mod tests {
 
     #[test]
     fn command_risk_medium_for_mutating_commands() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["git".into(), "touch".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_allowed_commands(vec!["git".into(), "touch".into()]);
         assert_eq!(
             p.command_risk_level("git reset --hard HEAD~1"),
             CommandRiskLevel::Medium
@@ -1421,10 +1462,7 @@ mod tests {
 
     #[test]
     fn command_risk_high_for_dangerous_commands() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["rm".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_allowed_commands(vec!["rm".into()]);
         assert_eq!(
             p.command_risk_level("rm -rf /tmp/test"),
             CommandRiskLevel::High
@@ -1496,12 +1534,10 @@ mod tests {
 
     #[test]
     fn validate_command_requires_approval_for_medium_risk() {
-        let p = SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
-            allowed_commands: vec!["touch".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
 
         let denied = p.validate_command_execution("touch test.txt", false);
         assert!(denied.is_err());
@@ -1516,12 +1552,10 @@ mod tests {
         // With block_high_risk_commands enabled, high-risk commands are hard-
         // blocked. (Easy-mode default leaves this off; this test opts in to
         // verify the blocking path itself is unchanged.)
-        let p = SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["rm".into()],
-            block_high_risk_commands: true,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_allowed_commands(vec!["rm".into()])
+            .with_block_high_risk_commands(true);
 
         let result = p.validate_command_execution("rm -rf /tmp/test", true);
         assert!(result.is_err());
@@ -1530,12 +1564,10 @@ mod tests {
 
     #[test]
     fn validate_command_full_mode_skips_medium_risk_approval_gate() {
-        let p = SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            require_approval_for_medium_risk: true,
-            allowed_commands: vec!["touch".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Full)
+            .with_require_approval_for_medium_risk(true)
+            .with_allowed_commands(vec!["touch".into()]);
 
         let result = p.validate_command_execution("touch test.txt", false);
         assert_eq!(result.unwrap(), CommandRiskLevel::Medium);
@@ -1578,20 +1610,15 @@ mod tests {
 
     #[test]
     fn absolute_paths_allowed_when_not_workspace_only() {
-        let p = SecurityPolicy {
-            workspace_only: false,
-            forbidden_paths: vec![],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default()
+            .with_workspace_only(false)
+            .with_forbidden_paths(vec![]);
         assert!(p.is_path_allowed("/tmp/file.txt"));
     }
 
     #[test]
     fn forbidden_paths_blocked() {
-        let p = SecurityPolicy {
-            workspace_only: false,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_workspace_only(false);
         assert!(!p.is_path_allowed("/etc/passwd"));
         assert!(!p.is_path_allowed("/root/.bashrc"));
         assert!(!p.is_path_allowed("~/.ssh/id_rsa"));
@@ -1629,14 +1656,14 @@ mod tests {
         let workspace = PathBuf::from("/tmp/test-workspace");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
 
-        assert_eq!(policy.autonomy, AutonomyLevel::Full);
-        assert!(!policy.workspace_only);
-        assert_eq!(policy.allowed_commands, vec!["docker"]);
-        assert_eq!(policy.forbidden_paths, vec!["/secret"]);
-        assert_eq!(policy.max_actions_per_hour, 100);
-        assert_eq!(policy.max_cost_per_day_cents, 1000);
-        assert!(!policy.require_approval_for_medium_risk);
-        assert!(!policy.block_high_risk_commands);
+        assert_eq!(policy.fields().autonomy, AutonomyLevel::Full);
+        assert!(!policy.fields().workspace_only);
+        assert_eq!(policy.fields().allowed_commands, vec!["docker"]);
+        assert_eq!(policy.fields().forbidden_paths, vec!["/secret"]);
+        assert_eq!(policy.fields().max_actions_per_hour, 100);
+        assert_eq!(policy.fields().max_cost_per_day_cents, 1000);
+        assert!(!policy.fields().require_approval_for_medium_risk);
+        assert!(!policy.fields().block_high_risk_commands);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
     }
 
@@ -1645,15 +1672,15 @@ mod tests {
     #[test]
     fn default_policy_has_sane_values() {
         let p = SecurityPolicy::default();
-        assert_eq!(p.autonomy, AutonomyLevel::Supervised);
-        assert!(p.workspace_only);
-        assert!(!p.allowed_commands.is_empty());
-        assert!(!p.forbidden_paths.is_empty());
-        assert!(p.max_actions_per_hour > 0);
-        assert!(p.max_cost_per_day_cents > 0);
-        assert!(p.require_approval_for_medium_risk);
+        assert_eq!(p.fields().autonomy, AutonomyLevel::Supervised);
+        assert!(p.fields().workspace_only);
+        assert!(!p.fields().allowed_commands.is_empty());
+        assert!(!p.fields().forbidden_paths.is_empty());
+        assert!(p.fields().max_actions_per_hour > 0);
+        assert!(p.fields().max_cost_per_day_cents > 0);
+        assert!(p.fields().require_approval_for_medium_risk);
         // Easy-mode default: high-risk commands are no longer hard-blocked.
-        assert!(!p.block_high_risk_commands);
+        assert!(!p.fields().block_high_risk_commands);
     }
 
     // ── ActionTracker / rate limiting ───────────────────────
@@ -1675,10 +1702,7 @@ mod tests {
 
     #[test]
     fn record_action_allows_within_limit() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 5,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_max_actions_per_hour(5);
         for _ in 0..5 {
             assert!(p.record_action(), "should allow actions within limit");
         }
@@ -1686,10 +1710,7 @@ mod tests {
 
     #[test]
     fn record_action_blocks_over_limit() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 3,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_max_actions_per_hour(3);
         assert!(p.record_action()); // 1
         assert!(p.record_action()); // 2
         assert!(p.record_action()); // 3
@@ -1698,10 +1719,7 @@ mod tests {
 
     #[test]
     fn is_rate_limited_reflects_count() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 2,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_max_actions_per_hour(2);
         assert!(!p.is_rate_limited());
         p.record_action();
         assert!(!p.is_rate_limited());
@@ -1720,39 +1738,6 @@ mod tests {
         assert_eq!(policy_b.tracker.count(), 2);
         policy_b.record_action();
         assert_eq!(policy_a.tracker.count(), 3);
-    }
-
-    #[test]
-    fn shared_tracker_accumulates_across_rebuilt_policies() {
-        // The gateway rebuilds its policy every turn so config stays fresh.
-        // The rate-limit window must NOT restart with it, or
-        // `max_actions_per_hour` is unenforceable on that path.
-        let mut cfg = crate::config::AutonomyConfig::default();
-        cfg.max_actions_per_hour = 3;
-        let workspace = PathBuf::from("/tmp/rantaiclaw-shared-tracker");
-        let tracker = Arc::new(ActionTracker::new());
-
-        let turn_one = SecurityPolicy::from_config_with_shared_tracker(
-            &cfg,
-            &workspace,
-            None,
-            Arc::clone(&tracker),
-        );
-        let turn_two = SecurityPolicy::from_config_with_shared_tracker(
-            &cfg,
-            &workspace,
-            None,
-            Arc::clone(&tracker),
-        );
-
-        assert!(turn_one.record_action());
-        assert!(turn_one.record_action());
-        assert!(turn_two.record_action());
-        assert!(
-            !turn_two.record_action(),
-            "the fourth action must exhaust a budget of 3 even though it lands \
-             on a policy rebuilt after the first two"
-        );
     }
 
     #[test]
@@ -1789,10 +1774,7 @@ mod tests {
 
     #[test]
     fn quoted_semicolons_do_not_split_sqlite_command() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["sqlite3".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_allowed_commands(vec!["sqlite3".into()]);
         assert!(p.is_command_allowed(
             "sqlite3 /tmp/test.db \"CREATE TABLE t(id INT); INSERT INTO t VALUES(1); SELECT * FROM t;\""
         ));
@@ -1806,10 +1788,7 @@ mod tests {
 
     #[test]
     fn unquoted_semicolon_after_quoted_sql_still_splits_commands() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["sqlite3".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_allowed_commands(vec!["sqlite3".into()]);
         assert!(!p.is_command_allowed("sqlite3 /tmp/test.db \"SELECT 1;\"; rm -rf /"));
     }
 
@@ -2058,20 +2037,14 @@ mod tests {
 
     #[test]
     fn path_home_tilde_ssh() {
-        let p = SecurityPolicy {
-            workspace_only: false,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_workspace_only(false);
         assert!(!p.is_path_allowed("~/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("~/.gnupg/secring.gpg"));
     }
 
     #[test]
     fn path_var_run_blocked() {
-        let p = SecurityPolicy {
-            workspace_only: false,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_workspace_only(false);
         assert!(!p.is_path_allowed("/var/run/docker.sock"));
     }
 
@@ -2079,10 +2052,7 @@ mod tests {
 
     #[test]
     fn rate_limit_exactly_at_boundary() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 1,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_max_actions_per_hour(1);
         assert!(p.record_action()); // 1 — exactly at limit
         assert!(!p.record_action()); // 2 — over
         assert!(!p.record_action()); // 3 — still over
@@ -2090,19 +2060,13 @@ mod tests {
 
     #[test]
     fn rate_limit_zero_blocks_everything() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_max_actions_per_hour(0);
         assert!(!p.record_action());
     }
 
     #[test]
     fn rate_limit_high_allows_many() {
-        let p = SecurityPolicy {
-            max_actions_per_hour: 10000,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_max_actions_per_hour(10000);
         for _ in 0..100 {
             assert!(p.record_action());
         }
@@ -2112,11 +2076,9 @@ mod tests {
 
     #[test]
     fn readonly_blocks_even_safe_commands() {
-        let p = SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            allowed_commands: vec!["ls".into(), "cat".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::ReadOnly)
+            .with_allowed_commands(vec!["ls".into(), "cat".into()]);
         assert!(!p.is_command_allowed("ls"));
         assert!(!p.is_command_allowed("cat"));
         assert!(!p.can_act());
@@ -2124,22 +2086,18 @@ mod tests {
 
     #[test]
     fn supervised_allows_listed_commands() {
-        let p = SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["git".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Supervised)
+            .with_allowed_commands(vec!["git".into()]);
         assert!(p.is_command_allowed("git status"));
         assert!(!p.is_command_allowed("docker ps"));
     }
 
     #[test]
     fn full_autonomy_still_respects_forbidden_paths() {
-        let p = SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            workspace_only: false,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default()
+            .with_autonomy(AutonomyLevel::Full)
+            .with_workspace_only(false);
         assert!(!p.is_path_allowed("/etc/shadow"));
         assert!(!p.is_path_allowed("/root/.bashrc"));
     }
@@ -2182,10 +2140,7 @@ mod tests {
 
     #[test]
     fn checklist_all_system_dirs_blocked() {
-        let p = SecurityPolicy {
-            workspace_only: false,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_workspace_only(false);
         for dir in [
             "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev",
             "/proc", "/sys", "/var", "/tmp",
@@ -2203,10 +2158,7 @@ mod tests {
 
     #[test]
     fn checklist_sensitive_dotfiles_blocked() {
-        let p = SecurityPolicy {
-            workspace_only: false,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_workspace_only(false);
         for path in [
             "~/.ssh/id_rsa",
             "~/.gnupg/secring.gpg",
@@ -2230,20 +2182,14 @@ mod tests {
 
     #[test]
     fn checklist_workspace_only_blocks_all_absolute() {
-        let p = SecurityPolicy {
-            workspace_only: true,
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_workspace_only(true);
         assert!(!p.is_path_allowed("/any/absolute/path"));
         assert!(p.is_path_allowed("relative/path.txt"));
     }
 
     #[test]
     fn checklist_resolved_path_must_be_in_workspace() {
-        let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/home/user/project"),
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default().with_workspace_dir(PathBuf::from("/home/user/project"));
         // Inside workspace — allowed
         assert!(p.is_resolved_path_allowed(Path::new("/home/user/project/src/main.rs")));
         // Outside workspace — blocked (symlink escape)
@@ -2257,7 +2203,7 @@ mod tests {
     fn checklist_default_policy_is_workspace_only() {
         let p = SecurityPolicy::default();
         assert!(
-            p.workspace_only,
+            p.fields().workspace_only,
             "Default policy must be workspace_only=true"
         );
     }
@@ -2268,14 +2214,14 @@ mod tests {
         // Must contain all critical system dirs
         for dir in ["/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp"] {
             assert!(
-                p.forbidden_paths.iter().any(|f| f == dir),
+                p.fields().forbidden_paths.iter().any(|f| f == dir),
                 "Default forbidden_paths must include {dir}"
             );
         }
         // Must contain sensitive dotfiles
         for dot in ["~/.ssh", "~/.gnupg", "~/.aws"] {
             assert!(
-                p.forbidden_paths.iter().any(|f| f == dot),
+                p.fields().forbidden_paths.iter().any(|f| f == dot),
                 "Default forbidden_paths must include {dot}"
             );
         }
@@ -2293,10 +2239,7 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| workspace.clone());
 
-        let policy = SecurityPolicy {
-            workspace_dir: canonical_workspace.clone(),
-            ..SecurityPolicy::default()
-        };
+        let policy = SecurityPolicy::default().with_workspace_dir(canonical_workspace.clone());
 
         // A resolved path inside the workspace should be allowed
         let inside = canonical_workspace.join("subdir").join("file.txt");
@@ -2320,10 +2263,8 @@ mod tests {
 
     #[test]
     fn resolved_path_blocks_root_escape() {
-        let policy = SecurityPolicy {
-            workspace_dir: PathBuf::from("/home/rantaiclaw_user/project"),
-            ..SecurityPolicy::default()
-        };
+        let policy = SecurityPolicy::default()
+            .with_workspace_dir(PathBuf::from("/home/rantaiclaw_user/project"));
 
         assert!(
             !policy.is_resolved_path_allowed(Path::new("/etc/passwd")),
@@ -2352,10 +2293,7 @@ mod tests {
         let link_path = workspace.join("escape_link");
         symlink(&outside, &link_path).unwrap();
 
-        let policy = SecurityPolicy {
-            workspace_dir: workspace.clone(),
-            ..SecurityPolicy::default()
-        };
+        let policy = SecurityPolicy::default().with_workspace_dir(workspace.clone());
 
         // The resolved symlink target should be outside workspace
         let resolved = link_path.canonicalize().unwrap();
@@ -2393,10 +2331,7 @@ mod tests {
 
     #[test]
     fn runtime_allowlist_command_passes_is_command_allowed() {
-        let policy = SecurityPolicy {
-            allowed_commands: vec!["ls".into()],
-            ..SecurityPolicy::default()
-        };
+        let policy = SecurityPolicy::default().with_allowed_commands(vec!["ls".into()]);
         assert!(!policy.is_command_allowed("brew --version"));
         policy.add_runtime_command("brew", false).unwrap();
         assert!(policy.is_command_allowed("brew --version"));
@@ -2463,7 +2398,7 @@ mod tests {
         assert!(snap.contains(&"brew".to_string()));
         assert!(snap.contains(&"rg".to_string()));
         // Boot list unchanged.
-        assert_eq!(policy.allowed_commands, vec!["ls".to_string()]);
+        assert_eq!(policy.fields().allowed_commands, vec!["ls".to_string()]);
         // is_command_allowed sees the runtime entry.
         assert!(policy.is_command_allowed("brew --version"));
     }

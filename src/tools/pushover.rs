@@ -222,12 +222,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_security(level: AutonomyLevel, max_actions_per_hour: u32) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: level,
-            max_actions_per_hour,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        })
+        Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(level)
+                .with_max_actions_per_hour(max_actions_per_hour)
+                .with_workspace_dir(std::env::temp_dir()),
+        )
     }
 
     #[test]

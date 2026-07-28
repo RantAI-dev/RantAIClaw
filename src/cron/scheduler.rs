@@ -39,6 +39,22 @@ pub async fn run(config: Config) -> Result<()> {
         // Keep scheduler liveness fresh even when there are no due jobs.
         crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
+        // Refresh the config half once per poll tick. The scheduler is a
+        // long-lived task built at daemon start, so without this an operator
+        // tightening autonomy would not reach scheduled jobs until a restart —
+        // exactly the surface where nobody is watching. Cost is one config read
+        // per interval, floored at MIN_POLL_SECONDS.
+        match Config::load_or_init().await {
+            Ok(cfg) => security.apply_config(&cfg.autonomy),
+            // Keep the previous fields. Never fall back to a permissive default
+            // because a config read failed.
+            Err(e) => tracing::warn!(
+                target: "scheduler",
+                error = %e,
+                "config reload failed; keeping the previously applied autonomy settings"
+            ),
+        }
+
         let jobs = match due_jobs(&config, Utc::now()) {
             Ok(jobs) => jobs,
             Err(e) => {
@@ -708,7 +724,38 @@ mod tests {
         );
     }
 
-    /// Guard against over-blocking: Step 3 must not refuse everything.
+    /// The scheduler builds its policy once at daemon start and holds it for
+    /// the process lifetime, so before the per-tick refresh an operator
+    /// tightening autonomy would not reach scheduled jobs until a restart —
+    /// the one surface where nobody is watching.
+    #[tokio::test]
+    async fn cron_scheduler_applies_an_autonomy_change() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        let job = test_job("echo still-running");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, _) = run_job_command(&config, &security, &job).await;
+        assert!(success, "baseline: the job runs under Supervised");
+
+        security.apply_config(&crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::ReadOnly,
+            ..config.autonomy.clone()
+        });
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(
+            !success,
+            "a tightened autonomy must reach the scheduled path"
+        );
+        assert!(
+            output.contains("read-only"),
+            "refusal should name the autonomy level, got: {output}"
+        );
+    }
+
+    /// Guard against over-blocking: the risk gate must not refuse everything.
     #[tokio::test]
     async fn scheduled_run_still_allows_a_low_risk_allowlisted_command() {
         let tmp = TempDir::new().unwrap();

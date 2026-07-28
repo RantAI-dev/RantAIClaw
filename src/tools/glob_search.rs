@@ -184,11 +184,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_security(workspace: PathBuf) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace,
-            ..SecurityPolicy::default()
-        })
+        Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_workspace_dir(workspace),
+        )
     }
 
     fn test_security_with(
@@ -196,12 +196,12 @@ mod tests {
         autonomy: AutonomyLevel,
         max_actions_per_hour: u32,
     ) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy,
-            workspace_dir: workspace,
-            max_actions_per_hour,
-            ..SecurityPolicy::default()
-        })
+        Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(autonomy)
+                .with_workspace_dir(workspace)
+                .with_max_actions_per_hour(max_actions_per_hour),
+        )
     }
 
     #[test]

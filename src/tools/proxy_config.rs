@@ -442,11 +442,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        })
+        Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_workspace_dir(std::env::temp_dir()),
+        )
     }
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {

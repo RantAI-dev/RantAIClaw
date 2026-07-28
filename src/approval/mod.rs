@@ -369,10 +369,8 @@ mod tests {
     /// channel approval gate open — fail-open on the exact path that matters.
     #[test]
     fn needs_approval_follows_a_live_autonomy_tightening() {
-        let policy = Arc::new(crate::security::SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            ..crate::security::SecurityPolicy::default()
-        });
+        let policy =
+            Arc::new(crate::security::SecurityPolicy::default().with_autonomy(AutonomyLevel::Full));
         let mgr = ApprovalManager::from_config(&full_config()).with_policy(Arc::clone(&policy));
 
         assert!(
@@ -380,7 +378,7 @@ mod tests {
             "full autonomy should not prompt"
         );
 
-        policy.set_autonomy(AutonomyLevel::Supervised);
+        policy.apply_config(&supervised_config());
         assert!(
             mgr.needs_approval("shell"),
             "tightening autonomy at runtime must close the approval gate"
@@ -389,10 +387,9 @@ mod tests {
 
     #[test]
     fn needs_approval_follows_a_live_autonomy_loosening() {
-        let policy = Arc::new(crate::security::SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            ..crate::security::SecurityPolicy::default()
-        });
+        let policy = Arc::new(
+            crate::security::SecurityPolicy::default().with_autonomy(AutonomyLevel::Supervised),
+        );
         let mgr =
             ApprovalManager::from_config(&supervised_config()).with_policy(Arc::clone(&policy));
 
@@ -401,7 +398,7 @@ mod tests {
             "supervised should prompt for shell"
         );
 
-        policy.set_autonomy(AutonomyLevel::Full);
+        policy.apply_config(&full_config());
         assert!(
             !mgr.needs_approval("shell"),
             "loosening autonomy at runtime must open the gate"

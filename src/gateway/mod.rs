@@ -487,17 +487,35 @@ fn build_tools_factory(
     runtime: Arc<dyn runtime::RuntimeAdapter>,
     mem: Arc<dyn Memory>,
 ) -> ToolsFactory {
-    // One tracker for the process. The registry is rebuilt per turn so policy
-    // stays fresh, but the rate-limit window must NOT restart with it — that is
-    // what made `max_actions_per_hour` unenforceable on this path.
-    let tracker = Arc::new(crate::security::policy::ActionTracker::new());
+    // One long-lived policy for the process, refreshed per turn rather than
+    // rebuilt. Rebuilding reset every piece of process state that hangs off it —
+    // the rate-limit window most visibly, which is why `max_actions_per_hour`
+    // was unenforceable here.
+    //
+    // Lazily initialised on purpose: `build_tools_factory` receives no `Config`,
+    // so a hoisted `SecurityPolicy::default()` would carry `workspace_dir` from
+    // `Default` rather than from the real config, silently relocating the
+    // gateway's write root. `apply_config` deliberately does not carry
+    // `workspace_dir`, so the first turn must build from the real config.
+    let policy: Arc<Mutex<Option<Arc<SecurityPolicy>>>> = Arc::new(Mutex::new(None));
     Arc::new(move |config: &Config| {
-        let security = Arc::new(SecurityPolicy::from_config_with_shared_tracker(
-            &config.autonomy,
-            &config.workspace_dir,
-            None,
-            Arc::clone(&tracker),
-        ));
+        let security = {
+            let mut slot = policy.lock();
+            match slot.as_ref() {
+                Some(p) => {
+                    p.apply_config(&config.autonomy);
+                    Arc::clone(p)
+                }
+                None => {
+                    let p = Arc::new(SecurityPolicy::from_config(
+                        &config.autonomy,
+                        &config.workspace_dir,
+                    ));
+                    *slot = Some(Arc::clone(&p));
+                    p
+                }
+            }
+        };
         let (composio_key, composio_entity_id) = if config.composio.enabled {
             (
                 config.composio.api_key.as_deref(),

@@ -544,11 +544,11 @@ mod tests {
     use std::time::Duration;
 
     fn supervised_only_echo() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy: crate::security::AutonomyLevel::Supervised,
-            allowed_commands: vec!["echo".into()],
-            ..SecurityPolicy::default()
-        })
+        Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(crate::security::AutonomyLevel::Supervised)
+                .with_allowed_commands(vec!["echo".into()]),
+        )
     }
 
     #[test]

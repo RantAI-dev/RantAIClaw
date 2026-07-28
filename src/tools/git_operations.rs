@@ -573,10 +573,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_tool(dir: &std::path::Path) -> GitOperationsTool {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            ..SecurityPolicy::default()
-        });
+        let security = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::Supervised));
         GitOperationsTool::new(security, dir.to_path_buf())
     }
 
@@ -700,10 +697,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
+        let security = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
         let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
 
         let result = tool
@@ -729,10 +723,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
+        let security = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
         let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
 
         let result = tool.execute(json!({"operation": "branch"})).await.unwrap();
@@ -747,10 +738,7 @@ mod tests {
     #[tokio::test]
     async fn allows_readonly_ops_in_readonly_mode() {
         let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
+        let security = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
         let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
 
         // This will fail because there's no git repo, but it shouldn't be blocked by autonomy
