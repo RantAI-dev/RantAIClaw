@@ -321,6 +321,68 @@ impl PromptSection for ToolsSection {
     }
 }
 
+/// Heading [`SafetySection`] emits. Callers that re-render the section into an
+/// already-built prompt split on this, so it lives next to the code that writes
+/// it rather than being duplicated as a literal at the call site.
+pub const SAFETY_SECTION_HEADING: &str = "## Safety + Approval Policy";
+
+/// Render just the safety section, for callers that cache an expensive base
+/// prompt but need this part to track the live policy.
+///
+/// The channel path builds its system prompt once at startup — it reads
+/// bootstrap files and skills off disk, so rebuilding per message is not free —
+/// but the approval policy can change under a running daemon. Everything this
+/// section reads is cheap and in memory, so it is re-rendered per turn and
+/// spliced in by [`replace_safety_section`].
+#[must_use]
+pub fn render_safety_section(
+    surface: PromptSurface,
+    autonomy_preset: Option<crate::approval::policy_writer::PolicyPreset>,
+    tools: &[Box<dyn Tool>],
+    allowed_commands: &[String],
+) -> String {
+    let ctx = PromptContext {
+        workspace_dir: Path::new("."),
+        model_name: "",
+        tools,
+        surface,
+        bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+        skills: &[],
+        skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+        identity_config: None,
+        dispatcher_instructions: "",
+        autonomy_preset,
+        allowed_commands,
+    };
+    SafetySection.build(&ctx).unwrap_or_default()
+}
+
+/// Swap the safety section of an already-built prompt for `replacement`.
+///
+/// Returns `prompt` unchanged when it carries no safety section, so a caller
+/// cannot silently lose the rest of the prompt if section composition changes.
+#[must_use]
+pub fn replace_safety_section(prompt: &str, replacement: &str) -> String {
+    let Some(start) = prompt.find(SAFETY_SECTION_HEADING) else {
+        return prompt.to_string();
+    };
+    // Sections are joined with a blank line and each opens with `## `, so the
+    // next such marker is the end of this one.
+    let rest = &prompt[start + SAFETY_SECTION_HEADING.len()..];
+    let end = rest.find("\n## ").map_or(prompt.len(), |i| {
+        start + SAFETY_SECTION_HEADING.len() + i + 1
+    });
+
+    let mut out = String::with_capacity(prompt.len());
+    out.push_str(&prompt[..start]);
+    out.push_str(replacement.trim_end());
+    if end < prompt.len() {
+        out.push_str("\n\n");
+        out.push_str(&prompt[end..]);
+    }
+    out
+}
+
 impl PromptSection for SafetySection {
     fn name(&self) -> &str {
         "safety"
@@ -802,6 +864,66 @@ mod tests {
         assert!(
             !out.contains("ls *"),
             "channel must not print shell allowlist: {out}"
+        );
+    }
+
+    /// Strict now refuses at the gate rather than unregistering the tool, so
+    /// The channel prompt is cached at startup, so the safety block has to be
+    /// swappable in place. Everything around it must survive intact.
+    #[test]
+    fn replace_safety_section_swaps_only_that_block() {
+        let prompt = "## Persona\n\nbe nice\n\n## Safety + Approval Policy\n\nold policy text\n\n## Skills\n\nskill list\n";
+        let out = replace_safety_section(prompt, "## Safety + Approval Policy\n\nnew policy text");
+
+        assert!(
+            out.contains("be nice"),
+            "earlier sections must survive: {out}"
+        );
+        assert!(
+            out.contains("skill list"),
+            "later sections must survive: {out}"
+        );
+        assert!(out.contains("new policy text"));
+        assert!(
+            !out.contains("old policy text"),
+            "the stale block must be gone: {out}"
+        );
+        assert_eq!(
+            out.matches(SAFETY_SECTION_HEADING).count(),
+            1,
+            "must not duplicate the heading: {out}"
+        );
+    }
+
+    /// A prompt with no safety block must come back untouched rather than
+    /// losing everything after a heading that was never there.
+    #[test]
+    fn replace_safety_section_is_a_noop_without_the_heading() {
+        let prompt = "## Persona\n\nbe nice\n\n## Skills\n\nskill list\n";
+        assert_eq!(
+            replace_safety_section(prompt, "## Safety + Approval Policy\n\nx"),
+            prompt
+        );
+    }
+
+    /// The section is a pure function of the preset, which is what lets the
+    /// channel path re-render it per turn instead of rebuilding the prompt.
+    #[test]
+    fn render_safety_section_tracks_the_preset() {
+        use crate::approval::policy_writer::PolicyPreset;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let surface = PromptSurface::Channel {
+            native_tools: false,
+        };
+
+        let strict = render_safety_section(surface, Some(PolicyPreset::Strict), &tools, &[]);
+        let off = render_safety_section(surface, Some(PolicyPreset::Off), &tools, &[]);
+
+        assert!(strict.contains("Strict (read-only)"), "{strict}");
+        assert!(!off.contains("Strict (read-only)"), "{off}");
+        assert_ne!(
+            strict, off,
+            "a different preset must produce different guidance"
         );
     }
 
