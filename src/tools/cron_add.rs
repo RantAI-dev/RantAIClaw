@@ -89,12 +89,7 @@ ask which configured channel to deliver to — do not imply a message will arriv
                 "session_target": { "type": "string", "enum": ["isolated", "main"] },
                 "model": { "type": "string" },
                 "delivery": { "type": "object" },
-                "delete_after_run": { "type": "boolean" },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
-                }
+                "delete_after_run": { "type": "boolean" }
             },
             "required": ["schedule"]
         })
@@ -158,10 +153,6 @@ ask which configured channel to deliver to — do not imply a message will arriv
             .get("delete_after_run")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(default_delete_after_run);
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
 
         let result = match job_type {
             JobType::Shell => {
@@ -176,7 +167,7 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     }
                 };
 
-                if let Err(reason) = self.security.validate_command_execution(command, approved) {
+                if let Err(reason) = self.security.validate_command_execution(command, false) {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
@@ -375,7 +366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn medium_risk_shell_command_requires_approval() {
+    async fn medium_risk_shell_command_is_refused() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -401,17 +392,6 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("explicit approval"));
-
-        let approved = tool
-            .execute(json!({
-                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
-                "job_type": "shell",
-                "command": "touch cron-approval-test",
-                "approved": true
-            }))
-            .await
-            .unwrap();
-        assert!(approved.success, "{:?}", approved.error);
     }
 
     #[tokio::test]

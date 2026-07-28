@@ -540,6 +540,14 @@ async fn run_job_command_with_timeout(
         );
     }
 
+    // Risk classification. Deliberately after `is_command_allowed` so the
+    // allowlist keeps its own (lowercase) message, and this check only ever
+    // fires for the risk gate. `approved` is `false`: on the scheduled path
+    // there is by definition no operator present to approve anything.
+    if let Err(reason) = security.validate_command_execution(&job.command, false) {
+        return (false, format!("blocked by security policy: {reason}"));
+    }
+
     if let Some(path) = forbidden_path_argument(security, &job.command) {
         return (
             false,
@@ -676,6 +684,45 @@ mod tests {
             run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
         assert!(!success);
         assert!(output.contains("job timed out after"));
+    }
+
+    /// The scheduled path never called the risk gate, so a cron job could run
+    /// a command the same policy would refuse from an interactive turn. There
+    /// is no operator present to approve at fire time, so it is refused.
+    ///
+    /// `chmod` is on the allowlist here on purpose: without that the allowlist
+    /// refuses first and the test would pass on pre-fix code.
+    #[tokio::test]
+    async fn scheduled_run_refuses_a_high_risk_command_under_supervised() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["echo".into(), "chmod".into()];
+        config.autonomy.block_high_risk_commands = false;
+        let job = test_job("chmod 644 f");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (_success, output) = run_job_command(&config, &security, &job).await;
+        assert!(
+            output.contains("blocked by security policy"),
+            "high-risk scheduled command should be refused by the risk gate, got: {output}"
+        );
+    }
+
+    /// Guard against over-blocking: Step 3 must not refuse everything.
+    #[tokio::test]
+    async fn scheduled_run_still_allows_a_low_risk_allowlisted_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        let job = test_job("echo scheduled-ok");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(
+            success,
+            "low-risk allowlisted command must still run: {output}"
+        );
+        assert!(output.contains("scheduled-ok"));
     }
 
     #[tokio::test]
