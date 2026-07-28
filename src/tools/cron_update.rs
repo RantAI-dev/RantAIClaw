@@ -68,12 +68,7 @@ impl Tool for CronUpdateTool {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string" },
-                "patch": { "type": "object" },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
-                }
+                "patch": { "type": "object" }
             },
             "required": ["job_id", "patch"]
         })
@@ -120,13 +115,9 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
 
         if let Some(command) = &patch.command {
-            if let Err(reason) = self.security.validate_command_execution(command, approved) {
+            if let Err(reason) = self.security.validate_command_execution(command, false) {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -252,7 +243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn medium_risk_shell_update_requires_approval() {
+    async fn medium_risk_shell_update_is_refused() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -278,15 +269,5 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("explicit approval"));
-
-        let approved = tool
-            .execute(json!({
-                "job_id": job.id,
-                "patch": { "command": "touch cron-update-approval-test" },
-                "approved": true
-            }))
-            .await
-            .unwrap();
-        assert!(approved.success, "{:?}", approved.error);
     }
 }

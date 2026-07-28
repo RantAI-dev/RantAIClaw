@@ -31,12 +31,7 @@ impl Tool for CronRunTool {
         json!({
             "type": "object",
             "properties": {
-                "job_id": { "type": "string" },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
-                }
+                "job_id": { "type": "string" }
             },
             "required": ["job_id"]
         })
@@ -61,10 +56,6 @@ impl Tool for CronRunTool {
                 });
             }
         };
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
 
         if !self.security.can_act() {
             return Ok(ToolResult {
@@ -99,7 +90,7 @@ impl Tool for CronRunTool {
         if matches!(job.job_type, JobType::Shell) {
             if let Err(reason) = self
                 .security
-                .validate_command_execution(&job.command, approved)
+                .validate_command_execution(&job.command, false)
             {
                 return Ok(ToolResult {
                     success: false,
@@ -212,8 +203,41 @@ mod tests {
         assert!(result.error.unwrap_or_default().contains("read-only"));
     }
 
+    /// `approved` used to be a tool parameter, which meant the *model* filled
+    /// it in — a caller could grant itself the approval the gate was asking
+    /// for. Emitting it now is inert.
+    ///
+    /// Asserts on `.error`, not `.output`: the tool gate and the scheduler gate
+    /// are distinguished by which field they land in, and only the tool gate
+    /// produces this message with an empty `output`.
     #[tokio::test]
-    async fn shell_run_requires_approval_for_medium_risk() {
+    async fn cron_run_does_not_accept_an_approved_argument() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.level = AutonomyLevel::Supervised;
+        config.autonomy.allowed_commands = vec!["touch".into()];
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let cfg = Arc::new(config);
+        let job = cron::add_job(&cfg, "*/5 * * * *", "touch cron-run-smuggled").unwrap();
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+
+        let out = tool
+            .execute(json!({ "job_id": job.id, "approved": true }))
+            .await
+            .unwrap();
+        assert!(
+            !out.success,
+            "a model-supplied approval must not unlock the gate"
+        );
+        assert!(out.error.unwrap_or_default().contains("explicit approval"));
+    }
+
+    #[tokio::test]
+    async fn shell_run_refuses_medium_risk_without_operator_approval() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -233,11 +257,5 @@ mod tests {
             .error
             .unwrap_or_default()
             .contains("explicit approval"));
-
-        let approved = tool
-            .execute(json!({ "job_id": job.id, "approved": true }))
-            .await
-            .unwrap();
-        assert!(approved.success, "{:?}", approved.error);
     }
 }
