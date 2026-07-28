@@ -187,6 +187,11 @@ struct ChannelRuntimeDefaults {
     /// `SecurityPolicy` on reload so `rantaiclaw autonomy <preset>` (e.g.
     /// Off → Full) applies without a `channels run`/daemon restart.
     autonomy_level: crate::security::AutonomyLevel,
+    /// Active approval preset, refreshed on reload. The channel system prompt
+    /// is built once at startup (it reads bootstrap files and skills off disk),
+    /// so without carrying this the prompt kept describing whatever preset was
+    /// active when the daemon started — the gate moved, the briefing did not.
+    autonomy_preset: crate::approval::policy_writer::PolicyPreset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,6 +547,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         )),
         allowed_commands: Arc::new(config.autonomy.allowed_commands.clone()),
         autonomy_level: config.autonomy.level,
+        autonomy_preset: crate::approval::policy_writer::preset_for_autonomy(&config.autonomy),
     }
 }
 
@@ -577,6 +583,23 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         guest_gate: Arc::clone(&ctx.guest_gate),
         allowed_commands: Arc::new(Vec::new()),
         autonomy_level: ctx.security.effective_autonomy(),
+        // Fallback path only (the store has no entry — ad-hoc/tests). The
+        // live policy carries the enforced level but not `always_ask`, which
+        // is what separates Manual from Smart, so Supervised resolves to the
+        // stricter of the two. Production goes through
+        // `runtime_defaults_from_config`, which has the full config and
+        // resolves the preset exactly.
+        autonomy_preset: match ctx.security.effective_autonomy() {
+            crate::security::AutonomyLevel::ReadOnly => {
+                crate::approval::policy_writer::PolicyPreset::Strict
+            }
+            crate::security::AutonomyLevel::Full => {
+                crate::approval::policy_writer::PolicyPreset::Off
+            }
+            crate::security::AutonomyLevel::Supervised => {
+                crate::approval::policy_writer::PolicyPreset::Manual
+            }
+        },
     }
 }
 
@@ -706,6 +729,16 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
                     last_applied_stamp: None,
                     last_reload_error: None,
                 });
+            // Keeping the old provider must not also keep the old *policy*.
+            // `apply_config` already moved the live gate above, so carry the
+            // autonomy-derived defaults forward too — otherwise the prompt
+            // would keep briefing the model on the pre-reload preset while the
+            // gate enforced the new one, which is the divergence this whole
+            // path exists to avoid. Provider/model/credentials stay as they
+            // were, deliberately.
+            entry.defaults.autonomy_preset = next_defaults.autonomy_preset;
+            entry.defaults.autonomy_level = next_defaults.autonomy_level;
+            entry.defaults.allowed_commands = Arc::clone(&next_defaults.allowed_commands);
             entry.last_applied_stamp = Some(stamp);
             entry.last_reload_error = Some(reason);
             return Ok(());
@@ -1795,8 +1828,29 @@ async fn process_channel_message(
         &runtime_defaults.approval_owners,
         msg.sender_identities(),
     );
-    let system_prompt = build_channel_system_prompt(
+    // `ctx.system_prompt` is built once at channel start — it reads bootstrap
+    // files and skills off disk, so rebuilding it per message is not free. The
+    // approval policy can change under a running daemon, though, and the safety
+    // section is pure in-memory work, so re-render just that part against the
+    // preset carried on the reloaded defaults. Without this the gate followed a
+    // config change while the briefing kept describing the boot-time preset.
+    let base_prompt = crate::agent::prompt::replace_safety_section(
         ctx.system_prompt.as_str(),
+        &crate::agent::prompt::render_safety_section(
+            // `SafetySection` matches `Channel { .. }` and never reads the
+            // payload, and the real value is only known where the provider is
+            // built (channel startup). If the section ever starts branching on
+            // it, this call site has to thread it through instead.
+            crate::agent::prompt::PromptSurface::Channel {
+                native_tools: false,
+            },
+            Some(runtime_defaults.autonomy_preset),
+            ctx.tools_registry.as_ref(),
+            &[],
+        ),
+    );
+    let system_prompt = build_channel_system_prompt(
+        &base_prompt,
         &msg.channel,
         &msg.reply_target,
         sender_is_owner,
@@ -4988,6 +5042,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         )),
                         allowed_commands: Arc::new(Vec::new()),
                         autonomy_level: crate::security::AutonomyLevel::Supervised,
+                        autonomy_preset: crate::approval::policy_writer::PolicyPreset::Manual,
                     },
                     last_applied_stamp: None,
                     last_reload_error: None,
@@ -5292,6 +5347,16 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.security.effective_autonomy(),
             crate::security::AutonomyLevel::ReadOnly,
             "autonomy downgrade must apply even when the new provider can't be built"
+        );
+        // ...and so did the preset the system prompt is rendered from. The gate
+        // and the briefing have to move together: `or_insert_with` on this path
+        // leaves an existing store entry untouched, so without carrying the
+        // autonomy-derived defaults forward the prompt would keep describing
+        // the pre-reload preset while the gate enforced ReadOnly.
+        assert_eq!(
+            runtime_defaults_snapshot(&ctx).autonomy_preset,
+            crate::approval::policy_writer::PolicyPreset::Strict,
+            "the prompt preset must follow a downgrade even when the provider build fails"
         );
 
         // A reload must refresh the WHOLE `[autonomy]` section, not just the two
