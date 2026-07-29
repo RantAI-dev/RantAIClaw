@@ -216,7 +216,7 @@ impl Tool for SkillsSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query (free text). Empty returns top-by-stars."
+                    "description": "Search query (free text). Empty returns top-by-stars. Each result carries a `reference` — pass that to skills_install verbatim; searching (rather than browsing) is what resolves the publisher."
                 }
             },
             "required": ["query"]
@@ -241,11 +241,26 @@ impl Tool for SkillsSearchTool {
                 let mapped: Vec<_> = skills
                     .into_iter()
                     .map(|s| {
+                        // `reference` is what `skills_install` expects.
+                        // ClawHub namespaces skills per publisher, so a bare
+                        // slug is ambiguous for most popular names — handing
+                        // the model only the slug meant every install of a
+                        // popular skill came back as a 409 it could not act
+                        // on. Search reports the publisher, so results from
+                        // here install in one step.
                         json!({
+                            "reference": if s.owner_handle.is_empty() {
+                                s.slug.clone()
+                            } else {
+                                format!("@{}/{}", s.owner_handle, s.slug)
+                            },
                             "slug": s.slug,
+                            "owner": s.owner_handle,
+                            "official": s.official,
                             "display_name": s.display_name,
                             "summary": s.summary,
                             "stars": s.stats.stars,
+                            "downloads": s.stats.downloads,
                         })
                     })
                     .collect();

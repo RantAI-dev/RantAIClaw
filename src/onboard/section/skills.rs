@@ -142,14 +142,86 @@ fn run_interactive(profile: &Profile) -> Result<()> {
             return Ok(());
         }
 
-        let slugs: Vec<String> = picks.into_iter().map(|i| top[i].slug.clone()).collect();
-        match block_on_clawhub_install_many(profile, &slugs) {
-            Ok(installed) => println!("  Installed from ClawHub: {}", installed.join(", ")),
-            Err(err) => eprintln!("  ClawHub install failed: {err}"),
+        let references: Vec<String> = picks.into_iter().map(|i| reference_for(&top[i])).collect();
+        let report = block_on_clawhub_install_many(profile, &references);
+        if !report.installed.is_empty() {
+            println!("  Installed from ClawHub: {}", report.installed.join(", "));
         }
+        resolve_install_failures(profile, &theme, report.failures);
     }
 
     Ok(())
+}
+
+/// The reference to install a listing/search result by: publisher-qualified
+/// when the endpoint reported one. `/skills?sort=stars` — what this wizard
+/// browses — reports none, so these come back bare and resolve through the
+/// prompt in [`resolve_install_failures`].
+fn reference_for(skill: &clawhub::ClawHubSkill) -> String {
+    if skill.owner_handle.is_empty() {
+        skill.slug.clone()
+    } else {
+        format!("@{}/{}", skill.owner_handle, skill.slug)
+    }
+}
+
+/// Report what a batch install could not do, and finish the job where the
+/// answer is just "which publisher?".
+///
+/// These used to be dropped into `tracing::warn!`, which the wizard never
+/// shows — so a user who picked five popular skills saw an empty install line
+/// and no reason. Most popular slugs are shared by several publishers, so
+/// that was the common case, not the rare one.
+fn resolve_install_failures(
+    profile: &Profile,
+    theme: &dialoguer::theme::ColorfulTheme,
+    failures: Vec<clawhub::BatchInstallFailure>,
+) {
+    use dialoguer::Select;
+
+    for failure in failures {
+        let Some(ambiguous) = failure.ambiguous().cloned() else {
+            eprintln!("  ✗ {}: {:#}", failure.reference, failure.error);
+            continue;
+        };
+
+        let handles: Vec<String> = ambiguous
+            .matches
+            .iter()
+            .map(|m| format!("@{}", m.owner_handle))
+            .collect();
+        println!(
+            "  `{}` is published by {} owners on ClawHub.",
+            ambiguous.slug,
+            handles.len()
+        );
+
+        // Esc skips this skill. The publisher is never picked automatically:
+        // installing stages code the agent will read and act on, and popular
+        // slugs attract forks that are indistinguishable by name alone.
+        let choice = Select::with_theme(theme)
+            .with_prompt(format!("Which publisher of `{}`?", ambiguous.slug))
+            .items(&handles)
+            .default(0)
+            .interact_opt();
+        let Ok(Some(index)) = choice else {
+            println!("    skipped `{}`.", ambiguous.slug);
+            continue;
+        };
+
+        let reference = format!(
+            "@{}/{}",
+            ambiguous.matches[index].owner_handle, ambiguous.slug
+        );
+        let retry = block_on_clawhub_install_many(profile, std::slice::from_ref(&reference));
+        if retry.installed.is_empty() {
+            for retry_failure in &retry.failures {
+                eprintln!("  ✗ {reference}: {:#}", retry_failure.error);
+            }
+        } else {
+            println!("  Installed {reference}.");
+        }
+    }
 }
 
 fn block_on_clawhub_list_top(n: usize) -> Result<Vec<clawhub::ClawHubSkill>> {
@@ -159,11 +231,32 @@ fn block_on_clawhub_list_top(n: usize) -> Result<Vec<clawhub::ClawHubSkill>> {
     rt.block_on(clawhub::list_top(n))
 }
 
-fn block_on_clawhub_install_many(profile: &Profile, slugs: &[String]) -> Result<Vec<String>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
+fn block_on_clawhub_install_many(
+    profile: &Profile,
+    references: &[String],
+) -> clawhub::BatchInstallReport {
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?;
-    rt.block_on(clawhub::install_many(profile, slugs))
+        .build()
+    {
+        Ok(rt) => rt,
+        // Report the runtime failure against every reference rather than
+        // returning an empty success — the caller prints failures, and a
+        // silent empty list is the exact failure mode this PR removes.
+        Err(err) => {
+            return clawhub::BatchInstallReport {
+                installed: Vec::new(),
+                failures: references
+                    .iter()
+                    .map(|reference| clawhub::BatchInstallFailure {
+                        reference: reference.clone(),
+                        error: anyhow::anyhow!("build tokio runtime: {err}"),
+                    })
+                    .collect(),
+            };
+        }
+    };
+    rt.block_on(clawhub::install_many(profile, references))
 }
 
 #[cfg(test)]
@@ -219,6 +312,47 @@ mod tests {
             assert!(!installed.is_empty());
             let s = SkillsSection;
             assert!(s.is_already_configured(&profile, &cfg));
+        });
+    }
+
+    fn skill_with_owner(slug: &str, owner: &str) -> clawhub::ClawHubSkill {
+        clawhub::ClawHubSkill {
+            slug: slug.into(),
+            display_name: slug.into(),
+            summary: String::new(),
+            owner_handle: owner.into(),
+            official: false,
+            stats: clawhub::ClawHubStats::default(),
+            tags: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn reference_qualifies_the_publisher_when_one_is_known() {
+        assert_eq!(
+            reference_for(&skill_with_owner("weather", "steipete")),
+            "@steipete/weather"
+        );
+        // The listing endpoint this wizard browses reports no publisher, so
+        // these stay bare and get resolved by asking the user.
+        assert_eq!(reference_for(&skill_with_owner("weather", "")), "weather");
+    }
+
+    #[test]
+    fn install_many_reports_failures_instead_of_swallowing_them() {
+        with_home(|| {
+            let profile = crate::profile::ProfileManager::ensure_default().unwrap();
+            // `a/b/c` is rejected while parsing, so this needs no network.
+            // The point is that the caller can see the failure at all: it
+            // used to go only to `tracing::warn!`, and the wizard printed an
+            // empty install line with no explanation.
+            let report = block_on_clawhub_install_many(&profile, &["a/b/c".to_string()]);
+            assert!(report.installed.is_empty());
+            assert_eq!(report.failures.len(), 1);
+            assert_eq!(report.failures[0].reference, "a/b/c");
+            // Not an ambiguity, so the wizard prints it rather than
+            // prompting for a publisher.
+            assert!(report.failures[0].ambiguous().is_none());
         });
     }
 }

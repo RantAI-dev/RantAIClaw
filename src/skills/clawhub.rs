@@ -353,20 +353,53 @@ pub async fn inspect_to_stdout(reference: &str) -> Result<()> {
     Ok(())
 }
 
-/// Install a batch of ClawHub skills by slug. Errors on individual slugs
-/// are logged but do not abort the batch — the function returns the slugs
-/// that successfully installed.
-pub async fn install_many(profile: &Profile, slugs: &[String]) -> Result<Vec<String>> {
-    let mut installed = Vec::new();
-    for slug in slugs {
-        match install_one(profile, slug).await {
-            Ok(()) => installed.push(slug.clone()),
-            Err(err) => {
-                tracing::warn!(slug = slug.as_str(), error = %err, "clawhub install failed");
+/// One reference that did not install, and why.
+pub struct BatchInstallFailure {
+    pub reference: String,
+    pub error: anyhow::Error,
+}
+
+impl BatchInstallFailure {
+    /// The candidate publishers, when this failed because the slug is shared.
+    /// Callers that can ask the user which one they meant use this; callers
+    /// that cannot fall back to printing [`Self::error`].
+    pub fn ambiguous(&self) -> Option<&AmbiguousSkill> {
+        self.error.downcast_ref::<AmbiguousSkill>()
+    }
+}
+
+/// What a batch install actually did.
+pub struct BatchInstallReport {
+    pub installed: Vec<String>,
+    pub failures: Vec<BatchInstallFailure>,
+}
+
+/// Install a batch of ClawHub references. A failure on one does not abort the
+/// batch.
+///
+/// Failures are *returned*, not swallowed. They used to go to
+/// `tracing::warn!`, which no console surface displays: the onboarding wizard
+/// printed `Installed from ClawHub:` with an empty list and no explanation,
+/// so picking five skills that all turned out to have shared slugs looked
+/// like the wizard had silently done nothing.
+pub async fn install_many(profile: &Profile, references: &[String]) -> BatchInstallReport {
+    let mut report = BatchInstallReport {
+        installed: Vec::new(),
+        failures: Vec::new(),
+    };
+    for reference in references {
+        match install_one(profile, reference).await {
+            Ok(()) => report.installed.push(reference.clone()),
+            Err(error) => {
+                tracing::warn!(reference = reference.as_str(), error = %error, "clawhub install failed");
+                report.failures.push(BatchInstallFailure {
+                    reference: reference.clone(),
+                    error,
+                });
             }
         }
     }
-    Ok(installed)
+    report
 }
 
 /// File entry returned by `GET /skills/:slug/versions/:v` (`version.files[*]`).
@@ -1177,6 +1210,34 @@ mod tests {
             rendered.contains("rantaiclaw skills install @steipete/weather"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn batch_failure_exposes_ambiguity_to_callers_that_can_ask() {
+        let ambiguous = AmbiguousSkill {
+            slug: "weather".into(),
+            matches: vec![AmbiguousMatch {
+                owner_handle: "steipete".into(),
+                reference: "@steipete/weather".into(),
+                url: String::new(),
+            }],
+        };
+        let failure = BatchInstallFailure {
+            reference: "weather".into(),
+            error: ambiguous.into(),
+        };
+        // The wizard turns this into a publisher prompt; without the
+        // downcast it could only print the message.
+        let recovered = failure.ambiguous().expect("ambiguity is recoverable");
+        assert_eq!(recovered.slug, "weather");
+        assert_eq!(recovered.matches[0].owner_handle, "steipete");
+
+        // Anything else stays opaque and is reported as-is.
+        let other = BatchInstallFailure {
+            reference: "weather".into(),
+            error: anyhow::anyhow!("network down"),
+        };
+        assert!(other.ambiguous().is_none());
     }
 
     #[test]
