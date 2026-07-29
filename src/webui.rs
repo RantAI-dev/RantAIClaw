@@ -21,7 +21,7 @@ const DEFAULT_PORT: u16 = 3939;
 
 /// Pinned claw-ui release tag `ui install` fetches by default. Bump this to
 /// roll the console forward; overridable per-invocation with `--ref`.
-const CLAW_UI_RELEASE: &str = "v0.3.9";
+const CLAW_UI_RELEASE: &str = "v0.3.10";
 /// Filename in the install dir recording the claw-ui tag last installed, so
 /// `ui update`/`ui start` can detect drift against `CLAW_UI_RELEASE`.
 const UI_VERSION_FILE: &str = ".version";
