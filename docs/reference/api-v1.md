@@ -448,18 +448,38 @@ as every other handler here.
 - **Auth**: bearer-gated.
 - **Request**:
   ```json
-  { "slug": "weather" }
+  { "slug": "@steipete/weather" }
   ```
-  `slug` is validated against ClawHub's slug charset (`[a-z0-9-_]`, no `/`,
-  `\`, or `..`) before anything is fetched.
+  `slug` accepts either a bare slug (`weather`) or the publisher-qualified
+  form (`@steipete/weather`). Each segment is validated against ClawHub's slug
+  charset (`[a-z0-9-_]`, no `\` or `..`) before anything is fetched.
 - **Response** `200`:
   ```json
-  { "slug": "weather", "installed": true }
+  { "slug": "@steipete/weather", "installed": true }
   ```
-  Installing an already-installed slug is idempotent and still returns
-  `installed: true` — it *is* installed, nothing was re-fetched.
-- **Status codes**: `200`, `400` (invalid slug), `401`, `500` (ClawHub
-  fetch/hash/install failure).
+  `slug` echoes the reference exactly as sent, qualified or not; the skill
+  itself is stored under its bare slug. Installing an already-installed skill
+  is idempotent and still returns `installed: true` — it *is* installed,
+  nothing was re-fetched. Asking for a slug that is installed from a
+  *different* publisher is refused rather than reported as installed.
+- **Response** `409` — the bare slug is published by more than one owner:
+  ```json
+  {
+    "error": "ambiguous_skill_slug",
+    "detail": "`weather` is published by 4 owners on ClawHub. Retry with one of the listed `reference` values.",
+    "matches": [
+      { "owner": "steipete", "reference": "@steipete/weather", "url": "https://clawhub.ai/steipete/skills/weather" },
+      { "owner": "lfengwa2", "reference": "@lfengwa2/weather", "url": "https://clawhub.ai/lfengwa2/skills/weather" }
+    ]
+  }
+  ```
+  Each `reference` can be sent straight back as the next request's `slug`.
+  The server never picks a publisher for you: an install stages code the agent
+  will later read and act on, so choosing by popularity or list order would
+  hand a slug squatter a path onto the machine. `matches` is omitted from
+  every other error response.
+- **Status codes**: `200`, `400` (invalid reference), `401`, `409` (ambiguous
+  slug), `500` (ClawHub fetch/hash/install failure).
 
 ### PUT /api/v1/skills/{name}/enabled
 
