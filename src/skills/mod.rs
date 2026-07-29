@@ -1629,12 +1629,20 @@ pub(crate) fn handle_command(
             // Bare slug (e.g. "weather") with no path separator and no URL
             // scheme → try ClawHub. This mirrors the TUI `/skills install <slug>`
             // path and keeps CLI/TUI surfaces in parity.
-            if !is_git_source(&source)
-                && !source.contains('/')
-                && !source.contains('\\')
-                && !source.starts_with('.')
-                && !source.starts_with('~')
-            {
+            // `@owner/slug` is a ClawHub reference, not a path or a git
+            // remote. It has to be recognised *before* the `contains('/')`
+            // test below, which would otherwise push it past the ClawHub
+            // branch into the git/local-path ones — where it fails as a
+            // missing directory. No git URL and no filesystem path begins
+            // with a bare `@` (git's scp form starts `user@`, not `@`), so
+            // the prefix is unambiguous.
+            let is_clawhub_source = source.starts_with('@')
+                || (!is_git_source(&source)
+                    && !source.contains('/')
+                    && !source.contains('\\')
+                    && !source.starts_with('.')
+                    && !source.starts_with('~'));
+            if is_clawhub_source {
                 let profile = crate::profile::ProfileManager::active()
                     .context("resolve active profile for ClawHub install")?;
                 // Caller is already inside a tokio runtime (main is `#[tokio::main]`),
@@ -1837,6 +1845,19 @@ pub(crate) fn handle_command(
                         continue;
                     }
 
+                    // Re-fetch from the publisher this copy actually came
+                    // from. Several publishers can share one slug, so
+                    // updating by bare slug would let an update pull a
+                    // different author's code into a directory the user
+                    // installed from someone else. Read before the rename
+                    // below — after it, the marker has moved with the dir.
+                    // Installs predating the marker have no owner recorded;
+                    // those fall back to the bare slug and behave as before.
+                    let reference = match crate::skills::clawhub::read_provenance(&dir) {
+                        Some(p) if !p.owner.is_empty() => format!("@{}/{}", p.owner, slug),
+                        _ => slug.clone(),
+                    };
+
                     // Non-destructive swap. `install_one` skips-if-exists
                     // and only cleans up *its own* partial dir on failure
                     // (`clawhub.rs:368-386`) — it never restores what a
@@ -1871,7 +1892,7 @@ pub(crate) fn handle_command(
                         continue;
                     }
 
-                    match rt.block_on(crate::skills::clawhub::install_one(&profile, slug)) {
+                    match rt.block_on(crate::skills::clawhub::install_one(&profile, &reference)) {
                         Ok(()) => {
                             let _ = std::fs::remove_dir_all(&backup);
                             println!("  {} {slug}: updated", console::style("✓").green().bold());
