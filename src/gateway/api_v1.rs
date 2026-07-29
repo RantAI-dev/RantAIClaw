@@ -124,6 +124,7 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, 
                 detail: Some(
                     "Pair via POST /pair, then send `Authorization: Bearer <token>`.".into(),
                 ),
+                matches: None,
             }),
         )),
     }
@@ -134,6 +135,20 @@ struct ErrorBody {
     error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// Candidate publishers, set only by `409 ambiguous_skill_slug` from the
+    /// skills-install route. Clients render these as a choice; the field is
+    /// omitted everywhere else, so existing consumers see the same shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matches: Option<Vec<SkillCandidate>>,
+}
+
+/// One publisher a shared ClawHub slug could mean.
+#[derive(Debug, Serialize)]
+struct SkillCandidate {
+    owner: String,
+    /// Ready to send straight back as the next request's `slug`.
+    reference: String,
+    url: String,
 }
 
 fn err_500(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
@@ -141,6 +156,7 @@ fn err_500(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorBody {
             error: "internal_error".into(),
+            matches: None,
             detail: Some(format!("{e:#}")),
         }),
     )
@@ -151,6 +167,7 @@ fn err_404(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
         StatusCode::NOT_FOUND,
         Json(ErrorBody {
             error: "not_found".into(),
+            matches: None,
             detail: Some(msg.into()),
         }),
     )
@@ -161,7 +178,43 @@ fn err_400(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
         StatusCode::BAD_REQUEST,
         Json(ErrorBody {
             error: "bad_request".into(),
+            matches: None,
             detail: Some(msg.into()),
+        }),
+    )
+}
+
+/// `409` for a ClawHub slug several publishers share.
+///
+/// A conflict, not a server error: the request was well-formed and the server
+/// is healthy — it just cannot tell which publisher was meant. Sending this as
+/// a 500 (what it used to be) told the console nothing and threw away the
+/// candidate list, so the panel could only show "internal error" for what is
+/// really a question with a known set of answers.
+fn err_409_ambiguous(
+    ambiguous: &crate::skills::clawhub::AmbiguousSkill,
+) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorBody {
+            error: "ambiguous_skill_slug".into(),
+            detail: Some(format!(
+                "`{}` is published by {} owners on ClawHub. Retry with one of the \
+                 listed `reference` values.",
+                ambiguous.slug,
+                ambiguous.matches.len()
+            )),
+            matches: Some(
+                ambiguous
+                    .matches
+                    .iter()
+                    .map(|m| SkillCandidate {
+                        owner: m.owner_handle.clone(),
+                        reference: format!("@{}/{}", m.owner_handle, ambiguous.slug),
+                        url: m.url.clone(),
+                    })
+                    .collect(),
+            ),
         }),
     )
 }
@@ -1073,6 +1126,10 @@ async fn skills_set_enabled(
 
 #[derive(Deserialize)]
 struct SkillInstallBody {
+    /// A ClawHub reference: a bare slug, or the publisher-qualified
+    /// `@owner/slug`. The qualified form is the only way to install a slug
+    /// more than one publisher uses, and a bare one that is shared comes back
+    /// as `409 ambiguous_skill_slug` with the candidates to choose from.
     slug: String,
 }
 
@@ -1090,11 +1147,21 @@ async fn skills_install(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let slug = body.slug.trim().to_string();
-    crate::skills::clawhub::validate_slug(&slug).map_err(|e| err_400(format!("{e:#}")))?;
+    // `slug` accepts the publisher-qualified form too (`@owner/slug`), which
+    // is the only way to install a slug several publishers share — 18 of the
+    // top 20 are. Parsed rather than `validate_slug`'d: that guard still runs,
+    // per segment, inside the parser, and stays untouched for the `{name}`
+    // path parameters on the routes below.
+    crate::skills::clawhub::parse_skill_ref(&slug).map_err(|e| err_400(format!("{e:#}")))?;
     let profile = crate::profile::ProfileManager::active().map_err(err_500)?;
     crate::skills::clawhub::install_one(&profile, &slug)
         .await
-        .map_err(err_500)?;
+        .map_err(
+            |e| match e.downcast_ref::<crate::skills::clawhub::AmbiguousSkill>() {
+                Some(ambiguous) => err_409_ambiguous(ambiguous),
+                None => err_500(e),
+            },
+        )?;
     // `install_one` is idempotent (a slug already present returns `Ok(())`
     // without re-fetching) — reporting `installed: true` for an
     // already-present skill is correct: it is installed.
@@ -2023,6 +2090,60 @@ mod tests {
                 .await
                 .expect_err("uninstall must require auth");
         assert_eq!(uninstall_err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn ambiguous_install_answers_409_with_usable_candidates() {
+        let ambiguous = crate::skills::clawhub::AmbiguousSkill {
+            slug: "weather".into(),
+            matches: vec![
+                crate::skills::clawhub::AmbiguousMatch {
+                    owner_handle: "steipete".into(),
+                    reference: "@steipete/weather".into(),
+                    url: "https://clawhub.ai/steipete/skills/weather".into(),
+                },
+                crate::skills::clawhub::AmbiguousMatch {
+                    owner_handle: "lfengwa2".into(),
+                    reference: "@lfengwa2/weather".into(),
+                    url: String::new(),
+                },
+            ],
+        };
+        let (status, Json(body)) = err_409_ambiguous(&ambiguous);
+
+        // A conflict, not a server error: the request was fine and the server
+        // is healthy, it just needs to be told which publisher.
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.error, "ambiguous_skill_slug");
+
+        // Each candidate must carry a reference the client can send straight
+        // back as the next request's `slug` — otherwise the console would
+        // have to build it by string-concatenating handles itself.
+        let candidates = body.matches.expect("candidates are the point of a 409");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].owner, "steipete");
+        assert_eq!(candidates[0].reference, "@steipete/weather");
+        assert_eq!(candidates[1].reference, "@lfengwa2/weather");
+    }
+
+    #[test]
+    fn non_ambiguous_errors_carry_no_candidates() {
+        // The field must stay absent on every other error, so existing
+        // clients keep seeing the shape they already parse.
+        let (status, Json(body)) = err_400("nope");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.matches.is_none());
+        assert!(err_500(anyhow::anyhow!("boom")).1 .0.matches.is_none());
+    }
+
+    #[tokio::test]
+    async fn skills_install_accepts_a_publisher_qualified_reference() {
+        // `validate_slug` rejects `/`, so routing this through it would 400
+        // every qualified reference before a request was ever made. The
+        // parser splits first and validates each segment, which is what lets
+        // a shared slug be installable at all.
+        assert!(crate::skills::clawhub::parse_skill_ref("@steipete/weather").is_ok());
+        assert!(crate::skills::clawhub::validate_slug("@steipete/weather").is_err());
     }
 
     #[tokio::test]
