@@ -103,6 +103,27 @@ impl ApprovalManager {
         }
     }
 
+    /// Does `tool` always prompt? Reads the live policy when one is attached.
+    ///
+    /// Manual and Smart are both `Supervised` and differ *only* by this list,
+    /// so a cached copy made switching between them a no-op on any surface
+    /// that builds its manager once — which the channels path does.
+    fn forces_prompt(&self, tool_name: &str) -> bool {
+        match &self.policy {
+            Some(p) => p.fields().always_ask.iter().any(|t| t == tool_name),
+            None => self.always_ask.contains(tool_name),
+        }
+    }
+
+    /// Does `tool` skip the prompt outright? Live counterpart of
+    /// [`Self::forces_prompt`].
+    fn pre_approved(&self, tool_name: &str) -> bool {
+        match &self.policy {
+            Some(p) => p.fields().auto_approve.iter().any(|t| t == tool_name),
+            None => self.auto_approve.contains(tool_name),
+        }
+    }
+
     /// Check whether a tool call requires interactive approval.
     ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
@@ -120,12 +141,12 @@ impl ApprovalManager {
         }
 
         // always_ask overrides everything.
-        if self.always_ask.contains(tool_name) {
+        if self.forces_prompt(tool_name) {
             return true;
         }
 
         // auto_approve skips the prompt.
-        if self.auto_approve.contains(tool_name) {
+        if self.pre_approved(tool_name) {
             return false;
         }
 
@@ -363,6 +384,64 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::AutonomyConfig;
+
+    /// Manual and Smart are both `Supervised`; the *only* thing separating
+    /// them is `always_ask`. With that list cached at construction, switching
+    /// between the two changed nothing on the channels path — a tightening
+    /// that silently did not apply.
+    #[test]
+    fn needs_approval_follows_a_live_switch_between_smart_and_manual() {
+        // Smart: nothing forced to prompt, reads pre-approved.
+        let smart = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec![],
+            auto_approve: vec!["file_read".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let policy = Arc::new(crate::security::SecurityPolicy::default());
+        policy.apply_config(&smart);
+        let mgr = ApprovalManager::from_config(&smart).with_policy(Arc::clone(&policy));
+
+        assert!(!mgr.needs_approval("file_read"), "Smart pre-approves reads");
+
+        // Manual: the same level, but every built-in is forced to prompt.
+        policy.apply_config(&crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec!["file_read".to_string()],
+            auto_approve: vec!["file_read".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
+        assert!(
+            mgr.needs_approval("file_read"),
+            "switching Smart -> Manual must start prompting even though the \
+             autonomy level did not change"
+        );
+    }
+
+    /// The mirror: dropping a tool from `auto_approve` must start prompting.
+    #[test]
+    fn needs_approval_follows_a_live_auto_approve_change() {
+        let cfg = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec![],
+            auto_approve: vec!["memory_recall".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let policy = Arc::new(crate::security::SecurityPolicy::default());
+        policy.apply_config(&cfg);
+        let mgr = ApprovalManager::from_config(&cfg).with_policy(Arc::clone(&policy));
+
+        assert!(!mgr.needs_approval("memory_recall"));
+
+        policy.apply_config(&crate::config::AutonomyConfig {
+            auto_approve: vec![],
+            ..cfg.clone()
+        });
+        assert!(
+            mgr.needs_approval("memory_recall"),
+            "removing a tool from auto_approve must take effect without a restart"
+        );
+    }
 
     /// The manager is built once when channels start. Before this, it cached
     /// the boot autonomy level, so tightening autonomy at runtime left the

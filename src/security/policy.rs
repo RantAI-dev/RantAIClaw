@@ -89,6 +89,14 @@ pub struct PolicyFields {
     pub require_approval_for_medium_risk: bool,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
+    /// Tools that always prompt, and tools that never do. Read by
+    /// `ApprovalManager`, not by the gate — they live here because they are
+    /// `[autonomy]` config like everything else in this struct, and the two
+    /// presets that share a level (Manual and Smart) differ *only* by
+    /// `always_ask`. Keeping them outside meant switching between those two
+    /// changed nothing on a surface that builds its manager once.
+    pub always_ask: Vec<String>,
+    pub auto_approve: Vec<String>,
 }
 
 impl PolicyFields {
@@ -102,6 +110,8 @@ impl PolicyFields {
             require_approval_for_medium_risk: c.require_approval_for_medium_risk,
             max_actions_per_hour: c.max_actions_per_hour,
             max_cost_per_day_cents: c.max_cost_per_day_cents,
+            always_ask: c.always_ask.clone(),
+            auto_approve: c.auto_approve.clone(),
         }
     }
 }
@@ -186,6 +196,10 @@ impl Default for SecurityPolicy {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: false,
+            // Matches `AutonomyConfig::default()`: the high-blast-radius pair
+            // always prompts, and reads are pre-approved.
+            always_ask: vec!["ssh".into(), "pty".into()],
+            auto_approve: vec!["file_read".into(), "memory_recall".into()],
         };
         Self {
             fields: Arc::new(RwLock::new(Arc::new(fields))),
