@@ -5,6 +5,66 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0-alpha] — 2026-07-29
+
+Make an autonomy change reach every surface without a restart. `[autonomy]`
+had ten fields; only two could be refreshed on a running process, each through
+its own bespoke override slot. The other eight were read straight off the
+struct and stayed frozen at whatever was on disk when the process started —
+so editing them saved to config and changed nothing.
+
+Minor bump: cron tools no longer accept an `approved` argument, the Strict
+preset now refuses `shell` at the gate rather than removing it from the
+registry, and scheduled cron jobs are subject to the risk gate for the first
+time. No config schema change (stays 16); the claw-ui pin moves to `v0.3.10`.
+
+### Fixed
+
+- **The whole `[autonomy]` section now refreshes on a running policy.** All ten
+  fields move into one slot swapped as a unit, so a reload reaches
+  `forbidden_paths`, `workspace_only`, `block_high_risk_commands`,
+  `require_approval_for_medium_risk` and the budgets — not just `level` and
+  `allowed_commands`. Process state (the rate-limit window, `/allow` grants,
+  the approval registry) is deliberately excluded and survives a refresh.
+- **The rate limit is enforceable on the gateway again.** The web console
+  rebuilt its policy every turn, which reset the hourly window with it, so
+  `max_actions_per_hour` never tripped there — a budget of 20 allowed 200
+  actions. Regression shipped in 0.13.0-alpha.
+- **The channel approval gate follows a live autonomy change.** It cached the
+  boot level, so tightening from Full to Supervised left the gate open until a
+  restart. Fail-open on the path where an arbitrary chat sender is the caller.
+- **Switching between Manual and Smart takes effect on channels.** Both are
+  `Supervised` and differ only by `always_ask`, which was cached at
+  construction, so the switch was a no-op — and Smart to Manual is a
+  tightening.
+- **The channel system prompt no longer briefs the model on a stale preset.**
+  The safety section is re-rendered per turn against the live policy, so the
+  gate and the briefing move together.
+- **The approval prompt names the command the gate actually rejected.** It read
+  the boot allowlist while the gate read the live one, so after a reload that
+  narrowed the list it named the wrong command — approving it would not have
+  helped. `/allowlist` showed the same stale list, now relabelled "Config
+  allowlist".
+
+### Security
+
+- **Cron tools can no longer approve themselves.** `cron_add`, `cron_run` and
+  `cron_update` exposed `approved` as a tool parameter, so the model filled it
+  in: a call refused for needing explicit approval could be re-sent with
+  `approved: true` and pass. The parameter is gone from all three schemas.
+- **Scheduled cron jobs now pass the risk gate.** The scheduled path checked
+  autonomy, the allowlist and forbidden paths but never the risk
+  classification, so a job the same policy would refuse from an interactive
+  turn ran unchallenged at fire time.
+
+### Changed
+
+- **Strict refuses `shell` at the gate instead of unregistering it.** The tool
+  stays listed and is denied on call with a policy reason, so the model reports
+  the real cause rather than "I don't have that capability" — and leaving
+  Strict mid-session restores it without a rebuild. Strict enforces the same
+  set of refusals as before; the two characterization tests exist to prove it.
+
 ## [0.13.0-alpha] — 2026-07-27
 
 Make the autonomy preset mean the same thing on every surface. A preset
