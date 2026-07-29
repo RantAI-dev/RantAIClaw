@@ -162,3 +162,66 @@ async fn cron_update_missing_job_returns_404() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
+
+/// The HTTP force-run endpoint keeps its `?approved=` parameter on purpose,
+/// even though the `cron_run` **tool** had its equivalent removed.
+///
+/// The two callers are not the same. The tool is invoked by the model, so a
+/// parameter it fills in is an assertion rather than an approval — that is the
+/// hole that was closed. This endpoint is behind `check_auth`, so the caller is
+/// an authenticated operator making the same call they could make from the CLI.
+///
+/// Pinned as a test because the asymmetry reads like an oversight: without
+/// this, "make the API match the tool" looks like a tidy-up rather than the
+/// removal of the only way to force-run a gated job over HTTP.
+#[tokio::test]
+async fn cron_run_honours_an_operator_supplied_approval() {
+    let ws = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(ws.path());
+    // `touch` is Medium risk, and Supervised requires approval for medium risk
+    // by default — so the gate is what decides here, not the allowlist.
+    cfg.autonomy.allowed_commands = vec!["touch".into()];
+    let base = spawn_test_gateway(cfg).await;
+    let client = reqwest::Client::new();
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/api/v1/cron"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+            "command": "touch cron-http-approval"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // Without an approval the gate refuses.
+    let denied = client
+        .post(format!("{base}/api/v1/cron/{id}/run"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a medium-risk job must be refused without an operator approval"
+    );
+
+    // With one, it runs. This is the behaviour that must not be "aligned" away.
+    let approved = client
+        .post(format!("{base}/api/v1/cron/{id}/run?approved=true"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        approved.status(),
+        reqwest::StatusCode::OK,
+        "an authenticated operator must still be able to force-run a gated job"
+    );
+}

@@ -364,7 +364,13 @@ async fn run_cron(
         .map_err(err_500)?
         .map_err(map_store_error)?;
 
-    // Security/approval gate — mirror the `cron_run` tool.
+    // Security/approval gate. This deliberately does NOT mirror the `cron_run`
+    // tool, which passes `false` unconditionally: there the caller is the
+    // model, and a parameter it fills in is an assertion, not an approval.
+    // Here the caller cleared `check_auth`, so `?approved=true` is an
+    // authenticated operator making the same decision they could make from the
+    // CLI. Keep the two asymmetric on purpose — narrowing this to `false` would
+    // remove the only way to force-run a gated job from the API.
     let security = SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir);
     if !security.can_act() {
         return Err(err_400(
