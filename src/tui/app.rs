@@ -78,6 +78,95 @@ pub struct ChannelSupervisor {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// Why a spawned ClawHub install did not finish successfully.
+///
+/// Ambiguity is modelled apart from ordinary failure because it is not really
+/// an error from where the user sits — it is a question. ClawHub namespaces
+/// skills per publisher, so a slug several of them share resolves to a
+/// candidate list, and the picker turns that list into rows instead of
+/// printing it as a message. The publisher is never chosen automatically.
+pub enum ClawhubInstallFailure {
+    Ambiguous(Box<crate::skills::clawhub::AmbiguousSkill>),
+    Other(String),
+}
+
+/// Build the picker row for one ClawHub search or listing result.
+///
+/// The row `key` is the install *reference*, not the slug: `@owner/slug`
+/// whenever the endpoint reported a publisher, a bare slug when it did not.
+/// Enter feeds that key straight to `install_one`, so qualifying it here is
+/// what lets a search result install in one step — `/search` reports the
+/// publisher, while the listing endpoint omits it and still has to resolve
+/// through the ambiguity prompt.
+fn clawhub_result_item(
+    skill: &crate::skills::clawhub::ClawHubSkill,
+) -> crate::tui::widgets::ListPickerItem {
+    let name = if skill.display_name.is_empty() {
+        skill.slug.clone()
+    } else {
+        skill.display_name.clone()
+    };
+    // Show who published it. Without the handle, a search for a shared slug
+    // renders rows that cannot be told apart — one of the four `weather`
+    // results is a verbatim fork of another, identical name and summary,
+    // differing only by publisher.
+    let mut primary = if skill.owner_handle.is_empty() {
+        name
+    } else {
+        format!("{name}  @{}", skill.owner_handle)
+    };
+    if skill.official {
+        primary.push_str(" ✓");
+    }
+    // Listings report stars, search reports downloads, and neither reports
+    // both — show whichever the endpoint actually returned rather than a
+    // misleading zero for the other.
+    if skill.stats.stars > 0 {
+        primary = format!("{primary}  (★{})", skill.stats.stars);
+    } else if skill.stats.downloads > 0 {
+        primary = format!("{primary}  (↓{})", skill.stats.downloads);
+    }
+    let secondary = if skill.summary.is_empty() {
+        String::new()
+    } else {
+        let cleaned = skill.summary.replace('\n', " ");
+        let cleaned = cleaned.trim();
+        if cleaned.chars().count() > 90 {
+            let head: String = cleaned.chars().take(87).collect();
+            format!("{head}…")
+        } else {
+            cleaned.to_string()
+        }
+    };
+    let key = if skill.owner_handle.is_empty() {
+        skill.slug.clone()
+    } else {
+        format!("@{}/{}", skill.owner_handle, skill.slug)
+    };
+    crate::tui::widgets::ListPickerItem {
+        key,
+        primary,
+        secondary,
+    }
+}
+
+/// Build the picker rows offered when a slug turns out to be shared by
+/// several publishers. Every key is fully qualified, so choosing a row
+/// installs that publisher's copy without another round trip.
+fn clawhub_candidate_items(
+    ambiguous: &crate::skills::clawhub::AmbiguousSkill,
+) -> Vec<crate::tui::widgets::ListPickerItem> {
+    ambiguous
+        .matches
+        .iter()
+        .map(|m| crate::tui::widgets::ListPickerItem {
+            key: format!("@{}/{}", m.owner_handle, ambiguous.slug),
+            primary: format!("@{}", m.owner_handle),
+            secondary: m.url.clone(),
+        })
+        .collect()
+}
+
 /// Top-level TUI application.
 // Many independent UI mode flags; grouping them into a sub-struct would not
 // improve clarity and would churn every call site.
@@ -148,20 +237,25 @@ pub struct TuiApp {
             anyhow::Result<Vec<crate::skills::clawhub::ClawHubSkill>>,
         )>,
     >,
-    /// Slug currently being installed from ClawHub, plus the spinner frame
-    /// index (advanced each render tick). `None` when no install is in
+    /// Local slug currently being installed from ClawHub, plus the spinner
+    /// frame index (advanced each render tick). `None` when no install is in
     /// flight. While `Some`, the picker title shows a Braille-spinner
     /// "Installing …" line that animates per tick.
+    ///
+    /// Holds the *slug*, not the `@owner/slug` reference the install was
+    /// launched with: it doubles as the preselect key for the Skill picker
+    /// that replaces this one on success, and those rows are keyed by the
+    /// local manifest name.
     pub clawhub_install_in_progress: Option<(String, usize)>,
     /// Completion channel for spawned ClawHub install tasks. `Ok(slug)` on
-    /// success, `Err(message)` on failure. The render loop drains this
-    /// each tick — when a result arrives, the install picker swaps to the
-    /// Skill picker (success) or its title flips to an error string
-    /// (failure).
+    /// success. The render loop drains this each tick — when a result
+    /// arrives, the install picker swaps to the Skill picker (success), asks
+    /// which publisher was meant (ambiguous), or flips its title to an error
+    /// string (anything else).
     pub clawhub_install_completion_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<Result<String, String>>>,
+        Option<tokio::sync::mpsc::UnboundedReceiver<Result<String, ClawhubInstallFailure>>>,
     pub clawhub_install_completion_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<Result<String, String>>>,
+        Option<tokio::sync::mpsc::UnboundedSender<Result<String, ClawhubInstallFailure>>>,
     /// Skill currently running install-deps from the local `/skills`
     /// picker, plus spinner frame. Triggered by Ctrl+I/Tab on a skill row.
     pub skill_deps_install_in_progress: Option<(String, usize)>,
@@ -870,7 +964,14 @@ impl TuiApp {
                         }
                         return Ok(EventResult::Continue);
                     }
-                    let slug = match self
+                    // The row key is the install *reference*: `@owner/slug`
+                    // whenever the endpoint told us who published it, a bare
+                    // slug otherwise. The local slug is derived from it
+                    // separately — it names the directory on disk and is the
+                    // preselect key for the Skill picker shown afterwards,
+                    // which keys rows by local manifest name, not by
+                    // reference.
+                    let reference = match self
                         .list_picker
                         .as_ref()
                         .and_then(|p| p.current().map(|i| i.key.clone()))
@@ -878,6 +979,8 @@ impl TuiApp {
                         Some(s) => s,
                         None => return Ok(EventResult::Continue),
                     };
+                    let slug = crate::skills::clawhub::parse_skill_ref(&reference)
+                        .map_or_else(|_| reference.clone(), |parsed| parsed.slug);
                     if self.clawhub_install_in_progress.is_some() {
                         // Already installing — ignore the second Enter so
                         // we don't fire two parallel installs.
@@ -891,20 +994,37 @@ impl TuiApp {
                     // inline, which froze the entire TUI for the whole
                     // network round-trip — no spinner, no animation, just
                     // instant flicker into the next picker.
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                        Result<String, ClawhubInstallFailure>,
+                    >();
                     self.clawhub_install_completion_rx = Some(rx);
                     self.clawhub_install_completion_tx = Some(tx.clone());
                     self.clawhub_install_in_progress = Some((slug.clone(), 0));
                     let profile = self.profile.clone();
-                    let slug_for_task = slug.clone();
+                    let reference_for_task = reference.clone();
                     tokio::spawn(async move {
-                        let send =
-                            match crate::skills::clawhub::install_one(&profile, &slug_for_task)
-                                .await
-                            {
-                                Ok(()) => Ok(slug_for_task),
-                                Err(e) => Err(format!("{e:#}")),
-                            };
+                        let send = match crate::skills::clawhub::install_one(
+                            &profile,
+                            &reference_for_task,
+                        )
+                        .await
+                        {
+                            Ok(()) => Ok(slug),
+                            // An ambiguous slug comes back as a typed error
+                            // carrying every candidate publisher; keep it
+                            // structured so the picker can offer them as rows
+                            // instead of flattening it into a message.
+                            Err(e) => Err(
+                                match e.downcast::<crate::skills::clawhub::AmbiguousSkill>() {
+                                    Ok(ambiguous) => {
+                                        ClawhubInstallFailure::Ambiguous(Box::new(ambiguous))
+                                    }
+                                    Err(other) => {
+                                        ClawhubInstallFailure::Other(format!("{other:#}"))
+                                    }
+                                },
+                            ),
+                        };
                         let _ = tx.send(send);
                     });
                     return Ok(EventResult::Continue);
@@ -3449,43 +3569,7 @@ impl TuiApp {
 
         match result {
             Ok(skills) => {
-                let items: Vec<ListPickerItem> = skills
-                    .into_iter()
-                    .map(|s| {
-                        let name = if s.display_name.is_empty() {
-                            s.slug.clone()
-                        } else {
-                            s.display_name.clone()
-                        };
-                        // Listings include star counts; search results
-                        // don't (server returns score, not stats), so
-                        // omit the (★N) suffix when stars is zero to
-                        // avoid showing a misleading "0 stars" for every
-                        // search hit.
-                        let primary = if s.stats.stars > 0 {
-                            format!("{name}  (★{})", s.stats.stars)
-                        } else {
-                            name
-                        };
-                        let secondary = if s.summary.is_empty() {
-                            String::new()
-                        } else {
-                            let cleaned = s.summary.replace('\n', " ");
-                            let cleaned = cleaned.trim();
-                            if cleaned.chars().count() > 90 {
-                                let head: String = cleaned.chars().take(87).collect();
-                                format!("{head}…")
-                            } else {
-                                cleaned.to_string()
-                            }
-                        };
-                        ListPickerItem {
-                            key: s.slug,
-                            primary,
-                            secondary,
-                        }
-                    })
-                    .collect();
+                let items: Vec<ListPickerItem> = skills.iter().map(clawhub_result_item).collect();
                 picker.set_items(items);
             }
             Err(e) => {
@@ -3511,7 +3595,7 @@ impl TuiApp {
 
         // Drain completion channel — only the most recent result matters
         // (only one install can be in flight at a time, but be defensive).
-        let mut completion: Option<Result<String, String>> = None;
+        let mut completion: Option<Result<String, ClawhubInstallFailure>> = None;
         if let Some(rx) = self.clawhub_install_completion_rx.as_mut() {
             while let Ok(msg) = rx.try_recv() {
                 completion = Some(msg);
@@ -3548,7 +3632,23 @@ impl TuiApp {
                     "No skills loaded.",
                 ));
             }
-            Some(Err(error_msg)) => {
+            Some(Err(ClawhubInstallFailure::Ambiguous(ambiguous))) => {
+                // Not a failure the user can only read about: the slug is
+                // shared by several publishers, so replace the rows with the
+                // candidates and let them say which one they meant. Keys are
+                // fully qualified, so the next Enter installs directly.
+                self.clawhub_install_in_progress = None;
+                self.clawhub_install_completion_rx = None;
+                self.clawhub_install_completion_tx = None;
+                let slug = ambiguous.slug.clone();
+                let items = clawhub_candidate_items(&ambiguous);
+                if let Some(p) = self.list_picker.as_mut() {
+                    p.title = format!("`{slug}` — {} publishers, pick one", items.len());
+                    p.set_items(items);
+                    p.focus = crate::tui::widgets::list_picker::Focus::List;
+                }
+            }
+            Some(Err(ClawhubInstallFailure::Other(error_msg))) => {
                 // Surface failure in the picker title; keep the overlay
                 // open so the user can pick a different slug or retry.
                 if let Some(p) = self.list_picker.as_mut() {
@@ -7432,6 +7532,93 @@ mod error_format_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn clawhub_skill(slug: &str, owner: &str) -> crate::skills::clawhub::ClawHubSkill {
+        crate::skills::clawhub::ClawHubSkill {
+            slug: slug.into(),
+            display_name: "Weather".into(),
+            summary: "Get current weather and forecasts.".into(),
+            owner_handle: owner.into(),
+            official: false,
+            stats: crate::skills::clawhub::ClawHubStats::default(),
+            tags: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn clawhub_result_row_keys_by_publisher_reference() {
+        // The key is fed straight to `install_one`, so a search result whose
+        // publisher is known must install that publisher's copy — not
+        // whichever one a bare slug happens to resolve to.
+        let item = clawhub_result_item(&clawhub_skill("weather", "steipete"));
+        assert_eq!(item.key, "@steipete/weather");
+
+        // The listing endpoint reports no publisher at all; those rows stay
+        // bare and resolve through the ambiguity prompt instead.
+        let unowned = clawhub_result_item(&clawhub_skill("weather", ""));
+        assert_eq!(unowned.key, "weather");
+    }
+
+    #[test]
+    fn clawhub_result_row_shows_publisher_and_popularity() {
+        let mut skill = clawhub_skill("weather", "steipete");
+        skill.official = true;
+        skill.stats.downloads = 165_212;
+        let item = clawhub_result_item(&skill);
+        // Two same-slug rows differ only by publisher, so the handle has to
+        // be on screen for the choice to mean anything.
+        assert!(item.primary.contains("@steipete"), "{}", item.primary);
+        assert!(item.primary.contains('✓'), "{}", item.primary);
+        assert!(item.primary.contains("165212"), "{}", item.primary);
+
+        // Listings carry stars instead; showing a 0 for the absent metric
+        // would read as "nobody uses this".
+        let mut starred = clawhub_skill("weather", "");
+        starred.stats.stars = 427;
+        let listed = clawhub_result_item(&starred);
+        assert!(listed.primary.contains("★427"), "{}", listed.primary);
+        assert!(!listed.primary.contains('↓'), "{}", listed.primary);
+    }
+
+    #[test]
+    fn clawhub_candidate_rows_are_fully_qualified() {
+        let ambiguous = crate::skills::clawhub::AmbiguousSkill {
+            slug: "weather".into(),
+            matches: vec![
+                crate::skills::clawhub::AmbiguousMatch {
+                    owner_handle: "steipete".into(),
+                    reference: "@steipete/weather".into(),
+                    url: "https://clawhub.ai/steipete/skills/weather".into(),
+                },
+                crate::skills::clawhub::AmbiguousMatch {
+                    owner_handle: "lfengwa2".into(),
+                    reference: "@lfengwa2/weather".into(),
+                    url: String::new(),
+                },
+            ],
+        };
+        let items = clawhub_candidate_items(&ambiguous);
+        // Every candidate key must be qualified: selecting one has to
+        // install that publisher, not re-enter the same ambiguity.
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key, "@steipete/weather");
+        assert_eq!(items[1].key, "@lfengwa2/weather");
+        assert!(items.iter().all(|i| i.key.starts_with('@')));
+        assert_eq!(items[0].primary, "@steipete");
+    }
+
+    #[test]
+    fn install_reference_and_local_slug_are_distinct() {
+        // The picker installs by reference but preselects the freshly
+        // installed skill in the Skill picker, whose rows are keyed by local
+        // manifest name. Reusing the reference there would silently fail to
+        // match, so the slug is derived separately.
+        let reference = clawhub_result_item(&clawhub_skill("weather", "steipete")).key;
+        let slug = crate::skills::clawhub::parse_skill_ref(&reference)
+            .map_or_else(|_| reference.clone(), |parsed| parsed.slug);
+        assert_eq!(reference, "@steipete/weather");
+        assert_eq!(slug, "weather");
+    }
 
     fn cfg_with_telegram(token: &str) -> crate::config::Config {
         let mut c = crate::config::Config::default();
