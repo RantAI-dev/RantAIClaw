@@ -56,8 +56,16 @@ tmux new-session -d -s "$SESSION" \
   "cd '$ROOT_DIR' && HOME='$TMP_HOME' RANTAICLAW_PROFILE='$PROFILE' RANTAICLAW_LOG_STDERR=1 '$BIN'"
 
 sleep 2
-tmux send-keys -t "$SESSION" "/skills" Enter
-sleep 2
+# Send the text and the Enter as two separate bursts. `send-keys "..." Enter`
+# delivers both in one write, and the composer's paste coalescing then reads
+# the whole burst as a multi-line paste — the Enter lands in the buffer as a
+# newline instead of submitting. The picker never opens, and the assertions
+# below fail against the splash screen (which contains the word "Skills", so
+# even the first check passes for the wrong reason).
+tmux send-keys -t "$SESSION" "/skills"
+sleep 1
+tmux send-keys -t "$SESSION" Enter
+sleep 3
 tmux capture-pane -t "$SESSION" -pS -200 >"$CAPTURE"
 
 if ! grep -Eiq "skills|web[- ]?search|summarizer|meeting" "$CAPTURE"; then
