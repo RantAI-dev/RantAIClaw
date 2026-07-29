@@ -58,7 +58,7 @@ impl Tool for SkillsInstallTool {
             "properties": {
                 "slug": {
                     "type": "string",
-                    "description": "ClawHub skill slug (e.g. `weather`)."
+                    "description": "ClawHub skill reference. Prefer the publisher-qualified form `@owner/slug` (e.g. `@steipete/weather`) — most popular slugs are published by several people, and a bare slug like `weather` is refused with the list of candidates. Use the `reference` field from skills_search."
                 }
             },
             "required": ["slug"]
@@ -114,11 +114,35 @@ impl Tool for SkillsInstallTool {
                     error: None,
                 })
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("clawhub install of `{slug_owned}` failed: {e:#}")),
-            }),
+            // An ambiguous slug is recoverable, but only if the caller is told
+            // how. The error's own Display suggests a CLI command, which is
+            // not something this caller can run — give it the reference to
+            // retry with instead, and let it decide which publisher it meant.
+            Err(e) => {
+                let error = match e.downcast_ref::<crate::skills::clawhub::AmbiguousSkill>() {
+                    Some(ambiguous) => {
+                        let options: Vec<String> = ambiguous
+                            .matches
+                            .iter()
+                            .map(|m| format!("@{}/{}", m.owner_handle, ambiguous.slug))
+                            .collect();
+                        format!(
+                            "`{}` is published by {} owners on ClawHub, so the bare slug is \
+                             ambiguous. Retry with one of these exact references: {}. Pick the \
+                             one the user asked for — do not guess, and say which you chose.",
+                            ambiguous.slug,
+                            options.len(),
+                            options.join(", ")
+                        )
+                    }
+                    None => format!("clawhub install of `{slug_owned}` failed: {e:#}"),
+                };
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                })
+            }
         }
     }
 }
