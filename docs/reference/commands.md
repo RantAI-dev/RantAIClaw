@@ -221,7 +221,22 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 
 `skills enable <name>` / `skills disable <name>` write `[skills.entries.<name>] enabled = true` / `enabled = false` in `config.toml` — the same key documented in `docs/reference/config.md`, which is also toggleable at runtime via the gateway's `PUT /api/v1/skills/{name}/enabled`.
 
-`<source>` accepts a ClawHub slug, git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`), or a local filesystem path.
+`<source>` accepts a ClawHub reference, git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`), or a local filesystem path.
+
+A ClawHub reference is either a bare slug (`weather`) or a publisher-qualified one (`@steipete/weather`). ClawHub namespaces skills per publisher, so a slug is not unique: several people can publish `weather`, and a bare slug that more than one of them uses is rejected rather than guessed at:
+
+```
+$ rantaiclaw skills install weather
+`weather` is published by 4 owners on ClawHub — say which one you mean:
+    @steipete/weather  https://clawhub.ai/steipete/skills/weather
+    @lfengwa2/weather  https://clawhub.ai/lfengwa2/skills/weather
+    ...
+  For example: `rantaiclaw skills install @steipete/weather`
+```
+
+The publisher is never chosen automatically. Installing stages remote code that the agent will later read and act on, so picking one on your behalf — by popularity, by "official" badge, or by list order — would hand anyone who squats a popular slug a path onto the machine.
+
+`skills inspect <slug>` takes the same two forms. A skill installed from a qualified reference records its publisher, and `skills update` re-fetches from that same publisher rather than resolving the slug again.
 
 Skill manifests (`SKILL.md`) support YAML frontmatter, `requires` gating, environment injection, and `metadata.clawdbot.install[]` recipes. `install-deps` runs the preferred host recipe (`brew`, `uv`, Node package managers, `go`, or `download`) and validates declared binaries afterward.
 
