@@ -1081,13 +1081,6 @@ impl TuiApp {
             KeyCode::Backspace if self.list_picker.is_some() => {
                 if let Some(p) = self.list_picker.as_mut() {
                     p.pop_query_char();
-                    // Mark a search as pending for the ClawHub picker so
-                    // the "↵ Enter to search ClawHub" hint shows up next
-                    // to the typed query — pre-fix users typed and saw
-                    // nothing happen, since search only fires on Enter.
-                    if p.kind == crate::tui::widgets::ListPickerKind::ClawhubInstall {
-                        p.search_pending = !p.query.is_empty();
-                    }
                 }
                 return Ok(EventResult::Continue);
             }
@@ -1098,9 +1091,6 @@ impl TuiApp {
             {
                 if let Some(p) = self.list_picker.as_mut() {
                     p.push_query_char(c);
-                    if p.kind == crate::tui::widgets::ListPickerKind::ClawhubInstall {
-                        p.search_pending = true;
-                    }
                 }
                 return Ok(EventResult::Continue);
             }
@@ -3327,11 +3317,6 @@ impl TuiApp {
         let Some(tx) = self.clawhub_install_results_tx.clone() else {
             return;
         };
-        // Clear the "↵ Enter to search ClawHub" hint — a search is
-        // about to fire, so the typed query is no longer pending.
-        if let Some(p) = self.list_picker.as_mut() {
-            p.search_pending = false;
-        }
         self.clawhub_install_search_version = self.clawhub_install_search_version.wrapping_add(1);
         let version = self.clawhub_install_search_version;
         let q = query.to_string();
@@ -4044,83 +4029,6 @@ impl TuiApp {
             || self.autocomplete.is_visible()
             || self.setup_overlay.is_some()
             || self.first_run_wizard.is_some()
-    }
-
-    /// Render path while the list picker is open. Uses the full
-    /// terminal area (alt-screen mode) so the picker can show a search
-    /// bar, many list rows, and a hotkey footer — Hermes / Claude-Code
-    /// style. The status bar and input box are intentionally hidden
-    /// here; the user is in modal selection mode.
-    pub fn render_fullscreen_picker(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> Result<()> {
-        let TuiApp { list_picker, .. } = self;
-        terminal.draw(|frame| {
-            let area = frame.area();
-            if let Some(picker) = list_picker.as_mut() {
-                picker.render_fullscreen(frame, area);
-            }
-        })?;
-        Ok(())
-    }
-
-    /// Fullscreen render for the read-only info panel. Mirrors the
-    /// list-picker fullscreen path so /channels, /config, /doctor, etc.
-    /// occupy the entire viewport while open and don't compete with the
-    /// chat scrollback for screen real estate.
-    pub fn render_fullscreen_info_panel(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> Result<()> {
-        let TuiApp { info_panel, .. } = self;
-        terminal.draw(|frame| {
-            let area = frame.area();
-            if let Some(panel) = info_panel.as_ref() {
-                panel.render(frame, area);
-            }
-        })?;
-        Ok(())
-    }
-
-    /// Render path while the slash-command autocomplete dropdown is
-    /// visible (alt-screen mode). Layout: input box at top, dropdown
-    /// below (taking the bulk of the screen so many commands are
-    /// visible at once), status bar at bottom — matches the Claude-Code
-    /// reference image. The user keeps typing into the input; the
-    /// dropdown re-filters live as they go.
-    pub fn render_fullscreen_autocomplete(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> Result<()> {
-        let TuiApp {
-            state,
-            context,
-            autocomplete,
-            ..
-        } = self;
-        terminal.draw(|frame| {
-            let area = frame.area();
-            // Layout: 1 row top margin · 4 rows input · 1 row spacer ·
-            // remaining rows for dropdown · 1 row status. Input pinned
-            // near the top so typing position stays consistent with
-            // inline mode; dropdown gets all the leftover height.
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1), // top margin
-                    Constraint::Length(4), // input box
-                    Constraint::Length(1), // spacer
-                    Constraint::Min(3),    // dropdown
-                    Constraint::Length(1), // status bar
-                ])
-                .split(area);
-
-            render_input_pane(context, frame, chunks[1]);
-            autocomplete.render(frame, chunks[3]);
-            render_status_pane(context, state, frame, chunks[4]);
-        })?;
-        Ok(())
     }
 
     /// Commit a finalized message to the terminal's scrollback (above the
