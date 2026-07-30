@@ -38,6 +38,16 @@ pub enum ListPickerKind {
     /// ClawHub install browser — opens via `/install` and `/skills install`.
     /// Selecting a row installs that skill via `clawhub::install_one`.
     ClawhubInstall,
+    /// "Which publisher did you mean?" — shown when a bare slug turns out to
+    /// be shared. Rows are the candidate publishers of one slug.
+    ///
+    /// A kind of its own rather than a reuse of [`Self::ClawhubInstall`],
+    /// because the two need incompatible keys. There, typing queues a
+    /// server-side search that Enter fires; here the rows are a fixed answer
+    /// to a fixed question, so a search would replace them and leave the
+    /// title asking about publishers that are no longer on screen. Typing
+    /// filters these locally instead — there are only ever a handful.
+    ClawhubPublisher,
     /// Approval-policy preset picker opened via `/autonomy` (no arg).
     /// Selecting a row force-writes the policy files for that preset —
     /// same write path as Shift+Tab and `rantaiclaw autonomy <preset>`.
@@ -589,6 +599,16 @@ impl ListPicker {
                     Span::styled("Esc ", Style::default().fg(sky)),
                 ]
             }
+        } else if self.kind == ListPickerKind::ClawhubPublisher {
+            vec![
+                Span::styled("Enter", Style::default().fg(sky)),
+                Span::styled(" install · ", Style::default().fg(muted)),
+                Span::styled("↑/↓", Style::default().fg(sky)),
+                Span::styled(" · ", Style::default().fg(muted)),
+                Span::styled("type", Style::default().fg(sky)),
+                Span::styled(" to filter · ", Style::default().fg(muted)),
+                Span::styled("Esc ", Style::default().fg(sky)),
+            ]
         } else {
             vec![
                 Span::styled("type", Style::default().fg(sky)),
@@ -622,7 +642,7 @@ impl ListPicker {
             } else {
                 format!("  ({}/{}) ", visible_indices.len(), self.entries.len())
             };
-            Line::from(vec![
+            let mut spans = vec![
                 Span::raw(" "),
                 Span::styled(
                     self.title.clone(),
@@ -635,7 +655,21 @@ impl ListPicker {
                 ),
                 Span::styled("▎", Style::default().fg(coral)),
                 Span::styled(counter, Style::default().fg(muted)),
-            ])
+            ];
+            // Typing replaces the hint above with the query, and in the
+            // search picker that is exactly when the user needs to know the
+            // results are stale until Enter. No "pending" flag is needed to
+            // say so: in this mode Enter from the search box *always*
+            // searches, so the affordance is unconditionally true.
+            if self.kind == ListPickerKind::ClawhubInstall && self.focus == Focus::Search {
+                spans.push(Span::styled(
+                    " ↵ search",
+                    Style::default()
+                        .fg(Color::Rgb(52, 211, 153))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            Line::from(spans)
         };
 
         let block = Block::default()
@@ -996,6 +1030,62 @@ mod tests {
         term.draw(|f| p.render(f, Rect::new(0, 0, 40, 6))).unwrap();
         assert!(p.page_size() >= 1, "stride was {}", p.page_size());
         assert!(p.page_count() >= 1);
+    }
+
+    fn publisher_picker(items: Vec<ListPickerItem>) -> ListPicker {
+        ListPicker::new(
+            ListPickerKind::ClawhubPublisher,
+            "`weather` — 3 publishers, pick one",
+            items,
+            None,
+            "empty",
+        )
+    }
+
+    #[test]
+    fn publisher_prompt_filters_locally_instead_of_searching() {
+        // The bug this kind exists for: on the shared `ClawhubInstall` kind,
+        // typing returned focus to the search box and the next Enter replaced
+        // the candidates with ClawHub search results — under a title still
+        // asking which publisher. Here typing narrows the candidates and
+        // nothing can swap them out.
+        let mut p = publisher_picker(vec![
+            item("@steipete/weather", "@steipete"),
+            item("@lfengwa2/weather", "@lfengwa2"),
+            item("@tongguanghai/weather", "@tongguanghai"),
+        ]);
+        assert_eq!(p.visible_len(), 3);
+        p.push_query_char('l');
+        assert_eq!(p.visible_len(), 1);
+        assert_eq!(p.current().unwrap().key, "@lfengwa2/weather");
+    }
+
+    #[test]
+    fn publisher_prompt_hint_never_offers_a_search() {
+        let mut p = publisher_picker(vec![item("@steipete/weather", "@steipete")]);
+        let text = rendered_text(&mut p);
+        assert!(text.contains("install"), "{text}");
+        assert!(text.contains("to filter"), "{text}");
+        assert!(!text.contains("search"), "{text}");
+    }
+
+    #[test]
+    fn search_affordance_survives_typing_in_the_browser() {
+        // Once a query is typed the hint is replaced by the query itself, and
+        // that is exactly when the user needs to know the rows are stale
+        // until Enter. No `search_pending` flag: in this mode Enter from the
+        // search box always searches, so the affordance is always true.
+        let mut p = clawhub_picker(vec![item("weather", "Weather")]);
+        p.push_query_char('w');
+        let text = rendered_text(&mut p);
+        assert!(text.contains("↵ search"), "{text}");
+
+        // Not offered on a picker that filters locally — there is nothing to
+        // fire.
+        let mut local = publisher_picker(vec![item("@a/weather", "@a")]);
+        local.push_query_char('a');
+        let local_text = rendered_text(&mut local);
+        assert!(!local_text.contains("↵ search"), "{local_text}");
     }
 
     #[test]
