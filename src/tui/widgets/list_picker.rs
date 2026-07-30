@@ -317,7 +317,17 @@ impl ListPicker {
     /// silently point them at a different entry. Recompute both from the
     /// absolute index to keep the cursor on the entry the user selected.
     pub fn set_page_size_from_area(&mut self, list_area_height: u16) {
-        let derived = (list_area_height as usize / ROWS_PER_ENTRY).max(1);
+        self.set_page_size_from_capacity(list_area_height as usize / ROWS_PER_ENTRY);
+    }
+
+    /// Set the page stride to however many entries the list area can hold.
+    ///
+    /// Split from [`Self::set_page_size_from_area`] because the two render
+    /// paths spend rows differently: the fullscreen layout gives each entry
+    /// [`ROWS_PER_ENTRY`] rows, while the overlay draws one row per entry. The
+    /// caller knows its own row budget; this only rebases the cursor.
+    pub fn set_page_size_from_capacity(&mut self, entries_per_page: usize) {
+        let derived = entries_per_page.max(1);
         if derived == self.page_size {
             return;
         }
@@ -567,6 +577,18 @@ impl ListPicker {
             height: area.height.saturating_sub(2),
         };
         frame.render_widget(Clear, panel);
+
+        // PgUp/PgDn move by `page_size`, which stayed at `DEFAULT_PAGE_SIZE`
+        // forever: the only code that derived it from the real area was
+        // `render_fullscreen`, whose caller was dropped when chat moved to the
+        // alt-screen (#265). So a page-down advanced five rows no matter how
+        // tall the overlay was. This path draws one row per entry inside the
+        // bordered panel, so its capacity is the panel minus the two borders.
+        //
+        // Note this render does not slice by page — it draws the whole
+        // filtered view and lets the list widget scroll to the cursor. The
+        // page size is a navigation stride here, not a visual page.
+        self.set_page_size_from_capacity(panel.height.saturating_sub(2) as usize);
 
         let sky = Color::Rgb(94, 184, 255);
         let muted = Color::Rgb(107, 114, 128);
@@ -1255,6 +1277,45 @@ mod tests {
             .map(|y| (0..90u16).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn overlay_page_stride_follows_the_rendered_height() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let mut p = picker(many_items(60));
+        // Nothing has told it a height yet.
+        assert_eq!(p.page_size(), DEFAULT_PAGE_SIZE);
+
+        let mut term = Terminal::new(TestBackend::new(90, 40)).unwrap();
+        term.draw(|f| p.render(f, Rect::new(0, 0, 90, 40))).unwrap();
+
+        // 40 rows → panel is inset by 1 top and bottom (38) → minus the two
+        // borders (36), one entry per row.
+        assert_eq!(p.page_size(), 36);
+
+        // The point of deriving it: PgDn moves a screenful instead of the
+        // fixed five it moved before, which was five rows out of ~36 visible.
+        p.next_page();
+        assert_eq!(p.page, 1);
+        assert_eq!(p.current().unwrap().key, "k36");
+    }
+
+    #[test]
+    fn overlay_page_stride_never_reaches_zero_on_a_short_terminal() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        // The minimum `render` will draw at. A stride of 0 would make
+        // `page_count` divide by zero and `next_page` never advance.
+        let mut p = picker(many_items(12));
+        let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| p.render(f, Rect::new(0, 0, 40, 6))).unwrap();
+        assert!(p.page_size() >= 1, "stride was {}", p.page_size());
+        assert!(p.page_count() >= 1);
     }
 
     #[test]
