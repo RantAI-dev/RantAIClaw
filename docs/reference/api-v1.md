@@ -468,12 +468,20 @@ as every other handler here.
     "error": "ambiguous_skill_slug",
     "detail": "`weather` is published by 4 owners on ClawHub. Retry with one of the listed `reference` values.",
     "matches": [
-      { "owner": "steipete", "reference": "@steipete/weather", "url": "https://clawhub.ai/steipete/skills/weather" },
-      { "owner": "lfengwa2", "reference": "@lfengwa2/weather", "url": "https://clawhub.ai/lfengwa2/skills/weather" }
+      { "owner": "steipete", "reference": "@steipete/weather", "url": "https://clawhub.ai/steipete/skills/weather", "downloads": 165212, "official": true },
+      { "owner": "lfengwa2", "reference": "@lfengwa2/weather", "url": "https://clawhub.ai/lfengwa2/skills/weather", "downloads": 57, "official": false }
     ]
   }
   ```
   Each `reference` can be sent straight back as the next request's `slug`.
+  `downloads` and `official` are joined in from ClawHub's search index so the
+  choice can be an informed one — among the four `weather` publishers, one is
+  a verbatim fork of the top one with an identical name and summary. Both are
+  best-effort: `0` / `false` means *unknown* (the lookup failed), not that the
+  skill is unused. Candidates keep the order ClawHub returned them in; they
+  are deliberately **not** sorted by popularity, since putting the largest
+  number first would read as a recommendation.
+
   The server never picks a publisher for you: an install stages code the agent
   will later read and act on, so choosing by popularity or list order would
   hand a slug squatter a path onto the machine. `matches` is omitted from

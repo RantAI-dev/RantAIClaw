@@ -149,6 +149,13 @@ struct SkillCandidate {
     /// Ready to send straight back as the next request's `slug`.
     reference: String,
     url: String,
+    /// What is known about this publisher, so the client can render a choice
+    /// rather than a list of bare handles. `0`/`false` means unknown — among
+    /// four `weather` publishers one has 165k installs and the official
+    /// marker while another is a verbatim fork with 68, and the handle alone
+    /// does not tell them apart.
+    downloads: u64,
+    official: bool,
 }
 
 fn err_500(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
@@ -212,6 +219,8 @@ fn err_409_ambiguous(
                         owner: m.owner_handle.clone(),
                         reference: format!("@{}/{}", m.owner_handle, ambiguous.slug),
                         url: m.url.clone(),
+                        downloads: m.downloads,
+                        official: m.official,
                     })
                     .collect(),
             ),
@@ -2101,11 +2110,15 @@ mod tests {
                     owner_handle: "steipete".into(),
                     reference: "@steipete/weather".into(),
                     url: "https://clawhub.ai/steipete/skills/weather".into(),
+                    downloads: 165_212,
+                    official: true,
                 },
                 crate::skills::clawhub::AmbiguousMatch {
                     owner_handle: "lfengwa2".into(),
                     reference: "@lfengwa2/weather".into(),
                     url: String::new(),
+                    downloads: 57,
+                    official: false,
                 },
             ],
         };
@@ -2124,6 +2137,15 @@ mod tests {
         assert_eq!(candidates[0].owner, "steipete");
         assert_eq!(candidates[0].reference, "@steipete/weather");
         assert_eq!(candidates[1].reference, "@lfengwa2/weather");
+
+        // The console renders a choice, not a list of handles, so what is
+        // known about each publisher has to survive the hop. Without these
+        // the picker asks the user to distinguish a 165k-install official
+        // skill from a 57-install look-alike fork on handle alone.
+        assert_eq!(candidates[0].downloads, 165_212);
+        assert!(candidates[0].official);
+        assert_eq!(candidates[1].downloads, 57);
+        assert!(!candidates[1].official);
     }
 
     #[test]
