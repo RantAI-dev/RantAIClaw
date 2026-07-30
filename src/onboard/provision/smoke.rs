@@ -33,6 +33,17 @@ async fn run_provisioner_headless(
     name: &str,
     responses: Vec<ProvisionResponse>,
 ) -> anyhow::Result<Vec<ProvisionEvent>> {
+    // Provisioners write through `profile::paths`, which resolves the home
+    // directory on every call. Any test that overrides `HOME` to isolate
+    // itself therefore moves the ground under these runs mid-flight — taking
+    // the crate-shared lock here serialises against those instead of racing
+    // them. Held for the whole run because the writes happen inside it.
+    //
+    // Gated because `test_env` is itself `#[cfg(test)]` while this module is
+    // not; every caller is a test, so the lock is always taken in practice.
+    #[cfg(test)]
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+
     let provisioner = provisioner_for(name)
         .ok_or_else(|| anyhow::anyhow!("no provisioner registered: {name}"))?;
 

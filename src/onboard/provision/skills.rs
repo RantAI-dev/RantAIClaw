@@ -59,6 +59,41 @@ impl TuiProvisioner for SkillsProvisioner {
         )
         .await?;
 
+        // Always-on core skills, installed before and independent of the
+        // starter-pack choice below.
+        //
+        // `owner-permissions` teaches the agent the owner/guest model behind
+        // `manage_permissions` and `issue_pairing_code` — both registered
+        // unconditionally, so without it the tools exist but the agent has no
+        // manual for them. Only the headless `SetupSection` installed it, and
+        // `setup` reaches that section only when stdin is not a terminal; with
+        // one it launches this provisioner instead. So the skill described as
+        // always-on was, in practice, almost never installed.
+        match bundled::install_core_skills(profile) {
+            Ok(core) if !core.is_empty() => {
+                send(
+                    &events,
+                    ProvisionEvent::Message {
+                        severity: Severity::Success,
+                        text: format!("Installed core skill(s): {}", core.join(", ")),
+                    },
+                )
+                .await?;
+            }
+            Ok(_) => {}
+            // Non-fatal: the rest of skills setup is still worth running.
+            Err(e) => {
+                send(
+                    &events,
+                    ProvisionEvent::Message {
+                        severity: Severity::Warn,
+                        text: format!("Could not install the owner-permissions skill: {e}"),
+                    },
+                )
+                .await?;
+            }
+        }
+
         // Step 1: Install starter pack?
         send(
             &events,
@@ -184,5 +219,99 @@ mod tests {
     fn provisioner_description_is_non_empty() {
         let p = SkillsProvisioner::new();
         assert!(!p.description().is_empty());
+    }
+
+    /// Restores `HOME` on drop.
+    ///
+    /// `Profile::skills_dir()` resolves through `profile::paths`, which reads
+    /// the home directory on every call and ignores `Profile::root` — so
+    /// overriding `HOME` is the only way to keep this test off the developer's
+    /// real profile tree, and the override has to outlive the assertions.
+    struct HomeGuard(Option<std::ffi::OsString>);
+
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            Self(prev)
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(prev) => std::env::set_var("HOME", prev),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Drive `run` to completion, answering every question with `Skip`
+    /// (index 1) so the starter pack never installs.
+    async fn run_answering_skip(profile: &Profile) {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let (response_tx, response_rx) = tokio::sync::mpsc::channel(4);
+
+        let responder = tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(event, ProvisionEvent::Choose { .. })
+                    && response_tx
+                        .send(ProvisionResponse::Selection(vec![1]))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        SkillsProvisioner::new()
+            .run(
+                &mut config,
+                profile,
+                ProvisionIo {
+                    events: event_tx,
+                    responses: response_rx,
+                },
+            )
+            .await
+            .expect("provisioner run");
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn installs_the_always_on_core_skill_even_when_the_starter_pack_is_skipped() {
+        // `owner-permissions` teaches the agent the owner/guest model behind
+        // `manage_permissions` and `issue_pairing_code` — both registered
+        // unconditionally, so without it the tools exist but the agent has no
+        // manual for them. It used to be installed only by the headless
+        // `SetupSection`, which `setup` reaches only without a terminal, so on
+        // the path users actually take it was never installed.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::set(tmp.path());
+        let profile = Profile {
+            name: "provision-skills-test".to_string(),
+            root: tmp.path().to_path_buf(),
+        };
+
+        run_answering_skip(&profile).await;
+
+        let core = crate::skills::bundled::CORE_PACK[0].slug;
+        assert!(
+            profile.skills_dir().join(core).join("SKILL.md").exists(),
+            "core skill `{core}` must be installed regardless of the starter-pack answer"
+        );
+
+        // Guards the assertion above from passing for the wrong reason: if
+        // "Skip" installed the pack anyway, a directory would exist either way.
+        for entry in crate::skills::bundled::STARTER_PACK {
+            assert!(
+                !profile.skills_dir().join(entry.slug).exists(),
+                "starter-pack skill `{}` must not be installed after Skip",
+                entry.slug
+            );
+        }
     }
 }
