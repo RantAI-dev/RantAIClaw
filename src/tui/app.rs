@@ -159,10 +159,23 @@ fn clawhub_candidate_items(
     ambiguous
         .matches
         .iter()
-        .map(|m| crate::tui::widgets::ListPickerItem {
-            key: format!("@{}/{}", m.owner_handle, ambiguous.slug),
-            primary: format!("@{}", m.owner_handle),
-            secondary: m.url.clone(),
+        .map(|m| {
+            // Annotate with install count and the official marker. Choosing
+            // between bare handles is choosing blind, and this is the one
+            // decision the flow refuses to make for the user — among four
+            // `weather` publishers, one is a verbatim fork of the top one with
+            // the same name and summary.
+            let annotation = m.annotation();
+            let primary = if annotation.is_empty() {
+                format!("@{}", m.owner_handle)
+            } else {
+                format!("@{}  ({annotation})", m.owner_handle)
+            };
+            crate::tui::widgets::ListPickerItem {
+                key: format!("@{}/{}", m.owner_handle, ambiguous.slug),
+                primary,
+                secondary: m.url.clone(),
+            }
         })
         .collect()
 }
@@ -7589,11 +7602,15 @@ mod tests {
                     owner_handle: "steipete".into(),
                     reference: "@steipete/weather".into(),
                     url: "https://clawhub.ai/steipete/skills/weather".into(),
+                    downloads: 165_212,
+                    official: true,
                 },
                 crate::skills::clawhub::AmbiguousMatch {
                     owner_handle: "lfengwa2".into(),
                     reference: "@lfengwa2/weather".into(),
                     url: String::new(),
+                    downloads: 57,
+                    official: false,
                 },
             ],
         };
@@ -7604,6 +7621,30 @@ mod tests {
         assert_eq!(items[0].key, "@steipete/weather");
         assert_eq!(items[1].key, "@lfengwa2/weather");
         assert!(items.iter().all(|i| i.key.starts_with('@')));
+
+        // The row has to say something about the publisher, not just name it.
+        // Choosing between bare handles is choosing blind, and this is the one
+        // decision the flow deliberately refuses to make for the user.
+        assert_eq!(items[0].primary, "@steipete  (165212 installs · official)");
+        assert_eq!(items[1].primary, "@lfengwa2  (57 installs)");
+    }
+
+    #[test]
+    fn clawhub_candidate_row_falls_back_to_a_bare_handle_when_nothing_is_known() {
+        // Enrichment is best-effort — the lookup that fills in install counts
+        // can fail. A bare handle is right then; "0 installs" would read as
+        // "nobody uses this", which is a claim we have not earned.
+        let ambiguous = crate::skills::clawhub::AmbiguousSkill {
+            slug: "weather".into(),
+            matches: vec![crate::skills::clawhub::AmbiguousMatch {
+                owner_handle: "steipete".into(),
+                reference: "@steipete/weather".into(),
+                url: String::new(),
+                downloads: 0,
+                official: false,
+            }],
+        };
+        let items = clawhub_candidate_items(&ambiguous);
         assert_eq!(items[0].primary, "@steipete");
     }
 

@@ -121,15 +121,28 @@ impl Tool for SkillsInstallTool {
             Err(e) => {
                 let error = match e.downcast_ref::<crate::skills::clawhub::AmbiguousSkill>() {
                     Some(ambiguous) => {
+                        // Include what is known about each publisher so the
+                        // model can hand the user something to decide on
+                        // instead of a row of anonymous handles.
                         let options: Vec<String> = ambiguous
                             .matches
                             .iter()
-                            .map(|m| format!("@{}/{}", m.owner_handle, ambiguous.slug))
+                            .map(|m| {
+                                let reference = format!("@{}/{}", m.owner_handle, ambiguous.slug);
+                                let annotation = m.annotation();
+                                if annotation.is_empty() {
+                                    reference
+                                } else {
+                                    format!("{reference} ({annotation})")
+                                }
+                            })
                             .collect();
                         format!(
                             "`{}` is published by {} owners on ClawHub, so the bare slug is \
                              ambiguous. Retry with one of these exact references: {}. Pick the \
-                             one the user asked for — do not guess, and say which you chose.",
+                             one the user asked for — do not guess, and say which you chose. \
+                             Install counts are shown to help the user decide, not to pick for \
+                             them; a look-alike fork can share a name and summary.",
                             ambiguous.slug,
                             options.len(),
                             options.join(", ")

@@ -185,10 +185,20 @@ fn resolve_install_failures(
             continue;
         };
 
+        // Label with install count and the official marker where known — a
+        // list of bare handles gives the user nothing to decide on, and this
+        // is the one decision the flow will not make for them.
         let handles: Vec<String> = ambiguous
             .matches
             .iter()
-            .map(|m| format!("@{}", m.owner_handle))
+            .map(|m| {
+                let annotation = m.annotation();
+                if annotation.is_empty() {
+                    format!("@{}", m.owner_handle)
+                } else {
+                    format!("@{}  ({annotation})", m.owner_handle)
+                }
+            })
             .collect();
         println!(
             "  `{}` is published by {} owners on ClawHub.",

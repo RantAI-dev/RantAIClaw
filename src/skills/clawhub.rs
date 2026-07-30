@@ -689,6 +689,35 @@ pub struct AmbiguousMatch {
     pub reference: String,
     #[serde(default)]
     pub url: String,
+    /// Install count, and whether ClawHub marks this publisher official.
+    ///
+    /// Neither is in the `409` body — they are joined in from `/search` by
+    /// [`enrich_candidates`] so the user has something to choose *on*. Left at
+    /// `0`/`false` when that lookup fails, which is the "unknown" case, not a
+    /// claim that nobody uses it.
+    #[serde(default)]
+    pub downloads: u64,
+    #[serde(default)]
+    pub official: bool,
+}
+
+impl AmbiguousMatch {
+    /// Short, human-readable summary of what is known about this publisher,
+    /// for putting next to the handle. Empty when nothing is known — better a
+    /// bare handle than a confident-looking `0 installs`.
+    ///
+    /// Shared by the CLI's error text, the TUI candidate rows, and the setup
+    /// wizard's prompt so all three describe a publisher the same way.
+    pub fn annotation(&self) -> String {
+        let mut parts = Vec::new();
+        if self.downloads > 0 {
+            parts.push(format!("{} installs", self.downloads));
+        }
+        if self.official {
+            parts.push("official".to_string());
+        }
+        parts.join(" · ")
+    }
 }
 
 /// ClawHub answered `409 Conflict` because the bare slug matches several
@@ -715,8 +744,16 @@ impl std::fmt::Display for AmbiguousSkill {
             self.slug,
             self.matches.len()
         )?;
+        // Server order is preserved deliberately. Sorting by install count
+        // would put the most popular publisher on top, which reads as a
+        // recommendation — the one thing this list must not imply. The numbers
+        // are shown so the reader can judge; the ranking stays theirs.
         for m in &self.matches {
             write!(f, "\n    @{}/{}", m.owner_handle, self.slug)?;
+            let annotation = m.annotation();
+            if !annotation.is_empty() {
+                write!(f, "  ({annotation})")?;
+            }
             if !m.url.is_empty() {
                 write!(f, "  {}", m.url)?;
             }
@@ -799,10 +836,56 @@ async fn decode_ambiguous(resp: reqwest::Response, fallback_slug: &str) -> Optio
     } else {
         parsed.slug
     };
-    Some(AmbiguousSkill {
+    let mut ambiguous = AmbiguousSkill {
         slug,
         matches: parsed.matches,
-    })
+    };
+    enrich_candidates(&mut ambiguous).await;
+    Some(ambiguous)
+}
+
+/// Join install counts and the official marker onto the candidate publishers.
+///
+/// The `409` body names the publishers but says nothing about them, which left
+/// every surface asking the user to pick between handles alone. That is the one
+/// choice we deliberately refuse to make for them, so it has to be an informed
+/// one: among four `weather` publishers, one has 165k installs and the official
+/// marker while another is a verbatim fork with 68 — identical display name and
+/// summary, distinguishable only by these numbers.
+///
+/// `/search` reports both, keyed by the same `ownerHandle` the `409` uses.
+/// Best-effort by design: a failed or partial lookup leaves the counts at zero
+/// and the install still proceeds to the prompt. Never turn "we could not
+/// annotate the list" into "the install failed".
+async fn enrich_candidates(ambiguous: &mut AmbiguousSkill) {
+    let Ok(results) = search(&ambiguous.slug).await else {
+        tracing::debug!(
+            slug = ambiguous.slug.as_str(),
+            "clawhub: candidate enrichment lookup failed; showing handles only"
+        );
+        return;
+    };
+    apply_enrichment(ambiguous, &results);
+}
+
+/// Join search results onto candidates by `(slug, ownerHandle)`.
+///
+/// Split from the fetch so the matching is testable: a bug here fails silently
+/// — every candidate keeps its zeroes and the prompt quietly goes back to being
+/// a list of bare handles, which looks the same as a network hiccup. Search
+/// returns hits for other slugs too (it is a fuzzy match), so the slug must be
+/// compared as well as the handle.
+fn apply_enrichment(ambiguous: &mut AmbiguousSkill, results: &[ClawHubSkill]) {
+    for candidate in &mut ambiguous.matches {
+        let Some(hit) = results
+            .iter()
+            .find(|r| r.slug == ambiguous.slug && r.owner_handle == candidate.owner_handle)
+        else {
+            continue;
+        };
+        candidate.downloads = hit.stats.downloads;
+        candidate.official = hit.official;
+    }
 }
 
 /// Reject any relative path that contains parent-dir traversal, leading
@@ -1212,6 +1295,120 @@ mod tests {
         );
     }
 
+    fn candidate(owner: &str) -> AmbiguousMatch {
+        AmbiguousMatch {
+            owner_handle: owner.into(),
+            reference: format!("@{owner}/weather"),
+            url: String::new(),
+            downloads: 0,
+            official: false,
+        }
+    }
+
+    fn search_hit(slug: &str, owner: &str, downloads: u64, official: bool) -> ClawHubSkill {
+        ClawHubSkill {
+            slug: slug.into(),
+            display_name: "Weather".into(),
+            summary: String::new(),
+            owner_handle: owner.into(),
+            official,
+            stats: ClawHubStats {
+                stars: 0,
+                downloads,
+            },
+            tags: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn annotation_describes_only_what_is_known() {
+        let mut m = candidate("steipete");
+        // Nothing known yet: a bare handle beats a confident-looking
+        // "0 installs", which would read as "nobody uses this".
+        assert_eq!(m.annotation(), "");
+
+        m.downloads = 165_212;
+        assert_eq!(m.annotation(), "165212 installs");
+
+        m.official = true;
+        assert_eq!(m.annotation(), "165212 installs · official");
+
+        let mut official_only = candidate("someone");
+        official_only.official = true;
+        assert_eq!(official_only.annotation(), "official");
+    }
+
+    #[test]
+    fn enrichment_joins_on_publisher_and_slug() {
+        let mut ambiguous = AmbiguousSkill {
+            slug: "weather".into(),
+            matches: vec![
+                candidate("steipete"),
+                candidate("lfengwa2"),
+                candidate("nobody-in-search"),
+            ],
+        };
+        let results = vec![
+            // Search is a fuzzy match, so it also returns other slugs. This
+            // decoy is deliberately FIRST: `find` takes the first hit, so a
+            // join on the handle alone would copy 999_999 onto @steipete's
+            // `weather` candidate. Ordering it after a correct hit would make
+            // the assertion below pass either way.
+            search_hit("weather-pro", "steipete", 999_999, true),
+            search_hit("weather", "steipete", 165_212, true),
+            search_hit("weather", "lfengwa2", 57, false),
+        ];
+        apply_enrichment(&mut ambiguous, &results);
+
+        assert_eq!(ambiguous.matches[0].downloads, 165_212);
+        assert!(ambiguous.matches[0].official);
+        assert_eq!(ambiguous.matches[1].downloads, 57);
+        assert!(!ambiguous.matches[1].official);
+        // Absent from search: left unknown rather than guessed at.
+        assert_eq!(ambiguous.matches[2].downloads, 0);
+        assert!(!ambiguous.matches[2].official);
+    }
+
+    #[test]
+    fn enrichment_leaves_candidates_alone_when_search_returns_nothing() {
+        // The lookup is best-effort: a failed or empty search must degrade to
+        // handles-only, never block the install from reaching the prompt.
+        let mut ambiguous = AmbiguousSkill {
+            slug: "weather".into(),
+            matches: vec![candidate("steipete")],
+        };
+        apply_enrichment(&mut ambiguous, &[]);
+        assert_eq!(ambiguous.matches[0].downloads, 0);
+        assert_eq!(ambiguous.matches[0].annotation(), "");
+    }
+
+    #[test]
+    fn display_annotates_candidates_without_reordering_them() {
+        let mut ambiguous = AmbiguousSkill {
+            slug: "weather".into(),
+            matches: vec![candidate("lfengwa2"), candidate("steipete")],
+        };
+        ambiguous.matches[0].downloads = 57;
+        ambiguous.matches[1].downloads = 165_212;
+        ambiguous.matches[1].official = true;
+        let rendered = ambiguous.to_string();
+
+        assert!(
+            rendered.contains("@lfengwa2/weather  (57 installs)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("@steipete/weather  (165212 installs · official)"),
+            "{rendered}"
+        );
+        // Server order is preserved: putting the most-installed publisher
+        // first would read as a recommendation, which is the one thing this
+        // list must not imply.
+        let low = rendered.find("@lfengwa2").expect("first candidate listed");
+        let high = rendered.find("@steipete").expect("second candidate listed");
+        assert!(low < high, "{rendered}");
+    }
+
     #[test]
     fn batch_failure_exposes_ambiguity_to_callers_that_can_ask() {
         let ambiguous = AmbiguousSkill {
@@ -1220,6 +1417,8 @@ mod tests {
                 owner_handle: "steipete".into(),
                 reference: "@steipete/weather".into(),
                 url: String::new(),
+                downloads: 165_212,
+                official: true,
             }],
         };
         let failure = BatchInstallFailure {
