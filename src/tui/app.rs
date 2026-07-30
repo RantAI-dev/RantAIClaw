@@ -967,16 +967,24 @@ impl TuiApp {
                 //   2. Focus::List → install the highlighted skill. Picker
                 //      stays open afterwards so the user can search again
                 //      and install more without re-running the command.
-                if kind == ListPickerKind::ClawhubInstall {
-                    if focus == Focus::Search {
-                        self.spawn_clawhub_search(&query);
-                        // After firing, move focus to the list so the
-                        // next Enter installs (when results arrive).
-                        if let Some(p) = self.list_picker.as_mut() {
-                            p.focus = Focus::List;
-                        }
-                        return Ok(EventResult::Continue);
+                // Only the browser searches. The publisher prompt is a fixed
+                // answer to a fixed question, so a search there would swap its
+                // rows out from under a title still asking which publisher —
+                // and typing returns focus to the search box, so a single
+                // keystroke used to be enough to trigger it.
+                if kind == ListPickerKind::ClawhubInstall && focus == Focus::Search {
+                    self.spawn_clawhub_search(&query);
+                    // After firing, move focus to the list so the
+                    // next Enter installs (when results arrive).
+                    if let Some(p) = self.list_picker.as_mut() {
+                        p.focus = Focus::List;
                     }
+                    return Ok(EventResult::Continue);
+                }
+                if matches!(
+                    kind,
+                    ListPickerKind::ClawhubInstall | ListPickerKind::ClawhubPublisher
+                ) {
                     // The row key is the install *reference*: `@owner/slug`
                     // whenever the endpoint told us who published it, a bare
                     // slug otherwise. The local slug is derived from it
@@ -2997,11 +3005,11 @@ impl TuiApp {
                     self.scrollback_queue.push(("system".into(), msg));
                 }
             },
-            ListPickerKind::ClawhubInstall => {
-                // ClawhubInstall Enter is handled inline in handle_key
-                // (split between Focus::Search → search and Focus::List
-                // → install) so it never reaches dispatch. This arm is
-                // unreachable; left as a defensive no-op.
+            ListPickerKind::ClawhubInstall | ListPickerKind::ClawhubPublisher => {
+                // Enter for both is handled inline in `handle_key` — the
+                // browser splits it (Focus::Search → search, Focus::List →
+                // install) and the publisher prompt always installs — so
+                // neither reaches dispatch. Defensive no-op.
             }
             ListPickerKind::Autonomy => {
                 use crate::approval::policy_writer::{self, PolicyPreset};
@@ -3640,9 +3648,21 @@ impl TuiApp {
                 self.clawhub_install_completion_tx = None;
                 let slug = ambiguous.slug.clone();
                 let items = clawhub_candidate_items(&ambiguous);
+                // A fresh picker of its own kind, not the browser with its
+                // rows swapped. Reusing the browser meant its search keys
+                // stayed live: one keystroke returned focus to the search box
+                // and the next Enter replaced these candidates with search
+                // results, under a title still asking which publisher.
+                // Building anew also drops the stale query the browser left
+                // behind, which that search would have run.
+                self.list_picker = Some(crate::tui::widgets::ListPicker::new(
+                    crate::tui::widgets::ListPickerKind::ClawhubPublisher,
+                    format!("`{slug}` — {} publishers, pick one", items.len()),
+                    items,
+                    None,
+                    "No publishers returned.",
+                ));
                 if let Some(p) = self.list_picker.as_mut() {
-                    p.title = format!("`{slug}` — {} publishers, pick one", items.len());
-                    p.set_items(items);
                     p.focus = crate::tui::widgets::list_picker::Focus::List;
                 }
             }
