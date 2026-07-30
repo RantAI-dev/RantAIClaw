@@ -15,7 +15,6 @@ use crate::config::Config;
 use crate::onboard::section::{SetupContext, SetupSection};
 use crate::profile::Profile;
 use crate::skills::bundled::{self, STARTER_PACK};
-use crate::skills::clawhub;
 
 const HEADLESS_HINT: &str =
     "rantaiclaw setup skills --starter-pack         # install the 5 bundled skills\n  \
@@ -47,226 +46,26 @@ impl SetupSection for SkillsSection {
         if !core.is_empty() {
             eprintln!("Installed core skill(s): {}", core.join(", "));
         }
-        if ctx.interactive {
-            run_interactive(ctx.profile)?;
-        } else {
-            // Headless: install the starter pack idempotently. The wizard's
-            // headless flag handler in main.rs will gate this — by the time
-            // we get here, the user opted in.
-            let installed = bundled::install_starter_pack(ctx.profile)?;
-            if !installed.is_empty() {
-                eprintln!(
-                    "Installed starter pack ({}): {}",
-                    installed.len(),
-                    installed.join(", ")
-                );
-            }
+        // Install the starter pack idempotently. There is no interactive
+        // branch here: `setup` only reaches this section when stdin is not a
+        // terminal (see `main.rs`), and with a terminal it launches the TUI
+        // setup overlay instead. ClawHub browsing lives in the TUI's
+        // `/skills install`, which the overlay points at.
+        let installed = bundled::install_starter_pack(ctx.profile)?;
+        if !installed.is_empty() {
+            eprintln!(
+                "Installed starter pack ({}): {}",
+                installed.len(),
+                installed.join(", ")
+            );
         }
+        eprintln!("Browse ClawHub from the TUI with `/skills install`.");
         Ok(())
     }
 
     fn headless_hint(&self) -> &'static str {
         HEADLESS_HINT
     }
-}
-
-/// Interactive flow — split out so it can be reused by `rantaiclaw setup
-/// skills` once Wave 3 wires the subcommand.
-fn run_interactive(profile: &Profile) -> Result<()> {
-    use dialoguer::theme::ColorfulTheme;
-    use dialoguer::{Confirm, MultiSelect};
-
-    let theme = ColorfulTheme::default();
-
-    let install_pack = Confirm::with_theme(&theme)
-        .with_prompt("Install the recommended starter pack? (5 skills)")
-        .default(true)
-        .interact()
-        .unwrap_or(true);
-
-    if install_pack {
-        let installed = bundled::install_starter_pack(profile)?;
-        if installed.is_empty() {
-            println!("  All 5 starter-pack skills already present — nothing to do.");
-        } else {
-            println!("  Installed: {}", installed.join(", "));
-        }
-    }
-
-    let browse = Confirm::with_theme(&theme)
-        .with_prompt("Browse ClawHub for more skills?")
-        .default(false)
-        .interact()
-        .unwrap_or(false);
-
-    if browse {
-        // Fetch top-20 in a one-shot blocking runtime so we don't bleed
-        // async assumptions into Wave 3's still-synchronous orchestrator.
-        let top = match block_on_clawhub_list_top(20) {
-            Ok(items) => items,
-            Err(err) => {
-                eprintln!("ClawHub fetch failed: {err}; skipping browse step.");
-                return Ok(());
-            }
-        };
-
-        if top.is_empty() {
-            println!("  ClawHub returned no skills.");
-            return Ok(());
-        }
-
-        let labels: Vec<String> = top
-            .iter()
-            .map(|s| {
-                let name = if s.display_name.is_empty() {
-                    s.slug.as_str()
-                } else {
-                    s.display_name.as_str()
-                };
-                if s.summary.is_empty() {
-                    format!("{name}  ({}*)", s.stats.stars)
-                } else {
-                    format!("{name}  ({}*) — {}", s.stats.stars, s.summary)
-                }
-            })
-            .collect();
-
-        let picks = MultiSelect::with_theme(&theme)
-            .with_prompt("Select skills to install (space to toggle, Enter to confirm)")
-            .items(&labels)
-            .interact()
-            .unwrap_or_default();
-
-        if picks.is_empty() {
-            println!("  No skills selected.");
-            return Ok(());
-        }
-
-        let references: Vec<String> = picks.into_iter().map(|i| reference_for(&top[i])).collect();
-        let report = block_on_clawhub_install_many(profile, &references);
-        if !report.installed.is_empty() {
-            println!("  Installed from ClawHub: {}", report.installed.join(", "));
-        }
-        resolve_install_failures(profile, &theme, report.failures);
-    }
-
-    Ok(())
-}
-
-/// The reference to install a listing/search result by: publisher-qualified
-/// when the endpoint reported one. `/skills?sort=stars` — what this wizard
-/// browses — reports none, so these come back bare and resolve through the
-/// prompt in [`resolve_install_failures`].
-fn reference_for(skill: &clawhub::ClawHubSkill) -> String {
-    if skill.owner_handle.is_empty() {
-        skill.slug.clone()
-    } else {
-        format!("@{}/{}", skill.owner_handle, skill.slug)
-    }
-}
-
-/// Report what a batch install could not do, and finish the job where the
-/// answer is just "which publisher?".
-///
-/// These used to be dropped into `tracing::warn!`, which the wizard never
-/// shows — so a user who picked five popular skills saw an empty install line
-/// and no reason. Most popular slugs are shared by several publishers, so
-/// that was the common case, not the rare one.
-fn resolve_install_failures(
-    profile: &Profile,
-    theme: &dialoguer::theme::ColorfulTheme,
-    failures: Vec<clawhub::BatchInstallFailure>,
-) {
-    use dialoguer::Select;
-
-    for failure in failures {
-        let Some(ambiguous) = failure.ambiguous().cloned() else {
-            eprintln!("  ✗ {}: {:#}", failure.reference, failure.error);
-            continue;
-        };
-
-        // Label with install count and the official marker where known — a
-        // list of bare handles gives the user nothing to decide on, and this
-        // is the one decision the flow will not make for them.
-        let handles: Vec<String> = ambiguous
-            .matches
-            .iter()
-            .map(|m| {
-                let annotation = m.annotation();
-                if annotation.is_empty() {
-                    format!("@{}", m.owner_handle)
-                } else {
-                    format!("@{}  ({annotation})", m.owner_handle)
-                }
-            })
-            .collect();
-        println!(
-            "  `{}` is published by {} owners on ClawHub.",
-            ambiguous.slug,
-            handles.len()
-        );
-
-        // Esc skips this skill. The publisher is never picked automatically:
-        // installing stages code the agent will read and act on, and popular
-        // slugs attract forks that are indistinguishable by name alone.
-        let choice = Select::with_theme(theme)
-            .with_prompt(format!("Which publisher of `{}`?", ambiguous.slug))
-            .items(&handles)
-            .default(0)
-            .interact_opt();
-        let Ok(Some(index)) = choice else {
-            println!("    skipped `{}`.", ambiguous.slug);
-            continue;
-        };
-
-        let reference = format!(
-            "@{}/{}",
-            ambiguous.matches[index].owner_handle, ambiguous.slug
-        );
-        let retry = block_on_clawhub_install_many(profile, std::slice::from_ref(&reference));
-        if retry.installed.is_empty() {
-            for retry_failure in &retry.failures {
-                eprintln!("  ✗ {reference}: {:#}", retry_failure.error);
-            }
-        } else {
-            println!("  Installed {reference}.");
-        }
-    }
-}
-
-fn block_on_clawhub_list_top(n: usize) -> Result<Vec<clawhub::ClawHubSkill>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(clawhub::list_top(n))
-}
-
-fn block_on_clawhub_install_many(
-    profile: &Profile,
-    references: &[String],
-) -> clawhub::BatchInstallReport {
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        // Report the runtime failure against every reference rather than
-        // returning an empty success — the caller prints failures, and a
-        // silent empty list is the exact failure mode this PR removes.
-        Err(err) => {
-            return clawhub::BatchInstallReport {
-                installed: Vec::new(),
-                failures: references
-                    .iter()
-                    .map(|reference| clawhub::BatchInstallFailure {
-                        reference: reference.clone(),
-                        error: anyhow::anyhow!("build tokio runtime: {err}"),
-                    })
-                    .collect(),
-            };
-        }
-    };
-    rt.block_on(clawhub::install_many(profile, references))
 }
 
 #[cfg(test)]
@@ -322,47 +121,6 @@ mod tests {
             assert!(!installed.is_empty());
             let s = SkillsSection;
             assert!(s.is_already_configured(&profile, &cfg));
-        });
-    }
-
-    fn skill_with_owner(slug: &str, owner: &str) -> clawhub::ClawHubSkill {
-        clawhub::ClawHubSkill {
-            slug: slug.into(),
-            display_name: slug.into(),
-            summary: String::new(),
-            owner_handle: owner.into(),
-            official: false,
-            stats: clawhub::ClawHubStats::default(),
-            tags: serde_json::Value::Null,
-        }
-    }
-
-    #[test]
-    fn reference_qualifies_the_publisher_when_one_is_known() {
-        assert_eq!(
-            reference_for(&skill_with_owner("weather", "steipete")),
-            "@steipete/weather"
-        );
-        // The listing endpoint this wizard browses reports no publisher, so
-        // these stay bare and get resolved by asking the user.
-        assert_eq!(reference_for(&skill_with_owner("weather", "")), "weather");
-    }
-
-    #[test]
-    fn install_many_reports_failures_instead_of_swallowing_them() {
-        with_home(|| {
-            let profile = crate::profile::ProfileManager::ensure_default().unwrap();
-            // `a/b/c` is rejected while parsing, so this needs no network.
-            // The point is that the caller can see the failure at all: it
-            // used to go only to `tracing::warn!`, and the wizard printed an
-            // empty install line with no explanation.
-            let report = block_on_clawhub_install_many(&profile, &["a/b/c".to_string()]);
-            assert!(report.installed.is_empty());
-            assert_eq!(report.failures.len(), 1);
-            assert_eq!(report.failures[0].reference, "a/b/c");
-            // Not an ambiguity, so the wizard prints it rather than
-            // prompting for a publisher.
-            assert!(report.failures[0].ambiguous().is_none());
         });
     }
 }
