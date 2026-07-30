@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -122,26 +122,16 @@ impl ListPickerEntry {
     }
 }
 
-/// Page size used before the first frame has told the picker how tall its
-/// list area actually is. `render_fullscreen` replaces it via
-/// [`ListPicker::set_page_size_from_area`].
+/// Page stride used before the first frame has told the picker how tall its
+/// list area actually is. [`ListPicker::render`] replaces it via
+/// [`ListPicker::set_page_size_from_capacity`].
 ///
-/// This was a hardcoded `PAGE_SIZE = 5` that no render path ever revised, so
-/// a 120x40 terminal paginated at 5 while ~15 rows sat blank. It halved every
-/// picker: `/help` ran to 7 pages, `/sessions` to 40, and `/setup` → Core put
-/// `knowledge` — the 7th of 7 — on page 2, where nobody found it.
+/// This render draws the whole filtered view and scrolls to the cursor, so the
+/// stride governs how far PgUp/PgDn jump rather than how many rows are drawn.
+/// It stayed pinned at 5 for a long time: the only code deriving it from a real
+/// area lived in a fullscreen renderer whose caller was dropped in #265, so a
+/// page-down moved five rows on any terminal.
 pub const DEFAULT_PAGE_SIZE: usize = 5;
-
-/// Rows one entry occupies in the fullscreen list.
-///
-/// The tallest form: a category header is always primary + count + spacer, and
-/// an item is primary + secondary + spacer whenever it has a secondary (every
-/// real picker's items do). Items without a secondary take 2, so sizing off 3
-/// can under-fill such a list by a row per entry — deliberate: it errs toward
-/// leaving a gap rather than pushing an entry off the bottom, and a per-entry
-/// measurement would make each page hold a different number of entries, which
-/// the page/selected index math is not built for.
-const ROWS_PER_ENTRY: usize = 3;
 
 /// Which UI element currently owns the cursor. Default is `Search` —
 /// the picker opens with focus on the search bar so the user can type
@@ -174,7 +164,7 @@ pub struct ListPicker {
     /// Current page index (0-based). Reset to 0 whenever the query changes.
     pub page: usize,
     /// Entries per page, derived from the list area the layout actually
-    /// grants. Set every frame by [`Self::set_page_size_from_area`]; holds
+    /// grants. Set every frame by [`Self::set_page_size_from_capacity`]; holds
     /// [`DEFAULT_PAGE_SIZE`] until the first render.
     page_size: usize,
     /// Which UI element owns the cursor: search bar or list. Defaults
@@ -184,13 +174,6 @@ pub struct ListPicker {
     /// Category IDs that are currently collapsed. Navigation skips items
     /// in collapsed categories unless a search query is active.
     collapsed_categories: HashSet<String>,
-    /// `true` when the user has typed into the search bar but not yet
-    /// pressed Enter to fire a remote search. Only meaningful for
-    /// `ClawhubInstall` (server-side search) — surfaced as a "Press Enter
-    /// to search ClawHub" banner so users don't think the picker is
-    /// stuck. App sets this on every keystroke and clears it when the
-    /// search task is dispatched.
-    pub search_pending: bool,
 }
 
 impl ListPicker {
@@ -252,7 +235,6 @@ impl ListPicker {
             page_size: DEFAULT_PAGE_SIZE,
             focus: Focus::Search,
             collapsed_categories: HashSet::new(),
-            search_pending: false,
         }
     }
 
@@ -294,7 +276,6 @@ impl ListPicker {
             page_size: DEFAULT_PAGE_SIZE,
             focus: Focus::Search,
             collapsed_categories: HashSet::new(),
-            search_pending: false,
         }
     }
 
@@ -304,28 +285,10 @@ impl ListPicker {
         self.page_size.max(1)
     }
 
-    /// Re-derive the page size from the height the layout actually granted
-    /// the list chunk.
-    ///
-    /// Must be called with the *granted* height, not a requested one. The
-    /// same trap is documented on `SetupOverlay::last_choose_viewport`: when
-    /// the stored viewport reflects what the widget asked for rather than
-    /// what it got, the clamp never engages and the cursor walks into rows
-    /// that were clipped away.
-    ///
-    /// `page`/`selected` are page-relative, so a changed page size would
-    /// silently point them at a different entry. Recompute both from the
-    /// absolute index to keep the cursor on the entry the user selected.
-    pub fn set_page_size_from_area(&mut self, list_area_height: u16) {
-        self.set_page_size_from_capacity(list_area_height as usize / ROWS_PER_ENTRY);
-    }
-
     /// Set the page stride to however many entries the list area can hold.
     ///
-    /// Split from [`Self::set_page_size_from_area`] because the two render
-    /// paths spend rows differently: the fullscreen layout gives each entry
-    /// [`ROWS_PER_ENTRY`] rows, while the overlay draws one row per entry. The
-    /// caller knows its own row budget; this only rebases the cursor.
+    /// The caller knows how many rows it spends per entry; this only rebases
+    /// the cursor onto the new stride so the highlighted item stays put.
     pub fn set_page_size_from_capacity(&mut self, entries_per_page: usize) {
         let derived = entries_per_page.max(1);
         if derived == self.page_size {
@@ -789,289 +752,6 @@ impl ListPicker {
         let list = List::new(items).block(block);
         frame.render_stateful_widget(list, panel, &mut self.list_state);
     }
-
-    /// Fullscreen picker render — used when the picker has the entire
-    /// alt-screen to itself. Layout: title row, search input box,
-    /// scrollable list area, hotkey footer. Matches the Hermes /
-    /// Claude-Code resume-picker UX.
-    pub fn render_fullscreen(&mut self, frame: &mut Frame, area: Rect) {
-        if area.height < 8 || area.width < 30 {
-            return;
-        }
-
-        let sky = Color::Rgb(94, 184, 255);
-        let muted = Color::Rgb(107, 114, 128);
-        let frame_color = Color::Rgb(40, 70, 140);
-        let dark_bg = Color::Rgb(4, 11, 46);
-        let coral = Color::Rgb(255, 138, 101);
-        let emerald = Color::Rgb(52, 211, 153);
-
-        // Outer 1-row margin so the picker doesn't kiss the terminal
-        // edges, then split into: title, search box, list, footer.
-        let outer = Rect {
-            x: area.x + 2,
-            y: area.y + 1,
-            width: area.width.saturating_sub(4),
-            height: area.height.saturating_sub(2),
-        };
-        frame.render_widget(Clear, area);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // title
-                Constraint::Length(1), // spacer
-                Constraint::Length(3), // search input box (bordered)
-                Constraint::Length(1), // spacer
-                Constraint::Min(3),    // list
-                Constraint::Length(2), // footer (1 line + spacer)
-            ])
-            .split(outer);
-
-        // Size the page off the list chunk the layout actually handed back —
-        // `Constraint::Min(3)` means the granted height is whatever is left
-        // after the chrome, which is the only number the page may be derived
-        // from. Must happen before `page_count`/`page_indices` are read below
-        // so the title's `n/m` and the rendered slice agree with each other.
-        self.set_page_size_from_area(chunks[4].height);
-
-        // Title — includes filtered count + page indicator.
-        let visible_indices = self.filtered_indices();
-        let page_count = self.page_count();
-        let title_line = Line::from(vec![
-            Span::styled(
-                self.title.clone(),
-                Style::default().fg(coral).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("   {}/{}", visible_indices.len(), self.entries.len()),
-                Style::default().fg(muted),
-            ),
-            Span::styled(
-                format!("  ·  page {}/{}", self.page + 1, page_count),
-                Style::default().fg(muted),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(title_line), chunks[0]);
-
-        // Search box (bordered, rounded). Border lights up coral when
-        // the search bar has focus; dim frame color otherwise. Cursor
-        // block is shown only when focused.
-        let search_focused = self.focus == Focus::Search;
-        let search_border_color = if search_focused { coral } else { frame_color };
-        let search_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(search_border_color));
-        // ClawHub picker hits the network on Enter, not on every
-        // keystroke — pre-fix users typed and stared at the picker
-        // wondering why nothing happened. Use a kind-aware placeholder
-        // and a "banner" (rendered just below the search box) when a
-        // pending query is sitting unsubmitted.
-        let placeholder = if self.kind == ListPickerKind::ClawhubInstall {
-            "Type query, press Enter to search ClawHub…"
-        } else {
-            "Search…"
-        };
-        let search_line = if self.query.is_empty() {
-            let mut spans = vec![
-                Span::styled(" 🔎 ", Style::default().fg(sky)),
-                Span::styled(
-                    placeholder,
-                    Style::default().fg(muted).add_modifier(Modifier::ITALIC),
-                ),
-            ];
-            if search_focused {
-                spans.insert(2, Span::styled("▎ ", Style::default().fg(coral)));
-            }
-            Line::from(spans)
-        } else {
-            let mut spans = vec![
-                Span::styled(" 🔎 ", Style::default().fg(sky)),
-                Span::styled(
-                    self.query.clone(),
-                    Style::default().fg(coral).add_modifier(Modifier::BOLD),
-                ),
-            ];
-            if search_focused {
-                spans.push(Span::styled("▎", Style::default().fg(coral)));
-            }
-            // Inline call-to-action when a search is pending. Renders
-            // immediately to the right of the typed query so it sits at
-            // the natural eye-line after typing.
-            if self.kind == ListPickerKind::ClawhubInstall && self.search_pending {
-                spans.push(Span::styled(
-                    "   ↵ Enter to search ClawHub",
-                    Style::default().fg(emerald).add_modifier(Modifier::BOLD),
-                ));
-            }
-            Line::from(spans)
-        };
-        let search_widget = Paragraph::new(search_line).block(search_block);
-        frame.render_widget(search_widget, chunks[2]);
-
-        // List.
-        let list_area = chunks[4];
-        if self.entries.is_empty() {
-            let body = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("  {}", self.empty_hint),
-                    Style::default().fg(muted),
-                )),
-            ])
-            .wrap(Wrap { trim: false });
-            frame.render_widget(body, list_area);
-        } else if visible_indices.is_empty() {
-            let body = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("  No matches for '{}'.", self.query),
-                    Style::default().fg(muted),
-                )),
-            ])
-            .wrap(Wrap { trim: false });
-            frame.render_widget(body, list_area);
-        } else {
-            // Render only the current page slice.
-            let page_indices = self.page_indices();
-            if self.selected >= page_indices.len() && !page_indices.is_empty() {
-                self.selected = page_indices.len().saturating_sub(1);
-                self.list_state.select(Some(self.selected));
-            }
-
-            let category_focused = self.focus == Focus::Category;
-            let list_focused = self.focus == Focus::List;
-            let items: Vec<ListItem> = page_indices
-                .iter()
-                .enumerate()
-                .map(|(page_i, original_i)| {
-                    let entry = &self.entries[*original_i];
-                    let is_selected = page_i == self.selected;
-                    match entry {
-                        ListPickerEntry::CategoryHeader {
-                            label,
-                            item_count,
-                            collapsed,
-                            ..
-                        } => {
-                            let highlight = is_selected && category_focused;
-                            let arrow = if *collapsed { "▶" } else { "▼" };
-                            let primary_style = if highlight {
-                                Style::default()
-                                    .fg(dark_bg)
-                                    .bg(frame_color)
-                                    .add_modifier(Modifier::BOLD)
-                            } else if is_selected {
-                                Style::default()
-                                    .fg(frame_color)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(frame_color)
-                            };
-                            let count_style = if highlight {
-                                Style::default().fg(dark_bg).bg(frame_color)
-                            } else {
-                                Style::default().fg(muted)
-                            };
-                            let toggle_hint = if highlight { " ◀▶ " } else { "    " };
-                            let mut lines = vec![Line::from(vec![
-                                Span::styled(toggle_hint, primary_style),
-                                Span::styled(format!("{} ", arrow), primary_style),
-                                Span::styled(label.clone(), primary_style),
-                            ])];
-                            lines.push(Line::from(vec![
-                                Span::raw("       "),
-                                Span::styled(
-                                    format!(
-                                        "{} item{}",
-                                        item_count,
-                                        if *item_count == 1 { "" } else { "s" }
-                                    ),
-                                    count_style,
-                                ),
-                            ]));
-                            lines.push(Line::from(""));
-                            ListItem::new(lines)
-                        }
-                        ListPickerEntry::Item(item) => {
-                            let highlight = is_selected && list_focused;
-                            let arrow = if highlight {
-                                "▸ "
-                            } else if is_selected {
-                                "› "
-                            } else {
-                                "  "
-                            };
-                            let primary_style = if highlight {
-                                Style::default().fg(emerald).add_modifier(Modifier::BOLD)
-                            } else if is_selected {
-                                Style::default().fg(sky).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(sky)
-                            };
-                            let secondary_style = Style::default().fg(muted);
-                            let mut lines = vec![Line::from(vec![
-                                Span::styled(arrow, primary_style),
-                                Span::styled(item.primary.clone(), primary_style),
-                            ])];
-                            if !item.secondary.is_empty() {
-                                lines.push(Line::from(vec![
-                                    Span::raw("  "),
-                                    Span::styled(item.secondary.clone(), secondary_style),
-                                ]));
-                            }
-                            lines.push(Line::from(""));
-                            ListItem::new(lines)
-                        }
-                    }
-                })
-                .collect();
-            let _ = dark_bg; // intentionally unused in fullscreen variant
-            let list = List::new(items);
-            frame.render_stateful_widget(list, list_area, &mut self.list_state);
-        }
-
-        // Footer with hotkey help. ClawhubInstall has a two-mode Enter
-        // (search vs install depending on focus) so its hint differs.
-        let footer = if self.kind == ListPickerKind::ClawhubInstall {
-            Line::from(vec![
-                Span::styled("type + Enter", Style::default().fg(sky)),
-                Span::styled(" search · ", Style::default().fg(muted)),
-                Span::styled("↑/↓", Style::default().fg(sky)),
-                Span::styled(" navigate · ", Style::default().fg(muted)),
-                Span::styled("Enter", Style::default().fg(sky)),
-                Span::styled(" install · ", Style::default().fg(muted)),
-                Span::styled("Esc", Style::default().fg(sky)),
-                Span::styled(" close", Style::default().fg(muted)),
-            ])
-        } else if self.kind == ListPickerKind::Skill {
-            Line::from(vec![
-                Span::styled("↑/↓", Style::default().fg(sky)),
-                Span::styled(" navigate · ", Style::default().fg(muted)),
-                Span::styled("Ctrl+I", Style::default().fg(sky)),
-                Span::styled(" install deps · ", Style::default().fg(muted)),
-                Span::styled("Enter", Style::default().fg(sky)),
-                Span::styled(" use · ", Style::default().fg(muted)),
-                Span::styled("Esc", Style::default().fg(sky)),
-                Span::styled(" cancel", Style::default().fg(muted)),
-            ])
-        } else {
-            Line::from(vec![
-                Span::styled("↑/↓", Style::default().fg(sky)),
-                Span::styled(" navigate · ", Style::default().fg(muted)),
-                Span::styled("←/→", Style::default().fg(sky)),
-                Span::styled(" collapse · ", Style::default().fg(muted)),
-                Span::styled("type", Style::default().fg(sky)),
-                Span::styled(" to filter · ", Style::default().fg(muted)),
-                Span::styled("Enter", Style::default().fg(sky)),
-                Span::styled(" select · ", Style::default().fg(muted)),
-                Span::styled("Esc", Style::default().fg(sky)),
-                Span::styled(" cancel", Style::default().fg(muted)),
-            ])
-        };
-        frame.render_widget(Paragraph::new(footer), chunks[5]);
-    }
 }
 
 #[cfg(test)]
@@ -1145,9 +825,9 @@ mod tests {
     #[test]
     fn page_size_derives_from_the_list_area_height() {
         let mut p = picker((0..20).map(|i| item(&i.to_string(), "x")).collect());
-        p.set_page_size_from_area(30);
+        p.set_page_size_from_capacity(10);
         assert_eq!(p.page_size(), 10);
-        p.set_page_size_from_area(15);
+        p.set_page_size_from_capacity(5);
         assert_eq!(p.page_size(), 5);
     }
 
@@ -1158,7 +838,7 @@ mod tests {
     fn page_size_never_drops_below_one() {
         let mut p = picker(vec![item("a", "a")]);
         for h in 0..3u16 {
-            p.set_page_size_from_area(h);
+            p.set_page_size_from_capacity(h as usize / 3);
             assert!(p.page_size() >= 1, "height {h} gave {}", p.page_size());
         }
     }
@@ -1182,7 +862,7 @@ mod tests {
             .map(|n| item(n, n))
             .collect(),
         );
-        p.set_page_size_from_area(30); // 120x40 terminal
+        p.set_page_size_from_capacity(10); // 120x40 terminal
         assert_eq!(p.page_count(), 1, "knowledge must not be paged out of view");
         assert_eq!(p.page_indices().len(), 7);
     }
@@ -1193,10 +873,10 @@ mod tests {
     #[test]
     fn resizing_keeps_the_selected_entry_selected() {
         let mut p = picker((0..20).map(|i| item(&i.to_string(), "x")).collect());
-        p.set_page_size_from_area(15); // 5 per page
+        p.set_page_size_from_capacity(5); // 5 per page
         p.page = 2;
         p.selected = 3; // absolute index 13
-        p.set_page_size_from_area(30); // 10 per page
+        p.set_page_size_from_capacity(10); // 10 per page
         assert_eq!(p.page, 1);
         assert_eq!(p.selected, 3); // 1*10 + 3 == 13
     }
@@ -1204,11 +884,11 @@ mod tests {
     #[test]
     fn page_count_follows_the_derived_page_size() {
         let mut p = picker((0..20).map(|i| item(&i.to_string(), "x")).collect());
-        p.set_page_size_from_area(15);
+        p.set_page_size_from_capacity(5);
         assert_eq!(p.page_count(), 4);
-        p.set_page_size_from_area(30);
+        p.set_page_size_from_capacity(10);
         assert_eq!(p.page_count(), 2);
-        p.set_page_size_from_area(60);
+        p.set_page_size_from_capacity(20);
         assert_eq!(p.page_count(), 1);
     }
 
@@ -1218,7 +898,7 @@ mod tests {
     #[test]
     fn repro_down_reaches_every_entry_across_pages() {
         let mut p = picker((0..12).map(|i| item(&format!("s{i}"), "x")).collect());
-        p.set_page_size_from_area(15); // 5 per page, 3 pages
+        p.set_page_size_from_capacity(5); // 5 per page, 3 pages
         let abs = |p: &ListPicker| p.page * p.page_size() + p.selected;
         let mut trail = Vec::new();
         for _ in 0..20 {
