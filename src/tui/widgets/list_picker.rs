@@ -578,14 +578,34 @@ impl ListPicker {
 
         // Title bar doubles as the search input. Empty query → show the
         // hint; non-empty → show `Title › query▎  (n/total)`.
-        let title_line = if self.query.is_empty() {
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    self.title.clone(),
-                    Style::default().fg(sky).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("   "),
+        // The hint has to describe what the keys actually do in *this* picker.
+        // `ClawhubInstall` does not filter locally (see `filtered_indices`) —
+        // typing queues a server-side search that fires on Enter — and once
+        // focus has moved to the list, Enter installs the highlighted row
+        // instead. A blanket "type to filter · Enter" was wrong on both counts,
+        // on the very screen where the user chooses whose code to install.
+        let hint_spans = if self.kind == ListPickerKind::ClawhubInstall {
+            if self.focus == Focus::Search {
+                vec![
+                    Span::styled("type + Enter", Style::default().fg(sky)),
+                    Span::styled(" search ClawHub · ", Style::default().fg(muted)),
+                    Span::styled("↑/↓", Style::default().fg(sky)),
+                    Span::styled(" · ", Style::default().fg(muted)),
+                    Span::styled("Esc ", Style::default().fg(sky)),
+                ]
+            } else {
+                vec![
+                    Span::styled("Enter", Style::default().fg(sky)),
+                    Span::styled(" install · ", Style::default().fg(muted)),
+                    Span::styled("↑/↓", Style::default().fg(sky)),
+                    Span::styled(" · ", Style::default().fg(muted)),
+                    Span::styled("type", Style::default().fg(sky)),
+                    Span::styled(" to search · ", Style::default().fg(muted)),
+                    Span::styled("Esc ", Style::default().fg(sky)),
+                ]
+            }
+        } else {
+            vec![
                 Span::styled("type", Style::default().fg(sky)),
                 Span::styled(" to filter · ", Style::default().fg(muted)),
                 Span::styled("↑/↓", Style::default().fg(sky)),
@@ -593,8 +613,30 @@ impl ListPicker {
                 Span::styled("Enter", Style::default().fg(sky)),
                 Span::styled(" · ", Style::default().fg(muted)),
                 Span::styled("Esc ", Style::default().fg(sky)),
-            ])
+            ]
+        };
+
+        let title_line = if self.query.is_empty() {
+            let mut spans = vec![
+                Span::raw(" "),
+                Span::styled(
+                    self.title.clone(),
+                    Style::default().fg(sky).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+            ];
+            spans.extend(hint_spans);
+            Line::from(spans)
         } else {
+            // The `(visible/total)` counter reads as a filter result. For a
+            // server-search picker nothing is filtered locally, so it would
+            // always read `(n/n)` — implying a filter ran and matched
+            // everything. Show the plain count instead.
+            let counter = if self.kind == ListPickerKind::ClawhubInstall {
+                format!("  ({}) ", self.entries.len())
+            } else {
+                format!("  ({}/{}) ", visible_indices.len(), self.entries.len())
+            };
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled(
@@ -607,10 +649,7 @@ impl ListPicker {
                     Style::default().fg(coral).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("▎", Style::default().fg(coral)),
-                Span::styled(
-                    format!("  ({}/{}) ", visible_indices.len(), self.entries.len()),
-                    Style::default().fg(muted),
-                ),
+                Span::styled(counter, Style::default().fg(muted)),
             ])
         };
 
@@ -1201,6 +1240,75 @@ mod tests {
             text.contains("item-05"),
             "6th ↓ must highlight item-05 (second page), got: {text:?}"
         );
+    }
+
+    /// Render a picker and return the whole pane as text, so assertions can
+    /// check what the user is actually told.
+    fn rendered_text(p: &mut ListPicker) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        term.draw(|f| p.render(f, Rect::new(0, 0, 90, 12))).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..12u16)
+            .map(|y| (0..90u16).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn clawhub_picker_hint_offers_search_not_filtering() {
+        // Typing in this picker does not filter — it queues a server search
+        // that fires on Enter. Promising a filter was wrong on the one screen
+        // where the user picks whose code gets installed.
+        let mut p = clawhub_picker(vec![item("@a/weather", "@a"), item("@b/weather", "@b")]);
+        assert_eq!(p.focus, Focus::Search);
+        let text = rendered_text(&mut p);
+        assert!(text.contains("search ClawHub"), "{text}");
+        assert!(!text.contains("to filter"), "{text}");
+    }
+
+    #[test]
+    fn clawhub_picker_hint_switches_to_install_with_the_list_focused() {
+        // Enter changes meaning with focus: it searches from the search box and
+        // installs from the list. A static hint could only ever be half right.
+        let mut p = clawhub_picker(vec![item("@a/weather", "@a"), item("@b/weather", "@b")]);
+        p.focus = Focus::List;
+        let text = rendered_text(&mut p);
+        assert!(text.contains("install"), "{text}");
+        assert!(!text.contains("to filter"), "{text}");
+    }
+
+    #[test]
+    fn non_clawhub_picker_still_advertises_filtering() {
+        // Every other picker does filter locally, so its hint is correct and
+        // must not change.
+        let mut p = picker(vec![item("a", "alpha"), item("b", "beta")]);
+        let text = rendered_text(&mut p);
+        assert!(text.contains("to filter"), "{text}");
+        assert!(!text.contains("search ClawHub"), "{text}");
+    }
+
+    #[test]
+    fn clawhub_picker_counter_is_a_count_not_a_filter_ratio() {
+        // `(n/total)` reads as "the filter matched n of total". Nothing is
+        // filtered here, so it would always say `(n/n)` and imply a filter ran.
+        let mut p = clawhub_picker(vec![
+            item("@a/weather", "@a"),
+            item("@b/weather", "@b"),
+            item("@c/weather", "@c"),
+        ]);
+        p.push_query_char('w');
+        let text = rendered_text(&mut p);
+        assert!(text.contains("(3)"), "{text}");
+        assert!(!text.contains("(3/3)"), "{text}");
+
+        // The local-filter pickers keep the ratio, which is meaningful there.
+        let mut local = picker(vec![item("a", "alpha"), item("b", "beta")]);
+        local.push_query_char('a');
+        let local_text = rendered_text(&mut local);
+        assert!(local_text.contains('/'), "{local_text}");
     }
 
     #[test]
