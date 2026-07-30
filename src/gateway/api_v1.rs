@@ -1019,6 +1019,34 @@ async fn insights(
 /// `load_skills_with_status`) is why the skill is not fully active — first
 /// entry is `"disabled in config.toml"` when the flag is off, followed by any
 /// unmet `requires` gates. `active` is `reasons.is_empty()`.
+/// Where an installed skill came from on ClawHub, when that was recorded.
+///
+/// Read from the `.clawhub.json` marker beside the skill's `SKILL.md`. Absent
+/// for skills that did not come from ClawHub (bundled, git remote, local
+/// path) **and** for ClawHub installs predating the marker, so absence means
+/// "unattributed", not "not from ClawHub" — clients must not read it as proof
+/// of either.
+///
+/// This is what lets a client say *which publisher's* copy is installed.
+/// Without it a console comparing by slug marks every same-slug publisher as
+/// installed once any one of them is, and comparing by manifest `name` misses
+/// entirely whenever that differs from the directory slug.
+fn skill_clawhub_json(skill: &crate::skills::Skill) -> Option<serde_json::Value> {
+    let dir = skill.location.as_ref()?.parent()?;
+    let provenance = crate::skills::clawhub::read_provenance(dir)?;
+    let reference = if provenance.owner.is_empty() {
+        provenance.slug.clone()
+    } else {
+        format!("@{}/{}", provenance.owner, provenance.slug)
+    };
+    Some(serde_json::json!({
+        "owner": provenance.owner,
+        "slug": provenance.slug,
+        "version": provenance.version,
+        "reference": reference,
+    }))
+}
+
 fn skill_status_json(
     cfg: &crate::config::Config,
     skill: &crate::skills::Skill,
@@ -1030,7 +1058,7 @@ fn skill_status_json(
         .get(&skill.name)
         .map(|e| e.enabled)
         .unwrap_or(true);
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "name": skill.name,
         "version": skill.version,
         "description": skill.description,
@@ -1039,7 +1067,11 @@ fn skill_status_json(
         "enabled": enabled,
         "active": reasons.is_empty(),
         "reasons": reasons,
-    })
+    });
+    if let Some(clawhub) = skill_clawhub_json(skill) {
+        json["clawhub"] = clawhub;
+    }
+    json
 }
 
 async fn skills_list(
@@ -2011,6 +2043,89 @@ mod tests {
             .join("config.toml");
         config.skills.open_skills_enabled = false;
         config
+    }
+
+    #[tokio::test]
+    async fn skills_list_reports_which_publisher_a_skill_came_from() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        let skills_root = workspace_dir.join("skills");
+        std::fs::create_dir_all(&skills_root).expect("create skills dir");
+        write_skill_fixture(&skills_root, "weather");
+        write_skill_fixture(&skills_root, "clock");
+
+        // `weather` came from ClawHub and its publisher was recorded; `clock`
+        // is a plain local skill with no marker.
+        std::fs::write(
+            skills_root.join("weather").join(".clawhub.json"),
+            br#"{"owner":"steipete","slug":"weather","version":"1.0.0"}"#,
+        )
+        .expect("write provenance marker");
+
+        let state = test_state();
+        *state.config.lock() = skills_test_config(&workspace_dir);
+
+        let resp = skills_list(State(state), HeaderMap::new())
+            .await
+            .expect("skills_list should succeed");
+        let skills = resp.0["skills"].as_array().expect("skills array");
+
+        let weather = skills
+            .iter()
+            .find(|s| s["name"] == "weather")
+            .expect("weather present");
+        // The console keys its "installed" badge off this. Without it, every
+        // same-slug publisher looks installed once any one of them is.
+        assert_eq!(weather["clawhub"]["owner"], "steipete");
+        assert_eq!(weather["clawhub"]["slug"], "weather");
+        assert_eq!(weather["clawhub"]["reference"], "@steipete/weather");
+        assert_eq!(weather["clawhub"]["version"], "1.0.0");
+
+        // Absent, not null-filled: a skill with no marker is unattributed,
+        // and a client must not read a blank owner as "published by nobody".
+        let clock = skills
+            .iter()
+            .find(|s| s["name"] == "clock")
+            .expect("clock present");
+        assert!(clock.get("clawhub").is_none(), "{clock:?}");
+    }
+
+    #[tokio::test]
+    async fn skills_list_reference_stays_bare_for_an_unattributed_install() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        let skills_root = workspace_dir.join("skills");
+        std::fs::create_dir_all(&skills_root).expect("create skills dir");
+        write_skill_fixture(&skills_root, "weather");
+        // A slug unique enough that ClawHub answered without an owner, so the
+        // marker records none. `@/weather` would be a malformed reference.
+        std::fs::write(
+            skills_root.join("weather").join(".clawhub.json"),
+            br#"{"owner":"","slug":"weather","version":"2.0.0"}"#,
+        )
+        .expect("write provenance marker");
+
+        let state = test_state();
+        *state.config.lock() = skills_test_config(&workspace_dir);
+
+        let resp = skills_list(State(state), HeaderMap::new())
+            .await
+            .expect("skills_list should succeed");
+        let weather = resp.0["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "weather")
+            .expect("weather present")
+            .clone();
+        assert_eq!(weather["clawhub"]["reference"], "weather");
+        assert_eq!(weather["clawhub"]["owner"], "");
     }
 
     #[tokio::test]

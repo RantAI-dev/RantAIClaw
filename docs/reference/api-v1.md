@@ -406,12 +406,32 @@ as every other handler here.
         "tools": ["tool_name_a", "tool_name_b"],
         "enabled": true,
         "active": true,
-        "reasons": []
+        "reasons": [],
+        "clawhub": {
+          "owner": "steipete",
+          "slug": "weather",
+          "version": "1.0.0",
+          "reference": "@steipete/weather"
+        }
       }
     ],
     "count": 1
   }
   ```
+  `clawhub` says which publisher's copy is installed, read from the
+  `.clawhub.json` marker beside the skill's `SKILL.md`. It is **omitted**, not
+  null-filled, when there is no marker — which covers skills that did not come
+  from ClawHub (bundled, git remote, local path) *and* ClawHub installs made
+  before the marker existed. Absence therefore means *unattributed*, not "not
+  from ClawHub"; a client must not read it as proof of either.
+
+  `reference` is the value to send to `POST /api/v1/skills/install`, and stays
+  a bare slug when the marker records no owner (installed back when the slug
+  resolved without one). Clients comparing an installed skill against a
+  ClawHub listing should match on `clawhub.reference`, or on `clawhub.slug`
+  when the publisher is unknown — matching on `name` is wrong, since the
+  manifest name can differ from the on-disk slug.
+
   `tools` here is just the tool **names** the skill exposes. `enabled`
   reflects only `[skills.entries.<name>] enabled` in `config.toml` (default
   `true`) — it's what the `PUT .../enabled` route below flips. `active` is
