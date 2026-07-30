@@ -5,6 +5,66 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0-alpha] — 2026-07-30
+
+Make ClawHub skills installable again, and make it clear whose code you are
+installing.
+
+ClawHub now namespaces skills per publisher, so a bare slug no longer
+identifies a skill: `GET /skills/<slug>` answers `409 AMBIGUOUS_SKILL_SLUG`
+when several people publish it. That is 18 of the top 20 slugs, and the client
+only ever sent bare ones — so installing `weather`, `github`, or
+`obsidian` failed on every surface, with an error that read
+`clawhub returned status 409 Conflict` and said nothing about why.
+
+### Added
+
+- `skills install` and `skills inspect` accept a publisher-qualified
+  reference (`@steipete/weather`) alongside a bare slug. The owner is sent as
+  `?owner=` on every endpoint an install walks.
+- An ambiguous slug now reports the candidate publishers, annotated with
+  install counts and ClawHub's official marker so the choice is an informed
+  one. The TUI and the setup wizard turn that list into a prompt; the web
+  console into a picker.
+- `POST /api/v1/skills/install` answers `409 ambiguous_skill_slug` with a
+  `matches` array instead of a generic `500`. Each entry carries a
+  `reference` the client can send straight back.
+- `GET /api/v1/skills` reports a `clawhub` object per installed skill (owner,
+  slug, version, reference), read from a new `.clawhub.json` marker. Omitted
+  when unknown — absence means unattributed, not "not from ClawHub".
+- `skills_search` returns a ready-to-use `reference`; `skills_install`
+  accepts it and, on an ambiguous slug, answers with the exact references to
+  retry.
+
+The publisher is never chosen automatically. Installing a skill stages remote
+code the agent will later read and act on, and popular slugs attract
+look-alike forks — one of the four `weather` publishers is a verbatim copy of
+the top one, same display name, same summary.
+
+### Fixed
+
+- `skills update` re-fetches from the publisher a skill was installed from,
+  rather than resolving the slug again and possibly swapping authors.
+- Installing over a slug held by a different publisher is refused instead of
+  reported as already installed.
+- Batch installs report their failures. They went to `tracing::warn!`, which
+  no console renders, so the onboarding wizard printed an empty
+  "Installed from ClawHub:" line and no reason — the common outcome, since
+  the listing it browses reports no publisher.
+- The TUI install picker distinguishes same-slug results, installs the one
+  shown, and no longer discards the publisher prompt on a keystroke.
+- The picker's hint describes what its keys actually do, and PgUp/PgDn move a
+  screenful instead of a fixed five rows.
+- The web console marks installed per publisher, and its "official" badge no
+  longer shares a colour with "installed".
+
+### Changed
+
+- Bundled console pinned to claw-ui `v0.3.11`.
+- Removed the alt-screen render paths orphaned when chat moved to the
+  alt-screen: they had no callers and carried a second, better-looking picker
+  renderer that never drew.
+
 ## [0.14.0-alpha] — 2026-07-29
 
 Make an autonomy change reach every surface without a restart. `[autonomy]`
