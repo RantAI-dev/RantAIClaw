@@ -5,6 +5,32 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.1-alpha] — 2026-07-30
+
+Remove a skills-onboarding branch that could never execute.
+
+`SkillsSection::run` carried an interactive path calling into a dialoguer flow
+that browsed ClawHub, multi-selected from the listing, and asked which
+publisher a shared slug meant. Nothing could reach it: `setup <topic>` matches
+a provisioner first and returns, so `setup skills` runs the provisioner and
+never touches the section, while a bare `setup` reaches it only when stdin is
+not a terminal — and with a terminal the TUI setup overlay runs instead. The
+branch was therefore entered only where dialoguer has no terminal to prompt
+on.
+
+That left three implementations of skills onboarding for one job. This removes
+the one that cannot run, along with `clawhub::install_many` and its report
+types, whose only caller it was.
+
+No behaviour changes. ClawHub browsing during setup was already directed to
+the TUI's `/skills install`, by both the provisioner and the overlay, and
+headless installs already work through `rantaiclaw skills install @owner/slug`.
+
+The publisher prompt added to that branch in v0.15.0-alpha was real code on an
+unreachable path; the parts of that release that are live — publisher-qualified
+references, the `409` candidate list, per-skill provenance, and the agent
+tools — are untouched.
+
 ## [0.15.0-alpha] — 2026-07-30
 
 Make ClawHub skills installable again, and make it clear whose code you are
