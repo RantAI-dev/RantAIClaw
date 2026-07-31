@@ -162,7 +162,7 @@ Notes:
 - OpenClaw-style bundled-skill block lists map to `[skills.entries.<name>] enabled = false`; RantaiClaw does not add a second `allowBundled` list.
 - Skill manifests can declare `metadata.clawdbot.requires` gates and `metadata.clawdbot.install[]` recipes. `rantaiclaw skills install-deps` runs a matching recipe and revalidates missing binaries.
 - `download` install recipes support raw files, `tar.gz`/`tgz`, and `zip` archives. Archive entries are checked before extraction so absolute paths and `..` traversal are rejected.
-- `entries.<name>.enabled` is also toggleable at runtime — not just by hand-editing `config.toml` or `rantaiclaw skills enable`/`disable` — via the gateway's `PUT /api/v1/skills/{name}/enabled` (bearer-gated; see `docs/reference/api-v1.md#skills`). Same key, no schema change.
+- `entries.<name>.enabled` is also toggleable at runtime — not just by hand-editing `config.toml` or `rantaiclaw skills enable`/`disable` — via the gateway's `PUT /api/v1/skills/{slug}/enabled` (bearer-gated; see `docs/reference/api-v1.md#skills`). Same key, no schema change. The route is addressed by the skill's **directory name** while the key it writes stays the manifest **name**; the two differ for any skill whose display name contains a space or capitals.
 
 Example:
 
