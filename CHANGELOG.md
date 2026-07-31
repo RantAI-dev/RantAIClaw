@@ -5,6 +5,36 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.2-alpha] — 2026-07-31
+
+Make the always-on core skill actually always on, and stop a profile's paths
+ignoring the profile.
+
+### Fixed
+
+- `owner-permissions` is installed on the setup paths users take. It is the
+  sole always-on core skill — it teaches the agent the owner/guest model
+  behind `manage_permissions` and `issue_pairing_code`, both of which are
+  registered unconditionally, so without it the tools work but the agent has
+  no manual for them. Only the headless section installed it, and `setup`
+  reaches that section only when stdin is not a terminal; with one it launches
+  the TUI overlay instead. The skill described as always-on was, in practice,
+  almost never installed.
+- Configuring a channel installs it too. `section/channels.rs` had always done
+  this once a multi-user channel existed — "even if the skills section was
+  skipped" — but none of the fifteen channel provisioners did, and those are
+  what the TUI runs. A multi-user channel is the whole reason those tools
+  exist, so this was the case that mattered most.
+- A `Profile`'s paths resolve from its own `root` instead of re-deriving them
+  from `name` through the global home on every call. Production layout is
+  unchanged and a test pins that equivalence; what changes is that a profile
+  pointed at a scratch directory now stays there. The provisioner smoke tests
+  had been leaving a `test` profile in the developer's real `~/.rantaiclaw`,
+  visible in `rantaiclaw profile list`, with contents that depended on what had
+  run before.
+
+No config keys, no API surface, and no CLI syntax changed.
+
 ## [0.15.1-alpha] — 2026-07-30
 
 Remove a skills-onboarding branch that could never execute.
