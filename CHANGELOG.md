@@ -5,6 +5,45 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2-alpha] — 2026-07-31
+
+The skill authoring form shipped unreachable. This makes it work.
+
+### Fixed
+
+Three defects in the web console's skill editor, all found by driving it with
+a real browser rather than reading the code. Ships as claw-ui v0.3.13, which
+this release pins.
+
+- **The form never opened when creating a skill.** Clicking `Write` went
+  straight to the markdown view, under a message saying the file's structure
+  had been changed by hand — about a template the editor had generated itself
+  a moment earlier. The check deciding whether the form can be used rejected a
+  blank `name:`, which is exactly what a new skill starts with. The form,
+  which is the feature, was unreachable.
+
+- **The title heading was written blank.** Typing a name updated the
+  frontmatter but not the `#` heading, so skills created through the console
+  landed on disk with a bare `# ` as their visible title. That heading is part
+  of the body the model reads, so it was not only untidy.
+
+- **The pencil always opened the markdown view.** The editor's view was stored
+  state pushed by an effect: while a skill's content was still loading the
+  document was empty, empty does not parse, so the effect switched to markdown
+  once and nothing ever switched back. A momentary condition latched
+  permanently.
+
+### Notes
+
+None of the three was reachable from the unit suite as it stood. The first had
+a test that passed a name the editor never supplies, so the failing path was
+never exercised; a second test asserted the buggy behaviour outright. The
+third lived in the ordering of an async fetch against a React effect, which no
+function-level test can observe.
+
+A skill created through v0.3.12 has a blank `# ` title on disk. Harmless, and
+editing and re-saving it now fixes it.
+
 ## [0.16.1-alpha] — 2026-07-31
 
 Four providers could be configured but never answered, `doctor` blamed your
