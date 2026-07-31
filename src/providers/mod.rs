@@ -696,6 +696,27 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Base URL for a provider whose endpoint varies by region, resolved from the
+/// same constants `create_provider` builds it with.
+///
+/// Exists so `doctor`'s live ping can ask *this* module where a provider lives
+/// instead of keeping its own table — the same reason `provider_is_local` reads
+/// from the catalog. It deliberately covers only the region-varying families,
+/// which are exactly the ones a second table gets wrong: their endpoint depends
+/// on which alias was configured (`minimax` vs `minimax-cn`), so a flat
+/// name→URL list cannot express them at all.
+///
+/// `None` means "not one of these families" — not "no endpoint". Callers must
+/// treat it as "ask elsewhere or say you don't know", never as a licence to
+/// synthesise a URL.
+pub(crate) fn region_base_url(name: &str) -> Option<&'static str> {
+    minimax_base_url(name)
+        .or_else(|| glm_base_url(name))
+        .or_else(|| moonshot_base_url(name))
+        .or_else(|| qwen_base_url(name))
+        .or_else(|| zai_base_url(name))
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
