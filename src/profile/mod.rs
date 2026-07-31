@@ -33,41 +33,55 @@ pub struct Profile {
 }
 
 impl Profile {
+    // Every accessor derives from `root`, the directory this profile actually
+    // lives in, rather than re-deriving it from `name` through `paths`.
+    //
+    // The two are identical in production — `ProfileManager::ensure` sets
+    // `root` to `paths::profile_dir(name)` and the struct doc requires callers
+    // to go through it, so nothing builds a `Profile` whose root points
+    // elsewhere. `profile_paths_match_the_global_layout` pins that.
+    //
+    // The difference is that `paths` resolves `$HOME` on every call, so a
+    // `Profile` handed a scratch directory still wrote to the real
+    // `~/.rantaiclaw`. Tests could only isolate by mutating the process-global
+    // `HOME`, which raced every other test reading it — a smoke harness doing
+    // exactly that measurably destabilised the suite. Reading `root` gives
+    // them isolation with no environment mutation at all.
     pub fn config_toml(&self) -> PathBuf {
-        paths::config_toml(&self.name)
+        self.root.join("config.toml")
     }
     pub fn config_staging(&self) -> PathBuf {
-        paths::config_staging(&self.name)
+        self.root.join("config.toml.staging")
     }
     pub fn workspace_dir(&self) -> PathBuf {
-        paths::workspace_dir(&self.name)
+        self.root.join("workspace")
     }
     pub fn memory_dir(&self) -> PathBuf {
-        paths::memory_dir(&self.name)
+        self.root.join("memory")
     }
     pub fn sessions_dir(&self) -> PathBuf {
-        paths::sessions_dir(&self.name)
+        self.root.join("sessions")
     }
     pub fn sessions_db_path(&self) -> PathBuf {
-        paths::sessions_db(&self.name)
+        self.sessions_dir().join("sessions.db")
     }
     pub fn kb_db_path(&self) -> PathBuf {
-        paths::kb_db(&self.name)
+        self.root.join("kb.db")
     }
     pub fn skills_dir(&self) -> PathBuf {
-        paths::skills_dir(&self.name)
+        self.root.join("skills")
     }
     pub fn persona_dir(&self) -> PathBuf {
-        paths::persona_dir(&self.name)
+        self.root.join("persona")
     }
     pub fn policy_dir(&self) -> PathBuf {
-        paths::policy_dir(&self.name)
+        self.root.join("policy")
     }
     pub fn secrets_dir(&self) -> PathBuf {
-        paths::secrets_dir(&self.name)
+        self.root.join("secrets")
     }
     pub fn audit_log(&self) -> PathBuf {
-        paths::audit_log(&self.name)
+        self.root.join("audit.log")
     }
 }
 
@@ -392,4 +406,50 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
         // symlinks intentionally skipped — clone semantics are file-data only.
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod profile_root_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn profile_paths_match_the_global_layout() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("RANTAICLAW_PROFILE");
+        let profile = ProfileManager::ensure_default().expect("profile");
+        let name = profile.name.clone();
+        assert_eq!(profile.root, paths::profile_dir(&name));
+        assert_eq!(profile.skills_dir(), paths::skills_dir(&name));
+        assert_eq!(profile.persona_dir(), paths::persona_dir(&name));
+        assert_eq!(profile.policy_dir(), paths::policy_dir(&name));
+        assert_eq!(profile.sessions_db_path(), paths::sessions_db(&name));
+        match prev {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn a_scratch_root_keeps_every_path_inside_it() {
+        let tmp = tempfile::tempdir().expect("scratch root");
+        let profile = Profile {
+            name: "scratch".to_string(),
+            root: tmp.path().to_path_buf(),
+        };
+        for path in [
+            profile.config_toml(),
+            profile.skills_dir(),
+            profile.persona_dir(),
+            profile.policy_dir(),
+            profile.secrets_dir(),
+        ] {
+            assert!(
+                path.starts_with(tmp.path()),
+                "{path:?} escaped the scratch root"
+            );
+        }
+    }
 }
