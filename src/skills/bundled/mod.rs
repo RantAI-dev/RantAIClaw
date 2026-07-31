@@ -92,6 +92,19 @@ fn install_pack(profile: &Profile, pack: &[StarterPackSkill]) -> Result<Vec<Stri
         let skill_md = dir.join("SKILL.md");
         fs::write(&skill_md, skill.skill_md)
             .with_context(|| format!("write {}", skill_md.display()))?;
+        // Only for directories we just created — the `dir.exists()` guard
+        // above skips existing ones by design, and that includes their marker.
+        // Best-effort: a pack member without a marker still resolves correctly
+        // via the bundled slug list.
+        if let Err(e) = crate::skills::origin::write_origin(
+            &dir,
+            &crate::skills::origin::SkillOrigin::new(
+                crate::skills::origin::SkillOriginKind::Bundled,
+                None,
+            ),
+        ) {
+            tracing::warn!("bundled: could not record origin for {}: {e}", skill.slug);
+        }
         installed.push(skill.slug.to_string());
     }
     Ok(installed)
@@ -148,6 +161,53 @@ mod tests {
                 s.slug
             );
         }
+    }
+
+    #[test]
+    fn install_pack_records_bundled_origin_and_leaves_existing_dirs_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile = Profile {
+            name: "test".to_string(),
+            root: tmp.path().to_path_buf(),
+        };
+
+        // A directory that already exists must survive untouched — including
+        // a marker claiming a different origin, since `install_pack` skips it.
+        let squatted = profile.skills_dir().join(CORE_PACK[0].slug);
+        fs::create_dir_all(&squatted).unwrap();
+        fs::write(squatted.join("SKILL.md"), "user edits").unwrap();
+        crate::skills::origin::write_origin(
+            &squatted,
+            &crate::skills::origin::SkillOrigin::new(
+                crate::skills::origin::SkillOriginKind::Authored,
+                None,
+            ),
+        )
+        .unwrap();
+
+        install_pack(&profile, STARTER_PACK).unwrap();
+        install_pack(&profile, CORE_PACK).unwrap();
+
+        for slug in STARTER_PACK.iter().map(|s| s.slug) {
+            let origin = crate::skills::origin::read_origin(&profile.skills_dir().join(slug))
+                .unwrap_or_else(|| panic!("{slug} has no origin marker"));
+            assert_eq!(
+                origin.kind,
+                crate::skills::origin::SkillOriginKind::Bundled,
+                "{slug}"
+            );
+        }
+
+        assert_eq!(
+            fs::read_to_string(squatted.join("SKILL.md")).unwrap(),
+            "user edits",
+            "install_pack must not overwrite an existing skill directory"
+        );
+        assert_eq!(
+            crate::skills::origin::read_origin(&squatted).map(|o| o.kind),
+            Some(crate::skills::origin::SkillOriginKind::Authored),
+            "an existing directory keeps its own marker"
+        );
     }
 
     #[test]
