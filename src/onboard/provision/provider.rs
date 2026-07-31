@@ -318,20 +318,36 @@ impl TuiProvisioner for ProviderProvisioner {
                 )
                 .await?;
 
-                // Build a `/v1/models` URL from the provider's base.
-                // Some bases already include `/v1` (e.g. openai →
-                // `api.openai.com/v1`) and some don't (e.g. minimax →
-                // `api.minimax.io`). The previous logic
-                // unconditionally appended `/v1/models` AND added
-                // another `/v1` for non-openrouter providers, producing
-                // `api.minimax.io/v1/v1/models` and
-                // `api.openai.com/v1/v1/v1/models`. Detect what's
-                // already present and only append the missing segments.
-                let base = provider_base_url(provider_name);
-                let validation_url = if base.contains("/v1") {
-                    format!("https://{base}/models")
-                } else {
-                    format!("https://{base}/v1/models")
+                // Ask `doctor` where this provider's `/models` lives. It is the
+                // same question that check answers, and it resolves
+                // region-varying families from the constants `create_provider`
+                // builds the client with.
+                //
+                // This replaced a local table of bare hostnames. That table had
+                // drifted badly — two of its entries named domains that do not
+                // exist (`api.zPUmlw.com` for Z.AI, `api.moonshot.io` for
+                // Moonshot International), and several others disagreed with
+                // the host the client actually talks to. Since this probe sends
+                // the user's freshly-entered API key as a bearer token, a wrong
+                // hostname here is not a broken check — it is a credential
+                // handed to whoever controls that name.
+                let Some(validation_url) =
+                    crate::doctor::checks::provider::resolve_endpoint(provider_name, None)
+                else {
+                    // No known endpoint: accept the key unvalidated rather than
+                    // send it somewhere guessed. Setup continues; `doctor`
+                    // reports the same gap later.
+                    send(
+                        &events,
+                        ProvisionEvent::Message {
+                            severity: Severity::Info,
+                            text: format!(
+                                "No validation endpoint known for {provider_name} — saving the key unchecked."
+                            ),
+                        },
+                    )
+                    .await?;
+                    break;
                 };
 
                 let probe = probe_get(
@@ -495,35 +511,6 @@ impl TuiProvisioner for ProviderProvisioner {
         .await?;
 
         Ok(())
-    }
-}
-
-fn provider_base_url(provider: &str) -> &'static str {
-    match provider {
-        "openrouter" => "openrouter.ai/api",
-        "anthropic" => "api.anthropic.com",
-        "openai" => "api.openai.com/v1",
-        "deepseek" => "api.deepseek.com",
-        "mistral" => "api.mistral.ai",
-        "xai" => "api.x.ai",
-        "perplexity" => "api.perplexity.ai",
-        "gemini" => "generativelanguage.googleapis.com",
-        "groq" => "api.groq.com/openai/v1",
-        "fireworks" => "api.fireworks.ai/inference",
-        "together-ai" => "api.together.xyz/v1",
-        "nvidia" => "integrate.api.nvidia.com/v1",
-        "vercel" => "api.vercel.ai",
-        "cloudflare" => "gateway.ai.cloudflare.com/v1",
-        "bedrock" => "",
-        "moonshot" => "api.moonshot.cn",
-        "moonshot-intl" => "api.moonshot.io",
-        "glm" => "open.bigmodel.cn",
-        "minimax" => "api.minimax.io",
-        "qwen" => "dashscope.aliyuncs.com",
-        "qianfan" => "qianfan.baidubce.com",
-        "zai" => "api.zPUmlw.com",
-        "cohere" => "api.cohere.ai",
-        _ => "",
     }
 }
 

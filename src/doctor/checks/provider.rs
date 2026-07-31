@@ -185,6 +185,17 @@ pub fn resolve_endpoint(provider: &str, api_url: Option<&str>) -> Option<String>
     // both names against `api.z.ai` (GLM_GLOBAL). Only `glm-cn`/`zhipu-cn`/
     // `bigmodel` resolve to `open.bigmodel.cn`, which is exactly what the
     // family resolver already encodes.
+    // Every entry below is the base `create_provider` builds the client with,
+    // so a probe here exercises the path a real message would take. The ones
+    // added beyond the original six were each confirmed against the live API
+    // without credentials: the host answers 404 for a nonsense path and
+    // something else (401/400/422) for this one, so the response distinguishes
+    // "endpoint exists" from "wrong path".
+    //
+    // Providers whose host answers identically for every path — cloudflare,
+    // doubao, together, cohere — are deliberately absent. Listing them would
+    // look like coverage while proving nothing, and this resolver also decides
+    // where onboarding sends a freshly-entered API key.
     let base = match provider {
         "openrouter" => "https://openrouter.ai/api/v1",
         "anthropic" => "https://api.anthropic.com/v1",
@@ -192,6 +203,15 @@ pub fn resolve_endpoint(provider: &str, api_url: Option<&str>) -> Option<String>
         "groq" => "https://api.groq.com/openai/v1",
         "ollama" => "http://localhost:11434/v1",
         "deepseek" => "https://api.deepseek.com/v1",
+        "mistral" => "https://api.mistral.ai/v1",
+        "xai" | "grok" => "https://api.x.ai/v1",
+        "perplexity" => "https://api.perplexity.ai",
+        "fireworks" | "fireworks-ai" => "https://api.fireworks.ai/inference/v1",
+        "nvidia" | "nvidia-nim" => "https://integrate.api.nvidia.com/v1",
+        "venice" => "https://api.venice.ai/api/v1",
+        "vercel" | "vercel-ai" => "https://ai-gateway.vercel.sh/v1",
+        "opencode" | "opencode-zen" => "https://opencode.ai/zen/v1",
+        "kimi-code" => "https://api.kimi.com/coding/v1",
         _ => return None,
     };
     Some(join_models(base))
@@ -282,7 +302,7 @@ mod tests {
             "bedrock",
             "copilot",
             "openai-codex",
-            "nvidia",
+            "qianfan",
             "not-a-provider",
         ] {
             let url = resolve_endpoint(provider, None);
@@ -336,6 +356,51 @@ mod tests {
                 resolve_endpoint(name, None).as_deref(),
                 Some("https://open.bigmodel.cn/api/paas/v4/models"),
                 "{name}"
+            );
+        }
+    }
+
+    /// This resolver decides where onboarding sends a freshly-entered API key,
+    /// so a hostname here is a credential destination, not just a probe target.
+    ///
+    /// It replaced a second table in `onboard::provision::provider` that had
+    /// drifted into naming domains that **do not exist** — `api.zPUmlw.com`
+    /// for Z.AI and `api.moonshot.io` for Moonshot International. Neither
+    /// resolves today, so the probe simply failed; but either could be
+    /// registered by anyone, at which point every setup run would hand them a
+    /// working key.
+    ///
+    /// Hence: every host below must be one `create_provider` also builds with.
+    #[test]
+    fn every_endpoint_is_a_host_the_client_actually_uses() {
+        for provider in [
+            "openrouter",
+            "anthropic",
+            "openai",
+            "groq",
+            "deepseek",
+            "mistral",
+            "xai",
+            "perplexity",
+            "fireworks",
+            "nvidia",
+            "venice",
+            "vercel",
+            "opencode",
+            "kimi-code",
+            "minimax",
+            "glm",
+            "moonshot",
+            "qwen",
+            "zai",
+        ] {
+            let url = resolve_endpoint(provider, None)
+                .unwrap_or_else(|| panic!("{provider} should resolve"));
+            assert!(url.starts_with("https://"), "{provider} -> {url}");
+            // The two dead domains, pinned by name so neither can come back.
+            assert!(
+                !url.contains("zPUmlw") && !url.contains("moonshot.io"),
+                "{provider} -> {url} names a domain that does not exist"
             );
         }
     }
