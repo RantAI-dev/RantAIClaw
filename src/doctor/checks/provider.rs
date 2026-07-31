@@ -45,10 +45,29 @@ impl DoctorCheck for ProviderPingCheck {
             }
         };
 
-        let endpoint = self
+        let endpoint = match self
             .endpoint_override
             .clone()
-            .unwrap_or_else(|| resolve_endpoint(provider, ctx.config.api_url.as_deref()));
+            .or_else(|| resolve_endpoint(provider, ctx.config.api_url.as_deref()))
+        {
+            Some(url) => url,
+            // No endpoint known. Previously this fell through to using the
+            // provider *name* as a URL — `minimax` became `minimax/models` —
+            // and reqwest's refusal to build a request from it surfaced as
+            // "network error: builder error", pointing every reader at their
+            // connection when nothing had been sent. Say what is actually
+            // true instead, and warn rather than fail: not knowing where to
+            // probe is a gap in this check, not evidence the provider is
+            // broken.
+            None => {
+                return CheckResult::warn(
+                    self.name(),
+                    format!("no probe endpoint known for {provider} — not probing"),
+                )
+                .with_category(self.category())
+                .with_hint("set `api_url` in config.toml to probe this provider")
+            }
+        };
 
         // Resolve the way the send paths do. Reading only the top-level
         // `api_key` missed anything stored under `provider_api_keys` — what
@@ -133,9 +152,30 @@ fn classify_response(
     }
 }
 
-pub fn resolve_endpoint(provider: &str, api_url: Option<&str>) -> String {
+/// Where to `GET /models` to prove a provider's key works, or `None` when this
+/// check does not know.
+///
+/// Returning `None` is the point. The previous version ended with
+/// `join_models(provider)`, turning an unknown provider name straight into a
+/// URL — `minimax` became `minimax/models`, which reqwest cannot build a
+/// request from, so every one of the ~20 providers absent from the list below
+/// reported `network error: builder error` without a packet leaving the
+/// machine. A wrong answer that reads as a connectivity problem is worse than
+/// no answer.
+///
+/// Region-varying families are asked of `providers` rather than listed here.
+/// Their endpoint depends on which alias was configured (`minimax` vs
+/// `minimax-cn`), so a flat name→URL table cannot express them, and a second
+/// copy of the constants would drift from the one `create_provider` uses.
+pub fn resolve_endpoint(provider: &str, api_url: Option<&str>) -> Option<String> {
     if let Some(base) = api_url.map(str::trim).filter(|s| !s.is_empty()) {
-        return join_models(base);
+        return Some(join_models(base));
+    }
+    if let Some(rest) = provider.strip_prefix("custom:") {
+        return Some(join_models(rest));
+    }
+    if let Some(base) = crate::providers::region_base_url(provider) {
+        return Some(join_models(base));
     }
     let base = match provider {
         "openrouter" => "https://openrouter.ai/api/v1",
@@ -144,15 +184,10 @@ pub fn resolve_endpoint(provider: &str, api_url: Option<&str>) -> String {
         "groq" => "https://api.groq.com/openai/v1",
         "ollama" => "http://localhost:11434/v1",
         "deepseek" => "https://api.deepseek.com/v1",
-        "zhipu" | "glm" => "https://open.bigmodel.cn/api/paas/v4",
-        _ => {
-            if let Some(rest) = provider.strip_prefix("custom:") {
-                return join_models(rest);
-            }
-            return join_models(provider);
-        }
+        "zhipu" => "https://open.bigmodel.cn/api/paas/v4",
+        _ => return None,
     };
-    join_models(base)
+    Some(join_models(base))
 }
 
 fn join_models(base: &str) -> String {
@@ -214,25 +249,70 @@ mod tests {
     #[test]
     fn resolve_endpoint_uses_api_url_override() {
         let url = resolve_endpoint("openrouter", Some("https://example.com/v1"));
-        assert_eq!(url, "https://example.com/v1/models");
+        assert_eq!(url.as_deref(), Some("https://example.com/v1/models"));
     }
 
     #[test]
     fn resolve_endpoint_strips_trailing_slash() {
         let url = resolve_endpoint("openrouter", Some("https://example.com/v1/"));
-        assert_eq!(url, "https://example.com/v1/models");
+        assert_eq!(url.as_deref(), Some("https://example.com/v1/models"));
     }
 
     #[test]
     fn resolve_endpoint_falls_back_to_known_default() {
-        let url = resolve_endpoint("openrouter", None);
+        let url = resolve_endpoint("openrouter", None).expect("openrouter is known");
         assert!(url.starts_with("https://openrouter.ai/api/v1"));
         assert!(url.ends_with("/models"));
+    }
+
+    /// The bug this guards: the old fallback ended with `join_models(provider)`,
+    /// so an unknown provider name became a "URL". `minimax` → `minimax/models`,
+    /// which reqwest cannot build a request from — reported to the user as
+    /// `network error: builder error`, with nothing having touched the network.
+    #[test]
+    fn resolve_endpoint_never_turns_a_bare_provider_name_into_a_url() {
+        for provider in [
+            "bedrock",
+            "copilot",
+            "openai-codex",
+            "nvidia",
+            "not-a-provider",
+        ] {
+            let url = resolve_endpoint(provider, None);
+            assert!(
+                url.is_none(),
+                "{provider} resolved to {url:?}; unknown providers must resolve to None so the \
+                 check can say so instead of probing a non-URL"
+            );
+        }
+    }
+
+    /// Region-varying providers come from `providers`, not from a second table
+    /// here — the endpoint depends on which alias was configured, which a flat
+    /// name→URL list cannot express.
+    #[test]
+    fn resolve_endpoint_asks_providers_for_region_varying_families() {
+        let intl = resolve_endpoint("minimax", None).expect("minimax is known");
+        assert_eq!(intl, "https://api.minimax.io/v1/models");
+
+        let cn = resolve_endpoint("minimax-cn", None).expect("minimax-cn is known");
+        assert_eq!(cn, "https://api.minimaxi.com/v1/models");
+        assert_ne!(
+            intl, cn,
+            "the two regions must not collapse to one endpoint"
+        );
+
+        for provider in ["glm", "moonshot", "qwen", "zai"] {
+            let url = resolve_endpoint(provider, None)
+                .unwrap_or_else(|| panic!("{provider} should resolve"));
+            assert!(url.starts_with("https://"), "{provider} -> {url}");
+            assert!(url.ends_with("/models"), "{provider} -> {url}");
+        }
     }
 
     #[test]
     fn resolve_endpoint_handles_custom_prefix() {
         let url = resolve_endpoint("custom:https://my-api.local", None);
-        assert_eq!(url, "https://my-api.local/models");
+        assert_eq!(url.as_deref(), Some("https://my-api.local/models"));
     }
 }
