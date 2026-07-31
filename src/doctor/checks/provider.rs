@@ -177,6 +177,14 @@ pub fn resolve_endpoint(provider: &str, api_url: Option<&str>) -> Option<String>
     if let Some(base) = crate::providers::region_base_url(provider) {
         return Some(join_models(base));
     }
+    // `zhipu` used to be listed here alongside `glm`, pointing at
+    // `open.bigmodel.cn`. It is gone rather than moved: `is_glm_global_alias`
+    // covers both names, so `region_base_url` above now answers first and this
+    // arm was unreachable. Keeping it would have documented an endpoint the
+    // code cannot reach — and the wrong one, since `create_provider` builds
+    // both names against `api.z.ai` (GLM_GLOBAL). Only `glm-cn`/`zhipu-cn`/
+    // `bigmodel` resolve to `open.bigmodel.cn`, which is exactly what the
+    // family resolver already encodes.
     let base = match provider {
         "openrouter" => "https://openrouter.ai/api/v1",
         "anthropic" => "https://api.anthropic.com/v1",
@@ -184,7 +192,6 @@ pub fn resolve_endpoint(provider: &str, api_url: Option<&str>) -> Option<String>
         "groq" => "https://api.groq.com/openai/v1",
         "ollama" => "http://localhost:11434/v1",
         "deepseek" => "https://api.deepseek.com/v1",
-        "zhipu" => "https://open.bigmodel.cn/api/paas/v4",
         _ => return None,
     };
     Some(join_models(base))
@@ -307,6 +314,29 @@ mod tests {
                 .unwrap_or_else(|| panic!("{provider} should resolve"));
             assert!(url.starts_with("https://"), "{provider} -> {url}");
             assert!(url.ends_with("/models"), "{provider} -> {url}");
+        }
+    }
+
+    /// `glm` and `zhipu` are the same provider under two names, and
+    /// `create_provider` builds both against GLM_GLOBAL. doctor used to probe
+    /// `open.bigmodel.cn` for them — a different host from the one the agent
+    /// actually talks to, so a green tick there proved nothing about the
+    /// configured client. Only the explicit `-cn` aliases belong on bigmodel.
+    #[test]
+    fn glm_aliases_probe_the_host_create_provider_uses() {
+        for name in ["glm", "zhipu"] {
+            assert_eq!(
+                resolve_endpoint(name, None).as_deref(),
+                Some("https://api.z.ai/api/paas/v4/models"),
+                "{name}"
+            );
+        }
+        for name in ["glm-cn", "zhipu-cn", "bigmodel"] {
+            assert_eq!(
+                resolve_endpoint(name, None).as_deref(),
+                Some("https://open.bigmodel.cn/api/paas/v4/models"),
+                "{name}"
+            );
         }
     }
 
