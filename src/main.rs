@@ -2919,6 +2919,7 @@ async fn run_provisioner_headless(
     };
 
     let prov_name = provisioner.name().to_string();
+    let provisioner_category = provisioner.category();
     let prov_future = provisioner.run(config, profile, io);
 
     tokio::pin!(prov_future);
@@ -2996,8 +2997,14 @@ async fn run_provisioner_headless(
 
     match timed.await {
         Ok((prov_result, _)) => {
-            if let Err(e) = prov_result {
-                eprintln!("\n❌ provisioner error: {e}");
+            match prov_result {
+                Err(e) => eprintln!("\n❌ provisioner error: {e}"),
+                // A configured multi-user channel is the point at which the
+                // owner needs to be able to manage permissions from chat.
+                Ok(()) => onboard::provision::install_core_skills_after_channel(
+                    provisioner_category,
+                    profile,
+                ),
             }
         }
         Err(_) => {
