@@ -1,6 +1,7 @@
 pub mod bundled;
 pub mod clawhub;
 pub mod install_deps;
+pub mod origin;
 pub mod watcher;
 
 use anyhow::{Context, Result};
@@ -60,6 +61,12 @@ pub struct Skill {
     /// `SKILL.md`; set only by the loader at load time.
     #[serde(skip)]
     pub remote: bool,
+    /// Who put this skill on disk. `None` when the origin cannot be
+    /// established — see [`origin::resolve_origin`]. Like `location` and
+    /// `remote`, this is read from disk at load time and never from the
+    /// manifest, so a `SKILL.md` cannot declare its own origin.
+    #[serde(skip)]
+    pub origin: Option<origin::SkillOrigin>,
 }
 
 /// One install recipe for a skill's binary dependency. Mirrors OpenClaw's
@@ -905,7 +912,18 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         requires: SkillRequires::default(),
         install_recipes: Vec::new(),
         remote: false,
+        origin: path.parent().and_then(resolve_origin_for_dir),
     })
+}
+
+/// Resolve a skill directory's origin against the active profile's skills
+/// root. Wrapped here so both loaders share one call and neither has to know
+/// how the profile is resolved.
+fn resolve_origin_for_dir(dir: &Path) -> Option<origin::SkillOrigin> {
+    let profile_skills = crate::profile::ProfileManager::active()
+        .ok()
+        .map(|p| p.skills_dir());
+    origin::resolve_origin(dir, profile_skills.as_deref())
 }
 
 /// Load a skill from a SKILL.md file (simpler format)
@@ -945,6 +963,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         requires,
         install_recipes,
         remote: false,
+        origin: resolve_origin_for_dir(dir),
     })
 }
 
@@ -1229,6 +1248,11 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         requires: SkillRequires::default(),
         install_recipes: Vec::new(),
         remote: true,
+        // Open-skills entries are flat `.md` files in the checkout, not skill
+        // directories, so there is no directory whose origin could be
+        // established. `resolve_origin` would reach the same answer via the
+        // profile-root test; stating it here keeps the loader honest.
+        origin: None,
     })
 }
 
@@ -1415,6 +1439,68 @@ fn is_git_source(source: &str) -> bool {
         || is_git_scheme_source(source, "ssh://")
         || is_git_scheme_source(source, "git://")
         || is_git_scp_source(source)
+}
+
+#[cfg(test)]
+mod git_clone_dir_name_tests {
+    use super::git_clone_dir_name;
+
+    #[test]
+    fn derives_the_directory_git_would_create() {
+        for (source, expected) in [
+            ("https://github.com/org/repo.git", "repo"),
+            ("https://github.com/org/repo", "repo"),
+            ("https://github.com/org/repo/", "repo"),
+            ("git@github.com:org/repo.git", "repo"),
+            ("ssh://git@github.com/org/repo.git", "repo"),
+        ] {
+            assert_eq!(git_clone_dir_name(source), Some(expected), "{source}");
+        }
+    }
+
+    #[test]
+    fn refuses_traversal_components() {
+        for source in ["https://example.com/..", "https://example.com/.", ".", ".."] {
+            assert_eq!(git_clone_dir_name(source), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn never_yields_a_path_separator() {
+        // The caller joins the result onto the skills root, so whatever comes
+        // back must be a single plain component. Asserting the property beats
+        // enumerating inputs: a URL shape nobody anticipated still cannot
+        // produce something that escapes.
+        for source in [
+            "https://github.com/org/repo.git",
+            "git@github.com:org/nested/repo.git",
+            "https://example.com/",
+            "https://example.com",
+            "ssh://git@host:2222/org/repo",
+        ] {
+            if let Some(name) = git_clone_dir_name(source) {
+                assert!(
+                    !name.contains('/') && !name.contains('\\') && name != ".." && name != ".",
+                    "{source} yielded unsafe component {name:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The directory `git clone <source>` creates, following git's own rule:
+/// the last path segment with a trailing `.git` and any trailing slashes
+/// removed. Returns `None` when nothing usable remains, or when the result
+/// would not be a plain directory name — the caller joins it onto the skills
+/// root, so `..` or a separator must never survive.
+fn git_clone_dir_name(source: &str) -> Option<&str> {
+    let trimmed = source.trim_end_matches('/');
+    let last = trimmed.rsplit(['/', ':']).next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    Some(name)
 }
 
 fn is_git_scheme_source(source: &str, scheme: &str) -> bool {
@@ -1685,6 +1771,21 @@ pub(crate) fn handle_command(
                     .output()?;
 
                 if output.status.success() {
+                    // Best-effort origin marker. `git clone <url>` names the
+                    // directory after the repo, so derive it the same way git
+                    // does rather than guessing from the loaded manifest.
+                    if let Some(dir_name) = git_clone_dir_name(&source) {
+                        let dir = skills_path.join(dir_name);
+                        if let Err(e) = origin::write_origin(
+                            &dir,
+                            &origin::SkillOrigin::new(
+                                origin::SkillOriginKind::Git,
+                                Some(source.clone()),
+                            ),
+                        ) {
+                            tracing::warn!("could not record origin for {source}: {e}");
+                        }
+                    }
                     println!(
                         "  {} Skill installed successfully!",
                         console::style("✓").green().bold()
@@ -1757,6 +1858,17 @@ pub(crate) fn handle_command(
                         console::style("✓").green().bold(),
                         dest.display()
                     );
+                }
+
+                // Written once after the platform arms above rather than
+                // inside each. Where `dest` is a symlink this lands in the
+                // target — the skill *is* that directory, so that is where its
+                // metadata belongs. Best-effort, as elsewhere.
+                if let Err(e) = origin::write_origin(
+                    &dest,
+                    &origin::SkillOrigin::new(origin::SkillOriginKind::Local, Some(source.clone())),
+                ) {
+                    tracing::warn!("could not record origin for {source}: {e}");
                 }
             }
 
@@ -2272,6 +2384,7 @@ command = "echo hello"
             requires: SkillRequires::default(),
             install_recipes: Vec::new(),
             remote: false,
+            origin: None,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<available_skills>"));
@@ -2299,6 +2412,7 @@ command = "echo hello"
             requires: SkillRequires::default(),
             install_recipes: Vec::new(),
             remote: false,
+            origin: None,
         }];
         let prompt = skills_to_prompt_with_mode(
             &skills,
@@ -2542,6 +2656,7 @@ description = "Bare minimum"
             requires: SkillRequires::default(),
             install_recipes: Vec::new(),
             remote: false,
+            origin: None,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
@@ -2564,6 +2679,7 @@ description = "Bare minimum"
             requires: SkillRequires::default(),
             install_recipes: Vec::new(),
             remote: false,
+            origin: None,
         }];
 
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
@@ -2877,6 +2993,7 @@ description = "Bare minimum"
             requires: SkillRequires::default(),
             install_recipes: Vec::new(),
             remote: false,
+            origin: None,
         };
         let remote = Skill {
             name: "remote-skill".to_string(),
@@ -2890,6 +3007,7 @@ description = "Bare minimum"
             requires: SkillRequires::default(),
             install_recipes: Vec::new(),
             remote: true,
+            origin: None,
         };
 
         let prompt = skills_to_prompt_with_mode(

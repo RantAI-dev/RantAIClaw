@@ -562,6 +562,22 @@ async fn install_one_inner(
         },
     )?;
 
+    // Separate from the provenance marker above, which answers "which
+    // publisher and version" for `skills update`. This one answers "who put
+    // this here", which is what edit surfaces gate on. Best-effort: an install
+    // that landed but could not record its origin degrades to "unknown", which
+    // is safe; failing the install over a metadata file is not.
+    let reference = match owner {
+        Some(owner) if !owner.is_empty() => format!("@{owner}/{slug}"),
+        _ => slug.to_string(),
+    };
+    if let Err(e) = super::origin::write_origin(
+        dir,
+        &super::origin::SkillOrigin::new(super::origin::SkillOriginKind::Clawhub, Some(reference)),
+    ) {
+        tracing::warn!("clawhub: could not record origin for {slug}: {e}");
+    }
+
     Ok(())
 }
 
@@ -605,9 +621,10 @@ fn is_reserved_manifest_path(rel: &std::path::Path) -> bool {
     if components.next().is_some() {
         return false;
     }
-    first
-        .to_str()
-        .is_some_and(|name| name.eq_ignore_ascii_case(PROVENANCE_FILE))
+    first.to_str().is_some_and(|name| {
+        name.eq_ignore_ascii_case(PROVENANCE_FILE)
+            || name.eq_ignore_ascii_case(super::origin::ORIGIN_FILE)
+    })
 }
 
 pub(crate) fn read_provenance(dir: &std::path::Path) -> Option<Provenance> {
@@ -1194,7 +1211,17 @@ mod tests {
 
     #[test]
     fn is_reserved_manifest_path_covers_curdir_and_case_variants() {
-        for raw in [".clawhub.json", "./.clawhub.json", ".CLAWHUB.JSON"] {
+        // `.origin.json` is reserved for the same reason `.clawhub.json` is:
+        // an archive shipping its own marker would otherwise declare any
+        // origin it liked, including `authored`.
+        for raw in [
+            ".clawhub.json",
+            "./.clawhub.json",
+            ".CLAWHUB.JSON",
+            ".origin.json",
+            "./.origin.json",
+            ".ORIGIN.JSON",
+        ] {
             assert!(
                 is_reserved_manifest_path(std::path::Path::new(raw)),
                 "expected {raw:?} to be reserved"
@@ -1202,7 +1229,13 @@ mod tests {
         }
         // Nested paths cannot reach the root-level marker, and ordinary
         // skill files stay installable.
-        for raw in ["SKILL.md", "assets/.clawhub.json", "clawhub.json"] {
+        for raw in [
+            "SKILL.md",
+            "assets/.clawhub.json",
+            "clawhub.json",
+            "assets/.origin.json",
+            "origin.json",
+        ] {
             assert!(
                 !is_reserved_manifest_path(std::path::Path::new(raw)),
                 "expected {raw:?} to be allowed"

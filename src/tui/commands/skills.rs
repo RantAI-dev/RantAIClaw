@@ -484,6 +484,7 @@ mod tests {
             requires: Default::default(),
             install_recipes: Vec::new(),
             remote: false,
+            origin: None,
         });
         let result = cmd.execute("summarizer", &mut ctx).unwrap();
         // A known skill name renders its detail in an InfoPanel (since v0.6.23),

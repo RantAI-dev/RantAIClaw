@@ -318,6 +318,20 @@ impl Tool for AuthorSkillTool {
             return Ok(fail(format!("Failed to write {}: {e}", skill_md.display())));
         }
 
+        // Records that this skill is the user's own, which is what edit
+        // surfaces gate on. Best-effort: without it the skill still works and
+        // still resolves as authored via the shape fallback, since it is a
+        // plain directory in the profile skills root.
+        if let Err(e) = crate::skills::origin::write_origin(
+            &dir,
+            &crate::skills::origin::SkillOrigin::new(
+                crate::skills::origin::SkillOriginKind::Authored,
+                None,
+            ),
+        ) {
+            tracing::warn!("author_skill: could not record origin for {slug}: {e}");
+        }
+
         let verb = if overwrite && skill_md.exists() {
             "Updated"
         } else {
@@ -543,6 +557,26 @@ mod tests {
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("name: Weather Reporter"));
         assert!(body.contains("Ask for the city first."));
+    }
+
+    #[tokio::test]
+    async fn execute_records_authored_origin() {
+        let tmp = TempDir::new().unwrap();
+        let tool = tool_in(&tmp);
+        tool.execute(json!({ "name": "Weather Reporter", "description": "Reports." }))
+            .await
+            .unwrap();
+
+        let dir = tmp.path().join("skills/weather-reporter");
+        let origin = crate::skills::origin::read_origin(&dir)
+            .expect("author_skill must record an origin marker");
+        assert_eq!(
+            origin.kind,
+            crate::skills::origin::SkillOriginKind::Authored
+        );
+        // `source` is meaningless for a skill written here — there is no
+        // upstream it came from.
+        assert_eq!(origin.source, None);
     }
 
     #[tokio::test]

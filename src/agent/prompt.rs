@@ -1072,6 +1072,7 @@ mod tests {
             requires: Default::default(),
             install_recipes: Vec::new(),
             remote: false,
+            origin: None,
         }];
 
         let ctx = PromptContext {
@@ -1117,6 +1118,7 @@ mod tests {
             requires: Default::default(),
             install_recipes: Vec::new(),
             remote: false,
+            origin: None,
         }];
 
         let ctx = PromptContext {
@@ -1188,6 +1190,7 @@ mod tests {
             requires: Default::default(),
             install_recipes: Vec::new(),
             remote: false,
+            origin: None,
         }];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
