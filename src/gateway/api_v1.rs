@@ -50,13 +50,17 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/sessions/{id}/title", put(sessions_set_title))
         .route("/api/v1/insights", get(insights))
-        .route("/api/v1/skills", get(skills_list))
+        .route("/api/v1/skills", get(skills_list).post(skills_create))
         .route("/api/v1/skills/install", post(skills_install))
         .route(
-            "/api/v1/skills/{name}",
+            "/api/v1/skills/{slug}",
             get(skills_show).delete(skills_uninstall),
         )
-        .route("/api/v1/skills/{name}/enabled", put(skills_set_enabled))
+        .route("/api/v1/skills/{slug}/enabled", put(skills_set_enabled))
+        .route(
+            "/api/v1/skills/{slug}/content",
+            get(skills_read_content).put(skills_write_content),
+        )
         .route("/api/v1/memory", get(memory_list))
         .route("/api/v1/memory/stats", get(memory_stats))
         .route(
@@ -185,6 +189,31 @@ fn err_400(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
         StatusCode::BAD_REQUEST,
         Json(ErrorBody {
             error: "bad_request".into(),
+            matches: None,
+            detail: Some(msg.into()),
+        }),
+    )
+}
+
+/// The caller may see this resource but not act on it. Used by the skill
+/// content routes for a skill someone else manages: 404 would be a lie, since
+/// the same caller can list and read its metadata.
+fn err_403(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorBody {
+            error: "forbidden".into(),
+            matches: None,
+            detail: Some(msg.into()),
+        }),
+    )
+}
+
+fn err_409(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorBody {
+            error: "conflict".into(),
             matches: None,
             detail: Some(msg.into()),
         }),
@@ -1068,10 +1097,99 @@ fn skill_status_json(
         "active": reasons.is_empty(),
         "reasons": reasons,
     });
+    // The address every skill route takes. Absent for skills with no
+    // directory of their own (open-skills entries) — those are not
+    // addressable, and clients must not offer actions on them.
+    if let Some(slug) = skill.slug() {
+        json["slug"] = serde_json::Value::String(slug);
+    }
+    // Who put this skill here. Absent means the origin could not be
+    // established, which clients must read as "not editable" — never as
+    // "probably fine".
+    if let Some(origin) = &skill.origin {
+        json["origin"] = serde_json::json!({
+            "kind": origin.kind,
+            "source": origin.source,
+        });
+    }
     if let Some(clawhub) = skill_clawhub_json(skill) {
         json["clawhub"] = clawhub;
     }
     json
+}
+
+/// Resolve a skill by its directory slug — the address all skill routes take.
+///
+/// Uses `load_skills_with_status` rather than `_with_config` for the same
+/// reason `remove_skill` does: the config loader filters out disabled skills,
+/// and a disabled skill must stay addressable (you have to be able to
+/// re-enable, edit, or remove one).
+fn resolve_by_slug<'a>(
+    skills: &'a [(crate::skills::Skill, Vec<String>)],
+    slug: &str,
+) -> Option<&'a (crate::skills::Skill, Vec<String>)> {
+    skills
+        .iter()
+        .find(|(s, _)| s.slug().is_some_and(|s| s.eq_ignore_ascii_case(slug)))
+}
+
+/// The skill's directory, but only when the user authored it.
+///
+/// A skill body is injected into the system prompt every turn, so a route that
+/// rewrites one rewrites the agent's standing instructions. Restricting that to
+/// skills the user wrote is what keeps a caller from replacing vendor-reviewed
+/// content while the console still shows the trusted badge.
+///
+/// 403 rather than 404: the skill exists and this caller can already list and
+/// read its metadata. Hiding it here would make the console's own list
+/// disagree with its errors.
+/// Map a slug to the manifest name the `skills::` writers key on.
+///
+/// `set_skill_enabled` and `remove_skill` both resolve by manifest name and
+/// (for the former) write a name-keyed config entry. Rather than change either
+/// — the config key is a shipped contract — the routes accept a slug and hand
+/// the resolved name down.
+///
+/// Falls back to treating the parameter as a name so clients written against
+/// the pre-slug API keep working; for ClawHub and bundled skills the two are
+/// identical anyway.
+fn resolve_slug_to_name(
+    cfg: &crate::config::Config,
+    slug: &str,
+) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+    let skills = crate::skills::load_skills_with_status(&cfg.workspace_dir, cfg);
+    resolve_by_slug(&skills, slug)
+        .or_else(|| {
+            skills
+                .iter()
+                .find(|(s, _)| s.name.eq_ignore_ascii_case(slug))
+        })
+        .map(|(s, _)| s.name.clone())
+        .ok_or_else(|| err_404(format!("skill `{slug}` not found")))
+}
+
+fn require_authored(
+    skill: &crate::skills::Skill,
+) -> Result<&std::path::Path, (StatusCode, Json<ErrorBody>)> {
+    let kind = skill.origin.as_ref().map(|o| o.kind);
+    if kind != Some(crate::skills::origin::SkillOriginKind::Authored) {
+        let managed_by = match kind {
+            Some(crate::skills::origin::SkillOriginKind::Clawhub) => "ClawHub",
+            Some(crate::skills::origin::SkillOriginKind::Bundled) => "a bundled pack",
+            Some(crate::skills::origin::SkillOriginKind::Git) => "a git remote",
+            Some(crate::skills::origin::SkillOriginKind::Local) => "a local-path install",
+            _ => "an unrecorded source",
+        };
+        return Err(err_403(format!(
+            "`{}` is managed by {managed_by} and cannot be edited here",
+            skill.name
+        )));
+    }
+    skill
+        .location
+        .as_ref()
+        .and_then(|m| m.parent())
+        .ok_or_else(|| err_500(anyhow::anyhow!("skill `{}` has no directory", skill.name)))
 }
 
 async fn skills_list(
@@ -1093,15 +1211,22 @@ async fn skills_list(
 async fn skills_show(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    Path(slug): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let cfg = state.config.lock().clone();
     let skills = crate::skills::load_skills_with_status(&cfg.workspace_dir, &cfg);
-    let (s, reasons) = skills
-        .iter()
-        .find(|(s, _)| s.name.eq_ignore_ascii_case(&name))
-        .ok_or_else(|| err_404(format!("skill `{name}` not found")))?;
+    // Resolve by slug, falling back to the manifest name. The fallback keeps
+    // clients written against the pre-slug API working: for every ClawHub and
+    // bundled skill the two are identical anyway, and `skills_show` never
+    // applied `validate_slug`, so name-keyed callers reached it before.
+    let (s, reasons) = resolve_by_slug(&skills, &slug)
+        .or_else(|| {
+            skills
+                .iter()
+                .find(|(s, _)| s.name.eq_ignore_ascii_case(&slug))
+        })
+        .ok_or_else(|| err_404(format!("skill `{slug}` not found")))?;
     let mut json = skill_status_json(&cfg, s, reasons);
     // `skills_show` keeps the richer per-tool `{name, description}` shape
     // (the list endpoint only needs tool names) — overwrite the `tools` field
@@ -1150,12 +1275,16 @@ fn err_for_skill_lookup(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
 async fn skills_set_enabled(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    Path(slug): Path<String>,
     Json(body): Json<SkillEnabledBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    crate::skills::clawhub::validate_slug(&name).map_err(|e| err_400(format!("{e:#}")))?;
+    crate::skills::clawhub::validate_slug(&slug).map_err(|e| err_400(format!("{e:#}")))?;
     let cfg = state.config.lock().clone();
+    // Route in by slug, then hand `set_skill_enabled` the manifest name it
+    // expects. The config key stays name-based on purpose — that contract is
+    // already shipped, and the resolver reads it by name.
+    let name = resolve_slug_to_name(&cfg, &slug)?;
     let (updated, canonical) = crate::skills::set_skill_enabled(&cfg, &name, body.enabled)
         .map_err(err_for_skill_lookup)?;
     updated.save().await.map_err(err_500)?;
@@ -1209,22 +1338,215 @@ async fn skills_install(
     Ok(Json(serde_json::json!({ "slug": slug, "installed": true })))
 }
 
-/// `DELETE /api/v1/skills/{name}` — owner-scoped (see [`check_auth`]). Reuses
+/// `DELETE /api/v1/skills/{slug}` — owner-scoped (see [`check_auth`]). Reuses
 /// `skills::remove_skill` (plan 034's uninstall, extracted so this route and
 /// `skills remove` share one containment-checked removal path) rather than
 /// re-implementing directory removal here.
 async fn skills_uninstall(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    Path(slug): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    crate::skills::clawhub::validate_slug(&name).map_err(|e| err_400(format!("{e:#}")))?;
+    crate::skills::clawhub::validate_slug(&slug).map_err(|e| err_400(format!("{e:#}")))?;
     let cfg = state.config.lock().clone();
+    let name = resolve_slug_to_name(&cfg, &slug)?;
     let canonical = crate::skills::remove_skill(&cfg.workspace_dir, &cfg, &name)
         .map_err(err_for_skill_lookup)?;
     Ok(Json(
         serde_json::json!({ "name": canonical, "removed": true }),
+    ))
+}
+
+// ── skill authoring ─────────────────────────────────────────────────────────
+//
+// Read, rewrite, and create a skill's `SKILL.md`. `skills_show` returns parsed
+// metadata only — the body is never sent — so an editor cannot load a skill it
+// cannot read or save one it cannot write.
+//
+// The write side is an exposure widening and is treated as one. A skill body
+// becomes the agent's standing instructions on the next load (`load_skill_md`
+// puts the entire file into `prompts`), so these routes are owner-scoped like
+// their siblings AND restricted to skills the user authored.
+//
+// Request bodies are capped at 64 KiB by `RequestBodyLimitLayer`
+// (`gateway/mod.rs`), which covers these routes. Reads are unaffected; a body
+// over the cap is rejected by the layer before a handler runs.
+
+#[derive(Deserialize)]
+struct SkillContentBody {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct SkillCreateBody {
+    /// Display name. Advisory: the `name:` inside `content` is what the loader
+    /// reads, and is what the slug is derived from.
+    #[serde(default)]
+    name: String,
+    content: String,
+}
+
+/// The manifest `name:` a submitted body would load as.
+///
+/// Rejects a body the loader could not read: one without parseable frontmatter
+/// or without a non-empty `name`. Such a body would install a skill that
+/// silently never appears.
+fn effective_skill_name(content: &str) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+    let frontmatter = crate::skills::parse_yaml_frontmatter(content);
+    let name = frontmatter
+        .get("name")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| err_400("SKILL.md needs YAML frontmatter with a non-empty `name:` field"))?;
+    Ok(name.to_string())
+}
+
+/// Replace `SKILL.md` without ever leaving a half-written body on disk.
+///
+/// A truncated write still parses as *something*, and that something becomes
+/// the agent's instructions on the next reload. Stage beside the target so the
+/// rename stays on one filesystem.
+fn write_skill_md_atomically(
+    dir: &std::path::Path,
+    content: &str,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let staged = dir.join("SKILL.md.staged");
+    std::fs::write(&staged, content).map_err(|e| err_500(anyhow::anyhow!("{e}")))?;
+    std::fs::rename(&staged, dir.join("SKILL.md")).map_err(|e| {
+        let _ = std::fs::remove_file(&staged);
+        err_500(anyhow::anyhow!("{e}"))
+    })
+}
+
+/// `GET /api/v1/skills/{slug}/content` — owner-scoped, authored-only.
+async fn skills_read_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    crate::skills::clawhub::validate_slug(&slug).map_err(|e| err_400(format!("{e:#}")))?;
+    let cfg = state.config.lock().clone();
+    let skills = crate::skills::load_skills_with_status(&cfg.workspace_dir, &cfg);
+    let (skill, _) = resolve_by_slug(&skills, &slug)
+        .ok_or_else(|| err_404(format!("skill `{slug}` not found")))?;
+    let dir = require_authored(skill)?;
+    let content = std::fs::read_to_string(dir.join("SKILL.md"))
+        .map_err(|e| err_500(anyhow::anyhow!("read SKILL.md: {e}")))?;
+    Ok(Json(serde_json::json!({
+        "slug": slug,
+        "name": skill.name,
+        "content": content,
+    })))
+}
+
+/// `PUT /api/v1/skills/{slug}/content` — owner-scoped, authored-only.
+///
+/// Refuses a body that changes `name:`, byte-for-byte. Renaming is out of
+/// scope here and cannot be half-applied: the name is the
+/// `[skills.entries.<name>]` config key, so changing even its case orphans the
+/// entry and silently resets the skill's enabled state, while the directory
+/// keeps its old slug.
+async fn skills_write_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Json(body): Json<SkillContentBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    crate::skills::clawhub::validate_slug(&slug).map_err(|e| err_400(format!("{e:#}")))?;
+    let cfg = state.config.lock().clone();
+    let skills = crate::skills::load_skills_with_status(&cfg.workspace_dir, &cfg);
+    let (skill, _) = resolve_by_slug(&skills, &slug)
+        .ok_or_else(|| err_404(format!("skill `{slug}` not found")))?;
+    let dir = require_authored(skill)?;
+
+    let submitted = effective_skill_name(&body.content)?;
+    if submitted != skill.name {
+        return Err(err_400(format!(
+            "renaming is not supported here: this skill is `{}`, the submitted body says `{submitted}`",
+            skill.name
+        )));
+    }
+
+    write_skill_md_atomically(dir, &body.content)?;
+    Ok(Json(
+        serde_json::json!({ "slug": slug, "name": skill.name, "written": true }),
+    ))
+}
+
+/// `POST /api/v1/skills` — owner-scoped. Creates a new authored skill.
+///
+/// Collision is checked on **both** keys across every read root. `load_skills`
+/// dedupes by name with the first root winning, so an unchecked create
+/// silently shadows a skill elsewhere and that skill stops working with no
+/// error anywhere; and two different display names can slugify to one
+/// directory, so checking names alone leaves the other collision reachable.
+async fn skills_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SkillCreateBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+
+    // The body's own `name:` wins over the envelope: it is what the loader
+    // reads, so deriving the directory from anything else would make the slug
+    // and the manifest disagree from the moment of creation.
+    let name = effective_skill_name(&body.content)?;
+    if !body.name.trim().is_empty() && body.name.trim() != name {
+        tracing::debug!(
+            envelope = %body.name.trim(),
+            manifest = %name,
+            "skills_create: envelope name differs from manifest name; using the manifest"
+        );
+    }
+
+    let slug = crate::tools::author_skill::slugify(&name);
+    if slug.is_empty() {
+        return Err(err_400(format!(
+            "`{name}` has no characters usable in a directory name"
+        )));
+    }
+
+    let cfg = state.config.lock().clone();
+    let skills = crate::skills::load_skills_with_status(&cfg.workspace_dir, &cfg);
+    if skills
+        .iter()
+        .any(|(s, _)| s.name.eq_ignore_ascii_case(&name))
+    {
+        return Err(err_409(format!("a skill named `{name}` already exists")));
+    }
+    if resolve_by_slug(&skills, &slug).is_some() {
+        return Err(err_409(format!(
+            "`{name}` would use directory `{slug}`, which another skill already occupies"
+        )));
+    }
+
+    let profile = crate::profile::ProfileManager::active().map_err(err_500)?;
+    let dir = profile.skills_dir().join(&slug);
+    if dir.exists() {
+        return Err(err_409(format!("directory `{slug}` already exists")));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| err_500(anyhow::anyhow!("create {slug}: {e}")))?;
+    write_skill_md_atomically(&dir, &body.content)?;
+
+    // Best-effort, like every other origin write. Without it the skill still
+    // resolves as authored through the shape fallback, since it is a plain
+    // directory in the profile skills root.
+    if let Err(e) = crate::skills::origin::write_origin(
+        &dir,
+        &crate::skills::origin::SkillOrigin::new(
+            crate::skills::origin::SkillOriginKind::Authored,
+            None,
+        ),
+    ) {
+        tracing::warn!("skills_create: could not record origin for {slug}: {e}");
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "name": name, "slug": slug, "created": true })),
     ))
 }
 
@@ -2043,6 +2365,304 @@ mod tests {
             .join("config.toml");
         config.skills.open_skills_enabled = false;
         config
+    }
+
+    /// Write an authored skill into the *profile* skills root, the way the
+    /// console and `author_skill` do. `display_name` is deliberately allowed to
+    /// contain spaces — that is the shape this whole slug-addressing effort
+    /// exists to handle.
+    fn write_authored_fixture(
+        home: &std::path::Path,
+        slug: &str,
+        display_name: &str,
+    ) -> std::path::PathBuf {
+        let dir = home.join(".rantaiclaw/profiles/default/skills").join(slug);
+        std::fs::create_dir_all(&dir).expect("create authored skill dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: {display_name}\ndescription: A test skill.\n---\n\n# {display_name}\n"
+            ),
+        )
+        .expect("write SKILL.md");
+        crate::skills::origin::write_origin(
+            &dir,
+            &crate::skills::origin::SkillOrigin::new(
+                crate::skills::origin::SkillOriginKind::Authored,
+                None,
+            ),
+        )
+        .expect("write origin marker");
+        dir
+    }
+
+    #[tokio::test]
+    async fn skills_list_reports_slug_and_origin() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        let skills_root = workspace_dir.join("skills");
+        std::fs::create_dir_all(&skills_root).expect("create skills dir");
+        write_skill_fixture(&skills_root, "clock");
+        write_authored_fixture(tmp.path(), "kopi-pagi", "Kopi Pagi");
+
+        let state = test_state();
+        *state.config.lock() = skills_test_config(&workspace_dir);
+
+        let resp = skills_list(State(state), HeaderMap::new())
+            .await
+            .expect("skills_list should succeed");
+        let skills = resp.0["skills"].as_array().expect("skills array");
+
+        // The display name keeps its space; the address does not have one.
+        let kopi = skills
+            .iter()
+            .find(|s| s["name"] == "Kopi Pagi")
+            .expect("authored skill present");
+        assert_eq!(kopi["slug"], "kopi-pagi");
+        assert_eq!(kopi["origin"]["kind"], "authored");
+
+        // A skill under the workspace root is addressable but has no
+        // established origin — absent, not guessed.
+        let clock = skills
+            .iter()
+            .find(|s| s["name"] == "clock")
+            .expect("clock present");
+        assert_eq!(clock["slug"], "clock");
+        assert!(clock.get("origin").is_none(), "{clock:?}");
+    }
+
+    /// Regression: before slug addressing these two routes ran the path
+    /// parameter through `validate_slug`, which rejects spaces — so any skill
+    /// with a human display name answered 400 and could be created but never
+    /// disabled or removed.
+    #[tokio::test]
+    async fn enabled_and_uninstall_reach_a_skill_whose_display_name_has_a_space() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace_dir.join("skills")).expect("create skills dir");
+        let dir = write_authored_fixture(tmp.path(), "kopi-pagi", "Kopi Pagi");
+
+        let state = test_state();
+        *state.config.lock() = skills_test_config(&workspace_dir);
+
+        let resp = skills_set_enabled(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("kopi-pagi".to_string()),
+            Json(SkillEnabledBody { enabled: false }),
+        )
+        .await
+        .expect("disabling by slug should succeed");
+        // The config key stays the manifest name — that contract is shipped.
+        assert_eq!(resp.0["name"], "Kopi Pagi");
+        assert_eq!(resp.0["enabled"], false);
+
+        let _removed = skills_uninstall(
+            State(state),
+            HeaderMap::new(),
+            Path("kopi-pagi".to_string()),
+        )
+        .await
+        .expect("uninstall by slug should succeed");
+        assert!(!dir.exists(), "skill directory should be gone");
+    }
+
+    #[tokio::test]
+    async fn content_routes_refuse_skills_the_user_did_not_author() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        let skills_root = workspace_dir.join("skills");
+        std::fs::create_dir_all(&skills_root).expect("create skills dir");
+        // No marker and outside the profile root → origin unknown → refused.
+        write_skill_fixture(&skills_root, "vendor-drop");
+        write_authored_fixture(tmp.path(), "kopi-pagi", "Kopi Pagi");
+
+        let state = test_state();
+        *state.config.lock() = skills_test_config(&workspace_dir);
+
+        let ok = skills_read_content(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("kopi-pagi".to_string()),
+        )
+        .await
+        .expect("reading an authored skill should succeed");
+        assert_eq!(ok.0["name"], "Kopi Pagi");
+        assert!(
+            ok.0["content"]
+                .as_str()
+                .unwrap()
+                .contains("name: Kopi Pagi"),
+            "body should be the raw file"
+        );
+
+        let (status, _) = skills_read_content(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("vendor-drop".to_string()),
+        )
+        .await
+        .expect_err("a skill we did not author must be refused");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, _) = skills_read_content(
+            State(state),
+            HeaderMap::new(),
+            Path("no-such-skill".to_string()),
+        )
+        .await
+        .expect_err("unknown slug must 404");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn write_content_round_trips_and_refuses_a_rename() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace_dir.join("skills")).expect("create skills dir");
+        let dir = write_authored_fixture(tmp.path(), "kopi-pagi", "Kopi Pagi");
+
+        let state = test_state();
+        *state.config.lock() = skills_test_config(&workspace_dir);
+
+        let edited = "---\nname: Kopi Pagi\ndescription: A test skill.\n---\n\n# Kopi Pagi\n\n## Troubleshooting\nToo sour: grind finer.\n";
+        let _written = skills_write_content(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("kopi-pagi".to_string()),
+            Json(SkillContentBody {
+                content: edited.to_string(),
+            }),
+        )
+        .await
+        .expect("saving an authored skill should succeed");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+            edited,
+            "the file should be exactly what was submitted"
+        );
+
+        // Renaming — including a case-only change, which keeps the same slug
+        // but orphans the `[skills.entries.<name>]` config key.
+        for renamed in ["kopi pagi", "Kopi Pagi Baru"] {
+            let body = format!("---\nname: {renamed}\ndescription: x\n---\n\n# x\n");
+            let (status, _) = skills_write_content(
+                State(state.clone()),
+                HeaderMap::new(),
+                Path("kopi-pagi".to_string()),
+                Json(SkillContentBody { content: body }),
+            )
+            .await
+            .expect_err("a rename must be refused");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{renamed}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+            edited,
+            "a refused rename must leave the file untouched"
+        );
+
+        // A body the loader could not read would install a skill that never
+        // appears, so it is refused before anything is written.
+        let (status, _) = skills_write_content(
+            State(state),
+            HeaderMap::new(),
+            Path("kopi-pagi".to_string()),
+            Json(SkillContentBody {
+                content: "no frontmatter here".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unparseable frontmatter must be refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_writes_an_authored_skill_and_rejects_both_collision_keys() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let workspace_dir = tmp.path().join("workspace");
+        let skills_root = workspace_dir.join("skills");
+        std::fs::create_dir_all(&skills_root).expect("create skills dir");
+        // Lives in another read root: a create that ignored it would shadow it
+        // by dedup and silently stop it working.
+        write_skill_fixture(&skills_root, "clock");
+
+        let state = test_state();
+        *state.config.lock() = skills_test_config(&workspace_dir);
+
+        let body = |name: &str| SkillCreateBody {
+            name: name.to_string(),
+            content: format!("---\nname: {name}\ndescription: x\n---\n\n# {name}\n"),
+        };
+
+        let (status, resp) = skills_create(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(body("Kopi Pagi")),
+        )
+        .await
+        .expect("create should succeed");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.0["slug"], "kopi-pagi");
+        assert_eq!(resp.0["name"], "Kopi Pagi");
+
+        let dir = tmp
+            .path()
+            .join(".rantaiclaw/profiles/default/skills/kopi-pagi");
+        assert!(dir.join("SKILL.md").exists());
+        assert_eq!(
+            crate::skills::origin::read_origin(&dir).map(|o| o.kind),
+            Some(crate::skills::origin::SkillOriginKind::Authored),
+        );
+
+        // Same name.
+        let (status, _) = skills_create(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(body("Kopi Pagi")),
+        )
+        .await
+        .expect_err("a duplicate name must be refused");
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Different name, same slug — the collision checking only one key
+        // would miss.
+        let (status, _) = skills_create(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(body("kopi  pagi")),
+        )
+        .await
+        .expect_err("a duplicate slug must be refused");
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Collision against a skill in a different read root.
+        let (status, _) =
+            skills_create(State(state.clone()), HeaderMap::new(), Json(body("clock")))
+                .await
+                .expect_err("a name taken in another root must be refused");
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Nothing usable in a directory name.
+        let (status, _) = skills_create(State(state), HeaderMap::new(), Json(body("!!!")))
+            .await
+            .expect_err("an unusable name must be refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

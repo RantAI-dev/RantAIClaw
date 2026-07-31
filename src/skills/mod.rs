@@ -69,6 +69,34 @@ pub struct Skill {
     pub origin: Option<origin::SkillOrigin>,
 }
 
+impl Skill {
+    /// The directory this skill lives in — its stable, filesystem-safe
+    /// address.
+    ///
+    /// Prefer this over `name` whenever a skill has to be identified across a
+    /// boundary. `name` comes from the manifest and is free text: a skill
+    /// written as "Kopi Pagi" lives in `kopi-pagi/`, and `clawhub::validate_slug`
+    /// (which the API applies to path parameters) rejects the space. Slugs are
+    /// `[a-z0-9-]` by construction, so they survive every such guard.
+    ///
+    /// `None` when the skill has no directory of its own. That is not a
+    /// defensive nicety: open-skills entries are flat `.md` files sitting
+    /// directly in the checkout, so keying off the parent directory alone
+    /// would hand every one of them the same slug. Testing the manifest's
+    /// file name is what distinguishes "a skill directory" from "a file in a
+    /// pile of skills".
+    pub fn slug(&self) -> Option<String> {
+        let manifest = self.location.as_ref()?;
+        let file_name = manifest.file_name()?.to_str()?;
+        if !file_name.eq_ignore_ascii_case("SKILL.md")
+            && !file_name.eq_ignore_ascii_case("SKILL.toml")
+        {
+            return None;
+        }
+        Some(manifest.parent()?.file_name()?.to_str()?.to_string())
+    }
+}
+
 /// One install recipe for a skill's binary dependency. Mirrors OpenClaw's
 /// `metadata.clawdbot.install[]` entries shape.
 ///
@@ -1183,7 +1211,7 @@ fn extract_yaml_env_block(body: &str) -> Vec<String> {
 /// scalar key/value pairs. Lists like `tags: [a, b]` are kept as the raw
 /// string (callers parse with `parse_yaml_list`). Not a full YAML parser —
 /// covers the SKILL.md frontmatter convention used by ClawHub skills.
-fn parse_yaml_frontmatter(content: &str) -> std::collections::HashMap<String, String> {
+pub(crate) fn parse_yaml_frontmatter(content: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let trimmed = content.trim_start();
     let Some(rest) = trimmed

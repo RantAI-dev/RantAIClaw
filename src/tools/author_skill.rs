@@ -64,7 +64,7 @@ impl AuthorSkillTool {
 /// string when nothing usable remains (caller treats that as an error). Because
 /// the output only ever contains `[a-z0-9-]`, path traversal (`..`, `/`) is
 /// impossible by construction.
-fn slugify(name: &str) -> String {
+pub(crate) fn slugify(name: &str) -> String {
     let mut slug = String::with_capacity(name.len());
     let mut prev_dash = false;
     for ch in name.chars() {
