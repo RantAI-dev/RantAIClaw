@@ -76,6 +76,28 @@ pub enum CommandResult {
     /// "stop, don't explore" semantics the inline N/Esc key already has.
     CancelTurnWithMessage(String),
     OpenFirstRunWizard,
+    /// Hand a skill's `SKILL.md` to `$EDITOR`, then validate and commit what
+    /// comes back.
+    ///
+    /// The TUI does not build a form for this. Its users are already sitting in
+    /// a terminal with the editor they use every day, so a form here would be a
+    /// worse editor inside their editor — `crontab -e` and `kubectl edit` make
+    /// the same call. It also sidesteps this project's most fragile input path:
+    /// pasting a prepared `SKILL.md` into the composer. With `$EDITOR` the TUI
+    /// is suspended and never sees the pasted bytes at all.
+    ///
+    /// Policy decisions (name collisions, the authored-only gate) are made in
+    /// dispatch where they are testable without a terminal; `run_loop` owns the
+    /// suspend, validation and commit.
+    OpenSkillInEditor {
+        /// Directory name under the profile's skills root.
+        slug: String,
+        /// Destination `SKILL.md`. May not exist yet when `is_new`.
+        path: std::path::PathBuf,
+        /// Template for a new skill, or the current file for an edit.
+        initial: String,
+        is_new: bool,
+    },
     /// Fetch the ClawHub catalogue and open an interactive install picker.
     /// Mirrors the `/sessions` pattern (search + paginate via ListPicker)
     /// but fetches asynchronously since the catalogue lives on the network.
