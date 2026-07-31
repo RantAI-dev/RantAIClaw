@@ -3776,6 +3776,7 @@ impl TuiApp {
         let profile = self.profile.clone();
 
         let prov_name = prov.name().to_string();
+        let prov_category = prov.category();
         let overlay_state = crate::tui::SetupOverlayState::new(format!("Setup — {prov_name}"));
 
         self.setup_overlay = Some(overlay_state);
@@ -3794,6 +3795,16 @@ impl TuiApp {
             };
             match prov.run(&mut config, &profile, io).await {
                 Ok(()) => {
+                    // A configured multi-user channel is the point at which
+                    // the owner needs to manage permissions from chat, so make
+                    // sure the skill that explains those tools is present.
+                    // Runs before the config save below because it touches the
+                    // profile's skills dir, not the config.
+                    crate::onboard::provision::install_core_skills_after_channel(
+                        prov_category,
+                        &profile,
+                    );
+
                     // Persist the mutated config to disk. Without this,
                     // every provisioner mutation is lost when the spawned
                     // task drops `config`. Config::save() also handles
