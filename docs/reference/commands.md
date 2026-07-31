@@ -219,7 +219,7 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 - `rantaiclaw skills update [<slug> | --all]`
 - `rantaiclaw skills remove <name>`
 
-`skills enable <name>` / `skills disable <name>` write `[skills.entries.<name>] enabled = true` / `enabled = false` in `config.toml` — the same key documented in `docs/reference/config.md`, which is also toggleable at runtime via the gateway's `PUT /api/v1/skills/{name}/enabled`.
+`skills enable <name>` / `skills disable <name>` write `[skills.entries.<name>] enabled = true` / `enabled = false` in `config.toml` — the same key documented in `docs/reference/config.md`, which is also toggleable at runtime via the gateway's `PUT /api/v1/skills/{slug}/enabled`. Note the CLI takes the manifest **name** while the gateway route takes the directory **slug**; the config key is name-based either way.
 
 `<source>` accepts a ClawHub reference, git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`), or a local filesystem path.
 
@@ -241,6 +241,41 @@ The publisher is never chosen automatically. Installing stages remote code that 
 Skill manifests (`SKILL.md`) support YAML frontmatter, `requires` gating, environment injection, and `metadata.clawdbot.install[]` recipes. `install-deps` runs the preferred host recipe (`brew`, `uv`, Node package managers, `go`, or `download`) and validates declared binaries afterward.
 
 In the TUI, `/skills` opens the local skills picker. Press `Ctrl+I` (or Tab in terminals that send Ctrl+I as Tab) on a gated skill row to run its install-deps recipe without leaving the picker.
+
+#### Writing a skill by hand
+
+```
+/skill new "Kopi Pagi"     write a new skill
+/skill edit kopi-pagi      edit one you wrote
+```
+
+Both hand the file to your `$EDITOR` (falling back to `$VISUAL`, then
+`nano`/`vi`/`notepad`) and take it back when you save. The TUI is fully
+suspended while the editor runs, which is why pasting a prepared `SKILL.md`
+works here even though pasting into the composer historically did not — the
+TUI never sees the pasted bytes.
+
+`/skill edit` accepts either the display name or the directory name, and
+**only opens skills you wrote yourself**. A ClawHub, bundled, git, or
+local-path skill is refused, naming what manages it: editing one loses the
+work silently, since a bundled skill is re-seeded by the next `setup` run and
+a vendor-managed one by its installer. Which skills those are is recorded in
+a `.origin.json` marker written at install time; skills that predate the
+marker are classified from their directory's shape.
+
+Whatever you save is validated before it replaces anything: frontmatter must
+parse and carry a non-empty `name:`, and for an edit that name must be
+unchanged (renaming is not supported — the name is the config key that tracks
+whether a skill is enabled). If validation fails the editor **reopens** with
+your text intact and the reason at the top, up to three times; after that the
+staged file's path is reported so nothing is lost.
+
+`/skill new` refuses before opening an editor if the name is unusable or
+collides with an existing skill's name or directory. Editing is refused while
+a response is streaming — retry once it finishes.
+
+The web console offers the same thing as a form (`Write` button, and a pencil
+on skills you wrote), backed by the routes in `docs/reference/api-v1.md`.
 
 ### API sessions
 

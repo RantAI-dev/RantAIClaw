@@ -379,16 +379,34 @@ resolves normally, `2+` matches return `400` ("ambiguous").
 
 ## Skills
 
-The three mutating endpoints below (`install`, `enabled`, uninstall) are
-**owner-scoped mutations equivalent to the local CLI** (`skills
-install`/`enable`/`disable`/`remove`) — they let the same
-pairing-authenticated principal do the same thing over the console instead of
-a terminal. `install` additionally **stages community code** fetched from
-ClawHub onto the operator's machine, so a compromised pairing token now also
-grants remote skill install/enable/disable/uninstall; see CLAUDE.md §3.6 for
-the exposure-boundary tradeoff. None of the four routes work when
-`gateway.require_pairing = false` opens the whole `/api/v1/*` surface, same
-as every other handler here.
+The mutating endpoints below (`install`, `enabled`, uninstall, and the three
+authoring routes) are **owner-scoped mutations equivalent to the local CLI**
+(`skills install`/`enable`/`disable`/`remove`, and `/skill new`/`/skill edit`
+in the TUI) — they let the same pairing-authenticated principal do the same
+thing over the console instead of a terminal. `install` additionally **stages
+community code** fetched from ClawHub onto the operator's machine, so a
+compromised pairing token also grants remote skill
+install/enable/disable/uninstall; see CLAUDE.md §3.6 for the exposure-boundary
+tradeoff. None of these routes work when `gateway.require_pairing = false`
+opens the whole `/api/v1/*` surface, same as every other handler here.
+
+### Skills are addressed by `slug`, not by `name`
+
+Every `{slug}` path parameter below is the skill's **directory name**. A
+skill's manifest `name:` is free text — `author_skill` and the console both
+write the display name the user asked for, so a skill called `Kopi Pagi` lives
+in `kopi-pagi/`. The routes run the path parameter through the same
+`validate_slug` guard as ClawHub references, which rejects spaces, so passing
+a display name containing one answers `400`.
+
+Take the address from the `slug` field on `GET /api/v1/skills`; never
+construct it from `name`. For every ClawHub and bundled skill the two are
+identical, which is why this only started to matter once skills could be
+authored locally.
+
+The single-skill read routes also accept a manifest name as a fallback, so
+clients written before `slug` existed keep working. The mutating routes do
+not — `validate_slug` runs first there.
 
 ### GET /api/v1/skills
 
@@ -400,6 +418,7 @@ as every other handler here.
     "skills": [
       {
         "name": "...",
+        "slug": "...",
         "version": "...",
         "description": "...",
         "tags": ["..."],
@@ -407,6 +426,7 @@ as every other handler here.
         "enabled": true,
         "active": true,
         "reasons": [],
+        "origin": { "kind": "authored", "source": null },
         "clawhub": {
           "owner": "steipete",
           "slug": "weather",
@@ -418,6 +438,21 @@ as every other handler here.
     "count": 1
   }
   ```
+  `slug` is the skill's directory name and **the address every other skill
+  route takes** (see above). It is omitted for entries with no directory of
+  their own — open-skills files, which live flat in a shared checkout. Those
+  cannot be acted on at all, so a client must not offer edit, enable, or
+  uninstall on a row without one.
+
+  `origin` records **who put the skill on disk**, as the gateway resolved it.
+  `kind` is one of `authored`, `clawhub`, `bundled`, `git`, `local`. It is
+  read from a `.origin.json` marker beside the skill's `SKILL.md`, falling
+  back — only when no marker exists — to an inference from the directory's
+  shape for skills that predate the marker. **It is omitted when the origin
+  could not be established, and a client must read absence as "not editable",
+  never as "probably fine".** Only `authored` unlocks the content routes
+  below.
+
   `clawhub` says which publisher's copy is installed, read from the
   `.clawhub.json` marker beside the skill's `SKILL.md`. It is **omitted**, not
   null-filled, when there is no marker — which covers skills that did not come
@@ -442,26 +477,32 @@ as every other handler here.
   silently dropped, which is why the console's toggle always looked "on").
 - **Status codes**: `200`, `401`.
 
-### GET /api/v1/skills/{name}
+### GET /api/v1/skills/{slug}
 
 - **Auth**: bearer-gated.
-- **Path param**: `name` — matched case-insensitively.
-- **Response** `200`:
+- **Path param**: `slug` — the directory name, matched case-insensitively.
+  Falls back to matching the manifest `name` so pre-`slug` clients keep
+  working.
+- **Response** `200`: same shape as one entry in the list endpoint, plus a
+  richer `tools`:
   ```json
   {
     "name": "...",
+    "slug": "...",
     "version": "...",
     "description": "...",
     "tags": ["..."],
     "tools": [{ "name": "...", "description": "..." }],
     "enabled": true,
     "active": true,
-    "reasons": []
+    "reasons": [],
+    "origin": { "kind": "authored", "source": null }
   }
   ```
   Unlike the list endpoint, `tools` here includes each tool's description.
-  `enabled`/`active`/`reasons` have the same meaning as on the list endpoint.
-- **Status codes**: `200`, `404` (no skill with that name), `401`.
+  `enabled`/`active`/`reasons`/`slug`/`origin` have the same meaning as on the
+  list endpoint.
+- **Status codes**: `200`, `404` (no skill with that slug or name), `401`.
 
 ### POST /api/v1/skills/install
 
@@ -509,10 +550,11 @@ as every other handler here.
 - **Status codes**: `200`, `400` (invalid reference), `401`, `409` (ambiguous
   slug), `500` (ClawHub fetch/hash/install failure).
 
-### PUT /api/v1/skills/{name}/enabled
+### PUT /api/v1/skills/{slug}/enabled
 
 - **Auth**: bearer-gated.
-- **Path param**: `name` — matched case-insensitively.
+- **Path param**: `slug` — the directory name. `validate_slug` runs first, so
+  a display name containing a space is rejected before resolution.
 - **Request**:
   ```json
   { "enabled": false }
@@ -523,14 +565,16 @@ as every other handler here.
   ```
   Writes `[skills.entries.<name>] enabled` (an existing config key — see
   `docs/reference/config.md`) and persists it, the same as `rantaiclaw skills
-  enable`/`disable`.
-- **Status codes**: `200`, `400` (invalid name), `401`, `404` (no skill with
-  that name), `500`.
+  enable`/`disable`. Note the response and the config key both use the
+  **manifest name**, not the slug: the route takes a slug in and resolves it,
+  but the config contract is unchanged.
+- **Status codes**: `200`, `400` (invalid slug), `401`, `404` (no skill with
+  that slug), `500`.
 
-### DELETE /api/v1/skills/{name}
+### DELETE /api/v1/skills/{slug}
 
 - **Auth**: bearer-gated.
-- **Path param**: `name` — matched case-insensitively.
+- **Path param**: `slug` — the directory name.
 - **Response** `200`:
   ```json
   { "name": "weather", "removed": true }
@@ -538,8 +582,86 @@ as every other handler here.
   Uninstalls the same way `rantaiclaw skills remove` does, including its
   path-traversal reject and 3-root containment gate (the removed directory
   must resolve under one of the known skill roots).
-- **Status codes**: `200`, `400` (invalid name), `401`, `404` (no skill with
-  that name), `500`.
+- **Status codes**: `200`, `400` (invalid slug), `401`, `404` (no skill with
+  that slug), `500`.
+
+### Authoring: read, write, and create a skill body
+
+These three carry the console's skill editor. They are the only routes that
+touch a `SKILL.md` body, and they exist because `GET /api/v1/skills/{slug}`
+returns parsed metadata only — the body is never in it.
+
+**All three refuse any skill whose `origin.kind` is not `authored`, with
+`403`.** That is not a courtesy. A skill's whole file becomes part of the
+agent's system prompt on the next load, so a route that rewrites one rewrites
+the agent's standing instructions — the same reasoning that makes
+`author_skill` and `skills_install` owner-only tools. Without the gate a
+caller could replace vendor-reviewed content while the console still showed
+the trusted badge.
+
+`403` rather than `404` is deliberate: the caller can already list the skill
+and read its metadata, so hiding it here would make the API disagree with
+itself.
+
+Request bodies are capped at 64 KiB by the shared body-limit layer, and JSON
+escaping inflates newline-dense markdown — a `SKILL.md` near 58 KB can cross
+the cap once encoded. Reads are unaffected (the cap is on requests). Clients
+should check the encoded size and say so plainly rather than surfacing a bare
+`413`.
+
+#### GET /api/v1/skills/{slug}/content
+
+- **Auth**: bearer-gated. Authored-only.
+- **Response** `200`:
+  ```json
+  { "slug": "kopi-pagi", "name": "Kopi Pagi", "content": "---\nname: Kopi Pagi\n..." }
+  ```
+  `content` is the file verbatim, including frontmatter.
+- **Status codes**: `200`, `400` (invalid slug), `401`, `403` (not authored),
+  `404`, `500`.
+
+#### PUT /api/v1/skills/{slug}/content
+
+- **Auth**: bearer-gated. Authored-only.
+- **Request**: `{ "content": "---\nname: Kopi Pagi\n..." }`
+- **Response** `200`: `{ "slug": "...", "name": "...", "written": true }`
+
+  The body must parse as frontmatter with a non-empty `name:`, and that name
+  must equal the current one **exactly** — byte-for-byte, including case.
+  Renaming is not supported here and is refused rather than half-applied: the
+  name is the `[skills.entries.<name>]` config key, so changing even its case
+  orphans the entry and silently resets whether the skill is enabled, while
+  the directory keeps its old slug.
+
+  The write is staged and renamed, never truncating in place — a half-written
+  `SKILL.md` still parses as *something*, and that something would become the
+  agent's instructions.
+- **Status codes**: `200`, `400` (unparseable frontmatter, or a rename),
+  `401`, `403`, `404`, `413` (body over 64 KiB), `500`.
+
+#### POST /api/v1/skills
+
+- **Auth**: bearer-gated.
+- **Request**: `{ "name": "Kopi Pagi", "content": "---\nname: Kopi Pagi\n..." }`
+
+  `name` is advisory. The `name:` **inside `content`** is what the loader
+  reads and what the slug is derived from, so it wins if the two disagree —
+  otherwise the directory and the manifest would disagree from the moment of
+  creation.
+- **Response** `201`: `{ "name": "Kopi Pagi", "slug": "kopi-pagi", "created": true }`
+
+  Creates the directory under the active profile's skills root and writes
+  `SKILL.md` plus a `.origin.json` marker with `kind: "authored"` — which is
+  what makes the skill editable afterwards.
+
+  Collisions are checked on **both** keys, across every skill root: the
+  manifest name, and the derived slug. Two different display names can
+  slugify to one directory, and the loader dedupes by name with the first
+  root winning — so checking only one key leaves the other collision
+  reachable, and a shadowed skill stops working with no error anywhere.
+- **Status codes**: `201`, `400` (unparseable frontmatter, or a name with no
+  characters usable in a directory name), `401`, `409` (name or slug taken),
+  `413`, `500`.
 
 ---
 
