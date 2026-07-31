@@ -1284,9 +1284,22 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
     })
 }
 
+/// First meaningful body line, used when frontmatter carries no `description`.
+///
+/// Skips a leading `---` frontmatter block. Without that, a skill whose
+/// `description:` is blank gets the literal string `---` as its description —
+/// `parse_yaml_frontmatter` drops empty values, so the lookup misses and the
+/// scan starts at the frontmatter fence. That reads as noise in `skills list`
+/// and, worse, is what the model is told the skill is for. Latent until
+/// `/skill new` started shipping a blank `description:` as the default state.
 fn extract_description(content: &str) -> String {
-    content
-        .lines()
+    let trimmed = content.trim_start();
+    let body = trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---\r\n"))
+        .and_then(|rest| rest.find("\n---").map(|end| &rest[end + 4..]))
+        .unwrap_or(content);
+    body.lines()
         .find(|line| !line.starts_with('#') && !line.trim().is_empty())
         .unwrap_or("No description")
         .trim()
@@ -1467,6 +1480,37 @@ fn is_git_source(source: &str) -> bool {
         || is_git_scheme_source(source, "ssh://")
         || is_git_scheme_source(source, "git://")
         || is_git_scp_source(source)
+}
+
+#[cfg(test)]
+mod extract_description_tests {
+    use super::extract_description;
+
+    #[test]
+    fn skips_the_frontmatter_fence() {
+        // Reproduces what `/skill new` produces: frontmatter present, but
+        // `description:` blank, so `parse_yaml_frontmatter` drops the key and
+        // the loader falls through to here. Before the fix this returned
+        // `"---"`, which then showed up in `skills list` and in the prompt.
+        let md = "---\nname: Uji\ndescription: \ntags: []\n---\n\n# Uji\n\nSeduh kopi.\n";
+        assert_eq!(extract_description(md), "Seduh kopi.");
+    }
+
+    #[test]
+    fn falls_back_when_there_is_no_body() {
+        assert_eq!(
+            extract_description("---\nname: Uji\n---\n"),
+            "No description"
+        );
+    }
+
+    #[test]
+    fn still_reads_a_file_with_no_frontmatter() {
+        assert_eq!(
+            extract_description("# Heading\n\nPlain body.\n"),
+            "Plain body."
+        );
+    }
 }
 
 #[cfg(test)]

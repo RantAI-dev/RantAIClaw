@@ -14,6 +14,140 @@ const PERSONALITY_PRESETS: &[(&str, &str)] = &[
     ("friendly-companion", "Warm, conversational tone"),
 ];
 
+/// Template for `/skill new`. Matches the shape the console's Form view
+/// expects (`## Instructions` with `- ` items), so a skill written here stays
+/// form-editable there.
+fn new_skill_template(name: &str) -> String {
+    format!("---\nname: {name}\ndescription: \ntags: []\n---\n\n# {name}\n\n## Instructions\n- \n")
+}
+
+/// `/skill new "<name>"` — stage a template and hand it to `$EDITOR`.
+///
+/// Everything that can be refused is refused *here*, before an editor opens or
+/// a file is staged: failing at this point costs the user nothing, whereas
+/// failing after they have typed costs them their work.
+fn skill_new(arg: &str, ctx: &TuiContext) -> Result<CommandResult> {
+    let name = arg.trim().trim_matches(['"', '\'']).trim();
+    if name.is_empty() {
+        return Ok(CommandResult::Message(
+            "Usage: /skill new \"<name>\"".to_string(),
+        ));
+    }
+
+    let slug = crate::tools::author_skill::slugify(name);
+    if slug.is_empty() {
+        return Ok(CommandResult::Message(format!(
+            "'{name}' has no characters usable in a folder name."
+        )));
+    }
+
+    // Both keys, across every loaded skill: two different display names can
+    // slugify to one directory, so checking names alone leaves the other
+    // collision reachable — and a shadowed skill stops working with no error.
+    let loaded = active_skill_status_from_context(ctx);
+    if let Some((clash, _)) = loaded
+        .iter()
+        .find(|(s, _)| s.name.eq_ignore_ascii_case(name))
+    {
+        return Ok(CommandResult::Message(format!(
+            "A skill named '{}' already exists.",
+            clash.name
+        )));
+    }
+    if let Some((clash, _)) = loaded
+        .iter()
+        .find(|(s, _)| s.slug().is_some_and(|d| d.eq_ignore_ascii_case(&slug)))
+    {
+        return Ok(CommandResult::Message(format!(
+            "'{name}' would use folder '{slug}', which '{}' already occupies.",
+            clash.name
+        )));
+    }
+
+    let profile = crate::profile::ProfileManager::active()?;
+    let path = profile.skills_dir().join(&slug).join("SKILL.md");
+    if path.exists() {
+        return Ok(CommandResult::Message(format!(
+            "Folder '{slug}' already exists."
+        )));
+    }
+
+    Ok(CommandResult::OpenSkillInEditor {
+        slug,
+        path,
+        initial: new_skill_template(name),
+        is_new: true,
+    })
+}
+
+/// `/skill edit <name-or-slug>` — open an existing skill you authored.
+///
+/// Accepts either spelling because they differ: `normalise_skill_name` only
+/// lowercases and maps `-` to `_`, leaving spaces alone, so a skill displayed
+/// as "Kopi Pagi" and its own folder `kopi-pagi` never match each other. The
+/// folder name is what the user sees on disk and in the console, so it has to
+/// work here.
+fn skill_edit(arg: &str, ctx: &TuiContext) -> Result<CommandResult> {
+    let query = arg.trim().trim_matches(['"', '\'']).trim();
+    if query.is_empty() {
+        return Ok(CommandResult::Message(
+            "Usage: /skill edit <name>".to_string(),
+        ));
+    }
+
+    let loaded = active_skill_status_from_context(ctx);
+    let wanted = normalise_skill_name(query);
+    let found = loaded
+        .iter()
+        .find(|(s, _)| normalise_skill_name(&s.name) == wanted)
+        .or_else(|| {
+            loaded
+                .iter()
+                .find(|(s, _)| s.slug().is_some_and(|d| d.eq_ignore_ascii_case(query)))
+        });
+
+    let Some((skill, _)) = found else {
+        return Ok(CommandResult::Message(format!(
+            "No skill '{query}'. Run /skills to see what is installed."
+        )));
+    };
+
+    // A skill body becomes the agent's standing instructions on the next load,
+    // and editing one someone else manages loses the work silently: a bundled
+    // skill is re-seeded by the next setup run, a vendor-managed one by its
+    // installer.
+    let kind = skill.origin.as_ref().map(|o| o.kind);
+    if kind != Some(crate::skills::origin::SkillOriginKind::Authored) {
+        let managed_by = match kind {
+            Some(crate::skills::origin::SkillOriginKind::Clawhub) => "ClawHub",
+            Some(crate::skills::origin::SkillOriginKind::Bundled) => "a bundled pack",
+            Some(crate::skills::origin::SkillOriginKind::Git) => "a git remote",
+            Some(crate::skills::origin::SkillOriginKind::Local) => "a local-path install",
+            _ => "an unrecorded source",
+        };
+        return Ok(CommandResult::Message(format!(
+            "'{}' is managed by {managed_by} — not editable here.",
+            skill.name
+        )));
+    }
+
+    let Some(path) = skill.location.clone() else {
+        return Ok(CommandResult::Message(format!(
+            "'{}' has no file on disk.",
+            skill.name
+        )));
+    };
+    let initial = std::fs::read_to_string(&path)?;
+    let slug = skill.slug().unwrap_or_else(|| skill.name.clone());
+
+    Ok(CommandResult::OpenSkillInEditor {
+        slug,
+        path,
+        initial,
+        is_new: false,
+    })
+}
+
 /// Build picker rows from the loaded skills list. Primary text is the
 /// skill name + version; secondary is the description (truncated by
 /// the renderer if too long).
@@ -147,11 +281,11 @@ impl CommandHandler for SkillCommand {
     }
 
     fn description(&self) -> &str {
-        "Invoke or inspect a skill"
+        "Invoke, inspect, write, or edit a skill"
     }
 
     fn usage(&self) -> &str {
-        "/skill [name]"
+        "/skill [name] | new \"<name>\" | edit <name> | install [query]"
     }
 
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
@@ -171,6 +305,13 @@ impl CommandHandler for SkillCommand {
                 Some(query.to_string())
             };
             return Ok(CommandResult::OpenClawhubInstallPicker { initial_query });
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("new") {
+            return skill_new(rest.trim(), ctx);
+        }
+        if let Some(rest) = trimmed.strip_prefix("edit") {
+            return skill_edit(rest.trim(), ctx);
         }
 
         let name = trimmed;
@@ -497,6 +638,120 @@ mod tests {
                 assert!(blob.contains("bullets"), "{blob}");
             }
             other => panic!("Expected OpenInfoPanel result, got {other:?}"),
+        }
+    }
+
+    /// A skill in `ctx`, with the origin and on-disk location the edit gate
+    /// reads. `dir` is where its `SKILL.md` would live.
+    fn push_skill(
+        ctx: &mut TuiContext,
+        name: &str,
+        dir: &std::path::Path,
+        origin: Option<crate::skills::origin::SkillOriginKind>,
+    ) {
+        ctx.available_skills.push(crate::skills::Skill {
+            name: name.to_string(),
+            description: "A test skill.".to_string(),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            location: Some(dir.join("SKILL.md")),
+            requires: crate::skills::SkillRequires::default(),
+            install_recipes: Vec::new(),
+            remote: false,
+            origin: origin.map(|kind| crate::skills::origin::SkillOrigin::new(kind, None)),
+        });
+    }
+
+    #[test]
+    fn skill_new_refuses_before_opening_an_editor() {
+        let cmd = SkillCommand;
+        let mut ctx = test_context();
+        let tmp = tempfile::tempdir().unwrap();
+        push_skill(
+            &mut ctx,
+            "Kopi Pagi",
+            &tmp.path().join("kopi-pagi"),
+            Some(crate::skills::origin::SkillOriginKind::Authored),
+        );
+
+        // Everything refusable is refused at dispatch, so a rejection costs the
+        // user nothing — no editor opened, no file staged.
+        for (args, expect) in [
+            ("new", "Usage"),
+            ("new \"!!!\"", "folder name"),
+            ("new \"Kopi Pagi\"", "already exists"),
+            // A different display name that slugifies onto the same folder —
+            // the collision a name-only check would miss.
+            ("new \"kopi  pagi\"", "already occupies"),
+        ] {
+            match cmd.execute(args, &mut ctx).unwrap() {
+                CommandResult::Message(msg) => {
+                    assert!(msg.contains(expect), "{args}: got {msg:?}");
+                }
+                other => panic!("{args}: expected Message, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn skill_edit_accepts_display_name_or_folder_name() {
+        let cmd = SkillCommand;
+        let mut ctx = test_context();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("kopi-pagi");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: Kopi Pagi\n---\n# x\n").unwrap();
+        push_skill(
+            &mut ctx,
+            "Kopi Pagi",
+            &dir,
+            Some(crate::skills::origin::SkillOriginKind::Authored),
+        );
+
+        // `normalise_skill_name` only lowercases and maps `-` to `_`, so the
+        // display name and its own folder name never match each other. Both
+        // spellings have to work: the folder is what the user sees on disk.
+        for args in ["edit Kopi Pagi", "edit kopi-pagi"] {
+            match cmd.execute(args, &mut ctx).unwrap() {
+                CommandResult::OpenSkillInEditor { slug, is_new, .. } => {
+                    assert_eq!(slug, "kopi-pagi", "{args}");
+                    assert!(!is_new, "{args}");
+                }
+                other => panic!("{args}: expected OpenSkillInEditor, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn skill_edit_refuses_skills_managed_by_someone_else() {
+        let cmd = SkillCommand;
+        let mut ctx = test_context();
+        let tmp = tempfile::tempdir().unwrap();
+
+        for (name, kind, expect) in [
+            (
+                "weather",
+                Some(crate::skills::origin::SkillOriginKind::Clawhub),
+                "ClawHub",
+            ),
+            (
+                "summarizer",
+                Some(crate::skills::origin::SkillOriginKind::Bundled),
+                "bundled",
+            ),
+            ("mystery", None, "unrecorded"),
+        ] {
+            let dir = tmp.path().join(name);
+            push_skill(&mut ctx, name, &dir, kind);
+            match cmd.execute(&format!("edit {name}"), &mut ctx).unwrap() {
+                CommandResult::Message(msg) => {
+                    assert!(msg.contains(expect), "{name}: got {msg:?}");
+                }
+                other => panic!("{name}: expected Message, got {other:?}"),
+            }
         }
     }
 

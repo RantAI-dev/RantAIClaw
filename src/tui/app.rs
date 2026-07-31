@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Stdout, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -321,6 +322,10 @@ pub struct TuiApp {
     /// file contents back into the input buffer. The key handler can't
     /// run the editor itself because it doesn't own the `Terminal`.
     pub editor_request: bool,
+    /// Deferred `/skill new` / `/skill edit`. Like `editor_request`, the work
+    /// happens in `run_loop`, which owns the `Terminal` the handoff has to
+    /// suspend and restore.
+    pub skill_editor_request: Option<SkillEditRequest>,
     /// `true` when the run loop should wipe the terminal's screen and
     /// scrollback before the next render (e.g. after `/new`/`/clear`).
     /// Set by command handlers via `CommandResult::ClearTerminal` and
@@ -524,6 +529,7 @@ impl TuiApp {
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
+            skill_editor_request: None,
             clear_terminal_request: false,
             composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
@@ -2819,6 +2825,30 @@ impl TuiApp {
             CmdResult::OpenClawhubInstallPicker { initial_query } => {
                 self.open_clawhub_install_picker(initial_query).await;
             }
+            CmdResult::OpenSkillInEditor {
+                slug,
+                path,
+                initial,
+                is_new,
+            } => {
+                // Suspending the terminal mid-stream would tear down a screen
+                // the agent is still writing to, and hand the editor a terminal
+                // the agent keeps printing into. Refuse rather than queue or
+                // cancel — the user can retry in a moment.
+                if matches!(self.state, AppState::Streaming { .. }) {
+                    let msg = "Wait for the current response to finish, then try again.";
+                    let _ = self.context.append_system_message(msg);
+                    self.scrollback_queue
+                        .push(("system".to_string(), msg.to_string()));
+                } else {
+                    self.skill_editor_request = Some(SkillEditRequest {
+                        slug,
+                        path,
+                        initial,
+                        is_new,
+                    });
+                }
+            }
             CmdResult::ClearTerminal(announce) => {
                 // The actual screen+scrollback wipe runs in `run_loop`
                 // (which owns the Terminal). We just raise the flag and
@@ -5073,6 +5103,67 @@ fn render_approval_pane(
 }
 
 #[cfg(test)]
+mod skill_body_validation_tests {
+    use super::{validate_skill_body, SkillEditRequest};
+    use std::path::PathBuf;
+
+    fn req(is_new: bool, slug: &str, initial: &str) -> SkillEditRequest {
+        SkillEditRequest {
+            slug: slug.to_string(),
+            path: PathBuf::from("/tmp").join(slug).join("SKILL.md"),
+            initial: initial.to_string(),
+            is_new,
+        }
+    }
+
+    const EXISTING: &str = "---\nname: Kopi Pagi\ndescription: x\n---\n\n# Kopi Pagi\n";
+
+    #[test]
+    fn accepts_an_unchanged_edit() {
+        let r = req(false, "kopi-pagi", EXISTING);
+        let body = format!("{EXISTING}\n## Troubleshooting\nToo sour: grind finer.\n");
+        assert!(validate_skill_body(&body, &r).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_body_the_loader_could_not_read() {
+        let r = req(false, "kopi-pagi", EXISTING);
+        for body in [
+            "no frontmatter\n",
+            "---\ndescription: x\n---\n",
+            "---\nname:   \n---\n",
+        ] {
+            let err = validate_skill_body(body, &r).expect_err("should reject");
+            assert!(err.contains("name"), "{body:?} -> {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_rename_including_a_case_only_one() {
+        let r = req(false, "kopi-pagi", EXISTING);
+        // A case change keeps the same folder but orphans the
+        // `[skills.entries.<name>]` config key, silently resetting whether the
+        // skill is enabled — so it is a rename too.
+        for renamed in ["kopi pagi", "Kopi Pagi Baru", "KOPI PAGI"] {
+            let body = format!("---\nname: {renamed}\n---\n# x\n");
+            let err = validate_skill_body(&body, &r).expect_err("should reject {renamed}");
+            assert!(err.contains("renaming"), "{renamed} -> {err}");
+        }
+    }
+
+    #[test]
+    fn new_skill_must_keep_the_folder_it_was_staged_for() {
+        let r = req(true, "kopi-pagi", "");
+        assert!(validate_skill_body("---\nname: Kopi Pagi\n---\n# x\n", &r).is_ok());
+        // Renaming in the editor would leave the folder saying one thing and
+        // the manifest another.
+        let err =
+            validate_skill_body("---\nname: Teh Sore\n---\n# x\n", &r).expect_err("should reject");
+        assert!(err.contains("teh-sore"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod composer_body_tests {
     use super::composer_body;
 
@@ -6705,6 +6796,193 @@ fn run_external_editor(
     app: &mut TuiApp,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
+    match edit_text_in_external_editor(terminal, &app.context.input_buffer, "prompt")? {
+        EditorOutcome::Saved { mut text, path } => {
+            if text.ends_with('\n') {
+                text.pop();
+            }
+            app.context.input_buffer = text;
+            app.context.cursor_to_end();
+            app.context.exit_history_navigation();
+            // Best-effort cleanup; file is in $TMPDIR so leftovers are harmless.
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        }
+        EditorOutcome::Failed { reason, path } => {
+            app.context.last_error = Some(format!("{reason} — buffer unchanged"));
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        }
+    }
+}
+
+/// A deferred `/skill new` / `/skill edit`, raised by dispatch and performed by
+/// `run_loop`.
+pub struct SkillEditRequest {
+    pub slug: String,
+    pub path: PathBuf,
+    pub initial: String,
+    pub is_new: bool,
+}
+
+/// Maximum times the editor reopens on a validation failure before giving up
+/// and reporting the staged path. Without a cap, someone who cannot get past
+/// validation is trapped in a reopening editor.
+const SKILL_EDIT_ATTEMPTS: usize = 3;
+
+/// The manifest `name:` a body would load as, or `None` when the loader could
+/// not read it.
+fn manifest_name(content: &str) -> Option<String> {
+    crate::skills::parse_yaml_frontmatter(content)
+        .get("name")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Why a saved body was rejected, phrased for the top of the reopened file.
+fn validate_skill_body(content: &str, req: &SkillEditRequest) -> Result<(), String> {
+    let Some(name) = manifest_name(content) else {
+        return Err(
+            "frontmatter is missing or has no `name:` — a skill without one never loads"
+                .to_string(),
+        );
+    };
+
+    if req.is_new {
+        // Keep the directory and the manifest agreeing. The folder was staged
+        // from the name typed at the prompt; renaming inside the editor would
+        // leave a skill whose folder says one thing and whose manifest says
+        // another.
+        let slug = crate::tools::author_skill::slugify(&name);
+        if slug != req.slug {
+            return Err(format!(
+                "name changed to `{name}`, which wants folder `{slug}` but this one is `{}` — \
+                 run `/skill new \"{name}\"` instead",
+                req.slug
+            ));
+        }
+    } else {
+        // The name is the `[skills.entries.<name>]` config key, so changing
+        // even its case orphans the entry and silently resets whether the
+        // skill is enabled.
+        let current = manifest_name(&req.initial).unwrap_or_default();
+        if name != current {
+            return Err(format!(
+                "renaming is not supported here: this skill is `{current}`, the file now says \
+                 `{name}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Hand a skill's `SKILL.md` to `$EDITOR`, validate what comes back, and commit
+/// it. Returns the line to show the user.
+///
+/// On a validation failure the editor **reopens** with their text intact and
+/// the reason as a comment at the top — the `git commit` pattern. A typo after
+/// pasting 200 lines must not mean starting over, and this needs no `--resume`
+/// flag or stashed-file bookkeeping to achieve.
+fn run_skill_editor(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    req: &SkillEditRequest,
+) -> Result<String> {
+    let mut buffer = req.initial.clone();
+
+    for attempt in 1..=SKILL_EDIT_ATTEMPTS {
+        let outcome = edit_text_in_external_editor(terminal, &buffer, "skill")?;
+        let (text, staged) = match outcome {
+            EditorOutcome::Saved { text, path } => (text, path),
+            EditorOutcome::Failed { reason, path } => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(format!("{reason} — nothing was saved."));
+            }
+        };
+
+        // Strip any comment banner a previous attempt prepended, so it never
+        // accumulates or ends up in the committed file.
+        let cleaned: String = text
+            .lines()
+            .skip_while(|l| l.starts_with("# ✗ ") || l.starts_with("#   "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cleaned = format!("{}\n", cleaned.trim_start_matches('\n').trim_end());
+
+        match validate_skill_body(&cleaned, req) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&staged);
+                return commit_skill_body(&cleaned, req);
+            }
+            Err(reason) if attempt < SKILL_EDIT_ATTEMPTS => {
+                let _ = std::fs::remove_file(&staged);
+                buffer = format!(
+                    "# ✗ {reason}\n#   Fix it and save again, or quit without saving to cancel.\n{cleaned}"
+                );
+            }
+            Err(reason) => {
+                // Out of attempts: keep the staged file so the work survives.
+                return Ok(format!(
+                    "Not saved: {reason}. Your text is at {}",
+                    staged.display()
+                ));
+            }
+        }
+    }
+    unreachable!("loop returns on every path")
+}
+
+/// Write the validated body, plus an origin marker for a newly created skill.
+fn commit_skill_body(content: &str, req: &SkillEditRequest) -> Result<String> {
+    let dir = req
+        .path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("skill path has no parent directory"))?;
+    std::fs::create_dir_all(dir)?;
+
+    // Stage then rename: a truncated SKILL.md still parses as *something*, and
+    // that something becomes the agent's instructions on the next load.
+    let staged = dir.join("SKILL.md.staged");
+    std::fs::write(&staged, content)?;
+    std::fs::rename(&staged, &req.path)?;
+
+    if req.is_new {
+        // Best-effort, like every other origin write.
+        if let Err(e) = crate::skills::origin::write_origin(
+            dir,
+            &crate::skills::origin::SkillOrigin::new(
+                crate::skills::origin::SkillOriginKind::Authored,
+                None,
+            ),
+        ) {
+            tracing::warn!("could not record origin for {}: {e}", req.slug);
+        }
+        Ok(format!("Created skill '{}'.", req.slug))
+    } else {
+        Ok(format!("Saved '{}'.", req.slug))
+    }
+}
+
+/// What came back from the editor handoff.
+///
+/// The staged path is reported either way: on failure the caller decides
+/// whether to keep it (a skill body the user just spent effort on) or discard
+/// it (a composer buffer that is still in the composer).
+enum EditorOutcome {
+    Saved { text: String, path: PathBuf },
+    Failed { reason: String, path: PathBuf },
+}
+
+/// Suspend the TUI, hand `initial` to the user's editor, and return whatever
+/// they saved.
+///
+/// `file_stem` names the staged file so a stray leftover in `$TMPDIR` says what
+/// it was. Always restores raw mode and the alternate screen before returning,
+/// including on failure, so the caller can resume drawing unconditionally.
+fn edit_text_in_external_editor(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    initial: &str,
+    file_stem: &str,
+) -> Result<EditorOutcome> {
     use std::io::Read as _;
     use std::process::Command;
 
@@ -6723,15 +7001,15 @@ fn run_external_editor(
             }
         });
 
-    // Write current buffer to a temp file; the editor edits in place.
+    // Write the text to a temp file; the editor edits in place.
     // Use a unique filename in the OS temp dir (no extra dep needed).
     let pid = std::process::id();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_path = std::env::temp_dir().join(format!("rantaiclaw-prompt-{pid}-{nonce}.md"));
-    std::fs::write(&tmp_path, &app.context.input_buffer)?;
+    let tmp_path = std::env::temp_dir().join(format!("rantaiclaw-{file_stem}-{pid}-{nonce}.md"));
+    std::fs::write(&tmp_path, initial)?;
 
     // Suspend the TUI: leave the alternate screen, drop raw mode. `enter_fullscreen`
     // re-enables mouse capture + bracketed paste on return.
@@ -6750,33 +7028,24 @@ fn run_external_editor(
     enable_raw_mode()?;
     *terminal = enter_fullscreen()?;
 
-    let result = match status {
+    Ok(match status {
         Ok(s) if s.success() => {
             let mut buf = String::new();
             std::fs::File::open(&tmp_path).and_then(|mut f| f.read_to_string(&mut buf))?;
-            if buf.ends_with('\n') {
-                buf.pop();
+            EditorOutcome::Saved {
+                text: buf,
+                path: tmp_path,
             }
-            app.context.input_buffer = buf;
-            app.context.cursor_to_end();
-            app.context.exit_history_navigation();
-            Ok(())
         }
-        Ok(s) => {
-            app.context.last_error = Some(format!(
-                "editor exited with status {} — buffer unchanged",
-                s.code().unwrap_or(-1)
-            ));
-            Ok(())
-        }
-        Err(e) => {
-            app.context.last_error = Some(format!("editor '{bin}' failed to launch: {e}"));
-            Ok(())
-        }
-    };
-    // Best-effort cleanup; file is in $TMPDIR so leftovers are harmless.
-    let _ = std::fs::remove_file(&tmp_path);
-    result
+        Ok(s) => EditorOutcome::Failed {
+            reason: format!("editor exited with status {}", s.code().unwrap_or(-1)),
+            path: tmp_path,
+        },
+        Err(e) => EditorOutcome::Failed {
+            reason: format!("editor '{bin}' failed to launch: {e}"),
+            path: tmp_path,
+        },
+    })
 }
 
 /// Cheap PATH check so we can prefer `nano` over `vi` when available.
@@ -7437,6 +7706,19 @@ async fn run_loop(
             }
         }
 
+        if let Some(req) = app.skill_editor_request.take() {
+            match run_skill_editor(terminal, &req) {
+                Ok(msg) => {
+                    let _ = app.context.append_system_message(&msg);
+                    app.scrollback_queue.push(("system".to_string(), msg));
+                    app.refresh_available_skills();
+                }
+                Err(e) => {
+                    app.context.last_error = Some(format!("skill editor error: {e}"));
+                }
+            }
+        }
+
         if matches!(app.state, AppState::Quitting) {
             break;
         }
@@ -7810,6 +8092,7 @@ mod tests {
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
+            skill_editor_request: None,
             clear_terminal_request: false,
             composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
@@ -7912,6 +8195,7 @@ mod submit_tests {
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
+            skill_editor_request: None,
             clear_terminal_request: false,
             composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
@@ -8276,6 +8560,7 @@ mod ctrl_c_tests {
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
+            skill_editor_request: None,
             clear_terminal_request: false,
             composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
@@ -8459,6 +8744,7 @@ mod drain_tests {
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
+            skill_editor_request: None,
             clear_terminal_request: false,
             composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
@@ -8627,6 +8913,7 @@ mod retry_tests {
             stream_committed_chars: 0,
             stream_header_committed: false,
             editor_request: false,
+            skill_editor_request: None,
             clear_terminal_request: false,
             composer_viewport_rows: INLINE_VIEWPORT_LINES,
             first_run_wizard: None,
