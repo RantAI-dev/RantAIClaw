@@ -5,6 +5,83 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1-alpha] — 2026-07-31
+
+Four providers could be configured but never answered, `doctor` blamed your
+network for it, and setup was sending API keys to two domains that do not
+exist.
+
+### Security
+
+- **Onboarding sent freshly-entered API keys to unregistered hostnames.** The
+  setup flow validates a key by sending it as a bearer token to a
+  `/v1/models` URL. The host came from a table in
+  `onboard::provision::provider` that had drifted from the one the client is
+  actually built with — and two of its entries named domains that do not
+  resolve: `api.zPUmlw.com` for Z.AI and `api.moonshot.io` for Moonshot
+  International.
+
+  Nothing leaked: DNS failed before any connection, so those keys were never
+  transmitted and **no rotation is warranted on account of this**. The
+  exposure was latent — either name could be registered by anyone, and from
+  that moment every setup run selecting those providers would have handed over
+  a working key.
+
+  The table is gone. Setup now resolves the endpoint from the same source the
+  provider client uses, so the set of hosts that can receive a key is exactly
+  the set the agent already talks to. Where no endpoint is known the key is
+  saved unvalidated with a message saying so, rather than sent somewhere
+  guessed.
+
+  Three further entries pointed at the wrong host without being fictional:
+  `vercel`, `glm`, and `cohere`.
+
+### Fixed
+
+- **groq, xAI, Venice, and Vercel AI Gateway sent every message to a 404.**
+  `OpenAiCompatibleProvider` appends `/chat/completions` to the configured base
+  URL verbatim, and these four shipped with a base missing the path their
+  vendor serves on. They could be selected, shown as ready, and then failed on
+  every single request with no indication why.
+
+  | provider | was | now |
+  |---|---|---|
+  | groq | `api.groq.com/openai` | `api.groq.com/openai/v1` |
+  | xai | `api.x.ai` | `api.x.ai/v1` |
+  | venice | `api.venice.ai` | `api.venice.ai/api/v1` |
+  | vercel | `api.vercel.ai` | `ai-gateway.vercel.sh/v1` |
+
+  Two were not simply missing `/v1`: Venice serves on `/api/v1` (the `/v1`
+  path answers 402), and Vercel's gateway is on a different host entirely.
+
+- **`doctor` turned a provider's name into a URL.** Its endpoint table held 8
+  of the 33 providers in the catalog, and anything absent fell through to
+  using the provider name itself as an address — `minimax` became
+  `minimax/models`. reqwest cannot build a request from that, and its refusal
+  was reported as `network error: builder error`, pointing you at your
+  connection when nothing had been sent. Roughly twenty providers hard-failed
+  this way on a healthy install.
+
+  The check now says what is true: a provider it has no endpoint for is
+  reported as not probed, rather than probed wrongly. Region-varying families
+  (minimax, GLM, Moonshot, Qwen, Z.AI) resolve from the same constants the
+  client is built with, so `minimax` and `minimax-cn` no longer collapse to
+  one endpoint.
+
+- **`doctor` probed GLM on the wrong host.** `glm` and `zhipu` are the same
+  provider under two names and the client talks to `api.z.ai`, but the check
+  probed `open.bigmodel.cn` — so a green tick there proved nothing about the
+  configured client. Only the explicit `-cn` aliases belong on bigmodel.
+
+### Notes
+
+Recorded rather than guessed at: `qianfan`'s base (`aip.baidubce.com`)
+redirects to a Baidu error page, so it is wrong too, but the replacement its
+URL pattern suggests was not confirmed against documentation. Four further
+providers — cloudflare, doubao, together, cohere — answer identically on every
+path, so unauthenticated probing cannot establish whether their base is
+correct; each needs a real key to confirm.
+
 ## [0.16.0-alpha] — 2026-07-31
 
 Write and edit your own skills — from the web console, from the TUI, or by
