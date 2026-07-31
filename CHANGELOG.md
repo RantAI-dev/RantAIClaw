@@ -5,6 +5,78 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0-alpha] — 2026-07-31
+
+Write and edit your own skills — from the web console, from the TUI, or by
+hand.
+
+Skills could be created from chat (`author_skill`) and nowhere else. Anyone
+who wanted to sit down and write one, or fix a typo in one they wrote last
+week, had to edit files by hand and hope. Both surfaces now offer it, and
+both refuse to touch a skill someone else manages.
+
+### Added
+
+- **A `Write` button and a per-card pencil in the web console.** The editor
+  has two views over one document: a form for name, description, tags, and
+  instructions, and the raw markdown. Its entire state is the `SKILL.md`
+  text — the form reads values out of it and patches them back — so moving
+  between views cannot lose a section you wrote by hand. When a file's
+  structure no longer matches what the form can locate, the form view is
+  hidden rather than shown broken, and editing continues in markdown.
+  Requires claw-ui v0.3.12, which this release pins.
+- **`/skill new "<name>"` and `/skill edit <name>` in the TUI**, handing the
+  file to your `$EDITOR`. No form: TUI users already have an editor, and a
+  form there would be a worse one inside it. It also means pasting a prepared
+  `SKILL.md` finally works — the TUI is suspended while the editor runs, so
+  the composer's paste handling is not involved at all. `/skill edit` accepts
+  either the display name or the directory name.
+- **Three gateway routes carrying the console editor**:
+  `GET`/`PUT /api/v1/skills/{slug}/content` and `POST /api/v1/skills`. All
+  three are owner-scoped like their siblings *and* refuse any skill you did
+  not author, with `403`. That gate is load-bearing: a skill's whole file
+  becomes part of the agent's system prompt on the next load, so a route that
+  rewrites one rewrites the agent's standing instructions.
+- **`.origin.json`, recording who put each skill on disk** — `authored`,
+  `clawhub`, `bundled`, `git`, or `local`. Written at every install path.
+  Skills that predate it are classified from their directory's shape, and
+  that inference is replaced by a real marker the first time the skill is
+  saved. `GET /api/v1/skills` reports it as `origin`, alongside a new `slug`.
+
+  This is what the edit affordances gate on. Before it, a skill you wrote, a
+  bundled pack member, and a folder a third party copied in were
+  **byte-identical on disk** — so there was no honest way to decide whether
+  Edit should appear. Editing the wrong one loses the work silently: bundled
+  skills are re-seeded by the next `setup` run, vendor-managed ones by their
+  installer.
+
+### Fixed
+
+- **The API could create a skill it could not then disable or delete.** Skill
+  routes were addressed by manifest `name`, which is free text, and
+  `validate_slug` — which they run it through — rejects spaces. So a skill
+  called `Kopi Pagi` answered `400` on `PUT .../enabled` and `DELETE`, while
+  `GET`, which has no such guard, worked. The CLI never had the bug. Latent
+  until now because ClawHub slugs are already slug-shaped; this release ends
+  that, since every console-authored skill gets a human display name. All
+  skill routes now address by directory slug, with a name fallback on the
+  read routes so existing clients keep working. The `[skills.entries.<name>]`
+  config key is unchanged — the routes resolve a slug and hand the name down.
+- **A skill with a blank `description:` was described as `---`.** The
+  frontmatter parser drops empty values, so the lookup missed and the
+  fallback scanned from the top of the file and returned the frontmatter
+  fence. Cosmetic in `skills list`, but not only cosmetic: the description is
+  what the model reads to decide when a skill applies.
+- Web console `Disable` and `Uninstall` now work on skills with a display
+  name containing a space — the client half of the addressing fix above.
+
+### Notes
+
+Not included, and deliberately: skills still live in two directory roots
+(`profiles/<p>/skills/` and `<workspace>/skills/`), and the write side now
+targets only the first. Consolidating them, and the third-party installer
+work that depends on it, is a separate effort.
+
 ## [0.15.2-alpha] — 2026-07-31
 
 Make the always-on core skill actually always on, and stop a profile's paths
