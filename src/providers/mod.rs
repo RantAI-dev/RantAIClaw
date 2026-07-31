@@ -79,6 +79,20 @@ const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 
+// Four bases that shipped without the path segment their API actually serves
+// on. `OpenAiCompatibleProvider` appends `/chat/completions` verbatim, so each
+// of these sent every message to a 404 — the provider was configurable but
+// could not answer once.
+//
+// Named rather than inlined so `openai_compatible_bases_are_the_probed_ones`
+// can pin them; a literal buried in a 24-arm match is not checkable.
+const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
+const XAI_BASE_URL: &str = "https://api.x.ai/v1";
+/// Venice serves on `/api/v1`, not `/v1` — the latter answers 402.
+const VENICE_BASE_URL: &str = "https://api.venice.ai/api/v1";
+/// The AI Gateway is a separate host; `api.vercel.ai` 404s every path.
+const VERCEL_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
         name,
@@ -1077,10 +1091,10 @@ fn create_provider_with_url_and_options(
 
         // ── OpenAI-compatible providers ──────────────────────
         "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
+            "Venice", VENICE_BASE_URL, key, AuthStyle::Bearer,
         ))),
         "vercel" | "vercel-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Vercel AI Gateway", "https://api.vercel.ai", key, AuthStyle::Bearer,
+            "Vercel AI Gateway", VERCEL_GATEWAY_BASE_URL, key, AuthStyle::Bearer,
         ))),
         "cloudflare" | "cloudflare-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Cloudflare AI Gateway",
@@ -1166,13 +1180,13 @@ fn create_provider_with_url_and_options(
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Groq", "https://api.groq.com/openai", key, AuthStyle::Bearer,
+            "Groq", GROQ_BASE_URL, key, AuthStyle::Bearer,
         ))),
         "mistral" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer,
         ))),
         "xai" | "grok" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "xAI", "https://api.x.ai", key, AuthStyle::Bearer,
+            "xAI", XAI_BASE_URL, key, AuthStyle::Bearer,
         ))),
         "deepseek" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "DeepSeek", "https://api.deepseek.com", key, AuthStyle::Bearer,
@@ -1997,6 +2011,59 @@ mod tests {
         assert_eq!(canonical_china_provider_name("doubao"), Some("doubao"));
         assert_eq!(canonical_china_provider_name("volcengine"), Some("doubao"));
         assert_eq!(canonical_china_provider_name("openai"), None);
+    }
+
+    /// Pins the four bases that shipped pointing at a path their API does not
+    /// serve. `OpenAiCompatibleProvider` appends `/chat/completions` verbatim,
+    /// so a base missing its version segment sent every message to a 404 — the
+    /// provider was configurable but could not answer once.
+    ///
+    /// Each value below was established by probing the live API without
+    /// credentials, where `404` means the path does not exist and any other
+    /// status means it does:
+    ///
+    /// ```text
+    /// POST api.groq.com/openai/chat/completions        404   ← shipped
+    /// POST api.groq.com/openai/v1/chat/completions     401
+    /// POST api.x.ai/chat/completions                   404   ← shipped
+    /// POST api.x.ai/v1/chat/completions                400
+    /// POST api.venice.ai/chat/completions              404   ← shipped
+    /// GET  api.venice.ai/v1/models                     402
+    /// GET  api.venice.ai/api/v1/models                 200
+    /// POST api.vercel.ai/chat/completions              404   ← shipped
+    /// POST api.vercel.ai/v1/chat/completions           404
+    /// GET  ai-gateway.vercel.sh/v1/models              200
+    /// ```
+    ///
+    /// `api.venice.ai/xyz/...` and `api.vercel.ai/xyz/...` both answer 404,
+    /// confirming those hosts route by path rather than rejecting everything —
+    /// so the 404s above mean the path was wrong, not that the probe was.
+    ///
+    /// Asserting the literals is the point: these cannot be derived, only
+    /// checked against the vendor, and a silent edit would restore a provider
+    /// that looks configured and never works.
+    #[test]
+    fn openai_compatible_bases_are_the_probed_ones() {
+        assert_eq!(GROQ_BASE_URL, "https://api.groq.com/openai/v1");
+        assert_eq!(XAI_BASE_URL, "https://api.x.ai/v1");
+        assert_eq!(VENICE_BASE_URL, "https://api.venice.ai/api/v1");
+        assert_eq!(VERCEL_GATEWAY_BASE_URL, "https://ai-gateway.vercel.sh/v1");
+
+        // The shape that broke them: a host with no API path at all. Every one
+        // of these must carry a version segment before `/chat/completions` is
+        // appended.
+        for base in [
+            GROQ_BASE_URL,
+            XAI_BASE_URL,
+            VENICE_BASE_URL,
+            VERCEL_GATEWAY_BASE_URL,
+        ] {
+            let path = base.split_once("://").expect("scheme").1;
+            assert!(
+                path.contains('/'),
+                "{base} has no API path; `/chat/completions` would hit the host root"
+            );
+        }
     }
 
     #[test]
