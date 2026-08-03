@@ -267,12 +267,27 @@ impl CommandHandler for SkillsCommand {
         "Browse available skills"
     }
 
+    fn usage(&self) -> &str {
+        "/skills [name] | new \"<name>\" | edit <name> | install [query]"
+    }
+
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         // `/skills install [query]` is an alias for `/install [query]` so
         // both discoverability paths reach the ClawHub browser. Anything
         // else (no args, or args that aren't `install*`) opens the local
         // skills picker as before.
         let trimmed = args.trim();
+        // `new` and `edit` route to the same handlers as the singular. The
+        // two commands are one letter apart and were never going to be
+        // remembered separately: `/skills new "Kopi Pagi"` used to fall
+        // through to the picker, which preselected nothing and said nothing,
+        // so the request vanished without a word.
+        if let Some(rest) = trimmed.strip_prefix("new") {
+            return skill_new(rest.trim(), ctx);
+        }
+        if let Some(rest) = trimmed.strip_prefix("edit") {
+            return skill_edit(rest.trim(), ctx);
+        }
         if let Some(rest) = trimmed.strip_prefix("install") {
             let query = rest.trim();
             let initial_query = if query.is_empty() {
@@ -328,7 +343,7 @@ impl CommandHandler for SkillCommand {
     }
 
     fn usage(&self) -> &str {
-        "/skill [name] | new \"<name>\" | edit <name> | install [query]"
+        "/skill <name> (details) | new \"<name>\" | edit <name> | install [query]"
     }
 
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
@@ -614,6 +629,29 @@ mod tests {
                 assert_eq!(picker.kind, crate::tui::widgets::ListPickerKind::Skill);
             }
             other => panic!("Expected OpenListPicker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skills_plural_accepts_the_same_subcommands_as_the_singular() {
+        // The two are one letter apart. `/skills new "Kopi Pagi"` used to fall
+        // through to the picker, which preselected nothing and said nothing —
+        // the request vanished without a word.
+        let cmd = SkillsCommand;
+        let mut ctx = test_context();
+
+        match cmd.execute("new \"Kopi Pagi\"", &mut ctx).unwrap() {
+            CommandResult::OpenSkillInEditor { slug, is_new, .. } => {
+                assert_eq!(slug, "kopi-pagi");
+                assert!(is_new);
+            }
+            other => panic!("expected the editor to open, got {other:?}"),
+        }
+
+        // `edit` reaches the same lookup, and reports the same miss.
+        match cmd.execute("edit no-such-skill", &mut ctx).unwrap() {
+            CommandResult::Message(m) => assert!(m.contains("no-such-skill"), "got {m:?}"),
+            other => panic!("expected a message, got {other:?}"),
         }
     }
 

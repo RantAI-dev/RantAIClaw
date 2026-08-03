@@ -93,10 +93,14 @@ pub struct TuiContext {
     /// unmet gating reasons. Used by `/skills` so install-deps can be
     /// reached from rows that are not active yet.
     pub available_skills_with_status: Vec<(crate::skills::Skill, Vec<String>)>,
-    /// Snapshot of `(command_name, description)` pairs taken at TUI
-    /// startup. Used by `/help` to populate the help picker without
-    /// reaching back into the command registry from inside handlers.
-    pub available_commands: Vec<(String, String)>,
+    /// Snapshot of every registered command taken at TUI startup. Used by
+    /// `/help` to populate the help picker without reaching back into the
+    /// command registry from inside handlers.
+    ///
+    /// Carries `usage` as well as the description: the invocation forms were
+    /// already written and had no reader, so `/skill new` and `/skill edit`
+    /// existed only in source.
+    pub available_commands: Vec<crate::tui::commands::CommandInfo>,
     /// Submitted prompts in chronological order (oldest first). Used
     /// by Up/Down to recall past prompts when the input is empty or
     /// when already in history-navigation mode.

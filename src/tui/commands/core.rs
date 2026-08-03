@@ -29,9 +29,16 @@ impl CommandHandler for HelpCommand {
             let found = ctx
                 .available_commands
                 .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(needle));
+                .find(|c| c.name.eq_ignore_ascii_case(needle));
             return match found {
-                Some((name, desc)) => Ok(CommandResult::Message(format!("/{name} — {desc}"))),
+                // Lead with the invocation form. "/skill — Invoke, inspect,
+                // write, or edit a skill" named four capabilities and showed
+                // how to reach none of them.
+                Some(c) => Ok(CommandResult::Message(format!(
+                    "{} — {}",
+                    c.headline(),
+                    c.description
+                ))),
                 None => Ok(CommandResult::Message(format!(
                     "No command named '/{needle}'. Run /help to see all commands."
                 ))),
@@ -42,13 +49,16 @@ impl CommandHandler for HelpCommand {
         // commands. The startup snapshot in `available_commands` keeps
         // command-handler trait signatures unchanged (no need to pass
         // the registry in here).
+        // Heading is the invocation form, so the subcommands are on screen
+        // instead of in a docstring. `key` stays the bare name — Enter still
+        // prefills `/skill`, not the whole usage line.
         let items: Vec<ListPickerItem> = ctx
             .available_commands
             .iter()
-            .map(|(name, desc)| ListPickerItem {
-                key: name.clone(),
-                primary: format!("/{name}"),
-                secondary: desc.clone(),
+            .map(|c| ListPickerItem {
+                key: c.name.clone(),
+                primary: c.headline(),
+                secondary: c.description.clone(),
             })
             .collect();
         let picker = ListPicker::new(
@@ -111,18 +121,23 @@ mod tests {
         ctx
     }
 
+    fn info(name: &str, description: &str, usage: &str) -> crate::tui::commands::CommandInfo {
+        crate::tui::commands::CommandInfo {
+            name: name.into(),
+            description: description.into(),
+            usage: usage.into(),
+        }
+    }
+
     #[test]
     fn help_command_opens_command_picker() {
         let cmd = HelpCommand;
         let mut ctx = test_context();
         // Seed the snapshot the picker reads from.
         ctx.available_commands = vec![
-            ("help".to_string(), "Browse commands".to_string()),
-            ("quit".to_string(), "Exit the application".to_string()),
-            (
-                "model".to_string(),
-                "Pick or change the active model".to_string(),
-            ),
+            info("help", "Browse commands", "/help [command]"),
+            info("quit", "Exit the application", "quit"),
+            info("model", "Pick or change the active model", "/model [name]"),
         ];
 
         let result = cmd.execute("", &mut ctx).unwrap();
@@ -144,12 +159,49 @@ mod tests {
     }
 
     #[test]
+    fn help_rows_lead_with_the_invocation_form() {
+        // `usage()` was implemented on two dozen commands and rendered
+        // nowhere, so `/skill new` and `/skill edit` existed only in source.
+        // A command that takes no arguments still shows the bare name.
+        let cmd = HelpCommand;
+        let mut ctx = test_context();
+        ctx.available_commands = vec![
+            info(
+                "skill",
+                "Invoke, inspect, write, or edit a skill",
+                "/skill <name> | new \"<name>\"",
+            ),
+            info("quit", "Exit the application", "quit"),
+        ];
+
+        let CommandResult::OpenListPicker(picker) = cmd.execute("", &mut ctx).unwrap() else {
+            panic!("expected a picker");
+        };
+        let rows: Vec<_> = picker
+            .entries()
+            .iter()
+            .filter_map(crate::tui::widgets::ListPickerEntry::as_item)
+            .collect();
+        let skill = rows.iter().find(|i| i.key == "skill").expect("skill row");
+        assert!(
+            skill.primary.contains("new"),
+            "the subcommands are still invisible: {:?}",
+            skill.primary
+        );
+        // Enter still prefills the command, not the whole usage line.
+        assert_eq!(skill.key, "skill");
+        let quit = rows.iter().find(|i| i.key == "quit").expect("quit row");
+        assert_eq!(quit.primary, "/quit", "a no-argument command gains nothing");
+    }
+
+    #[test]
     fn help_command_with_arg_shows_one_line_description() {
         let cmd = HelpCommand;
         let mut ctx = test_context();
-        ctx.available_commands = vec![(
-            "model".to_string(),
-            "Pick or change the active model".to_string(),
+        ctx.available_commands = vec![info(
+            "model",
+            "Pick or change the active model",
+            "/model [name]",
         )];
 
         let result = cmd.execute("model", &mut ctx).unwrap();
