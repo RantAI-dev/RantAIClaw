@@ -299,6 +299,89 @@ pub fn truncate_preview(s: &str, max: usize) -> String {
     out
 }
 
+/// Truncate `s` to `max_cols` **display columns**, appending `…` when it did
+/// not fit.
+///
+/// Distinct from [`truncate_preview`], which counts characters. A character
+/// count is a fine proxy for Latin text and wrong for everything else: a CJK
+/// ideograph occupies two cells, so `chars().count()` under-measures a Chinese
+/// summary by half and the row overruns the pane it was measured against.
+/// ClawHub returns those summaries today.
+///
+/// The ellipsis costs one column, so the kept text is fitted to
+/// `max_cols - 1`. A `max_cols` of 0 yields an empty string; of 1, just the
+/// ellipsis — there is no width at which this returns something wider than it
+/// was asked for.
+pub fn truncate_to_cols(s: &str, max_cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    if max_cols == 0 {
+        return String::new();
+    }
+    if display_cols(s) <= max_cols {
+        return s.to_string();
+    }
+    let budget = max_cols - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Display width of `s` in terminal cells.
+pub fn display_cols(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// Collapse anything that would break a single-row label into one space:
+/// real control characters, and the **literal** two-character `\n` / `\r` /
+/// `\t` sequences that reach us verbatim inside registry metadata.
+///
+/// The escapes are not ours to interpret — a publisher wrote `\n` into their
+/// SKILL.md frontmatter and the registry stored it as written, so it arrives
+/// as a backslash followed by an `n` and renders as exactly that. Whatever the
+/// author meant, a picker row is one line, so both spellings collapse here.
+pub fn flatten_to_row(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            // `\n` and `\r` only. Not `\t`: a backslash-t is far more often a
+            // Windows path segment than an escaped tab — `\to`, `\temp`,
+            // `\test` — and eating it silently corrupts the text. A real tab
+            // character still collapses below; this branch is only about the
+            // two-character spellings that reach us verbatim.
+            if let Some(&next) = chars.peek() {
+                if matches!(next, 'n' | 'r') {
+                    chars.next();
+                    push_space(&mut out);
+                    continue;
+                }
+            }
+            out.push(ch);
+        } else if ch.is_control() || ch.is_whitespace() {
+            push_space(&mut out);
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
+}
+
+fn push_space(out: &mut String) {
+    if !out.ends_with(' ') {
+        out.push(' ');
+    }
+}
+
 /// Parse a single line of text into ratatui `Span`s, applying inline
 /// markdown for **bold**, *italic*, and `inline code`. The parser is
 /// intentionally minimal — multi-line constructs (code fences, lists,
@@ -534,6 +617,72 @@ mod tests {
         let out = truncate_preview(&s, 10);
         assert_eq!(out.chars().count(), 11); // 10 + ellipsis
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_to_cols_never_exceeds_the_width_it_was_given() {
+        // The property that matters: whatever comes back must fit the pane it
+        // was measured for. A row wider than its area is what produced the
+        // mid-word clipping against the border.
+        for s in [
+            "short",
+            &"a".repeat(200),
+            "查询指定城市或地区的天气预报信息，包括温度、天气状况、降水概率",
+            "mixed 天气 forecast 预报 text",
+        ] {
+            for w in 0..40 {
+                assert!(
+                    display_cols(&truncate_to_cols(s, w)) <= w,
+                    "{s:?} at width {w} came back wider than {w}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_to_cols_measures_wide_characters_as_two_cells() {
+        // Six ideographs are twelve columns, so a ten-column budget cannot
+        // hold them — counting `chars()` would have said five fit with room
+        // to spare. This is the case the old char-counting helper documented
+        // as "revisit if we ever pick up east-Asian option text".
+        let cjk = "老默天气预报中";
+        assert_eq!(display_cols(cjk), 14);
+        let out = truncate_to_cols(cjk, 10);
+        assert!(out.ends_with('…'));
+        assert_eq!(display_cols(&out), 9); // 4 ideographs + ellipsis
+    }
+
+    #[test]
+    fn truncate_to_cols_passes_through_what_already_fits() {
+        assert_eq!(truncate_to_cols("weather", 7), "weather");
+        assert_eq!(truncate_to_cols("weather", 20), "weather");
+    }
+
+    #[test]
+    fn flatten_to_row_collapses_literal_escapes_and_real_breaks() {
+        // ClawHub returns the two-character sequence verbatim — a publisher
+        // typed `\n` into their frontmatter and the registry stored it as
+        // written, so it reaches the row as a backslash and an `n`.
+        assert_eq!(
+            flatten_to_row("Get the weather (no API key)。核心能力:\\n\\n- one"),
+            "Get the weather (no API key)。核心能力: - one",
+        );
+        assert_eq!(flatten_to_row("real\nnewline\there"), "real newline here");
+        assert_eq!(flatten_to_row("  padded  "), "padded");
+    }
+
+    #[test]
+    fn flatten_to_row_keeps_a_backslash_that_is_not_an_escape() {
+        // `\t` is left alone on purpose: in free text a backslash-t is far
+        // more often a path segment than an escaped tab, and treating it as
+        // one turned `C:\path\to` into `C:\path o`.
+        assert_eq!(flatten_to_row(r"C:\path\to"), r"C:\path\to");
+        assert_eq!(
+            flatten_to_row(r"use \temp for scratch"),
+            r"use \temp for scratch"
+        );
+        // A real tab still collapses — that one genuinely breaks a row.
+        assert_eq!(flatten_to_row("a\tb"), "a b");
     }
 
     #[test]

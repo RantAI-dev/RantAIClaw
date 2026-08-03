@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 
+use crate::tui::render::{display_cols, flatten_to_row, truncate_to_cols};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -55,6 +56,23 @@ pub enum ListPickerKind {
     /// Scheduled-jobs browser opened via `/cron` (no arg). Enter opens a detail
     /// panel whose action-keys run/pause/delete the selected job.
     Cron,
+}
+
+/// Smallest useful panel: two borders around two rows. Below this the box has
+/// nothing to show, so a content-sized panel never shrinks past it.
+const MIN_PANEL_HEIGHT: u16 = 4;
+
+/// Right-pad `s` with spaces to `cols` display columns. Wider input is
+/// returned unchanged — callers truncate first; this only fills.
+fn pad_to_cols(s: &str, cols: usize) -> String {
+    let w = display_cols(s);
+    if w >= cols {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + (cols - w));
+    out.push_str(s);
+    out.extend(std::iter::repeat_n(' ', cols - w));
+    out
 }
 
 /// One row in the picker. `key` is opaque (provider:model, session id,
@@ -184,6 +202,28 @@ pub struct ListPicker {
     /// Category IDs that are currently collapsed. Navigation skips items
     /// in collapsed categories unless a search query is active.
     collapsed_categories: HashSet<String>,
+    /// Transient line shown beside the title — "searching…", "that failed".
+    ///
+    /// Separate from `title` so setting it cannot destroy the picker's
+    /// identity: overwriting `title` is how the install spinner works, and it
+    /// leaves the user on a screen that no longer says what screen it is.
+    pub status: Option<PickerStatus>,
+}
+
+/// A transient message beside the picker title, and how it should read.
+#[derive(Debug, Clone)]
+pub struct PickerStatus {
+    pub text: String,
+    pub tone: StatusTone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTone {
+    /// Work in flight.
+    Busy,
+    /// It did not work. Must not be silent — a failed search that leaves the
+    /// previous results on screen is indistinguishable from a successful one.
+    Error,
 }
 
 impl ListPicker {
@@ -245,6 +285,7 @@ impl ListPicker {
             page_size: DEFAULT_PAGE_SIZE,
             focus: Focus::Search,
             collapsed_categories: HashSet::new(),
+            status: None,
         }
     }
 
@@ -286,6 +327,7 @@ impl ListPicker {
             page_size: DEFAULT_PAGE_SIZE,
             focus: Focus::Search,
             collapsed_categories: HashSet::new(),
+            status: None,
         }
     }
 
@@ -461,8 +503,14 @@ impl ListPicker {
                         self.page += 1;
                         self.selected = 0;
                     } else {
-                        // Already on last item of last page — keep
-                        // wrap-to-top behavior for cyclic browsing.
+                        // Already on the last item of the last page — wrap to
+                        // the top of the *list*, not of this page. `page` was
+                        // left where it stood, so on a list spanning more than
+                        // one page ↓ bounced between the final two entries and
+                        // never cycled. Latent while `page_size` was the whole
+                        // pane (everything fit on page 0); reachable now that
+                        // a two-row entry halves the stride.
+                        self.page = 0;
                         self.selected = 0;
                     }
                 } else {
@@ -535,6 +583,22 @@ impl ListPicker {
         }
     }
 
+    /// Rows one entry occupies.
+    ///
+    /// Two for the skill-shaped pickers, whose secondary text is a sentence
+    /// describing what the thing does; one for the rest, where it is a short
+    /// qualifier (a model's provider, a session's date) that reads fine beside
+    /// the label. Sizing, paging and the highlight band all derive from this,
+    /// so it is the single place the row shape is decided.
+    fn row_height(&self) -> u16 {
+        match self.kind {
+            ListPickerKind::Skill
+            | ListPickerKind::ClawhubInstall
+            | ListPickerKind::ClawhubPublisher => 2,
+            _ => 1,
+        }
+    }
+
     /// Render the picker as a modal panel inside `area`. The search
     /// query is shown in the title bar (the top border line), so all
     /// inner rows go to list items — important in inline-viewport mode
@@ -543,11 +607,39 @@ impl ListPicker {
         if area.height < 6 || area.width < 30 {
             return;
         }
+
+        let visible_indices = self.filtered_indices();
+        let row_h = self.row_height();
+        let width = area.width.saturating_sub(2);
+        let inner_w = width.saturating_sub(2) as usize;
+
+        // Size the panel to what it actually holds. It used to take the whole
+        // overlay unconditionally, so five skills sat at the top of a
+        // forty-six-row box — which reads as a screen that failed to load
+        // rather than as a short list.
+        let body_rows = if visible_indices.is_empty() {
+            // The empty/no-match branches below draw a blank line plus a hint
+            // that wraps; measure it rather than guessing a constant.
+            let hint = if self.entries.is_empty() {
+                self.empty_hint.as_str()
+            } else {
+                self.query.as_str()
+            };
+            let cols = inner_w.max(1);
+            1 + crate::tui::render::display_cols(hint).div_ceil(cols) + 1
+        } else {
+            visible_indices.len().saturating_mul(row_h as usize)
+        };
+        let available = area.height.saturating_sub(2);
+        let height = u16::try_from(body_rows.saturating_add(2))
+            .unwrap_or(u16::MAX)
+            .clamp(MIN_PANEL_HEIGHT.min(available), available);
+
         let panel = Rect {
             x: area.x + 1,
             y: area.y + 1,
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
+            width,
+            height,
         };
         frame.render_widget(Clear, panel);
 
@@ -561,15 +653,17 @@ impl ListPicker {
         // Note this render does not slice by page — it draws the whole
         // filtered view and lets the list widget scroll to the cursor. The
         // page size is a navigation stride here, not a visual page.
-        self.set_page_size_from_capacity(panel.height.saturating_sub(2) as usize);
+        // Capacity is in *entries*, not rows: a two-row picker fits half as
+        // many per screen, and PgUp/PgDn stride by entries.
+        self.set_page_size_from_capacity(
+            (panel.height.saturating_sub(2) as usize) / row_h.max(1) as usize,
+        );
 
         let sky = Color::Rgb(94, 184, 255);
         let muted = Color::Rgb(107, 114, 128);
         let frame_color = Color::Rgb(40, 70, 140);
         let dark_bg = Color::Rgb(4, 11, 46);
         let coral = Color::Rgb(255, 138, 101);
-
-        let visible_indices = self.filtered_indices();
 
         // Title bar doubles as the search input. Empty query → show the
         // hint; non-empty → show `Title › query▎  (n/total)`.
@@ -661,7 +755,12 @@ impl ListPicker {
             // results are stale until Enter. No "pending" flag is needed to
             // say so: in this mode Enter from the search box *always*
             // searches, so the affordance is unconditionally true.
-            if self.kind == ListPickerKind::ClawhubInstall && self.focus == Focus::Search {
+            // Suppressed while a status is showing: "↵ search" invites an
+            // action that is already running, or that just failed.
+            if self.kind == ListPickerKind::ClawhubInstall
+                && self.focus == Focus::Search
+                && self.status.is_none()
+            {
                 spans.push(Span::styled(
                     " ↵ search",
                     Style::default()
@@ -670,6 +769,24 @@ impl ListPicker {
                 ));
             }
             Line::from(spans)
+        };
+
+        // Status rides beside the title in both branches — an in-flight or
+        // failed search has to be visible whether or not a query is typed.
+        let title_line = match &self.status {
+            None => title_line,
+            Some(status) => {
+                let style = match status.tone {
+                    StatusTone::Busy => Style::default().fg(Color::Rgb(52, 211, 153)),
+                    StatusTone::Error => Style::default().fg(coral),
+                };
+                let mut spans = title_line.spans;
+                spans.push(Span::styled(
+                    format!("  {} ", status.text),
+                    style.add_modifier(Modifier::BOLD),
+                ));
+                Line::from(spans)
+            }
         };
 
         let block = Block::default()
@@ -771,13 +888,55 @@ impl ListPicker {
                         } else {
                             Style::default().fg(muted)
                         };
-                        let mut spans =
-                            vec![Span::styled(format!(" {} ", item.primary), primary_style)];
-                        if !item.secondary.is_empty() {
-                            spans.push(Span::styled("   ", secondary_style));
-                            spans.push(Span::styled(item.secondary.clone(), secondary_style));
+                        let primary = flatten_to_row(&item.primary);
+                        let secondary = flatten_to_row(&item.secondary);
+
+                        if row_h == 2 {
+                            // Two rows: the label keeps its own line, so the
+                            // description gets the full width instead of
+                            // whatever the label left over. Skill summaries are
+                            // sentences, and a sentence with eight columns to
+                            // live in says nothing.
+                            let head = pad_to_cols(
+                                &format!(
+                                    " {}",
+                                    truncate_to_cols(&primary, inner_w.saturating_sub(1))
+                                ),
+                                inner_w,
+                            );
+                            let body = pad_to_cols(
+                                &format!(
+                                    "   {}",
+                                    truncate_to_cols(&secondary, inner_w.saturating_sub(3))
+                                ),
+                                inner_w,
+                            );
+                            ListItem::new(vec![
+                                Line::from(Span::styled(head, primary_style)),
+                                Line::from(Span::styled(body, secondary_style)),
+                            ])
+                        } else {
+                            // One row: fit the label first, then hand the
+                            // description whatever is left. Both are cut with
+                            // an ellipsis rather than run into the border —
+                            // clipping mid-word looks like a rendering fault,
+                            // and hides that there was more to read.
+                            let head = format!(" {} ", truncate_to_cols(&primary, inner_w));
+                            let head_cols = display_cols(&head);
+                            let rest = inner_w.saturating_sub(head_cols);
+                            let mut spans = vec![Span::styled(head, primary_style)];
+                            // Below the three-column gap plus an ellipsis there
+                            // is nothing left to say, so say nothing.
+                            let tail = if secondary.is_empty() || rest <= 4 {
+                                String::new()
+                            } else {
+                                format!("   {}", truncate_to_cols(&secondary, rest - 3))
+                            };
+                            // Pad to the full width so the selection reads as
+                            // one band rather than stopping where the text did.
+                            spans.push(Span::styled(pad_to_cols(&tail, rest), secondary_style));
+                            ListItem::new(Line::from(spans))
                         }
-                        ListItem::new(Line::from(spans))
                     }
                 }
             })
@@ -976,6 +1135,174 @@ mod tests {
             text.contains("item-05"),
             "6th ↓ must highlight item-05 (second page), got: {text:?}"
         );
+    }
+
+    /// Draw `p` into a `w`×`h` terminal and hand back the cell buffer.
+    fn draw(p: &mut ListPicker, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| p.render(f, Rect::new(0, 0, w, h))).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// The whole pane as newline-joined text.
+    fn pane_text(p: &mut ListPicker, w: u16, h: u16) -> String {
+        let buf = draw(p, w, h);
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Rows the panel actually occupies — counted from where its border is
+    /// drawn, not from what it was offered.
+    fn panel_rows(buf: &ratatui::buffer::Buffer, w: u16, h: u16) -> usize {
+        (0..h)
+            .filter(|&y| (0..w).any(|x| matches!(buf[(x, y)].symbol(), "╭" | "│" | "╰")))
+            .count()
+    }
+
+    #[test]
+    fn down_past_the_last_entry_wraps_to_the_first_not_the_last_page() {
+        // Five two-row entries in a ten-row area: the stride lands at four, so
+        // the list spans two pages. Found by driving ↓ to the bottom of the
+        // ClawHub browser — it alternated between the final two entries and
+        // never returned to the top.
+        let mut p = clawhub_picker(
+            (0..5)
+                .map(|i| item(&format!("k{i}"), &format!("item-{i}")))
+                .collect(),
+        );
+        // Render once so the picker learns its real page stride.
+        let _ = draw(&mut p, 60, 10);
+        // Stride is 3 here (six inner rows at two rows an entry), so the list
+        // is pages [0,1,2] and [3,4]. One press moves focus into the list,
+        // four walk to the final entry, and the sixth is the one that wraps.
+        for _ in 0..6 {
+            p.move_down();
+        }
+        assert_eq!((p.page, p.selected), (0, 0), "wrapped to the wrong page");
+        let text = pane_text(&mut p, 60, 10);
+        let first = text.lines().find(|l| l.contains("item-0")).unwrap_or("");
+        assert!(first.contains("item-0"), "top entry not on screen: {text}");
+    }
+
+    #[test]
+    fn panel_shrinks_to_its_contents() {
+        // Five entries used to sit at the top of a box as tall as the screen,
+        // which reads as a view that failed to load rather than a short list.
+        let mut p = picker(
+            (0..5)
+                .map(|i| item(&format!("k{i}"), &format!("item-{i}")))
+                .collect(),
+        );
+        let buf = draw(&mut p, 60, 40);
+        let rows = panel_rows(&buf, 60, 40);
+        assert_eq!(rows, 7, "5 one-row entries + 2 borders, got {rows}");
+    }
+
+    #[test]
+    fn panel_still_caps_at_the_area_it_was_given() {
+        let mut p = picker(
+            (0..100)
+                .map(|i| item(&format!("k{i}"), &format!("item-{i}")))
+                .collect(),
+        );
+        let buf = draw(&mut p, 60, 20);
+        assert!(
+            panel_rows(&buf, 60, 20) <= 18,
+            "a long list must not draw past the area it was handed",
+        );
+    }
+
+    #[test]
+    fn a_description_too_long_to_fit_ends_in_an_ellipsis() {
+        // Asserting the row stops at the border proves nothing: ratatui's List
+        // clips there whatever it is handed, so a hard mid-word cut passes it
+        // too. What changed is that the cut is now *marked* — the user is told
+        // the sentence continues instead of being shown a severed word.
+        let long =
+            "Cron-driven reminders, time-aware scheduling, and recurring nudges for anything";
+        let mut p = clawhub_picker(vec![ListPickerItem {
+            key: "k".into(),
+            primary: "scheduler-reminders · v0.1.0".into(),
+            secondary: long.into(),
+        }]);
+        let text = pane_text(&mut p, 60, 20);
+        assert!(text.contains('…'), "no ellipsis marks the cut: {text}");
+        assert!(
+            !text.contains("for anything"),
+            "the tail should have been cut, not drawn: {text}",
+        );
+    }
+
+    #[test]
+    fn skill_rows_give_the_description_its_own_line() {
+        // Two rows per entry for the skill-shaped pickers: a summary sharing
+        // one line with the label had single digits of width left over.
+        let mut p = clawhub_picker(vec![ListPickerItem {
+            key: "k".into(),
+            primary: "Weather  @steipete ✓".into(),
+            secondary: "Get current weather and forecasts (no API key required).".into(),
+        }]);
+        let buf = draw(&mut p, 70, 20);
+        let text: String = (0..20u16)
+            .map(|y| (0..70u16).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        let label_row = text
+            .lines()
+            .position(|l| l.contains("@steipete"))
+            .expect("label row");
+        let desc_row = text
+            .lines()
+            .position(|l| l.contains("Get current weather"))
+            .expect("description row");
+        assert_eq!(desc_row, label_row + 1, "description sits under the label");
+        // And it is not the truncated stub the one-line layout produced.
+        assert!(text.contains("no API key required"), "got: {text}");
+    }
+
+    #[test]
+    fn a_wide_character_row_is_measured_in_cells_not_characters() {
+        // Each ideograph is two cells, so a character count budgets twice the
+        // text that fits. The old helper documented this as "revisit if we
+        // ever pick up east-Asian option text"; ClawHub returns it now.
+        let cjk = "查询指定城市或地区的天气预报信息，包括温度、天气状况、降水概率与风力等级";
+        let mut p = clawhub_picker(vec![ListPickerItem {
+            key: "k".into(),
+            primary: "weather  @congwupiece".into(),
+            secondary: cjk.into(),
+        }]);
+        let w = 50u16;
+        let text = pane_text(&mut p, w, 20);
+        let drawn = text
+            .lines()
+            .find(|l| l.contains('查'))
+            .expect("the description row");
+        // This is the observable difference, and the only one. A character
+        // budget asks for roughly twice the cells the pane has, so the row is
+        // filled past its width and ratatui clips — taking the ellipsis with
+        // it. Measured in cells, the mark survives because it was placed
+        // inside the pane to begin with.
+        assert!(
+            drawn.contains('…'),
+            "the cut is unmarked, so the budget was not measured in cells: {drawn:?}",
+        );
+    }
+
+    #[test]
+    fn a_failed_search_says_so_in_the_title() {
+        // Logging alone left the previous results on screen, which is
+        // indistinguishable from a search that succeeded.
+        let mut p = clawhub_picker(vec![item("k", "stale-result")]);
+        p.status = Some(PickerStatus {
+            text: "✗ search failed — network unreachable".into(),
+            tone: StatusTone::Error,
+        });
+        let text = rendered_text(&mut p);
+        assert!(text.contains("search failed"), "got: {text}");
     }
 
     /// Render a picker and return the whole pane as text, so assertions can

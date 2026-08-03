@@ -155,6 +155,10 @@ webpki-roots = "1.0.6"
 # TUI framework
 ratatui = { version = "0.29", optional = true, default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 crossterm = { version = "0.28", optional = true }
+# Display width for row truncation. ratatui already builds this crate, so
+# depending on it directly adds no compilation — and counting `chars()` is
+# simply wrong for the CJK skill summaries ClawHub now returns.
+unicode-width = { version = "0.2", optional = true }
 
 # email
 lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
@@ -250,7 +254,7 @@ default = ["tui", "whatsapp-web", "remote-install", "kb"]
 # Gemini CLI OAuth) — see the comment at src/providers/mod.rs:18 and
 # plans/025-rigprovider-auth-parity.md.
 legacy-providers = []
-tui = ["dep:ratatui", "dep:crossterm"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
