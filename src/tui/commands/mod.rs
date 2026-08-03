@@ -12,7 +12,7 @@ mod pairing;
 mod permissions;
 mod session;
 pub mod setup;
-mod skills;
+pub(crate) mod skills;
 
 use anyhow::Result;
 use std::collections::HashMap;

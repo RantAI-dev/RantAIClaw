@@ -163,7 +163,40 @@ fn active_skill_status_from_context(ctx: &TuiContext) -> Vec<(crate::skills::Ski
     }
 }
 
-fn build_skill_items(skills: &[(crate::skills::Skill, Vec<String>)]) -> Vec<ListPickerItem> {
+/// Short provenance tag for a picker row, or `None` when the gateway recorded
+/// no origin. `@handle` for a ClawHub install so the publisher stays visible
+/// after the install screen is gone; a bare word for the rest.
+pub(crate) fn skill_origin_label(s: &crate::skills::Skill) -> Option<String> {
+    use crate::skills::origin::SkillOriginKind;
+    let origin = s.origin.as_ref()?;
+    match origin.kind {
+        SkillOriginKind::Authored => Some("yours".to_string()),
+        // `source` is the `@owner/slug` reference the install ran with. Fall
+        // back to the bare word when it is missing rather than dropping the
+        // tag: "installed from ClawHub, publisher unrecorded" is still worth
+        // more than a row that says nothing about where it came from.
+        SkillOriginKind::Clawhub => Some(
+            origin
+                .source
+                .as_deref()
+                .and_then(clawhub_handle)
+                .map_or_else(|| "clawhub".to_string(), |h| format!("@{h}")),
+        ),
+        SkillOriginKind::Bundled => Some("bundled".to_string()),
+        SkillOriginKind::Git => Some("git".to_string()),
+        SkillOriginKind::Local => Some("local".to_string()),
+    }
+}
+
+/// Publisher handle out of an `@owner/slug` reference.
+fn clawhub_handle(source: &str) -> Option<&str> {
+    let handle = source.trim().strip_prefix('@')?.split('/').next()?;
+    (!handle.is_empty()).then_some(handle)
+}
+
+pub(crate) fn build_skill_items(
+    skills: &[(crate::skills::Skill, Vec<String>)],
+) -> Vec<ListPickerItem> {
     skills
         .iter()
         .map(|(s, reasons)| {
@@ -176,6 +209,16 @@ fn build_skill_items(skills: &[(crate::skills::Skill, Vec<String>)]) -> Vec<List
                 primary
             } else {
                 format!("✗ {primary}")
+            };
+            // Where this copy came from. Two skills with the same name do
+            // different things depending on who wrote them, and after
+            // installing `@steipete/weather` the row read simply `weather` —
+            // the publisher you chose on the install screen was gone by the
+            // time you looked at what you had. Absent origin says nothing
+            // rather than guessing: unrecorded is not the same as bundled.
+            let primary = match skill_origin_label(s) {
+                Some(label) => format!("{primary}  {label}"),
+                None => primary,
             };
             let mut secondary = s.description.clone();
             if !reasons.is_empty() {
@@ -372,12 +415,32 @@ impl CommandHandler for SkillCommand {
                 if !s.tags.is_empty() {
                     sec = sec.spacer().key_value("Tags", s.tags.join(", "));
                 }
-                panel = panel
-                    .section(sec)
-                    .section(InfoSection::new("Activate").plain(
-                        "Describe what you want and the agent will use this \
-                             skill — e.g. `summarize today's standup notes`.",
-                    ));
+                // Who put this on disk, and where. The panel used to answer
+                // neither, so a skill installed from ClawHub was
+                // indistinguishable from one shipped in the box — and the two
+                // differ in who can change what the agent will read.
+                if let Some(origin) = skill_origin_label(&s) {
+                    sec = sec.spacer().key_value("Source", origin);
+                }
+                if let Some(slug) = s.slug() {
+                    if slug != s.name {
+                        sec = sec.key_value("Folder", slug);
+                    }
+                }
+                if !s.tools.is_empty() {
+                    let names: Vec<&str> = s.tools.iter().map(|t| t.name.as_str()).collect();
+                    sec = sec.key_value("Tools", names.join(", "));
+                }
+                // Naming the skill makes this true of the skill in front of
+                // you. It used to read `e.g. summarize today's standup notes`
+                // on every panel, so the weather skill explained itself with a
+                // summarizer's example.
+                panel = panel.section(sec).section(
+                    InfoSection::new("Activate")
+                        .plain("Describe the task and the agent reaches for this skill on its own.")
+                        .spacer()
+                        .key_value("Force it", format!("Use the {} skill: <task>", s.name)),
+                );
                 Ok(CommandResult::OpenInfoPanel(panel))
             }
             None => Ok(CommandResult::Message(format!(

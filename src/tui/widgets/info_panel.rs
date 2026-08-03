@@ -20,6 +20,10 @@ use ratatui::{
     Frame,
 };
 
+/// Smallest useful panel: two borders around two rows. Mirrors the picker's
+/// floor so the two surfaces shrink alike.
+const MIN_PANEL_HEIGHT: u16 = 4;
+
 /// Visual status icon for a `Status` row. Determines glyph + color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
@@ -273,17 +277,46 @@ impl InfoPanel {
 
     /// Render the panel into `area`. The widget owns its own clear so the
     /// chat scrollback underneath is hidden cleanly.
+    /// Word-wrap `text` to `width` columns, giving every line the same
+    /// `indent`. Falls back to one unwrapped line when the width leaves no
+    /// room for content, which is better than an infinite loop.
+    fn wrap_indented(text: &str, indent: &str, width: usize) -> Vec<Line<'static>> {
+        use crate::tui::render::display_cols;
+
+        let avail = width.saturating_sub(display_cols(indent));
+        if avail < 4 {
+            return vec![Line::from(format!("{indent}{text}"))];
+        }
+        let mut lines = Vec::new();
+        let mut cur = String::new();
+        for word in text.split_whitespace() {
+            let w = display_cols(word);
+            if cur.is_empty() {
+                cur.push_str(word);
+            } else if display_cols(&cur) + 1 + w <= avail {
+                cur.push(' ');
+                cur.push_str(word);
+            } else {
+                lines.push(Line::from(format!("{indent}{cur}")));
+                cur = word.to_string();
+            }
+        }
+        if !cur.is_empty() || lines.is_empty() {
+            lines.push(Line::from(format!("{indent}{cur}")));
+        }
+        lines
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if area.width < 12 || area.height < 4 {
             return;
         }
-        let panel = Rect {
-            x: area.x + 1,
-            y: area.y + 1,
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
-        };
-        frame.render_widget(Clear, panel);
+        // Width is fixed by the area; height waits until the body is built, so
+        // the panel can be sized to what it holds. Six lines of skill detail
+        // used to sit at the top of a full-screen box.
+        let width = area.width.saturating_sub(2);
+        // Text width inside the borders — what a wrapped paragraph has to fit.
+        let body_w = width.saturating_sub(2) as usize;
 
         // Brand colors — must stay in sync with list_picker.rs and
         // setup_overlay.rs so the surfaces feel like one app.
@@ -311,7 +344,9 @@ impl InfoPanel {
         title_spans.push(Span::styled("↑/↓", Style::default().fg(sky)));
         title_spans.push(Span::styled(" scroll · ", Style::default().fg(muted)));
         title_spans.push(Span::styled("Esc ", Style::default().fg(sky)));
-        title_spans.push(Span::styled("close", Style::default().fg(muted)));
+        // Trailing space so the hint does not butt against the border rule —
+        // it rendered as `Esc close────────`, which reads as one word.
+        title_spans.push(Span::styled("close ", Style::default().fg(muted)));
         let title_line = Line::from(title_spans);
 
         let footer_spans: Vec<Span<'static>> = if let Some(ref hint) = self.footer_hint {
@@ -412,10 +447,11 @@ impl InfoPanel {
                         ]));
                     }
                     InfoRow::Plain(text) => {
-                        lines.push(Line::from(vec![
-                            Span::raw("    "),
-                            Span::styled(text.clone(), Style::default()),
-                        ]));
+                        // Wrapped here rather than by the Paragraph, which
+                        // knows nothing about the four-space gutter and so
+                        // returned every continuation line to column zero —
+                        // a paragraph that started indented and then did not.
+                        lines.extend(Self::wrap_indented(text, "    ", body_w));
                     }
                     InfoRow::Spacer => {
                         lines.push(Line::from(""));
@@ -431,6 +467,21 @@ impl InfoPanel {
         framed.push(Line::from(""));
         framed.extend(lines);
         framed.push(Line::from(""));
+
+        // Every `Plain` row is already wrapped to `body_w`, so the line count
+        // is the row count. Anything taller than the area still caps there and
+        // scrolls, exactly as before.
+        let available = area.height.saturating_sub(2);
+        let height = u16::try_from(framed.len().saturating_add(2))
+            .unwrap_or(u16::MAX)
+            .clamp(MIN_PANEL_HEIGHT.min(available), available);
+        let panel = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, panel);
 
         let body = Paragraph::new(framed)
             .block(block)

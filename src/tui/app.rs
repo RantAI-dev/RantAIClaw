@@ -99,8 +99,24 @@ pub enum ClawhubInstallFailure {
 /// what lets a search result install in one step — `/search` reports the
 /// publisher, while the listing endpoint omits it and still has to resolve
 /// through the ambiguity prompt.
+/// Deepest cause in an error chain, sized for a one-row status.
+///
+/// The outermost link is our own `.context("GET clawhub search")`, which tells
+/// the user what we were doing and nothing about why it failed — it read
+/// `✗ search failed — GET clawhub search`. The root is the part they can act
+/// on: a refused connection, a DNS failure, a timeout.
+fn root_cause_of(e: &anyhow::Error) -> String {
+    let root = e
+        .chain()
+        .last()
+        .map_or_else(|| e.to_string(), ToString::to_string);
+    let head = root.lines().next().unwrap_or("").trim();
+    crate::tui::render::truncate_to_cols(head, 60)
+}
+
 fn clawhub_result_item(
     skill: &crate::skills::clawhub::ClawHubSkill,
+    installed: &std::collections::HashMap<String, Option<String>>,
 ) -> crate::tui::widgets::ListPickerItem {
     let name = if skill.display_name.is_empty() {
         skill.slug.clone()
@@ -127,18 +143,23 @@ fn clawhub_result_item(
     } else if skill.stats.downloads > 0 {
         primary = format!("{primary}  (↓{})", skill.stats.downloads);
     }
-    let secondary = if skill.summary.is_empty() {
-        String::new()
-    } else {
-        let cleaned = skill.summary.replace('\n', " ");
-        let cleaned = cleaned.trim();
-        if cleaned.chars().count() > 90 {
-            let head: String = cleaned.chars().take(87).collect();
-            format!("{head}…")
-        } else {
-            cleaned.to_string()
+    // Whether this row is already on disk, and if so whose copy. Reinstalling
+    // is refused by the gateway when another publisher holds the directory, so
+    // a row offering an install that cannot happen is worse than a quiet one.
+    match installed.get(&skill.slug) {
+        None => {}
+        Some(None) => primary.push_str("  · installed"),
+        Some(Some(owner)) if owner == &skill.owner_handle => primary.push_str("  · installed"),
+        Some(Some(owner)) => {
+            use std::fmt::Write as _;
+            let _ = write!(primary, "  · @{owner} installed");
         }
-    };
+    }
+    // Left whole: the picker fits it to the width it actually has, and a
+    // second cap here only guaranteed the two would disagree. The old 90-char
+    // cut also measured characters, which halves the budget for the CJK
+    // summaries ClawHub returns.
+    let secondary = crate::tui::render::flatten_to_row(&skill.summary);
     let key = if skill.owner_handle.is_empty() {
         skill.slug.clone()
     } else {
@@ -261,6 +282,10 @@ pub struct TuiApp {
     /// that replaces this one on success, and those rows are keyed by the
     /// local manifest name.
     pub clawhub_install_in_progress: Option<(String, usize)>,
+    /// Spinner frame for an in-flight ClawHub *search*, or `None` when none is
+    /// running. The install path above already animates; searching did not,
+    /// and it is the slower of the two.
+    pub clawhub_search_frame: Option<usize>,
     /// Completion channel for spawned ClawHub install tasks. `Ok(slug)` on
     /// success. The render loop drains this each tick — when a result
     /// arrives, the install picker swaps to the Skill picker (success), asks
@@ -407,52 +432,41 @@ impl TuiApp {
             crate::skills::load_skills_with_status(&self.config.workspace_dir, &self.config);
     }
 
-    fn skill_picker_items(&self) -> Vec<crate::tui::widgets::ListPickerItem> {
+    /// Installed skills as `slug -> publisher handle`, for marking ClawHub
+    /// rows. `Some(None)` means the directory is taken but the gateway kept no
+    /// attribution — which reads as "installed", not as "not from ClawHub".
+    ///
+    /// Keyed by slug because that is the directory a second install would have
+    /// to claim, and the gateway refuses to overwrite one publisher's copy
+    /// with another's.
+    fn installed_slug_owners(&self) -> std::collections::HashMap<String, Option<String>> {
         self.context
-            .available_skills_with_status
+            .available_skills
             .iter()
-            .map(|(s, reasons)| {
-                let primary = if s.version.is_empty() {
-                    s.name.clone()
-                } else {
-                    format!("{} · v{}", s.name, s.version)
-                };
-                let primary = if reasons.is_empty() {
-                    primary
-                } else {
-                    format!("✗ {primary}")
-                };
-                let mut secondary = s.description.clone();
-                if !reasons.is_empty() {
-                    let reason = reasons.join("; ");
-                    secondary = if secondary.is_empty() {
-                        format!("gated: {reason}")
-                    } else {
-                        format!("{secondary}  · gated: {reason}")
-                    };
-                }
-                if !s.tags.is_empty() {
-                    secondary = format!("{secondary}  ({})", s.tags.join(", "));
-                }
-                let has_missing_bin = s
-                    .requires
-                    .unmet()
-                    .iter()
-                    .any(|reason| reason.starts_with("missing binary"));
-                if has_missing_bin && !s.install_recipes.is_empty() {
-                    secondary = if secondary.is_empty() {
-                        "Ctrl+I install deps".to_string()
-                    } else {
-                        format!("{secondary}  · Ctrl+I install deps")
-                    };
-                }
-                crate::tui::widgets::ListPickerItem {
-                    key: s.name.clone(),
-                    primary,
-                    secondary,
-                }
+            .filter_map(|s| {
+                let slug = s.slug()?;
+                let owner = s
+                    .origin
+                    .as_ref()
+                    .and_then(|o| o.source.as_deref())
+                    .and_then(|src| src.trim().strip_prefix('@'))
+                    .and_then(|rest| rest.split('/').next())
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string);
+                Some((slug, owner))
             })
             .collect()
+    }
+
+    /// Rows for the local skills picker.
+    ///
+    /// Delegates to the `/skills` command's builder rather than repeating it.
+    /// This was a verbatim copy, and the two had already begun to disagree:
+    /// the copy shown after an install is the one where knowing which
+    /// publisher you just took code from matters most, and it was the one
+    /// without that label.
+    fn skill_picker_items(&self) -> Vec<crate::tui::widgets::ListPickerItem> {
+        crate::tui::commands::skills::build_skill_items(&self.context.available_skills_with_status)
     }
 
     /// Create a new `TuiApp`, starting or resuming a session based on config.
@@ -516,6 +530,7 @@ impl TuiApp {
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
             clawhub_install_in_progress: None,
+            clawhub_search_frame: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
             skill_deps_install_in_progress: None,
@@ -1964,6 +1979,10 @@ impl TuiApp {
         // background task. Drain on each render tick so newly-arrived
         // results land between user actions, not just after the next key.
         self.drain_clawhub_search_results();
+        // Draining first means a result that just landed clears the spinner
+        // this frame instead of showing one more tick of "searching" after the
+        // rows have already changed.
+        self.tick_clawhub_search();
         // Same idea for install completion + spinner animation: advance
         // the spinner frame and check whether the spawned install task
         // has produced a result.
@@ -3355,6 +3374,11 @@ impl TuiApp {
         let Some(tx) = self.clawhub_install_results_tx.clone() else {
             return;
         };
+        // A ClawHub round trip runs six to sixteen seconds here. Without this
+        // the picker kept showing the previous results the whole time, with
+        // nothing to say a search was running — the user could not tell
+        // whether Enter had registered.
+        self.clawhub_search_frame = Some(0);
         self.clawhub_install_search_version = self.clawhub_install_search_version.wrapping_add(1);
         let version = self.clawhub_install_search_version;
         let q = query.to_string();
@@ -3573,12 +3597,34 @@ impl TuiApp {
         }
     }
 
+    /// Animate the in-flight search indicator. Same Braille spinner and the
+    /// same per-frame cadence as the install ticker below, so the two read as
+    /// one language rather than two.
+    fn tick_clawhub_search(&mut self) {
+        use super::widgets::{ListPickerKind, PickerStatus, StatusTone};
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+        let Some(frame) = self.clawhub_search_frame.as_mut() else {
+            return;
+        };
+        *frame = (*frame + 1) % SPINNER.len();
+        let glyph = SPINNER[*frame];
+        if let Some(p) = self.list_picker.as_mut() {
+            if p.kind == ListPickerKind::ClawhubInstall {
+                p.status = Some(PickerStatus {
+                    text: format!("{glyph} searching ClawHub…"),
+                    tone: StatusTone::Busy,
+                });
+            }
+        }
+    }
+
     /// Drain any pending ClawHub search results and apply the latest one
     /// matching the current search version. Called on each event loop
     /// tick (after a key is processed) so results land before the next
     /// render. Stale results (older versions) are silently discarded.
     fn drain_clawhub_search_results(&mut self) {
-        use super::widgets::{ListPickerItem, ListPickerKind};
+        use super::widgets::{ListPickerItem, ListPickerKind, PickerStatus, StatusTone};
 
         let current_version = self.clawhub_install_search_version;
         let Some(rx) = self.clawhub_install_results_rx.as_mut() else {
@@ -3596,6 +3642,10 @@ impl TuiApp {
             return;
         };
 
+        // Read before the picker borrow — the rows need to know what is
+        // already on disk, and `self` is not reachable once `picker` is held.
+        let installed = self.installed_slug_owners();
+
         let Some(picker) = self.list_picker.as_mut() else {
             return;
         };
@@ -3603,13 +3653,33 @@ impl TuiApp {
             return;
         }
 
+        self.clawhub_search_frame = None;
         match result {
             Ok(skills) => {
-                let items: Vec<ListPickerItem> = skills.iter().map(clawhub_result_item).collect();
+                picker.status = None;
+                let items: Vec<ListPickerItem> = skills
+                    .iter()
+                    .map(|s| clawhub_result_item(s, &installed))
+                    .collect();
+                if items.is_empty() {
+                    picker.empty_hint = if picker.query.trim().is_empty() {
+                        "ClawHub returned nothing.".to_string()
+                    } else {
+                        format!("No ClawHub skill matches '{}'.", picker.query.trim())
+                    };
+                }
                 picker.set_items(items);
             }
             Err(e) => {
-                tracing::warn!("ClawHub search failed: {e}");
+                // Logging alone left the previous results on screen, which is
+                // indistinguishable from a search that succeeded and returned
+                // the same thing. A failure the user cannot see is a failure
+                // they will act on.
+                tracing::warn!("ClawHub search failed: {e:#}");
+                picker.status = Some(PickerStatus {
+                    text: format!("✗ search failed — {}", root_cause_of(&e)),
+                    tone: StatusTone::Error,
+                });
             }
         }
     }
@@ -7784,12 +7854,18 @@ mod tests {
         // The key is fed straight to `install_one`, so a search result whose
         // publisher is known must install that publisher's copy — not
         // whichever one a bare slug happens to resolve to.
-        let item = clawhub_result_item(&clawhub_skill("weather", "steipete"));
+        let item = clawhub_result_item(
+            &clawhub_skill("weather", "steipete"),
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(item.key, "@steipete/weather");
 
         // The listing endpoint reports no publisher at all; those rows stay
         // bare and resolve through the ambiguity prompt instead.
-        let unowned = clawhub_result_item(&clawhub_skill("weather", ""));
+        let unowned = clawhub_result_item(
+            &clawhub_skill("weather", ""),
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(unowned.key, "weather");
     }
 
@@ -7798,7 +7874,7 @@ mod tests {
         let mut skill = clawhub_skill("weather", "steipete");
         skill.official = true;
         skill.stats.downloads = 165_212;
-        let item = clawhub_result_item(&skill);
+        let item = clawhub_result_item(&skill, &std::collections::HashMap::new());
         // Two same-slug rows differ only by publisher, so the handle has to
         // be on screen for the choice to mean anything.
         assert!(item.primary.contains("@steipete"), "{}", item.primary);
@@ -7809,7 +7885,7 @@ mod tests {
         // would read as "nobody uses this".
         let mut starred = clawhub_skill("weather", "");
         starred.stats.stars = 427;
-        let listed = clawhub_result_item(&starred);
+        let listed = clawhub_result_item(&starred, &std::collections::HashMap::new());
         assert!(listed.primary.contains("★427"), "{}", listed.primary);
         assert!(!listed.primary.contains('↓'), "{}", listed.primary);
     }
@@ -7875,7 +7951,11 @@ mod tests {
         // installed skill in the Skill picker, whose rows are keyed by local
         // manifest name. Reusing the reference there would silently fail to
         // match, so the slug is derived separately.
-        let reference = clawhub_result_item(&clawhub_skill("weather", "steipete")).key;
+        let reference = clawhub_result_item(
+            &clawhub_skill("weather", "steipete"),
+            &std::collections::HashMap::new(),
+        )
+        .key;
         let slug = crate::skills::clawhub::parse_skill_ref(&reference)
             .map_or_else(|_| reference.clone(), |parsed| parsed.slug);
         assert_eq!(reference, "@steipete/weather");
@@ -8079,6 +8159,7 @@ mod tests {
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
             clawhub_install_in_progress: None,
+            clawhub_search_frame: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
             skill_deps_install_in_progress: None,
@@ -8182,6 +8263,7 @@ mod submit_tests {
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
             clawhub_install_in_progress: None,
+            clawhub_search_frame: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
             skill_deps_install_in_progress: None,
@@ -8547,6 +8629,7 @@ mod ctrl_c_tests {
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
             clawhub_install_in_progress: None,
+            clawhub_search_frame: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
             skill_deps_install_in_progress: None,
@@ -8731,6 +8814,7 @@ mod drain_tests {
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
             clawhub_install_in_progress: None,
+            clawhub_search_frame: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
             skill_deps_install_in_progress: None,
@@ -8900,6 +8984,7 @@ mod retry_tests {
             clawhub_install_results_rx: None,
             clawhub_install_results_tx: None,
             clawhub_install_in_progress: None,
+            clawhub_search_frame: None,
             clawhub_install_completion_rx: None,
             clawhub_install_completion_tx: None,
             skill_deps_install_in_progress: None,
