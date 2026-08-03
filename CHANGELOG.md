@@ -5,6 +5,67 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.3-alpha] — 2026-08-03
+
+You could not type a space into the skill authoring form. This fixes that, and
+rebuilds the Skills panel around it.
+
+### Fixed
+
+- **A space could not be typed into the skill form.** `Kopi Pagi` came out as
+  `KopiPagi` — in Name, in Description, and in every Instructions step. Any
+  multi-word value was unreachable, which is most of them.
+
+  The form deliberately holds no state of its own: each keystroke writes the
+  whole field into the `SKILL.md` document and reads it straight back, which is
+  what lets the Form and Markdown views share one source and keeps
+  hand-written sections intact. But both halves of that round trip normalized
+  — the writer trimmed, and so did the reader — so a trailing space was
+  deleted before the next character could arrive after it. Normalization
+  belongs at save, not at every keypress; only line breaks are stripped now,
+  since those are the one thing that genuinely breaks a line-oriented
+  frontmatter parser. Whitespace at the ends never mattered: the loader trims
+  it either way.
+
+- **`Add step` did nothing once a step existed.** Same defect from the other
+  direction — the writer filtered empty items out, so a newly added blank row
+  disappeared before it could be typed into, and clearing a step's text
+  deleted the row out from under the cursor.
+
+### Changed
+
+Ships as claw-ui v0.3.14, which this release pins.
+
+- The left rail reads **Skills**, not *ClawHub Skills*. Installed skills also
+  come from bundled packs, git, local paths, and the user's own hand; naming
+  the marketplace made the section look like it was only for browsing someone
+  else's work. Route ids are unchanged, so `#skills` still resolves.
+
+- The Skills panel is rebuilt around the authoring form. `Write` is reachable
+  from both views instead of only Installed — it used to disappear exactly
+  when a user with nothing installed most needed it. The installed list gained
+  search and origin badges (`yours`, `@publisher`, `bundled`, `git`, `local`),
+  the ClawHub error state gained the retry it never had, and the editor moved
+  from a modal to a drawer carrying a running size against the gateway's 64 KB
+  body cap — a limit that previously surfaced only as a `413` after a failed
+  save.
+
+- Smaller corrections in the same pass: `Needs a name.` no longer greets an
+  untouched field, labels are bound to their inputs, `Enter` continues the
+  step list, the uninstall prompt names the skill rather than its directory,
+  and the nav badge follows your own writes instead of reporting the count
+  from page load.
+
+### Notes
+
+The gateway is untouched — `/api/v1/skills*` is unchanged, and this is a
+console pin bump plus its release.
+
+The regression test types character by character through the same write/read
+cycle the component performs. That is the only shape in which this reproduces:
+asserting on a single write passes either way, which is why the existing suite
+was green throughout.
+
 ## [0.16.2-alpha] — 2026-07-31
 
 The skill authoring form shipped unreachable. This makes it work.
