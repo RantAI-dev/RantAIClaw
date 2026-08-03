@@ -505,11 +505,7 @@ impl TuiApp {
         // picker without reaching back into TuiApp from the command
         // handler (which only sees TuiContext).
         let command_registry = CommandRegistry::new();
-        context.available_commands = command_registry
-            .get_help()
-            .into_iter()
-            .map(|(n, d)| (n.to_string(), d.to_string()))
-            .collect();
+        context.available_commands = command_registry.get_help_detailed();
 
         Ok(Self {
             state: AppState::Ready,

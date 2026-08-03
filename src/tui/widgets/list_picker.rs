@@ -594,7 +594,10 @@ impl ListPicker {
         match self.kind {
             ListPickerKind::Skill
             | ListPickerKind::ClawhubInstall
-            | ListPickerKind::ClawhubPublisher => 2,
+            | ListPickerKind::ClawhubPublisher
+            // `/help` heads each row with the full invocation form, which is
+            // longer than a name and needs the line to itself.
+            | ListPickerKind::Help => 2,
             _ => 1,
         }
     }

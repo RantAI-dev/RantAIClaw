@@ -358,6 +358,48 @@ impl CommandRegistry {
         help.sort_by(|a, b| a.0.cmp(b.0));
         help
     }
+
+    /// Same listing, carrying each command's invocation form.
+    ///
+    /// `usage()` has been implemented on two dozen commands and rendered
+    /// nowhere: its only readers were two error paths in `permissions.rs`, so
+    /// `/skill new` and `/skill edit` were documented in a string no user could
+    /// reach. This is what `/help` reads now.
+    pub fn get_help_detailed(&self) -> Vec<CommandInfo> {
+        let mut help: Vec<CommandInfo> = self
+            .commands
+            .values()
+            .map(|h| CommandInfo {
+                name: h.name().to_string(),
+                description: h.description().to_string(),
+                usage: h.usage().to_string(),
+            })
+            .collect();
+        help.sort_by(|a, b| a.name.cmp(&b.name));
+        help
+    }
+}
+
+/// One command in the startup snapshot `/help` renders from.
+#[derive(Debug, Clone)]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+    /// Invocation form. Equals `name` when the command takes no arguments —
+    /// the trait's default — so callers must compare before showing it.
+    pub usage: String,
+}
+
+impl CommandInfo {
+    /// The heading for this command: its invocation form when that says more
+    /// than the bare name, else `/name`.
+    pub fn headline(&self) -> String {
+        if self.usage == self.name {
+            format!("/{}", self.name)
+        } else {
+            self.usage.clone()
+        }
+    }
 }
 
 impl Default for CommandRegistry {
