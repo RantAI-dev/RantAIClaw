@@ -5,6 +5,74 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.4-alpha] — 2026-08-03
+
+The terminal's skill screens, audited by driving them rather than reading them.
+
+### Fixed
+
+- **A failed ClawHub search was silent.** The error was logged and the previous
+  results were left on screen — indistinguishable from a search that succeeded
+  and returned the same thing. A failure you cannot see is one you act on. It
+  now says so beside the title, and names the root cause (`Connection refused`)
+  rather than our own "GET clawhub search" context.
+
+- **A search gave no sign it was running.** Six to sixteen seconds against the
+  live registry with the stale list still showing and nothing moving; you could
+  not tell whether Enter had registered. Installing already animated a spinner,
+  so searching — the slower of the two — was the one without feedback.
+
+- **`↓` bounced between the last two entries of a long list.** The end-of-list
+  wrap returned to the top of the last *page* instead of the top of the list.
+  Latent for as long as a page was the whole screen; reachable once a two-row
+  entry halved the stride.
+
+- **Rows were clipped mid-word at the border.** They are cut with an ellipsis
+  now, so a cut reads as a cut. The fit is measured in display cells rather
+  than characters — a Chinese summary occupies twice the width a character
+  count budgets for it, and ClawHub returns those.
+
+- **Literal `\n` escapes appeared verbatim** inside ClawHub summaries, where a
+  publisher had written them into their own frontmatter.
+
+- **The skill detail panel explained every skill with a summarizer's example.**
+  `weather` suggested `e.g. summarize today's standup notes`. It names the
+  skill in front of you now, and gained `Source`, `Folder` and `Tools`.
+
+- **`/skills new` and `/skills edit` did nothing.** Only the singular `/skill`
+  accepted them, so the plural fell through to the picker, which preselected
+  nothing and said nothing. Both spellings route to the same handlers now.
+
+### Changed
+
+- **`/help` shows each command's invocation form.** Two dozen commands
+  implement `usage()` and nothing rendered it — its only readers were two error
+  paths — so `/skill new`, `/skill edit` and `/skill install` were documented
+  in a string no user could reach. Commands that take no arguments still show
+  their bare name.
+
+- **Pickers and info panels size to their contents** instead of taking the
+  whole screen. Five skills used to sit at the top of a forty-six-row box.
+
+- **Installed skills show where they came from** — `yours`, `@publisher`,
+  `bundled`, `git`, `local`. After installing `@steipete/weather` the row read
+  simply `weather`, so the publisher you chose on the install screen was gone
+  by the time you looked at what you had. ClawHub rows are marked `installed`
+  or `@other installed`, since the gateway refuses to overwrite another
+  publisher's directory and an install that cannot happen should not be
+  offered.
+
+### Notes
+
+Terminal-side only. No gateway, API, or configuration change, and the console
+pin stays at claw-ui v0.3.14.
+
+Two of the tests written for this shipped green against the bug they were
+meant to catch: ratatui clips at the border whatever it is handed, so
+asserting that a row stops there passes for a hard mid-word cut too. They were
+found by mutating the fix away and watching them stay green, and every test
+here was re-checked the same way.
+
 ## [0.16.3-alpha] — 2026-08-03
 
 You could not type a space into the skill authoring form. This fixes that, and
