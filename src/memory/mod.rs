@@ -61,10 +61,15 @@ where
         MemoryBackendKind::Markdown => Ok(Box::new(MarkdownMemory::new(workspace_dir))),
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
-            tracing::warn!(
-                "Unknown memory backend '{backend_name}'{unknown_context}, falling back to markdown"
-            );
-            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+            // Falling back to markdown here meant a typo in `backend` silently
+            // ran a different store with different semantics — one whose
+            // `forget` used to do nothing — while a warning scrolled past. The
+            // backend is a config contract; an unrecognised value is a
+            // configuration error, not a default.
+            anyhow::bail!(
+                "unknown memory backend '{backend_name}'{unknown_context}; \
+                 expected one of: sqlite, lucid, markdown, postgres, none"
+            )
         }
     }
 }
@@ -661,14 +666,24 @@ mod tests {
     }
 
     #[test]
-    fn factory_unknown_falls_back_to_markdown() {
+    /// An unrecognised backend used to fall back to markdown behind a warning,
+    /// so a typo silently ran a different store with different semantics. The
+    /// backend name is a config contract; an unknown value is an error.
+    fn factory_unknown_backend_is_rejected() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
             backend: "redis".into(),
             ..MemoryConfig::default()
         };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "markdown");
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("an unknown backend must not silently resolve to another one");
+        let message = error.to_string();
+        assert!(message.contains("redis"), "{message}");
+        assert!(
+            message.contains("sqlite"),
+            "the error must list the valid values: {message}"
+        );
     }
 
     #[test]

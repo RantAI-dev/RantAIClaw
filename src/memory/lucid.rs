@@ -383,8 +383,27 @@ impl Memory for LucidMemory {
         self.local.list(category, session_id).await
     }
 
+    /// Remove the local copy.
+    ///
+    /// The external lucid store keeps its own, and this codebase does not know
+    /// that CLI's delete verb — only `store` and `context` are used anywhere
+    /// here, so issuing a guess would be inventing an API. Say so rather than
+    /// let `memory_forget`, which offers to "delete sensitive data", read as a
+    /// complete deletion.
+    ///
+    /// A forgotten entry can therefore still resurface through `recall`'s merge
+    /// with lucid results. Closing that needs either the external delete API or
+    /// a local tombstone consulted on the read path.
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
-        self.local.forget(key).await
+        let removed = self.local.forget(key).await?;
+        if removed {
+            tracing::warn!(
+                key,
+                "removed the local copy only; the lucid store keeps its own and may \
+                 resurface it on recall"
+            );
+        }
+        Ok(removed)
     }
 
     async fn count(&self) -> anyhow::Result<usize> {

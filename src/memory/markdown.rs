@@ -4,6 +4,21 @@ use chrono::Local;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+/// Split a stored line back into the key and content `store` wrote.
+///
+/// `store` renders `- **key**: content`; this is the inverse. Returns `None` for
+/// a line an operator hand-wrote in some other shape, which then keeps its
+/// positional identity rather than being mangled into one.
+fn split_stored_entry(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("**")?;
+    let (key, content) = rest.split_once("**: ")?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key.to_string(), content.to_string()))
+}
+
 /// Markdown-based memory — plain files as source of truth
 ///
 /// Layout:
@@ -83,10 +98,17 @@ impl MarkdownMemory {
             .map(|(i, line)| {
                 let trimmed = line.trim();
                 let clean = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+                // `store` writes `- **key**: content`, so read the key back out
+                // of it. Keys used to be positional (`file:index`), which meant
+                // they did not survive a round trip: `get`/`forget` could not
+                // address an entry by the key it was stored under, and every
+                // index shifted when a line was added above.
+                let (key, content) = split_stored_entry(clean)
+                    .unwrap_or_else(|| (format!("{filename}:{i}"), clean.to_string()));
                 MemoryEntry {
                     id: format!("{filename}:{i}"),
-                    key: format!("{filename}:{i}"),
-                    content: clean.to_string(),
+                    key,
+                    content,
                     category: category.clone(),
                     timestamp: filename.to_string(),
                     session_id: None,
@@ -94,6 +116,29 @@ impl MarkdownMemory {
                 }
             })
             .collect()
+    }
+
+    /// Every markdown file this backend owns: the core file, then the daily logs.
+    async fn all_memory_files(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+
+        let core = self.core_path();
+        if core.exists() {
+            paths.push(core);
+        }
+
+        let mem_dir = self.memory_dir();
+        if mem_dir.exists() {
+            let mut dir = fs::read_dir(&mem_dir).await?;
+            while let Some(entry) = dir.next_entry().await? {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    paths.push(path);
+                }
+            }
+        }
+
+        Ok(paths)
     }
 
     async fn read_all_entries(&self) -> anyhow::Result<Vec<MemoryEntry>> {
@@ -212,10 +257,46 @@ impl Memory for MarkdownMemory {
         }
     }
 
-    async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
-        // Markdown memory is append-only by design (audit trail)
-        // Return false to indicate the entry wasn't removed
-        Ok(false)
+    /// Remove the line holding `key`.
+    ///
+    /// This used to return `false` unconditionally, described as append-only for
+    /// the audit trail. That reasoning does not survive the tool that calls it:
+    /// `memory_forget` offers to "delete outdated facts or sensitive data", and
+    /// answering "no memory found" about an entry that plainly exists is worse
+    /// than either deleting it or refusing outright.
+    async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+        let mut removed = false;
+
+        for path in self.all_memory_files().await? {
+            let Ok(existing) = fs::read_to_string(&path).await else {
+                continue;
+            };
+
+            let kept: Vec<&str> = existing
+                .lines()
+                .filter(|line| {
+                    let clean = line.trim().strip_prefix("- ").unwrap_or(line.trim());
+                    match split_stored_entry(clean) {
+                        Some((stored_key, _)) if stored_key == key => {
+                            removed = true;
+                            false
+                        }
+                        _ => true,
+                    }
+                })
+                .collect();
+
+            if removed {
+                let mut rewritten = kept.join("\n");
+                if !rewritten.ends_with('\n') {
+                    rewritten.push('\n');
+                }
+                fs::write(&path, rewritten).await?;
+                break;
+            }
+        }
+
+        Ok(removed)
     }
 
     async fn count(&self) -> anyhow::Result<usize> {
@@ -333,13 +414,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn markdown_forget_is_noop() {
+    /// `forget` used to return `false` unconditionally, so `memory_forget` —
+    /// which offers to delete sensitive data — reported "no memory found" about
+    /// an entry that plainly existed.
+    async fn markdown_forget_removes_the_entry() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("a", "permanent", MemoryCategory::Core, None)
+        mem.store("doomed", "delete me", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let removed = mem.forget("a").await.unwrap();
-        assert!(!removed, "Markdown memory is append-only");
+        mem.store("keeper", "keep me", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let removed = mem.forget("doomed").await.unwrap();
+        assert!(removed, "an entry that exists must be reported as removed");
+
+        let remaining = mem.list(None, None).await.unwrap();
+        let keys: Vec<&str> = remaining.iter().map(|e| e.key.as_str()).collect();
+        assert!(!keys.contains(&"doomed"), "still present: {keys:?}");
+        assert!(
+            keys.contains(&"keeper"),
+            "took a neighbour with it: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn markdown_forget_reports_false_for_a_missing_key() {
+        let (_tmp, mem) = temp_workspace();
+        assert!(!mem.forget("never_stored").await.unwrap());
+    }
+
+    /// `store` writes `- **key**: content`; keys used to be read back
+    /// positionally, so they did not survive the round trip and every index
+    /// shifted when a line was added above.
+    #[tokio::test]
+    async fn markdown_keys_round_trip_through_storage() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("user_lang", "prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let fetched = mem.get("user_lang").await.unwrap();
+        assert!(fetched.is_some(), "an entry must be addressable by its key");
+        assert_eq!(fetched.unwrap().content, "prefers Rust");
     }
 
     #[tokio::test]
