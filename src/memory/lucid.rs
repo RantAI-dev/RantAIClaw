@@ -341,7 +341,12 @@ impl Memory for LucidMemory {
         match self.recall_from_lucid(query).await {
             Ok(lucid_results) if !lucid_results.is_empty() => {
                 self.clear_failure();
-                Ok(Self::merge_results(local_results, lucid_results, limit))
+                let mut merged = Self::merge_results(local_results, lucid_results, limit);
+                // Two rankings meet here — the local backend's normalised scores
+                // and lucid's rank-derived ones. Rescale the union so the set
+                // still satisfies the trait's "best hit scores 1.0" contract.
+                super::vector::normalize_entry_scores(&mut merged);
+                Ok(merged)
             }
             Ok(_) => {
                 self.clear_failure();
@@ -671,5 +676,34 @@ exit 1
 
         let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert_eq!(calls.lines().count(), 1);
+    }
+
+    /// Contract: the top-ranked entry lucid returns scores 1.0, and rank order
+    /// is strictly decreasing from there.
+    #[test]
+    fn lucid_top_ranked_entry_scores_one() {
+        let parsed = LucidMemory::parse_lucid_context(
+            "<lucid-context>\n\
+             - [decision] Use token refresh middleware\n\
+             - [context] Working in src/auth.rs\n\
+             </lucid-context>",
+        );
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].score,
+            Some(1.0),
+            "the top-ranked lucid entry must score 1.0"
+        );
+        assert!(
+            parsed[1].score < parsed[0].score,
+            "rank order must decrease: {:?} then {:?}",
+            parsed[0].score,
+            parsed[1].score
+        );
+        for e in &parsed {
+            let s = e.score.unwrap();
+            assert!((0.0..=1.0).contains(&s), "{} out of range: {s}", e.key);
+        }
     }
 }

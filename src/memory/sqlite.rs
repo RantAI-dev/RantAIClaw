@@ -662,6 +662,9 @@ impl Memory for SqliteMemory {
 
             // Hybrid merge
             let merged = if vector_results.is_empty() {
+                // Raw BM25 magnitudes. They are unbounded, so they are not a
+                // relevance yet — the single rescale at the end of `recall`
+                // turns them into one. Ordering is unaffected either way.
                 keyword_results
                     .iter()
                     .map(|(id, score)| vector::ScoredResult {
@@ -743,11 +746,15 @@ impl Memory for SqliteMemory {
             // which helps prepared-statement cache efficiency.
             if results.is_empty() {
                 const MAX_LIKE_KEYWORDS: usize = 8;
-                let keywords: Vec<String> = query
+                // Kept alongside the `%…%` patterns so each row can be scored by
+                // how many of these terms it actually contains.
+                let keyword_terms: Vec<String> = query
                     .split_whitespace()
                     .take(MAX_LIKE_KEYWORDS)
-                    .map(|w| format!("%{w}%"))
+                    .map(str::to_lowercase)
                     .collect();
+                let keywords: Vec<String> =
+                    keyword_terms.iter().map(|w| format!("%{w}%")).collect();
                 if !keywords.is_empty() {
                     let conditions: Vec<String> = keywords
                         .iter()
@@ -775,14 +782,32 @@ impl Memory for SqliteMemory {
                     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
                         param_values.iter().map(AsRef::as_ref).collect();
                     let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                        let key: String = row.get(1)?;
+                        let content: String = row.get(2)?;
+                        // A substring scan has no ranking of its own. Score it by
+                        // how much of the query it actually covers — claiming a
+                        // perfect 1.0 made the weakest retrieval path outrank
+                        // every BM25 and vector hit.
+                        let haystack = format!("{key} {content}").to_lowercase();
+                        #[allow(clippy::cast_precision_loss)]
+                        let matched = keyword_terms
+                            .iter()
+                            .filter(|term| haystack.contains(term.as_str()))
+                            .count() as f64;
+                        #[allow(clippy::cast_precision_loss)]
+                        let coverage = if keyword_terms.is_empty() {
+                            0.0
+                        } else {
+                            matched / keyword_terms.len() as f64
+                        };
                         Ok(MemoryEntry {
                             id: row.get(0)?,
-                            key: row.get(1)?,
-                            content: row.get(2)?,
+                            key,
+                            content,
                             category: Self::str_to_category(&row.get::<_, String>(3)?),
                             timestamp: row.get(4)?,
                             session_id: row.get(5)?,
-                            score: Some(1.0),
+                            score: Some(coverage),
                         })
                     })?;
                     for row in rows {
@@ -797,6 +822,12 @@ impl Memory for SqliteMemory {
                 }
             }
 
+            // Every path out of `recall` — hybrid, keyword-only, LIKE fallback —
+            // lands here, so the returned set always satisfies the trait's
+            // "best hit scores 1.0" contract. Idempotent for the paths that
+            // already normalised, and it re-bases the set when session filtering
+            // has removed the top hit.
+            vector::normalize_entry_scores(&mut results);
             results.truncate(limit);
             Ok(results)
         })
@@ -1760,6 +1791,71 @@ mod tests {
         let long = "a".repeat(1_000_000);
         let h = SqliteMemory::content_hash("test-model", 8, &long);
         assert_eq!(h.len(), 16);
+    }
+
+    // ── Score contract ────────────────────────────────────────────
+
+    /// BM25 magnitudes are unbounded, so the keyword-only path used to hand back
+    /// a raw score that no `[0,1]` threshold could be compared against.
+    #[tokio::test]
+    async fn keyword_only_top_hit_scores_one() {
+        let (_tmp, mem) = temp_sqlite();
+        for (k, c) in [
+            ("a", "rust ownership and borrowing"),
+            ("b", "rust lifetimes"),
+            ("c", "unrelated note about gardening"),
+        ] {
+            mem.store(k, c, MemoryCategory::Core, None).await.unwrap();
+        }
+
+        let hits = mem.recall("rust", 10, None).await.unwrap();
+        assert!(!hits.is_empty(), "expected keyword hits");
+
+        let best = hits.iter().filter_map(|e| e.score).fold(0.0_f64, f64::max);
+        assert!(
+            (best - 1.0).abs() < 1e-6,
+            "best hit must score 1.0, got {best}"
+        );
+        for e in &hits {
+            let s = e.score.unwrap();
+            assert!((0.0..=1.0).contains(&s), "{} out of range: {s}", e.key);
+        }
+    }
+
+    /// The LIKE fallback is an unranked substring scan. It used to claim a flat
+    /// 1.0, which made the weakest retrieval path outrank every BM25 hit. Score
+    /// it by how much of the query each row actually covers.
+    #[tokio::test]
+    async fn like_fallback_ranks_by_query_coverage() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("both", "telemetry subsystem", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("one", "telemetry only", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Partial words: FTS5 matches whole tokens, so this reaches the fallback.
+        let hits = mem.recall("eleme ubsyst", 10, None).await.unwrap();
+        assert_eq!(hits.len(), 2, "both rows contain at least one fragment");
+
+        let score_of = |key: &str| {
+            hits.iter()
+                .find(|e| e.key == key)
+                .and_then(|e| e.score)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        assert!(
+            (score_of("both") - 1.0).abs() < 1e-6,
+            "row covering both fragments should be the best hit, got {}",
+            score_of("both")
+        );
+        assert!(
+            score_of("one") < score_of("both"),
+            "partial coverage must rank below full coverage: {} vs {}",
+            score_of("one"),
+            score_of("both")
+        );
     }
 
     // ── Embedding provenance + UTC timestamp migration ────────────

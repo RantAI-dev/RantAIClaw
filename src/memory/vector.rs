@@ -1,5 +1,38 @@
 // Vector operations — cosine similarity, normalization, hybrid merge.
 
+use super::traits::MemoryEntry;
+
+/// Rescale `MemoryEntry::score` so the best hit in the set is exactly `1.0`.
+///
+/// The [`Memory`](super::traits::Memory) contract defines `score` as relevance
+/// *relative to the best hit in the same result set*. Backends compute whatever
+/// raw signal they have — BM25 magnitudes, keyword counts, SQL weights — and
+/// pass it through here, so one `min_relevance_score` threshold means the same
+/// thing on every backend.
+///
+/// Entries with no score are left alone. A set whose best score is zero or
+/// non-finite is left alone too: there is no meaningful ratio to take, and
+/// inventing one would be worse than leaving the raw signal visible.
+pub fn normalize_entry_scores(entries: &mut [MemoryEntry]) {
+    let best = entries
+        .iter()
+        .filter_map(|e| e.score)
+        .filter(|s| s.is_finite())
+        .fold(0.0_f64, f64::max);
+
+    if best <= 0.0 || !best.is_finite() {
+        return;
+    }
+
+    for entry in entries.iter_mut() {
+        if let Some(score) = entry.score {
+            if score.is_finite() {
+                entry.score = Some((score / best).clamp(0.0, 1.0));
+            }
+        }
+    }
+}
+
 /// Cosine similarity between two vectors. Returns 0.0–1.0.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
@@ -121,6 +154,24 @@ pub fn hybrid_merge(
             r
         })
         .collect();
+
+    // Rescale so the best hit is exactly 1.0, whichever signal produced it.
+    // Without this a document found by only one signal is capped at that
+    // signal's weight: a keyword-only match could never exceed `keyword_weight`
+    // — 0.3 by default — which put it under the 0.4 relevance threshold no
+    // matter how well it matched.
+    let best = results
+        .iter()
+        .map(|r| r.final_score)
+        .filter(|s| s.is_finite())
+        .fold(0.0_f32, f32::max);
+    if best > 0.0 && best.is_finite() {
+        for r in &mut results {
+            if r.final_score.is_finite() {
+                r.final_score = (r.final_score / best).clamp(0.0, 1.0);
+            }
+        }
+    }
 
     results.sort_by(|a, b| {
         b.final_score
@@ -398,5 +449,82 @@ mod tests {
         let merged = hybrid_merge(&[("only".into(), 0.8)], &[], 0.7, 0.3, 10);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "only");
+    }
+
+    // ── Score contract: best hit in the set scores 1.0 ───────────
+
+    /// A document found only by keyword used to be capped at `keyword_weight`
+    /// — 0.3 by default — so however well it matched it stayed below the 0.4
+    /// relevance threshold and never reached the model.
+    #[test]
+    fn hybrid_merge_rescales_to_best() {
+        let vec_results = vec![("semantic".into(), 0.5)];
+        let kw_results = vec![("keyword".into(), 10.0)];
+
+        let merged = hybrid_merge(&vec_results, &kw_results, 0.7, 0.3, 10);
+
+        let best = merged.iter().map(|r| r.final_score).fold(0.0_f32, f32::max);
+        assert!(
+            (best - 1.0).abs() < 1e-6,
+            "best hit must score 1.0, got {best}"
+        );
+        for r in &merged {
+            assert!(
+                (0.0..=1.0).contains(&r.final_score),
+                "{} out of range: {}",
+                r.id,
+                r.final_score
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_merge_keyword_only_set_reaches_one() {
+        // No vector signal at all: the top keyword hit is still the best hit.
+        let merged = hybrid_merge(&[], &[("a".into(), 4.0), ("b".into(), 1.0)], 0.7, 0.3, 10);
+        assert!(
+            (merged[0].final_score - 1.0).abs() < 1e-6,
+            "got {}",
+            merged[0].final_score
+        );
+        assert!(merged[1].final_score < merged[0].final_score);
+    }
+
+    fn scored_entry(key: &str, score: Option<f64>) -> MemoryEntry {
+        MemoryEntry {
+            id: key.to_string(),
+            key: key.to_string(),
+            content: format!("content-{key}"),
+            category: super::super::traits::MemoryCategory::Core,
+            timestamp: "t".into(),
+            session_id: None,
+            score,
+        }
+    }
+
+    #[test]
+    fn normalize_entry_scores_rescales_to_best() {
+        let mut entries = vec![
+            scored_entry("a", Some(4.0)),
+            scored_entry("b", Some(1.0)),
+            scored_entry("c", Some(0.0)),
+        ];
+        normalize_entry_scores(&mut entries);
+        assert_eq!(entries[0].score, Some(1.0));
+        assert_eq!(entries[1].score, Some(0.25));
+        assert_eq!(entries[2].score, Some(0.0));
+    }
+
+    #[test]
+    fn normalize_entry_scores_leaves_unscored_and_degenerate_sets_alone() {
+        let mut none_scored = vec![scored_entry("a", None)];
+        normalize_entry_scores(&mut none_scored);
+        assert_eq!(none_scored[0].score, None);
+
+        // Nothing to divide by — leaving the raw signal visible beats inventing
+        // a ratio.
+        let mut all_zero = vec![scored_entry("a", Some(0.0))];
+        normalize_entry_scores(&mut all_zero);
+        assert_eq!(all_zero[0].score, Some(0.0));
     }
 }

@@ -241,9 +241,16 @@ impl Memory for PostgresMemory {
             let limit_i64 = limit as i64;
 
             let rows = client.query(&stmt, &[&query, &sid, &limit_i64])?;
-            rows.iter()
+            let mut entries = rows
+                .iter()
                 .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
+                .collect::<Result<Vec<MemoryEntry>>>()?;
+            // The SQL expression above yields 0.0/1.0/2.0/3.0 — a raw signal, not
+            // a relevance. Rescale so the best hit is 1.0, matching the contract
+            // every other backend now satisfies. Left unscaled, any match scored
+            // at or above 1.0 and the relevance threshold never filtered here.
+            super::vector::normalize_entry_scores(&mut entries);
+            Ok(entries)
         })
         .await?
     }

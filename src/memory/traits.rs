@@ -10,6 +10,19 @@ pub struct MemoryEntry {
     pub category: MemoryCategory,
     pub timestamp: String,
     pub session_id: Option<String>,
+    /// Relevance, normalised to `[0, 1]` **within the returned result set**.
+    ///
+    /// The best hit for a query scores `1.0`; weaker hits score proportionally
+    /// lower. Scores are *not* comparable across queries or across calls — a
+    /// `1.0` means "the best of what this query found", not "a good match in
+    /// absolute terms". Nothing here has a calibrated model, and pretending
+    /// otherwise would make `min_relevance_score` mean different things on
+    /// different backends, which is exactly what it used to.
+    ///
+    /// `None` where the operation does not rank — [`Memory::get`] and
+    /// [`Memory::list`] return entries, not search results.
+    ///
+    /// Backends normalise via `vector::normalize_entry_scores`.
     pub score: Option<f64>,
 }
 
@@ -53,7 +66,13 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
     ) -> anyhow::Result<()>;
 
-    /// Recall memories matching a query (keyword search), optionally scoped to a session
+    /// Recall memories matching a query (keyword search), optionally scoped to a session.
+    ///
+    /// Implementations must satisfy the scoring contract on
+    /// [`MemoryEntry::score`]: whatever raw signal the backend ranks by, the
+    /// returned set is rescaled so its best hit is `1.0`. Every retrieval path
+    /// inside a backend has to join that rescale — a fallback path that skips it
+    /// will outrank the primary one.
     async fn recall(
         &self,
         query: &str,
