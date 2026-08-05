@@ -308,7 +308,18 @@ fn prune_conversation_rows(workspace_dir: &Path, retention_days: u32) -> Result<
     let conn = Connection::open(db_path)?;
     // Use WAL so hygiene pruning doesn't block agent reads
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-    let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
+
+    // Hygiene runs before the backend is constructed (`create_memory`), so on the
+    // first pass after an upgrade the rows may still carry the writer's local
+    // offset while the cutoff below is UTC. Comparing those as strings disagrees
+    // with real time — for a negative offset it disagrees in the direction that
+    // deletes. Normalise first; the pass is guarded by `user_version` and is a
+    // no-op once done.
+    crate::memory::sqlite::SqliteMemory::migrate_timestamps_to_utc(&conn)?;
+    // UTC, matching what the backend now writes. These are compared as strings by
+    // SQL, so a cutoff carrying a different offset than the rows would disagree
+    // with real time — and it errs toward deleting rows early.
+    let cutoff = (Utc::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
 
     let affected = conn.execute(
         "DELETE FROM memories WHERE category = 'conversation' AND updated_at < ?1",
@@ -535,6 +546,72 @@ mod tests {
         assert!(
             mem2.get("core_keep").await.unwrap().is_some(),
             "core memory should remain"
+        );
+    }
+
+    /// Rows written by an older build carry the writing machine's UTC offset, and
+    /// the cutoff is compared against them as a string. A row from a machine west
+    /// of UTC renders hours *below* its real instant, so a row that is genuinely
+    /// newer than the cutoff can sort beneath it — and get deleted.
+    ///
+    /// Hygiene runs before the backend is constructed, so it has to normalise the
+    /// timestamps itself before comparing.
+    #[tokio::test]
+    async fn prune_keeps_rows_newer_than_cutoff_written_in_a_western_offset() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new(workspace).unwrap();
+        mem.store(
+            "conv_edge",
+            "still within retention",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        // Two hours newer than the 30-day cutoff, so it must survive — but
+        // rendered in UTC-11, which reads eleven hours earlier than it happened.
+        let retention_days = 30_i64;
+        let instant = Utc::now() - Duration::days(retention_days) + Duration::hours(2);
+        let west = chrono::FixedOffset::west_opt(11 * 3600).unwrap();
+        let rendered = instant.with_timezone(&west).to_rfc3339();
+
+        let db_path = workspace.join("memory").join("brain.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'conv_edge'",
+                params![rendered],
+            )
+            .unwrap();
+            // Re-arm the migration guard: this row is deliberately in the
+            // pre-normalisation state that an upgrading install would be in.
+            conn.pragma_update(None, "user_version", 0_i64).unwrap();
+        }
+
+        // Sanity: the raw string really does sort below the UTC cutoff, so a
+        // plain string comparison would delete it. Without this the test could
+        // pass for the wrong reason.
+        let utc_cutoff = (Utc::now() - Duration::days(retention_days)).to_rfc3339();
+        assert!(
+            rendered.as_str() < utc_cutoff.as_str(),
+            "test setup is not exercising the defect: {rendered} >= {utc_cutoff}"
+        );
+
+        let mut cfg = default_cfg();
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        cfg.conversation_retention_days = u32::try_from(retention_days).unwrap();
+
+        run_if_due(&cfg, workspace).unwrap();
+
+        let mem2 = SqliteMemory::new(workspace).unwrap();
+        assert!(
+            mem2.get("conv_edge").await.unwrap().is_some(),
+            "a row newer than the cutoff was deleted because of its UTC offset"
         );
     }
 }
