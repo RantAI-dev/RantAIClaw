@@ -358,20 +358,21 @@ async fn compare_forget() {
         sq.count().await.unwrap()
     );
     println!(
-        "  Markdown: {} (append-only by design)",
-        if md_forgot {
-            "✅ Deleted"
-        } else {
-            "⚠️  Cannot delete (audit trail)"
-        },
+        "  Markdown: {} (count={})",
+        if md_forgot { "✅ Deleted" } else { "❌ Kept" },
+        md.count().await.unwrap()
     );
 
     // SQLite can delete
     assert!(sq_forgot);
     assert_eq!(sq.count().await.unwrap(), 0);
 
-    // Markdown cannot delete (by design)
-    assert!(!md_forgot);
+    // So can markdown. It used to return `false` unconditionally, described as
+    // append-only for the audit trail — but `memory_forget` offers to delete
+    // sensitive data, and reporting "no memory found" about an entry that
+    // plainly exists is worse than deleting it.
+    assert!(md_forgot, "markdown must remove the entry it was asked to");
+    assert_eq!(md.count().await.unwrap(), 0);
 }
 
 // ── Test 7: Category filtering ─────────────────────────────────
