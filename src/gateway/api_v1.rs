@@ -2187,33 +2187,7 @@ mod tests {
         }
     }
 
-    /// Point `HOME` at a temp dir and put the previous value back on drop, so a
-    /// panicking test does not leak it into the next one.
-    ///
-    /// `HOME` is the right lever: the profile root is
-    /// `home_dir()/.rantaiclaw/profiles/<name>` (`profile/paths.rs`), so
-    /// `RANTAICLAW_CONFIG_DIR` does **not** move `sessions.db` — pinning that
-    /// instead left the test still writing to the shared profile.
-    ///
-    /// Only meaningful while `test_env::ENV_LOCK` is held.
-    struct HomeGuard(Option<String>);
-
-    impl HomeGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let prev = std::env::var("HOME").ok();
-            std::env::set_var("HOME", path);
-            Self(prev)
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(prev) => std::env::set_var("HOME", prev),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
+    use crate::test_env::HomeGuard;
 
     fn test_state() -> AppState {
         let mut config = crate::config::Config::default();
@@ -2420,6 +2394,26 @@ mod tests {
 
     #[tokio::test]
     async fn agent_chat_without_stream_accept_returns_sync_json() {
+        // Same hazard as `sse_chat_emits_chunk_then_done`: this handler persists
+        // through `open_session_store`, which resolves the ACTIVE PROFILE from
+        // `HOME` — not from the `AppState` config. Unpinned, every
+        // `cargo test --lib` appended a real `hello`/`test-model` row to the
+        // operator's own sessions.db; that is how 131 of them accumulated.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        // Prove the pin took rather than trusting it — an unasserted pin is how
+        // this leak stayed invisible while the sibling test looked fixed.
+        let db = crate::profile::ProfileManager::active()
+            .expect("active profile")
+            .sessions_db_path();
+        assert!(
+            db.starts_with(tmp.path()),
+            "test must own its sessions.db; resolved {db:?} outside {:?}",
+            tmp.path()
+        );
+
         let response = agent_chat_dispatch(
             State(test_state()),
             HeaderMap::new(),
