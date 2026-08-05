@@ -1356,6 +1356,19 @@ enum MemoryCommands {
     },
     /// Get a specific memory entry by key
     Get { key: String },
+    /// Store a memory entry
+    Add {
+        key: String,
+        content: String,
+        #[arg(long, default_value = "core")]
+        category: String,
+    },
+    /// Search memory entries by keyword
+    Recall {
+        query: String,
+        #[arg(long, default_value = "5")]
+        limit: usize,
+    },
     /// Show memory backend statistics and health
     Stats,
     /// Clear memories by category, by key, or clear all

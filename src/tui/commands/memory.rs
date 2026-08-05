@@ -44,7 +44,7 @@ impl CommandHandler for MemoryCommand {
     }
 
     fn usage(&self) -> &str {
-        "/memory [list|get|add|remove|recall] [args]"
+        "/memory [list|get|add|remove|recall|stats] [args]"
     }
 
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
@@ -60,6 +60,7 @@ impl CommandHandler for MemoryCommand {
             "add" | "store" => add_memory(ctx, rest),
             "remove" | "rm" | "delete" => remove_memory(ctx, rest),
             "recall" | "search" => recall_memory(ctx, rest),
+            "stats" => stats_memory(ctx),
             other => Ok(CommandResult::Message(format!(
                 "Unknown subcommand '{other}'. Try /memory help."
             ))),
@@ -75,6 +76,7 @@ fn usage_message() -> CommandResult {
          \n  add <key> <content>        store a new core memory entry\
          \n  remove <key>               delete an entry by key\
          \n  recall <query> [limit]     keyword search across all entries\
+         \n  stats                      backend name, entry count, health\
          \n\nAlias: /forget <key> is shorthand for /memory remove."
             .to_string(),
     )
@@ -100,12 +102,19 @@ fn list_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
             }
         )));
     }
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Memory entries ({}, backend: {}):\n",
-        entries.len(),
+    // `list` is capped by the backend, so its length is a page size rather than
+    // a total; `count()` is the total.
+    let listed = entries.len();
+    let total = run_blocking(async { memory.count().await }).unwrap_or(listed);
+    let truncated = if total > listed {
+        format!(", listing the most recent {listed}")
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "Memory entries ({total}, backend: {}{truncated}):\n",
         memory.name()
-    ));
+    );
     for entry in entries.iter().take(50) {
         let preview = truncate_preview(&entry.content, 80);
         out.push_str(&format!(
@@ -114,11 +123,13 @@ fn list_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
             key = entry.key,
         ));
     }
-    if entries.len() > 50 {
-        out.push_str(&format!(
-            "  … {} more (use `/memory recall` to filter)\n",
-            entries.len() - 50
-        ));
+    if listed > 50 {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "  … {} more (use `/memory recall` to filter)",
+            listed - 50
+        );
     }
     Ok(CommandResult::Message(out))
 }
@@ -244,6 +255,24 @@ fn recall_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
         ));
     }
     Ok(CommandResult::Message(out))
+}
+
+/// `/memory stats` — the CLI and the API both reported backend health; the TUI
+/// could not, so an operator debugging memory had to leave it.
+fn stats_memory(ctx: &TuiContext) -> Result<CommandResult> {
+    let Some(memory) = ensure_backend(ctx) else {
+        return Ok(no_backend_message());
+    };
+    let (count, healthy) = run_blocking(async {
+        let count = memory.count().await?;
+        Ok((count, memory.health_check().await))
+    })?;
+
+    Ok(CommandResult::Message(format!(
+        "Memory backend: {}\n  entries: {count}\n  health:  {}",
+        memory.name(),
+        if healthy { "ok" } else { "unhealthy" }
+    )))
 }
 
 fn parse_category(s: &str) -> Option<MemoryCategory> {
@@ -565,6 +594,36 @@ mod tests {
         let res = ForgetCommand.execute("temp", &mut ctx).unwrap();
         match res {
             CommandResult::Message(msg) => assert!(msg.contains("Forgot 'temp'")),
+            _ => panic!("expected Message"),
+        }
+    }
+
+    /// The CLI and the API both reported backend health; the TUI could not, so
+    /// an operator debugging memory had to leave it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_stats_reports_backend_and_count() {
+        let mem = StubMemory::arc();
+        let mut ctx = ctx_with_memory(mem);
+        MemoryCommand.execute("add a first", &mut ctx).unwrap();
+        MemoryCommand.execute("add b second", &mut ctx).unwrap();
+
+        let res = MemoryCommand.execute("stats", &mut ctx).unwrap();
+        match res {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("stub"), "backend name missing: {msg}");
+                assert!(msg.contains("entries: 2"), "count missing: {msg}");
+                assert!(msg.contains("ok"), "health missing: {msg}");
+            }
+            _ => panic!("expected Message"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_help_lists_stats() {
+        let mut ctx = ctx_with_memory(StubMemory::arc());
+        let res = MemoryCommand.execute("", &mut ctx).unwrap();
+        match res {
+            CommandResult::Message(msg) => assert!(msg.contains("stats"), "{msg}"),
             _ => panic!("expected Message"),
         }
     }

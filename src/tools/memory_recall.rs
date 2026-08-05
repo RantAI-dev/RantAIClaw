@@ -64,9 +64,13 @@ impl Tool for MemoryRecallTool {
             Ok(entries) => {
                 let mut output = format!("Found {} memories:\n", entries.len());
                 for entry in &entries {
+                    // Scores are relevance in [0,1] relative to the best hit
+                    // in this set. Formatting the fraction directly as a
+                    // percentage rendered the best match as "[1%]" and
+                    // everything else as "[0%]".
                     let score = entry
                         .score
-                        .map_or_else(String::new, |s| format!(" [{s:.0}%]"));
+                        .map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
                     let _ = writeln!(
                         output,
                         "- [{}] {}: {}{score}",
@@ -155,6 +159,30 @@ mod tests {
         let tool = MemoryRecallTool::new(mem);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
+    }
+
+    /// Scores are relevance in [0,1]. Printing the fraction straight as a
+    /// percentage rendered the best match as "[1%]".
+    #[tokio::test]
+    async fn recall_renders_the_score_as_a_real_percentage() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store(
+            "lang",
+            "the operator prefers Rust",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool.execute(json!({"query": "Rust"})).await.unwrap();
+
+        assert!(
+            result.output.contains("[100%]"),
+            "the best hit scores 1.0 and must read as 100%, got: {}",
+            result.output
+        );
     }
 
     #[test]
