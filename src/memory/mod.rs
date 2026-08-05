@@ -10,6 +10,7 @@ pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod response_cache;
+pub mod sanitize;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
@@ -27,6 +28,7 @@ pub use none::NoneMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use response_cache::ResponseCache;
+pub use sanitize::{sanitize_memory_content, SanitizedMemory};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]

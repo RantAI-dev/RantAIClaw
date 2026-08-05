@@ -267,18 +267,25 @@ impl LucidMemory {
         let payload = format!("{key}: {content}");
         vec![
             "store".to_string(),
-            payload,
             format!("--type={}", Self::to_lucid_type(category)),
             format!("--project={}", self.workspace_dir.display()),
+            // Everything after `--` is positional. Without it, memory content
+            // beginning with `-` is read by the receiving CLI as a flag — the
+            // content is agent- and user-influenced, so that is an argument
+            // injection, not a formatting quirk.
+            "--".to_string(),
+            payload,
         ]
     }
 
     fn build_recall_args(&self, query: &str) -> Vec<String> {
         vec![
             "context".to_string(),
-            query.to_string(),
             format!("--budget={}", self.token_budget),
             format!("--project={}", self.workspace_dir.display()),
+            // Same reason as `build_store_args`: the query is user text.
+            "--".to_string(),
+            query.to_string(),
         ]
     }
 
