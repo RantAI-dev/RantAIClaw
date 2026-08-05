@@ -864,10 +864,13 @@ impl Agent {
         let conversation_scope = self.conversation_id.as_deref();
 
         if self.auto_save {
+            // Per-turn key: `memories.key` is UNIQUE and `store` upserts on
+            // conflict, so a literal key would make each turn overwrite the last
+            // and leave this surface with a single row forever.
             let _ = self
                 .memory
                 .store(
-                    "user_msg",
+                    &crate::memory::autosave_memory_key("user_msg"),
                     user_message,
                     MemoryCategory::Conversation,
                     conversation_scope,

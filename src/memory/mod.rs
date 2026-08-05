@@ -79,6 +79,18 @@ pub fn effective_memory_backend_name(
     memory_backend.trim().to_ascii_lowercase()
 }
 
+/// Build a per-turn auto-save key.
+///
+/// `memories.key` is UNIQUE and `store` upserts on conflict, so a fixed key makes
+/// each turn overwrite the last. Every auto-save write site must go through this
+/// rather than passing a literal, or that surface keeps exactly one row forever.
+///
+/// Paired with [`is_assistant_autosave_key`], the read-side half of the same
+/// convention.
+pub fn autosave_memory_key(prefix: &str) -> String {
+    format!("{prefix}_{}", uuid::Uuid::new_v4())
+}
+
 /// Legacy auto-save key used for model-authored assistant summaries.
 /// These entries are treated as untrusted context and should not be re-injected.
 pub fn is_assistant_autosave_key(key: &str) -> bool {

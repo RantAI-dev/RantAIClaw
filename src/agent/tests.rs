@@ -654,11 +654,15 @@ async fn auto_save_stores_only_user_messages_in_memory() {
         "Expected exactly 1 user memory entry, got {count}"
     );
 
-    let stored = mem.get("user_msg").await.unwrap();
-    assert!(stored.is_some(), "Expected user_msg key to be present");
+    // The key carries a per-turn suffix, so match the prefix rather than a
+    // literal — a literal here is what let each turn overwrite the last.
+    let all = mem.list(None, None).await.unwrap();
+    let stored = all
+        .iter()
+        .find(|e| e.key.starts_with("user_msg_"))
+        .expect("Expected a user_msg_* entry to be present");
     assert_eq!(
-        stored.unwrap().content,
-        "Remember this fact",
+        stored.content, "Remember this fact",
         "Stored memory should match the original user message"
     );
 
@@ -666,6 +670,41 @@ async fn auto_save_stores_only_user_messages_in_memory() {
     assert!(
         assistant.is_none(),
         "assistant_resp should not be auto-saved anymore"
+    );
+}
+
+/// `memories.key` is UNIQUE and `store` upserts on conflict, so a fixed
+/// auto-save key made every turn overwrite the previous one — the TUI and the
+/// gateway kept exactly one user message, forever.
+#[tokio::test]
+async fn auto_save_preserves_every_turn() {
+    let (mem, _tmp) = make_sqlite_memory();
+    let provider = Box::new(ScriptedProvider::new(vec![
+        text_response("first reply"),
+        text_response("second reply"),
+    ]));
+
+    let mut agent = build_agent_with_memory(provider, vec![], mem.clone(), true);
+
+    let _ = agent.turn("my name is rantaiclaw_user").await.unwrap();
+    let _ = agent.turn("I work in the Jakarta office").await.unwrap();
+
+    let entries = mem.list(None, None).await.unwrap();
+    let saved: Vec<_> = entries
+        .iter()
+        .filter(|e| e.key.starts_with("user_msg_"))
+        .collect();
+
+    assert_eq!(
+        saved.len(),
+        2,
+        "both turns must survive; a fixed key collapses them to one: {saved:?}"
+    );
+    let bodies: Vec<&str> = saved.iter().map(|e| e.content.as_str()).collect();
+    assert!(bodies.contains(&"my name is rantaiclaw_user"), "{bodies:?}");
+    assert!(
+        bodies.contains(&"I work in the Jakarta office"),
+        "{bodies:?}"
     );
 }
 
@@ -1080,8 +1119,9 @@ async fn turn_stores_memory_under_conversation_scope() {
 
     let recs = recorded.lock().unwrap();
     assert!(
-        recs.iter()
-            .any(|(k, sid)| k == "user_msg" && sid.as_deref() == Some("telegram:123")),
+        recs.iter().any(|(k, sid)| {
+            k.starts_with("user_msg_") && sid.as_deref() == Some("telegram:123")
+        }),
         "user_msg should be stored under the conversation scope, got {recs:?}"
     );
 }
