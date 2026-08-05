@@ -345,6 +345,38 @@ pub fn create_memory_with_storage_and_routes(
     Ok(memory)
 }
 
+/// Build the SQLite backend with the embedder the config asks for.
+///
+/// `create_memory_for_migration` deliberately skips embedding setup because its
+/// callers only read and delete. Re-embedding needs the real provider, and it
+/// needs the concrete type — `reindex` is not on the `Memory` trait, because
+/// only a backend that stores vectors has anything to rebuild.
+pub fn create_sqlite_with_embedder(
+    config: &MemoryConfig,
+    embedding_routes: &[EmbeddingRouteConfig],
+    workspace_dir: &Path,
+    api_key: Option<&str>,
+) -> anyhow::Result<SqliteMemory> {
+    let resolved = resolve_embedding_config(config, embedding_routes, api_key);
+    let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+        Arc::from(embeddings::create_embedding_provider(
+            &resolved.provider,
+            resolved.api_key.as_deref(),
+            &resolved.model,
+            resolved.dimensions,
+        ));
+
+    #[allow(clippy::cast_possible_truncation)]
+    SqliteMemory::with_embedder(
+        workspace_dir,
+        embedder,
+        config.vector_weight as f32,
+        config.keyword_weight as f32,
+        config.embedding_cache_size,
+        config.sqlite_open_timeout_secs,
+    )
+}
+
 pub fn create_memory_for_migration(
     backend: &str,
     workspace_dir: &Path,
