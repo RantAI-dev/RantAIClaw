@@ -310,13 +310,34 @@ pub fn create_memory_with_storage_and_routes(
         );
     }
 
-    create_memory_with_builders(
+    let memory = create_memory_with_builders(
         &backend_name,
         workspace_dir,
         || build_sqlite_memory(config, workspace_dir, &resolved_embedding),
         || build_postgres_memory(storage_provider),
         "",
-    )
+    )?;
+
+    // Project core memory into `MEMORY.md`, which the system prompt injects.
+    //
+    // On these backends nothing else writes that file, so the tier guaranteed to
+    // reach the model held only scaffold prose while everything the agent learned
+    // lived in `brain.db`. `MarkdownMemory` is excluded because it owns the file
+    // directly — projecting there too would write it twice.
+    //
+    // The prompt is built once per session, so a memory stored mid-session lands
+    // in the file now and in the prompt next session. Within-session freshness is
+    // the recall tier's job; it runs every turn.
+    if matches!(
+        backend_kind,
+        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
+    ) {
+        if let Err(e) = snapshot::project_core_memories(workspace_dir) {
+            tracing::warn!("memory projection skipped: {e}");
+        }
+    }
+
+    Ok(memory)
 }
 
 pub fn create_memory_for_migration(

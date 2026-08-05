@@ -89,6 +89,124 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     Ok(rows.len())
 }
 
+/// Filename of the human-readable memory file injected into the system prompt.
+pub const MEMORY_FILE: &str = "MEMORY.md";
+
+/// Markers delimiting the region of `MEMORY.md` the runtime owns.
+const PROJECTION_BEGIN: &str = "<!-- rantaiclaw:memory:begin -->";
+const PROJECTION_END: &str = "<!-- rantaiclaw:memory:end -->";
+
+/// Ceiling on the generated block.
+///
+/// The whole file is injected into the system prompt every session, so an
+/// unbounded projection is a silent per-session token cost that grows with the
+/// database.
+const PROJECTION_MAX_CHARS: usize = 4_000;
+
+/// Render core memories into the delimited block of `MEMORY.md`.
+///
+/// `brain.db` is authoritative; this file is its projection. The prompt already
+/// injects `MEMORY.md`, but on the sqlite backend nothing ever wrote it — so the
+/// tier guaranteed to reach the model held only scaffold prose while everything
+/// the agent learned went somewhere the prompt never reads.
+///
+/// One direction only. Content outside the markers is human-authored and is
+/// preserved byte-for-byte; content inside is generated and is replaced. A
+/// bidirectional sync would need conflict rules and a way to tell a hand edit
+/// from a stale render, which is not worth it when "facts through the agent,
+/// prose by hand" is a clear enough split.
+///
+/// Returns the number of entries projected.
+pub fn project_core_memories(workspace_dir: &Path) -> Result<usize> {
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        return Ok(0);
+    }
+
+    let conn = Connection::open(&db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT key, content FROM memories
+         WHERE category = 'core'
+         ORDER BY updated_at DESC",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(std::result::Result::ok)
+        .collect();
+
+    let (body, projected, omitted) = render_projection(&rows);
+    let block = format!(
+        "{PROJECTION_BEGIN}\n\
+         <!-- Generated from core memory. Edits inside this block are overwritten; \
+         write prose outside it. -->\n\
+         {body}{}{PROJECTION_END}",
+        if omitted > 0 {
+            format!(
+                "_… {omitted} more core memor{} not shown._\n",
+                if omitted == 1 { "y" } else { "ies" }
+            )
+        } else {
+            String::new()
+        }
+    );
+
+    let path = workspace_dir.join(MEMORY_FILE);
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    fs::write(&path, splice_block(&existing, &block))?;
+
+    Ok(projected)
+}
+
+/// Render entries as list lines, stopping at the character ceiling.
+///
+/// Returns the body, how many entries it holds, and how many were left out.
+fn render_projection(rows: &[(String, String)]) -> (String, usize, usize) {
+    let mut body = String::new();
+    let mut projected = 0_usize;
+
+    for (key, content) in rows {
+        let line = format!("- {key}: {}\n", content.replace('\n', " "));
+        if body.chars().count() + line.chars().count() > PROJECTION_MAX_CHARS {
+            break;
+        }
+        body.push_str(&line);
+        projected += 1;
+    }
+
+    (body, projected, rows.len() - projected)
+}
+
+/// Replace the delimited block, or append one, leaving the rest untouched.
+fn splice_block(existing: &str, block: &str) -> String {
+    match (
+        existing.find(PROJECTION_BEGIN),
+        existing.find(PROJECTION_END),
+    ) {
+        (Some(start), Some(end)) if end > start => {
+            let mut out = String::with_capacity(existing.len() + block.len());
+            out.push_str(&existing[..start]);
+            out.push_str(block);
+            out.push_str(&existing[end + PROJECTION_END.len()..]);
+            out
+        }
+        // No usable block: append one, keeping whatever is already there. A
+        // half-written block from an interrupted run falls here too — appending
+        // is recoverable, rewriting someone's file is not.
+        _ => {
+            let mut out = existing.to_string();
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(block);
+            out.push('\n');
+            out
+        }
+    }
+}
+
 /// Import memories from `MEMORY_SNAPSHOT.md` into SQLite.
 ///
 /// Called during cold-boot when `brain.db` doesn't exist but the snapshot does.
@@ -447,6 +565,165 @@ Rule 3: Protect the user.
         let tmp = TempDir::new().unwrap();
         let count = hydrate_from_snapshot(tmp.path()).unwrap();
         assert_eq!(count, 0);
+    }
+
+    // ── MEMORY.md projection ──────────────────────────────────────
+
+    async fn workspace_with_core(entries: &[(&str, &str)]) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+        for (k, c) in entries {
+            mem.store(k, c, crate::memory::MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        tmp
+    }
+
+    fn memory_md(dir: &Path) -> String {
+        fs::read_to_string(dir.join(MEMORY_FILE)).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn projection_writes_core_memories_into_the_block() {
+        let tmp = workspace_with_core(&[("user_lang", "prefers Bahasa Indonesia")]).await;
+
+        let n = project_core_memories(tmp.path()).unwrap();
+        assert_eq!(n, 1);
+
+        let out = memory_md(tmp.path());
+        assert!(out.contains(PROJECTION_BEGIN));
+        assert!(out.contains("- user_lang: prefers Bahasa Indonesia"));
+        assert!(out.contains(PROJECTION_END));
+    }
+
+    /// The wizard scaffolds this file with guidance prose, and operators write
+    /// their own notes in it. Projection owns the marked block and nothing else —
+    /// this is what makes the change safe to ship to an existing workspace.
+    #[tokio::test]
+    async fn projection_preserves_content_outside_the_markers() {
+        let tmp = workspace_with_core(&[("fact", "value")]).await;
+        let path = tmp.path().join(MEMORY_FILE);
+        fs::write(
+            &path,
+            format!(
+                "# Long-Term Memory\n\nHand-written guidance from the wizard.\n\n\
+                 {PROJECTION_BEGIN}\n- stale: old\n{PROJECTION_END}\n\n\
+                 ## Operator notes\n\nDo not delete me.\n"
+            ),
+        )
+        .unwrap();
+
+        project_core_memories(tmp.path()).unwrap();
+
+        let out = memory_md(tmp.path());
+        assert!(out.contains("Hand-written guidance from the wizard."));
+        assert!(out.contains("## Operator notes"));
+        assert!(out.contains("Do not delete me."));
+        assert!(out.contains("- fact: value"));
+        assert!(!out.contains("- stale: old"), "block was not replaced");
+    }
+
+    #[tokio::test]
+    async fn projection_replaces_a_previous_block_rather_than_appending() {
+        let tmp = workspace_with_core(&[("k", "v")]).await;
+
+        project_core_memories(tmp.path()).unwrap();
+        project_core_memories(tmp.path()).unwrap();
+
+        let out = memory_md(tmp.path());
+        assert_eq!(
+            out.matches(PROJECTION_BEGIN).count(),
+            1,
+            "regenerating stacked a second block:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_appends_a_block_to_a_file_without_markers() {
+        let tmp = workspace_with_core(&[("k", "v")]).await;
+        fs::write(
+            tmp.path().join(MEMORY_FILE),
+            "# Long-Term Memory\n\nJust prose, no markers.\n",
+        )
+        .unwrap();
+
+        project_core_memories(tmp.path()).unwrap();
+
+        let out = memory_md(tmp.path());
+        assert!(out.contains("Just prose, no markers."));
+        assert!(out.contains("- k: v"));
+    }
+
+    #[tokio::test]
+    async fn projection_excludes_non_core_categories() {
+        let tmp = TempDir::new().unwrap();
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "core_one",
+            "durable",
+            crate::memory::MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "chatter",
+            "ephemeral",
+            crate::memory::MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        project_core_memories(tmp.path()).unwrap();
+
+        let out = memory_md(tmp.path());
+        assert!(out.contains("- core_one: durable"));
+        assert!(!out.contains("chatter"));
+    }
+
+    /// The whole file goes into the system prompt every session, so the block
+    /// has to be bounded or the token cost grows with the database.
+    #[tokio::test]
+    async fn projection_is_bounded() {
+        let big = "x".repeat(500);
+        let entries: Vec<(String, String)> =
+            (0..50).map(|i| (format!("k{i}"), big.clone())).collect();
+        let borrowed: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(k, c)| (k.as_str(), c.as_str()))
+            .collect();
+        let tmp = workspace_with_core(&borrowed).await;
+
+        let projected = project_core_memories(tmp.path()).unwrap();
+
+        let out = memory_md(tmp.path());
+        assert!(projected < 50, "expected some entries to be omitted");
+        assert!(
+            out.chars().count() < PROJECTION_MAX_CHARS + 500,
+            "block exceeded its ceiling: {} chars",
+            out.chars().count()
+        );
+        assert!(out.contains("not shown"), "omission must be stated:\n{out}");
+    }
+
+    #[tokio::test]
+    async fn projection_creates_the_file_when_absent() {
+        let tmp = workspace_with_core(&[("k", "v")]).await;
+        assert!(!tmp.path().join(MEMORY_FILE).exists());
+
+        project_core_memories(tmp.path()).unwrap();
+
+        assert!(tmp.path().join(MEMORY_FILE).exists());
+    }
+
+    #[test]
+    fn projection_without_a_database_is_a_no_op() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(project_core_memories(tmp.path()).unwrap(), 0);
+        assert!(!tmp.path().join(MEMORY_FILE).exists());
     }
 
     /// Write a snapshot holding one core memory and hydrate it.
