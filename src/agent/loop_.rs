@@ -117,9 +117,7 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
         .collect()
 }
 
-fn autosave_memory_key(prefix: &str) -> String {
-    format!("{prefix}_{}", Uuid::new_v4())
-}
+use crate::memory::autosave_memory_key;
 
 /// Open the same `sessions.db` the TUI uses so single-shot CLI agent
 /// turns (`agent -m`) get recorded alongside TUI sessions. Returns
