@@ -27,6 +27,7 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
         crate::MemoryCommands::Recall { query, limit } => {
             handle_recall(config, &query, limit).await
         }
+        crate::MemoryCommands::Reindex => handle_reindex(config).await,
         crate::MemoryCommands::Stats => handle_stats(config).await,
         crate::MemoryCommands::Clear { key, category, yes } => {
             handle_clear(config, key, category, yes).await
@@ -221,6 +222,46 @@ async fn handle_recall(config: &Config, query: &str, limit: usize) -> Result<()>
             entry.category
         );
         println!("    {}", truncate_content(&entry.content, 80));
+    }
+    Ok(())
+}
+
+/// Re-embed memories the live embedding model cannot use.
+///
+/// Two kinds accumulate and never clear on their own: rows written while the
+/// embedding provider was unavailable, and rows embedded by a previous model —
+/// vector search skips the latter because a vector of another dimensionality is
+/// not comparable, so switching models silently emptied it.
+async fn handle_reindex(config: &Config) -> Result<()> {
+    let backend = effective_memory_backend_name(
+        &config.memory.backend,
+        Some(&config.storage.provider.config),
+    );
+    if !matches!(
+        classify_memory_backend(&backend),
+        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
+    ) {
+        bail!("memory backend '{backend}' does not store embeddings; nothing to reindex");
+    }
+
+    let mem = super::create_sqlite_with_embedder(
+        &config.memory,
+        &config.embedding_routes,
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?;
+
+    println!("Reindexing memory (backend: sqlite)…");
+    let count = mem.reindex().await?;
+
+    if count == 0 {
+        println!("Nothing to re-embed — every memory matches the current embedding model.");
+    } else {
+        println!(
+            "Re-embedded {} {}.",
+            style(count).white().bold(),
+            if count == 1 { "memory" } else { "memories" }
+        );
     }
     Ok(())
 }

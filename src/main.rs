@@ -1369,6 +1369,8 @@ enum MemoryCommands {
         #[arg(long, default_value = "5")]
         limit: usize,
     },
+    /// Re-embed memories the current embedding model cannot use
+    Reindex,
     /// Show memory backend statistics and health
     Stats,
     /// Clear memories by category, by key, or clear all

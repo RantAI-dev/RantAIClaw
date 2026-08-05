@@ -540,8 +540,15 @@ impl SqliteMemory {
         Ok(scored)
     }
 
-    /// Safe reindex: rebuild FTS5 + embeddings with rollback on failure
-    #[allow(dead_code)]
+    /// Rebuild the FTS index and re-embed anything the live embedder cannot use.
+    ///
+    /// Two kinds of row qualify: one that never got an embedding — a write that
+    /// happened while the provider was unavailable — and one embedded by a
+    /// different model, which `vector_search` skips because a vector of another
+    /// dimensionality is not comparable. Both are otherwise permanent: nothing
+    /// re-embeds on its own.
+    ///
+    /// Returns how many rows were re-embedded.
     pub async fn reindex(&self) -> anyhow::Result<usize> {
         // Step 1: Rebuild FTS5
         {
@@ -560,11 +567,20 @@ impl SqliteMemory {
         }
 
         let conn = self.conn.clone();
+        #[allow(clippy::cast_possible_wrap)]
+        let live_dims = self.embedder.dimensions() as i64;
         let entries: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
-            let mut stmt =
-                conn.prepare("SELECT id, content FROM memories WHERE embedding IS NULL")?;
-            let rows = stmt.query_map([], |row| {
+            // Rows with no embedding, and rows carrying one from a different
+            // model — the latter are skipped by vector search and would stay
+            // invisible to it forever otherwise.
+            let mut stmt = conn.prepare(
+                "SELECT id, content FROM memories
+                 WHERE embedding IS NULL
+                    OR embedding_dims IS NULL
+                    OR embedding_dims != ?1",
+            )?;
+            let rows = stmt.query_map(params![live_dims], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             Ok::<_, anyhow::Error>(rows.filter_map(std::result::Result::ok).collect())
@@ -577,11 +593,17 @@ impl SqliteMemory {
                 let bytes = vector::vec_to_bytes(&emb);
                 let conn = self.conn.clone();
                 let id = id.clone();
+                let model = self.embedder.name().to_string();
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                     let conn = conn.lock();
+                    // Stamp provenance alongside the vector. Without it the row
+                    // would be re-embedded again on the next run and still be
+                    // skipped by vector search in between.
                     conn.execute(
-                        "UPDATE memories SET embedding = ?1 WHERE id = ?2",
-                        params![bytes, id],
+                        "UPDATE memories
+                         SET embedding = ?1, embedding_model = ?2, embedding_dims = ?3
+                         WHERE id = ?4",
+                        params![bytes, model, live_dims, id],
                     )?;
                     Ok(())
                 })
@@ -1883,6 +1905,87 @@ mod tests {
         let long = "a".repeat(1_000_000);
         let h = SqliteMemory::content_hash("test-model", 8, &long);
         assert_eq!(h.len(), 16);
+    }
+
+    // ── reindex ───────────────────────────────────────────────────
+
+    /// A row embedded by another model is skipped by vector search, because a
+    /// vector of a different dimensionality is not comparable. Nothing
+    /// re-embeds on its own, so switching models used to empty vector recall
+    /// permanently.
+    #[tokio::test]
+    async fn reindex_re_embeds_rows_from_a_foreign_model() {
+        let tmp = TempDir::new().unwrap();
+
+        let small = stub_memory(tmp.path(), "stub-4", 4);
+        small
+            .store(
+                "legacy",
+                "embedded by the old model",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(small);
+
+        let large = stub_memory(tmp.path(), "stub-8", 8);
+        let re_embedded = large.reindex().await.unwrap();
+        assert_eq!(
+            re_embedded, 1,
+            "the foreign-dimensioned row must be rebuilt"
+        );
+
+        let conn = large.conn.lock();
+        let dims: Option<i64> = conn
+            .query_row(
+                "SELECT embedding_dims FROM memories WHERE key = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dims,
+            Some(8),
+            "provenance must be stamped with the new model"
+        );
+    }
+
+    /// A write that happened while the provider was down leaves no vector and
+    /// NULL provenance — exactly what this is for.
+    #[tokio::test]
+    async fn reindex_fills_in_rows_that_never_got_an_embedding() {
+        let tmp = TempDir::new().unwrap();
+
+        let degraded = failing_embedder_memory(tmp.path());
+        degraded
+            .store(
+                "stored_while_down",
+                "a durable fact",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(degraded);
+
+        let healthy = stub_memory(tmp.path(), "stub-8", 8);
+        assert_eq!(healthy.reindex().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn reindex_is_quiet_when_everything_already_matches() {
+        let tmp = TempDir::new().unwrap();
+        let mem = stub_memory(tmp.path(), "stub-8", 8);
+        mem.store("k", "already embedded", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mem.reindex().await.unwrap(),
+            0,
+            "a matching row must not be re-embedded on every run"
+        );
     }
 
     // ── Recall path hardening ─────────────────────────────────────
