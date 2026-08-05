@@ -394,6 +394,14 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
     }
 }
 
+/// How far past `limit` the shared-memory backfill reads before filtering.
+///
+/// The `Memory` trait can ask for one scope or for all of them, not for "shared
+/// only", so the filter runs on our side and discards part of what comes back.
+/// Over-fetching keeps the backfill useful without changing the trait — which
+/// would oblige every backend to grow a third recall mode.
+const BACKFILL_OVERFETCH: usize = 3;
+
 /// Recall memories across the layered scopes for one turn: the active
 /// conversation's own scope first, then the rest of memory as a backfill.
 ///
@@ -423,9 +431,31 @@ pub async fn recall_layered(
             out.push(entry);
         }
     }
-    // Backfill with the rest of memory, skipping anything already surfaced.
+    // Backfill from *shared* memory only.
+    //
+    // An entry carrying another conversation's scope is not background context —
+    // it is someone else's. On a channel with several senders, auto-save writes
+    // every message under its own scope, so an unfiltered backfill put one user's
+    // words into another user's prompt.
+    //
+    // Unscoped entries (`session_id IS NULL`) are the shared tier and do belong
+    // here: that is what `memory_store` writes and what layering exists to reach.
+    //
+    // Asking for more than `limit` because the filter runs after the backend's:
+    // the widest scope-agnostic recall this trait offers is "everything", so some
+    // of what comes back is discarded. Over-fetching narrows that window without
+    // a trait change. It fails safe either way — a thin backfill shows less, it
+    // never shows someone else's memory.
     if out.len() < limit {
-        for entry in memory.recall(query, limit, None).await? {
+        let backfill_limit = limit.saturating_mul(BACKFILL_OVERFETCH).max(limit);
+        for entry in memory.recall(query, backfill_limit, None).await? {
+            let belongs_elsewhere = entry
+                .session_id
+                .as_deref()
+                .is_some_and(|owner| owner != cid);
+            if belongs_elsewhere {
+                continue;
+            }
             if seen.insert(entry.key.clone()) {
                 out.push(entry);
                 if out.len() >= limit {
@@ -535,6 +565,34 @@ mod tests {
         // duplicated even though recall(None) also returns it.
         assert_eq!(keys.iter().filter(|k| **k == "conv_only").count(), 1);
         assert!(keys.contains(&"global_a"));
+    }
+
+    /// Auto-save writes every channel message under its own conversation scope.
+    /// An unfiltered backfill therefore put one sender's words into another
+    /// sender's prompt — the backfill has to be *shared* memory, not *all*
+    /// memory.
+    #[tokio::test]
+    async fn recall_layered_backfill_excludes_other_conversations() {
+        let mem = ScopedMockMemory {
+            entries: vec![
+                entry("mine", Some("conv1")),
+                entry("shared_fact", None),
+                entry("someone_elses_secret", Some("conv2")),
+            ],
+        };
+
+        let got = recall_layered(&mem, "q", 10, Some("conv1")).await.unwrap();
+        let keys: Vec<&str> = got.iter().map(|e| e.key.as_str()).collect();
+
+        assert!(keys.contains(&"mine"), "own scope must surface: {keys:?}");
+        assert!(
+            keys.contains(&"shared_fact"),
+            "unscoped memory is the shared tier and must still backfill: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"someone_elses_secret"),
+            "another conversation's memory must never backfill: {keys:?}"
+        );
     }
 
     #[tokio::test]

@@ -577,6 +577,15 @@ impl Agent {
     /// via [`Agent::from_config`], `None` for bare-builder agents
     /// (tests/custom embeds). Use this to mutate the runtime allowlist
     /// or resolve pending approvals from outside the agent loop.
+    /// Point this agent's turn memory at a conversation.
+    ///
+    /// Set per request by surfaces that serve more than one conversation through
+    /// one agent, or that only learn the identity after construction. `None`
+    /// restores global behaviour.
+    pub fn set_conversation_id(&mut self, conversation_id: Option<String>) {
+        self.conversation_id = conversation_id;
+    }
+
     pub fn security(&self) -> Option<Arc<SecurityPolicy>> {
         self.security.clone()
     }
