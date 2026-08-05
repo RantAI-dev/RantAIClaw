@@ -187,6 +187,8 @@ impl Memory for MarkdownMemory {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        // Contract: the best hit in the returned set scores 1.0.
+        super::vector::normalize_entry_scores(&mut scored);
         scored.truncate(limit);
         Ok(scored)
     }
@@ -351,5 +353,31 @@ mod tests {
     async fn markdown_empty_count() {
         let (_tmp, mem) = temp_workspace();
         assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    /// Contract: the best hit in a returned set scores 1.0 and nothing exceeds
+    /// it, so one relevance threshold means the same thing on every backend.
+    #[tokio::test]
+    async fn markdown_recall_normalises_scores_to_best() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("a", "rust ownership model", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "rust only", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let hits = mem.recall("rust ownership", 10, None).await.unwrap();
+        assert!(!hits.is_empty());
+
+        let best = hits.iter().filter_map(|e| e.score).fold(0.0_f64, f64::max);
+        assert!(
+            (best - 1.0).abs() < 1e-6,
+            "best hit must score 1.0, got {best}"
+        );
+        for e in &hits {
+            let s = e.score.unwrap();
+            assert!((0.0..=1.0).contains(&s), "{} out of range: {s}", e.key);
+        }
     }
 }
