@@ -125,7 +125,11 @@ impl SqliteMemory {
     }
 
     /// Initialize all tables: memories, FTS5, `embedding_cache`
-    fn init_schema(conn: &Connection) -> anyhow::Result<()> {
+    /// The single source of truth for the memory schema.
+    ///
+    /// `pub(crate)` so snapshot hydration can create a database the backend can
+    /// actually open. A second declaration elsewhere drifts and breaks startup.
+    pub(crate) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "-- Core memories table
             CREATE TABLE IF NOT EXISTS memories (
