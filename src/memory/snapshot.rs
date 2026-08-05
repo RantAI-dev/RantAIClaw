@@ -114,30 +114,11 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
     let conn = Connection::open(&db_path)?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
 
-    // Initialize schema (same as SqliteMemory::init_schema)
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS memories (
-            id         TEXT PRIMARY KEY,
-            key        TEXT NOT NULL UNIQUE,
-            content    TEXT NOT NULL,
-            category   TEXT NOT NULL DEFAULT 'core',
-            embedding  BLOB,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_mem_key ON memories(key);
-        CREATE INDEX IF NOT EXISTS idx_mem_cat ON memories(category);
-        CREATE INDEX IF NOT EXISTS idx_mem_updated ON memories(updated_at);
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-            USING fts5(key, content, content='memories', content_rowid='rowid');
-
-        CREATE TABLE IF NOT EXISTS embedding_cache (
-            content_hash TEXT PRIMARY KEY,
-            embedding    BLOB NOT NULL,
-            created_at   TEXT NOT NULL
-        );",
-    )?;
+    // Use the backend's own schema rather than a second declaration of it. A
+    // local copy drifts: the previous one omitted `embedding_cache.accessed_at`,
+    // so the index `SqliteMemory::init_schema` builds on that column failed and
+    // the hydrated database could not be opened at all.
+    super::sqlite::SqliteMemory::init_schema(&conn)?;
 
     let now = Local::now().to_rfc3339();
     let mut hydrated = 0;
@@ -152,11 +133,9 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
 
         match result {
             Ok(changed) if changed > 0 => {
-                // Populate FTS5
-                let _ = conn.execute(
-                    "INSERT INTO memories_fts(key, content) VALUES (?1, ?2)",
-                    params![key, content],
-                );
+                // FTS5 is populated by the `memories_ai` trigger that
+                // `init_schema` installs — inserting here too would leave an
+                // orphan index row with no matching `memories` rowid.
                 hydrated += 1;
             }
             Ok(_) => {
@@ -262,6 +241,7 @@ fn parse_snapshot(input: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::traits::Memory;
     use tempfile::TempDir;
 
     #[test]
@@ -466,5 +446,75 @@ Rule 3: Protect the user.
         let tmp = TempDir::new().unwrap();
         let count = hydrate_from_snapshot(tmp.path()).unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Write a snapshot holding one core memory and hydrate it.
+    fn hydrated_workspace() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(SNAPSHOT_FILENAME),
+            "### 🔑 `preference_lang`\n\nThe operator prefers Rust.\n\n---\n",
+        )
+        .unwrap();
+        let count = hydrate_from_snapshot(tmp.path()).unwrap();
+        assert_eq!(count, 1, "snapshot entry should hydrate");
+        tmp
+    }
+
+    /// Hydration used to declare its own schema, which drifted from the
+    /// backend's: it omitted `embedding_cache.accessed_at`, so the index
+    /// `init_schema` builds on that column failed and the hydrated database
+    /// could not be opened at all.
+    #[tokio::test]
+    async fn hydrated_database_opens_with_sqlite_memory() {
+        let tmp = hydrated_workspace();
+        crate::memory::SqliteMemory::new(tmp.path())
+            .expect("a hydrated database must be openable by the backend");
+    }
+
+    #[tokio::test]
+    async fn hydrated_entries_are_recallable() {
+        let tmp = hydrated_workspace();
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+        let hits = mem.recall("Rust", 10, None).await.unwrap();
+        assert_eq!(hits.len(), 1, "hydrated entry should be searchable");
+        assert_eq!(hits[0].key, "preference_lang");
+    }
+
+    /// FTS5 is populated by the `memories_ai` trigger. Hydration must not also
+    /// insert by hand: a manual insert into an external-content table takes a
+    /// fresh rowid with no matching `memories` row, leaving a stray index entry.
+    ///
+    /// Asserted against the index itself, not through `recall` — `recall` joins
+    /// on `m.rowid = f.rowid` and would silently drop the stray row, hiding the
+    /// defect.
+    #[test]
+    fn hydrate_leaves_no_orphan_fts_rows() {
+        let tmp = hydrated_workspace();
+        let conn = Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
+
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'prefers'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let joined: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories_fts f \
+                 JOIN memories m ON m.rowid = f.rowid \
+                 WHERE memories_fts MATCH 'prefers'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(indexed, 1, "expected one FTS index entry, got {indexed}");
+        assert_eq!(
+            indexed, joined,
+            "every FTS row must map to a memories row; {} indexed vs {} joined",
+            indexed, joined
+        );
     }
 }
