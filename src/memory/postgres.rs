@@ -3,13 +3,60 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use postgres::{Client, NoTls, Row};
+use postgres::{Client, Row};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
+
+/// Build the TLS connector used for every PostgreSQL connection.
+///
+/// This backend used to connect with `NoTls`, which cannot negotiate TLS at all.
+/// rust-postgres defaults to `sslmode=prefer`, and `prefer` with no TLS
+/// implementation quietly means *plaintext* — so a backend whose whole purpose is
+/// remote durable storage sent memory contents, and the password in `db_url`,
+/// across the network in the clear. `sslmode=require` could not work either; it
+/// just failed.
+///
+/// Supplying a real connector hands the decision back to the URL, which is the
+/// standard PostgreSQL contract: `disable` never invokes it, `prefer` uses it
+/// when the server offers TLS, `require` and the `verify-*` modes insist. No
+/// parsing on our side, and no way to end up unencrypted without having asked.
+///
+/// `ring` matches the process-wide provider installed in `main.rs`; roots come
+/// from the host trust store rather than a bundled set that would drift.
+fn build_tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        // A single unparseable certificate in the host store is not a reason to
+        // refuse every connection.
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        anyhow::bail!(
+            "no usable certificates in the host trust store, so the PostgreSQL \
+             connection cannot be verified; install CA certificates, or set \
+             sslmode=disable in the connection URL to accept an unencrypted link"
+        );
+    }
+
+    // Name the provider rather than relying on the process-level default. Both
+    // `ring` and `aws-lc-rs` are in the dependency tree, so rustls cannot pick
+    // one on its own, and the `install_default()` in `main.rs` only runs for the
+    // binary — a unit test or any other entry point would panic here instead.
+    let config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .context("rustls rejected the default protocol versions")?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
+}
 
 /// PostgreSQL-backed persistent memory.
 ///
@@ -66,7 +113,7 @@ impl PostgresMemory {
                 }
 
                 let mut client = config
-                    .connect(NoTls)
+                    .connect(build_tls_connector()?)
                     .context("failed to connect to PostgreSQL memory backend")?;
 
                 Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
@@ -395,6 +442,22 @@ mod tests {
         assert!(
             outcome.unwrap().is_err(),
             "PostgresMemory::new should return a connect error for an unreachable endpoint"
+        );
+    }
+
+    /// The backend used to connect with `NoTls`, which cannot negotiate TLS at
+    /// all — so `sslmode=prefer`, the default, silently meant plaintext.
+    ///
+    /// A connector has to be constructible for the URL's `sslmode` to mean
+    /// anything. Failure here means the host has no CA certificates installed,
+    /// which is exactly what the error message says to fix.
+    #[test]
+    fn tls_connector_builds_from_the_host_trust_store() {
+        let connector = build_tls_connector();
+        assert!(
+            connector.is_ok(),
+            "could not build a TLS connector: {:?}",
+            connector.err()
         );
     }
 }
