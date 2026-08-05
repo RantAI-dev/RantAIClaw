@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 16;
+pub const CURRENT_VERSION: u32 = 17;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -245,11 +245,44 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive field + default/injection-behavior change)
     }
 
-    // Future migrations (v17, v18, …) inserted here in order.
-    // if from < 17 { migrate_v17(raw)?; }
+    // v16 → v17: the response cache was removed. Its three `[memory]` keys
+    // configured a module nothing ever constructed, so they promised behaviour
+    // that never existed. Strip them rather than leave dead knobs behind.
+    if from < 17 {
+        migrate_v17(raw);
+    }
+
+    // Future migrations (v18, v19, …) inserted here in order.
+    // if from < 18 { migrate_v18(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
+}
+
+/// v16 → v17: drop the response-cache keys.
+///
+/// `[memory] response_cache_enabled`, `response_cache_ttl_minutes` and
+/// `response_cache_max_entries` configured a cache that was never wired to
+/// anything — setting them changed nothing. Leaving them in a config would keep
+/// advertising a feature that does not exist.
+fn migrate_v17(raw: &mut Value) {
+    const REMOVED: [&str; 3] = [
+        "response_cache_enabled",
+        "response_cache_ttl_minutes",
+        "response_cache_max_entries",
+    ];
+
+    let Some(memory) = raw
+        .as_table_mut()
+        .and_then(|t| t.get_mut("memory"))
+        .and_then(Value::as_table_mut)
+    else {
+        return;
+    };
+
+    for key in REMOVED {
+        memory.remove(key);
+    }
 }
 
 /// Write `version` into the root TOML table. Creates the field if
@@ -275,6 +308,54 @@ mod tests {
 
     fn version_of(v: &Value) -> Option<i64> {
         v.get(SCHEMA_VERSION_KEY)?.as_integer()
+    }
+
+    /// The three response-cache keys configured a module nothing constructed,
+    /// so they advertised behaviour that never existed. A config carrying them
+    /// must come out without them.
+    #[test]
+    fn v17_strips_the_response_cache_keys() {
+        let mut raw = parse(
+            r#"
+schema_version = 16
+
+[memory]
+backend = "sqlite"
+response_cache_enabled = true
+response_cache_ttl_minutes = 120
+response_cache_max_entries = 9000
+"#,
+        );
+
+        assert!(migrate(&mut raw).expect("migration runs"));
+
+        let memory = raw
+            .get("memory")
+            .and_then(Value::as_table)
+            .expect("memory table survives");
+        assert!(memory.get("response_cache_enabled").is_none());
+        assert!(memory.get("response_cache_ttl_minutes").is_none());
+        assert!(memory.get("response_cache_max_entries").is_none());
+        assert_eq!(
+            memory.get("backend").and_then(Value::as_str),
+            Some("sqlite"),
+            "unrelated keys must be left alone"
+        );
+        assert_eq!(version_of(&raw), Some(i64::from(CURRENT_VERSION)));
+    }
+
+    #[test]
+    fn v17_is_a_noop_when_the_keys_are_absent() {
+        let mut raw = parse(
+            "schema_version = 16
+
+[memory]
+backend = \"markdown\"
+",
+        );
+        assert!(migrate(&mut raw).expect("migration runs"));
+        let memory = raw.get("memory").and_then(Value::as_table).unwrap();
+        assert_eq!(memory.len(), 1, "nothing else may be touched");
     }
 
     #[test]
