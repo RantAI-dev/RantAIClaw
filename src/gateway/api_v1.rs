@@ -24,7 +24,7 @@ use axum::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse, Json, Response,
     },
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/memory", get(memory_list).post(memory_create))
         .route("/api/v1/memory/stats", get(memory_stats))
-        .route("/api/v1/memory/{key}", delete(memory_delete))
+        .route(
+            "/api/v1/memory/{key}",
+            get(memory_get).delete(memory_delete),
+        )
         .route(
             "/api/v1/personality",
             get(personality_get).put(personality_set),
@@ -1658,6 +1661,36 @@ async fn memory_create(
     ))
 }
 
+/// Fetch one memory by key.
+///
+/// The CLI and the TUI could both address an entry directly; the API could only
+/// page through a list, so a console had no way to open one.
+async fn memory_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let entry = state.mem.get(&key).await.map_err(err_500)?.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "not_found".into(),
+                detail: Some(format!("no memory with key '{key}'")),
+                matches: None,
+            }),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "key": entry.key,
+        "content": entry.content,
+        "category": entry.category.to_string(),
+        "timestamp": entry.timestamp,
+        "session_id": entry.session_id,
+    })))
+}
+
 /// Remove a memory by key.
 ///
 /// `removed: false` means no entry carried that key — a successful request
@@ -1699,7 +1732,11 @@ async fn memory_list(
     let entries = mem.list(None, None).await.map_err(err_500)?;
     // `offset` used to be accepted and ignored here, so a console could never
     // reach past its first page however it asked.
-    let total = entries.len();
+    // `list` is capped by the backend, so its length is a page size. `count()`
+    // is the total, and reporting the page size as one made a large store look
+    // permanently stuck at the cap.
+    let listed = entries.len();
+    let total = mem.count().await.unwrap_or(listed);
     let json: Vec<_> = entries
         .iter()
         .skip(offset)
@@ -1720,6 +1757,7 @@ async fn memory_list(
         // What the store actually holds, so a caller can tell "this page is
         // short" from "there is no more".
         "total": total,
+        "listed": listed,
         "offset": offset,
     })))
 }
@@ -2672,6 +2710,33 @@ mod tests {
         .await
         .expect("absent key is not an error");
         assert_eq!(resp.0["removed"], false);
+    }
+
+    /// The CLI and TUI could both open one entry directly; the API could only
+    /// page through a list.
+    #[tokio::test]
+    async fn memory_get_returns_one_entry_and_404s_for_a_missing_key() {
+        let (_tmp, state) = state_with_real_memory();
+        state
+            .mem
+            .store("office", "Jakarta", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let found = memory_get(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("office".to_string()),
+        )
+        .await
+        .expect("existing key should be returned");
+        assert_eq!(found.0["content"], "Jakarta");
+        assert_eq!(found.0["category"], "core");
+
+        let missing = memory_get(State(state), HeaderMap::new(), Path("nope".to_string()))
+            .await
+            .expect_err("a missing key is a 404");
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

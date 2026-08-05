@@ -19,6 +19,14 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
             offset,
         } => handle_list(config, category, session, limit, offset).await,
         crate::MemoryCommands::Get { key } => handle_get(config, &key).await,
+        crate::MemoryCommands::Add {
+            key,
+            content,
+            category,
+        } => handle_add(config, &key, &content, &category).await,
+        crate::MemoryCommands::Recall { query, limit } => {
+            handle_recall(config, &query, limit).await
+        }
         crate::MemoryCommands::Stats => handle_stats(config).await,
         crate::MemoryCommands::Clear { key, category, yes } => {
             handle_clear(config, key, category, yes).await
@@ -84,7 +92,11 @@ async fn handle_list(
         return Ok(());
     }
 
-    let total = entries.len();
+    // `list` is capped by the backend, so its length is a page size, not a
+    // total. Asking `count()` is what stops a database of 5,000 entries
+    // reporting "1000 total" forever.
+    let listed = entries.len();
+    let total = mem.count().await.unwrap_or(listed);
     let page: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
 
     if page.is_empty() {
@@ -92,8 +104,13 @@ async fn handle_list(
         return Ok(());
     }
 
+    let truncated = if total > listed {
+        format!(" — listing the most recent {listed}")
+    } else {
+        String::new()
+    };
     println!(
-        "Memory entries ({total} total, showing {}-{}):\n",
+        "Memory entries ({total} total{truncated}, showing {}-{}):\n",
         offset + 1,
         offset + page.len(),
     );
@@ -154,6 +171,58 @@ fn print_entry(entry: &super::traits::MemoryEntry) {
         println!("Session:   {sid}");
     }
     println!("\n{}", entry.content);
+}
+
+/// Store a memory from the command line.
+///
+/// The CLI could read and delete but not write, so an operator seeding a fresh
+/// workspace had to go through the agent or hand-edit the database.
+///
+/// Screened like every other write path — this is the fourth, and the screen is
+/// only worth anything if none of them skips it.
+async fn handle_add(config: &Config, key: &str, content: &str, category: &str) -> Result<()> {
+    let mem = create_cli_memory(config)?;
+
+    let sanitized =
+        super::sanitize_memory_content(content).map_err(|reason| anyhow::anyhow!("{reason}"))?;
+    for note in &sanitized.notes {
+        println!("  {} {note}", style("note:").yellow());
+    }
+
+    mem.store(key, &sanitized.content, parse_category(category), None)
+        .await?;
+    println!("Stored {} [{}]", style(key).white().bold(), category);
+    Ok(())
+}
+
+/// Search memory from the command line.
+///
+/// The other three surfaces could search; this one could not, so an operator
+/// checking what the agent knows had to page through `list`.
+async fn handle_recall(config: &Config, query: &str, limit: usize) -> Result<()> {
+    let mem = create_cli_memory(config)?;
+    let hits = mem.recall(query, limit.max(1), None).await?;
+
+    if hits.is_empty() {
+        println!("No memory entries matched '{query}'.");
+        return Ok(());
+    }
+
+    println!("{} match(es) for '{}':\n", hits.len(), query);
+    for entry in &hits {
+        // Scores are relevance relative to the best hit in this set, so render
+        // them as a percentage of it rather than as a bare fraction.
+        let relevance = entry
+            .score
+            .map_or_else(String::new, |s| format!("  [{:.0}%]", s * 100.0));
+        println!(
+            "- {} [{}]{relevance}",
+            style(&entry.key).white().bold(),
+            entry.category
+        );
+        println!("    {}", truncate_content(&entry.content, 80));
+    }
+    Ok(())
 }
 
 async fn handle_stats(config: &Config) -> Result<()> {

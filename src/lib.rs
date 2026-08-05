@@ -450,6 +450,24 @@ pub enum MemoryCommands {
         /// Memory key to look up
         key: String,
     },
+    /// Store a memory entry
+    Add {
+        /// Key to store it under
+        key: String,
+        /// The information to remember
+        content: String,
+        /// Category: core (default), daily, conversation, or a custom name
+        #[arg(long, default_value = "core")]
+        category: String,
+    },
+    /// Search memory entries by keyword
+    Recall {
+        /// Keywords or phrase to search for
+        query: String,
+        /// Maximum number of results
+        #[arg(long, default_value = "5")]
+        limit: usize,
+    },
     /// Show memory backend statistics and health
     Stats,
     /// Clear memories by category, by key, or clear all

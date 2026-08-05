@@ -958,6 +958,9 @@ impl Memory for SqliteMemory {
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // Callers render `list().len()` as a total. It is not one past this
+        // cap — `count()` is — so anything reporting a total has to ask for it
+        // rather than trusting the length of this page.
         const DEFAULT_LIST_LIMIT: i64 = 1000;
 
         let conn = self.conn.clone();
