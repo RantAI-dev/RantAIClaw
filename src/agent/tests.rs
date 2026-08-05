@@ -1499,3 +1499,82 @@ async fn run_single_delegates_to_turn() {
         "Expected non-empty response from run_single"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 21. Memory flush before compaction
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn agent_with_security(provider: Box<dyn Provider>, mem: Arc<dyn Memory>) -> Agent {
+    Agent::builder()
+        .provider(provider)
+        .tools(vec![])
+        .memory(mem)
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .security(Arc::new(crate::security::SecurityPolicy::default()))
+        .auto_save(false)
+        .build()
+        .unwrap()
+}
+
+/// Seed enough history for `compute_split_index` to find a boundary.
+async fn seed_history(agent: &mut Agent) {
+    for i in 0..12 {
+        let _ = agent.turn(&format!("turn {i}")).await;
+    }
+}
+
+/// The compacted summary lives only in this session's history, so a fact the
+/// conversation established is gone when the session ends unless it was stored.
+#[tokio::test]
+async fn compaction_flush_stores_durable_facts() {
+    let (mem, _tmp) = make_sqlite_memory();
+
+    // 12 seeding turns, then the flush turn's tool call, then its wrap-up, then
+    // the summary. Anything past the script falls back to plain text.
+    let mut script: Vec<ChatResponse> = (0..12).map(|_| text_response("ok")).collect();
+    script.push(tool_response(vec![ToolCall {
+        id: "call_1".into(),
+        name: "memory_store".into(),
+        arguments: serde_json::json!({
+            "key": "operator_office",
+            "content": "The operator works from the Jakarta office"
+        })
+        .to_string(),
+    }]));
+    script.push(text_response("none"));
+    script.push(text_response("## Summary\nsummarised"));
+
+    let mut agent = agent_with_security(Box::new(ScriptedProvider::new(script)), mem.clone());
+    seed_history(&mut agent).await;
+
+    agent.compact_streaming(4, None).await.unwrap();
+
+    let stored = mem.get("operator_office").await.unwrap();
+    assert!(
+        stored.is_some(),
+        "the flush turn's memory write must survive compaction"
+    );
+}
+
+/// The flush runs over a scratch history that is thrown away. Only the summary
+/// envelope belongs in the agent's own history.
+#[tokio::test]
+async fn compaction_flush_leaves_no_trace_in_history() {
+    let (mem, _tmp) = make_sqlite_memory();
+    let mut script: Vec<ChatResponse> = (0..12).map(|_| text_response("ok")).collect();
+    script.push(text_response("none"));
+    script.push(text_response("## Summary\nsummarised"));
+
+    let mut agent = agent_with_security(Box::new(ScriptedProvider::new(script)), mem);
+    seed_history(&mut agent).await;
+
+    agent.compact_streaming(4, None).await.unwrap();
+
+    let rendered = format!("{:?}", agent.history());
+    assert!(
+        !rendered.contains("outlive this session"),
+        "the flush prompt must not leak into the agent's history"
+    );
+}
