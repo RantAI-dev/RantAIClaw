@@ -25,7 +25,7 @@ impl Tool for MemoryForgetTool {
     }
 
     fn description(&self) -> &str {
-        "Remove a memory by key. Use to delete outdated facts or sensitive data. Returns whether the memory was found and removed."
+        "Remove a memory. Address it by 'key', or by 'contains' with a distinctive phrase from its content when the key is not known. Use to delete outdated facts or sensitive data."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -35,17 +35,51 @@ impl Tool for MemoryForgetTool {
                 "key": {
                     "type": "string",
                     "description": "The key of the memory to forget"
+                },
+                "contains": {
+                    "type": "string",
+                    "description": "Alternative to 'key': a distinctive phrase from the memory's content. Must match exactly one memory — if it matches several, the call fails and names them."
                 }
-            },
-            "required": ["key"]
+            }
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let key = args
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'key' parameter"))?;
+        let key_arg = args.get("key").and_then(|v| v.as_str());
+        let contains_arg = args.get("contains").and_then(|v| v.as_str());
+
+        // Exactly one selector. Accepting both would make it ambiguous which one
+        // decides when they disagree, and that ambiguity deletes something.
+        let key: String = match (key_arg, contains_arg) {
+            (Some(k), None) => k.to_string(),
+            (None, Some(needle)) => {
+                match super::memory_store::resolve_unique_entry(
+                    self.memory.as_ref(),
+                    needle,
+                    "contains",
+                )
+                .await
+                {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(error),
+                        })
+                    }
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Pass either 'key' or 'contains', not both".into()),
+                })
+            }
+            (None, None) => return Err(anyhow::anyhow!("Missing 'key' or 'contains' parameter")),
+        };
+        let key = key.as_str();
 
         if let Err(error) = self
             .security
@@ -133,6 +167,78 @@ mod tests {
         let tool = MemoryForgetTool::new(mem, test_security());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
+    }
+
+    // ── contains selector ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn forget_by_contains_removes_the_entry() {
+        let (_tmp, mem) = test_mem();
+        mem.store(
+            "obscure_key_9f2",
+            "The staging password rotates weekly",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security());
+        let result = tool
+            .execute(json!({"contains": "staging password"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(mem.get("obscure_key_9f2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn forget_by_ambiguous_contains_is_rejected() {
+        let (_tmp, mem) = test_mem();
+        mem.store("a", "the deploy runbook", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "the deploy schedule", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security());
+        let result = tool.execute(json!({"contains": "deploy"})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("matches 2 memories"));
+        assert!(
+            mem.get("a").await.unwrap().is_some(),
+            "nothing may be deleted"
+        );
+        assert!(mem.get("b").await.unwrap().is_some());
+    }
+
+    /// Accepting both selectors would leave it ambiguous which one decides when
+    /// they disagree — and that ambiguity deletes something.
+    #[tokio::test]
+    async fn forget_requires_exactly_one_selector() {
+        let (_tmp, mem) = test_mem();
+        mem.store("k", "some content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let tool = MemoryForgetTool::new(mem.clone(), test_security());
+
+        let both = tool
+            .execute(json!({"key": "k", "contains": "some"}))
+            .await
+            .unwrap();
+        assert!(!both.success);
+        assert!(both.error.unwrap_or_default().contains("not both"));
+
+        let neither = tool.execute(json!({})).await;
+        assert!(neither.is_err(), "neither selector must be an error");
+
+        assert!(mem.get("k").await.unwrap().is_some());
     }
 
     #[tokio::test]

@@ -101,7 +101,7 @@ const PROJECTION_END: &str = "<!-- rantaiclaw:memory:end -->";
 /// The whole file is injected into the system prompt every session, so an
 /// unbounded projection is a silent per-session token cost that grows with the
 /// database.
-const PROJECTION_MAX_CHARS: usize = 4_000;
+pub const PROJECTION_MAX_CHARS: usize = 4_000;
 
 /// Render core memories into the delimited block of `MEMORY.md`.
 ///
