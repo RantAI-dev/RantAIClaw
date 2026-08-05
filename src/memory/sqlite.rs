@@ -390,42 +390,79 @@ impl SqliteMemory {
         conn: &Connection,
         query: &str,
         limit: usize,
+        session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        // Escape FTS5 special chars and build query
-        let fts_query: String = query
-            .split_whitespace()
-            .map(|w| format!("\"{w}\""))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-
+        let fts_query = Self::build_fts_query(query);
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
 
-        let sql = "SELECT m.id, bm25(memories_fts) as score
-                   FROM memories_fts f
-                   JOIN memories m ON m.rowid = f.rowid
-                   WHERE memories_fts MATCH ?1
-                   ORDER BY score
-                   LIMIT ?2";
+        // The session predicate belongs in the query, not after it. Filtering the
+        // global top-N afterwards means a conversation's own memories are only
+        // findable when they happen to outrank every other conversation's — on a
+        // busy database a scoped recall came back empty while matching rows sat
+        // in the table.
+        let sql = if session_id.is_some() {
+            "SELECT m.id, bm25(memories_fts) as score
+             FROM memories_fts f
+             JOIN memories m ON m.rowid = f.rowid
+             WHERE memories_fts MATCH ?1 AND m.session_id = ?3
+             ORDER BY score
+             LIMIT ?2"
+        } else {
+            "SELECT m.id, bm25(memories_fts) as score
+             FROM memories_fts f
+             JOIN memories m ON m.rowid = f.rowid
+             WHERE memories_fts MATCH ?1
+             ORDER BY score
+             LIMIT ?2"
+        };
 
         let mut stmt = conn.prepare(sql)?;
         #[allow(clippy::cast_possible_wrap)]
         let limit_i64 = limit as i64;
 
-        let rows = stmt.query_map(params![fts_query, limit_i64], |row| {
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<(String, f32)> {
             let id: String = row.get(0)?;
             let score: f64 = row.get(1)?;
             // BM25 returns negative scores (lower = better), negate for ranking
             #[allow(clippy::cast_possible_truncation)]
             Ok((id, (-score) as f32))
-        })?;
+        };
 
         let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
+        match session_id {
+            Some(sid) => {
+                let rows = stmt.query_map(params![fts_query, limit_i64, sid], map_row)?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+            None => {
+                let rows = stmt.query_map(params![fts_query, limit_i64], map_row)?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
         }
         Ok(results)
+    }
+
+    /// Build the FTS5 MATCH expression for a free-text query.
+    ///
+    /// Each term becomes a quoted string literal so punctuation cannot be read
+    /// as FTS5 syntax. A `"` inside a term is escaped by doubling it, per FTS5's
+    /// string-literal rules — left raw it closed the literal early and produced
+    /// an expression the parser rejected, which silently demoted the whole query
+    /// to the substring fallback.
+    fn build_fts_query(query: &str) -> String {
+        query
+            .split_whitespace()
+            .map(|w| w.replace('"', "\"\""))
+            .filter(|w| !w.is_empty())
+            .map(|w| format!("\"{w}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ")
     }
 
     /// Vector similarity search: scan embeddings and compute cosine similarity.
@@ -570,11 +607,22 @@ impl Memory for SqliteMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        // Compute embedding (async, before blocking work)
-        let embedding_bytes = self
-            .get_or_compute_embedding(content)
-            .await?
-            .map(|emb| vector::vec_to_bytes(&emb));
+        // Compute embedding (async, before blocking work).
+        //
+        // A provider failure degrades rather than failing the write. Memory is an
+        // auxiliary capability: refusing to store a message because a third-party
+        // embedding endpoint is rate-limiting loses the message outright, and the
+        // callers make that invisible — auto-save discards the error. The row is
+        // still keyword-searchable, and its provenance columns stay NULL, which is
+        // exactly what a later re-embedding pass looks for. Documented departure
+        // from fail-fast, announced in the log rather than silent.
+        let embedding_bytes = match self.get_or_compute_embedding(content).await {
+            Ok(emb) => emb.map(|e| vector::vec_to_bytes(&e)),
+            Err(e) => {
+                tracing::warn!("embedding unavailable, storing memory without a vector: {e}");
+                None
+            }
+        };
 
         let conn = self.conn.clone();
         let key = key.to_string();
@@ -637,8 +685,17 @@ impl Memory for SqliteMemory {
             return Ok(Vec::new());
         }
 
-        // Compute query embedding (async, before blocking work)
-        let query_embedding = self.get_or_compute_embedding(query).await?;
+        // Compute query embedding (async, before blocking work). As in `store`, a
+        // provider failure degrades to keyword-only rather than failing the read —
+        // `build_memory_context` swallows an `Err`, so propagating one here reads
+        // to the user as "the agent has no memory".
+        let query_embedding = match self.get_or_compute_embedding(query).await {
+            Ok(emb) => emb,
+            Err(e) => {
+                tracing::warn!("embedding unavailable, recalling by keyword only: {e}");
+                None
+            }
+        };
 
         let conn = self.conn.clone();
         let query = query.to_string();
@@ -650,12 +707,27 @@ impl Memory for SqliteMemory {
             let conn = conn.lock();
             let session_ref = sid.as_deref();
 
-            // FTS5 BM25 keyword search
-            let keyword_results = Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default();
+            // FTS5 BM25 keyword search. A failure here is a real failure — an
+            // unparseable MATCH expression, a damaged index — and used to be
+            // indistinguishable from "nothing matched", which quietly demoted the
+            // query to the substring fallback. Say so, then degrade as before.
+            let keyword_results = match Self::fts5_search(&conn, &query, limit * 2, session_ref) {
+                Ok(hits) => hits,
+                Err(e) => {
+                    tracing::warn!("memory keyword search failed, falling back: {e}");
+                    Vec::new()
+                }
+            };
 
             // Vector similarity search (if embeddings available)
             let vector_results = if let Some(ref qe) = query_embedding {
-                Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
+                match Self::vector_search(&conn, qe, limit * 2, None, session_ref) {
+                    Ok(hits) => hits,
+                    Err(e) => {
+                        tracing::warn!("memory vector search failed, using keyword results: {e}");
+                        Vec::new()
+                    }
+                }
             } else {
                 Vec::new()
             };
@@ -764,12 +836,24 @@ impl Memory for SqliteMemory {
                         })
                         .collect();
                     let where_clause = conditions.join(" OR ");
+                    // Scope in SQL here too, for the same reason as the FTS path:
+                    // `ORDER BY updated_at DESC LIMIT n` applied globally can fill
+                    // the whole limit with other sessions' rows before the filter
+                    // ever runs.
+                    let limit_idx = keywords.len() * 2 + 1;
+                    let (scope_clause, session_idx) = if session_ref.is_some() {
+                        (
+                            format!(" AND session_id = ?{}", limit_idx + 1),
+                            Some(limit_idx + 1),
+                        )
+                    } else {
+                        (String::new(), None)
+                    };
                     let sql = format!(
                         "SELECT id, key, content, category, created_at, session_id FROM memories
-                         WHERE {where_clause}
+                         WHERE ({where_clause}){scope_clause}
                          ORDER BY updated_at DESC
-                         LIMIT ?{}",
-                        keywords.len() * 2 + 1
+                         LIMIT ?{limit_idx}"
                     );
                     let mut stmt = conn.prepare(&sql)?;
                     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -779,6 +863,11 @@ impl Memory for SqliteMemory {
                     }
                     #[allow(clippy::cast_possible_wrap)]
                     param_values.push(Box::new(limit as i64));
+                    if session_idx.is_some() {
+                        if let Some(sid) = session_ref {
+                            param_values.push(Box::new(sid.to_string()));
+                        }
+                    }
                     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
                         param_values.iter().map(AsRef::as_ref).collect();
                     let rows = stmt.query_map(params_ref.as_slice(), |row| {
@@ -1791,6 +1880,212 @@ mod tests {
         let long = "a".repeat(1_000_000);
         let h = SqliteMemory::content_hash("test-model", 8, &long);
         assert_eq!(h.len(), 16);
+    }
+
+    // ── Recall path hardening ─────────────────────────────────────
+
+    /// An embedder that always fails, standing in for a rate-limited or
+    /// unreachable provider.
+    struct FailingEmbedder;
+
+    #[async_trait]
+    impl super::super::embeddings::EmbeddingProvider for FailingEmbedder {
+        fn name(&self) -> &str {
+            "failing-stub"
+        }
+        fn dimensions(&self) -> usize {
+            8
+        }
+        async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("embedding provider unavailable (429)")
+        }
+    }
+
+    fn failing_embedder_memory(dir: &Path) -> SqliteMemory {
+        SqliteMemory::with_embedder(dir, Arc::new(FailingEmbedder), 0.7, 0.3, 1000, None).unwrap()
+    }
+
+    /// The keyword search took the global top-N and only then dropped rows from
+    /// other sessions, so a conversation's own memories were findable only when
+    /// they outranked every other conversation's.
+    #[tokio::test]
+    async fn scoped_recall_finds_rows_outside_the_global_top_n() {
+        let (_tmp, mem) = temp_sqlite();
+
+        for i in 0..40 {
+            mem.store(
+                &format!("noise_{i}"),
+                "shared topic shared topic shared topic",
+                MemoryCategory::Conversation,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store(
+            "needle",
+            "shared topic",
+            MemoryCategory::Conversation,
+            Some("session-b"),
+        )
+        .await
+        .unwrap();
+
+        let hits = mem
+            .recall("shared topic", 5, Some("session-b"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected the session-b row, got {:?}",
+            hits.iter().map(|e| &e.key).collect::<Vec<_>>()
+        );
+        assert_eq!(hits[0].key, "needle");
+    }
+
+    /// Isolates the keyword path. The integration test above can be satisfied by
+    /// the substring fallback, which this PR also scopes — so on its own it
+    /// proves the pair works, not that FTS filters. This one asks `fts5_search`
+    /// directly.
+    #[tokio::test]
+    async fn fts5_search_applies_the_session_filter() {
+        let (_tmp, mem) = temp_sqlite();
+        for i in 0..40 {
+            mem.store(
+                &format!("noise_{i}"),
+                "shared topic shared topic shared topic",
+                MemoryCategory::Conversation,
+                Some("session-a"),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store(
+            "needle",
+            "shared topic",
+            MemoryCategory::Conversation,
+            Some("session-b"),
+        )
+        .await
+        .unwrap();
+
+        let conn = mem.conn.lock();
+        let hits = SqliteMemory::fts5_search(&conn, "shared topic", 10, Some("session-b")).unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "keyword search must filter by session in SQL, not after the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_recall_still_excludes_other_sessions() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "a",
+            "shared topic",
+            MemoryCategory::Conversation,
+            Some("session-a"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "b",
+            "shared topic",
+            MemoryCategory::Conversation,
+            Some("session-b"),
+        )
+        .await
+        .unwrap();
+
+        let hits = mem.recall("shared", 10, Some("session-a")).await.unwrap();
+        assert_eq!(hits.len(), 1, "scope filter must not become a no-op");
+        assert_eq!(hits[0].key, "a");
+    }
+
+    /// A `"` inside a term closed the FTS5 string literal early, so the whole
+    /// expression failed to parse and the query silently dropped to the
+    /// substring fallback.
+    #[tokio::test]
+    async fn quote_in_query_still_uses_fts() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("quoted", "deployment runbook", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // `runbook"` is a whole token to FTS5 once the quote is escaped, but is
+        // not a substring of the stored content — so a hit here cannot have come
+        // from the LIKE fallback.
+        let hits = mem.recall("runbook\"", 10, None).await.unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected the FTS hit, got {:?}",
+            hits.iter().map(|e| &e.key).collect::<Vec<_>>()
+        );
+        assert_eq!(hits[0].key, "quoted");
+    }
+
+    #[test]
+    fn build_fts_query_escapes_embedded_quotes() {
+        assert_eq!(SqliteMemory::build_fts_query("a\"b"), "\"a\"\"b\"");
+        assert_eq!(
+            SqliteMemory::build_fts_query("one two"),
+            "\"one\" OR \"two\""
+        );
+        assert_eq!(SqliteMemory::build_fts_query("   "), "");
+    }
+
+    /// An embedding outage used to fail the write outright, and auto-save
+    /// discards the error — so the message was lost without a trace.
+    #[tokio::test]
+    async fn store_survives_embedding_provider_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mem = failing_embedder_memory(tmp.path());
+
+        mem.store(
+            "survivor",
+            "user prefers concise answers",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .expect("store must not fail when the embedding provider does");
+
+        let stored = mem.get("survivor").await.unwrap().expect("row must exist");
+        assert_eq!(stored.content, "user prefers concise answers");
+
+        // Provenance stays NULL, which is what a later re-embedding pass looks for.
+        let conn = mem.conn.lock();
+        let dims: Option<i64> = conn
+            .query_row(
+                "SELECT embedding_dims FROM memories WHERE key = 'survivor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dims, None, "a degraded write must not claim provenance");
+    }
+
+    #[tokio::test]
+    async fn recall_survives_embedding_provider_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mem = failing_embedder_memory(tmp.path());
+
+        mem.store("k", "rust ownership model", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let hits = mem
+            .recall("ownership", 10, None)
+            .await
+            .expect("recall must not fail when the embedding provider does");
+        assert_eq!(hits.len(), 1, "keyword results must still come back");
+        assert_eq!(hits[0].key, "k");
     }
 
     // ── Score contract ────────────────────────────────────────────
