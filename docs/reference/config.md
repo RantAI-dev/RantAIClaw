@@ -385,17 +385,82 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
+| `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `postgres`, `none`. An unrecognised value is a startup error, not a fallback |
 | `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded) |
-| `embedding_provider` | `none` | `none`, `openai`, or custom endpoint |
-| `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` route |
-| `embedding_dimensions` | `1536` | expected vector size for selected embedding model |
-| `vector_weight` | `0.7` | hybrid ranking vector weight |
-| `keyword_weight` | `0.3` | hybrid ranking keyword weight |
+| `min_relevance_score` | `0.4` | drop recalled entries scoring below this. See _Scores are relative_ below |
+| `embedding_provider` | `none` | `none`, `openai`, `openrouter`, `minimax`, or `custom:<base-url>` |
+| `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` to use an `[[embedding_routes]]` entry |
+| `embedding_dimensions` | `1536` | vector size the model emits. A mismatch disables vector search — see below |
+| `embedding_cache_size` | `10000` | embeddings cached before LRU eviction |
+| `vector_weight` | `0.7` | weight of the vector signal in hybrid ranking |
+| `keyword_weight` | `0.3` | weight of the keyword signal in hybrid ranking |
+| `hygiene_enabled` | `true` | run the retention pass (throttled to once every 12h) |
+| `archive_after_days` | `7` | move daily memory and session files to `archive/` after this many days. `0` disables |
+| `purge_after_days` | `30` | delete archived files after this many days. `0` disables |
+| `conversation_retention_days` | `30` | delete `conversation` memories older than this. `0` disables |
+| `snapshot_enabled` | `false` | export core memories to `MEMORY_SNAPSHOT.md` |
+| `snapshot_on_hygiene` | `false` | run that export during the hygiene pass |
+| `auto_hydrate` | `true` | restore from `MEMORY_SNAPSHOT.md` when `brain.db` is missing or empty |
+| `sqlite_open_timeout_secs` | unset | seconds to wait when opening `brain.db`. Unset waits indefinitely; capped at 300 |
+| `chunk_max_tokens` | `512` | **not used by memory** — see the note below |
+
+### Scores are relative, not absolute
+
+`MemoryEntry.score` is relevance normalised to `[0, 1]` **within one result set**:
+the best hit for a query scores `1.0` and weaker hits score proportionally lower.
+Scores are not comparable across queries.
+
+So `min_relevance_score` reads as _"keep hits at least this fraction as good as the
+best one"_, and it means the same thing on every backend. It is not a measure of
+absolute quality — a result set whose best hit is poor still contains a `1.0`.
+
+### Embedding dimensions must match the model
+
+`cosine_similarity` returns `0.0` when two vectors differ in length, so a
+`embedding_dimensions` that disagrees with what the model emits disables vector
+search rather than erroring. Each stored vector records the model and
+dimensionality that produced it; recall skips rows that do not match the live
+embedder and logs how many it skipped.
+
+After changing `embedding_model` or `embedding_dimensions`, run:
+
+```bash
+rantaiclaw memory reindex
+```
+
+That re-embeds rows carrying a foreign vector, plus any stored while the
+embedding provider was unavailable. Nothing re-embeds on its own.
+
+### `MEMORY.md`
+
+On the `sqlite` and `lucid` backends, core memories are projected into a delimited
+block of `MEMORY.md`, which the system prompt injects. Content **outside** the
+markers is yours and is preserved; content inside is generated and is replaced on
+each run. The database is authoritative — edit memories through the agent or
+`rantaiclaw memory`, and keep prose outside the block.
+
+The system prompt is built once per session, so a memory stored mid-session
+appears in the file immediately but reaches the prompt next session. Within-session
+recall covers the gap.
+
+### `chunk_max_tokens` is misplaced
+
+It sits under `[memory]` but nothing in the memory subsystem reads it — its only
+consumer is hardware datasheet RAG (`src/rag/`). Left where it is deliberately:
+relocating a key means another schema migration, and the value's behaviour is
+unchanged either way. Documented here so it is not mistaken for a memory setting.
 
 Notes:
 
-- Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
+- Memory context injection ignores legacy `assistant_resp*` auto-save keys, so old
+  model-authored summaries are not re-presented as facts.
+- Content written to memory is screened: invisible characters are stripped,
+  credential-shaped tokens are redacted, and content carrying the `[Memory context]`
+  header is refused — it would let one memory impersonate several.
+- The injected block is bounded (4 entries, 800 characters each, 4,000 total).
+- `response_cache_enabled`, `response_cache_ttl_minutes` and
+  `response_cache_max_entries` were removed in schema v17. They configured a cache
+  that was never wired to anything; the migrator strips them.
 
 ## `[[model_routes]]` and `[[embedding_routes]]`
 

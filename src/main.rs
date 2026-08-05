@@ -630,11 +630,11 @@ Examples:
         ui_command: UiCommands,
     },
 
-    /// Manage agent memory (list, get, stats, clear)
+    /// Manage agent memory (list, get, add, recall, reindex, stats, clear)
     #[command(long_about = "\
 Manage agent memory entries.
 
-List, inspect, and clear memory entries stored by the agent. \
+Store, search, inspect and clear the memories the agent keeps. \
 Supports filtering by category and session, pagination, and \
 batch clearing with confirmation.
 
@@ -643,6 +643,9 @@ Examples:
   rantaiclaw memory list
   rantaiclaw memory list --category core --limit 10
   rantaiclaw memory get <key>
+  rantaiclaw memory add user_lang \"Prefers Bahasa Indonesia\"
+  rantaiclaw memory recall \"deploy runbook\"
+  rantaiclaw memory reindex
   rantaiclaw memory clear --category conversation --yes")]
     Memory {
         #[command(subcommand)]

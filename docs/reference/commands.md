@@ -285,6 +285,31 @@ The same endpoint can stream partial output as Server-Sent Events when called
 with `Accept: text/event-stream` or `?stream=1`; see
 `docs/reference/api-v1-streaming.md` for the event schema.
 
+### `memory`
+
+- `rantaiclaw memory list [--category <name>] [--session <id>] [--limit <n>] [--offset <n>]`
+- `rantaiclaw memory get <key>`
+- `rantaiclaw memory add <key> <content> [--category <name>]`
+- `rantaiclaw memory recall <query> [--limit <n>]`
+- `rantaiclaw memory reindex`
+- `rantaiclaw memory stats`
+- `rantaiclaw memory clear [--key <key>] [--category <name>] [--yes]`
+
+`add` screens content the same way the agent's own writes are screened: invisible
+characters are stripped, credential-shaped tokens are redacted, and content
+carrying the `[Memory context]` header is refused.
+
+`recall` shows relevance as a percentage of the best hit in that result set, not
+as an absolute quality score.
+
+`reindex` re-embeds memories the current embedding model cannot use — rows stored
+while the embedding provider was unavailable, and rows embedded by a previous
+model. Run it after changing `embedding_model` or `embedding_dimensions`; nothing
+re-embeds on its own. It refuses backends that store no embeddings.
+
+`list` reports the true entry count. The backend caps a single listing at 1,000
+rows, and the output says when it is showing a subset.
+
 ### `migrate`
 
 - `rantaiclaw migrate openclaw [--source <path>] [--dry-run]`
