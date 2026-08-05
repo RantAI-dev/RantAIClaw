@@ -36,7 +36,10 @@ credentials.json
 
 # Local Claude Code harness state
 .claude/
-memory/
+# Anchored to the repo root: unanchored, `memory/` also matches `src/memory/`,
+# so any new source file added there is silently ignored. The tracked ones
+# predate the rule and are unaffected, which is what hid it.
+/memory/
 state/
 
 # Agent implementation plans & specs (scratchpad — not product docs)

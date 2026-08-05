@@ -923,18 +923,6 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     persist_sender_turns(ctx, sender_key, &snapshot);
 }
 
-fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
-    if memory::is_assistant_autosave_key(key) {
-        return true;
-    }
-
-    if key.trim().to_ascii_lowercase().ends_with("_history") {
-        return true;
-    }
-
-    content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
-}
-
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
@@ -1180,51 +1168,21 @@ async fn build_memory_context(
     min_relevance_score: f64,
     conversation_id: Option<&str>,
 ) -> String {
-    let mut context = String::new();
-
-    if let Ok(entries) = crate::memory::recall_layered(mem, user_msg, 5, conversation_id).await {
-        let mut included = 0usize;
-        let mut used_chars = 0usize;
-
-        for entry in entries.iter().filter(|e| match e.score {
-            Some(score) => score >= min_relevance_score,
-            None => true, // keep entries without a score (e.g. non-vector backends)
-        }) {
-            if included >= MEMORY_CONTEXT_MAX_ENTRIES {
-                break;
-            }
-
-            if should_skip_memory_context_entry(&entry.key, &entry.content) {
-                continue;
-            }
-
-            let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
-                truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
-            } else {
-                entry.content.clone()
-            };
-
-            let line = format!("- {}: {}\n", entry.key, content);
-            let line_chars = line.chars().count();
-            if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
-                break;
-            }
-
-            if included == 0 {
-                context.push_str("[Memory context]\n");
-            }
-
-            context.push_str(&line);
-            used_chars += line_chars;
-            included += 1;
-        }
-
-        if included > 0 {
-            context.push('\n');
-        }
-    }
-
-    context
+    // The shared builder now owns these rules. This was the only one of the
+    // three that bounded its output; the agent loader and the CLI loop have
+    // been moved onto it rather than the other way round.
+    crate::memory::build_memory_context(
+        mem,
+        user_msg,
+        min_relevance_score,
+        conversation_id,
+        crate::memory::MemoryContextLimits {
+            max_entries: MEMORY_CONTEXT_MAX_ENTRIES,
+            max_entry_chars: MEMORY_CONTEXT_ENTRY_MAX_CHARS,
+            max_total_chars: MEMORY_CONTEXT_MAX_CHARS,
+        },
+    )
+    .await
 }
 
 /// Extract a compact summary of tool interactions from history messages added
@@ -4017,19 +3975,6 @@ mod tests {
         let other_err =
             anyhow::anyhow!("OpenAI Codex API error (502 Bad Gateway): error code: 502");
         assert!(!is_context_window_overflow_error(&other_err));
-    }
-
-    #[test]
-    fn memory_context_skip_rules_exclude_history_blobs() {
-        assert!(should_skip_memory_context_entry(
-            "telegram_123_history",
-            r#"[{"role":"user"}]"#
-        ));
-        assert!(should_skip_memory_context_entry(
-            "assistant_resp_legacy",
-            "fabricated memory"
-        ));
-        assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
     }
 
     #[test]

@@ -1,6 +1,5 @@
 use crate::memory::{self, Memory};
 use async_trait::async_trait;
-use std::fmt::Write;
 
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
@@ -49,32 +48,20 @@ impl MemoryLoader for DefaultMemoryLoader {
         user_message: &str,
         conversation_id: Option<&str>,
     ) -> anyhow::Result<String> {
-        let entries =
-            memory::recall_layered(memory, user_message, self.limit, conversation_id).await?;
-        if entries.is_empty() {
-            return Ok(String::new());
-        }
-
-        let mut context = String::from("[Memory context]\n");
-        for entry in entries {
-            if memory::is_assistant_autosave_key(&entry.key) {
-                continue;
-            }
-            if let Some(score) = entry.score {
-                if score < self.min_relevance_score {
-                    continue;
-                }
-            }
-            let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
-        }
-
-        // If all entries were below threshold, return empty
-        if context == "[Memory context]\n" {
-            return Ok(String::new());
-        }
-
-        context.push('\n');
-        Ok(context)
+        // One builder, shared with the CLI loop and the channel dispatcher. This
+        // path used to render its own block with no cap on entry count, entry
+        // size or total size, so a large recall went into the prompt whole.
+        Ok(memory::build_memory_context(
+            memory,
+            user_message,
+            self.min_relevance_score,
+            conversation_id,
+            memory::MemoryContextLimits {
+                max_entries: self.limit,
+                ..memory::MemoryContextLimits::default()
+            },
+        )
+        .await)
     }
 }
 

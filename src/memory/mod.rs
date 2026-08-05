@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod chunker;
 pub mod cli;
+pub mod context;
 pub mod embeddings;
 pub mod hygiene;
 pub mod lucid;
@@ -19,6 +20,7 @@ pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
+pub use context::{build_memory_context, MemoryContextLimits};
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
