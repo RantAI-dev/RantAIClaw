@@ -124,10 +124,12 @@ fn list_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
         ));
     }
     if listed > 50 {
-        out.push_str(&format!(
-            "  … {} more (use `/memory recall` to filter)\n",
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "  … {} more (use `/memory recall` to filter)",
             listed - 50
-        ));
+        );
     }
     Ok(CommandResult::Message(out))
 }
