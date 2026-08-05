@@ -501,6 +501,15 @@ async fn agent_chat_sync(
     let mut agent = crate::agent::Agent::from_config_with_observer(&config, state.observer.clone())
         .await
         .map_err(err_500)?;
+    // Scope this request's turn memory to its conversation. The gateway serves
+    // many callers, so an unscoped agent would write every session's messages
+    // into one shared pool and read them back into each other's context.
+    agent.set_conversation_id(
+        body.session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    );
     // Continue an existing conversation: re-feed prior turns so the model
     // remembers the exchange instead of starting cold on every message.
     let prior = load_session_history(body.session_id.as_deref());
@@ -575,6 +584,7 @@ async fn agent_chat_stream(
     let user_message = body.message.clone();
     let agent_message = body.message.clone();
     let req_session_id = body.session_id.clone();
+    let scope_session_id = req_session_id.clone();
     let history_session_id = body.session_id.clone();
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<crate::agent::AgentEvent>(64);
     let cancel = CancellationToken::new();
@@ -593,6 +603,9 @@ async fn agent_chat_stream(
     tokio::spawn(async move {
         match crate::agent::Agent::from_config_with_observer(&config, observer).await {
             Ok(mut agent) => {
+                // Same scoping as the non-streaming path: one agent per request,
+                // pointed at the conversation it is serving.
+                agent.set_conversation_id(scope_session_id.filter(|s: &String| !s.is_empty()));
                 // Gate non-read-only tools through an in-browser modal: the
                 // agent pauses, emits `AgentEvent::ApprovalRequest` over this
                 // SSE stream, and waits for `POST /approvals/{id}`. Off when
