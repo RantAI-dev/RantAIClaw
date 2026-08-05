@@ -7,7 +7,7 @@
 //! re-indexes all entries back into a fresh SQLite database.
 
 use anyhow::Result;
-use chrono::Local;
+use chrono::{Local, Utc};
 use rusqlite::{params, Connection};
 use std::fmt::Write;
 use std::fs;
@@ -120,7 +120,8 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
     // the hydrated database could not be opened at all.
     super::sqlite::SqliteMemory::init_schema(&conn)?;
 
-    let now = Local::now().to_rfc3339();
+    // UTC, matching what the backend writes — hygiene compares these as strings.
+    let now = Utc::now().to_rfc3339();
     let mut hydrated = 0;
 
     for (key, content) in &entries {

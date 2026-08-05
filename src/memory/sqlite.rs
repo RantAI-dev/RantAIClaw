@@ -3,7 +3,7 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
-use chrono::Local;
+use chrono::Utc;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use std::fmt::Write as _;
@@ -16,6 +16,16 @@ use uuid::Uuid;
 
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
+
+/// Re-render an RFC3339 timestamp in UTC, whatever offset it carries.
+///
+/// Returns `None` for anything that is not RFC3339 so callers can keep the
+/// original rather than substitute a guess.
+fn to_utc_rfc3339(raw: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|ts| ts.with_timezone(&Utc).to_rfc3339())
+}
 
 /// SQLite-backed persistent memory — the brain
 ///
@@ -175,17 +185,92 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
         )?;
 
-        // Migration: add session_id column if not present (safe to run repeatedly)
-        let has_session_id: bool = conn
+        // Column migrations: read the table definition once, then add whatever is
+        // missing. Safe to run repeatedly.
+        let table_sql: String = conn
             .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'")?
-            .query_row([], |row| row.get::<_, String>(0))?
-            .contains("session_id");
-        if !has_session_id {
+            .query_row([], |row| row.get::<_, String>(0))?;
+
+        if !table_sql.contains("session_id") {
             conn.execute_batch(
                 "ALTER TABLE memories ADD COLUMN session_id TEXT;
                  CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
             )?;
         }
+
+        // Which embedder produced `embedding`. Without it, swapping models leaves
+        // vectors of a foreign dimensionality that `cosine_similarity` scores 0.0
+        // silently. NULL means "written before this column existed".
+        if !table_sql.contains("embedding_model") {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN embedding_model TEXT;
+                 ALTER TABLE memories ADD COLUMN embedding_dims INTEGER;",
+            )?;
+        }
+
+        Self::migrate_timestamps_to_utc(conn)?;
+
+        Ok(())
+    }
+
+    /// Memory schema version, tracked in `PRAGMA user_version`.
+    ///
+    /// - `0` — pre-migration: timestamps carry the writing machine's UTC offset.
+    /// - `1` — `created_at` / `updated_at` are canonical UTC.
+    const SCHEMA_VERSION: i64 = 1;
+
+    /// Rewrite stored timestamps into UTC, once.
+    ///
+    /// Timestamps used to be written as `Local::now().to_rfc3339()` and compared
+    /// lexicographically by the hygiene pass. Two machines with different offsets
+    /// — a UTC container writing, a `+07:00` host pruning — make that comparison
+    /// disagree with real time, and it errs toward deleting rows early. Canonical
+    /// UTC makes the comparison sound again.
+    pub(crate) fn migrate_timestamps_to_utc(conn: &Connection) -> anyhow::Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version >= Self::SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        // Rebuild the FTS index before touching rows. The timestamp rewrite below
+        // fires `memories_au`, which deletes the old index entry — and that errors
+        // with SQLITE_CORRUPT_VTAB if the entry is missing or misaligned. Databases
+        // hydrated by the pre-056 snapshot path can be in exactly that state, since
+        // it inserted into the index by hand without the triggers. Rebuilding
+        // repairs them and makes the update path safe; it runs once, under the same
+        // version guard.
+        conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")?;
+
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = conn.prepare("SELECT id, created_at, updated_at FROM memories")?;
+            let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut rewritten = 0_usize;
+        for (id, created, updated) in rows {
+            let created_utc = to_utc_rfc3339(&created);
+            let updated_utc = to_utc_rfc3339(&updated);
+            // A value we cannot parse is left exactly as it is — guessing at an
+            // instant is worse than an untouched row.
+            if created_utc.is_none() && updated_utc.is_none() {
+                continue;
+            }
+            conn.execute(
+                "UPDATE memories SET created_at = ?1, updated_at = ?2 WHERE id = ?3",
+                params![
+                    created_utc.unwrap_or(created),
+                    updated_utc.unwrap_or(updated),
+                    id
+                ],
+            )?;
+            rewritten += 1;
+        }
+
+        if rewritten > 0 {
+            tracing::info!("memory schema: normalised {rewritten} timestamp(s) to UTC");
+        }
+        conn.pragma_update(None, "user_version", Self::SCHEMA_VERSION)?;
 
         Ok(())
     }
@@ -208,12 +293,24 @@ impl SqliteMemory {
         }
     }
 
-    /// Deterministic content hash for embedding cache.
+    /// Deterministic cache key for one embedding.
+    ///
+    /// Keyed on the embedder as well as the text: the same sentence under a
+    /// different model is a different vector in a different space, and often a
+    /// different length. Hashing text alone meant a model switch served the
+    /// previous model's vector as a cache hit.
+    ///
     /// Uses SHA-256 (truncated) instead of DefaultHasher, which is
     /// explicitly documented as unstable across Rust versions.
-    fn content_hash(text: &str) -> String {
+    fn content_hash(model: &str, dims: usize, text: &str) -> String {
         use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(text.as_bytes());
+        let mut hasher = Sha256::new();
+        hasher.update(model.as_bytes());
+        hasher.update(b"|");
+        hasher.update(dims.to_string().as_bytes());
+        hasher.update(b"|");
+        hasher.update(text.as_bytes());
+        let hash = hasher.finalize();
         // First 8 bytes → 16 hex chars, matching previous format length
         format!(
             "{:016x}",
@@ -231,8 +328,8 @@ impl SqliteMemory {
             return Ok(None); // Noop embedder
         }
 
-        let hash = Self::content_hash(text);
-        let now = Local::now().to_rfc3339();
+        let hash = Self::content_hash(self.embedder.name(), self.embedder.dimensions(), text);
+        let now = Utc::now().to_rfc3339();
 
         // Check cache (offloaded to blocking thread)
         let conn = self.conn.clone();
@@ -342,7 +439,9 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        let mut sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
+        let mut sql =
+            "SELECT id, embedding, embedding_dims FROM memories WHERE embedding IS NOT NULL"
+                .to_string();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
 
@@ -362,17 +461,41 @@ impl SqliteMemory {
         let rows = stmt.query_map(params_ref.as_slice(), |row| {
             let id: String = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
-            Ok((id, blob))
+            let dims: Option<i64> = row.get(2)?;
+            Ok((id, blob, dims))
         })?;
 
         let mut scored: Vec<(String, f32)> = Vec::new();
+        let mut foreign = 0_usize;
         for row in rows {
-            let (id, blob) = row?;
+            let (id, blob, stored_dims) = row?;
+            // A vector from a different embedder is not comparable: cosine
+            // similarity returns 0.0 on a length mismatch without saying so, which
+            // reads as "no match" rather than "wrong index". Skip it and count it,
+            // so the operator gets told to reindex instead of silently losing
+            // vector recall. Rows predating the provenance columns carry NULL and
+            // are judged on vector length alone, as before.
+            let comparable = match stored_dims {
+                Some(d) => usize::try_from(d).is_ok_and(|d| d == query_embedding.len()),
+                None => true,
+            };
+            if !comparable {
+                foreign += 1;
+                continue;
+            }
             let emb = vector::bytes_to_vec(&blob);
             let sim = vector::cosine_similarity(query_embedding, &emb);
             if sim > 0.0 {
                 scored.push((id, sim));
             }
+        }
+
+        if foreign > 0 {
+            tracing::warn!(
+                "vector search skipped {foreign} memor{} embedded by a different model; \
+                 run `rantaiclaw memory reindex` to re-embed them",
+                if foreign == 1 { "y" } else { "ies" }
+            );
         }
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -457,23 +580,47 @@ impl Memory for SqliteMemory {
         let key = key.to_string();
         let content = content.to_string();
         let sid = session_id.map(String::from);
+        // Record which embedder produced the vector, so a later model switch can
+        // be detected instead of silently scoring every comparison 0.0.
+        let (emb_model, emb_dims) = if embedding_bytes.is_some() {
+            (
+                Some(self.embedder.name().to_string()),
+                Some(self.embedder.dimensions()),
+            )
+        } else {
+            (None, None)
+        };
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
-            let now = Local::now().to_rfc3339();
+            let now = Utc::now().to_rfc3339();
             let cat = Self::category_to_str(&category);
             let id = Uuid::new_v4().to_string();
+            let emb_dims = emb_dims.map(|d| i64::try_from(d).unwrap_or(i64::MAX));
 
             conn.execute(
-                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, embedding_model, embedding_dims)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(key) DO UPDATE SET
                     content = excluded.content,
                     category = excluded.category,
                     embedding = excluded.embedding,
+                    embedding_model = excluded.embedding_model,
+                    embedding_dims = excluded.embedding_dims,
                     updated_at = excluded.updated_at,
                     session_id = excluded.session_id",
-                params![id, key, content, cat, embedding_bytes, now, now, sid],
+                params![
+                    id,
+                    key,
+                    content,
+                    cat,
+                    embedding_bytes,
+                    now,
+                    now,
+                    sid,
+                    emb_model,
+                    emb_dims
+                ],
             )?;
             Ok(())
         })
@@ -1083,15 +1230,15 @@ mod tests {
 
     #[test]
     fn content_hash_deterministic() {
-        let h1 = SqliteMemory::content_hash("hello world");
-        let h2 = SqliteMemory::content_hash("hello world");
+        let h1 = SqliteMemory::content_hash("test-model", 8, "hello world");
+        let h2 = SqliteMemory::content_hash("test-model", 8, "hello world");
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn content_hash_different_inputs() {
-        let h1 = SqliteMemory::content_hash("hello");
-        let h2 = SqliteMemory::content_hash("world");
+        let h1 = SqliteMemory::content_hash("test-model", 8, "hello");
+        let h2 = SqliteMemory::content_hash("test-model", 8, "world");
         assert_ne!(h1, h2);
     }
 
@@ -1594,25 +1741,223 @@ mod tests {
 
     #[test]
     fn content_hash_empty_string() {
-        let h = SqliteMemory::content_hash("");
+        let h = SqliteMemory::content_hash("test-model", 8, "");
         assert!(!h.is_empty());
         assert_eq!(h.len(), 16); // 16 hex chars
     }
 
     #[test]
     fn content_hash_unicode() {
-        let h1 = SqliteMemory::content_hash("🦀");
-        let h2 = SqliteMemory::content_hash("🦀");
+        let h1 = SqliteMemory::content_hash("test-model", 8, "🦀");
+        let h2 = SqliteMemory::content_hash("test-model", 8, "🦀");
         assert_eq!(h1, h2);
-        let h3 = SqliteMemory::content_hash("🚀");
+        let h3 = SqliteMemory::content_hash("test-model", 8, "🚀");
         assert_ne!(h1, h3);
     }
 
     #[test]
     fn content_hash_long_input() {
         let long = "a".repeat(1_000_000);
-        let h = SqliteMemory::content_hash(&long);
+        let h = SqliteMemory::content_hash("test-model", 8, &long);
         assert_eq!(h.len(), 16);
+    }
+
+    // ── Embedding provenance + UTC timestamp migration ────────────
+
+    /// Deterministic embedder with a declared identity, so tests can simulate
+    /// swapping models without any network.
+    struct StubEmbedder {
+        label: &'static str,
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl super::super::embeddings::EmbeddingProvider for StubEmbedder {
+        fn name(&self) -> &str {
+            self.label
+        }
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    #[allow(clippy::cast_precision_loss)]
+                    (0..self.dims)
+                        .map(|i| ((t.len() + i) % 7) as f32 + 1.0)
+                        .collect()
+                })
+                .collect())
+        }
+    }
+
+    fn stub_memory(dir: &Path, label: &'static str, dims: usize) -> SqliteMemory {
+        SqliteMemory::with_embedder(
+            dir,
+            Arc::new(StubEmbedder { label, dims }),
+            0.7,
+            0.3,
+            1000,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Write a database in the shape a pre-migration build left behind: no
+    /// provenance columns, `user_version` still 0, timestamps carrying an offset.
+    fn legacy_db(dir: &Path, created: &str, updated: &str) {
+        std::fs::create_dir_all(dir.join("memory")).unwrap();
+        let conn = Connection::open(dir.join("memory").join("brain.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, content TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'core', embedding BLOB,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, session_id TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, key, content, category, created_at, updated_at)
+             VALUES ('legacy-1', 'legacy_key', 'legacy content', 'conversation', ?1, ?2)",
+            params![created, updated],
+        )
+        .unwrap();
+    }
+
+    fn stored_timestamps(dir: &Path) -> (String, String) {
+        let conn = Connection::open(dir.join("memory").join("brain.db")).unwrap();
+        conn.query_row(
+            "SELECT created_at, updated_at FROM memories WHERE id = 'legacy-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_local_offset_timestamps_migrate_to_utc() {
+        let tmp = TempDir::new().unwrap();
+        legacy_db(
+            tmp.path(),
+            "2026-08-05T10:00:00+07:00",
+            "2026-08-05T11:30:00+07:00",
+        );
+
+        let _mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let (created, updated) = stored_timestamps(tmp.path());
+        assert_eq!(
+            created, "2026-08-05T03:00:00+00:00",
+            "created_at not in UTC"
+        );
+        assert_eq!(
+            updated, "2026-08-05T04:30:00+00:00",
+            "updated_at not in UTC"
+        );
+    }
+
+    #[test]
+    fn timestamp_migration_runs_once() {
+        let tmp = TempDir::new().unwrap();
+        legacy_db(
+            tmp.path(),
+            "2026-08-05T10:00:00+07:00",
+            "2026-08-05T10:00:00+07:00",
+        );
+        let _mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        // A later write in some other offset must survive a reopen untouched —
+        // the migration is a one-time normalisation, not a recurring rewrite.
+        {
+            let conn = Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
+            conn.execute(
+                "UPDATE memories SET updated_at = '2026-08-06T09:00:00+02:00' WHERE id = 'legacy-1'",
+                [],
+            )
+            .unwrap();
+        }
+        let _mem2 = SqliteMemory::new(tmp.path()).unwrap();
+
+        let (_, updated) = stored_timestamps(tmp.path());
+        assert_eq!(
+            updated, "2026-08-06T09:00:00+02:00",
+            "migration re-ran on an already-migrated database"
+        );
+    }
+
+    #[test]
+    fn unparseable_timestamp_is_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        legacy_db(tmp.path(), "not-a-date", "also-not-a-date");
+
+        let _mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let (created, updated) = stored_timestamps(tmp.path());
+        assert_eq!(created, "not-a-date");
+        assert_eq!(updated, "also-not-a-date");
+    }
+
+    #[test]
+    fn embedding_cache_key_separates_models() {
+        let same = SqliteMemory::content_hash("model-a", 8, "shared text");
+        let other_model = SqliteMemory::content_hash("model-b", 8, "shared text");
+        let other_dims = SqliteMemory::content_hash("model-a", 16, "shared text");
+
+        assert_ne!(
+            same, other_model,
+            "a different model must not hit the same cache entry"
+        );
+        assert_ne!(
+            same, other_dims,
+            "a different dimensionality must not hit the same cache entry"
+        );
+    }
+
+    /// A vector produced by another embedder is not comparable: `cosine_similarity`
+    /// returns 0.0 on a length mismatch without signalling why. Those rows must be
+    /// skipped rather than silently scored as "no match".
+    #[tokio::test]
+    async fn vector_search_skips_foreign_dimensioned_rows() {
+        let tmp = TempDir::new().unwrap();
+
+        let small = stub_memory(tmp.path(), "stub-4", 4);
+        small
+            .store(
+                "k4",
+                "embedded by the 4-dim model",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(small);
+
+        let large = stub_memory(tmp.path(), "stub-8", 8);
+        large
+            .store(
+                "k8",
+                "embedded by the 8-dim model",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let query = large
+            .get_or_compute_embedding("embedded by the 8-dim model")
+            .await
+            .unwrap()
+            .expect("stub embedder should produce a vector");
+
+        let conn = large.conn.lock();
+        let hits = SqliteMemory::vector_search(&conn, &query, 10, None, None).unwrap();
+
+        let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the row matching the live embedder is comparable, got {ids:?}"
+        );
     }
 
     // ── Edge cases: category helpers ─────────────────────────────
