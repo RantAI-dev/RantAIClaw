@@ -63,6 +63,38 @@ pub(crate) const COMPACTION_USER_PROMPT: &str = "\
 Above is the portion of our conversation that needs to be \
 compacted. Produce the summary as instructed in the system message.";
 
+/// System prompt for the flush turn that runs before compaction.
+///
+/// The compacted summary lives in this session's history and nothing more, so a
+/// fact the conversation established disappears when the session ends unless it
+/// was stored. Compaction is the moment to promote what deserves promoting.
+///
+/// Deliberately asks the model to *choose and call*, rather than scraping the
+/// summary: auto-saving model-authored text as memory is the mistake
+/// `is_assistant_autosave_key` exists to clean up after.
+pub(crate) const MEMORY_FLUSH_SYSTEM_PROMPT: &str = "\
+You are about to lose access to the conversation below — it is being \
+compacted into a short summary.\n\
+\n\
+Your only job right now is to save anything from it that should outlive this \
+session, using the memory tools available to you.\n\
+\n\
+Save: stable preferences, decisions that still stand, project facts, \
+corrections the user made.\n\
+Do not save: the flow of the conversation, transient state, anything already \
+obvious from the code or the workspace, or anything you are unsure about.\n\
+\n\
+When a fact you are saving supersedes one you already hold, pass `replaces` \
+with a distinctive phrase from the old one so it is corrected rather than \
+duplicated.\n\
+\n\
+If nothing qualifies, call no tools and reply with the single word: none.";
+
+/// Closing user turn for the flush.
+pub(crate) const MEMORY_FLUSH_USER_PROMPT: &str = "\
+Save anything above that should outlive this session, then stop. Reply `none` \
+if there is nothing worth keeping.";
+
 /// Walk `history` from the end and find the index where the
 /// (`keep_last`)-th user message from the back sits. That index is
 /// the boundary: everything strictly before it is compacted,

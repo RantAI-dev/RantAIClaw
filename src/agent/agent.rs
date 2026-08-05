@@ -15,6 +15,35 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+/// Tool-call rounds allowed to the pre-compaction memory flush. It has one
+/// errand — store what matters — and does not need to iterate like a turn.
+const FLUSH_MAX_TOOL_ITERATIONS: usize = 3;
+
+/// The tool registry handed to the pre-compaction memory flush.
+///
+/// Built explicitly rather than filtered from the agent's live registry, so a
+/// tool added later is never silently handed to a turn whose whole purpose is to
+/// write memory. A flush holding `shell` could take an action while nominally
+/// tidying up.
+///
+/// A free function so the property above can be asserted directly, without
+/// standing up an agent to ask it.
+fn memory_flush_tools(
+    memory: &Arc<dyn Memory>,
+    security: &Arc<SecurityPolicy>,
+) -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(tools::MemoryStoreTool::new(
+            memory.clone(),
+            security.clone(),
+        )),
+        Box::new(tools::MemoryForgetTool::new(
+            memory.clone(),
+            security.clone(),
+        )),
+    ]
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -84,6 +113,7 @@ pub struct AgentBuilder {
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     conversation_id: Option<String>,
+    security: Option<Arc<SecurityPolicy>>,
     approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
     approval_backend: Option<Arc<dyn crate::approval::ApprovalBackend>>,
 }
@@ -109,6 +139,7 @@ impl AgentBuilder {
             classification_config: None,
             available_hints: None,
             conversation_id: None,
+            security: None,
             approval_manager: None,
             approval_backend: None,
         }
@@ -124,6 +155,14 @@ impl AgentBuilder {
     ) -> Self {
         self.approval_manager = manager;
         self.approval_backend = backend;
+        self
+    }
+
+    /// Attach a security policy. `from_config` always sets one; the bare
+    /// builder does not, and without it the memory tools — which gate on a
+    /// policy — cannot be constructed, so the pre-compaction flush is skipped.
+    pub fn security(mut self, security: Arc<SecurityPolicy>) -> Self {
+        self.security = Some(security);
         self
     }
 
@@ -260,7 +299,7 @@ impl AgentBuilder {
             workspace_dir: self
                 .workspace_dir
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
-            security: None,
+            security: self.security,
             mcp_health: Vec::new(),
             mcp_tools_by_server: std::collections::HashMap::new(),
             identity_config: self.identity_config.unwrap_or_default(),
@@ -579,6 +618,68 @@ impl Agent {
     /// Returns an `Err` if the history is too short to compact (fewer
     /// than `keep_last + 1` user messages). The caller's TUI shows
     /// that error verbatim — it's user-facing, not a panic path.
+    /// Ask the model to save anything from the about-to-be-compacted turns that
+    /// should outlive the session.
+    ///
+    /// Runs over a scratch history that is thrown away: only the memory writes
+    /// survive, and the agent's own history is untouched.
+    ///
+    /// Entirely best-effort. Compaction is the user's request; it must not fail
+    /// because this errand did.
+    async fn flush_durable_memory(&mut self, to_compact: &[ConversationMessage]) {
+        use crate::agent::compaction::{
+            flatten_for_summary, MEMORY_FLUSH_SYSTEM_PROMPT, MEMORY_FLUSH_USER_PROMPT,
+        };
+
+        // No policy means a bare-builder agent; the memory tools gate on one, so
+        // there is nothing to flush through.
+        let Some(security) = self.security.clone() else {
+            return;
+        };
+        let flush_tools = memory_flush_tools(&self.memory, &security);
+
+        let mut scratch: Vec<ConversationMessage> = Vec::with_capacity(to_compact.len() + 2);
+        scratch.push(ConversationMessage::Chat(ChatMessage::system(
+            MEMORY_FLUSH_SYSTEM_PROMPT.to_string(),
+        )));
+        scratch.extend(
+            flatten_for_summary(to_compact)
+                .into_iter()
+                .map(ConversationMessage::Chat),
+        );
+        scratch.push(ConversationMessage::Chat(ChatMessage::user(
+            MEMORY_FLUSH_USER_PROMPT.to_string(),
+        )));
+
+        let result = crate::agent::loop_::run_structured_loop(
+            self.provider.as_ref(),
+            &mut scratch,
+            self.tool_dispatcher.as_ref(),
+            &flush_tools,
+            self.observer.as_ref(),
+            "memory-flush",
+            &self.model_name,
+            self.temperature,
+            true,
+            self.approval_manager.as_deref(),
+            "cli",
+            None,
+            self.approval_backend.as_deref(),
+            None,
+            &crate::config::MultimodalConfig::default(),
+            // One bounded errand, not an agentic session.
+            FLUSH_MAX_TOOL_ITERATIONS,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        if let Err(e) = result {
+            tracing::warn!("memory flush before compaction failed, continuing: {e}");
+        }
+    }
+
     pub async fn compact_streaming(
         &mut self,
         keep_last: usize,
@@ -608,6 +709,13 @@ impl Agent {
         }
 
         let to_compact: Vec<ConversationMessage> = self.history[..split_idx].to_vec();
+
+        // Promote durable facts before the turns carrying them are folded into a
+        // summary. The summary itself only lives in this session's history, so a
+        // fact established here is gone when the session ends unless it was
+        // stored — and compaction is the natural moment to store it.
+        self.flush_durable_memory(&to_compact).await;
+
         let side_messages = build_side_request(&to_compact);
 
         let observer_started = Instant::now();
@@ -1368,6 +1476,26 @@ mod tests {
         assert!(
             saw_cancelled_done,
             "expected Done {{ cancelled: true }} event"
+        );
+    }
+
+    /// A flush turn exists to write memory. Handing it anything else — `shell`,
+    /// `http_request` — would let it take an action while nominally tidying up.
+    /// The registry is built explicitly for exactly this reason, so assert it.
+    #[test]
+    fn memory_flush_registry_exposes_only_memory_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(tmp.path()).unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+
+        let registry = memory_flush_tools(&memory, &security);
+        let names: Vec<&str> = registry.iter().map(|t| t.name()).collect();
+
+        assert_eq!(
+            names,
+            vec!["memory_store", "memory_forget"],
+            "the flush turn must reach nothing but memory"
         );
     }
 }
