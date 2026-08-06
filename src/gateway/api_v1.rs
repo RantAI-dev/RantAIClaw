@@ -1630,14 +1630,8 @@ async fn memory_create(
             str::to_string,
         );
 
-    let category = match body.category.as_deref().map(str::trim) {
-        Some("daily") => crate::memory::MemoryCategory::Daily,
-        Some("conversation") => crate::memory::MemoryCategory::Conversation,
-        Some(other) if !other.is_empty() && other != "core" => {
-            crate::memory::MemoryCategory::Custom(other.to_string())
-        }
-        _ => crate::memory::MemoryCategory::Core,
-    };
+    let category = parse_memory_category(body.category.as_deref())
+        .unwrap_or(crate::memory::MemoryCategory::Core);
 
     let session = body
         .session_id
@@ -1720,23 +1714,83 @@ async fn memory_stats(
     })))
 }
 
+/// Query for `GET /api/v1/memory`.
+///
+/// Separate from [`ListQuery`] so that memory's filters do not leak onto the
+/// session routes that share it.
+#[derive(Deserialize)]
+struct MemoryListQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Rows to skip, newest first.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Restrict to one category. Unknown names are treated as custom
+    /// categories, matching how `POST /api/v1/memory` accepts them.
+    #[serde(default)]
+    category: Option<String>,
+    /// Keyword search. Present and non-empty routes through `Memory::recall`
+    /// instead of `Memory::list`, so results come back ranked.
+    #[serde(default)]
+    q: Option<String>,
+}
+
+/// Map a category name onto [`MemoryCategory`], or `None` when absent/blank.
+///
+/// Unknown names become custom categories rather than errors — the store
+/// accepts custom categories on write, so refusing them on read would make
+/// entries unreachable through the surface that created them.
+fn parse_memory_category(raw: Option<&str>) -> Option<crate::memory::MemoryCategory> {
+    match raw.map(str::trim).filter(|c| !c.is_empty())? {
+        "core" => Some(crate::memory::MemoryCategory::Core),
+        "daily" => Some(crate::memory::MemoryCategory::Daily),
+        "conversation" => Some(crate::memory::MemoryCategory::Conversation),
+        other => Some(crate::memory::MemoryCategory::Custom(other.to_string())),
+    }
+}
+
 async fn memory_list(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<ListQuery>,
+    Query(q): Query<MemoryListQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let mem = Arc::clone(&state.mem);
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
-    let entries = mem.list(None, None).await.map_err(err_500)?;
+    // `category` used to be accepted and ignored, so a caller asking for one
+    // category got the whole store back under a 200 — a silent wrong answer.
+    let category = parse_memory_category(q.category.as_deref());
+    let query = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    // A search is a ranked read, so it goes through `recall`; `recall` returns
+    // its own ranked page, which `offset`/`limit` then window like any other.
+    let entries = match query {
+        Some(text) => {
+            let mut hits = mem
+                .recall(text, offset.saturating_add(limit).max(1), None)
+                .await
+                .map_err(err_500)?;
+            if let Some(cat) = category.as_ref() {
+                hits.retain(|e| &e.category == cat);
+            }
+            hits
+        }
+        None => mem.list(category.as_ref(), None).await.map_err(err_500)?,
+    };
     // `offset` used to be accepted and ignored here, so a console could never
     // reach past its first page however it asked.
     // `list` is capped by the backend, so its length is a page size. `count()`
     // is the total, and reporting the page size as one made a large store look
     // permanently stuck at the cap.
     let listed = entries.len();
-    let total = mem.count().await.unwrap_or(listed);
+    // `count()` counts the whole store, so it is only the right total when
+    // nothing narrowed the read.
+    let total = if category.is_some() || query.is_some() {
+        listed
+    } else {
+        mem.count().await.unwrap_or(listed)
+    };
     let json: Vec<_> = entries
         .iter()
         .skip(offset)
@@ -1748,6 +1802,8 @@ async fn memory_list(
                 "content": e.content,
                 "timestamp": e.timestamp,
                 "session_id": e.session_id,
+                // Only a search ranks, so this is absent on a plain list.
+                "score": e.score,
             })
         })
         .collect();
@@ -2531,6 +2587,121 @@ mod tests {
         headers
     }
 
+    /// Store three entries across two categories and return the router.
+    async fn app_with_mixed_memory() -> (tempfile::TempDir, axum::Router) {
+        let (tmp, state) = state_with_real_memory();
+        state
+            .mem
+            .store(
+                "a_core",
+                "deploy runbook for the console",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .mem
+            .store(
+                "b_daily",
+                "deploy notes from today",
+                MemoryCategory::Daily,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .mem
+            .store(
+                "c_core",
+                "unrelated persona tuning",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        (tmp, router().with_state(state))
+    }
+
+    async fn memory_list_json(app: &axum::Router, query: &str) -> serde_json::Value {
+        use tower::ServiceExt as _;
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/memory?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "GET /api/v1/memory?{query}");
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// `?category=` used to be accepted and ignored: the caller got the whole
+    /// store back under a 200, which is a wrong answer that looks like a right
+    /// one. The unfiltered read is the control.
+    #[tokio::test]
+    async fn memory_list_filters_by_category() {
+        let (_tmp, app) = app_with_mixed_memory().await;
+
+        let all = memory_list_json(&app, "limit=50").await;
+        assert_eq!(all["entries"].as_array().unwrap().len(), 3, "control");
+
+        let daily = memory_list_json(&app, "limit=50&category=daily").await;
+        let cats: Vec<&str> = daily["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["category"].as_str().unwrap())
+            .collect();
+        assert_eq!(cats, vec!["daily"], "category filter ignored");
+        // A narrowed read must not report the whole-store count as its total.
+        assert_eq!(daily["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn memory_list_searches_with_q() {
+        let (_tmp, app) = app_with_mixed_memory().await;
+
+        let hits = memory_list_json(&app, "limit=50&q=deploy").await;
+        let keys: Vec<&str> = hits["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys.len(), 2, "expected both deploy entries, got {keys:?}");
+        assert!(
+            !keys.contains(&"c_core"),
+            "unrelated entry matched: {keys:?}"
+        );
+
+        // Search and category compose.
+        let narrowed = memory_list_json(&app, "limit=50&q=deploy&category=daily").await;
+        let keys: Vec<&str> = narrowed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["b_daily"], "q + category did not compose");
+    }
+
+    /// Absent params must behave exactly as before this route learned to filter.
+    #[tokio::test]
+    async fn memory_list_without_filters_is_unchanged() {
+        let (_tmp, app) = app_with_mixed_memory().await;
+        let all = memory_list_json(&app, "limit=50").await;
+        assert_eq!(all["total"], 3);
+        assert_eq!(all["count"], 3);
+        assert_eq!(all["offset"], 0);
+    }
+
     /// The handler tests above call the functions directly, which is exactly
     /// what the original defect could survive: the routes existed as `get(...)`
     /// only, so `POST` returned 405 and `DELETE` 404 while the handlers were
@@ -2772,9 +2943,11 @@ mod tests {
         let first = memory_list(
             State(state.clone()),
             HeaderMap::new(),
-            Query(ListQuery {
+            Query(MemoryListQuery {
                 limit: Some(2),
                 offset: Some(0),
+                category: None,
+                q: None,
             }),
         )
         .await
@@ -2782,9 +2955,11 @@ mod tests {
         let second = memory_list(
             State(state.clone()),
             HeaderMap::new(),
-            Query(ListQuery {
+            Query(MemoryListQuery {
                 limit: Some(2),
                 offset: Some(2),
+                category: None,
+                q: None,
             }),
         )
         .await
