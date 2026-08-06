@@ -20,7 +20,7 @@ pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
-pub use context::{build_memory_context, MemoryContextLimits};
+pub use context::{build_memory_context, MemoryContext, MemoryContextLimits};
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;

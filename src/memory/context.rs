@@ -55,10 +55,33 @@ fn should_skip(key: &str, content: &str, limits: &MemoryContextLimits) -> bool {
     content.chars().count() > limits.max_total_chars
 }
 
+/// What a turn's recall produced: the block to inject, and which entries are
+/// in it.
+///
+/// The keys are carried separately rather than parsed back out of `block`
+/// because the block's shape is a prompt-formatting decision — a reader that
+/// re-derived the keys from it would break the next time that shape changed.
+/// They exist so a surface can tell the operator that memory was used, and
+/// which memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryContext {
+    /// The rendered `[Memory context]` block. Empty when nothing survived.
+    pub block: String,
+    /// Keys of the entries in `block`, in the order they appear.
+    pub keys: Vec<String>,
+}
+
+impl MemoryContext {
+    /// True when nothing survived recall and filtering.
+    pub fn is_empty(&self) -> bool {
+        self.block.is_empty()
+    }
+}
+
 /// Recall for this turn and render the `[Memory context]` block.
 ///
-/// Returns an empty string when nothing survives — callers concatenate the
-/// result, so an empty block must cost nothing.
+/// Returns an empty block when nothing survives — callers concatenate it, so
+/// an empty result must cost nothing.
 ///
 /// `conversation_id` scopes the recall through [`recall_layered`]: the
 /// conversation's own memory surfaces first, then shared memory backfills.
@@ -69,7 +92,7 @@ pub async fn build_memory_context(
     min_relevance_score: f64,
     conversation_id: Option<&str>,
     limits: MemoryContextLimits,
-) -> String {
+) -> MemoryContext {
     let recall_limit = limits.max_entries.max(1) + 1;
     let entries = match recall_layered(memory, user_message, recall_limit, conversation_id).await {
         Ok(entries) => entries,
@@ -77,11 +100,12 @@ pub async fn build_memory_context(
             // Recall failing is not the same as recalling nothing. Callers
             // cannot tell the difference from an empty string, so say it here.
             tracing::warn!("memory recall failed while building context: {e}");
-            return String::new();
+            return MemoryContext::default();
         }
     };
 
     let mut context = String::new();
+    let mut keys: Vec<String> = Vec::new();
     let mut included = 0_usize;
     let mut used_chars = 0_usize;
 
@@ -114,6 +138,7 @@ pub async fn build_memory_context(
             context.push_str("[Memory context]\n");
         }
         context.push_str(&line);
+        keys.push(entry.key.clone());
         used_chars += line_chars;
         included += 1;
     }
@@ -121,7 +146,10 @@ pub async fn build_memory_context(
     if included > 0 {
         context.push('\n');
     }
-    context
+    MemoryContext {
+        block: context,
+        keys,
+    }
 }
 
 #[cfg(test)]
@@ -198,7 +226,9 @@ mod tests {
     #[tokio::test]
     async fn renders_entries_above_the_threshold() {
         let mem = memory_of(vec![entry("lang", "prefers Rust", 1.0)]);
-        let out = build_memory_context(&mem, "q", 0.4, None, MemoryContextLimits::default()).await;
+        let out = build_memory_context(&mem, "q", 0.4, None, MemoryContextLimits::default())
+            .await
+            .block;
         assert!(out.starts_with("[Memory context]\n"));
         assert!(out.contains("- lang: prefers Rust"));
         assert!(out.ends_with("\n\n"));
@@ -207,7 +237,9 @@ mod tests {
     #[tokio::test]
     async fn empty_when_everything_is_below_the_threshold() {
         let mem = memory_of(vec![entry("weak", "barely related", 0.1)]);
-        let out = build_memory_context(&mem, "q", 0.4, None, MemoryContextLimits::default()).await;
+        let out = build_memory_context(&mem, "q", 0.4, None, MemoryContextLimits::default())
+            .await
+            .block;
         assert!(out.is_empty(), "expected no block at all, got {out:?}");
     }
 
@@ -224,7 +256,9 @@ mod tests {
             max_entries: 3,
             ..MemoryContextLimits::default()
         };
-        let out = build_memory_context(&mem, "q", 0.0, None, limits).await;
+        let out = build_memory_context(&mem, "q", 0.0, None, limits)
+            .await
+            .block;
         assert_eq!(out.lines().filter(|l| l.starts_with("- ")).count(), 3);
     }
 
@@ -235,7 +269,9 @@ mod tests {
             max_entry_chars: 50,
             ..MemoryContextLimits::default()
         };
-        let out = build_memory_context(&mem, "q", 0.0, None, limits).await;
+        let out = build_memory_context(&mem, "q", 0.0, None, limits)
+            .await
+            .block;
         assert!(out.contains("..."), "expected an ellipsis, got {out:?}");
         assert!(out.chars().count() < 200);
     }
@@ -252,7 +288,9 @@ mod tests {
             max_entry_chars: 100,
             max_total_chars: 150,
         };
-        let out = build_memory_context(&mem, "q", 0.0, None, limits).await;
+        let out = build_memory_context(&mem, "q", 0.0, None, limits)
+            .await
+            .block;
         assert!(
             out.chars().count() <= 150 + "[Memory context]\n\n".len(),
             "block exceeded its budget: {} chars",
@@ -267,10 +305,67 @@ mod tests {
             entry("telegram_123_history", "serialised transcript", 1.0),
             entry("user_fact", "prefers concise answers", 1.0),
         ]);
-        let out = build_memory_context(&mem, "q", 0.0, None, MemoryContextLimits::default()).await;
+        let out = build_memory_context(&mem, "q", 0.0, None, MemoryContextLimits::default())
+            .await
+            .block;
         assert!(out.contains("user_fact"));
         assert!(!out.contains("fabricated"));
         assert!(!out.contains("transcript"));
+    }
+
+    /// The keys are what a surface shows the operator, so they must name
+    /// exactly the entries that reached the prompt — not what recall returned
+    /// before filtering, and not what the block happens to look like.
+    #[tokio::test]
+    async fn keys_name_exactly_the_entries_in_the_block() {
+        let mem = memory_of(vec![
+            entry("kept_a", "first fact", 1.0),
+            entry("assistant_resp_old", "a fabrication", 1.0),
+            entry("chat_history", "transcript", 1.0),
+            entry("kept_b", "second fact", 1.0),
+            entry("too_weak", "barely related", 0.1),
+        ]);
+        let limits = MemoryContextLimits {
+            max_entries: 5,
+            ..MemoryContextLimits::default()
+        };
+        let ctx = build_memory_context(&mem, "q", 0.4, None, limits).await;
+
+        assert_eq!(ctx.keys, vec!["kept_a", "kept_b"]);
+        for key in &ctx.keys {
+            assert!(ctx.block.contains(key.as_str()), "{key} missing from block");
+        }
+        assert!(!ctx.block.contains("assistant_resp_old"));
+        assert!(!ctx.block.contains("too_weak"));
+    }
+
+    #[tokio::test]
+    async fn keys_are_empty_when_nothing_survives() {
+        let mem = memory_of(vec![entry("weak", "barely related", 0.1)]);
+        let ctx = build_memory_context(&mem, "q", 0.4, None, MemoryContextLimits::default()).await;
+        assert!(ctx.is_empty());
+        assert!(ctx.keys.is_empty(), "no block means no keys");
+    }
+
+    /// Truncation caps the block; the keys must be capped with it, or a surface
+    /// would name entries the model never saw.
+    #[tokio::test]
+    async fn keys_stop_where_the_budget_does() {
+        let mem = memory_of(
+            (0..10)
+                .map(|i| entry(&format!("k{i}"), "fact", 1.0))
+                .collect(),
+        );
+        let limits = MemoryContextLimits {
+            max_entries: 3,
+            ..MemoryContextLimits::default()
+        };
+        let ctx = build_memory_context(&mem, "q", 0.0, None, limits).await;
+        assert_eq!(ctx.keys.len(), 3);
+        assert_eq!(
+            ctx.keys.len(),
+            ctx.block.lines().filter(|l| l.starts_with("- ")).count()
+        );
     }
 
     #[tokio::test]
@@ -278,7 +373,9 @@ mod tests {
         let mut e = entry("k", "v", 0.0);
         e.score = None;
         let mem = memory_of(vec![e]);
-        let out = build_memory_context(&mem, "q", 0.9, None, MemoryContextLimits::default()).await;
+        let out = build_memory_context(&mem, "q", 0.9, None, MemoryContextLimits::default())
+            .await
+            .block;
         assert!(out.contains("- k: v"), "unscored entries must survive");
     }
 }

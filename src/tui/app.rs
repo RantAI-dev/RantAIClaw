@@ -2440,6 +2440,14 @@ impl TuiApp {
                     }
                 }
             }
+            AgentEvent::MemoryRecalled { keys } => {
+                // Muted and indented, like a tool log: memory shaping the answer
+                // is background activity, not something the operator has to act
+                // on. But it was previously invisible, and an answer that leans
+                // on a remembered fact is unreadable without knowing that.
+                self.scrollback_queue
+                    .push(("_tool_log".to_string(), render_recalled_memories(&keys)));
+            }
             AgentEvent::Usage(u) => {
                 // Map the agent's cost::TokenUsage onto the TUI's tally shape.
                 self.context.token_usage = TokenUsage {
@@ -4478,6 +4486,39 @@ impl TuiApp {
 
         let status = Paragraph::new(line);
         frame.render_widget(status, area);
+    }
+}
+
+/// Most memory keys to name before summarising the rest.
+///
+/// The point of the line is "memory was used, here is roughly what" — past a
+/// few names it stops informing and starts crowding the answer it introduces.
+const RECALL_KEYS_SHOWN: usize = 3;
+
+/// One muted line naming the memories that shaped this turn.
+fn render_recalled_memories(keys: &[String]) -> String {
+    let noun = if keys.len() == 1 {
+        "memory"
+    } else {
+        "memories"
+    };
+    if keys.is_empty() {
+        // The agent only emits this event with a non-empty block, so an empty
+        // key list means the block was built without naming its entries —
+        // still worth saying memory was used.
+        return "↺ recalled stored memory".to_string();
+    }
+    let shown = keys
+        .iter()
+        .take(RECALL_KEYS_SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match keys.len().checked_sub(RECALL_KEYS_SHOWN) {
+        Some(rest) if rest > 0 => {
+            format!("↺ recalled {} {noun}: {shown} +{rest} more", keys.len())
+        }
+        _ => format!("↺ recalled {} {noun}: {shown}", keys.len()),
     }
 }
 
@@ -9058,6 +9099,47 @@ mod drain_tests {
         } else {
             panic!("expected Streaming");
         }
+    }
+}
+
+#[cfg(test)]
+mod recalled_memory_tests {
+    use super::*;
+
+    fn keys(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    #[test]
+    fn names_the_recalled_memories() {
+        assert_eq!(
+            render_recalled_memories(&keys(&["user_lang", "project"])),
+            "↺ recalled 2 memories: user_lang, project"
+        );
+    }
+
+    #[test]
+    fn one_memory_reads_as_singular() {
+        assert_eq!(
+            render_recalled_memories(&keys(&["user_lang"])),
+            "↺ recalled 1 memory: user_lang"
+        );
+    }
+
+    /// The count stays honest when the names are abbreviated — an operator
+    /// reading "3 memories" while seeing two names would mistrust both numbers.
+    #[test]
+    fn summarises_the_tail_without_losing_the_count() {
+        let line = render_recalled_memories(&keys(&["a", "b", "c", "d", "e"]));
+        assert_eq!(line, "↺ recalled 5 memories: a, b, c +2 more");
+        assert_eq!(line.matches(", ").count(), 2, "only the shown names listed");
+    }
+
+    #[test]
+    fn exactly_the_shown_limit_has_no_tail() {
+        let line = render_recalled_memories(&keys(&["a", "b", "c"]));
+        assert_eq!(line, "↺ recalled 3 memories: a, b, c");
+        assert!(!line.contains("more"), "no tail to summarise: {line}");
     }
 }
 

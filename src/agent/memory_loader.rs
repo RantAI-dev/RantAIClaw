@@ -14,7 +14,7 @@ pub trait MemoryLoader: Send + Sync {
         memory: &dyn Memory,
         user_message: &str,
         conversation_id: Option<&str>,
-    ) -> anyhow::Result<String>;
+    ) -> anyhow::Result<memory::MemoryContext>;
 }
 
 pub struct DefaultMemoryLoader {
@@ -47,7 +47,7 @@ impl MemoryLoader for DefaultMemoryLoader {
         memory: &dyn Memory,
         user_message: &str,
         conversation_id: Option<&str>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<memory::MemoryContext> {
         // One builder, shared with the CLI loop and the channel dispatcher. This
         // path used to render its own block with no cap on entry count, entry
         // size or total size, so a large recall went into the prompt whole.
@@ -193,7 +193,8 @@ mod tests {
         let context = loader
             .load_context(&MockMemory, "hello", None)
             .await
-            .unwrap();
+            .unwrap()
+            .block;
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("- k: v"));
     }
@@ -227,7 +228,8 @@ mod tests {
         let context = loader
             .load_context(&memory, "answer style", None)
             .await
-            .unwrap();
+            .unwrap()
+            .block;
         assert!(context.contains("user_fact"));
         assert!(!context.contains("assistant_resp_legacy"));
         assert!(!context.contains("fabricated detail"));
@@ -242,7 +244,8 @@ mod tests {
         let context = loader
             .load_context(&MockMemory, "hello", Some("telegram:123"))
             .await
-            .unwrap();
+            .unwrap()
+            .block;
         assert!(context.contains("- k: v"));
     }
 }

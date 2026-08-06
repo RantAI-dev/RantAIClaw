@@ -1007,7 +1007,17 @@ impl Agent {
         let enriched = if context.is_empty() {
             user_message.to_string()
         } else {
-            format!("{context}{user_message}")
+            // Say that memory shaped this turn, and which memory. Emitted before
+            // the first chunk so a surface can show it above the answer rather
+            // than after it.
+            if let Some(tx) = events {
+                let _ = tx
+                    .send(AgentEvent::MemoryRecalled {
+                        keys: context.keys.clone(),
+                    })
+                    .await;
+            }
+            format!("{}{user_message}", context.block)
         };
 
         self.history
