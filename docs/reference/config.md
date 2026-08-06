@@ -414,6 +414,15 @@ So `min_relevance_score` reads as _"keep hits at least this fraction as good as 
 best one"_, and it means the same thing on every backend. It is not a measure of
 absolute quality — a result set whose best hit is poor still contains a `1.0`.
 
+One consequence is worth knowing about, because it used to bite: with
+`auto_save = true` the store holds a verbatim copy of the message being answered
+by the time recall runs. A verbatim copy is the best possible lexical match, so
+it took `1.0` and everything else was scored against it — which pushed genuinely
+relevant memories under the threshold and out of the prompt. The context builder
+now drops an entry that _is_ the message being answered and re-ranks what remains,
+so the scale is set by the best **usable** hit. An entry that merely mentions the
+same topic is unaffected; only a verbatim echo is dropped.
+
 ### Embedding dimensions must match the model
 
 `cosine_similarity` returns `0.0` when two vectors differ in length, so a
