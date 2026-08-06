@@ -5,6 +5,79 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0-alpha] — 2026-08-06
+
+The memory subsystem, audited by running it rather than reading it.
+
+Most of what follows was found by driving the binary against a real store —
+not by reading code, and not by a failing test. Several defects returned
+confident wrong answers, which is why a green suite had never caught them.
+
+### Added
+
+- `memory reindex` re-embeds entries the current embedding model cannot use,
+  so changing embedding provider or dimensions no longer silently disables
+  vector search for everything stored before the change.
+- `GET /api/v1/memory` accepts `category` and `q`. `q` routes through the
+  backend's ranked recall and composes with `category`; entries carry `score`
+  when a search ranked them. Both are additive — absent behaves as before.
+- `POST`, `GET /{key}` and `DELETE /{key}` on `/api/v1/memory`: the console
+  had been calling write endpoints that did not exist.
+- The agent reports which stored memories shaped a turn. The TUI prints
+  `↺ recalled N memories: …`; the console shows them as chips beside Sources.
+  Emitted only when something was actually injected.
+- `/memory stats` in the TUI, and `--category` on `/memory add` — the CLI, the
+  API and the console could all pick a category; the terminal could not.
+
+### Fixed
+
+- **A turn no longer recalls the question it is answering.** Auto-save writes
+  each user message to memory before recall runs, so the store held a verbatim
+  copy of the question. Being a perfect lexical match it took the top rank, and
+  scores normalise *relative to the best hit* — so one self-echo pushed every
+  curated fact under `min_relevance_score`. Measured on a live store, the same
+  query returned one entry (its own question) with auto-save on, and five
+  curated facts with it off. Now the echo is dropped **before** the threshold
+  and the survivors are re-ranked.
+- `/memory recall project 2024` searched for `project`. A trailing token was
+  parsed as a positional limit, so any query ending in a number silently lost
+  it. Limit is now `--limit N`.
+- `/memory list <category>` reported the whole store's count beside a filtered
+  body — `(121, listing the most recent 1)`. A filtered list now reports the
+  filtered count.
+- One conversation's memory no longer reaches another's prompt on a shared
+  channel.
+- Memory backends now honour the contract they advertise: `forget` really
+  forgets on markdown, and an unrecognised `backend` is a startup error rather
+  than a silent fallback to a different store with different semantics.
+- The memory schema was declared twice and had drifted; the sqlite backend
+  could fail to open. There is now one definition.
+- Narrow terminals no longer clip the fields that matter most — the autonomy
+  indicator used to become an ambiguous single letter at 60 columns.
+
+### Changed
+
+- Relevance scores are normalised per result set on every backend, so
+  `min_relevance_score` means the same thing everywhere: "at least this
+  fraction as good as the best hit".
+- Timestamps are stored in UTC and rendered to second precision.
+- `MEMORY.md` is a one-way projection of the store's core memories, written
+  between markers; anything outside them is preserved byte-for-byte.
+- The response cache was removed. It was never wired up, and its key had no
+  scope dimension.
+- Config schema is now v17 (the response-cache keys are migrated away).
+- Bundled console moves to claw-ui `v0.3.15`: the memory panel gains search,
+  category filtering and paging — every entry is reachable, where it
+  previously stopped at 100 with no way forward.
+
+### Notes
+
+- Channels inject memory context only on a conversation's **first** turn. This
+  is pre-existing behaviour and is unchanged here; it is documented so it is
+  not mistaken for a regression.
+- The self-echo fix changes what every turn sends the model. That is the point
+  of it, and it is the blast radius.
+
 ## [0.16.4-alpha] — 2026-08-03
 
 The terminal's skill screens, audited by driving them rather than reading them.
