@@ -21,6 +21,9 @@ where
     Ok(tokio::task::block_in_place(|| handle.block_on(future))?)
 }
 
+/// Matches counted out by `/memory recall` when `--limit` is absent.
+const DEFAULT_RECALL_LIMIT: usize = 5;
+
 fn no_backend_message() -> CommandResult {
     CommandResult::Message(
         "Memory backend unavailable (running without an attached agent).".to_string(),
@@ -71,15 +74,56 @@ impl CommandHandler for MemoryCommand {
 fn usage_message() -> CommandResult {
     CommandResult::Message(
         "Usage: /memory <subcommand> [args]\n\
-         \n  list [category]            list stored entries (optionally filter by category)\
-         \n  get <key>                  show one entry's full content\
-         \n  add <key> <content>        store a new core memory entry\
-         \n  remove <key>               delete an entry by key\
-         \n  recall <query> [limit]     keyword search across all entries\
-         \n  stats                      backend name, entry count, health\
+         \n  list [category]                    list stored entries (optionally filter by category)\
+         \n  get <key>                          show one entry's full content\
+         \n  add [--category C] <key> <content> store a memory entry (default category: core)\
+         \n  remove <key>                       delete an entry by key\
+         \n  recall <query> [--limit N]         keyword search across all entries\
+         \n  stats                              backend name, entry count, health\
          \n\nAlias: /forget <key> is shorthand for /memory remove."
             .to_string(),
     )
+}
+
+/// Pull `--<name> <value>` out of a free-form argument string, returning the
+/// value and the remaining text.
+///
+/// Memory content is arbitrary prose, so a flag is the only unambiguous way to
+/// carry a second parameter alongside it. Positional parsing cannot tell a
+/// limit from a query: `/memory recall project 2024` used to search for
+/// `project` and silently drop the year, returning a result that looked right.
+fn take_flag(args: &str, name: &str) -> (Option<String>, String) {
+    let flag = format!("--{name}");
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    let Some(pos) = tokens.iter().position(|t| *t == flag) else {
+        return (None, args.trim().to_string());
+    };
+    let value = tokens.get(pos + 1).map(|v| (*v).to_string());
+    // Drop the flag and, when present, the value that follows it.
+    let drop_upto = if value.is_some() { pos + 2 } else { pos + 1 };
+    let rest: Vec<&str> = tokens[..pos]
+        .iter()
+        .chain(tokens[drop_upto..].iter())
+        .copied()
+        .collect();
+    (value, rest.join(" "))
+}
+
+/// Trim a stored timestamp to second precision for display.
+///
+/// The backend stores RFC 3339 with nanoseconds
+/// (`2026-08-06T04:59:09.523739664+00:00`); nine digits of precision are noise
+/// in a line an operator reads. Anything that does not parse is passed through
+/// untouched rather than mangled.
+fn format_timestamp(ts: &str) -> String {
+    let Some(dot) = ts.find('.') else {
+        return ts.to_string();
+    };
+    let tail_start = ts[dot..].find(['+', '-', 'Z']).map(|i| dot + i);
+    match tail_start {
+        Some(i) => format!("{}{}", &ts[..dot], &ts[i..]),
+        None => ts[..dot].to_string(),
+    }
 }
 
 fn list_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
@@ -103,16 +147,24 @@ fn list_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
         )));
     }
     // `list` is capped by the backend, so its length is a page size rather than
-    // a total; `count()` is the total.
+    // a total; `count()` is the total. `count()` counts the whole store though,
+    // so it is only the right total when nothing is filtered — reporting it
+    // next to a filtered body read as "121 entries, listing the most recent 1".
     let listed = entries.len();
-    let total = run_blocking(async { memory.count().await }).unwrap_or(listed);
+    let (total, scope) = match &category {
+        Some(cat) => (listed, format!(" in '{cat}'")),
+        None => (
+            run_blocking(async { memory.count().await }).unwrap_or(listed),
+            String::new(),
+        ),
+    };
     let truncated = if total > listed {
         format!(", listing the most recent {listed}")
     } else {
         String::new()
     };
     let mut out = format!(
-        "Memory entries ({total}, backend: {}{truncated}):\n",
+        "Memory entries{scope} ({total}, backend: {}{truncated}):\n",
         memory.name()
     );
     for entry in entries.iter().take(50) {
@@ -150,7 +202,7 @@ fn get_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
             "{key}\n  category: {category}\n  stored:   {ts}\n\n{content}",
             key = e.key,
             category = e.category,
-            ts = e.timestamp,
+            ts = format_timestamp(&e.timestamp),
             content = e.content,
         ))),
         None => Ok(CommandResult::Message(format!(
@@ -160,12 +212,20 @@ fn get_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
 }
 
 fn add_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
+    // The CLI, the HTTP API and the web console can all pick a category. The
+    // TUI could only ever write `core`, so an operator working in the TUI had
+    // no way to file a daily or conversation note.
+    let (category_flag, rest) = take_flag(rest, "category");
+    let category = category_flag
+        .as_deref()
+        .and_then(parse_category)
+        .unwrap_or(MemoryCategory::Core);
     let mut parts = rest.splitn(2, char::is_whitespace);
     let key = parts.next().unwrap_or("").trim();
     let content = parts.next().unwrap_or("").trim();
     if key.is_empty() || content.is_empty() {
         return Ok(CommandResult::Message(
-            "Usage: /memory add <key> <content>".to_string(),
+            "Usage: /memory add [--category C] <key> <content>".to_string(),
         ));
     }
     let Some(memory) = ensure_backend(ctx) else {
@@ -176,14 +236,15 @@ fn add_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
     // auto-saving turn context, which uses a different path.
     let key_owned = key.to_string();
     let content_owned = content.to_string();
+    let stored_category = category.clone();
     run_blocking(async move {
         memory
-            .store(&key_owned, &content_owned, MemoryCategory::Core, None)
+            .store(&key_owned, &content_owned, stored_category, None)
             .await
             .map_err(anyhow::Error::from)
     })?;
     Ok(CommandResult::Message(format!(
-        "Stored '{key}' in core memory."
+        "Stored '{key}' in {category} memory."
     )))
 }
 
@@ -210,24 +271,15 @@ fn remove_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
 }
 
 fn recall_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
-    let mut parts = rest.rsplitn(2, char::is_whitespace);
-    let (query, limit) = if let Some(maybe_limit) = parts.next() {
-        if let Ok(n) = maybe_limit.parse::<usize>() {
-            let q = parts.next().unwrap_or("").trim();
-            if q.is_empty() {
-                (maybe_limit.trim(), 5usize)
-            } else {
-                (q, n.clamp(1, 50))
-            }
-        } else {
-            (rest.trim(), 5)
-        }
-    } else {
-        (rest.trim(), 5)
-    };
+    let (limit_flag, query) = take_flag(rest, "limit");
+    let limit = limit_flag
+        .as_deref()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(DEFAULT_RECALL_LIMIT, |n| n.clamp(1, 50));
+    let query = query.trim();
     if query.is_empty() {
         return Ok(CommandResult::Message(
-            "Usage: /memory recall <query> [limit]".to_string(),
+            "Usage: /memory recall <query> [--limit N]".to_string(),
         ));
     }
     let Some(memory) = ensure_backend(ctx) else {
@@ -249,10 +301,18 @@ fn recall_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
     out.push_str(&format!("{} match(es) for '{}':\n", entries.len(), query));
     for entry in entries {
         let preview = truncate_preview(&entry.content, 120);
-        out.push_str(&format!(
-            "  [{}] {}  ·  {}\n",
+        // Same shape the `memory_recall` tool reports to the agent. Relevance
+        // is what makes a ranked list readable as a ranking rather than an
+        // arbitrary order.
+        let score = entry
+            .score
+            .map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "  [{}] {}{score}  ·  {}",
             entry.category, entry.key, preview
-        ));
+        );
     }
     Ok(CommandResult::Message(out))
 }
@@ -639,6 +699,155 @@ mod tests {
             }
             _ => panic!("expected Message"),
         }
+    }
+
+    /// A query ending in a number used to lose that number: the trailing token
+    /// was parsed as a limit, so `recall project 2024` searched for `project`
+    /// and returned a plausible-looking wrong answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recall_keeps_a_trailing_number_in_the_query() {
+        let mem = StubMemory::arc();
+        let mut ctx = ctx_with_memory(mem);
+        MemoryCommand
+            .execute(
+                "add roadmap Ship the console refresh in project 2024",
+                &mut ctx,
+            )
+            .unwrap();
+        MemoryCommand
+            .execute("add decoy Unrelated note about project scope", &mut ctx)
+            .unwrap();
+
+        let res = MemoryCommand
+            .execute("recall project 2024", &mut ctx)
+            .unwrap();
+        match res {
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.contains("for 'project 2024'"),
+                    "query was rewritten: {msg}"
+                );
+                assert!(!msg.contains("decoy"), "matched too broadly: {msg}");
+            }
+            _ => panic!("expected Message"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recall_limit_flag_caps_results() {
+        let mem = StubMemory::arc();
+        let mut ctx = ctx_with_memory(mem);
+        for i in 0..4 {
+            MemoryCommand
+                .execute(&format!("add k{i} shared token here"), &mut ctx)
+                .unwrap();
+        }
+        let res = MemoryCommand
+            .execute("recall shared --limit 2", &mut ctx)
+            .unwrap();
+        match res {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("2 match(es) for 'shared'"), "got:\n{msg}");
+            }
+            _ => panic!("expected Message"),
+        }
+    }
+
+    /// `count()` counts the whole store, so reporting it beside a filtered body
+    /// read as "121 entries, listing the most recent 1".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_with_category_reports_the_filtered_count() {
+        let mem = StubMemory::arc();
+        let mut ctx = ctx_with_memory(mem);
+        for i in 0..5 {
+            MemoryCommand
+                .execute(&format!("add core{i} a core note"), &mut ctx)
+                .unwrap();
+        }
+        MemoryCommand
+            .execute("add chat --category conversation a chat note", &mut ctx)
+            .unwrap();
+
+        let res = MemoryCommand
+            .execute("list conversation", &mut ctx)
+            .unwrap();
+        match res {
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.contains("in 'conversation' (1,"),
+                    "total ignored the filter: {msg}"
+                );
+                assert!(!msg.contains("(6,"), "reported the global count: {msg}");
+            }
+            _ => panic!("expected Message"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn add_stores_the_requested_category() {
+        let mem = StubMemory::arc();
+        let mut ctx = ctx_with_memory(mem);
+        let res = MemoryCommand
+            .execute("add note --category daily a daily note", &mut ctx)
+            .unwrap();
+        match res {
+            CommandResult::Message(msg) => assert!(msg.contains("in daily memory"), "{msg}"),
+            _ => panic!("expected Message"),
+        }
+        let got = MemoryCommand.execute("get note", &mut ctx).unwrap();
+        match got {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("category: daily"), "got:\n{msg}");
+                assert!(msg.contains("a daily note"), "content lost the flag: {msg}");
+            }
+            _ => panic!("expected Message"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn add_without_a_category_still_defaults_to_core() {
+        let mem = StubMemory::arc();
+        let mut ctx = ctx_with_memory(mem);
+        MemoryCommand.execute("add plain a note", &mut ctx).unwrap();
+        match MemoryCommand.execute("get plain", &mut ctx).unwrap() {
+            CommandResult::Message(msg) => assert!(msg.contains("category: core"), "{msg}"),
+            _ => panic!("expected Message"),
+        }
+    }
+
+    #[test]
+    fn timestamps_lose_sub_second_noise_but_keep_the_zone() {
+        assert_eq!(
+            format_timestamp("2026-08-06T04:59:09.523739664+00:00"),
+            "2026-08-06T04:59:09+00:00"
+        );
+        assert_eq!(
+            format_timestamp("2026-08-06T04:59:09.523Z"),
+            "2026-08-06T04:59:09Z"
+        );
+        // Already second-precision, and anything unparseable, passes through.
+        assert_eq!(
+            format_timestamp("2026-08-06T04:59:09Z"),
+            "2026-08-06T04:59:09Z"
+        );
+        assert_eq!(format_timestamp("not a timestamp"), "not a timestamp");
+    }
+
+    #[test]
+    fn take_flag_removes_only_the_flag_and_its_value() {
+        let (v, rest) = take_flag("note --category daily a daily note", "category");
+        assert_eq!(v.as_deref(), Some("daily"));
+        assert_eq!(rest, "note a daily note");
+
+        // Absent flag leaves the text alone.
+        let (v, rest) = take_flag("note a plain note", "category");
+        assert_eq!(v, None);
+        assert_eq!(rest, "note a plain note");
+
+        // A trailing flag with no value must not swallow a word that isn't there.
+        let (v, rest) = take_flag("some query --limit", "limit");
+        assert_eq!(v, None);
+        assert_eq!(rest, "some query");
     }
 
     #[test]
