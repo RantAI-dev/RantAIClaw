@@ -756,7 +756,21 @@ pub fn post_update_ui_notice() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let _ = Command::new(exe).args(["ui", "update", "--check"]).status();
+    // Capture rather than inherit. This child runs immediately after the
+    // binary was replaced on disk and it loads config on the way to the check,
+    // so it can fail for reasons that have nothing to do with the update that
+    // just succeeded — a config migrated past what the spawned image supports,
+    // for one. Inheriting stderr let that failure print `Error: …` as the last
+    // thing an operator saw, after `✓ updated`, which reads as a failed update
+    // and invites an unnecessary rollback.
+    //
+    // This notice is advisory. If it cannot run, the right outcome is silence.
+    let Ok(out) = Command::new(exe).args(["ui", "update", "--check"]).output() else {
+        return;
+    };
+    if out.status.success() {
+        print!("{}", String::from_utf8_lossy(&out.stdout));
+    }
 }
 
 /// Environment for the standalone console process. `HOSTNAME` sets the bind
