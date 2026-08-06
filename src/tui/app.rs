@@ -4481,6 +4481,50 @@ impl TuiApp {
     }
 }
 
+/// Fit a status line to `width` by dropping whole segments.
+///
+/// A `Paragraph` clips at the character, so an overflowing line loses the *end*
+/// of its last field — which is how "Smart" became "S" at 60 columns, turning
+/// the autonomy indicator into an ambiguous letter.
+///
+/// Each optional segment carries a `drop_rank`: the highest rank goes first.
+/// Rank is deliberately separate from position, so deciding what to sacrifice
+/// does not reorder what survives.
+fn fit_segments<'a>(
+    required: Vec<Span<'a>>,
+    optional: Vec<(u8, Vec<Span<'a>>)>,
+    width: u16,
+) -> Vec<Span<'a>> {
+    fn cells(spans: &[Span<'_>]) -> usize {
+        spans.iter().map(|s| s.content.chars().count()).sum()
+    }
+
+    let budget = width as usize;
+    let mut kept = optional;
+
+    loop {
+        let mut out: Vec<Span<'a>> = required.clone();
+        for (_, seg) in &kept {
+            out.extend(seg.iter().cloned());
+        }
+        if cells(&out) <= budget || kept.is_empty() {
+            return out;
+        }
+        // Drop the highest rank, keeping the rest in declaration order.
+        let victim = kept
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (rank, _))| *rank)
+            .map(|(i, _)| i);
+        match victim {
+            Some(i) => {
+                kept.remove(i);
+            }
+            None => return out,
+        }
+    }
+}
+
 /// Append a `· <preset>` segment to the status bar when an active
 /// preset is known. Colour-coded so the user can tell at a glance which
 /// tier they're in: Off in coral (autonomy hot), Strict in muted-amber,
@@ -5888,13 +5932,53 @@ fn composer_body(input_buffer: &str, inner_w: u16) -> Text<'static> {
     );
 
     if input_buffer.is_empty() {
-        return Text::from(Line::from(vec![
-            prefix,
-            Span::styled(
-                "Type a message…  (Enter sends · /help for commands · Ctrl+J newline · Ctrl+C exit)",
-                Style::default().fg(Color::Rgb(107, 114, 128)),
-            ),
-        ]));
+        // The hint used to be one string that the widget clipped mid-phrase: at
+        // 80 columns it ended "· Ctrl+C" with an unclosed parenthesis and no
+        // "exit", so the one thing a stuck operator needs was the first to go.
+        // Drop whole hints instead, least useful first, and only bracket what
+        // actually survived.
+        let hint_style = Style::default().fg(Color::Rgb(107, 114, 128));
+        const PLACEHOLDER: &str = "Type a message…";
+        // Display order is reading order — primary action first, escape last —
+        // and the rank decides what a narrow terminal gives up. Keeping those
+        // separate matters: sorting by importance would put "Ctrl+C exit" at the
+        // front of the sentence, which reads like a warning rather than a hint.
+        const HINTS: [(u8, &str); 4] = [
+            (1, "Enter sends"),
+            (2, "/help for commands"),
+            (3, "Ctrl+J newline"),
+            // Last to go: without it, someone who cannot get out has nothing.
+            (0, "Ctrl+C exit"),
+        ];
+
+        // 2 for the prefix, 4 for the "  (" and ")" around the hints.
+        let budget = usize::from(inner_w).saturating_sub(PLACEHOLDER.chars().count() + 6);
+        let mut kept: Vec<(u8, &str)> = HINTS.to_vec();
+        let width_of = |hs: &[(u8, &str)]| -> usize {
+            hs.iter().map(|(_, h)| h.chars().count()).sum::<usize>()
+                + 3 * hs.len().saturating_sub(1)
+        };
+        while kept.len() > 1 && width_of(&kept) > budget {
+            if let Some(i) = kept
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (rank, _))| *rank)
+                .map(|(i, _)| i)
+            {
+                kept.remove(i);
+            } else {
+                break;
+            }
+        }
+
+        let joined = kept.iter().map(|(_, h)| *h).collect::<Vec<_>>().join(" · ");
+        let text = if joined.chars().count() <= budget {
+            format!("{PLACEHOLDER}  ({joined})")
+        } else {
+            PLACEHOLDER.to_string()
+        };
+
+        return Text::from(Line::from(vec![prefix, Span::styled(text, hint_style)]));
     }
 
     // Same wrapping the caret walker uses (cursor_pos irrelevant here).
@@ -6017,7 +6101,12 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
         let age_secs = ctx.started_at.elapsed().as_secs();
         let age_label = format_duration_short(age_secs);
 
-        let mut spans = vec![
+        // The autonomy indicator tells the operator whether tools will stop and
+        // ask. It used to sit last, so a narrow terminal clipped it to a single
+        // letter — "Smart" rendered as "S" at 60 columns. Telemetry is what a
+        // cramped line should lose, not the safety signal, so build it as
+        // required + least-important-first optional segments.
+        let required = vec![
             Span::styled(" $ ", sky),
             Span::styled(
                 ctx.model.clone(),
@@ -6025,15 +6114,36 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
                     .fg(Color::Rgb(94, 184, 255))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  │  ", muted),
-            Span::styled(used_label, Style::default().fg(Color::Rgb(126, 226, 179))),
-            Span::styled("  │  ", muted),
-            Span::styled(format!("{} msgs", ctx.messages.len()), muted),
-            Span::styled("  │  ", muted),
-            Span::styled(age_label, muted),
         ];
-        append_autonomy_segment(&mut spans, ctx.autonomy_preset, muted);
-        Line::from(spans)
+
+        let mut autonomy: Vec<Span> = Vec::new();
+        append_autonomy_segment(&mut autonomy, ctx.autonomy_preset, muted);
+
+        // Declaration order is display order; the rank decides what a cramped
+        // line gives up. Telemetry goes before the safety signal.
+        let optional = vec![
+            (
+                2,
+                vec![
+                    Span::styled("  │  ", muted),
+                    Span::styled(used_label, Style::default().fg(Color::Rgb(126, 226, 179))),
+                ],
+            ),
+            (
+                1,
+                vec![
+                    Span::styled("  │  ", muted),
+                    Span::styled(format!("{} msgs", ctx.messages.len()), muted),
+                ],
+            ),
+            (
+                3,
+                vec![Span::styled("  │  ", muted), Span::styled(age_label, muted)],
+            ),
+            (0, autonomy),
+        ];
+
+        Line::from(fit_segments(required, optional, area.width))
     };
 
     let status = Paragraph::new(line);
@@ -8947,6 +9057,102 @@ mod drain_tests {
             assert_eq!(tool_blocks[0].result, Some((true, "files".into())));
         } else {
             panic!("expected Streaming");
+        }
+    }
+}
+
+#[cfg(test)]
+mod narrow_terminal_tests {
+    use super::*;
+
+    fn seg(text: &'static str) -> Vec<Span<'static>> {
+        vec![Span::raw(text)]
+    }
+
+    /// A `Paragraph` clips at the character, so an overflowing status line lost
+    /// the end of its last field — "Smart" rendered as "S" at 60 columns.
+    #[test]
+    fn fit_segments_drops_whole_segments_by_rank() {
+        let required = seg("MODEL");
+        let optional = vec![
+            (2, seg("|tokens")),
+            (1, seg("|msgs")),
+            (3, seg("|age")),
+            (0, seg("|SAFE")),
+        ];
+
+        let wide: String = fit_segments(required.clone(), optional.clone(), 100)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(wide, "MODEL|tokens|msgs|age|SAFE");
+
+        // Tight: highest ranks go first, and the rest keep their order.
+        let tight: String = fit_segments(required.clone(), optional.clone(), 16)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            tight, "MODEL|msgs|SAFE",
+            "rank 3 then 2 should go, in order"
+        );
+
+        // Down to a genuinely cramped terminal, the safety signal is the last
+        // optional field standing. (Below this nothing fits, which is not a
+        // terminal anyone has.)
+        let tiny: String = fit_segments(required, optional, 11)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            tiny, "MODEL|SAFE",
+            "the safety signal must be the last to go"
+        );
+    }
+
+    /// Rank must not double as position: deciding what to sacrifice cannot
+    /// reorder what survives.
+    #[test]
+    fn fit_segments_preserves_declaration_order() {
+        let out: String = fit_segments(
+            seg("A"),
+            vec![(9, seg("B")), (0, seg("C")), (5, seg("D"))],
+            100,
+        )
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+        assert_eq!(out, "ABCD", "display order follows declaration, not rank");
+    }
+
+    /// The hint used to be clipped mid-phrase: at 80 columns it ended
+    /// "· Ctrl+C" with an unclosed parenthesis and no "exit" — the one thing a
+    /// stuck operator needs was the first to go.
+    #[test]
+    fn composer_placeholder_degrades_without_dangling_text() {
+        for width in [40_u16, 56, 64, 72, 80, 100, 160] {
+            let text = composer_body("", width);
+            let rendered: String = text.lines[0]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+
+            assert!(
+                rendered.contains("Type a message"),
+                "w={width}: placeholder missing: {rendered}"
+            );
+            assert_eq!(
+                rendered.matches('(').count(),
+                rendered.matches(')').count(),
+                "w={width}: unbalanced parenthesis: {rendered}"
+            );
+            if rendered.contains('(') {
+                assert!(
+                    rendered.contains("Ctrl+C exit"),
+                    "w={width}: the exit hint must outlive the others: {rendered}"
+                );
+            }
         }
     }
 }
