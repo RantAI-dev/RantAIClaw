@@ -261,11 +261,18 @@ pub fn full_backup_archive(rantaiclaw_root: &Path, label: &str) -> Result<PathBu
     // Use system `tar` to avoid pulling in `flate2` for one feature we
     // could provide via the same trick we already use for binary
     // extraction.
+    //
+    // The archive is written *inside* the tree being archived, so `.` would
+    // include the file tar is still writing — GNU tar then fails the whole run
+    // with "file changed as we read it" and `--backup` produced no tarball at
+    // all. Exclude the snapshot directory: it holds recovery artifacts, and a
+    // recovery artifact has no business containing the others.
     let status = std::process::Command::new("tar")
-        .args(["-czf"])
+        .arg("-czf")
         .arg(&archive_path)
         .arg("-C")
         .arg(rantaiclaw_root)
+        .arg(format!("--exclude=./{SNAPSHOT_PARENT}"))
         .arg(".")
         .status()
         .context("run tar -czf for full backup")?;
@@ -285,6 +292,49 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(p, body).unwrap();
+    }
+
+    /// `--backup` wrote its tarball inside the tree it was archiving, so tar
+    /// read the file it was still writing and failed the whole run with
+    /// "file changed as we read it" — leaving the user with no tarball and
+    /// only a `⚠` to notice it by.
+    ///
+    /// A prior snapshot in the same directory is what makes it reproduce
+    /// reliably: with the directory empty, tar can finish before its own
+    /// output grows enough to trip the check.
+    #[test]
+    fn full_backup_succeeds_and_excludes_its_own_snapshot_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write(&root.join("config.toml"), "schema_version = 17");
+        write(&root.join("profiles/default/config.toml"), "x = 1");
+        // Bulk inside the snapshot dir: this is what tar used to swallow, and
+        // it is also the recovery artifact that has no business being nested
+        // inside another one.
+        write(
+            &root.join(SNAPSHOT_PARENT).join("old/blob.bin"),
+            &"padding".repeat(20_000),
+        );
+
+        let archive = full_backup_archive(root, "0.16.4-alpha").expect("tar must not fail");
+        assert!(archive.is_file(), "no tarball at {}", archive.display());
+
+        let listing = std::process::Command::new("tar")
+            .arg("-tzf")
+            .arg(&archive)
+            .output()
+            .expect("list the archive");
+        assert!(listing.status.success(), "archive is not readable");
+        let names = String::from_utf8_lossy(&listing.stdout);
+
+        assert!(
+            names.contains("config.toml"),
+            "real content missing:\n{names}"
+        );
+        assert!(
+            !names.contains(SNAPSHOT_PARENT),
+            "archive contains the snapshot dir — including itself:\n{names}"
+        );
     }
 
     #[test]
