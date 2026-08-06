@@ -670,7 +670,14 @@ should check the encoded size and say so plainly rather than surfacing a bare
 ### GET /api/v1/memory
 
 - **Auth**: bearer-gated.
-- **Query params**: `limit` — optional, default `50`, capped at `500`.
+- **Query params** — all optional, and all of them narrow rather than expand:
+  - `limit` — default `50`, capped at `500`.
+  - `offset` — rows to skip, newest first. Default `0`.
+  - `category` — one category only. Unknown names are treated as custom
+    categories, matching what `POST /api/v1/memory` accepts on write.
+  - `q` — keyword search. When present and non-empty the read is served by
+    the backend's ranked recall instead of a plain list, so entries come back
+    ordered by relevance and carry a `score`. Composes with `category`.
 - **Response** `200`:
   ```json
   {
@@ -680,10 +687,14 @@ should check the encoded size and say so plainly rather than surfacing a bare
         "category": "core",
         "content": "...",
         "timestamp": "...",
-        "session_id": "may be null"
+        "session_id": "may be null",
+        "score": 0.87
       }
     ],
-    "count": 1
+    "count": 1,
+    "total": 121,
+    "listed": 121,
+    "offset": 0
   }
   ```
   `category` is one of `"core"`, `"daily"`, `"conversation"`, or a
@@ -692,9 +703,22 @@ should check the encoded size and say so plainly rather than surfacing a bare
   backend and the sessions store encode time differently; this is a real,
   current inconsistency across resource groups worth knowing about if you're
   writing a client that parses both.
-  The handler fetches the full entry list from the backend and truncates to
-  `limit` in the response — `limit` bounds the response size, not the
-  underlying query.
+
+  `score` is relevance in `0.0..=1.0`, **relative to the best hit in the same
+  result set** rather than an absolute measure. Only a `q` search ranks, so
+  the field is `null` on a plain list.
+
+  Counts are three different things and it is worth keeping them apart:
+  `count` is how many entries this response carries, `listed` is how many the
+  backend returned before `offset`/`limit` windowed them, and `total` is the
+  size of the set you are paging. For an unfiltered read `total` is the whole
+  store; when `category` or `q` narrows the read, `total` is the size of the
+  narrowed set — otherwise a filtered page would advertise a total it could
+  never reach. A `q` search ranks up to 500 hits before paging, so `total`
+  stays put as you page through it.
+
+  The handler fetches the entry list from the backend and windows it in the
+  response — `limit` bounds the response size, not the underlying query.
 - **Status codes**: `200`, `401`.
 
 ### GET /api/v1/memory/stats
