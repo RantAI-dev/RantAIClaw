@@ -1749,6 +1749,10 @@ fn parse_memory_category(raw: Option<&str>) -> Option<crate::memory::MemoryCateg
     }
 }
 
+/// Hits a `?q=` search ranks before paging. Matches the route's own `limit`
+/// ceiling, so a caller can page the whole ranked set.
+const SEARCH_CEILING: usize = 500;
+
 async fn memory_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1767,8 +1771,11 @@ async fn memory_list(
     // its own ranked page, which `offset`/`limit` then window like any other.
     let entries = match query {
         Some(text) => {
+            // Ask for the ceiling rather than `offset + limit`: sizing the
+            // recall to the requested page would make the reported total grow
+            // as the caller pages through it.
             let mut hits = mem
-                .recall(text, offset.saturating_add(limit).max(1), None)
+                .recall(text, SEARCH_CEILING, None)
                 .await
                 .map_err(err_500)?;
             if let Some(cat) = category.as_ref() {
@@ -2690,6 +2697,49 @@ mod tests {
             .map(|e| e["key"].as_str().unwrap())
             .collect();
         assert_eq!(keys, vec!["b_daily"], "q + category did not compose");
+    }
+
+    /// Sizing the recall to `offset + limit` would make the total grow as the
+    /// caller pages, so "of N" would change under them mid-search.
+    #[tokio::test]
+    async fn search_total_is_stable_across_pages() {
+        let (_tmp, state) = state_with_real_memory();
+        for i in 0..7 {
+            state
+                .mem
+                .store(
+                    &format!("hit_{i}"),
+                    "deploy runbook entry",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let app = router().with_state(state);
+
+        let page1 = memory_list_json(&app, "q=deploy&limit=3&offset=0").await;
+        let page2 = memory_list_json(&app, "q=deploy&limit=3&offset=3").await;
+
+        assert_eq!(page1["total"], 7, "page 1 total");
+        assert_eq!(page2["total"], 7, "total changed between pages");
+        assert_eq!(page1["count"], 3);
+        assert_eq!(page2["count"], 3);
+
+        // And the pages are actually different rows.
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            v["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (a, b) = (keys(&page1), keys(&page2));
+        assert!(
+            a.iter().all(|k| !b.contains(k)),
+            "pages overlap: {a:?} {b:?}"
+        );
     }
 
     /// Absent params must behave exactly as before this route learned to filter.
