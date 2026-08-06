@@ -5,6 +5,35 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.1-alpha] — 2026-08-06
+
+Two defects on the update path itself, found by taking v0.17.0-alpha on a real
+install rather than by reading the code.
+
+### Fixed
+
+- **A successful update no longer ends in a fatal-looking error.** After
+  printing `✓ updated` and `✓ daemon service restarted`, the run finished with
+  `Error: Failed to migrate config schema`. Everything had in fact worked; the
+  error came from the post-update console notice, which spawned a child with
+  inherited stderr. That child loads config on its way to the check, moments
+  after the binary was replaced, so it can fail for reasons unrelated to the
+  update that just succeeded. The last thing on screen was `Error:` directly
+  under a line explaining how to roll back — inviting an operator to undo a
+  working update. The notice is advisory and now stays silent when it cannot
+  run.
+- **`--backup` produced no tarball.** It wrote the archive inside the directory
+  tree it was archiving, so `tar` read the file it was still writing and failed
+  the whole run with "file changed as we read it" — reported only as a `⚠`,
+  while what was lost is the artifact you would restore from. The snapshot
+  directory is now excluded from the archive.
+
+### Notes
+
+- No config schema change, and the bundled console stays at claw-ui `v0.3.15`.
+  Unlike v0.17.0-alpha — which migrated the config to schema v17 and is
+  therefore one-way — this patch can be rolled back freely.
+
 ## [0.17.0-alpha] — 2026-08-06
 
 The memory subsystem, audited by running it rather than reading it.
