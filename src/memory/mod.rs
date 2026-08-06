@@ -20,7 +20,7 @@ pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
-pub use context::{build_memory_context, MemoryContextLimits};
+pub use context::{build_memory_context, MemoryContext, MemoryContextLimits};
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -96,6 +96,22 @@ pub fn effective_memory_backend_name(
 /// convention.
 pub fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4())
+}
+
+/// True for a key this runtime generated rather than a person naming a fact.
+///
+/// Auto-save writes one entry per turn under `<prefix>_<uuid>`. The uuid is an
+/// address, not a name: showing it to an operator identifies nothing, so
+/// surfaces that list recalled memories summarise these instead of naming them.
+pub fn is_autosave_key(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    let Some((_, suffix)) = normalized.rsplit_once('_') else {
+        return false;
+    };
+    // A v4 uuid tail is what auto-save appends; anything else is a chosen name.
+    suffix.len() == 36
+        && suffix.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        && suffix.matches('-').count() == 4
 }
 
 /// Legacy auto-save key used for model-authored assistant summaries.

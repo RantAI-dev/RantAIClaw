@@ -196,12 +196,23 @@ impl Provider for RecordingProvider {
 /// simulating RAG recall without a real memory backend.
 struct StaticMemoryLoader {
     context: String,
+    keys: Vec<String>,
 }
 
 impl StaticMemoryLoader {
     fn new(context: &str) -> Self {
         Self {
             context: context.to_string(),
+            keys: Vec::new(),
+        }
+    }
+
+    /// Name the entries this loader pretends to have recalled, so a test can
+    /// assert on what the turn reports having used.
+    fn with_keys(context: &str, keys: &[&str]) -> Self {
+        Self {
+            context: context.to_string(),
+            keys: keys.iter().map(|k| (*k).to_string()).collect(),
         }
     }
 }
@@ -213,8 +224,11 @@ impl MemoryLoader for StaticMemoryLoader {
         _memory: &dyn Memory,
         _user_message: &str,
         _conversation_id: Option<&str>,
-    ) -> Result<String> {
-        Ok(self.context.clone())
+    ) -> Result<rantaiclaw::memory::MemoryContext> {
+        Ok(rantaiclaw::memory::MemoryContext {
+            block: self.context.clone(),
+            keys: self.keys.clone(),
+        })
     }
 }
 
@@ -623,6 +637,46 @@ async fn e2e_multi_turn_with_memory_enrichment() {
 
     // History: system + 2*(enriched_user + assistant) = 5
     assert_eq!(agent.history().len(), 5);
+}
+
+/// Memory silently shaped every answer and no surface said so. The turn now
+/// reports which entries it injected — and the control matters as much as the
+/// signal: a turn that recalled nothing must stay silent, or the notice becomes
+/// noise an operator learns to ignore.
+#[tokio::test]
+async fn turn_reports_which_memories_it_injected() {
+    use rantaiclaw::agent::AgentEvent;
+
+    async fn keys_from_turn(loader: StaticMemoryLoader) -> Option<Vec<String>> {
+        let provider = Box::new(MockProvider::new(vec![text_response("ok")]));
+        let mut agent = build_recording_agent(provider, vec![], Some(Box::new(loader)));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+        agent.turn_streaming("hello", Some(tx), None).await.unwrap();
+
+        let mut found = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::MemoryRecalled { keys } = ev {
+                found = Some(keys);
+            }
+        }
+        found
+    }
+
+    let recalled = keys_from_turn(StaticMemoryLoader::with_keys(
+        "[Memory context]\n- user_lang: prefers Rust\n- project: rantaiclaw\n\n",
+        &["user_lang", "project"],
+    ))
+    .await;
+    assert_eq!(
+        recalled,
+        Some(vec!["user_lang".to_string(), "project".to_string()]),
+        "a turn that injected memory must say which",
+    );
+
+    // Control: nothing recalled, nothing announced.
+    let silent = keys_from_turn(StaticMemoryLoader::new("")).await;
+    assert_eq!(silent, None, "an empty recall must not announce itself");
 }
 
 /// Validates that empty memory context passes user message through unmodified.

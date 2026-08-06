@@ -1183,6 +1183,9 @@ async fn build_memory_context(
         },
     )
     .await
+    // Channels reach a remote user over a transport with no event stream, so
+    // there is nowhere to surface the recalled keys; only the block is used.
+    .block
 }
 
 /// Extract a compact summary of tool interactions from history messages added

@@ -2440,6 +2440,16 @@ impl TuiApp {
                     }
                 }
             }
+            AgentEvent::MemoryRecalled { keys } => {
+                // `append_system_message` is the live path. `scrollback_queue`
+                // and `commit_message_to_scrollback` still exist beside it but
+                // nothing reads them any more — a muted `_tool_log` line pushed
+                // there renders nowhere, which is how the first version of this
+                // silently did nothing.
+                let _ = self
+                    .context
+                    .append_system_message(&render_recalled_memories(&keys));
+            }
             AgentEvent::Usage(u) => {
                 // Map the agent's cost::TokenUsage onto the TUI's tally shape.
                 self.context.token_usage = TokenUsage {
@@ -4479,6 +4489,53 @@ impl TuiApp {
         let status = Paragraph::new(line);
         frame.render_widget(status, area);
     }
+}
+
+/// Most memory keys to name before summarising the rest.
+///
+/// The point of the line is "memory was used, here is roughly what" — past a
+/// few names it stops informing and starts crowding the answer it introduces.
+const RECALL_KEYS_SHOWN: usize = 3;
+
+/// One line naming the memories that shaped this turn.
+///
+/// Auto-saved turn entries are counted, not named: their keys are
+/// `user_msg_<uuid>`, and a uuid identifies nothing to the person reading it.
+/// Naming them was the first version of this line, and it filled the width with
+/// hex while saying less than "3 from this conversation" does.
+fn render_recalled_memories(keys: &[String]) -> String {
+    let noun = if keys.len() == 1 {
+        "memory"
+    } else {
+        "memories"
+    };
+    if keys.is_empty() {
+        // The agent only emits this event with a non-empty block, so an empty
+        // key list means the block was built without naming its entries —
+        // still worth saying memory was used.
+        return "↺ recalled stored memory".to_string();
+    }
+
+    let (auto, named): (Vec<&String>, Vec<&String>) =
+        keys.iter().partition(|k| crate::memory::is_autosave_key(k));
+
+    let mut parts: Vec<String> = named
+        .iter()
+        .take(RECALL_KEYS_SHOWN)
+        .map(|k| (*k).clone())
+        .collect();
+    if let Some(rest) = named
+        .len()
+        .checked_sub(RECALL_KEYS_SHOWN)
+        .filter(|n| *n > 0)
+    {
+        parts.push(format!("+{rest} more"));
+    }
+    if !auto.is_empty() {
+        parts.push(format!("{} from this conversation", auto.len()));
+    }
+
+    format!("↺ recalled {} {noun}: {}", keys.len(), parts.join(", "))
 }
 
 /// Fit a status line to `width` by dropping whole segments.
@@ -9058,6 +9115,83 @@ mod drain_tests {
         } else {
             panic!("expected Streaming");
         }
+    }
+}
+
+#[cfg(test)]
+mod recalled_memory_tests {
+    use super::*;
+
+    fn keys(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    #[test]
+    fn names_the_recalled_memories() {
+        assert_eq!(
+            render_recalled_memories(&keys(&["user_lang", "project"])),
+            "↺ recalled 2 memories: user_lang, project"
+        );
+    }
+
+    #[test]
+    fn one_memory_reads_as_singular() {
+        assert_eq!(
+            render_recalled_memories(&keys(&["user_lang"])),
+            "↺ recalled 1 memory: user_lang"
+        );
+    }
+
+    /// The count stays honest when the names are abbreviated — an operator
+    /// reading "3 memories" while seeing two names would mistrust both numbers.
+    #[test]
+    fn summarises_the_tail_without_losing_the_count() {
+        let line = render_recalled_memories(&keys(&["a", "b", "c", "d", "e"]));
+        assert_eq!(line, "↺ recalled 5 memories: a, b, c, +2 more");
+    }
+
+    /// A uuid names nothing to the reader. Counting the auto-saved turns says
+    /// more in less width than three lines of hex.
+    #[test]
+    fn autosaved_turns_are_counted_not_named() {
+        let line = render_recalled_memories(&keys(&[
+            "user_msg_23f4b294-d91b-4ba4-9fd5-a902a78f3a82",
+            "user_msg_9bd37f53-4f36-4819-972b-21cf335e6280",
+            "deploy_window",
+        ]));
+        assert_eq!(
+            line,
+            "↺ recalled 3 memories: deploy_window, 2 from this conversation"
+        );
+        assert!(!line.contains("23f4b294"), "uuid leaked into the line");
+    }
+
+    #[test]
+    fn all_autosaved_reads_as_a_count_alone() {
+        let line = render_recalled_memories(&keys(&[
+            "user_msg_23f4b294-d91b-4ba4-9fd5-a902a78f3a82",
+            "user_msg_9bd37f53-4f36-4819-972b-21cf335e6280",
+        ]));
+        assert_eq!(line, "↺ recalled 2 memories: 2 from this conversation");
+    }
+
+    #[test]
+    fn exactly_the_shown_limit_has_no_tail() {
+        let line = render_recalled_memories(&keys(&["a", "b", "c"]));
+        assert_eq!(line, "↺ recalled 3 memories: a, b, c");
+        assert!(!line.contains("more"), "no tail to summarise: {line}");
+    }
+
+    /// A key ending in something uuid-shaped is generated; a chosen name that
+    /// merely contains underscores is not.
+    #[test]
+    fn only_uuid_tails_count_as_generated() {
+        assert!(crate::memory::is_autosave_key(
+            "user_msg_23f4b294-d91b-4ba4-9fd5-a902a78f3a82"
+        ));
+        assert!(!crate::memory::is_autosave_key("deploy_window"));
+        assert!(!crate::memory::is_autosave_key("user_lang"));
+        assert!(!crate::memory::is_autosave_key("plan_2026_08_06"));
     }
 }
 

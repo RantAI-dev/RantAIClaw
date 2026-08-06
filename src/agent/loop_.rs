@@ -252,6 +252,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
         memory::MemoryContextLimits::default(),
     )
     .await
+    .block
 }
 
 /// Build hardware datasheet context from RAG when peripherals are enabled.

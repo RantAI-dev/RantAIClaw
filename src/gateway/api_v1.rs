@@ -739,6 +739,13 @@ async fn agent_chat_stream(
                     buffered_text.push_str(&text);
                     serde_json::json!({"type": "chunk", "text": text})
                 }
+                // Memory shaping the answer used to be invisible to a console
+                // client. Emitted before the first chunk, so it can render
+                // above the answer rather than after it.
+                crate::agent::AgentEvent::MemoryRecalled { keys } => serde_json::json!({
+                    "type": "memory_recalled",
+                    "keys": keys,
+                }),
                 crate::agent::AgentEvent::Usage(usage) => serde_json::json!({
                     "type": "usage",
                     "model": usage.model,

@@ -44,6 +44,15 @@ pub enum AgentEvent {
         args: serde_json::Value,
     },
 
+    /// Stored memory was recalled and prepended to this turn's user message.
+    /// Emitted once, before the first `Chunk`, and only when something was
+    /// actually injected — an empty recall emits nothing.
+    ///
+    /// Injection was previously invisible: memory silently shaped every answer
+    /// and an operator had no way to tell whether it had, or which entries did
+    /// it. `keys` names exactly the entries in the prompt.
+    MemoryRecalled { keys: Vec<String> },
+
     /// Usage totals for the turn. Emitted once, immediately before `Done`.
     Usage(TokenUsage),
 
