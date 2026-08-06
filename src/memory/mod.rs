@@ -98,6 +98,22 @@ pub fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4())
 }
 
+/// True for a key this runtime generated rather than a person naming a fact.
+///
+/// Auto-save writes one entry per turn under `<prefix>_<uuid>`. The uuid is an
+/// address, not a name: showing it to an operator identifies nothing, so
+/// surfaces that list recalled memories summarise these instead of naming them.
+pub fn is_autosave_key(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    let Some((_, suffix)) = normalized.rsplit_once('_') else {
+        return false;
+    };
+    // A v4 uuid tail is what auto-save appends; anything else is a chosen name.
+    suffix.len() == 36
+        && suffix.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        && suffix.matches('-').count() == 4
+}
+
 /// Legacy auto-save key used for model-authored assistant summaries.
 /// These entries are treated as untrusted context and should not be re-injected.
 pub fn is_assistant_autosave_key(key: &str) -> bool {
