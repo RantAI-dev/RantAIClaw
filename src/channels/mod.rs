@@ -6920,6 +6920,118 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
     }
 
+    /// The channel dispatcher shares `build_memory_context` with the agent and
+    /// the CLI loop, and it has the same shape that broke them: it auto-saves
+    /// the inbound message *before* recalling, so the store holds a verbatim
+    /// copy of the question by the time the context block is built.
+    ///
+    /// This drives the real dispatcher against a real SQLite store — no stub
+    /// memory — and reads the prompt off the provider. Without the self-echo
+    /// drop the block is the question quoted back, and the curated fact never
+    /// reaches the model.
+    #[tokio::test]
+    async fn channel_turn_recalls_facts_not_the_question_it_was_asked() {
+        // Long enough to clear AUTOSAVE_MIN_MESSAGE_CHARS, or nothing is saved
+        // and there is no echo to reproduce.
+        let question = "when is the deployment window for this service";
+        assert!(question.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "deploy_window",
+            "The deployment window for this service is Friday afternoons",
+            crate::memory::MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(mem),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            // Both of these matter: auto-save writes the echo, and the real
+            // default threshold is what the echo's ranking pushed facts under.
+            auto_save_memory: true,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.4,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(tmp.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                sender_aliases: Vec::new(),
+                id: "tg-mem-1".to_string(),
+                sender: "rantaiclaw_user".to_string(),
+                reply_target: "chat-telegram".to_string(),
+                content: question.to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let user_turn = calls[0]
+            .iter()
+            .find(|(role, _)| role == "user")
+            .map(|(_, content)| content.clone())
+            .expect("a user turn should reach the provider");
+
+        let block = user_turn
+            .split_once(question)
+            .map(|(before, _)| before.to_string())
+            .unwrap_or_default();
+
+        assert!(
+            block.contains("deployment window for this service is Friday"),
+            "the curated fact never reached the prompt:\n{user_turn}"
+        );
+        assert!(
+            !block.contains(question),
+            "the question was injected back as its own context:\n{user_turn}"
+        );
+    }
+
     #[test]
     fn extract_tool_context_summary_collects_alias_and_native_tool_calls() {
         let history = vec![
