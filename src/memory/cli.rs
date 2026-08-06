@@ -1,6 +1,6 @@
 use super::traits::{Memory, MemoryCategory};
 use super::{
-    classify_memory_backend, create_memory_for_migration, effective_memory_backend_name,
+    classify_memory_backend, create_memory_for_cli, effective_memory_backend_name,
     MemoryBackendKind,
 };
 use crate::config::Config;
@@ -73,7 +73,7 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
                 Ok(Box::new(mem))
             }
         }
-        _ => create_memory_for_migration(&backend, &config.workspace_dir),
+        _ => create_memory_for_cli(&backend, &config.workspace_dir),
     }
 }
 
@@ -174,6 +174,32 @@ fn print_entry(entry: &super::traits::MemoryEntry) {
     println!("\n{}", entry.content);
 }
 
+/// Refresh the `MEMORY.md` projection after a write.
+///
+/// The agent, gateway and TUI project when they construct memory. The CLI does
+/// not build memory that way — it skips embedding setup — so `memory add` and
+/// `memory clear` used to leave the file that the system prompt injects
+/// untouched, and a workspace seeded entirely from the command line reached the
+/// model with an empty core tier until something else ran.
+///
+/// Best-effort, like the projection everywhere else: a failure here must not
+/// fail the write that already succeeded.
+fn refresh_projection(config: &Config) {
+    let backend = effective_memory_backend_name(
+        &config.memory.backend,
+        Some(&config.storage.provider.config),
+    );
+    if !matches!(
+        classify_memory_backend(&backend),
+        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
+    ) {
+        return;
+    }
+    if let Err(e) = super::snapshot::project_core_memories(&config.workspace_dir) {
+        tracing::warn!("memory projection skipped: {e}");
+    }
+}
+
 /// Store a memory from the command line.
 ///
 /// The CLI could read and delete but not write, so an operator seeding a fresh
@@ -193,6 +219,7 @@ async fn handle_add(config: &Config, key: &str, content: &str, category: &str) -
     mem.store(key, &sanitized.content, parse_category(category), None)
         .await?;
     println!("Stored {} [{}]", style(key).white().bold(), category);
+    refresh_projection(config);
     Ok(())
 }
 
@@ -311,7 +338,10 @@ async fn handle_clear(
 
     // Single-key deletion (exact or prefix match).
     if let Some(key) = key {
-        return handle_clear_key(&*mem, &key, yes).await;
+        let result = handle_clear_key(&*mem, &key, yes).await;
+        // Deleting a core memory has to leave the projected block too.
+        refresh_projection(config);
+        return result;
     }
 
     // Batch deletion by category (or all).
@@ -350,6 +380,7 @@ async fn handle_clear(
         entries.len(),
     );
 
+    refresh_projection(config);
     Ok(())
 }
 
@@ -421,6 +452,64 @@ fn truncate_content(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `memory add` and `memory clear` used to leave `MEMORY.md` untouched: the
+    /// CLI builds memory through a factory that skips embedding setup, and only
+    /// the agent/gateway/TUI factory projected. A workspace seeded entirely from
+    /// the command line therefore reached the model with an empty core tier.
+    #[tokio::test]
+    async fn cli_writes_refresh_the_memory_projection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+
+        let projected = tmp.path().join(super::super::snapshot::MEMORY_FILE);
+
+        handle_add(&config, "user_lang", "prefers Bahasa Indonesia", "core")
+            .await
+            .unwrap();
+        let after_add = std::fs::read_to_string(&projected).expect("add must project");
+        assert!(
+            after_add.contains("- user_lang: prefers Bahasa Indonesia"),
+            "{after_add}"
+        );
+
+        handle_clear(&config, Some("user_lang".into()), None, true)
+            .await
+            .unwrap();
+        let after_clear = std::fs::read_to_string(&projected).expect("clear must project");
+        assert!(
+            !after_clear.contains("user_lang"),
+            "a cleared memory must leave the block too:\n{after_clear}"
+        );
+    }
+
+    /// The CLI borrowed the migration factory, so an operator running
+    /// `memory stats` against a mistyped backend was told a migration was
+    /// underway.
+    #[test]
+    fn cli_backend_errors_do_not_mention_migration() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let error = create_memory_for_cli("sqlit", tmp.path())
+            .err()
+            .expect("an unknown backend is an error");
+        let message = error.to_string();
+        assert!(message.contains("sqlit"), "{message}");
+        assert!(
+            !message.contains("migration"),
+            "the CLI is not migrating anything: {message}"
+        );
+    }
+
+    #[test]
+    fn migration_backend_errors_still_say_migration() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let error = super::super::create_memory_for_migration("none", tmp.path())
+            .err()
+            .expect("backend 'none' is rejected");
+        assert!(error.to_string().contains("migrate"), "{error}");
+    }
 
     #[test]
     fn parse_category_known_variants() {
