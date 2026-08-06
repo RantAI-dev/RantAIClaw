@@ -36,6 +36,40 @@ impl Default for MemoryContextLimits {
     }
 }
 
+/// Extra rows to ask recall for, covering the self-echoes about to be dropped.
+///
+/// Auto-save writes one copy of the message per surface that handled it, so a
+/// turn can echo more than once.
+///
+/// This is deliberately small. Asking the same question verbatim N times leaves
+/// N stored echoes, and past this margin the usable page shrinks by one per
+/// extra echo — measured at four identical turns, the block went from five
+/// entries to four. Widening the recall on *every* turn to buy headroom for
+/// verbatim repeats costs more than the case is worth; the entries lost are the
+/// weakest-ranked ones, and nothing incorrect enters the prompt.
+const ECHO_OVERFETCH: usize = 2;
+
+/// Collapse whitespace so a stored copy and the live message compare equal
+/// even if one was re-wrapped on the way in.
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// True when a recalled entry is just the message being answered.
+///
+/// Auto-save writes each user message to memory, so by the time recall runs the
+/// store holds a verbatim copy of the question. It is worthless as context —
+/// the text sits in the prompt directly below this block — and it is actively
+/// harmful: being an exact lexical match it takes the top rank, and scores are
+/// normalised *relative to the best hit*, so a single self-echo pushes every
+/// real fact under `min_relevance_score`. Measured on a live store: with
+/// auto-save on, one turn recalled only its own question; with auto-save off,
+/// the same query surfaced five curated facts.
+fn is_echo_of_query(content: &str, user_message: &str) -> bool {
+    let query = squash(user_message);
+    !query.is_empty() && squash(content) == query
+}
+
 /// Entries that must never reach the prompt, whatever they scored.
 fn should_skip(key: &str, content: &str, limits: &MemoryContextLimits) -> bool {
     // Model-authored summaries from a legacy auto-save. Treated as untrusted
@@ -93,16 +127,28 @@ pub async fn build_memory_context(
     conversation_id: Option<&str>,
     limits: MemoryContextLimits,
 ) -> MemoryContext {
-    let recall_limit = limits.max_entries.max(1) + 1;
-    let entries = match recall_layered(memory, user_message, recall_limit, conversation_id).await {
-        Ok(entries) => entries,
-        Err(e) => {
-            // Recall failing is not the same as recalling nothing. Callers
-            // cannot tell the difference from an empty string, so say it here.
-            tracing::warn!("memory recall failed while building context: {e}");
-            return MemoryContext::default();
-        }
-    };
+    // Over-fetch so dropping self-echoes does not shrink the usable page.
+    let recall_limit = limits.max_entries.max(1) + 1 + ECHO_OVERFETCH;
+    let mut entries =
+        match recall_layered(memory, user_message, recall_limit, conversation_id).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                // Recall failing is not the same as recalling nothing. Callers
+                // cannot tell the difference from an empty string, so say it here.
+                tracing::warn!("memory recall failed while building context: {e}");
+                return MemoryContext::default();
+            }
+        };
+
+    // Drop self-echoes *before* the score threshold, not after: by then the
+    // echo has already defined the ranking everything else is measured against.
+    let before = entries.len();
+    entries.retain(|e| !is_echo_of_query(&e.content, user_message));
+    if entries.len() != before {
+        // Removing the top hit invalidates the scale it set, so re-rank what is
+        // left. "Relative to the best hit" now means the best *usable* hit.
+        super::vector::normalize_entry_scores(&mut entries);
+    }
 
     let mut context = String::new();
     let mut keys: Vec<String> = Vec::new();
@@ -366,6 +412,83 @@ mod tests {
             ctx.keys.len(),
             ctx.block.lines().filter(|l| l.starts_with("- ")).count()
         );
+    }
+
+    /// The defect, reproduced: auto-save stores the question, the stored copy
+    /// is a perfect lexical match so it ranks 1.0, and every real fact is then
+    /// scored *relative to it* — under the threshold and out of the prompt.
+    ///
+    /// Scores here are what a backend produces before this function sees them:
+    /// the echo at 1.0, a genuinely relevant fact well below it.
+    #[tokio::test]
+    async fn a_self_echo_does_not_bury_the_facts_beneath_it() {
+        let question = "when is the deployment window?";
+        let mem = memory_of(vec![
+            entry("user_msg_a1b2", question, 1.0),
+            entry(
+                "deploy_window",
+                "Deployments happen Friday afternoons",
+                0.30,
+            ),
+            entry("release_cadence", "Releases cut on the first Monday", 0.22),
+        ]);
+
+        let ctx =
+            build_memory_context(&mem, question, 0.4, None, MemoryContextLimits::default()).await;
+
+        assert!(
+            !ctx.block.contains(question),
+            "the question was injected as its own context: {}",
+            ctx.block
+        );
+        assert_eq!(
+            ctx.keys,
+            vec!["deploy_window", "release_cadence"],
+            "facts stayed buried under the echo's ranking"
+        );
+    }
+
+    /// Whitespace differences must not defeat the match — a stored copy may
+    /// have been re-wrapped on the way in.
+    #[tokio::test]
+    async fn an_echo_is_recognised_across_whitespace() {
+        let mem = memory_of(vec![
+            entry("user_msg_a1b2", "when is  the\ndeployment window?", 1.0),
+            entry("deploy_window", "Friday afternoons", 0.3),
+        ]);
+        let ctx = build_memory_context(
+            &mem,
+            "when is the deployment window?",
+            0.4,
+            None,
+            MemoryContextLimits::default(),
+        )
+        .await;
+        assert_eq!(ctx.keys, vec!["deploy_window"]);
+    }
+
+    /// The control. An entry that merely *mentions* the topic is real context
+    /// and must survive; only a verbatim echo is dropped.
+    #[tokio::test]
+    async fn an_entry_that_is_not_the_question_survives() {
+        let question = "when is the deployment window?";
+        let mem = memory_of(vec![entry(
+            "prior_answer",
+            "The deployment window is Friday, per the release runbook",
+            1.0,
+        )]);
+        let ctx =
+            build_memory_context(&mem, question, 0.4, None, MemoryContextLimits::default()).await;
+        assert_eq!(ctx.keys, vec!["prior_answer"]);
+    }
+
+    /// An empty query must not turn every empty-ish entry into an "echo".
+    #[tokio::test]
+    async fn an_empty_query_drops_nothing() {
+        let mem = memory_of(vec![entry("k", "a fact", 1.0)]);
+        let ctx =
+            build_memory_context(&mem, "   ", 0.0, None, MemoryContextLimits::default()).await;
+        assert_eq!(ctx.keys, vec!["k"]);
     }
 
     #[tokio::test]
