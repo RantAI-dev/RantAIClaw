@@ -4481,12 +4481,6 @@ impl TuiApp {
     }
 }
 
-/// Append a `· <preset>` segment to the status bar when an active
-/// preset is known. Colour-coded so the user can tell at a glance which
-/// tier they're in: Off in coral (autonomy hot), Strict in muted-amber,
-/// Manual in sky, Smart in mint (default-feel). When `preset` is `None`
-/// (pre-onboarding, unreadable file), the segment is omitted entirely.
-
 /// Fit a status line to `width` by dropping whole segments.
 ///
 /// A `Paragraph` clips at the character, so an overflowing line loses the *end*
@@ -4531,6 +4525,11 @@ fn fit_segments<'a>(
     }
 }
 
+/// Append a `· <preset>` segment to the status bar when an active
+/// preset is known. Colour-coded so the user can tell at a glance which
+/// tier they're in: Off in coral (autonomy hot), Strict in muted-amber,
+/// Manual in sky, Smart in mint (default-feel). When `preset` is `None`
+/// (pre-onboarding, unreadable file), the segment is omitted entirely.
 pub(crate) fn append_autonomy_segment(
     spans: &mut Vec<Span<'_>>,
     preset: Option<crate::approval::policy_writer::PolicyPreset>,
