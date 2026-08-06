@@ -377,13 +377,19 @@ pub fn create_sqlite_with_embedder(
     )
 }
 
-pub fn create_memory_for_migration(
+/// Build a backend without embedding setup, for work that only reads or deletes.
+///
+/// `purpose` names what the caller is doing, so an error about an unrecognised
+/// backend does not claim a migration is underway when the operator ran
+/// `memory stats`.
+fn create_memory_without_embeddings(
     backend: &str,
     workspace_dir: &Path,
+    purpose: &str,
 ) -> anyhow::Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
         anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration"
+            "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown to {purpose}"
         );
     }
 
@@ -392,7 +398,7 @@ pub fn create_memory_for_migration(
         MemoryBackendKind::Postgres
     ) {
         anyhow::bail!(
-            "memory migration for backend 'postgres' is unsupported; migrate with sqlite or markdown first"
+            "backend 'postgres' is not supported here; use sqlite or markdown to {purpose}"
         );
     }
 
@@ -400,9 +406,28 @@ pub fn create_memory_for_migration(
         backend,
         workspace_dir,
         || SqliteMemory::new(workspace_dir),
-        || anyhow::bail!("postgres backend is not available in migration context"),
-        " during migration",
+        || anyhow::bail!("postgres backend is not available in this context"),
+        "",
     )
+}
+
+pub fn create_memory_for_migration(
+    backend: &str,
+    workspace_dir: &Path,
+) -> anyhow::Result<Box<dyn Memory>> {
+    create_memory_without_embeddings(backend, workspace_dir, "migrate")
+}
+
+/// Backend for the `rantaiclaw memory` commands.
+///
+/// Skips embedding setup — these commands never run a vector search — and, unlike
+/// the migration factory it used to borrow, reports errors in terms of what the
+/// operator actually asked for.
+pub fn create_memory_for_cli(
+    backend: &str,
+    workspace_dir: &Path,
+) -> anyhow::Result<Box<dyn Memory>> {
+    create_memory_without_embeddings(backend, workspace_dir, "manage memory")
 }
 
 /// How far past `limit` the shared-memory backfill reads before filtering.
