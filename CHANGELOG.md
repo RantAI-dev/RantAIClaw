@@ -5,6 +5,113 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0-alpha] — 2026-08-07
+
+The provider/model catalog, audited by diffing it against what the providers
+actually serve rather than by reading it. Six changes; the security one first.
+
+### Security
+
+- **The model probe no longer prints `api_url` into its error output.**
+  `rantaiclaw doctor models` printed a live provider API key in plaintext on its
+  `[llamacpp]` line. Four independent links produced it and each is closed:
+  `run_models_refresh` handed the *global* `config.api_url` to every provider
+  probe, and `resolve_live_models_endpoint` trusts that argument unconditionally
+  for llama.cpp — so a sweep built llama.cpp's endpoint out of whatever the
+  active provider had stored there. The fetch error then echoed the endpoint
+  verbatim. The value was **not transmitted** (an unparseable URL fails inside
+  the HTTP client before a socket opens), but it reached stdout, and therefore
+  terminal scrollback and CI logs.
+
+  Endpoints are now parsed before the request is built and reduced to
+  scheme + host + path in any error — `userinfo` and query strings are dropped,
+  and a value that does not parse as a URL is withheld entirely.
+
+  **If you ran `doctor models` on an affected build, rotate the key.** An
+  operator whose `api_url` already holds a credential keeps that stored value
+  until they next set it; nothing rewrites config on upgrade.
+
+### Changed
+
+- **`PUT /api/v1/secrets` now rejects an `api_url` that is not an http(s) URL,
+  and one that looks like an API key.** Any non-empty string was previously
+  accepted and written to `config.toml` **in plaintext**, while the `api_key`
+  in the same request body is encrypted at rest. Validation runs before any
+  mutation, so a rejected body leaves the whole config untouched. This is a
+  contract change: a request that used to return 200 can now return 400.
+- **A live model list is authoritative; the curated list is a seed.** The
+  catalog previously appended every curated id the live list lacked. Five of the
+  twelve curated OpenRouter entries were absent from that provider's live
+  catalog — two of them (`meta-llama/llama-spark`, `openai/gpt-5.5-codex`) exist
+  nowhere at all — so the union manufactured options that fail at call time.
+  Once you have run `models refresh`, the list you see is the provider's own.
+- **Providers with no curated catalog report an empty list** instead of a single
+  entry literally named `default`, which was not a model id on any of them
+  (`synthetic`, `opencode`, `doubao`, `copilot`, `lmstudio`, `ovhcloud`).
+- **Default models changed for five providers.** Two pointed at models that do
+  not exist: `venice` (`zai-org-glm-5.1` → `zai-org-glm-5-2`; Venice separates
+  version parts with dashes) and `nvidia` (`meta/llama-spark` →
+  `meta/llama-3.3-70b-instruct`; NVIDIA NIM serves no `llama-spark`). Three more
+  were absent from their own provider's picker, so setup wrote a `default_model`
+  the operator could not re-select: `ollama`, `llamacpp` and `bedrock`.
+  Existing configs are not rewritten — a profile already holding one of these
+  keeps it until you change the model.
+- **Bedrock model ids use one format.** Its four-entry list carried three, two
+  of which omit the `-v1:0` suffix Bedrock requires. Bedrock has no live model
+  discovery, so curated is its entire catalog and a malformed id there can never
+  be corrected by a refresh.
+- Refreshed the OpenRouter, Venice, NVIDIA, astrai and Ollama curated lists
+  against live catalogs from those providers. The setup wizard's provider-tier
+  labels no longer name specific model versions (they advertised "GPT-4o, o1,
+  o3", "Grok 3" and "Gemini 2.0 Flash & Pro" while the lists one file over said
+  otherwise). Knowledge-base image ingestion moves off `gpt-4o-mini`.
+
+### Added
+
+- **`rantaiclaw models refresh --all`** refreshes every registered provider in
+  one sweep, continuing past providers that lack a key or live-discovery
+  support. This existed only as `doctor models` — the command nobody reaches for
+  when they want to update a model list. `--all` conflicts with `--provider`,
+  always forces a live refresh, and `--help` states that the sweep sends each
+  provider's configured (or env-supplied) key to that provider's own endpoint.
+
+### Fixed
+
+- **The TUI `/model` picker reads the model cache.** It was built from the
+  curated list alone, so `models refresh` and `doctor models` — both of which
+  write `models_cache.json` — had no effect on the TUI at all. On a profile
+  whose cache held 400 live OpenRouter models the picker still offered 12.
+- **Anthropic completions no longer down-tier models the match arm never
+  named.** `with_anthropic_max_tokens` enumerated the *high* tier and let
+  everything else fall lower, so `claude-opus-4-8` received 64k instead of 128k
+  and the Claude 5 family received 4096 — a 16x undershoot. Both truncate a long
+  generation silently: the operator sees a short answer, not an error. Known
+  lower tiers are now enumerated instead, and an unrecognized `claude-*` logs a
+  warning rather than quietly taking the floor.
+- **A remote-Ollama refresh performs a real probe.** That branch returned a
+  hardcoded ten-entry list which was then cached and reported as
+  `✅ model catalog check passed` — observed passing on a machine with no Ollama
+  running. A probe that cannot fail is not a check.
+- The channel runtime's in-chat `/model` reply no longer carries its own copy of
+  the cache path, deserialization structs and lookup. All four surfaces — TUI,
+  CLI, channels, gateway — now resolve one catalog.
+
+### Notes
+
+- **No config schema change**, and the bundled console stays at claw-ui
+  `v0.3.15`. Like v0.17.1-alpha and unlike v0.17.0-alpha, this release rolls
+  back freely.
+- Two invariants were added to keep this class of drift from returning: every
+  provider's default must appear in that provider's own curated list, and every
+  Bedrock id must carry its version suffix. The only prior coverage exercised a
+  single provider, which is why the defects went unnoticed. Correcting the data
+  also required correcting three existing tests that had pinned the broken
+  values in place.
+- Not addressed: the cost pricing table (`get_default_pricing`) has zero overlap
+  with any current default model, so enabling cost tracking leaves every model
+  you actually use unpriced. `[cost] enabled` is `false` by default, so nothing
+  is broken today. Tracked for a follow-up that can verify real prices.
+
 ## [0.17.1-alpha] — 2026-08-06
 
 Two defects on the update path itself, found by taking v0.17.0-alpha on a real
