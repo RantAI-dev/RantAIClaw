@@ -1104,6 +1104,12 @@ enum ModelCommands {
         /// Force live refresh and ignore fresh cache
         #[arg(long)]
         force: bool,
+
+        /// Refresh every registered provider instead of just one. Sends each
+        /// provider's configured (or env-supplied) key to that provider's own
+        /// endpoint; providers without one are reported and skipped.
+        #[arg(long, conflicts_with = "provider")]
+        all: bool,
     },
     /// List the cached/curated model catalog for a provider
     List {
@@ -1963,10 +1969,21 @@ async fn main() -> Result<()> {
         Some(Commands::Cron { cron_command }) => cron::handle_command(cron_command, &config),
 
         Some(Commands::Models { model_command }) => match model_command {
-            ModelCommands::Refresh { provider, force } => {
+            ModelCommands::Refresh {
+                provider,
+                force,
+                all,
+            } => {
                 let config_for_refresh = config.clone();
                 tokio::task::spawn_blocking(move || {
-                    onboard::run_models_refresh(&config_for_refresh, provider.as_deref(), force)
+                    if all {
+                        // The sweep is deliberately always a live refresh: an
+                        // operator asking for every provider is asking for the
+                        // current truth, not a cache replay.
+                        doctor::refresh_all_model_catalogs(&config_for_refresh, true)
+                    } else {
+                        onboard::run_models_refresh(&config_for_refresh, provider.as_deref(), force)
+                    }
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("models refresh task failed: {e}"))?
