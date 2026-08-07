@@ -1338,7 +1338,14 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
                 "Gemini 2.5 Flash-Lite (lowest cost)".to_string(),
             ),
         ],
-        _ => vec![("default".to_string(), "Default model".to_string())],
+        // No curated list for this provider. `list_providers()` carries more
+        // entries than this table does — `synthetic`, `opencode`, `doubao`,
+        // `copilot`, `lmstudio`, `ovhcloud` all land here — and the previous
+        // fallback offered a single row literally named `default`, which is not
+        // a model ID on any of them. An empty catalog is honest: the caller
+        // renders its "no catalog, run `models refresh`" state and the operator
+        // can still type an ID directly.
+        _ => Vec::new(),
     }
 }
 
@@ -1607,13 +1614,25 @@ fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
     Ok(parse_gemini_model_ids(&payload))
 }
 
-fn fetch_ollama_models() -> Result<Vec<String>> {
+/// Where a local Ollama daemon listens when no endpoint is configured.
+const OLLAMA_LOCAL_ENDPOINT: &str = "http://localhost:11434";
+
+/// Ask an Ollama endpoint what it serves. `base_url` is a normalized origin
+/// (no trailing `/api`), so the same call reaches a local daemon or a remote
+/// host.
+fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>> {
+    let endpoint = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let Ok(parsed) = reqwest::Url::parse(&endpoint) else {
+        bail!("Ollama endpoint is not a valid URL ({REDACTED_ENDPOINT})");
+    };
+    let safe_endpoint = redact_endpoint_for_display(&endpoint);
+
     let client = build_model_fetch_client()?;
     let payload: Value = client
-        .get("http://localhost:11434/api/tags")
+        .get(parsed)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
-        .context("model fetch failed: GET http://localhost:11434/api/tags")?
+        .with_context(|| format!("model fetch failed: GET {safe_endpoint}"))?
         .json()
         .context("failed to parse Ollama model list response")?;
 
@@ -1726,24 +1745,26 @@ fn fetch_live_models_for_provider(
         "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
         "gemini" => fetch_gemini_models(api_key.as_deref())?,
         "ollama" => {
+            // Ask the configured endpoint what it serves, remote or local. This
+            // branch used to return a hardcoded ten-entry list for remote
+            // endpoints, which `run_models_refresh` then wrote to the cache and
+            // reported as `✅ model catalog check passed` — observed passing on a
+            // box with no Ollama running at all. A probe that cannot fail is not
+            // a check, and a compile-time constant served as `source: "cache"`
+            // is a false provenance claim.
+            let base_url = provider_api_url
+                .map(normalize_ollama_endpoint_url)
+                .filter(|url| !url.is_empty())
+                .unwrap_or_else(|| OLLAMA_LOCAL_ENDPOINT.to_string());
+
+            let models = fetch_ollama_models(&base_url)?;
             if ollama_remote {
-                // Remote Ollama endpoints can serve cloud-routed models.
-                // Keep this curated list aligned with current Ollama cloud catalog.
-                vec![
-                    "glm-5:cloud".to_string(),
-                    "glm-4.7:cloud".to_string(),
-                    "gpt-oss:20b:cloud".to_string(),
-                    "gpt-oss:120b:cloud".to_string(),
-                    "gemini-3-flash-preview:cloud".to_string(),
-                    "qwen3-coder-next:cloud".to_string(),
-                    "qwen3-coder:480b:cloud".to_string(),
-                    "kimi-k2.5:cloud".to_string(),
-                    "minimax-m2.5:cloud".to_string(),
-                    "deepseek-v3.1:671b:cloud".to_string(),
-                ]
+                // Remote endpoints legitimately serve cloud-routed models.
+                models
             } else {
-                // Local endpoints should not surface cloud-only suffixes.
-                fetch_ollama_models()?
+                // A local daemon has no cloud routing; a `:cloud` suffix here
+                // would be unusable.
+                models
                     .into_iter()
                     .filter(|model_id| !model_id.ends_with(":cloud"))
                     .collect()
@@ -1907,12 +1928,21 @@ fn load_any_cached_models_for_provider(
     load_cached_models_for_provider_internal(workspace_dir, provider_name, None)
 }
 
-/// Read-through view of a provider's model catalog for non-TUI surfaces (the web
-/// console / gateway). Resolves the **same** sources the TUI uses — the on-disk
-/// model cache (`models_cache.json`) unioned with the curated fallback, plus the
-/// canonical default — so the web UI and the TUI never drift. No network: returns
-/// whatever the cache holds (any age) else curated; refresh is explicit via
+/// Read-through view of a provider's model catalog, shared by the TUI picker,
+/// `models list`, the channel runtime and the gateway, so no surface drifts from
+/// another. No network: it serves the on-disk cache (`models_cache.json`) when
+/// one exists, else the curated seed. Refresh is explicit, via
 /// [`run_models_refresh`].
+///
+/// **A live list is authoritative.** The cache is the provider's own answer to
+/// "what do you serve"; curated is a hand-written seed for a profile that has
+/// never refreshed. Earlier this unioned the two, appending every curated ID the
+/// live list lacked — which manufactured options that cannot be called. On a
+/// real profile, five of the twelve curated OpenRouter IDs were absent from the
+/// live 400, including two (`meta-llama/llama-spark`, `openai/gpt-5.5-codex`)
+/// that do not exist in any form. Offering a model the provider will reject is
+/// worse than omitting one it would have accepted: the first fails at call time
+/// with no explanation, the second is fixed by a refresh.
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderCatalog {
     pub models: Vec<String>,
@@ -1924,31 +1954,20 @@ pub(crate) struct ProviderCatalog {
 }
 
 pub(crate) fn provider_model_catalog(workspace_dir: &Path, provider_name: &str) -> ProviderCatalog {
-    let curated: Vec<String> = curated_models_for_provider(provider_name)
-        .into_iter()
-        .map(|(id, _label)| id)
-        .collect();
     let default_model = default_model_for_provider(provider_name);
 
     match load_any_cached_models_for_provider(workspace_dir, provider_name) {
-        Ok(Some(cached)) if !cached.models.is_empty() => {
-            // Cache first (the live truth), then any curated id not already present
-            // — mirrors the TUI picker which overlays live onto the curated base.
-            let mut models = cached.models;
-            for id in curated {
-                if !models.contains(&id) {
-                    models.push(id);
-                }
-            }
-            ProviderCatalog {
-                models,
-                default_model,
-                source: "cache",
-                age_secs: Some(cached.age_secs),
-            }
-        }
+        Ok(Some(cached)) if !cached.models.is_empty() => ProviderCatalog {
+            models: cached.models,
+            default_model,
+            source: "cache",
+            age_secs: Some(cached.age_secs),
+        },
         _ => ProviderCatalog {
-            models: curated,
+            models: curated_models_for_provider(provider_name)
+                .into_iter()
+                .map(|(id, _label)| id)
+                .collect(),
             default_model,
             source: "curated",
             age_secs: None,
@@ -6098,6 +6117,91 @@ mod tests {
         assert!(
             cat.models.iter().any(|m| m == "gpt-5.5"),
             "curated openai list must include the default model"
+        );
+    }
+
+    // ── the catalog must not invent models ───────────────────────
+
+    /// Seed a workspace whose model cache holds `models` for `provider`.
+    fn workspace_with_cached_models(provider: &str, models: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        cache_live_models_for_provider(
+            dir.path(),
+            provider,
+            &models.iter().map(|m| (*m).to_string()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn cached_catalog_does_not_readmit_curated_models_the_provider_dropped() {
+        // The exact shape observed on a real profile: curated carries IDs the
+        // live catalog does not serve. Appending them manufactured options that
+        // fail at call time.
+        let curated = curated_models_for_provider("openrouter");
+        assert!(
+            curated.len() > 1,
+            "fixture assumes openrouter has a curated list"
+        );
+        let (kept, _) = curated.first().unwrap().clone();
+        let dropped: Vec<String> = curated
+            .iter()
+            .skip(1)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+
+        let workspace = workspace_with_cached_models("openrouter", &[kept.as_str()]);
+        let cat = provider_model_catalog(workspace.path(), "openrouter");
+
+        assert_eq!(cat.source, "cache");
+        assert_eq!(
+            cat.models,
+            vec![kept],
+            "a live list is authoritative — curated must not be appended to it"
+        );
+        for id in dropped {
+            assert!(
+                !cat.models.contains(&id),
+                "curated id {id} was re-admitted despite the live list omitting it"
+            );
+        }
+    }
+
+    #[test]
+    fn providers_without_a_curated_list_report_no_models_rather_than_a_fake_one() {
+        // `list_providers()` carries more entries than the curated table does.
+        // The old fallback offered one row literally named `default`.
+        for provider in [
+            "synthetic",
+            "opencode",
+            "doubao",
+            "copilot",
+            "lmstudio",
+            "ovhcloud",
+        ] {
+            let curated = curated_models_for_provider(provider);
+            assert!(
+                curated.is_empty(),
+                "{provider} should report an empty catalog, got {curated:?}"
+            );
+        }
+
+        let dir = std::path::Path::new("/nonexistent-rantaiclaw-catalog-test");
+        assert!(provider_model_catalog(dir, "opencode").models.is_empty());
+    }
+
+    #[test]
+    fn ollama_fetch_probes_the_configured_endpoint_instead_of_a_constant() {
+        // The remote branch used to return a hardcoded ten-entry list, which was
+        // then cached and reported as a passing catalog check on a machine with
+        // no Ollama running. A real probe must fail when the endpoint is not
+        // usable — no network is reached here because the URL never parses.
+        let error = fetch_ollama_models("not-a-url")
+            .expect_err("an unusable endpoint must not yield a model list");
+        assert!(
+            format!("{error:#}").contains(REDACTED_ENDPOINT),
+            "unexpected error: {error:#}"
         );
     }
 
