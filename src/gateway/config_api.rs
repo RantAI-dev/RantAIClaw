@@ -739,7 +739,14 @@ fn switch_active_provider(cfg: &mut crate::config::Config, new_provider: Option<
     cfg.default_provider = new_provider;
 }
 
-fn apply_secrets(cfg: &mut crate::config::Config, body: &SecretsBody) {
+fn apply_secrets(cfg: &mut crate::config::Config, body: &SecretsBody) -> Result<(), String> {
+    if let Some(u) = body.api_url.as_ref() {
+        let u = u.trim();
+        if !u.is_empty() {
+            validate_api_url(u)?;
+        }
+    }
+
     if let Some(k) = body.api_key.as_ref() {
         let k = k.trim();
         // Mirror the key into the per-provider store, keyed by the active
@@ -767,6 +774,36 @@ fn apply_secrets(cfg: &mut crate::config::Config, body: &SecretsBody) {
             Some(u.to_string())
         };
     }
+    Ok(())
+}
+
+/// Prefixes used by the providers this project talks to. A value carrying one of
+/// these was meant for `api_key`, whatever field it arrived in.
+const API_KEY_PREFIXES: [&str; 6] = ["sk-", "sk_", "gsk_", "xai-", "AIza", "hf_"];
+
+/// `api_url` is stored in `config.toml` in plaintext, unlike `api_key`, which is
+/// encrypted at rest. A credential that lands here is therefore written to disk
+/// unprotected and later interpolated into operator-facing error messages by
+/// whatever consumes it. Reject at the boundary rather than store and redact
+/// downstream — redaction limits the damage, this prevents it.
+fn validate_api_url(value: &str) -> Result<(), String> {
+    if API_KEY_PREFIXES
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+    {
+        return Err(
+            "api_url looks like an API key, not a URL — set it as api_key instead".to_string(),
+        );
+    }
+
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "api_url must be a valid URL, e.g. https://api.example.com/v1".to_string())?;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("api_url must use http:// or https://".to_string());
+    }
+
+    Ok(())
 }
 
 /// `GET /secrets` — presence-only view; the raw key is never returned.
@@ -788,7 +825,7 @@ async fn set_secrets(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let (_guard, mut cfg) = lock_and_load().await?;
-    apply_secrets(&mut cfg, &body);
+    apply_secrets(&mut cfg, &body).map_err(err_400)?;
     let present = api_key_present(&cfg);
     persist_and_swap(&state, cfg).await?;
     Ok(Json(json!({ "ok": true, "api_key_present": present })))
@@ -1065,7 +1102,8 @@ mod tests {
                 api_key: Some("  sk-openai  ".into()),
                 api_url: None,
             },
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.api_key.as_deref(), Some("sk-openai"));
         assert_eq!(
             cfg.provider_api_keys.get("openai").map(String::as_str),
@@ -1097,7 +1135,8 @@ mod tests {
                 api_key: Some("openai-key".into()),
                 api_url: None,
             },
-        );
+        )
+        .unwrap();
         switch_active_provider(&mut cfg, Some("minimax".into()));
         assert_eq!(cfg.api_key.as_deref(), Some("minimax-key"));
         assert_eq!(
@@ -1237,7 +1276,8 @@ mod tests {
                 api_key: Some("  sk-test  ".into()),
                 api_url: Some("https://api.example.com".into()),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
         assert_eq!(cfg.api_url.as_deref(), Some("https://api.example.com"));
         assert!(api_key_present(&cfg));
@@ -1248,7 +1288,8 @@ mod tests {
                 api_key: Some(String::new()),
                 api_url: Some("   ".into()),
             },
-        );
+        )
+        .unwrap();
         assert!(cfg.api_key.is_none(), "empty key clears the credential");
         assert!(cfg.api_url.is_none(), "blank url clears the override");
         assert!(!api_key_present(&cfg));
@@ -1264,13 +1305,72 @@ mod tests {
                 api_key: None,
                 api_url: Some("http://override".into()),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             cfg.api_key.as_deref(),
             Some("keep-me"),
             "an omitted api_key must not wipe the existing key"
         );
         assert_eq!(cfg.api_url.as_deref(), Some("http://override"));
+    }
+
+    // ── api_url validation ───────────────────────────────────────
+    //
+    // `api_url` is persisted to config.toml in plaintext while `api_key` is
+    // encrypted, and it is later consumed as a base URL by the model probe. A
+    // credential arriving in this field is therefore stored unprotected and
+    // interpolated into operator-facing errors. Reject it at the boundary.
+
+    #[test]
+    fn validate_api_url_rejects_credential_shaped_values() {
+        // Derive the fixtures from the prefix table rather than spelling out
+        // realistic keys: a literal like `sk_live_<24 chars>` trips GitHub's
+        // push protection, and a hand-written list silently stops covering any
+        // prefix added later.
+        for prefix in API_KEY_PREFIXES {
+            let value = format!("{prefix}EXAMPLE");
+            let err =
+                validate_api_url(&value).expect_err("a credential-shaped api_url must be rejected");
+            assert!(
+                err.contains("API key"),
+                "message should name the confusion, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_api_url_requires_an_http_url() {
+        assert!(validate_api_url("not a url at all").is_err());
+        assert!(validate_api_url("ftp://api.example.com").is_err());
+        assert!(validate_api_url("file:///etc/passwd").is_err());
+
+        assert!(validate_api_url("http://localhost:8080/v1").is_ok());
+        assert!(validate_api_url("https://api.example.com/v1").is_ok());
+    }
+
+    #[test]
+    fn apply_secrets_rejects_credential_in_api_url_without_mutating_config() {
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("openrouter".into());
+        cfg.api_key = Some("existing-key".into());
+        cfg.api_url = Some("https://openrouter.ai/api/v1".into());
+
+        let err = apply_secrets(
+            &mut cfg,
+            &SecretsBody {
+                api_key: Some("new-key".into()),
+                api_url: Some("sk-or-v1-EXAMPLE".into()),
+            },
+        )
+        .expect_err("a credential-shaped api_url must be rejected");
+        assert!(err.contains("API key"), "unexpected message: {err}");
+
+        // Validation runs before any mutation, so a rejected body leaves the
+        // whole config untouched — including the api_key in the same request.
+        assert_eq!(cfg.api_key.as_deref(), Some("existing-key"));
+        assert_eq!(cfg.api_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+        assert!(cfg.provider_api_keys.is_empty());
     }
 
     #[test]

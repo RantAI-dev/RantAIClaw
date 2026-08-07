@@ -1479,24 +1479,58 @@ fn parse_ollama_model_ids(payload: &Value) -> Vec<String> {
     normalize_model_ids(ids)
 }
 
+/// Render an endpoint for an operator-facing error without echoing it verbatim.
+///
+/// This is the only model-fetch path whose endpoint is built from config rather
+/// than a compile-time constant, so it is the only one that can carry operator
+/// data into a log line. A value that fails to parse as a URL is, by definition,
+/// not a URL — it may be anything the operator typed into `api_url`, including a
+/// credential — so it is never printed. A value that does parse is reduced to
+/// scheme + host + path: `userinfo` and query strings are dropped because both
+/// are places API keys turn up.
+fn redact_endpoint_for_display(endpoint: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return REDACTED_ENDPOINT.to_string();
+    };
+
+    let Some(host) = url.host_str() else {
+        return REDACTED_ENDPOINT.to_string();
+    };
+
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}{}", url.scheme(), url.path()),
+        None => format!("{}://{host}{}", url.scheme(), url.path()),
+    }
+}
+
+const REDACTED_ENDPOINT: &str = "<invalid endpoint, redacted>";
+
 fn fetch_openai_compatible_models(
     endpoint: &str,
     api_key: Option<&str>,
     allow_unauthenticated: bool,
 ) -> Result<Vec<String>> {
+    // Parse before building the request. `reqwest` carries the offending URL in
+    // its own builder error, so handing it an unparseable endpoint would leak
+    // the raw value through an error we do not format.
+    let Ok(parsed) = reqwest::Url::parse(endpoint) else {
+        bail!("model fetch endpoint is not a valid URL ({REDACTED_ENDPOINT})");
+    };
+    let safe_endpoint = redact_endpoint_for_display(endpoint);
+
     let client = build_model_fetch_client()?;
-    let mut request = client.get(endpoint);
+    let mut request = client.get(parsed);
 
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     } else if !allow_unauthenticated {
-        bail!("model fetch requires API key for endpoint {endpoint}");
+        bail!("model fetch requires API key for endpoint {safe_endpoint}");
     }
 
     let payload: Value = request
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
-        .with_context(|| format!("model fetch failed: GET {endpoint}"))?
+        .with_context(|| format!("model fetch failed: GET {safe_endpoint}"))?
         .json()
         .context("failed to parse model list response")?;
 
@@ -1636,6 +1670,24 @@ fn resolve_live_models_endpoint(
     }
 
     models_endpoint_for_provider(provider_name).map(str::to_string)
+}
+
+/// `config.api_url` is the base URL of the **active** provider, not a global one.
+/// Only hand it to a probe for that same provider.
+///
+/// Without this gate a probe for any other provider receives a URL that was set
+/// while something else was selected. `resolve_live_models_endpoint` ignores the
+/// argument for every provider except llama.cpp, which trusts it unconditionally
+/// — so a `doctor models` sweep would build llama.cpp's endpoint out of whatever
+/// the active provider had stored there, including a value that is not a URL at
+/// all.
+fn active_provider_api_url<'a>(config: &'a Config, provider_name: &str) -> Option<&'a str> {
+    let active = config.default_provider.as_deref()?;
+    if canonical_provider_name(active) == canonical_provider_name(provider_name) {
+        config.api_url.as_deref()
+    } else {
+        None
+    }
 }
 
 fn fetch_live_models_for_provider(
@@ -2020,8 +2072,9 @@ pub fn run_models_refresh(
     }
 
     let api_key = config.api_key.clone().unwrap_or_default();
+    let provider_api_url = active_provider_api_url(config, &provider_name);
 
-    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
+    match fetch_live_models_for_provider(&provider_name, &api_key, provider_api_url) {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
             println!(
@@ -6390,6 +6443,83 @@ mod tests {
             Some("https://api.venice.ai/api/v1/models".to_string())
         );
         assert_eq!(resolve_live_models_endpoint("unknown-provider", None), None);
+    }
+
+    // ── secret containment in the model-probe path ───────────────
+    //
+    // `doctor models` printed a live `sk-or-v1-…` key on the `[llamacpp]` line:
+    // `config.api_url` held a credential, llama.cpp was the one provider that
+    // consumed that argument unconditionally, and the fetch error echoed the
+    // endpoint verbatim. Each assertion below closes one link of that chain.
+
+    const PROBE_SECRET: &str = "sk-or-v1-EXAMPLE";
+
+    #[test]
+    fn active_provider_api_url_is_withheld_from_other_providers() {
+        let mut config = Config::default();
+        config.default_provider = Some("openrouter".into());
+        config.api_url = Some(PROBE_SECRET.into());
+
+        // llama.cpp is the provider that would have consumed it as a base URL.
+        assert_eq!(active_provider_api_url(&config, "llamacpp"), None);
+        assert_eq!(active_provider_api_url(&config, "anthropic"), None);
+        // The active provider still gets its own override, under any alias.
+        assert_eq!(
+            active_provider_api_url(&config, "openrouter"),
+            Some(PROBE_SECRET)
+        );
+    }
+
+    #[test]
+    fn active_provider_api_url_matches_across_provider_aliases() {
+        let mut config = Config::default();
+        config.default_provider = Some("llama.cpp".into());
+        config.api_url = Some("http://127.0.0.1:8033/v1".into());
+
+        assert_eq!(
+            active_provider_api_url(&config, "llamacpp"),
+            Some("http://127.0.0.1:8033/v1")
+        );
+    }
+
+    #[test]
+    fn redact_endpoint_for_display_hides_unparseable_and_embedded_secrets() {
+        // The exact shape that leaked: a credential where a URL was expected.
+        assert_eq!(
+            redact_endpoint_for_display(&format!("{PROBE_SECRET}/models")),
+            REDACTED_ENDPOINT
+        );
+        // A parseable URL is still stripped of the two places keys hide.
+        assert_eq!(
+            redact_endpoint_for_display(&format!(
+                "https://user:{PROBE_SECRET}@api.example.com/v1/models?key={PROBE_SECRET}"
+            )),
+            "https://api.example.com/v1/models"
+        );
+        // A plain endpoint survives intact — the message stays useful.
+        assert_eq!(
+            redact_endpoint_for_display("http://127.0.0.1:8033/v1/models"),
+            "http://127.0.0.1:8033/v1/models"
+        );
+    }
+
+    #[test]
+    fn model_fetch_error_never_echoes_the_endpoint_value() {
+        // No network: an unparseable endpoint fails before any request is built,
+        // which is also what stops reqwest from carrying the raw value in its own
+        // builder error.
+        let error = fetch_openai_compatible_models(&format!("{PROBE_SECRET}/models"), None, true)
+            .expect_err("an endpoint that is not a URL must not be fetched");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains(PROBE_SECRET),
+            "model fetch error leaked the endpoint value: {rendered}"
+        );
+        assert!(
+            rendered.contains(REDACTED_ENDPOINT),
+            "error should say the endpoint was withheld, got: {rendered}"
+        );
     }
 
     #[test]
