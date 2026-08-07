@@ -79,7 +79,6 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -114,7 +113,6 @@ const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
-const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
 const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
@@ -150,17 +148,6 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ModelCacheState {
-    entries: Vec<ModelCacheEntry>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ModelCacheEntry {
-    provider: String,
-    models: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -939,27 +926,19 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     .any(|hint| lower.contains(hint))
 }
 
+/// Top model IDs for a provider, for the in-channel `/model` reply.
+///
+/// Resolves through the shared catalog rather than re-reading
+/// `models_cache.json` here. This module used to carry its own copy of the
+/// cache path, the deserialization structs and the lookup — a fourth reader of
+/// one file with a fourth copy of the rules, which is the duplication that let
+/// the catalog surfaces drift apart in the first place.
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
-    let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
-    let Ok(raw) = std::fs::read_to_string(cache_path) else {
-        return Vec::new();
-    };
-    let Ok(state) = serde_json::from_str::<ModelCacheState>(&raw) else {
-        return Vec::new();
-    };
-
-    state
-        .entries
+    crate::onboard::wizard::provider_model_catalog(workspace_dir, provider_name)
+        .models
         .into_iter()
-        .find(|entry| entry.provider == provider_name)
-        .map(|entry| {
-            entry
-                .models
-                .into_iter()
-                .take(MODEL_CACHE_PREVIEW_LIMIT)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+        .take(MODEL_CACHE_PREVIEW_LIMIT)
+        .collect()
 }
 
 async fn get_or_create_provider(

@@ -86,6 +86,12 @@ pub struct TuiContext {
     /// configured) when the TUI launched. Used by `/model` to populate
     /// the model picker. First entry is the primary/default provider.
     pub available_providers: Vec<String>,
+    /// Workspace root, so `/model` can resolve the on-disk model cache the
+    /// same way the CLI and the web console do. Precomputed where `Config` is
+    /// available — same pattern as `channels_summary` and `provider_key_ok` —
+    /// so the command doesn't carry `Config`. `None` in unit tests, which
+    /// falls back to the curated lists. Refreshed by `reload_config`.
+    pub workspace_dir: Option<std::path::PathBuf>,
     /// Skills loaded from the workspace at TUI startup. Used by
     /// direct slash-skill invocation and agent prompt construction.
     pub available_skills: Vec<crate::skills::Skill>,
@@ -207,6 +213,7 @@ impl TuiContext {
             events_rx,
             queued_turns: 0,
             available_providers: Vec::new(),
+            workspace_dir: None,
             available_skills: Vec::new(),
             available_skills_with_status: Vec::new(),
             available_commands: Vec::new(),
