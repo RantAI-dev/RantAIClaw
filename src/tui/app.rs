@@ -2275,6 +2275,7 @@ impl TuiApp {
             }
         }
         self.context.available_providers = available_providers;
+        self.context.workspace_dir = Some(config.workspace_dir.clone());
         // Refresh the channels snapshot so /channels and /platforms reflect
         // any wizard-driven add/remove since launch.
         let prev_channels_count = count_configured_channels(&self.config);
@@ -7608,6 +7609,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         events_rx,
     )?;
     app.context.available_providers = available_providers;
+    app.context.workspace_dir = Some(app_config.workspace_dir.clone());
     // Subscribe to the pending-approvals broadcast before stashing the
     // security handle on the context, so that the moment the shell tool
     // suspends a turn waiting for /allow|/deny, the TUI sees the

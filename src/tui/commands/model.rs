@@ -4,6 +4,56 @@ use super::{CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
 use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind, ModelEntry};
 
+/// Rows for one provider's model picker.
+///
+/// Resolves the same catalog the CLI (`models list`) and the web console
+/// (`GET /providers/{id}/models`) resolve: the on-disk model cache written by
+/// `models refresh` / `doctor models`, falling back to the curated list when
+/// no cache exists. Before this, `/model` read the curated list *only*, so a
+/// refresh had no effect on the TUI at all — on a profile whose cache held 400
+/// live OpenRouter models the picker still offered 12, five of which OpenRouter
+/// does not serve.
+///
+/// The catalog returns bare IDs, so the curated `(id, label)` pairs are kept as
+/// a description lookup: catalog order wins, curated supplies a description
+/// where it has one, and anything else shows the ID alone.
+fn model_entries_for_provider(
+    provider: &str,
+    workspace_dir: Option<&std::path::Path>,
+) -> Vec<ModelEntry> {
+    let curated = crate::onboard::wizard::curated_models_for_provider(provider);
+
+    let Some(workspace_dir) = workspace_dir else {
+        // No config was available (unit tests) — curated is all there is.
+        return curated
+            .into_iter()
+            .map(|(model_id, description)| ModelEntry {
+                provider: provider.to_string(),
+                model_id,
+                description,
+            })
+            .collect();
+    };
+
+    let describe = |id: &str| {
+        curated
+            .iter()
+            .find(|(curated_id, _)| curated_id == id)
+            .map(|(_, description)| description.clone())
+            .unwrap_or_default()
+    };
+
+    crate::onboard::wizard::provider_model_catalog(workspace_dir, provider)
+        .models
+        .into_iter()
+        .map(|model_id| ModelEntry {
+            description: describe(&model_id),
+            provider: provider.to_string(),
+            model_id,
+        })
+        .collect()
+}
+
 /// /model command — display, change, or interactively pick the active model.
 pub struct ModelCommand;
 
@@ -32,9 +82,8 @@ impl CommandHandler for ModelCommand {
             return Ok(CommandResult::Message(format!("Model set to: {model}")));
         }
 
-        // No args → open the interactive picker. Build entries from the
-        // curated per-provider lists, restricted to providers detected as
-        // enabled at TUI startup.
+        // No args → open the interactive picker, restricted to providers
+        // detected as enabled at TUI startup.
         let mut entries: Vec<ModelEntry> = Vec::new();
         let providers = if ctx.available_providers.is_empty() {
             ctx.model
@@ -47,13 +96,10 @@ impl CommandHandler for ModelCommand {
         };
 
         for provider in &providers {
-            for (id, desc) in crate::onboard::wizard::curated_models_for_provider(provider) {
-                entries.push(ModelEntry {
-                    provider: provider.clone(),
-                    model_id: id,
-                    description: desc,
-                });
-            }
+            entries.extend(model_entries_for_provider(
+                provider,
+                ctx.workspace_dir.as_deref(),
+            ));
         }
 
         let items: Vec<ListPickerItem> = entries
@@ -157,5 +203,82 @@ mod tests {
             }
             other => panic!("expected OpenListPicker, got {other:?}"),
         }
+    }
+
+    // ── the picker follows the model cache ───────────────────────
+    //
+    // `/model` used to read the curated list only, so `models refresh` and
+    // `doctor models` — both of which write `models_cache.json` — had no effect
+    // on the TUI whatsoever.
+
+    /// Seed a workspace whose model cache holds `models` for `provider`.
+    fn workspace_with_cached_models(provider: &str, models: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let payload = serde_json::json!({
+            "entries": [{
+                "provider": provider,
+                "fetched_at_unix": 4_102_444_800_u64,
+                "models": models,
+            }]
+        });
+        std::fs::write(
+            state.join("models_cache.json"),
+            serde_json::to_string(&payload).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn picker_offers_cached_models_the_curated_list_never_mentions() {
+        let cache_only = "openai/some-model-only-the-live-catalog-has";
+        assert!(
+            !crate::onboard::wizard::curated_models_for_provider("openai")
+                .iter()
+                .any(|(id, _)| id == cache_only),
+            "fixture must not collide with the curated list"
+        );
+
+        let workspace = workspace_with_cached_models("openai", &[cache_only]);
+        let entries = model_entries_for_provider("openai", Some(workspace.path()));
+
+        assert!(
+            entries.iter().any(|e| e.model_id == cache_only),
+            "the picker must surface what `models refresh` wrote"
+        );
+    }
+
+    #[test]
+    fn picker_keeps_curated_descriptions_for_models_present_in_both() {
+        let (curated_id, curated_desc) =
+            crate::onboard::wizard::curated_models_for_provider("openai")
+                .into_iter()
+                .next()
+                .expect("openai has a curated list");
+
+        let workspace = workspace_with_cached_models("openai", &[curated_id.as_str()]);
+        let entries = model_entries_for_provider("openai", Some(workspace.path()));
+
+        let entry = entries
+            .iter()
+            .find(|e| e.model_id == curated_id)
+            .expect("cached curated model must be offered");
+        assert_eq!(
+            entry.description, curated_desc,
+            "catalog supplies the ID, curated supplies the description"
+        );
+    }
+
+    #[test]
+    fn picker_falls_back_to_curated_without_a_cache() {
+        // A fresh install has no cache; the picker must still be usable.
+        let empty = tempfile::TempDir::new().unwrap();
+        let entries = model_entries_for_provider("openai", Some(empty.path()));
+        let curated = crate::onboard::wizard::curated_models_for_provider("openai");
+
+        assert_eq!(entries.len(), curated.len());
+        assert!(entries.iter().all(|e| !e.description.is_empty()));
     }
 }
