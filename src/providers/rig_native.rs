@@ -250,18 +250,53 @@ fn tool_result_message_from(content: &str) -> RigMessage {
 /// `None` (their APIs treat it as "model default").
 fn with_anthropic_max_tokens(mut req: CompletionRequest, model: &str) -> CompletionRequest {
     if req.max_tokens.is_none() {
-        req.max_tokens = Some(match model {
-            m if m.starts_with("claude-opus-4-7") || m.starts_with("claude-opus-4-6") => 128_000,
-            m if m.starts_with("claude-opus-4")
-                || m.starts_with("claude-sonnet-4")
-                || m.starts_with("claude-haiku-4-5") =>
-            {
-                64_000
-            }
-            _ => 4_096,
-        });
+        req.max_tokens = Some(anthropic_max_tokens(model));
     }
     req
+}
+
+/// Output-token budget for an Anthropic model.
+///
+/// This used to enumerate the *high* tier (`claude-opus-4-7`, `claude-opus-4-6`)
+/// and let everything else fall to a lower one, which meant every model released
+/// after the list was written was silently down-tiered. `claude-opus-4-8` — the
+/// flagship in our own curated table — matched the generic `claude-opus-4` arm
+/// and got 64k instead of 128k; the Claude 5 family matched nothing at all and
+/// got 4096, a 16x undershoot. Both fail the same way: a long generation stops
+/// early and the operator sees a short answer, not an error.
+///
+/// So the polarity is inverted. Known-lower models are enumerated; anything else
+/// in a family takes that family's current top value. Guessing high produces an
+/// API error the operator can act on; guessing low truncates invisibly.
+fn anthropic_max_tokens(model: &str) -> u64 {
+    // Opus tiers that genuinely cap below 128k. Everything else in the Opus
+    // family — including versions that do not exist yet — takes the high tier.
+    const OPUS_MID_TIER: [&str; 3] = ["claude-opus-4-0", "claude-opus-4-1", "claude-opus-4-5"];
+
+    if model == "claude-opus-4" || OPUS_MID_TIER.iter().any(|p| model.starts_with(p)) {
+        return 64_000;
+    }
+    if model.starts_with("claude-opus-") {
+        return 128_000;
+    }
+    if model.starts_with("claude-sonnet-")
+        || model.starts_with("claude-haiku-")
+        || model.starts_with("claude-fable-")
+    {
+        return 64_000;
+    }
+
+    // claude-3.x and anything unrecognized. 4096 never exceeds an Anthropic
+    // model's cap, so it is always accepted — but for a model we simply do not
+    // know, that acceptance is bought with silent truncation. Say so.
+    if model.starts_with("claude-") && !model.starts_with("claude-3") {
+        tracing::warn!(
+            target: "rig_native",
+            model = %model,
+            "unrecognized Anthropic model; defaulting max_tokens to 4096, which may truncate long responses"
+        );
+    }
+    4_096
 }
 
 fn build_rig_request(
@@ -1077,5 +1112,57 @@ mod tests {
         assert_eq!(deduped.len(), 2, "distinct ids must all survive");
         assert_eq!(deduped[0].id, "call_a", "order preserved");
         assert_eq!(deduped[1].id, "call_b");
+    }
+
+    // ── Anthropic max_tokens tiers ───────────────────────────────
+
+    #[test]
+    fn anthropic_max_tokens_gives_the_current_opus_flagship_the_high_tier() {
+        // The defect: `claude-opus-4-8` is the "best quality" entry in our own
+        // curated table, matched the generic `claude-opus-4` arm, and got half
+        // the budget of its two predecessors.
+        assert_eq!(anthropic_max_tokens("claude-opus-4-8"), 128_000);
+        assert_eq!(anthropic_max_tokens("claude-opus-4-7"), 128_000);
+        assert_eq!(anthropic_max_tokens("claude-opus-4-6"), 128_000);
+    }
+
+    #[test]
+    fn anthropic_max_tokens_does_not_down_tier_models_that_do_not_exist_yet() {
+        // This is the assertion that encodes the lesson. Pinning `4-8` alone
+        // would pass again the day `4-9` ships and regress in exactly the same
+        // way, because the bug was the shape of the match, not one missing arm.
+        assert_eq!(anthropic_max_tokens("claude-opus-4-99"), 128_000);
+        assert_eq!(anthropic_max_tokens("claude-opus-5"), 128_000);
+        assert_eq!(anthropic_max_tokens("claude-sonnet-5"), 64_000);
+        assert_eq!(anthropic_max_tokens("claude-fable-5"), 64_000);
+
+        for model in [
+            "claude-opus-4-99",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+        ] {
+            assert_ne!(
+                anthropic_max_tokens(model),
+                4_096,
+                "{model} fell to the floor, which truncates silently"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_max_tokens_preserves_the_known_lower_tiers() {
+        // The fix must not move anything that was already correct.
+        assert_eq!(anthropic_max_tokens("claude-opus-4"), 64_000);
+        assert_eq!(anthropic_max_tokens("claude-opus-4-1"), 64_000);
+        assert_eq!(anthropic_max_tokens("claude-opus-4-5"), 64_000);
+        assert_eq!(anthropic_max_tokens("claude-sonnet-4-6"), 64_000);
+        assert_eq!(anthropic_max_tokens("claude-sonnet-4-5-20250929"), 64_000);
+        assert_eq!(anthropic_max_tokens("claude-haiku-4-5-20251001"), 64_000);
+
+        // claude-3.x keeps the 4096 floor — it is that family's real output cap,
+        // not a fallback, and rig does not default it.
+        assert_eq!(anthropic_max_tokens("claude-3-5-sonnet-20241022"), 4_096);
+        assert_eq!(anthropic_max_tokens("claude-3-opus-20240229"), 4_096);
     }
 }
