@@ -12,6 +12,7 @@ pub mod checks;
 pub mod legacy;
 pub mod report;
 
+pub use legacy::refresh_all_model_catalogs;
 #[allow(unused_imports)]
 pub use legacy::run;
 pub use legacy::run_models;

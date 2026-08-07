@@ -136,7 +136,8 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
     ModelProbeOutcome::Error
 }
 
-fn doctor_model_targets(provider_override: Option<&str>) -> Vec<String> {
+/// Every provider to probe: the override alone, else all registered providers.
+pub(crate) fn doctor_model_targets(provider_override: Option<&str>) -> Vec<String> {
     if let Some(provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
         return vec![provider.to_string()];
     }
@@ -145,6 +146,92 @@ fn doctor_model_targets(provider_override: Option<&str>) -> Vec<String> {
         .into_iter()
         .map(|provider| provider.name.to_string())
         .collect()
+}
+
+/// How a batch of catalog probes came out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeSummary {
+    pub ok: usize,
+    pub skipped: usize,
+    pub auth: usize,
+    pub errors: usize,
+}
+
+/// Refresh each provider's model catalog in turn, printing a block per
+/// provider, and **continue past failures**. One provider without an API key
+/// must not abort the sweep, so errors are classified into buckets rather than
+/// returned — the caller decides what a given bucket means for its exit status.
+pub(crate) fn refresh_model_catalogs(
+    config: &Config,
+    targets: &[String],
+    force: bool,
+) -> ProbeSummary {
+    let mut summary = ProbeSummary::default();
+
+    for provider_name in targets {
+        println!("  [{}]", provider_name);
+
+        match crate::onboard::run_models_refresh(config, Some(provider_name), force) {
+            Ok(()) => {
+                summary.ok += 1;
+                println!("    ✅ model catalog check passed");
+            }
+            Err(error) => {
+                let error_text = format_error_chain(&error);
+                match classify_model_probe_error(&error_text) {
+                    ModelProbeOutcome::Skipped => {
+                        summary.skipped += 1;
+                        println!("    ⚪ skipped: {}", truncate_for_display(&error_text, 160));
+                    }
+                    ModelProbeOutcome::AuthOrAccess => {
+                        summary.auth += 1;
+                        println!(
+                            "    ⚠️  auth/access: {}",
+                            truncate_for_display(&error_text, 160)
+                        );
+                    }
+                    ModelProbeOutcome::Error => {
+                        summary.errors += 1;
+                        println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
+                    }
+                    ModelProbeOutcome::Ok => {
+                        summary.ok += 1;
+                    }
+                }
+            }
+        }
+
+        println!();
+    }
+
+    summary
+}
+
+/// Backs `rantaiclaw models refresh --all`.
+///
+/// The all-provider sweep already existed, but only under `doctor models` —
+/// the command nobody reaches for when they want to update a model list. This
+/// is the same enumerator and the same loop under the name operators guess.
+pub fn refresh_all_model_catalogs(config: &Config, force: bool) -> Result<()> {
+    let targets = doctor_model_targets(None);
+    if targets.is_empty() {
+        anyhow::bail!("No providers available for model refresh");
+    }
+
+    println!("Refreshing model catalogs for {} providers.", targets.len());
+    println!();
+
+    let summary = refresh_model_catalogs(config, &targets, force);
+
+    println!(
+        "  Summary: {} ok, {} skipped, {} auth/access, {} errors",
+        summary.ok, summary.skipped, summary.auth, summary.errors
+    );
+    if summary.auth > 0 {
+        println!("  Some providers need a valid API key before their catalog can be fetched.");
+    }
+
+    Ok(())
 }
 
 pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: bool) -> Result<()> {
@@ -166,59 +253,20 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     );
     println!();
 
-    let mut ok_count = 0usize;
-    let mut skipped_count = 0usize;
-    let mut auth_count = 0usize;
-    let mut error_count = 0usize;
-
-    for provider_name in &targets {
-        println!("  [{}]", provider_name);
-
-        match crate::onboard::run_models_refresh(config, Some(provider_name), !use_cache) {
-            Ok(()) => {
-                ok_count += 1;
-                println!("    ✅ model catalog check passed");
-            }
-            Err(error) => {
-                let error_text = format_error_chain(&error);
-                match classify_model_probe_error(&error_text) {
-                    ModelProbeOutcome::Skipped => {
-                        skipped_count += 1;
-                        println!("    ⚪ skipped: {}", truncate_for_display(&error_text, 160));
-                    }
-                    ModelProbeOutcome::AuthOrAccess => {
-                        auth_count += 1;
-                        println!(
-                            "    ⚠️  auth/access: {}",
-                            truncate_for_display(&error_text, 160)
-                        );
-                    }
-                    ModelProbeOutcome::Error => {
-                        error_count += 1;
-                        println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
-                    }
-                    ModelProbeOutcome::Ok => {
-                        ok_count += 1;
-                    }
-                }
-            }
-        }
-
-        println!();
-    }
+    let summary = refresh_model_catalogs(config, &targets, !use_cache);
 
     println!(
         "  Summary: {} ok, {} skipped, {} auth/access, {} errors",
-        ok_count, skipped_count, auth_count, error_count
+        summary.ok, summary.skipped, summary.auth, summary.errors
     );
 
-    if auth_count > 0 {
+    if summary.auth > 0 {
         println!(
             "  💡 Some providers need valid API keys/plan access before `/models` can be fetched."
         );
     }
 
-    if provider_override.is_some() && ok_count == 0 {
+    if provider_override.is_some() && summary.ok == 0 {
         anyhow::bail!("Model probe failed for target provider")
     }
 
@@ -1051,6 +1099,46 @@ mod tests {
     fn truncate_for_display_preserves_utf8_boundaries() {
         let preview = truncate_for_display("🙂example-alpha-build", 3);
         assert_eq!(preview, "🙂ex…");
+    }
+
+    // ── batch catalog refresh ────────────────────────────────────
+
+    #[test]
+    fn doctor_model_targets_defaults_to_every_registered_provider() {
+        let all = doctor_model_targets(None);
+        assert_eq!(all.len(), crate::providers::list_providers().len());
+        assert!(all.iter().any(|p| p == "openrouter"));
+
+        // An override narrows to exactly one, which is what `--provider` means.
+        assert_eq!(doctor_model_targets(Some("openrouter")), vec!["openrouter"]);
+        assert_eq!(doctor_model_targets(Some("   ")), all);
+    }
+
+    #[test]
+    fn refresh_model_catalogs_continues_past_a_failing_provider() {
+        // Providers with no live-fetch support bail before any network call, so
+        // this exercises the loop offline. Every target fails; the point is that
+        // the batch still visits all of them and reports per-provider outcomes
+        // instead of aborting on the first error.
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+
+        let targets: Vec<String> = ["bedrock", "perplexity", "minimax"]
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect();
+
+        let summary = refresh_model_catalogs(&config, &targets, true);
+
+        assert_eq!(
+            summary.skipped,
+            targets.len(),
+            "every unsupported provider should be skipped, not abort the sweep"
+        );
+        assert_eq!(summary.ok, 0);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.auth, 0);
     }
 
     #[test]
