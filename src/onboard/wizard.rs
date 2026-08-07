@@ -806,20 +806,17 @@ fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
 }
 
 /// Pick a sensible default model for the given provider.
-const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
-    ("MiniMax-M2.5", "MiniMax M2.5 (latest, recommended)"),
-    ("MiniMax-M2.5-highspeed", "MiniMax M2.5 High-Speed (faster)"),
-    ("MiniMax-M2.1", "MiniMax M2.1 (stable)"),
-    ("MiniMax-M2.1-highspeed", "MiniMax M2.1 High-Speed (faster)"),
-    ("MiniMax-M2", "MiniMax M2 (legacy)"),
-];
-
+///
+/// Every id returned here must also appear in `curated_models_for_provider`
+/// for the same provider — `default_model_is_offered_by_its_own_provider`
+/// asserts it. Setup writes this value as `default_model`, so a default the
+/// picker never offers is one the operator cannot re-select after changing it.
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-6".into(),
         "openai" => "gpt-5.5".into(),
         "openai-codex" => "gpt-5.3-codex".into(),
-        "venice" => "zai-org-glm-5.1".into(),
+        "venice" => "zai-org-glm-5-2".into(),
         "groq" => "llama-spark".into(),
         "mistral" => "mistral-large-latest".into(),
         "deepseek" => "deepseek-v4-pro".into(),
@@ -833,12 +830,12 @@ fn default_model_for_provider(provider: &str) -> String {
         "minimax" => "MiniMax-M3".into(),
         "qwen" => "qwen3.7-plus".into(),
         "qwen-code" => "qwen3.6-coder-plus".into(),
-        "ollama" => "llama-spark".into(),
-        "llamacpp" => "ggml-org/llama-spark-GGUF".into(),
+        "ollama" => "llama3.3".into(),
+        "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
         "gemini" => "gemini-3-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-6-v1:0".into(),
-        "nvidia" => "meta/llama-spark".into(),
+        "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
@@ -851,48 +848,56 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
                 "Claude Sonnet 4.6 (balanced, recommended)".to_string(),
             ),
             (
-                "anthropic/claude-opus-4.7".to_string(),
-                "Claude Opus 4.7 (best quality)".to_string(),
+                "anthropic/claude-sonnet-5".to_string(),
+                "Claude Sonnet 5 (latest balanced)".to_string(),
+            ),
+            (
+                "anthropic/claude-opus-5".to_string(),
+                "Claude Opus 5 (best quality)".to_string(),
+            ),
+            (
+                "anthropic/claude-opus-4.8".to_string(),
+                "Claude Opus 4.8 (previous flagship)".to_string(),
             ),
             (
                 "openai/gpt-5.5".to_string(),
-                "GPT-5.5 (latest flagship)".to_string(),
+                "GPT-5.5 (OpenAI flagship)".to_string(),
             ),
             (
-                "openai/gpt-5.5-codex".to_string(),
-                "GPT-5.5 Codex (agentic coding flagship)".to_string(),
+                "openai/gpt-5.3-codex".to_string(),
+                "GPT-5.3 Codex (agentic coding)".to_string(),
             ),
             (
                 "openai/gpt-5-mini".to_string(),
                 "GPT-5 mini (fast, cost-efficient)".to_string(),
             ),
             (
-                "google/gemini-3-pro".to_string(),
-                "Gemini 3 Pro (frontier reasoning)".to_string(),
+                "google/gemini-3.1-pro-preview".to_string(),
+                "Gemini 3.1 Pro (frontier reasoning)".to_string(),
             ),
             (
-                "google/gemini-3-flash".to_string(),
-                "Gemini 3 Flash (best price/performance)".to_string(),
+                "google/gemini-3.6-flash".to_string(),
+                "Gemini 3.6 Flash (best price/performance)".to_string(),
             ),
             (
-                "x-ai/grok-4.1-fast".to_string(),
-                "Grok 4.1 Fast (reasoning + speed)".to_string(),
+                "x-ai/grok-4.5".to_string(),
+                "Grok 4.5 (reasoning + speed)".to_string(),
             ),
             (
-                "deepseek/deepseek-v3.2".to_string(),
-                "DeepSeek V3.2 (agentic + affordable)".to_string(),
+                "deepseek/deepseek-v4-pro".to_string(),
+                "DeepSeek V4 Pro (agentic + affordable)".to_string(),
             ),
             (
-                "meta-llama/llama-spark".to_string(),
-                "Llama Spark (Meta's latest open model)".to_string(),
+                "moonshotai/kimi-k3".to_string(),
+                "Kimi K3 (latest reasoning + coding)".to_string(),
             ),
             (
-                "moonshotai/kimi-k2.6".to_string(),
-                "Kimi K2.6 (latest reasoning + coding)".to_string(),
+                "z-ai/glm-5.2".to_string(),
+                "GLM-5.2 (latest, high reasoning)".to_string(),
             ),
             (
-                "z-ai/glm-5.1".to_string(),
-                "GLM-5.1 (latest, high reasoning)".to_string(),
+                "meta-llama/llama-4-maverick".to_string(),
+                "Llama 4 Maverick (Meta's latest open model)".to_string(),
             ),
         ],
         "anthropic" => vec![
@@ -968,20 +973,24 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "venice" => vec![
             (
-                "zai-org-glm-5.1".to_string(),
-                "GLM-5.1 via Venice (agentic flagship)".to_string(),
+                "zai-org-glm-5-2".to_string(),
+                "GLM-5.2 via Venice (agentic flagship)".to_string(),
+            ),
+            (
+                "claude-opus-5".to_string(),
+                "Claude Opus 5 via Venice (best quality)".to_string(),
             ),
             (
                 "claude-sonnet-4-6".to_string(),
-                "Claude Sonnet 4.6 via Venice (best quality)".to_string(),
+                "Claude Sonnet 4.6 via Venice (balanced)".to_string(),
             ),
             (
-                "deepseek-v3.2".to_string(),
-                "DeepSeek V3.2 via Venice (strong value)".to_string(),
+                "deepseek-v4-pro".to_string(),
+                "DeepSeek V4 Pro via Venice (strong value)".to_string(),
             ),
             (
-                "grok-41-fast".to_string(),
-                "Grok 4.1 Fast via Venice (low latency)".to_string(),
+                "grok-4-5".to_string(),
+                "Grok 4.5 via Venice (low latency)".to_string(),
             ),
         ],
         "groq" => vec![
@@ -1229,16 +1238,12 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "nvidia" => vec![
             (
-                "meta/llama-spark".to_string(),
-                "Llama Spark (Meta's latest, recommended)".to_string(),
-            ),
-            (
                 "meta/llama-3.3-70b-instruct".to_string(),
-                "Llama 3.3 70B Instruct (previous flagship, stable)".to_string(),
+                "Llama 3.3 70B Instruct (recommended)".to_string(),
             ),
             (
-                "deepseek-ai/deepseek-v3.2".to_string(),
-                "DeepSeek V3.2 (advanced reasoning + coding)".to_string(),
+                "nvidia/nemotron-3-nano-30b-a3b".to_string(),
+                "Nemotron 3 Nano 30B (NVIDIA-tuned, efficient)".to_string(),
             ),
             (
                 "nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string(),
@@ -1246,7 +1251,7 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
             ),
             (
                 "nvidia/llama-3.1-nemotron-ultra-253b-v1".to_string(),
-                "Llama 3.1 Nemotron Ultra 253B v1 (max quality, legacy)".to_string(),
+                "Llama 3.1 Nemotron Ultra 253B v1 (max quality)".to_string(),
             ),
         ],
         "astrai" => vec![
@@ -1255,34 +1260,38 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
                 "Claude Sonnet 4.6 (balanced default)".to_string(),
             ),
             (
+                "anthropic/claude-opus-5".to_string(),
+                "Claude Opus 5 (best quality)".to_string(),
+            ),
+            (
                 "openai/gpt-5.5".to_string(),
-                "GPT-5.5 (latest flagship)".to_string(),
+                "GPT-5.5 (OpenAI flagship)".to_string(),
             ),
             (
-                "google/gemini-3-pro".to_string(),
-                "Gemini 3 Pro (frontier reasoning)".to_string(),
+                "google/gemini-3.1-pro-preview".to_string(),
+                "Gemini 3.1 Pro (frontier reasoning)".to_string(),
             ),
             (
-                "deepseek/deepseek-v3.2".to_string(),
-                "DeepSeek V3.2 (agentic + affordable)".to_string(),
+                "deepseek/deepseek-v4-pro".to_string(),
+                "DeepSeek V4 Pro (agentic + affordable)".to_string(),
             ),
             (
-                "z-ai/glm-5.1".to_string(),
-                "GLM-5.1 (high reasoning)".to_string(),
-            ),
-            (
-                "moonshotai/kimi-k2.6".to_string(),
-                "Kimi K2.6 (latest)".to_string(),
+                "z-ai/glm-5.2".to_string(),
+                "GLM-5.2 (high reasoning)".to_string(),
             ),
         ],
         "ollama" => vec![
             (
-                "llama3.2".to_string(),
-                "Llama 3.2 (recommended local)".to_string(),
+                "llama3.3".to_string(),
+                "Llama 3.3 (recommended local)".to_string(),
             ),
-            ("mistral".to_string(), "Mistral 7B".to_string()),
-            ("codellama".to_string(), "Code Llama".to_string()),
-            ("phi3".to_string(), "Phi-3 (small, fast)".to_string()),
+            ("qwen3".to_string(), "Qwen 3".to_string()),
+            ("gemma3".to_string(), "Gemma 3".to_string()),
+            (
+                "deepseek-r1".to_string(),
+                "DeepSeek R1 (reasoning)".to_string(),
+            ),
+            ("phi4".to_string(), "Phi-4 (small, fast)".to_string()),
         ],
         "llamacpp" => vec![
             (
@@ -1300,11 +1309,11 @@ pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)>
         ],
         "bedrock" => vec![
             (
-                "anthropic.claude-sonnet-4-6".to_string(),
+                "anthropic.claude-sonnet-4-6-v1:0".to_string(),
                 "Claude Sonnet 4.6 (latest, recommended)".to_string(),
             ),
             (
-                "anthropic.claude-opus-4-6-v1".to_string(),
+                "anthropic.claude-opus-4-6-v1:0".to_string(),
                 "Claude Opus 4.6 (strongest)".to_string(),
             ),
             (
@@ -6205,6 +6214,50 @@ mod tests {
         );
     }
 
+    /// Every provider's default must be a model that provider's own picker
+    /// offers. This is the assertion worth keeping — the ids below will drift
+    /// again, but a default the picker never lists is a defect at any vintage.
+    ///
+    /// It caught three: `ollama` defaulted to `llama-spark` (not an Ollama tag
+    /// at all), `llamacpp` to `ggml-org/llama-spark-GGUF`, and `bedrock` to a
+    /// `-v1:0` id while its list carried the bare form. The only prior coverage
+    /// exercised `openai`, so the whole class was untested.
+    #[test]
+    fn default_model_is_offered_by_its_own_provider() {
+        for provider in crate::providers::list_providers() {
+            let name = provider.name;
+            let curated = curated_models_for_provider(name);
+            if curated.is_empty() {
+                // No curated catalog for this provider; nothing to be
+                // inconsistent with. `providers_without_a_curated_list_*`
+                // covers that case.
+                continue;
+            }
+
+            let default_model = default_model_for_provider(name);
+            assert!(
+                curated.iter().any(|(id, _)| *id == default_model),
+                "{name} defaults to `{default_model}`, which its own curated list does not offer: {:?}",
+                curated.iter().map(|(id, _)| id).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Bedrock is not in `supports_live_model_fetch`, so curated *is* its whole
+    /// catalog — a malformed id there can never be corrected by a refresh.
+    /// Its ids previously came in three shapes within one four-entry list.
+    #[test]
+    fn bedrock_model_ids_use_one_format() {
+        let curated = curated_models_for_provider("bedrock");
+        assert!(!curated.is_empty());
+        for (id, _) in &curated {
+            assert!(
+                id.ends_with("-v1:0"),
+                "bedrock id `{id}` is missing the version suffix Bedrock requires"
+            );
+        }
+    }
+
     #[test]
     fn default_model_for_provider_uses_latest_defaults() {
         assert_eq!(
@@ -6231,13 +6284,19 @@ mod tests {
             "anthropic.claude-sonnet-4-6-v1:0"
         );
         assert_eq!(default_model_for_provider("google-gemini"), "gemini-3-pro");
-        assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5.1");
+        assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5-2");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.6");
-        assert_eq!(default_model_for_provider("nvidia"), "meta/llama-spark");
-        assert_eq!(default_model_for_provider("nvidia-nim"), "meta/llama-spark");
+        assert_eq!(
+            default_model_for_provider("nvidia"),
+            "meta/llama-3.3-70b-instruct"
+        );
+        assert_eq!(
+            default_model_for_provider("nvidia-nim"),
+            "meta/llama-3.3-70b-instruct"
+        );
         assert_eq!(
             default_model_for_provider("llamacpp"),
-            "ggml-org/llama-spark-GGUF"
+            "ggml-org/gpt-oss-20b-GGUF"
         );
         assert_eq!(
             default_model_for_provider("astrai"),
@@ -6335,8 +6394,12 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        assert!(ids.contains(&"anthropic.claude-sonnet-4-6".to_string()));
-        assert!(ids.contains(&"anthropic.claude-opus-4-6-v1".to_string()));
+        // These previously pinned `anthropic.claude-sonnet-4-6` (bare) and
+        // `anthropic.claude-opus-4-6-v1` (no `:0`) — two of the three shapes the
+        // list carried, neither of which Bedrock accepts. The test named itself
+        // "verified" while holding the malformed ids in place.
+        assert!(ids.contains(&"anthropic.claude-sonnet-4-6-v1:0".to_string()));
+        assert!(ids.contains(&"anthropic.claude-opus-4-6-v1:0".to_string()));
         assert!(ids.contains(&"anthropic.claude-haiku-4-5-20251001-v1:0".to_string()));
         assert!(ids.contains(&"anthropic.claude-sonnet-4-5-20250929-v1:0".to_string()));
     }
@@ -6473,8 +6536,10 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
+        // `deepseek-ai/deepseek-v3.2` used to be asserted here; it is absent
+        // from NVIDIA NIM's live catalog. Every id below was confirmed present.
         assert!(ids.contains(&"meta/llama-3.3-70b-instruct".to_string()));
-        assert!(ids.contains(&"deepseek-ai/deepseek-v3.2".to_string()));
+        assert!(ids.contains(&"nvidia/nemotron-3-nano-30b-a3b".to_string()));
         assert!(ids.contains(&"nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string()));
     }
 
