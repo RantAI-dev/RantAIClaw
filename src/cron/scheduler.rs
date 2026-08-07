@@ -868,6 +868,27 @@ mod tests {
 
     #[tokio::test]
     async fn run_agent_job_returns_error_without_provider_key() {
+        // This is the only agent-job test that clears the security gates and
+        // reaches the real `agent::run`, which records the turn through
+        // `open_cli_session_store`. That resolves the ACTIVE PROFILE from
+        // `HOME`, not from the `Config` handed in below — so the TempDir config
+        // isolates the cron DB but not session history, and every run appended a
+        // `[cron:test-job cron-job] Say hello` row to the operator's real
+        // sessions.db. Pin `HOME` under the crate-wide lock.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let home = TempDir::new().unwrap();
+        let _restore = crate::test_env::HomeGuard::set(home.path());
+
+        // Prove the pin took rather than trusting it.
+        let db = crate::profile::ProfileManager::active()
+            .expect("active profile")
+            .sessions_db_path();
+        assert!(
+            db.starts_with(home.path()),
+            "test must own its sessions.db; resolved {db:?} outside {:?}",
+            home.path()
+        );
+
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let mut job = test_job("");
