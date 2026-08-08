@@ -5546,9 +5546,39 @@ mod tests {
         assert!(ctx.communication_style.is_empty());
     }
 
+    /// Pin the process `HOME` at `tmp` and prove the pin took.
+    ///
+    /// `run_quick_setup_with_home` takes `home` as a parameter, and every write
+    /// it makes honours it — except the last one. `persist_workspace_selection`
+    /// reaches `persist_active_workspace_config_dir`, which resolves the default
+    /// config dir from the process `HOME` (`UserDirs::new()`), not from that
+    /// parameter. Unpinned, the two disagree: `config_dir` follows `tmp` while
+    /// the destination follows the real home, so the run drops an
+    /// `active_workspace.toml` into the operator's own `~/.rantaiclaw/` naming a
+    /// tempdir that is deleted moments later. The runtime then has to recognise
+    /// and ignore that marker on every launch.
+    ///
+    /// Caller must hold `test_env::ENV_LOCK` first — `HOME` is process-global.
+    /// Hold the returned guard for the whole test.
+    fn pin_home(tmp: &TempDir) -> crate::test_env::HomeGuard {
+        let guard = crate::test_env::HomeGuard::set(tmp.path());
+        let home = directories::UserDirs::new()
+            .expect("user dirs")
+            .home_dir()
+            .to_path_buf();
+        assert!(
+            home.starts_with(tmp.path()),
+            "test must own its HOME; resolved {home:?} outside {:?}",
+            tmp.path()
+        );
+        guard
+    }
+
     #[tokio::test]
     async fn quick_setup_model_override_persists_to_config_toml() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
+        let _home = pin_home(&tmp);
 
         let config = run_quick_setup_with_home(
             Some("sk-issue946"),
@@ -5572,7 +5602,9 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_without_model_uses_provider_default_model() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
+        let _home = pin_home(&tmp);
 
         let config = run_quick_setup_with_home(
             Some("sk-issue946"),
@@ -5619,7 +5651,9 @@ mod tests {
 
     #[tokio::test]
     async fn quick_setup_existing_config_overwrites_with_force() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
+        let _home = pin_home(&tmp);
         let rantaiclaw_dir = tmp.path().join(".rantaiclaw");
         let config_path = rantaiclaw_dir.join("config.toml");
 
