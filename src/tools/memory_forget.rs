@@ -10,11 +10,23 @@ use std::sync::Arc;
 pub struct MemoryForgetTool {
     memory: Arc<dyn Memory>,
     security: Arc<SecurityPolicy>,
+    /// Needed to re-project `MEMORY.md` after a delete. Without it the entry the
+    /// agent just forgot keeps reaching the model, because the prompt injects
+    /// that file and only backend construction rewrites it.
+    workspace_dir: std::path::PathBuf,
 }
 
 impl MemoryForgetTool {
-    pub fn new(memory: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
-        Self { memory, security }
+    pub fn new(
+        memory: Arc<dyn Memory>,
+        security: Arc<SecurityPolicy>,
+        workspace_dir: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            memory,
+            security,
+            workspace_dir,
+        }
     }
 }
 
@@ -110,11 +122,17 @@ impl Tool for MemoryForgetTool {
         let key = key.as_str();
 
         match self.memory.forget(key).await {
-            Ok(true) => Ok(ToolResult {
-                success: true,
-                output: format!("Forgot memory: {key}"),
-                error: None,
-            }),
+            Ok(true) => {
+                crate::memory::snapshot::refresh_projection(
+                    self.memory.as_ref(),
+                    &self.workspace_dir,
+                );
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Forgot memory: {key}"),
+                    error: None,
+                })
+            }
             Ok(false) => Ok(ToolResult {
                 success: true,
                 output: format!("No memory found with key: {key}"),
@@ -148,20 +166,20 @@ mod tests {
 
     #[test]
     fn name_and_schema() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryForgetTool::new(mem, test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryForgetTool::new(mem, test_security(), tmp.path().to_path_buf());
         assert_eq!(tool.name(), "memory_forget");
         assert!(tool.parameters_schema()["properties"]["key"].is_object());
     }
 
     #[tokio::test]
     async fn forget_existing() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("temp", "temporary", MemoryCategory::Conversation, None)
             .await
             .unwrap();
 
-        let tool = MemoryForgetTool::new(mem.clone(), test_security());
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
         let result = tool.execute(json!({"key": "temp"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("Forgot"));
@@ -171,8 +189,8 @@ mod tests {
 
     #[tokio::test]
     async fn forget_nonexistent() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryForgetTool::new(mem, test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryForgetTool::new(mem, test_security(), tmp.path().to_path_buf());
         let result = tool.execute(json!({"key": "nope"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No memory found"));
@@ -180,8 +198,8 @@ mod tests {
 
     #[tokio::test]
     async fn forget_missing_key() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryForgetTool::new(mem, test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryForgetTool::new(mem, test_security(), tmp.path().to_path_buf());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
@@ -190,7 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_by_contains_removes_the_entry() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store(
             "obscure_key_9f2",
             "The staging password rotates weekly",
@@ -200,7 +218,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tool = MemoryForgetTool::new(mem.clone(), test_security());
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
         let result = tool
             .execute(json!({"contains": "staging password"}))
             .await
@@ -212,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_by_ambiguous_contains_is_rejected() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("a", "the deploy runbook", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -220,7 +238,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = MemoryForgetTool::new(mem.clone(), test_security());
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
         let result = tool.execute(json!({"contains": "deploy"})).await.unwrap();
 
         assert!(!result.success);
@@ -239,11 +257,11 @@ mod tests {
     /// they disagree — and that ambiguity deletes something.
     #[tokio::test]
     async fn forget_requires_exactly_one_selector() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("k", "some content", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let tool = MemoryForgetTool::new(mem.clone(), test_security());
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
 
         let both = tool
             .execute(json!({"key": "k", "contains": "some"}))
@@ -258,14 +276,79 @@ mod tests {
         assert!(mem.get("k").await.unwrap().is_some());
     }
 
+    // ── the projection follows the store ──────────────────────────
+
+    /// `MEMORY.md` is injected into every system prompt, and on sqlite it is a
+    /// projection of the `core` rows. Nothing re-projects on its own, so a delete
+    /// that skipped it left the forgotten entry reaching the model — for the rest
+    /// of the process, on the long-lived gateway and TUI.
+    #[tokio::test]
+    async fn forget_reprojects_memory_md() {
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "rotation_note",
+            "staging credentials rotate weekly",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let projected = crate::memory::snapshot::project_core_memories(tmp.path()).unwrap();
+        assert_eq!(projected, 1, "control: the projection wrote the entry");
+        let before = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        assert!(
+            before.contains("rotation_note"),
+            "control: it is in the file"
+        );
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = tool.execute(json!({"key": "rotation_note"})).await.unwrap();
+        assert!(result.success, "control: the tool reports success");
+        assert!(
+            mem.get("rotation_note").await.unwrap().is_none(),
+            "control: gone from the authoritative store"
+        );
+
+        let after = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        assert!(
+            !after.contains("rotation_note"),
+            "the prompt-injected file still holds the forgotten entry:\n{after}"
+        );
+    }
+
+    /// The projection is a rewrite of the whole marked block, so a delete that
+    /// triggers it must not take the surviving entries with it.
+    #[tokio::test]
+    async fn forget_leaves_the_other_projected_entries_alone() {
+        let (tmp, mem) = test_mem();
+        mem.store("keep", "still true", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("drop", "no longer true", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        crate::memory::snapshot::project_core_memories(tmp.path()).unwrap();
+
+        let tool = MemoryForgetTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        tool.execute(json!({"key": "drop"})).await.unwrap();
+
+        let after = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        assert!(
+            after.contains("keep"),
+            "surviving entry was dropped:\n{after}"
+        );
+        assert!(!after.contains("drop"));
+    }
+
     #[tokio::test]
     async fn forget_blocked_in_readonly_mode() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("temp", "temporary", MemoryCategory::Conversation, None)
             .await
             .unwrap();
         let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
-        let tool = MemoryForgetTool::new(mem.clone(), readonly);
+        let tool = MemoryForgetTool::new(mem.clone(), readonly, tmp.path().to_path_buf());
         let result = tool.execute(json!({"key": "temp"})).await.unwrap();
         assert!(!result.success);
         assert!(result
@@ -278,12 +361,12 @@ mod tests {
 
     #[tokio::test]
     async fn forget_blocked_when_rate_limited() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("temp", "temporary", MemoryCategory::Conversation, None)
             .await
             .unwrap();
         let limited = Arc::new(SecurityPolicy::default().with_max_actions_per_hour(0));
-        let tool = MemoryForgetTool::new(mem.clone(), limited);
+        let tool = MemoryForgetTool::new(mem.clone(), limited, tmp.path().to_path_buf());
         let result = tool.execute(json!({"key": "temp"})).await.unwrap();
         assert!(!result.success);
         assert!(result
@@ -303,13 +386,13 @@ mod tests {
 
     #[tokio::test]
     async fn forget_by_contains_blocked_in_readonly_mode() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("only", "the deploy runbook", MemoryCategory::Core, None)
             .await
             .unwrap();
 
         let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
-        let tool = MemoryForgetTool::new(mem.clone(), readonly);
+        let tool = MemoryForgetTool::new(mem.clone(), readonly, tmp.path().to_path_buf());
         let result = tool.execute(json!({"contains": "runbook"})).await.unwrap();
 
         assert!(!result.success);
@@ -325,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_by_ambiguous_contains_reports_the_gate_not_the_ambiguity() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("a", "the deploy runbook", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -334,7 +417,7 @@ mod tests {
             .unwrap();
 
         let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
-        let tool = MemoryForgetTool::new(mem.clone(), readonly);
+        let tool = MemoryForgetTool::new(mem.clone(), readonly, tmp.path().to_path_buf());
         let result = tool.execute(json!({"contains": "deploy"})).await.unwrap();
 
         assert!(!result.success);
@@ -353,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_by_contains_blocked_when_rate_limited() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("a", "the deploy runbook", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -362,7 +445,7 @@ mod tests {
             .unwrap();
 
         let limited = Arc::new(SecurityPolicy::default().with_max_actions_per_hour(0));
-        let tool = MemoryForgetTool::new(mem.clone(), limited);
+        let tool = MemoryForgetTool::new(mem.clone(), limited, tmp.path().to_path_buf());
         // An ambiguous phrase: resolving it first produced the "matches 2
         // memories" error, which is what made the limiter invisible here.
         let result = tool.execute(json!({"contains": "deploy"})).await.unwrap();
@@ -435,11 +518,12 @@ mod tests {
             }
         }
 
+        let tmp = TempDir::new().unwrap();
         let counting = Arc::new(CountingMemory {
             reads: AtomicUsize::new(0),
         });
         let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
-        let tool = MemoryForgetTool::new(counting.clone(), readonly);
+        let tool = MemoryForgetTool::new(counting.clone(), readonly, tmp.path().to_path_buf());
 
         let result = tool.execute(json!({"contains": "anything"})).await.unwrap();
         assert!(!result.success);
@@ -451,7 +535,8 @@ mod tests {
 
         // Control: the same call under a permitting policy does read it, so the
         // counter is wired to something that actually happens.
-        let tool = MemoryForgetTool::new(counting.clone(), test_security());
+        let tool =
+            MemoryForgetTool::new(counting.clone(), test_security(), tmp.path().to_path_buf());
         let _ = tool.execute(json!({"contains": "anything"})).await.unwrap();
         assert!(
             counting.reads.load(Ordering::SeqCst) > 0,

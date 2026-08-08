@@ -237,15 +237,31 @@ fn add_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
     let key_owned = key.to_string();
     let content_owned = content.to_string();
     let stored_category = category.clone();
+    let store_handle = memory.clone();
     run_blocking(async move {
-        memory
+        store_handle
             .store(&key_owned, &content_owned, stored_category, None)
             .await
             .map_err(anyhow::Error::from)
     })?;
+    refresh_projection(ctx, memory.as_ref());
     Ok(CommandResult::Message(format!(
         "Stored '{key}' in {category} memory."
     )))
+}
+
+/// Re-project `MEMORY.md` after a `/memory` write.
+///
+/// The prompt injects that file, and on sqlite/lucid it is a projection of the
+/// store rather than the store itself. Only backend construction rewrites it
+/// otherwise — and the TUI is long-lived, so without this a memory removed here
+/// kept reaching the model for the rest of the session, and one added here did
+/// not reach it at all.
+fn refresh_projection(ctx: &TuiContext, memory: &dyn Memory) {
+    let Some(workspace_dir) = ctx.workspace_dir.as_deref() else {
+        return;
+    };
+    crate::memory::snapshot::refresh_projection(memory, workspace_dir);
 }
 
 fn remove_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
@@ -259,9 +275,10 @@ fn remove_memory(ctx: &TuiContext, rest: &str) -> Result<CommandResult> {
         return Ok(no_backend_message());
     };
     let key_owned = key.to_string();
-    let removed =
-        run_blocking(async move { memory.forget(&key_owned).await.map_err(anyhow::Error::from) })?;
+    let forget_handle = memory.clone();
+    let removed = run_blocking(async move { forget_handle.forget(&key_owned).await })?;
     if removed {
+        refresh_projection(ctx, memory.as_ref());
         Ok(CommandResult::Message(format!("Forgot '{key}'.")))
     } else {
         Ok(CommandResult::Message(format!(
@@ -555,6 +572,42 @@ mod tests {
         let (mut ctx, _req_rx, _events_tx) = TuiContext::test_context();
         ctx.memory = Some(mem);
         ctx
+    }
+
+    /// `MEMORY.md` is injected into every system prompt, and on sqlite it is a
+    /// projection of the `core` rows. Only backend construction rewrote it, and
+    /// the TUI outlives that by the whole session — so a memory removed here kept
+    /// reaching the model, and one added here did not reach it at all.
+    ///
+    /// `StubMemory` deliberately is not used: the projection is gated on the
+    /// backend, so this needs the real one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_add_and_remove_reproject_memory_md() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).unwrap());
+        let mut ctx = ctx_with_memory(mem.clone());
+        ctx.workspace_dir = Some(tmp.path().to_path_buf());
+
+        MemoryCommand
+            .execute(
+                "add rotation_note staging credentials rotate weekly",
+                &mut ctx,
+            )
+            .unwrap();
+        let after_add = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap_or_default();
+        assert!(
+            after_add.contains("rotation_note"),
+            "a stored memory never reached the projected file:\n{after_add}"
+        );
+
+        MemoryCommand
+            .execute("remove rotation_note", &mut ctx)
+            .unwrap();
+        let after_remove = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        assert!(
+            !after_remove.contains("rotation_note"),
+            "the projected file still holds the removed entry:\n{after_remove}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

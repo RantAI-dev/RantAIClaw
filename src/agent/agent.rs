@@ -31,15 +31,18 @@ const FLUSH_MAX_TOOL_ITERATIONS: usize = 3;
 fn memory_flush_tools(
     memory: &Arc<dyn Memory>,
     security: &Arc<SecurityPolicy>,
+    workspace_dir: &std::path::Path,
 ) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(tools::MemoryStoreTool::new(
             memory.clone(),
             security.clone(),
+            workspace_dir.to_path_buf(),
         )),
         Box::new(tools::MemoryForgetTool::new(
             memory.clone(),
             security.clone(),
+            workspace_dir.to_path_buf(),
         )),
     ]
 }
@@ -645,7 +648,7 @@ impl Agent {
         let Some(security) = self.security.clone() else {
             return;
         };
-        let flush_tools = memory_flush_tools(&self.memory, &security);
+        let flush_tools = memory_flush_tools(&self.memory, &security, &self.workspace_dir);
 
         let mut scratch: Vec<ConversationMessage> = Vec::with_capacity(to_compact.len() + 2);
         scratch.push(ConversationMessage::Chat(ChatMessage::system(
@@ -1508,7 +1511,7 @@ mod tests {
             Arc::new(crate::memory::SqliteMemory::new(tmp.path()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
 
-        let registry = memory_flush_tools(&memory, &security);
+        let registry = memory_flush_tools(&memory, &security, tmp.path());
         let names: Vec<&str> = registry.iter().map(|t| t.name()).collect();
 
         assert_eq!(

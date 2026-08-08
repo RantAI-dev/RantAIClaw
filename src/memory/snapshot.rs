@@ -6,6 +6,7 @@
 //! **Auto-Hydration**: if `brain.db` is missing but `MEMORY_SNAPSHOT.md` exists,
 //! re-indexes all entries back into a fresh SQLite database.
 
+use super::traits::Memory;
 use anyhow::Result;
 use chrono::{Local, Utc};
 use rusqlite::{params, Connection};
@@ -155,6 +156,33 @@ pub fn project_core_memories(workspace_dir: &Path) -> Result<usize> {
     fs::write(&path, splice_block(&existing, &block))?;
 
     Ok(projected)
+}
+
+/// Re-project core memory into `MEMORY.md` after a write to the store.
+///
+/// `MEMORY.md` is injected into every system prompt (`agent::prompt`), and on the
+/// sqlite/lucid backends it is a *projection* of the `core` rows rather than the
+/// store itself. Nothing re-projects on its own — the only other caller is
+/// backend construction — so a mutation that skips this leaves the file that
+/// reaches the model disagreeing with the store. A forgotten memory keeps being
+/// injected; a stored one is not injected until the next process builds a
+/// backend. In the gateway and the TUI, both long-lived, that is the rest of the
+/// process lifetime.
+///
+/// Gated on the backend rather than on config, which is the same decision by
+/// construction and asks for less at the call site: `MarkdownMemory` owns
+/// `MEMORY.md` directly and projecting there would write it twice, while
+/// `postgres` and `none` have no `brain.db` to project from.
+///
+/// Best-effort, like the projection everywhere else: a failure here must not
+/// fail the write that already succeeded.
+pub fn refresh_projection(memory: &dyn Memory, workspace_dir: &Path) {
+    if !matches!(memory.name(), "sqlite" | "lucid") {
+        return;
+    }
+    if let Err(e) = project_core_memories(workspace_dir) {
+        tracing::warn!("memory projection skipped: {e}");
+    }
 }
 
 /// Render entries as list lines, stopping at the character ceiling.
@@ -724,6 +752,58 @@ Rule 3: Protect the user.
         let tmp = TempDir::new().unwrap();
         assert_eq!(project_core_memories(tmp.path()).unwrap(), 0);
         assert!(!tmp.path().join(MEMORY_FILE).exists());
+    }
+
+    // ── refresh_projection: the backend gate ──────────────────────
+
+    #[tokio::test]
+    async fn refresh_projects_on_sqlite() {
+        let tmp = workspace_with_core(&[("user_lang", "prefers Bahasa Indonesia")]).await;
+        let mem = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
+
+        refresh_projection(&mem, tmp.path());
+
+        let out = memory_md(tmp.path());
+        assert!(out.contains(PROJECTION_BEGIN), "nothing projected:\n{out}");
+        assert!(out.contains("- user_lang: prefers Bahasa Indonesia"));
+    }
+
+    /// `MarkdownMemory` owns `MEMORY.md` — it *is* the store. Projecting there
+    /// would splice a generated block into the operator's own file and duplicate
+    /// every entry.
+    #[tokio::test]
+    async fn refresh_is_a_no_op_on_markdown() {
+        let tmp = TempDir::new().unwrap();
+        let mem = crate::memory::MarkdownMemory::new(tmp.path());
+        mem.store(
+            "user_lang",
+            "prefers Bahasa Indonesia",
+            crate::memory::MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        let before = memory_md(tmp.path());
+        assert!(before.contains("user_lang"), "control: the store wrote it");
+
+        refresh_projection(&mem, tmp.path());
+
+        let after = memory_md(tmp.path());
+        assert_eq!(before, after, "the backend's own file was rewritten");
+        assert!(!after.contains(PROJECTION_BEGIN));
+    }
+
+    #[tokio::test]
+    async fn refresh_is_a_no_op_when_memory_is_disabled() {
+        let tmp = workspace_with_core(&[("user_lang", "prefers Bahasa Indonesia")]).await;
+        let mem = crate::memory::NoneMemory::new();
+
+        refresh_projection(&mem, tmp.path());
+
+        assert!(
+            !tmp.path().join(MEMORY_FILE).exists(),
+            "a disabled backend projected anyway"
+        );
     }
 
     /// Write a snapshot holding one core memory and hydrate it.

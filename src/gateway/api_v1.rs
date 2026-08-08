@@ -1651,6 +1651,7 @@ async fn memory_create(
         .store(&key, &sanitized.content, category, session)
         .await
         .map_err(err_500)?;
+    refresh_memory_projection(&state);
 
     Ok((
         StatusCode::CREATED,
@@ -1660,6 +1661,20 @@ async fn memory_create(
             "notes": sanitized.notes,
         })),
     ))
+}
+
+/// Re-project `MEMORY.md` after a memory write through the API.
+///
+/// The prompt injects that file, and on sqlite/lucid it is a projection of the
+/// store rather than the store itself. Only backend construction rewrites it
+/// otherwise — and the gateway is long-lived, so without this a memory deleted
+/// from the web console kept reaching the model for every session started in the
+/// same process.
+///
+/// The lock is taken for the path alone and released before the projection runs.
+fn refresh_memory_projection(state: &AppState) {
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    crate::memory::snapshot::refresh_projection(state.mem.as_ref(), &workspace_dir);
 }
 
 /// Fetch one memory by key.
@@ -1703,6 +1718,9 @@ async fn memory_delete(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let removed = state.mem.forget(&key).await.map_err(err_500)?;
+    if removed {
+        refresh_memory_projection(&state);
+    }
     Ok(Json(serde_json::json!({ "key": key, "removed": removed })))
 }
 
@@ -2577,6 +2595,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut state = test_state();
         state.mem = Arc::new(crate::memory::SqliteMemory::new(tmp.path()).unwrap());
+        // The memory write paths re-project `MEMORY.md` into the *config's*
+        // workspace. Point it at the same directory the store lives in, or the
+        // projection lands somewhere this test cannot see.
+        state.config.lock().workspace_dir = tmp.path().to_path_buf();
         (tmp, state)
     }
 
@@ -2902,6 +2924,73 @@ mod tests {
         .await
         .expect_err("missing bearer must be rejected");
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    // ── the projection follows the store ──────────────────────────
+
+    /// `MEMORY.md` is injected into every system prompt, and on sqlite it is a
+    /// projection of the `core` rows. The gateway is long-lived and only backend
+    /// construction rewrote that file, so a memory deleted from the web console
+    /// kept reaching the model for every session started in the same process.
+    #[tokio::test]
+    async fn memory_delete_reprojects_memory_md() {
+        let (tmp, state) = state_with_real_memory();
+        state
+            .mem
+            .store(
+                "rotation_note",
+                "staging credentials rotate weekly",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let projected = crate::memory::snapshot::project_core_memories(tmp.path()).unwrap();
+        assert_eq!(projected, 1, "control: the projection wrote the entry");
+
+        let resp = memory_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("rotation_note".to_string()),
+        )
+        .await
+        .expect("delete should succeed");
+        assert_eq!(resp.0["removed"], true, "control: the delete took effect");
+
+        let after = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        assert!(
+            !after.contains("rotation_note"),
+            "the prompt-injected file still holds the deleted entry:\n{after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_create_reprojects_memory_md() {
+        let (tmp, state) = state_with_real_memory();
+
+        let (status, _body) = memory_create(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(MemoryCreateBody {
+                key: Some("user_lang".to_string()),
+                content: "prefers Bahasa Indonesia".to_string(),
+                category: Some("core".to_string()),
+                session_id: None,
+            }),
+        )
+        .await
+        .expect("create should succeed");
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "control: the write took effect"
+        );
+
+        let projected = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap_or_default();
+        assert!(
+            projected.contains("user_lang"),
+            "the prompt-injected file does not hold the stored entry:\n{projected}"
+        );
     }
 
     #[tokio::test]

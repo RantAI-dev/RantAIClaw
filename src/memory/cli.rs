@@ -182,22 +182,12 @@ fn print_entry(entry: &super::traits::MemoryEntry) {
 /// untouched, and a workspace seeded entirely from the command line reached the
 /// model with an empty core tier until something else ran.
 ///
-/// Best-effort, like the projection everywhere else: a failure here must not
-/// fail the write that already succeeded.
-fn refresh_projection(config: &Config) {
-    let backend = effective_memory_backend_name(
-        &config.memory.backend,
-        Some(&config.storage.provider.config),
-    );
-    if !matches!(
-        classify_memory_backend(&backend),
-        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-    ) {
-        return;
-    }
-    if let Err(e) = super::snapshot::project_core_memories(&config.workspace_dir) {
-        tracing::warn!("memory projection skipped: {e}");
-    }
+/// Delegates to `snapshot::refresh_projection`, which every other write path now
+/// shares. The backend gate moved with it: gating on `mem.name()` is the same
+/// decision this used to make from config, because `create_cli_memory` builds the
+/// instance from exactly that classification.
+fn refresh_projection(mem: &dyn Memory, config: &Config) {
+    super::snapshot::refresh_projection(mem, &config.workspace_dir);
 }
 
 /// Store a memory from the command line.
@@ -219,7 +209,7 @@ async fn handle_add(config: &Config, key: &str, content: &str, category: &str) -
     mem.store(key, &sanitized.content, parse_category(category), None)
         .await?;
     println!("Stored {} [{}]", style(key).white().bold(), category);
-    refresh_projection(config);
+    refresh_projection(&*mem, config);
     Ok(())
 }
 
@@ -389,7 +379,7 @@ async fn handle_clear(
     if let Some(key) = key {
         let result = handle_clear_key(&*mem, &key, yes).await;
         // Deleting a core memory has to leave the projected block too.
-        refresh_projection(config);
+        refresh_projection(&*mem, config);
         return result;
     }
 
@@ -429,7 +419,7 @@ async fn handle_clear(
         entries.len(),
     );
 
-    refresh_projection(config);
+    refresh_projection(&*mem, config);
     Ok(())
 }
 
