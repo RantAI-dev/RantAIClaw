@@ -5,6 +5,89 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.2-alpha] — 2026-08-08
+
+Four memory fixes. The first one changes what reaches the model, so read it even
+if you skip the rest.
+
+Every fix here was reproduced by a failing test before it was written, and each
+regression test was checked by restoring the old behaviour and confirming the
+test goes red — the counts below say which tests actually discriminate and which
+only guard against the fix over-reaching.
+
+### Fixed
+
+- **Forgetting a core memory now removes it from the prompt too.** `MEMORY.md` is
+  injected into every system prompt, and on the `sqlite` and `lucid` backends it
+  is a *projection* of the `core` rows rather than the store itself. Only the CLI
+  re-projected after a write. A memory deleted through the agent's own
+  `memory_forget`, the TUI's `/memory remove`, or `DELETE /api/v1/memory/{key}`
+  left the authoritative store and stayed in the file the model reads:
+
+  ```
+  <!-- rantaiclaw:memory:begin -->
+  - rotation_note: staging credentials rotate weekly
+  <!-- rantaiclaw:memory:end -->
+  ```
+
+  The projection is otherwise rebuilt only when a backend is constructed. For
+  `rantaiclaw run` that is the next process; for the gateway and the TUI, both
+  long-lived, it was the rest of the process lifetime — and a session started
+  inside that process read the stale file. The store side was the mirror image: a
+  `core` memory written mid-session was not in the injected file at all.
+
+  All seven write paths now re-project. Eight of the ten new tests fail against
+  the previous behaviour, one per call site. The `markdown` backend is
+  deliberately excluded — it owns `MEMORY.md` directly.
+
+- **The `markdown` backend replaces instead of appending, and forgets every
+  copy.** Storing a key twice wrote two lines, which inflated `count()`, showed
+  the key twice in `list()`, and left `get()` returning whichever copy sorted
+  first. `forget` then stopped at the first file that matched, so a key present
+  in both `MEMORY.md` and a daily log lost one copy, kept the rest, and still
+  reported success — `memory_forget` answered "Forgot memory: k" about an entry
+  `get()` would still return. Since that tool exists partly to delete sensitive
+  data, a false success there is worse than a missing feature.
+
+  `SqliteMemory` and `PostgresMemory` both upsert on `key`; `Memory` is one
+  trait, so this was a contract divergence rather than a backend flavour. A
+  re-store under a different category now moves the entry, matching what sqlite's
+  upsert does to `category`.
+
+  Only reached when `[memory] backend = "markdown"`; the default is `sqlite`.
+  Existing duplicate lines collapse on the next write of that key — no migration.
+
+- **`memory stats` no longer prints a total its own breakdown contradicts.**
+  `Total:` came from `count()` while the `By category:` block was built from
+  `list()`, which is capped at 1000 rows. Past the cap the two disagreed with
+  nothing saying the breakdown was partial — 1100 stored entries reported
+  `Total: 1100` above categories summing to 1000. The block is now labelled
+  `(most recent N of M)` when the page is short, matching the wording
+  `memory list` already used.
+
+  The same command also swallowed a `count()` failure as `Total: 0`, which is
+  indistinguishable from an empty store. `Health:` does not cover that gap:
+  sqlite's health check is `SELECT 1` and survives a damaged `memories` table.
+  It now reads `unavailable (<cause>)`.
+
+  **If you parse this command:** `Total:` is no longer always an integer, and the
+  category header can carry a suffix. It is a human-facing diagnostic, not a
+  documented machine interface.
+
+- **`memory_forget` consults the autonomy gate before it reads the store.** The
+  `contains` selector resolves by scanning every entry, and that ran before the
+  policy check. A read-only or rate-limited caller was answered out of memory
+  contents — `'deploy' matches 2 memories (b, a); be more specific` — instead of
+  being told it was refused, which is an instruction to retry a call that can
+  never complete. Nothing was ever deleted; the gate did stop the mutation, just
+  late. The scan also happened outside anything the rate limiter accounts for,
+  since `enforce_tool_operation` is what records the action.
+
+### Notes
+
+No config schema change: `schema_drift` passes without a snapshot update, so this
+release carries no migration and rolls back cleanly.
+
 ## [0.18.1-alpha] — 2026-08-08
 
 **Nothing in this release changes how the binary behaves.** Both commits are
