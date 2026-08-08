@@ -386,13 +386,13 @@ mod tests {
 
     #[tokio::test]
     async fn forget_by_contains_blocked_in_readonly_mode() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("only", "the deploy runbook", MemoryCategory::Core, None)
             .await
             .unwrap();
 
         let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
-        let tool = MemoryForgetTool::new(mem.clone(), readonly);
+        let tool = MemoryForgetTool::new(mem.clone(), readonly, tmp.path().to_path_buf());
         let result = tool.execute(json!({"contains": "runbook"})).await.unwrap();
 
         assert!(!result.success);
@@ -408,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_by_ambiguous_contains_reports_the_gate_not_the_ambiguity() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("a", "the deploy runbook", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -417,7 +417,7 @@ mod tests {
             .unwrap();
 
         let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
-        let tool = MemoryForgetTool::new(mem.clone(), readonly);
+        let tool = MemoryForgetTool::new(mem.clone(), readonly, tmp.path().to_path_buf());
         let result = tool.execute(json!({"contains": "deploy"})).await.unwrap();
 
         assert!(!result.success);
@@ -436,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_by_contains_blocked_when_rate_limited() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("a", "the deploy runbook", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -445,7 +445,7 @@ mod tests {
             .unwrap();
 
         let limited = Arc::new(SecurityPolicy::default().with_max_actions_per_hour(0));
-        let tool = MemoryForgetTool::new(mem.clone(), limited);
+        let tool = MemoryForgetTool::new(mem.clone(), limited, tmp.path().to_path_buf());
         // An ambiguous phrase: resolving it first produced the "matches 2
         // memories" error, which is what made the limiter invisible here.
         let result = tool.execute(json!({"contains": "deploy"})).await.unwrap();
@@ -518,11 +518,12 @@ mod tests {
             }
         }
 
+        let tmp = TempDir::new().unwrap();
         let counting = Arc::new(CountingMemory {
             reads: AtomicUsize::new(0),
         });
         let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
-        let tool = MemoryForgetTool::new(counting.clone(), readonly);
+        let tool = MemoryForgetTool::new(counting.clone(), readonly, tmp.path().to_path_buf());
 
         let result = tool.execute(json!({"contains": "anything"})).await.unwrap();
         assert!(!result.success);
@@ -534,7 +535,8 @@ mod tests {
 
         // Control: the same call under a permitting policy does read it, so the
         // counter is wired to something that actually happens.
-        let tool = MemoryForgetTool::new(counting.clone(), test_security());
+        let tool =
+            MemoryForgetTool::new(counting.clone(), test_security(), tmp.path().to_path_buf());
         let _ = tool.execute(json!({"contains": "anything"})).await.unwrap();
         assert!(
             counting.reads.load(Ordering::SeqCst) > 0,
