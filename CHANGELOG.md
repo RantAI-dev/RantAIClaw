@@ -5,6 +5,52 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.1-alpha] — 2026-08-08
+
+**Nothing in this release changes how the binary behaves.** Both commits are
+test-only; the shipped artifact is byte-for-byte equivalent in behaviour to
+0.18.0-alpha. It exists so the fixes below are carried on a tag rather than only
+on `main`. If you install RantaiClaw, you can skip it.
+
+It matters if you run the test suite from source.
+
+### Fixed
+
+- **Unit tests no longer write into the operator's own `~/.rantaiclaw/`.** Five
+  tests treated a `TempDir` as isolation while the code under them resolved its
+  destination from the process `HOME`, so every `cargo test --lib` appended to
+  real state:
+
+  - Two wrote to `sessions.db`. `open_session_store` and
+    `open_cli_session_store` resolve the session database from
+    `ProfileManager::active()` — from `HOME` — not from the `Config` handed to
+    them, so a synthetic `Config` isolated nothing. Each run left a
+    `[cron:test-job cron-job] Say hello` session (dangling at
+    `message_count = 1`, the provider having failed as the test asserts) and a
+    `hello` / `test-model` session. On one machine these had reached 267
+    sessions — 88% of that profile's history — and read as a runaway cron job
+    rather than test residue.
+
+  - Three wrote `active_workspace.toml`. `run_quick_setup_with_home` takes
+    `home` as a parameter and every write honours it except the last:
+    `persist_workspace_selection` resolves its destination from `HOME` instead.
+    The marker landed in the real `~/.rantaiclaw/` naming a tempdir deleted
+    moments later. That file precedes `~/.rantaiclaw/config.toml` in the
+    resolution order, so a stale one shadows the real config — the split-brain
+    `active_workspace_marker_is_temp_leak` already existed to catch, which is
+    why the symptom was a warning on every CLI invocation rather than a broken
+    install.
+
+  Each fix pins `HOME` under the crate-shared `test_env::ENV_LOCK` **and asserts
+  the pin took**, so it cannot rot into a no-op — which is exactly how a sibling
+  test pinned in 0.12 kept looking fixed while the one beside it leaked. Removing
+  either pin now fails its test with the real path in the message.
+
+  Verified by row count against a real profile: an unpatched 0.18.0-alpha binary
+  takes the session table 39 → 41 on those two tests alone; patched, 41 → 41, and
+  a full `cargo test --lib` (4097 tests) leaves both the session database and the
+  workspace marker byte-identical.
+
 ## [0.18.0-alpha] — 2026-08-07
 
 The provider/model catalog, audited by diffing it against what the providers
