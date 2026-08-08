@@ -62,11 +62,23 @@ pub(super) async fn resolve_unique_entry(
 pub struct MemoryStoreTool {
     memory: Arc<dyn Memory>,
     security: Arc<SecurityPolicy>,
+    /// Needed to re-project `MEMORY.md` after a write. `core_capacity_notice`
+    /// below already reasons about the injected block; without this, the block it
+    /// reasons about does not yet contain the entry that was just stored.
+    workspace_dir: std::path::PathBuf,
 }
 
 impl MemoryStoreTool {
-    pub fn new(memory: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
-        Self { memory, security }
+    pub fn new(
+        memory: Arc<dyn Memory>,
+        security: Arc<SecurityPolicy>,
+        workspace_dir: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            memory,
+            security,
+            workspace_dir,
+        }
     }
 }
 
@@ -208,6 +220,10 @@ impl Tool for MemoryStoreTool {
             }
         }
 
+        // After both mutations, so the projection reflects the new entry *and*
+        // the superseded one's removal in a single rewrite.
+        crate::memory::snapshot::refresh_projection(self.memory.as_ref(), &self.workspace_dir);
+
         if category == MemoryCategory::Core {
             if let Some(notice) = self.core_capacity_notice().await {
                 output.push('\n');
@@ -288,10 +304,91 @@ mod tests {
         (tmp, Arc::new(mem))
     }
 
+    // ── the projection follows the store ──────────────────────────
+
+    /// `MEMORY.md` is injected into every system prompt, and on sqlite it is a
+    /// projection of the `core` rows. Only backend construction rewrote it, so a
+    /// memory stored mid-session did not reach the model until the next process —
+    /// on the long-lived gateway and TUI, not at all.
+    #[tokio::test]
+    async fn store_reprojects_memory_md() {
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({"key": "user_lang", "content": "prefers Bahasa Indonesia"}))
+            .await
+            .unwrap();
+        assert!(result.success, "control: {:?}", result.error);
+
+        let projected = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap_or_default();
+        assert!(
+            projected.contains("user_lang"),
+            "the prompt-injected file does not hold the stored entry:\n{projected}"
+        );
+    }
+
+    /// `replaces` performs two mutations. One rewrite has to reflect both, or the
+    /// superseded memory survives in the file the prompt injects.
+    #[tokio::test]
+    async fn store_with_replaces_drops_the_superseded_entry_from_the_projection() {
+        let (tmp, mem) = test_mem();
+        mem.store(
+            "old_key",
+            "the office is in Bandung",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        crate::memory::snapshot::project_core_memories(tmp.path()).unwrap();
+
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
+        let result = tool
+            .execute(json!({
+                "key": "new_key",
+                "content": "the office is in Jakarta",
+                "replaces": "office is in Bandung",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "control: {:?}", result.error);
+
+        let projected = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        assert!(projected.contains("Jakarta"), "{projected}");
+        assert!(
+            !projected.contains("Bandung"),
+            "the superseded memory survives in the projection:\n{projected}"
+        );
+    }
+
+    /// A refused write must not rewrite the file either.
+    #[tokio::test]
+    async fn a_blocked_store_does_not_touch_the_projection() {
+        let (tmp, mem) = test_mem();
+        mem.store("kept", "already here", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        crate::memory::snapshot::project_core_memories(tmp.path()).unwrap();
+        let before = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+
+        let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
+        let tool = MemoryStoreTool::new(mem.clone(), readonly, tmp.path().to_path_buf());
+        let result = tool
+            .execute(json!({"key": "denied", "content": "should not land"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+
+        let after = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        assert_eq!(before, after);
+        assert!(!after.contains("denied"));
+    }
+
     #[test]
     fn name_and_schema() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem, test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security(), tmp.path().to_path_buf());
         assert_eq!(tool.name(), "memory_store");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["key"].is_object());
@@ -300,8 +397,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_core() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
         let result = tool
             .execute(json!({"key": "lang", "content": "Prefers Rust"}))
             .await
@@ -316,8 +413,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_with_category() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
         let result = tool
             .execute(json!({"key": "note", "content": "Fixed bug", "category": "daily"}))
             .await
@@ -327,8 +424,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_with_custom_category() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
         let result = tool
             .execute(
                 json!({"key": "proj_note", "content": "Uses async runtime", "category": "project"}),
@@ -344,25 +441,25 @@ mod tests {
 
     #[tokio::test]
     async fn store_missing_key() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem, test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security(), tmp.path().to_path_buf());
         let result = tool.execute(json!({"content": "no key"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn store_missing_content() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem, test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security(), tmp.path().to_path_buf());
         let result = tool.execute(json!({"key": "no_content"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn store_blocked_in_readonly_mode() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
-        let tool = MemoryStoreTool::new(mem.clone(), readonly);
+        let tool = MemoryStoreTool::new(mem.clone(), readonly, tmp.path().to_path_buf());
         let result = tool
             .execute(json!({"key": "lang", "content": "Prefers Rust"}))
             .await
@@ -380,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_with_replaces_supersedes_the_matching_entry() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store(
             "old_lang",
             "The operator prefers Python",
@@ -390,7 +487,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
         let result = tool
             .execute(json!({
                 "key": "user_lang",
@@ -417,7 +514,7 @@ mod tests {
     /// specific, so an ambiguous selector fails and names the candidates.
     #[tokio::test]
     async fn store_with_ambiguous_replaces_is_rejected() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         mem.store("a", "the deploy runbook", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -425,7 +522,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
         let result = tool
             .execute(json!({"key": "c", "content": "new", "replaces": "deploy"}))
             .await
@@ -449,8 +546,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_with_unmatched_replaces_is_rejected() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
 
         let result = tool
             .execute(json!({"key": "k", "content": "v", "replaces": "nothing like this"}))
@@ -467,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn core_store_reports_when_the_projection_is_over_budget() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         let filler = "y".repeat(900);
         for i in 0..6 {
             mem.store(&format!("bulk_{i}"), &filler, MemoryCategory::Core, None)
@@ -475,7 +572,7 @@ mod tests {
                 .unwrap();
         }
 
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
         let result = tool
             .execute(json!({"key": "one_more", "content": "a durable fact"}))
             .await
@@ -491,8 +588,8 @@ mod tests {
 
     #[tokio::test]
     async fn core_store_is_quiet_under_the_budget() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
 
         let result = tool
             .execute(json!({"key": "small", "content": "a durable fact"}))
@@ -513,8 +610,8 @@ mod tests {
     /// at it again, so a write is the durable end of any injection.
     #[tokio::test]
     async fn store_refuses_content_forging_the_context_block() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
 
         let result = tool
             .execute(json!({
@@ -534,8 +631,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_redacts_a_credential_and_says_so() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
 
         let result = tool
             .execute(json!({
@@ -558,8 +655,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_strips_invisible_characters() {
-        let (_tmp, mem) = test_mem();
-        let tool = MemoryStoreTool::new(mem.clone(), test_security());
+        let (tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem.clone(), test_security(), tmp.path().to_path_buf());
 
         tool.execute(json!({
             "key": "hidden",
@@ -574,9 +671,9 @@ mod tests {
 
     #[tokio::test]
     async fn store_blocked_when_rate_limited() {
-        let (_tmp, mem) = test_mem();
+        let (tmp, mem) = test_mem();
         let limited = Arc::new(SecurityPolicy::default().with_max_actions_per_hour(0));
-        let tool = MemoryStoreTool::new(mem.clone(), limited);
+        let tool = MemoryStoreTool::new(mem.clone(), limited, tmp.path().to_path_buf());
         let result = tool
             .execute(json!({"key": "lang", "content": "Prefers Rust"}))
             .await
