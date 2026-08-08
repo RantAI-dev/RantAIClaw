@@ -296,7 +296,13 @@ async fn handle_reindex(config: &Config) -> Result<()> {
 async fn handle_stats(config: &Config) -> Result<()> {
     let mem = create_cli_memory(config)?;
     let healthy = mem.health_check().await;
-    let total = mem.count().await.unwrap_or(0);
+    // Not `unwrap_or(0)`. `health_check` does not cover this — sqlite's is
+    // `SELECT 1` and survives a damaged `memories` table, markdown's is
+    // `workspace_dir.exists()` — so a store that cannot be counted printed
+    // `Total: 0` next to `Health: healthy` and read as an empty store. `stats` is
+    // the command an operator runs *because* memory is misbehaving; report what
+    // can be read and name what cannot.
+    let counted = mem.count().await;
 
     println!("Memory Statistics:\n");
     println!("  Backend:  {}", style(mem.name()).white().bold());
@@ -308,24 +314,67 @@ async fn handle_stats(config: &Config) -> Result<()> {
             style("unhealthy").yellow().bold().to_string()
         }
     );
-    println!("  Total:    {total}");
+    println!("  Total:    {}", render_total(counted.as_ref()));
 
     let all = mem.list(None, None).await.unwrap_or_default();
-    if !all.is_empty() {
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for entry in &all {
-            *counts.entry(entry.category.to_string()).or_default() += 1;
-        }
-
-        println!("\n  By category:");
-        let mut sorted: Vec<_> = counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-        for (cat, count) in sorted {
-            println!("    {cat:<20} {count}");
-        }
-    }
+    print!(
+        "{}",
+        render_category_breakdown(&all, counted.as_ref().ok().copied())
+    );
 
     Ok(())
+}
+
+/// Render the `Total:` value.
+///
+/// This was `count().unwrap_or(0)`. `health_check` does not cover the gap —
+/// sqlite's is `SELECT 1` and survives a damaged `memories` table, markdown's is
+/// `workspace_dir.exists()` — so a store that could not be counted printed
+/// `Total: 0` beside `Health: healthy` and read as an empty store.
+fn render_total(counted: Result<&usize, &anyhow::Error>) -> String {
+    match counted {
+        Ok(total) => total.to_string(),
+        Err(e) => format!("{} ({e:#})", style("unavailable").yellow().bold()),
+    }
+}
+
+/// Render the per-category breakdown of `entries`.
+///
+/// `entries` is a **page**, not the whole store: `Memory::list` is capped by the
+/// backend (`DEFAULT_LIST_LIMIT` on sqlite), so its length is a page size and
+/// `count()` is the total. Building the breakdown from it without saying so
+/// printed per-category numbers that silently summed to less than the `Total:`
+/// line directly above them. `handle_list` and the TUI's `/memory list` already
+/// carry this qualifier; this one was missed.
+///
+/// `total` is `count()`'s answer when it is available.
+fn render_category_breakdown(
+    entries: &[super::traits::MemoryEntry],
+    total: Option<usize>,
+) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for entry in entries {
+        *counts.entry(entry.category.to_string()).or_default() += 1;
+    }
+
+    let listed = entries.len();
+    let scope = match total {
+        Some(total) if total > listed => format!(" (most recent {listed} of {total})"),
+        _ => String::new(),
+    };
+
+    let mut out = format!("\n  By category{scope}:\n");
+    let mut sorted: Vec<_> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    for (cat, count) in sorted {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "    {cat:<20} {count}");
+    }
+    out
 }
 
 async fn handle_clear(
@@ -548,5 +597,103 @@ mod tests {
     #[test]
     fn truncate_content_empty_string() {
         assert_eq!(truncate_content("", 10), "");
+    }
+
+    // ── `memory stats` breakdown ──────────────────────────────────
+
+    fn entries(categories: &[MemoryCategory]) -> Vec<super::super::traits::MemoryEntry> {
+        categories
+            .iter()
+            .enumerate()
+            .map(|(i, category)| super::super::traits::MemoryEntry {
+                id: format!("id{i}"),
+                key: format!("k{i}"),
+                content: "filler".to_string(),
+                category: category.clone(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                session_id: None,
+                score: None,
+            })
+            .collect()
+    }
+
+    /// `Total:` comes from `count()`, the breakdown from `list()` — and `list()`
+    /// is capped by the backend. Past the cap the two disagreed with nothing on
+    /// screen saying the breakdown was partial.
+    #[test]
+    fn category_breakdown_is_labelled_when_the_page_is_shorter_than_the_total() {
+        let page = entries(&[
+            MemoryCategory::Core,
+            MemoryCategory::Core,
+            MemoryCategory::Core,
+        ]);
+        let out = render_category_breakdown(&page, Some(1100));
+
+        assert!(
+            out.contains("most recent 3 of 1100"),
+            "partial breakdown not labelled: {out}"
+        );
+        assert!(out.contains("core"));
+    }
+
+    #[test]
+    fn category_breakdown_is_unlabelled_when_the_page_is_the_whole_store() {
+        let page = entries(&[MemoryCategory::Core, MemoryCategory::Daily]);
+        let out = render_category_breakdown(&page, Some(2));
+
+        assert!(
+            out.contains("By category:"),
+            "an exhaustive breakdown must not be qualified: {out}"
+        );
+        assert!(!out.contains("most recent"));
+    }
+
+    /// With `count()` unavailable there is no total to compare the page against,
+    /// so the breakdown must not claim the page is partial either.
+    #[test]
+    fn category_breakdown_without_a_total_makes_no_claim() {
+        let page = entries(&[MemoryCategory::Core]);
+        let out = render_category_breakdown(&page, None);
+
+        assert!(out.contains("By category:"));
+        assert!(!out.contains("most recent"));
+    }
+
+    /// A store that cannot be counted must not be reported as an empty one.
+    #[test]
+    fn total_says_unavailable_rather_than_zero_when_count_fails() {
+        let failure = anyhow::anyhow!("attempt to write a readonly database");
+        let rendered = render_total(Err(&failure));
+
+        assert!(
+            rendered.contains("unavailable"),
+            "a count failure rendered as: {rendered}"
+        );
+        assert!(
+            rendered.contains("readonly database"),
+            "the cause was dropped: {rendered}"
+        );
+        assert_ne!(rendered.trim(), "0");
+    }
+
+    #[test]
+    fn total_renders_the_count_when_it_is_available() {
+        assert_eq!(render_total(Ok(&1100)), "1100");
+    }
+
+    #[test]
+    fn category_breakdown_of_an_empty_page_renders_nothing() {
+        assert_eq!(render_category_breakdown(&[], Some(0)), "");
+    }
+
+    /// Equal counts used to fall out of a `HashMap` in whatever order it chose.
+    #[test]
+    fn category_breakdown_orders_ties_by_name() {
+        let page = entries(&[MemoryCategory::Daily, MemoryCategory::Core]);
+        let out = render_category_breakdown(&page, Some(2));
+
+        let core = out.find("core").expect("core listed");
+        let daily = out.find("daily").expect("daily listed");
+        assert!(core < daily, "ties are not ordered by name: {out}");
     }
 }
