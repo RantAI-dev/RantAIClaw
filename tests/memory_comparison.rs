@@ -312,7 +312,7 @@ async fn compare_upsert() {
     let md_count = md.count().await.unwrap();
 
     let sq_entry = sq.get("pref").await.unwrap();
-    let md_results = md.recall("loves Rust", 5, None).await.unwrap();
+    let md_entry = md.get("pref").await.unwrap();
 
     println!("\n============================================================");
     println!("UPSERT (store same key twice):");
@@ -320,15 +320,22 @@ async fn compare_upsert() {
         "  SQLite:   count={sq_count}, latest=\"{}\"",
         sq_entry.as_ref().map_or("none", |e| &e.content)
     );
-    println!("  Markdown: count={md_count} (append-only, both entries kept)");
-    println!("    Can still find latest: {}", !md_results.is_empty());
+    println!(
+        "  Markdown: count={md_count}, latest=\"{}\"",
+        md_entry.as_ref().map_or("none", |e| &e.content)
+    );
 
     // SQLite: upsert replaces, count stays at 1
     assert_eq!(sq_count, 1);
     assert_eq!(sq_entry.unwrap().content, "loves Rust");
 
-    // Markdown: append-only, count increases
-    assert!(md_count >= 2, "Markdown should keep both entries");
+    // So does markdown. It used to append unconditionally — described as
+    // append-only, and asserted here as `md_count >= 2` — which left two lines
+    // under one key: `count()` inflated, `list()` showed the key twice, and
+    // `get()` returned whichever copy sorted first. `Memory` is one trait, and
+    // one key means one entry on every backend that implements it.
+    assert_eq!(md_count, 1, "markdown must replace, not append");
+    assert_eq!(md_entry.unwrap().content, "loves Rust");
 }
 
 // ── Test 6: Forget / delete capability ─────────────────────────

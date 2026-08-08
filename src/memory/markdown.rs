@@ -118,6 +118,55 @@ impl MarkdownMemory {
             .collect()
     }
 
+    /// Drop every line in `path` stored under `key`. Returns whether any went.
+    ///
+    /// A line `split_stored_entry` cannot parse is not addressed by any key, so it
+    /// is left alone — headers and the prose an operator hand-wrote in
+    /// `MEMORY.md` are not ours to rewrite.
+    ///
+    /// Trailing blank lines are dropped from the result. Without that, the
+    /// removal leaves the blank line that separated the entry behind, and
+    /// `append_to_file` adds another on the next write — so re-storing one key
+    /// repeatedly grew the file by a blank line each time. `MEMORY.md` is
+    /// injected into the prompt, so that growth is a token cost.
+    async fn remove_key_from_file(path: &Path, key: &str) -> anyhow::Result<bool> {
+        let Ok(existing) = fs::read_to_string(path).await else {
+            return Ok(false);
+        };
+
+        let mut removed = false;
+        let mut kept: Vec<&str> = existing
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                let clean = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+                match split_stored_entry(clean) {
+                    Some((stored_key, _)) if stored_key == key => {
+                        removed = true;
+                        false
+                    }
+                    _ => true,
+                }
+            })
+            .collect();
+
+        if !removed {
+            return Ok(false);
+        }
+
+        while kept.last().is_some_and(|line| line.trim().is_empty()) {
+            kept.pop();
+        }
+
+        let mut rewritten = kept.join("\n");
+        if !rewritten.ends_with('\n') {
+            rewritten.push('\n');
+        }
+        fs::write(path, rewritten).await?;
+
+        Ok(true)
+    }
+
     /// Every markdown file this backend owns: the core file, then the daily logs.
     async fn all_memory_files(&self) -> anyhow::Result<Vec<PathBuf>> {
         let mut paths = Vec::new();
@@ -190,6 +239,20 @@ impl Memory for MarkdownMemory {
         category: MemoryCategory,
         _session_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        // Replace, don't append. `SqliteMemory` upserts on `key`
+        // (`ON CONFLICT(key) DO UPDATE`) and `PostgresMemory` matches it; one
+        // `Memory` trait has to mean one thing. Appending left a second line under
+        // the same key, which inflated `count()` — rendered as `Total:` by
+        // `memory stats` — showed the key twice in `list()`, and left `get()`
+        // returning whichever copy sorted first under a `timestamp` that is really
+        // the filename.
+        //
+        // `forget` clears the key from *every* file, not just the one about to be
+        // written, so a re-store under a different category moves the entry rather
+        // than duplicating it across two files. That is what sqlite's upsert does
+        // to `category`.
+        self.forget(key).await?;
+
         let entry = format!("- **{key}**: {content}");
         let path = match category {
             MemoryCategory::Core => self.core_path(),
@@ -257,46 +320,28 @@ impl Memory for MarkdownMemory {
         }
     }
 
-    /// Remove the line holding `key`.
+    /// Remove the line holding `key`, from **every** file this backend owns.
     ///
     /// This used to return `false` unconditionally, described as append-only for
     /// the audit trail. That reasoning does not survive the tool that calls it:
     /// `memory_forget` offers to "delete outdated facts or sensitive data", and
     /// answering "no memory found" about an entry that plainly exists is worse
     /// than either deleting it or refusing outright.
+    ///
+    /// It then stopped at the first file that matched, which reintroduced the
+    /// same wrong answer from the other direction: a key present in `MEMORY.md`
+    /// *and* a daily log lost one copy, kept the rest, and still reported `true`.
+    /// Sweep all of them.
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
-        let mut removed = false;
+        let mut removed_any = false;
 
         for path in self.all_memory_files().await? {
-            let Ok(existing) = fs::read_to_string(&path).await else {
-                continue;
-            };
-
-            let kept: Vec<&str> = existing
-                .lines()
-                .filter(|line| {
-                    let clean = line.trim().strip_prefix("- ").unwrap_or(line.trim());
-                    match split_stored_entry(clean) {
-                        Some((stored_key, _)) if stored_key == key => {
-                            removed = true;
-                            false
-                        }
-                        _ => true,
-                    }
-                })
-                .collect();
-
-            if removed {
-                let mut rewritten = kept.join("\n");
-                if !rewritten.ends_with('\n') {
-                    rewritten.push('\n');
-                }
-                fs::write(&path, rewritten).await?;
-                break;
+            if Self::remove_key_from_file(&path, key).await? {
+                removed_any = true;
             }
         }
 
-        Ok(removed)
+        Ok(removed_any)
     }
 
     async fn count(&self) -> anyhow::Result<usize> {
@@ -496,5 +541,150 @@ mod tests {
             let s = e.score.unwrap();
             assert!((0.0..=1.0).contains(&s), "{} out of range: {s}", e.key);
         }
+    }
+
+    // ── store replaces; forget sweeps every file ───────────────────
+
+    /// `store` appended, so one key became two lines: `count()` inflated,
+    /// `list()` showed it twice, and `get()` returned whichever copy sorted first.
+    #[tokio::test]
+    async fn markdown_store_replaces_an_existing_key() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("k", "old value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k", "new value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        assert_eq!(mem.count().await.unwrap(), 1, "one key counts once");
+        assert_eq!(mem.get("k").await.unwrap().unwrap().content, "new value");
+
+        let rows: Vec<_> = mem
+            .list(None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.key == "k")
+            .collect();
+        assert_eq!(rows.len(), 1, "stale row survives: {rows:?}");
+    }
+
+    /// A re-store under a different category moves the entry, matching what
+    /// sqlite's `ON CONFLICT(key) DO UPDATE SET category = excluded.category` does.
+    #[tokio::test]
+    async fn markdown_store_moves_an_entry_across_categories() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("k", "core copy", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k", "daily copy", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        assert_eq!(mem.count().await.unwrap(), 1);
+        let entry = mem.get("k").await.unwrap().unwrap();
+        assert_eq!(entry.content, "daily copy");
+        assert_eq!(entry.category, MemoryCategory::Daily);
+
+        let core = fs::read_to_string(mem.core_path()).await.unwrap();
+        assert!(
+            !core.contains("core copy"),
+            "the old file still holds it:\n{core}"
+        );
+    }
+
+    /// `forget` stopped at the first file that matched, so a key present in both
+    /// `MEMORY.md` and a daily log lost one copy, kept the rest, and reported
+    /// `true` — which `memory_forget` renders as "Forgot memory: k".
+    #[tokio::test]
+    async fn markdown_forget_sweeps_every_file() {
+        let (_tmp, mem) = temp_workspace();
+        // Write the duplicate directly: `store` no longer produces this state, but
+        // a workspace written by an earlier build can still be in it.
+        mem.append_to_file(&mem.core_path(), "- **dupe**: core copy")
+            .await
+            .unwrap();
+        mem.append_to_file(&mem.daily_path(), "- **dupe**: daily copy")
+            .await
+            .unwrap();
+        assert_eq!(mem.count().await.unwrap(), 2, "control: both copies exist");
+
+        assert!(mem.forget("dupe").await.unwrap());
+        assert!(
+            mem.get("dupe").await.unwrap().is_none(),
+            "forget reported true but an entry survives"
+        );
+        assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    /// `MEMORY.md` is a file operators edit. A line that is not a stored entry is
+    /// not addressed by any key and must survive both operations.
+    #[tokio::test]
+    async fn markdown_hand_written_lines_survive_store_and_forget() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("k", "stored value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.append_to_file(&mem.core_path(), "Prose an operator wrote.")
+            .await
+            .unwrap();
+
+        mem.store("other", "another value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.forget("k").await.unwrap();
+
+        let core = fs::read_to_string(mem.core_path()).await.unwrap();
+        assert!(
+            core.contains("Prose an operator wrote."),
+            "hand-written line was rewritten away:\n{core}"
+        );
+        assert!(core.contains("# Long-Term Memory"), "header lost:\n{core}");
+    }
+
+    #[tokio::test]
+    async fn markdown_forget_absent_key_rewrites_nothing() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("k", "value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let path = mem.core_path();
+        let before = fs::read_to_string(&path).await.unwrap();
+        let before_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert!(!mem.forget("absent").await.unwrap());
+
+        let after = fs::read_to_string(&path).await.unwrap();
+        let after_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "contents changed");
+        assert_eq!(before_mtime, after_mtime, "file was rewritten");
+    }
+
+    /// Re-storing one key repeatedly must not grow the file. The removal leaves
+    /// the blank line that separated the entry, and `append_to_file` adds another
+    /// on the next write — unbounded growth in a file the prompt injects.
+    #[tokio::test]
+    async fn markdown_repeated_store_does_not_grow_the_file() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("k", "v1", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let after_first = fs::read_to_string(mem.core_path()).await.unwrap();
+
+        for i in 2..6 {
+            mem.store("k", &format!("v{i}"), MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        let after_many = fs::read_to_string(mem.core_path()).await.unwrap();
+
+        assert_eq!(
+            after_first.lines().count(),
+            after_many.lines().count(),
+            "file grew across re-stores:\n{after_many}"
+        );
+        assert!(after_many.contains("- **k**: v5"));
     }
 }
