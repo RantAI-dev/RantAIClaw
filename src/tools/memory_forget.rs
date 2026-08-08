@@ -48,11 +48,47 @@ impl Tool for MemoryForgetTool {
         let key_arg = args.get("key").and_then(|v| v.as_str());
         let contains_arg = args.get("contains").and_then(|v| v.as_str());
 
+        enum Selector<'a> {
+            Key(&'a str),
+            Contains(&'a str),
+        }
+
         // Exactly one selector. Accepting both would make it ambiguous which one
         // decides when they disagree, and that ambiguity deletes something.
-        let key: String = match (key_arg, contains_arg) {
-            (Some(k), None) => k.to_string(),
-            (None, Some(needle)) => {
+        let selector = match (key_arg, contains_arg) {
+            (Some(k), None) => Selector::Key(k),
+            (None, Some(needle)) => Selector::Contains(needle),
+            (Some(_), Some(_)) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Pass either 'key' or 'contains', not both".into()),
+                })
+            }
+            (None, None) => return Err(anyhow::anyhow!("Missing 'key' or 'contains' parameter")),
+        };
+
+        // Gate before the selector is resolved, not after. `contains` reads the
+        // whole store to find its target, so resolving first meant a refused call
+        // did that work anyway and — on an unresolvable phrase — was answered out
+        // of memory contents ("matches 2 memories (a, b)") instead of being told
+        // it was refused. An agent following that answer retries a call it can
+        // never complete. Argument shape is still checked above: a malformed call
+        // is the model's mistake either way.
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "memory_forget")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
+        let key: String = match selector {
+            Selector::Key(k) => k.to_string(),
+            Selector::Contains(needle) => {
                 match super::memory_store::resolve_unique_entry(
                     self.memory.as_ref(),
                     needle,
@@ -70,27 +106,8 @@ impl Tool for MemoryForgetTool {
                     }
                 }
             }
-            (Some(_), Some(_)) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Pass either 'key' or 'contains', not both".into()),
-                })
-            }
-            (None, None) => return Err(anyhow::anyhow!("Missing 'key' or 'contains' parameter")),
         };
         let key = key.as_str();
-
-        if let Err(error) = self
-            .security
-            .enforce_tool_operation(ToolOperation::Act, "memory_forget")
-        {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(error),
-            });
-        }
 
         match self.memory.forget(key).await {
             Ok(true) => Ok(ToolResult {
@@ -275,5 +292,170 @@ mod tests {
             .unwrap_or("")
             .contains("Rate limit exceeded"));
         assert!(mem.get("temp").await.unwrap().is_some());
+    }
+
+    // ── the gate covers the `contains` selector too ────────────────
+    //
+    // These used the `key` selector only, so the `contains` path resolved its
+    // target — reading the whole store — before the policy was consulted. A
+    // refused call was then answered out of memory contents rather than told it
+    // was refused.
+
+    #[tokio::test]
+    async fn forget_by_contains_blocked_in_readonly_mode() {
+        let (_tmp, mem) = test_mem();
+        mem.store("only", "the deploy runbook", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
+        let tool = MemoryForgetTool::new(mem.clone(), readonly);
+        let result = tool.execute(json!({"contains": "runbook"})).await.unwrap();
+
+        assert!(!result.success);
+        // A phrase that resolves cleanly: the refusal cannot be mistaken for the
+        // ambiguity error shadowing it.
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("read-only mode"));
+        assert!(mem.get("only").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn forget_by_ambiguous_contains_reports_the_gate_not_the_ambiguity() {
+        let (_tmp, mem) = test_mem();
+        mem.store("a", "the deploy runbook", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "the deploy schedule", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
+        let tool = MemoryForgetTool::new(mem.clone(), readonly);
+        let result = tool.execute(json!({"contains": "deploy"})).await.unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("read-only mode"),
+            "refused call answered from memory contents: {error}"
+        );
+        assert!(
+            !error.contains("be more specific"),
+            "a refused caller must not be told to retry: {error}"
+        );
+        assert!(mem.get("a").await.unwrap().is_some());
+        assert!(mem.get("b").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn forget_by_contains_blocked_when_rate_limited() {
+        let (_tmp, mem) = test_mem();
+        mem.store("a", "the deploy runbook", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "the deploy schedule", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let limited = Arc::new(SecurityPolicy::default().with_max_actions_per_hour(0));
+        let tool = MemoryForgetTool::new(mem.clone(), limited);
+        // An ambiguous phrase: resolving it first produced the "matches 2
+        // memories" error, which is what made the limiter invisible here.
+        let result = tool.execute(json!({"contains": "deploy"})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Rate limit exceeded"));
+        assert!(mem.get("a").await.unwrap().is_some());
+        assert!(mem.get("b").await.unwrap().is_some());
+    }
+
+    /// A refused call must not touch the store at all. `contains` resolution is a
+    /// full `list()`, and doing it before the gate meant the work happened on
+    /// every refused call — outside anything the rate limiter accounts for, since
+    /// `enforce_tool_operation` is what records the action.
+    #[tokio::test]
+    async fn a_refused_forget_does_not_read_memory() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingMemory {
+            reads: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Memory for CountingMemory {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            async fn store(
+                &self,
+                _key: &str,
+                _content: &str,
+                _category: MemoryCategory,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _query: &str,
+                _limit: usize,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            async fn get(&self, _key: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+            async fn list(
+                &self,
+                _category: Option<&MemoryCategory>,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        let counting = Arc::new(CountingMemory {
+            reads: AtomicUsize::new(0),
+        });
+        let readonly = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::ReadOnly));
+        let tool = MemoryForgetTool::new(counting.clone(), readonly);
+
+        let result = tool.execute(json!({"contains": "anything"})).await.unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            counting.reads.load(Ordering::SeqCst),
+            0,
+            "a refused call read the store"
+        );
+
+        // Control: the same call under a permitting policy does read it, so the
+        // counter is wired to something that actually happens.
+        let tool = MemoryForgetTool::new(counting.clone(), test_security());
+        let _ = tool.execute(json!({"contains": "anything"})).await.unwrap();
+        assert!(
+            counting.reads.load(Ordering::SeqCst) > 0,
+            "control: a permitted call resolves the selector"
+        );
     }
 }
