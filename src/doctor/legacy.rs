@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::onboard::wizard::{humanize_age, ModelRefreshOutcome, StaleCacheReason};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::io::Write;
@@ -155,6 +156,10 @@ pub struct ProbeSummary {
     pub skipped: usize,
     pub auth: usize,
     pub errors: usize,
+    /// The provider could not be reached, but a previously-cached catalog was
+    /// shown. Counted apart from `ok` because nothing was verified — this bucket
+    /// exists precisely so a failed probe stops reading as a passed one.
+    pub stale: usize,
 }
 
 /// Refresh each provider's model catalog in turn, printing a block per
@@ -172,9 +177,32 @@ pub(crate) fn refresh_model_catalogs(
         println!("  [{}]", provider_name);
 
         match crate::onboard::run_models_refresh(config, Some(provider_name), force) {
-            Ok(()) => {
+            Ok(ModelRefreshOutcome::FetchedLive { count }) => {
                 summary.ok += 1;
-                println!("    ✅ model catalog check passed");
+                println!("    ✅ model catalog check passed ({count} models)");
+            }
+            Ok(ModelRefreshOutcome::ServedFreshCache { age_secs }) => {
+                // Cache-first mode asked for exactly this, so it is not a
+                // failure — but no request was made, so say so rather than
+                // implying the provider answered.
+                summary.ok += 1;
+                println!(
+                    "    ✅ cached catalog is fresh ({} old, provider not contacted)",
+                    humanize_age(age_secs)
+                );
+            }
+            Ok(ModelRefreshOutcome::ServedStaleCache { age_secs, reason }) => {
+                // The headline bug: this printed `✅ model catalog check passed`
+                // on a machine with no Ollama running.
+                summary.stale += 1;
+                let why = match reason {
+                    StaleCacheReason::FetchFailed => "provider unreachable",
+                    StaleCacheReason::ProviderReturnedEmpty => "provider returned no models",
+                };
+                println!(
+                    "    ⚠️  stale: showing cache from {} ago — {why}, nothing verified",
+                    humanize_age(age_secs)
+                );
             }
             Err(error) => {
                 let error_text = format_error_chain(&error);
@@ -224,11 +252,14 @@ pub fn refresh_all_model_catalogs(config: &Config, force: bool) -> Result<()> {
     let summary = refresh_model_catalogs(config, &targets, force);
 
     println!(
-        "  Summary: {} ok, {} skipped, {} auth/access, {} errors",
-        summary.ok, summary.skipped, summary.auth, summary.errors
+        "  Summary: {} ok, {} stale, {} skipped, {} auth/access, {} errors",
+        summary.ok, summary.stale, summary.skipped, summary.auth, summary.errors
     );
     if summary.auth > 0 {
         println!("  Some providers need a valid API key before their catalog can be fetched.");
+    }
+    if summary.stale > 0 {
+        println!("  Stale entries kept a previous catalog; those providers were not reached.");
     }
 
     Ok(())
@@ -256,9 +287,16 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     let summary = refresh_model_catalogs(config, &targets, !use_cache);
 
     println!(
-        "  Summary: {} ok, {} skipped, {} auth/access, {} errors",
-        summary.ok, summary.skipped, summary.auth, summary.errors
+        "  Summary: {} ok, {} stale, {} skipped, {} auth/access, {} errors",
+        summary.ok, summary.stale, summary.skipped, summary.auth, summary.errors
     );
+
+    if summary.stale > 0 {
+        println!(
+            "  ⚠️  {} provider(s) served a cached catalog without being reached — not a pass.",
+            summary.stale
+        );
+    }
 
     if summary.auth > 0 {
         println!(
@@ -266,6 +304,8 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
         );
     }
 
+    // A stale cache is deliberately NOT counted here: `--provider X` asks
+    // whether X is reachable, and showing yesterday's list does not answer that.
     if provider_override.is_some() && summary.ok == 0 {
         anyhow::bail!("Model probe failed for target provider")
     }
@@ -1112,6 +1152,38 @@ mod tests {
         // An override narrows to exactly one, which is what `--provider` means.
         assert_eq!(doctor_model_targets(Some("openrouter")), vec!["openrouter"]);
         assert_eq!(doctor_model_targets(Some("   ")), all);
+    }
+
+    #[test]
+    fn a_provider_served_from_stale_cache_is_not_counted_as_passing() {
+        // The reported bug, at the level the operator sees it: `doctor models`
+        // printed `✅ model catalog check passed` for a provider it could not
+        // reach, and the run summary counted it among the "ok".
+        let tmp = TempDir::new().unwrap();
+        crate::onboard::wizard::cache_live_models_for_provider(
+            tmp.path(),
+            "llamacpp",
+            &["cached-model".to_string()],
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.default_provider = Some("llamacpp".into());
+        // Unparseable endpoint: the fetch fails before a socket is opened, so
+        // this stays offline.
+        config.api_url = Some("not-a-url".into());
+
+        let summary = refresh_model_catalogs(&config, &["llamacpp".to_string()], true);
+
+        assert_eq!(summary.stale, 1, "an unreached provider belongs in `stale`");
+        assert_eq!(
+            summary.ok, 0,
+            "showing yesterday's catalog is not a passed check"
+        );
+        assert_eq!(summary.errors, 0, "the command itself did not fail");
+        assert_eq!(summary.auth, 0);
+        assert_eq!(summary.skipped, 0);
     }
 
     #[test]
