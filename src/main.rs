@@ -1982,7 +1982,14 @@ async fn main() -> Result<()> {
                         // current truth, not a cache replay.
                         doctor::refresh_all_model_catalogs(&config_for_refresh, true)
                     } else {
+                        // The outcome is discarded here on purpose: `models
+                        // refresh` exists to hand back a usable catalog, and a
+                        // stale-cache fallback still does that. It already
+                        // prints which case it hit. Only `doctor models` needs
+                        // to grade the outcome, because only it claims to have
+                        // verified anything.
                         onboard::run_models_refresh(&config_for_refresh, provider.as_deref(), force)
+                            .map(|_| ())
                     }
                 })
                 .await

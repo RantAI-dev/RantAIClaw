@@ -1860,7 +1860,7 @@ fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Resu
     Ok(())
 }
 
-fn cache_live_models_for_provider(
+pub(crate) fn cache_live_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     models: &[String],
@@ -1984,7 +1984,7 @@ pub(crate) fn provider_model_catalog(workspace_dir: &Path, provider_name: &str) 
     }
 }
 
-fn humanize_age(age_secs: u64) -> String {
+pub(crate) fn humanize_age(age_secs: u64) -> String {
     if age_secs < 60 {
         format!("{age_secs}s")
     } else if age_secs < 60 * 60 {
@@ -2059,11 +2059,50 @@ pub fn list_models(config: &Config, provider_override: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// What a refresh actually did.
+///
+/// `run_models_refresh` used to return `Result<()>`, which collapsed four
+/// distinct outcomes into one `Ok`. Three of them involve no successful fetch,
+/// and `doctor models` — a *diagnostic* command — reported all four as
+/// `✅ model catalog check passed`. Observed on a machine with no Ollama
+/// running: the probe correctly failed, fell back to a stale cache, and still
+/// printed a pass. A check that reports success when the thing it checks failed
+/// is worse than no check, because it is believed.
+///
+/// Falling back to a stale list is right for `models refresh`, whose job is to
+/// hand back a usable catalog. It is wrong to *report as verified*. Hence an
+/// outcome rather than a bool: each caller decides what a given case means for
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelRefreshOutcome {
+    /// Reached the provider and it returned a catalog. The only genuine pass.
+    FetchedLive { count: usize },
+    /// Cache was inside its TTL, so no request was made. Legitimate for
+    /// `models refresh` without `--force`; not evidence the provider is
+    /// reachable.
+    ServedFreshCache { age_secs: u64 },
+    /// The fetch failed and a previously-cached list was shown instead. The
+    /// operator still gets a usable list, but nothing was verified.
+    ServedStaleCache {
+        age_secs: u64,
+        reason: StaleCacheReason,
+    },
+}
+
+/// Why a refresh fell back to a stale cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleCacheReason {
+    /// The request itself failed — network, auth, bad endpoint.
+    FetchFailed,
+    /// The request succeeded and the provider returned nothing.
+    ProviderReturnedEmpty,
+}
+
 pub fn run_models_refresh(
     config: &Config,
     provider_override: Option<&str>,
     force: bool,
-) -> Result<()> {
+) -> Result<ModelRefreshOutcome> {
     let provider_name = provider_override
         .or(config.default_provider.as_deref())
         .unwrap_or("openrouter")
@@ -2095,7 +2134,9 @@ pub fn run_models_refresh(
                 "Tip: run `rantaiclaw models refresh --force --provider {}` to fetch latest now.",
                 provider_name
             );
-            return Ok(());
+            return Ok(ModelRefreshOutcome::ServedFreshCache {
+                age_secs: cached.age_secs,
+            });
         }
     }
 
@@ -2110,8 +2151,9 @@ pub fn run_models_refresh(
                 provider_name,
                 models.len()
             );
+            let count = models.len();
             print_model_preview(&models);
-            Ok(())
+            Ok(ModelRefreshOutcome::FetchedLive { count })
         }
         Ok(_) => {
             if let Some(stale_cache) =
@@ -2122,7 +2164,10 @@ pub fn run_models_refresh(
                     humanize_age(stale_cache.age_secs)
                 );
                 print_model_preview(&stale_cache.models);
-                return Ok(());
+                return Ok(ModelRefreshOutcome::ServedStaleCache {
+                    age_secs: stale_cache.age_secs,
+                    reason: StaleCacheReason::ProviderReturnedEmpty,
+                });
             }
 
             anyhow::bail!("Provider '{}' returned an empty model list", provider_name)
@@ -2137,7 +2182,10 @@ pub fn run_models_refresh(
                     humanize_age(stale_cache.age_secs)
                 );
                 print_model_preview(&stale_cache.models);
-                return Ok(());
+                return Ok(ModelRefreshOutcome::ServedStaleCache {
+                    age_secs: stale_cache.age_secs,
+                    reason: StaleCacheReason::FetchFailed,
+                });
             }
 
             Err(error)
@@ -6869,6 +6917,59 @@ mod tests {
         };
 
         run_models_refresh(&config, None, false).unwrap();
+    }
+
+    // ── a failed probe must not report as a pass ─────────────────
+    //
+    // `run_models_refresh` returned `Result<()>`, so `doctor models` could not
+    // tell "reached the provider" from "the fetch failed and we showed an old
+    // list". It printed `✅ model catalog check passed` for both. Observed on a
+    // machine with no Ollama running.
+
+    /// A config whose llama.cpp endpoint cannot be parsed as a URL, so the
+    /// fetch fails inside the client before any socket is opened. Keeps this
+    /// test offline and deterministic.
+    fn config_with_unreachable_llamacpp(workspace: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        config.default_provider = Some("llamacpp".into());
+        config.api_url = Some("not-a-url".into());
+        config
+    }
+
+    #[test]
+    fn failed_fetch_with_a_cache_reports_stale_not_success() {
+        let dir = tempfile::TempDir::new().unwrap();
+        cache_live_models_for_provider(dir.path(), "llamacpp", &["cached-model".to_string()])
+            .unwrap();
+
+        let outcome = run_models_refresh(&config_with_unreachable_llamacpp(dir.path()), None, true)
+            .expect("a usable cache means the command still succeeds");
+
+        match outcome {
+            ModelRefreshOutcome::ServedStaleCache { reason, .. } => {
+                assert_eq!(reason, StaleCacheReason::FetchFailed);
+            }
+            other => panic!("expected a stale-cache outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn successful_fetch_is_the_only_outcome_that_reports_live() {
+        // The fresh-cache path must not masquerade as a live fetch either: no
+        // request is made, so it is not evidence the provider is reachable.
+        let dir = tempfile::TempDir::new().unwrap();
+        cache_live_models_for_provider(dir.path(), "llamacpp", &["cached-model".to_string()])
+            .unwrap();
+
+        let outcome =
+            run_models_refresh(&config_with_unreachable_llamacpp(dir.path()), None, false)
+                .expect("a fresh cache short-circuits before any request");
+
+        assert!(
+            matches!(outcome, ModelRefreshOutcome::ServedFreshCache { .. }),
+            "expected a fresh-cache outcome, got {outcome:?}"
+        );
     }
 
     #[test]

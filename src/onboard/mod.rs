@@ -8,6 +8,7 @@ pub mod ui;
 #[allow(unused_imports)]
 pub use wizard::{
     list_models, run_channels_repair_wizard, run_models_refresh, run_quick_setup, run_wizard,
+    ModelRefreshOutcome, StaleCacheReason,
 };
 
 #[cfg(test)]
