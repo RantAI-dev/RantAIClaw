@@ -5,6 +5,54 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.3-alpha] — 2026-08-09
+
+One fix: `doctor models` reported a passed check for a provider it could not
+reach. This is the other half of the Ollama finding from v0.18.0-alpha — that
+release made the probe able to fail, and left the verdict still saying it
+passed.
+
+### Fixed
+
+- **A failed model probe no longer reports as a passed check.** `doctor models`
+  printed `✅ model catalog check passed` for a provider it never reached.
+  Observed on a machine with no Ollama running: the fetch failed, the command
+  fell back to a previously-cached list, and the run summary counted it among
+  the "ok". An operator had no way to learn their provider was down.
+
+  `run_models_refresh` returned `Result<()>`, which collapsed four outcomes into
+  one `Ok` — three of which involve no successful fetch. It now reports which
+  one it hit, so `doctor models` can grade it:
+
+  | what happened | before | now |
+  | --- | --- | --- |
+  | fetched live from the provider | `✅ passed` | `✅ passed (N models)` |
+  | cache inside its TTL, no request made | `✅ passed` | `✅ cached catalog is fresh (provider not contacted)` |
+  | provider returned an empty catalog | `✅ passed` | `⚠️ stale — nothing verified` |
+  | the fetch failed outright | `✅ passed` | `⚠️ stale — provider unreachable, nothing verified` |
+
+  The run summary gains a `stale` count, kept separate from `ok`.
+
+  `models refresh` is unchanged: its job is to hand back a usable catalog, and
+  falling back to a cached list still does that. Only the *diagnostic* command
+  changes, because only it claims to have verified anything.
+
+### Changed
+
+- **`doctor models --provider <name>` now exits non-zero when that provider
+  served only a stale cache.** It asks whether the provider is reachable, and a
+  previously-cached list does not answer that. A reachable provider still exits
+  zero. If you script this command, a provider that is intentionally offline
+  some of the time will now be reported as a failure.
+
+### Notes
+
+- No config schema change, and the console pin stays at claw-ui `v0.3.15`. This
+  release rolls back freely.
+- `ModelRefreshOutcome` and `StaleCacheReason` are new public types, and
+  `run_models_refresh`'s return type changed. All in-tree callers are updated;
+  external callers of the library API would need to adjust.
+
 ## [0.18.2-alpha] — 2026-08-08
 
 Four memory fixes. The first one changes what reaches the model, so read it even
