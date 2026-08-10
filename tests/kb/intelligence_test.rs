@@ -892,3 +892,54 @@ async fn relations_survive_entity_name_case_mismatch() {
     let (_entities, relations) = store.intelligence_for_document("d_case").await.unwrap();
     assert_eq!(relations.len(), 1, "the relation row must be stored");
 }
+
+#[tokio::test]
+async fn summary_counts_deduped_entities_not_raw_extractions() {
+    // Plan 095: the same entity in three chunks is three extractions and ONE
+    // stored row — the summary must report 1, matching the Entities tab.
+    use async_trait::async_trait;
+    use rantaiclaw::kb::intelligence::extract::{EntityRelationExtractor, Extracted};
+    use rantaiclaw::kb::intelligence::extract_document_intelligence;
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use tempfile::TempDir;
+
+    struct CannedExtractor;
+    #[async_trait]
+    impl EntityRelationExtractor for CannedExtractor {
+        async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
+            Ok(Extracted {
+                entities: vec![
+                    (0, "TechCorp".into(), EntityType::Organization, 0.9),
+                    (1, "TechCorp".into(), EntityType::Organization, 0.9),
+                    (2, "techcorp".into(), EntityType::Organization, 0.9),
+                ],
+                relations: vec![],
+            })
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let summary = extract_document_intelligence(
+        &store,
+        &CannedExtractor,
+        "d_dedup",
+        &["c0", "c1", "c2"],
+        "exact",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        summary.entities, 1,
+        "summary must count distinct canonical keys, not raw extractions"
+    );
+    let (entities, _relations) = store.intelligence_for_document("d_dedup").await.unwrap();
+    assert_eq!(
+        entities.len(),
+        summary.entities,
+        "summary must equal what the store actually holds"
+    );
+}
