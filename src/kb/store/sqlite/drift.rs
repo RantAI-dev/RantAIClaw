@@ -16,9 +16,15 @@ impl SqliteStore {
         tokio::task::spawn_blocking(move || -> KbResult<Vec<(Option<String>, usize)>> {
             let conn = conn.blocking_lock();
             let mut stmt = conn.prepare(
-                "SELECT embedding_model, COUNT(*) AS n
-                 FROM chunk
-                 GROUP BY embedding_model",
+                // Soft-deleted parents excluded: list_chunks_for_re_embed
+                // skips them, so an unfiltered count here reports stale
+                // chunks a re-embed will never walk — drift could never
+                // reach in_sync after a console (soft) delete (plan 100).
+                "SELECT c.embedding_model, COUNT(*) AS n
+                 FROM chunk c
+                 JOIN document d ON d.id = c.document_id
+                 WHERE d.deleted_at IS NULL
+                 GROUP BY c.embedding_model",
             )?;
             let rows = stmt
                 .query_map([], |row| {
