@@ -943,3 +943,93 @@ async fn summary_counts_deduped_entities_not_raw_extractions() {
         "summary must equal what the store actually holds"
     );
 }
+
+#[tokio::test]
+async fn graph_node_selection_uses_deduped_degree() {
+    // Plan 096: an entity with 5 duplicate relation rows for the SAME
+    // (target, type) is ONE deduplicated edge; an entity with 2 genuinely
+    // distinct edges is better connected by the metric the UI shows. Under
+    // limit=1 the distinct-edge entity must win the slot — before the fix
+    // selection ordered by raw relation-row count and the duplicate-heavy
+    // entity won with degree 5, then rendered as degree 1.
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, ExtractSource, Relation};
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    let ent = |id: &str, name: &str| Entity {
+        id: id.into(),
+        canonical_key: format!("{}:Concept", name.to_lowercase()),
+        name: name.into(),
+        entity_type: EntityType::Concept,
+        confidence: 0.9,
+        metadata: serde_json::json!({}),
+    };
+    let mention = |eid: &str| EntityMention {
+        id: uuid::Uuid::new_v4().to_string(),
+        entity_id: eid.into(),
+        document_id: "d1".into(),
+        chunk_index: Some(0),
+        context: None,
+        source: ExtractSource::Llm,
+    };
+    let rel = |src: &str, tgt: &str| Relation {
+        id: uuid::Uuid::new_v4().to_string(),
+        source_entity_id: src.into(),
+        target_entity_id: tgt.into(),
+        relation_type: RelationType::RelatedTo,
+        confidence: 0.8,
+        document_id: "d1".into(),
+        metadata: serde_json::json!({}),
+    };
+
+    // dup_hub: 5 identical (dup_hub -> sink, RelatedTo) rows = 1 deduped edge.
+    // true_hub: 2 distinct edges (-> t1, -> t2) = deduped degree 2.
+    let entities = vec![
+        ent("e_dup", "DupHub"),
+        ent("e_sink", "Sink"),
+        ent("e_true", "TrueHub"),
+        ent("e_t1", "TargetOne"),
+        ent("e_t2", "TargetTwo"),
+    ];
+    let mentions: Vec<EntityMention> = ["e_dup", "e_sink", "e_true", "e_t1", "e_t2"]
+        .iter()
+        .map(|e| mention(e))
+        .collect();
+    let relations = vec![
+        rel("e_dup", "e_sink"),
+        rel("e_dup", "e_sink"),
+        rel("e_dup", "e_sink"),
+        rel("e_dup", "e_sink"),
+        rel("e_dup", "e_sink"),
+        rel("e_true", "e_t1"),
+        rel("e_true", "e_t2"),
+    ];
+    store
+        .store_intelligence("d1", &entities, &mentions, &relations)
+        .await
+        .unwrap();
+
+    let g = store.graph(None, 1).await.unwrap();
+    assert_eq!(g.nodes.len(), 1);
+    assert_eq!(
+        g.nodes[0].name, "TrueHub",
+        "the top-1 slot must go to the entity with the most DEDUPED edges, got: {:?}",
+        g.nodes[0]
+    );
+    // Rendered degree is within-the-returned-subgraph (edges need BOTH
+    // endpoints in the node set — pinned by
+    // graph_dedupes_edges_weights_and_recomputes_degree). With limit=1 the
+    // targets fall outside the view, so the displayed degree is 0; the
+    // SELECTION still ran on deduped degree 2 vs 1, which is what this test
+    // pins.
+    assert_eq!(
+        g.nodes[0].degree, 0,
+        "within-view degree with no co-selected neighbours"
+    );
+}
