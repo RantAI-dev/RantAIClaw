@@ -110,8 +110,7 @@ or use a TEI sidecar to speed up the ingest pass.
 ## What this test does NOT cover
 
 - Reranker behavior — Phase 8 has dedicated tests.
-- Query expansion / contextual retrieval / standalone query — Phase 7
-  has dedicated tests.
+- Query expansion / contextual retrieval — Phase 7 has dedicated tests.
 - `enumerate`, `followup`, and `oos` query kinds in the fixture.
 - TS-vs-Rust head-to-head comparison. The TS retriever runs against a
   live Postgres+pgvector corpus that we don't replicate locally;

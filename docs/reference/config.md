@@ -769,7 +769,7 @@ Gateway config API (for the management console; key values are never returned):
 | `KB_QUERY_EXPANSION_ENABLED` | `false` | LLM-generated paraphrases of the query before retrieval |
 | `KB_QUERY_EXPANSION_MODEL` | `openai/gpt-4.1-nano` | Model used for paraphrase generation |
 | `KB_QUERY_EXPANSION_PARAPHRASES` | `3` | Number of paraphrases per query |
-| `KB_CONTEXTUAL_RETRIEVAL_ENABLED` | `false` | Anthropic-style contextual prefix prepended to each chunk during ingest |
+| `KB_CONTEXTUAL_RETRIEVAL_ENABLED` | `false` | Anthropic-style contextual prefix prepended to each chunk during ingest. Costs one chat call per ingested document and needs `OPENROUTER_API_KEY` in the environment (fail-soft: without it, chunks index without prefixes) |
 | `KB_CONTEXTUAL_RETRIEVAL_MODEL` | `openai/gpt-4.1-nano` | Model used for contextual prefix generation |
 
 ### Reranker
@@ -799,7 +799,7 @@ Opt-in second-stage ranker over the top-`KB_RERANK_INITIAL_K` candidates.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `KB_OPENROUTER_CHAT_URL` | `https://openrouter.ai/api/v1/chat/completions` | Chat-completions endpoint shared by query expansion, contextual retrieval, and standalone-query rewriting |
+| `KB_OPENROUTER_CHAT_URL` | `https://openrouter.ai/api/v1/chat/completions` | Chat-completions endpoint shared by query expansion and contextual retrieval |
 | `OPENROUTER_API_KEY` | unset | Fallback bearer for any KB endpoint whose per-endpoint key is empty |
 
 ### Document Intelligence

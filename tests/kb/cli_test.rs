@@ -613,3 +613,81 @@ async fn kb_ingest_embeds_metadata_prefixed_text() {
         "stored embedding_model must carry the recipe tag, got: {model}"
     );
 }
+
+/// Plan 091: with contextual retrieval enabled, the LLM-generated prefix
+/// must reach the embedding input. The prefix token appears nowhere in the
+/// document — only the stubbed chat endpoint emits it, so finding it in the
+/// embedding request proves the whole chain: chat call -> metadata ->
+/// prepare_chunk_for_embedding -> embedder.
+#[tokio::test]
+async fn kb_ingest_contextual_prefix_reaches_the_embedding() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // Chat endpoint: one situating sentence for the single chunk.
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [ { "message": { "content": "[\"ZorbluqContext situates this chunk\"]" } } ]
+        })))
+        .mount(&server)
+        .await;
+    // Embedding endpoint on a distinct path.
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [1.0, 0.0, 0.0, 0.0] } ]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let md = tmp.path().join("doc.md");
+    std::fs::write(&md, "# Plain Title\nBody text with nothing special.").unwrap();
+    let uri = server.uri();
+    let embed_url = format!("{uri}/embed");
+    let chat_url = format!("{uri}/chat");
+    let mock_env = [
+        ("KB_EMBEDDING_BASE_URL", embed_url.as_str()),
+        ("KB_OPENROUTER_CHAT_URL", chat_url.as_str()),
+        ("KB_CONTEXTUAL_RETRIEVAL_ENABLED", "true"),
+        // contextual.rs reads the key from env directly (plan 108 caveat).
+        ("OPENROUTER_API_KEY", "rantaiclaw_test_key"),
+    ];
+
+    let (code, stdout, stderr) = run_kb_with_env(&db, &["ingest", md.to_str().unwrap()], &mock_env);
+    assert_eq!(
+        code, 0,
+        "ingest must succeed: stdout={stdout} stderr={stderr}"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let embed_bodies: Vec<String> = requests
+        .iter()
+        .filter(|r| r.url.path().ends_with("/embed"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(!embed_bodies.is_empty(), "embedder must have been called");
+    assert!(
+        embed_bodies
+            .iter()
+            .any(|b| b.contains("Context: ZorbluqContext situates this chunk")),
+        "the contextual prefix must reach the embedding input, got: {embed_bodies:?}"
+    );
+
+    // And it must be persisted on the chunk row (indexing-time enrichment).
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let stored: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chunk WHERE metadata_json LIKE '%ZorbluqContext%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored >= 1,
+        "contextual prefix must be stored in chunk metadata"
+    );
+}
