@@ -1111,6 +1111,14 @@ impl Default for ComposioConfig {
 /// stable across feature sets.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct KnowledgeConfig {
+    /// Whether the Knowledge Base is active. `false` (the default) means the
+    /// agent is not told the KB exists, the `/api/v1/kb/*` routes report
+    /// `kb_disabled`, and the console shows an activation screen. Turning it
+    /// off does NOT clear the credentials below — reactivation is one click.
+    /// Deleting a key is a separate, explicit action. (Named `enabled`, not
+    /// login/logout — `login` is already a provisioner name.)
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default)]
     pub embedding_api_key: Option<String>,
     #[serde(default)]
