@@ -145,6 +145,7 @@ fn test_cfg() -> KbConfig {
         query_embed_cache_ttl_ms: 60_000,
         // Default points at the public URL; per-test we overwrite to
         // `server.uri()` so we don't have to set KB_OPENROUTER_CHAT_URL.
+        vision_model: "rantaiclaw_test_vision_model/x".into(),
         chat_api_key: String::new(),
         rerank_api_key: String::new(),
         openrouter_chat_url: "http://localhost".into(),

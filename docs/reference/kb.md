@@ -218,6 +218,54 @@ When `--features kb` is enabled **and** a `kb.db` exists at the resolved path, r
 No MCP server, tool registration, or schema declaration is required — the agent uses its existing `shell` capability with the standard policy + autonomy gates. If the autonomy preset doesn't permit `rantaiclaw` in the shell allowlist, the agent simply can't reach the KB. Operators can either add `rantaiclaw` to `[autonomy].allowed_commands` or implement a dedicated tool.
 
 
+
+## Model rules (embedding, extraction, vision)
+
+The rules an operator needs to pick or change a model safely. Every model
+knob is env-driven; `config.toml`'s `[knowledge]` section carries only
+`enabled` and credentials.
+
+### Embedding models and dimensions
+
+The embedding model and `KB_EMBEDDING_DIM` are a **pair** — the vector
+table's width is fixed at database creation, and a mismatched dimension is
+refused at open (no in-place migration). Known-good pairs:
+
+| Model | Dim | Endpoint shape |
+|---|---|---|
+| `qwen/qwen3-embedding-8b` (default) | `4096` | OpenRouter `/api/v1/embeddings` (verified live) |
+| `openai/text-embedding-3-small` | `1536` | OpenAI-shaped / TEI |
+| `openai/text-embedding-3-large` | `3072` | OpenAI-shaped / TEI |
+
+Any OpenAI-shaped or TEI endpoint works via `KB_EMBEDDING_BASE_URL`; the dim
+must match whatever the model actually emits.
+
+### Changing the embedding model — the safe procedure
+
+1. Set `KB_EMBEDDING_MODEL` and the matching `KB_EMBEDDING_DIM` together.
+2. **Same dim as before**: run `rantaiclaw kb re-embed --include-current` —
+   every chunk is re-embedded and re-tagged; `kb drift` then reports
+   `in_sync`. The stored tag carries the input-recipe suffix (`+meta1`), so
+   drift can also tell a pre-recipe corpus from a current one.
+3. **Different dim**: there is no in-place migration — the open is refused
+   with an error naming both dims. Move `kb.db` aside and re-ingest.
+
+### Extraction and vision models
+
+| Var | Default | Meaning |
+|---|---|---|
+| `KB_EXTRACT_PRIMARY` | `smart` | PDF extractor: `unpdf` \| `mineru` \| `hybrid` \| `smart`, or an OpenRouter vision model id (must contain `/`; a bare-word typo fails config load naming the options) |
+| `KB_EXTRACT_FALLBACK` | `unpdf` | Extractor used when the primary errors |
+| `KB_EXTRACT_SMART_FALLBACK` | model id | Where `smart` routes scanned pages |
+| `KB_VISION_MODEL` | `openai/gpt-5-mini` | Model for single-image ingestion (posts to the vision chat endpoint) |
+| `KB_INTELLIGENCE_MODEL` | `openai/gpt-4.1-nano` | Entity/relation extraction |
+| `KB_RERANK_MODEL` | provider-specific | Reranker model (`KB_RERANK_PROVIDER` picks the transport) |
+| `KB_CONTEXTUAL_RETRIEVAL_MODEL` | `openai/gpt-4.1-nano` | Ingest-time contextual prefixes |
+| `KB_QUERY_EXPANSION_MODEL` | `openai/gpt-4.1-nano` | Query paraphrase generation |
+
+Local OCR for single images is a build feature (`kb-ocr`), not a model knob —
+see [OCR](#ocr-scanned-documents) below.
+
 ## OCR (scanned documents)
 
 What handles scanned content today:

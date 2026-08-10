@@ -47,6 +47,7 @@ fn make_kb_cfg(vision_base_url: String) -> KbConfig {
         embed_concurrency: 2,
         query_embed_cache_size: 8,
         query_embed_cache_ttl_ms: 60_000,
+        vision_model: "rantaiclaw_test_vision_model/x".into(),
         chat_api_key: String::new(),
         rerank_api_key: String::new(),
         openrouter_chat_url: "http://localhost".into(),
@@ -282,6 +283,13 @@ async fn process_image_makes_openrouter_vision_call() {
         .clone()
         .expect("captured request body");
     // Walk down to the image_url content block.
+    // Plan 113: the vision model is a config knob now — the configured
+    // value must reach the request body (test cfg pins a distinctive id).
+    assert_eq!(
+        captured["model"].as_str(),
+        Some("rantaiclaw_test_vision_model/x"),
+        "configured vision_model must reach the request: {captured}"
+    );
     let messages = captured["messages"].as_array().expect("messages array");
     let content_blocks = messages[0]["content"]
         .as_array()

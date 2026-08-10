@@ -295,6 +295,7 @@ fn vision_cfg(base_url: String) -> KbConfig {
         embed_concurrency: 2,
         query_embed_cache_size: 8,
         query_embed_cache_ttl_ms: 60_000,
+        vision_model: "rantaiclaw_test_vision_model/x".into(),
         chat_api_key: String::new(),
         rerank_api_key: String::new(),
         openrouter_chat_url: "http://localhost".into(),
@@ -919,4 +920,31 @@ async fn measure_pdf_splitter_clone_cost() {
         elapsed / segs.len().max(1) as u32
     );
     assert_eq!(segs.len(), 8);
+}
+
+#[test]
+fn build_extractor_rejects_bare_word_typo() {
+    // Plan 113: a typo'd sentinel (`unpfd`) used to fall through the
+    // catch-all into the vision extractor and surface later as a runtime
+    // API error. Every OpenRouter model id contains '/', so a bare word is
+    // a config error naming the options.
+    use rantaiclaw::kb::extract::build_extractor;
+    let mut cfg = vision_cfg("http://127.0.0.1:1/unused".into());
+    cfg.extract_primary = "unpfd".into();
+    let err = match build_extractor(&cfg, "unpfd") {
+        Err(e) => e,
+        Ok(_) => panic!("bare-word typo must be refused"),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("unpfd"), "names the offender: {msg}");
+    assert!(
+        msg.contains("unpdf") && msg.contains("smart"),
+        "names the valid sentinels: {msg}"
+    );
+
+    // Control: a real model id still routes to the vision extractor.
+    assert!(
+        build_extractor(&cfg, "openai/gpt-4.1-nano").is_ok(),
+        "a provider/model id must still construct the vision extractor"
+    );
 }
