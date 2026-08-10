@@ -129,8 +129,12 @@ struct Harness {
 }
 
 fn build_state(require_pairing: bool, tokens: &[String]) -> AppState {
+    // The KB is off by default (plan 102); these tests exercise the KB API
+    // itself, so the harness activates it explicitly.
+    let mut cfg = Config::default();
+    cfg.knowledge.enabled = true;
     AppState {
-        config: Arc::new(Mutex::new(Config::default())),
+        config: Arc::new(Mutex::new(cfg)),
         config_fingerprint: Arc::new(Mutex::new("test".to_string())),
         provider: Arc::new(MockProvider),
         model: "test-model".into(),
@@ -1182,4 +1186,65 @@ async fn re_extract_success_still_returns_200_with_zero_failed() {
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(body["failed_chunks"], 0, "{body}");
     assert!(body["entities"].as_u64().unwrap() >= 1, "{body}");
+}
+
+#[tokio::test]
+async fn kb_routes_report_disabled_when_turned_off() {
+    // Plan 104: enabled = false must answer kb_disabled on every route —
+    // checked in ensure_kb_ctx so all 12 routes share the one gate.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().expect("tempdir");
+    std::env::set_var("KB_DB_PATH", tmp.path().join("kb.db"));
+    std::env::set_var("KB_EMBEDDING_DIM", "4");
+    std::env::set_var("KB_EMBEDDING_API_KEY", "test-embedding-key");
+    api::clear_kb_ctx().await;
+
+    let mut state = build_state(false, &[]);
+    {
+        let mut cfg = state.config.lock();
+        cfg.knowledge.enabled = false;
+    }
+    let app: Router = Router::new().merge(api::router()).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resp = reqwest::get(format!("http://{addr}/api/v1/kb/documents"))
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 503);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"], "kb_disabled", "{body}");
+}
+
+#[tokio::test]
+async fn kb_enabled_without_key_still_reports_not_configured() {
+    // Control for the gate: the two 503 states must stay distinguishable —
+    // a gate that swallowed every error into kb_disabled would pass the
+    // test above and break the console's screens (plan 106).
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().expect("tempdir");
+    std::env::set_var("KB_DB_PATH", tmp.path().join("kb.db"));
+    std::env::set_var("KB_EMBEDDING_DIM", "4");
+    // No key anywhere.
+    std::env::remove_var("KB_EMBEDDING_API_KEY");
+    std::env::remove_var("OPENROUTER_API_KEY");
+    api::clear_kb_ctx().await;
+
+    let state = build_state(false, &[]); // enabled = true via harness
+    let app: Router = Router::new().merge(api::router()).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resp = reqwest::get(format!("http://{addr}/api/v1/kb/documents"))
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 503);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"], "kb_not_configured", "{body}");
 }

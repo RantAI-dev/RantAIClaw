@@ -174,13 +174,29 @@ async fn ensure_kb_ctx(state: &crate::gateway::AppState) -> Result<Arc<KbContext
     let path = super::cli::resolve_kb_db_path();
     // parking_lot guard is !Send — clone keys inside a scoped block, drop the
     // guard before the async build below.
-    let (emb, vis) = {
+    let (enabled, emb, vis) = {
         let c = state.config.lock();
         (
+            c.knowledge.enabled,
             c.knowledge.embedding_api_key.clone(),
             c.knowledge.vision_api_key.clone(),
         )
     };
+    // The operator's off switch (plan 104). Checked here — every handler
+    // calls ensure_kb_ctx, so one check covers all 12 routes and cannot be
+    // forgotten on a new one — and deliberately NOT at the gateway merge
+    // site: the KB test harness builds its own router and a gate in
+    // gateway/mod.rs would never be exercised by these tests. Sits BEFORE
+    // the cache lookup so a disabled KB never serves a cached context.
+    // Distinct from kb_not_configured (no key): the console renders
+    // different screens for the two states.
+    if !enabled {
+        return Err(ApiError::service_unavailable(
+            "kb_disabled",
+            "The Knowledge Base is turned off. Activate it in Configuration →              Knowledge Base."
+                .into(),
+        ));
+    }
     let mut guard = KB_CTX.lock().await;
     if let Some(cached) = guard.as_ref() {
         if cached.path == path {
