@@ -345,29 +345,97 @@ impl SqliteStore {
             // in vector-store.ts:71-82.
             let allowed_doc_ids = resolve_allowed_documents(&conn, &filter)?;
 
-            // Over-fetch from vec0 then post-filter in Rust. vec0's MATCH
-            // operator does not accept arbitrary WHERE clauses on joined
-            // tables, so we pull a larger KNN window and filter afterwards.
-            // Heuristic factor of 4 keeps the result set bounded under
-            // typical document/category filters.
-            let knn_limit = (limit_i.saturating_mul(4)).max(limit_i).max(8);
-
-            let mut stmt = conn.prepare(
-                "SELECT v.rowid, v.distance
-                 FROM chunk_vec v
-                 WHERE v.embedding MATCH ?1 AND k = ?2
-                 ORDER BY v.distance",
-            )?;
-            let mut rows = stmt.query(params![query_bytes, knn_limit])?;
+            // Filtered searches push the constraint INTO the KNN query via
+            // sqlite-vec's `rowid IN (...)` support (available in the linked
+            // 0.1.9; the Cargo pin "0.1" resolves there). The old shape —
+            // fetch a limit*4 global window, post-filter in Rust — returned
+            // ZERO results whenever a small group's chunks all ranked
+            // outside the global top-K (the normal case for a small KB in a
+            // large corpus, plan 101). Restricting the scan to the allowed
+            // rowids makes recall exact, not merely wider.
+            //
+            // The rowid list is bounded by the allowed documents' chunk
+            // count; a genuinely huge scope logs at debug and still runs —
+            // sqlite handles long IN lists fine, and correctness beats a
+            // silent truncation.
+            let allowed_rowids: Option<Vec<i64>> = match &allowed_doc_ids {
+                None => None,
+                Some(allowed) => {
+                    let mut ids: Vec<i64> = Vec::new();
+                    {
+                        // Soft-deleted parents excluded here so k = limit is
+                        // exact: their chunks stay in chunk_vec and would
+                        // otherwise occupy KNN slots only to be dropped by
+                        // the join below.
+                        let mut stmt = conn.prepare(
+                            "SELECT c.rowid, c.document_id FROM chunk c
+                             JOIN document d ON d.id = c.document_id
+                             WHERE d.deleted_at IS NULL",
+                        )?;
+                        let mut rows = stmt.query([])?;
+                        while let Some(row) = rows.next()? {
+                            let doc: String = row.get(1)?;
+                            if allowed.contains(&doc) {
+                                ids.push(row.get(0)?);
+                            }
+                        }
+                    }
+                    tracing::debug!(
+                        target: "kb::store",
+                        candidate_rowids = ids.len(),
+                        "vector search scoped to allowed rowids"
+                    );
+                    Some(ids)
+                }
+            };
 
             let mut hits: Vec<(i64, f32)> = Vec::new();
-            while let Some(row) = rows.next()? {
-                let rid: i64 = row.get(0)?;
-                let dist: f32 = row.get(1)?;
-                hits.push((rid, dist));
+            match &allowed_rowids {
+                Some(ids) if ids.is_empty() => {
+                    // Scope resolves to nothing — the KNN query would error
+                    // on an empty IN (); the honest result is no hits.
+                }
+                Some(ids) => {
+                    let placeholders = vec!["?"; ids.len()].join(",");
+                    let sql = format!(
+                        "SELECT v.rowid, v.distance
+                         FROM chunk_vec v
+                         WHERE v.embedding MATCH ?1 AND k = ?2
+                           AND v.rowid IN ({placeholders})
+                         ORDER BY v.distance"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+                        vec![Box::new(query_bytes.clone()), Box::new(limit_i)];
+                    for id in ids {
+                        params_vec.push(Box::new(*id));
+                    }
+                    let param_refs: Vec<&dyn rusqlite::ToSql> =
+                        params_vec.iter().map(|b| b.as_ref()).collect();
+                    let mut rows = stmt.query(param_refs.as_slice())?;
+                    while let Some(row) = rows.next()? {
+                        hits.push((row.get(0)?, row.get(1)?));
+                    }
+                }
+                None => {
+                    // Unfiltered: keep the pre-existing over-fetch — soft-
+                    // deleted chunks remain in chunk_vec and are dropped by
+                    // the join below, so a bare k = limit could return fewer
+                    // than limit live results. Same window as before this
+                    // change; results still truncate at `limit`.
+                    let knn_limit = (limit_i.saturating_mul(4)).max(limit_i).max(8);
+                    let mut stmt = conn.prepare(
+                        "SELECT v.rowid, v.distance
+                         FROM chunk_vec v
+                         WHERE v.embedding MATCH ?1 AND k = ?2
+                         ORDER BY v.distance",
+                    )?;
+                    let mut rows = stmt.query(params![query_bytes, knn_limit])?;
+                    while let Some(row) = rows.next()? {
+                        hits.push((row.get(0)?, row.get(1)?));
+                    }
+                }
             }
-            drop(rows);
-            drop(stmt);
 
             // Join back to chunk + document and apply filters.
             let mut chunk_stmt = conn.prepare(
