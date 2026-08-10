@@ -1296,6 +1296,22 @@ async fn ingest(
         .ok_or_else(|| ApiError::bad_request("multipart 'file' field is required".into()))?;
     let original_name = file_name.unwrap_or_else(|| "upload.md".to_string());
 
+    // Validate group ids BEFORE the expensive work (staging, extraction,
+    // embedding). The store's add_document_to_group also validates (plan
+    // 099), but failing there would leave an already-persisted document
+    // behind — a worse outcome than a typo costing nothing up front.
+    for group_id in &groups {
+        if ctx
+            .store
+            .get_group(group_id)
+            .await
+            .map_err(ApiError::from)?
+            .is_none()
+        {
+            return Err(ApiError::not_found(format!("group {group_id} not found")).into());
+        }
+    }
+
     // Stage the upload to a per-request tempdir so `process_file` can
     // dispatch by extension. We build the dir under `std::env::temp_dir()`
     // with a UUID suffix so concurrent requests don't collide, and clean

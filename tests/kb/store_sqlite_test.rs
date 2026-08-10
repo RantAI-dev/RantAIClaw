@@ -658,3 +658,39 @@ async fn reopen_with_same_dim_succeeds() {
         .await
         .expect("same-dim reopen must succeed");
 }
+
+#[tokio::test]
+async fn membership_rejects_nonexistent_group_and_document() {
+    // Plan 099: PRAGMA foreign_keys is off, so without explicit checks a
+    // membership row pointing at nothing inserts fine — inflating
+    // document_count while list_group_documents shows nothing.
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::KbStore;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let doc = sample_doc("rantaiclaw_doc_m", "Doc M");
+    store.create_document(&doc).await.unwrap();
+
+    let err = store
+        .add_document_to_group(&doc.id.0, "no_such_group")
+        .await
+        .expect_err("attaching to a nonexistent group must fail");
+    assert!(err.to_string().contains("no_such_group"), "{err}");
+
+    let group = store.create_group("Group M", None, None).await.unwrap();
+    let err = store
+        .add_document_to_group("no_such_doc", &group.id)
+        .await
+        .expect_err("attaching a nonexistent document must fail");
+    assert!(err.to_string().contains("no_such_doc"), "{err}");
+
+    // Valid pair still works (control — group_lifecycle also covers this).
+    store
+        .add_document_to_group(&doc.id.0, &group.id)
+        .await
+        .expect("valid membership must still insert");
+}
