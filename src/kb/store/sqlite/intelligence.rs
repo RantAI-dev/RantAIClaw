@@ -265,7 +265,8 @@ impl IntelligenceStore for SqliteStore {
             // documents via the `document_group` membership table.
             let node_sql = if group_id.is_some() {
                 "SELECT e.id, e.name, e.type,
-                        COUNT(DISTINCT r.id) AS degree,
+                        COUNT(DISTINCT r.source_entity_id || char(31) || r.target_entity_id
+                              || char(31) || r.relation_type) AS degree,
                         COUNT(DISTINCT m.document_id) AS doc_count
                  FROM entity e
                  LEFT JOIN entity_mention m ON m.entity_id = e.id
@@ -282,7 +283,8 @@ impl IntelligenceStore for SqliteStore {
                  LIMIT ?1"
             } else {
                 "SELECT e.id, e.name, e.type,
-                        COUNT(DISTINCT r.id) AS degree,
+                        COUNT(DISTINCT r.source_entity_id || char(31) || r.target_entity_id
+                              || char(31) || r.relation_type) AS degree,
                         COUNT(DISTINCT m.document_id) AS doc_count
                  FROM entity e
                  LEFT JOIN entity_mention m ON m.entity_id = e.id
@@ -344,8 +346,11 @@ impl IntelligenceStore for SqliteStore {
                 })
                 .collect();
 
-            // degree = incident DEDUPED edges (overwrites the SQL
-            // COUNT(DISTINCT r.id) ordering key used for node selection above).
+            // degree = incident DEDUPED edges. The SQL above orders node
+            // selection by the same deduplicated (source, target, type)
+            // definition; this Rust pass recomputes it exactly for the
+            // returned node set (self-loops counted once, matching the edge
+            // dedup), so the number shown is the number the cut was made on.
             let mut degree: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
             for e in &edges {
