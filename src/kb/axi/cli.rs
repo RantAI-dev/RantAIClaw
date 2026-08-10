@@ -136,6 +136,16 @@ pub enum KbCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show whether the Knowledge Base is active and whether a key resolves.
+    Status {
+        /// Output JSON instead of TOON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Activate the Knowledge Base. Refuses when no embedding key resolves.
+    Enable,
+    /// Deactivate the Knowledge Base. Credentials are kept.
+    Disable,
     /// Show the cross-document knowledge graph (top entities by degree).
     Graph {
         /// Filter to a knowledge base group's documents
@@ -155,11 +165,36 @@ impl KbCommand {
     /// - `Ok(0)` — success.
     /// - `Ok(1)` — operational failure already reported on stdout.
     /// - `Err(KbError)` — internal failure; caller decides how to render.
+    ///
+    /// Plain-data parameters rather than `&Config`: `main.rs` compiles the
+    /// config module as its own crate, so the bin's `Config` and the lib's
+    /// `Config` are distinct types even though they share a source file.
     pub async fn run(
         self,
+        knowledge_enabled: bool,
         embedding_api_key: Option<&str>,
         vision_api_key: Option<&str>,
     ) -> KbResult<i32> {
+        // Status/Enable/Disable never open the store (opening rewrites
+        // kb_meta — plan 098) and must work while the KB is off.
+        match &self {
+            Self::Status { json } => {
+                return cmd_status_sync(knowledge_enabled, embedding_api_key, vision_api_key, *json)
+            }
+            Self::Enable => return cmd_set_enabled(true).await,
+            Self::Disable => return cmd_set_enabled(false).await,
+            _ => {}
+        }
+        // The operator's off switch (plans 102/104/107): data subcommands
+        // answer a parseable TOON error + exit 1 (the AXI contract) instead
+        // of a confusing empty result. Mirrors the HTTP kb_disabled gate.
+        if !knowledge_enabled {
+            print_error_toon(
+                "kb_disabled",
+                "Knowledge Base is off. Run `rantaiclaw kb enable`.",
+            );
+            return Ok(1);
+        }
         let cfg = KbConfig::from_env_with_keys(embedding_api_key, vision_api_key)?;
         // Build the concrete store once, then alias it through both trait
         // views. `SqliteStore` implements `KbStore` and `IntelligenceStore`;
@@ -205,6 +240,8 @@ impl KbCommand {
                 batch_size,
                 json,
             } => cmd_re_embed(&cfg, store, include_current, dry_run, batch_size, json).await,
+            // Handled above before the store was opened.
+            Self::Status { .. } | Self::Enable | Self::Disable => unreachable!(),
             Self::Intelligence { document_id, json } => {
                 let intel: Arc<dyn IntelligenceStore> = concrete;
                 cmd_intelligence(intel, document_id, json).await
@@ -828,6 +865,131 @@ async fn open_store(cfg: &KbConfig) -> KbResult<Arc<SqliteStore>> {
 ///
 /// Per AXI principle 6, everything goes to stdout — operators grep one
 /// stream, agents parse one stream.
+/// `kb status` — no store open (that would rewrite kb_meta, plan 098):
+/// db_path existence + a read-only row count instead.
+fn cmd_status_sync(
+    enabled: bool,
+    embedding_api_key: Option<&str>,
+    vision_api_key: Option<&str>,
+    json: bool,
+) -> KbResult<i32> {
+    let emb_cfg = embedding_api_key.unwrap_or_default();
+    let source = if std::env::var("KB_EMBEDDING_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        "env"
+    } else if !emb_cfg.is_empty() {
+        "config"
+    } else if std::env::var("OPENROUTER_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        "openrouter_env"
+    } else {
+        "none"
+    };
+    let vision_configured = vision_api_key.map(|v| !v.is_empty()).unwrap_or(false)
+        || std::env::var("KB_EXTRACT_VISION_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+    let db_path = resolve_kb_db_path();
+    // Read-only count: never SqliteStore::open here.
+    let document_count: Option<i64> = std::path::Path::new(&db_path)
+        .exists()
+        .then(|| {
+            rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM document WHERE deleted_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok()
+            })
+        })
+        .flatten();
+
+    let row = serde_json::json!({
+        "enabled": enabled,
+        "embedding_configured": source != "none",
+        "vision_configured": vision_configured,
+        "source": source,
+        "db_path": db_path.display().to_string(),
+        "document_count": document_count,
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&row)?);
+    } else {
+        print!(
+            "{}",
+            super::format_toon(
+                "status",
+                &[row],
+                &[
+                    "enabled",
+                    "embedding_configured",
+                    "vision_configured",
+                    "source",
+                    "db_path",
+                    "document_count",
+                ],
+            )
+        );
+    }
+    Ok(0)
+}
+
+/// `kb enable` / `kb disable` — the ONLY KbCommand arms that write config.
+/// Load fresh from disk, mutate, save (same discipline as the gateway's
+/// PUT): persisting a stale in-memory snapshot would clobber concurrent
+/// edits. Enable refuses when no embedding key resolves anywhere, so it
+/// cannot persist a config the gateway then 503s on (plan 103 agreement).
+async fn cmd_set_enabled(enabled: bool) -> KbResult<i32> {
+    let mut fresh = crate::config::Config::load_or_init()
+        .await
+        .map_err(|e| crate::kb::KbError::Other(format!("config load: {e}")))?;
+    if enabled {
+        let key_resolves = fresh
+            .knowledge
+            .embedding_api_key
+            .as_deref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+            || std::env::var("KB_EMBEDDING_API_KEY")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+            || std::env::var("OPENROUTER_API_KEY")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        if !key_resolves {
+            print_error_toon(
+                "no_credential",
+                "cannot activate the knowledge base without an embedding key;                  run `rantaiclaw setup knowledge` or set KB_EMBEDDING_API_KEY",
+            );
+            return Ok(1);
+        }
+    }
+    fresh.knowledge.enabled = enabled;
+    fresh
+        .save()
+        .await
+        .map_err(|e| crate::kb::KbError::Other(format!("config save: {e}")))?;
+    let row = serde_json::json!({
+        "enabled": enabled,
+        "note": if enabled { "knowledge base activated" } else { "deactivated; credentials kept" },
+    });
+    print!(
+        "{}",
+        super::format_toon("result", &[row], &["enabled", "note"])
+    );
+    Ok(0)
+}
+
 fn print_error_toon(code: &str, message: &str) {
     let row = serde_json::json!({ "code": code, "message": message });
     print!(

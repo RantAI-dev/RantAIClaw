@@ -2275,6 +2275,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "kb")]
         Some(Commands::Kb { cmd }) => match cmd
             .run(
+                config.knowledge.enabled,
                 config.knowledge.embedding_api_key.as_deref(),
                 config.knowledge.vision_api_key.as_deref(),
             )

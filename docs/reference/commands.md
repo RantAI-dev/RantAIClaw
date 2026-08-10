@@ -421,6 +421,20 @@ Re-embed chunks using the currently-configured embedding model.
 | `--batch-size <n>` | Batch size for re-embed work | `100` |
 | `--json` | Emit JSON instead of TOON | `false` |
 
+#### `kb status`
+
+Show whether the Knowledge Base is active, whether a key resolves (and from where), the database path, and the live document count. Never opens the store for writing.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--json` | Emit JSON instead of TOON | `false` |
+
+#### `kb enable` / `kb disable`
+
+Toggle `[knowledge].enabled` and persist it. `enable` refuses when no embedding key resolves anywhere (config or env) — it will not persist a config the gateway then rejects. `disable` keeps the credentials, so re-activation is one command. While disabled, the data subcommands (`search`, `ingest`, `list`, …) answer a `kb_disabled` TOON error with exit 1.
+
+In the TUI, `/kb` shows the same status and `/kb enable` / `/kb disable` toggle it.
+
 ## Validation Tip
 
 To verify docs against your current binary quickly:
