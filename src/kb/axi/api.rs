@@ -9,12 +9,14 @@
 //! requests pass through.
 //!
 //! **KB context**: the heavy KB plumbing (config, sqlite-vec store, embedder)
-//! is built once per process via [`KB_CTX`], a [`OnceCell`]. The first request
-//! to land triggers initialization; subsequent requests share the same store
-//! handle and provider client. Init failures cache as `Err` and surface as
-//! 503 on every call until the process restarts — this is intentional: we
-//! fail fast rather than re-attempt on every webhook tick. Operators fix the
-//! env and bounce the gateway.
+//! is built lazily and cached in [`KB_CTX`], a mutex-held cell keyed on the
+//! resolved DB path AND a fingerprint of the resolved credentials. A key
+//! changed from any surface (gateway PUT, TUI wizard, hand-edited config,
+//! profile switch) is a cache miss and rebuilds on the next request; the
+//! gateway's PUT additionally calls [`clear_kb_ctx`] eagerly. Init failures
+//! cache as `Err` so a broken credential doesn't hammer the embed endpoint
+//! on every webhook tick — fixing the config (new fingerprint) or clearing
+//! the cache recovers without a restart.
 //!
 //! Feature-gated: the entire module is `#[cfg(feature = "kb")]` at the
 //! gateway-import level so non-KB builds never see these routes or pay the
@@ -153,14 +155,27 @@ pub(crate) struct KbContext {
     pub reranker: Option<Arc<dyn Reranker>>,
 }
 
-/// Cached entry — the resolved DB path acts as the cache key. When the
-/// path changes (only realistic in test bins that mutate `KB_DB_PATH`), the
-/// next request builds a fresh context. In production the path is stable
-/// for the gateway's lifetime, so the cache effectively pins one
-/// [`KbContext`].
+/// Cached entry — keyed on the resolved DB path plus a fingerprint of the
+/// resolved credentials. The gateway calls `clear_kb_ctx` on its own writes,
+/// but a key changed via the TUI wizard, a hand-edited config, or a profile
+/// switch would otherwise keep serving a context built with the old
+/// credential — including a cached `Err` (plan 105).
 struct CachedCtx {
     path: PathBuf,
+    /// Hash of the resolved credentials — a comparison token only; the keys
+    /// themselves are never stored here or logged.
+    cred_fingerprint: u64,
     ctx: Result<Arc<KbContext>, String>,
+}
+
+/// Cheap comparison token over the two optional keys. DefaultHasher is fine:
+/// this is change detection within one process, not a security boundary.
+fn cred_fingerprint(emb: Option<&str>, vis: Option<&str>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    emb.hash(&mut h);
+    vis.hash(&mut h);
+    h.finish()
 }
 
 /// Cache cell. Holding the cell behind a `tokio::sync::Mutex` rather than a
@@ -197,9 +212,10 @@ async fn ensure_kb_ctx(state: &crate::gateway::AppState) -> Result<Arc<KbContext
                 .into(),
         ));
     }
+    let fp = cred_fingerprint(emb.as_deref(), vis.as_deref());
     let mut guard = KB_CTX.lock().await;
     if let Some(cached) = guard.as_ref() {
-        if cached.path == path {
+        if cached.path == path && cached.cred_fingerprint == fp {
             return match &cached.ctx {
                 Ok(ctx) => Ok(Arc::clone(ctx)),
                 Err(msg) if msg.starts_with("kb_not_configured") => Err(
@@ -214,7 +230,11 @@ async fn ensure_kb_ctx(state: &crate::gateway::AppState) -> Result<Arc<KbContext
     // gateway, which clears the static.
     let outcome = build_ctx(&path, emb, vis).await;
     let snapshot = outcome.clone();
-    *guard = Some(CachedCtx { path, ctx: outcome });
+    *guard = Some(CachedCtx {
+        path,
+        cred_fingerprint: fp,
+        ctx: outcome,
+    });
     match snapshot {
         Ok(ctx) => Ok(ctx),
         Err(msg) if msg.starts_with("kb_not_configured") => {

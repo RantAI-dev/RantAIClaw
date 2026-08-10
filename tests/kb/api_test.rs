@@ -1248,3 +1248,48 @@ async fn kb_enabled_without_key_still_reports_not_configured() {
     let body: Value = resp.json().await.expect("json");
     assert_eq!(body["error"], "kb_not_configured", "{body}");
 }
+
+#[tokio::test]
+async fn key_change_in_state_config_rebuilds_ctx_without_explicit_clear() {
+    // Plan 105: the ctx cache was keyed on the DB path alone — a key changed
+    // via the TUI wizard / hand edit / profile switch kept serving a context
+    // built with the old credential, including a cached Err, until restart.
+    // The credential fingerprint makes such a change a cache miss.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().expect("tempdir");
+    std::env::set_var("KB_DB_PATH", tmp.path().join("kb.db"));
+    std::env::set_var("KB_EMBEDDING_DIM", "4");
+    // No key anywhere: the first request caches an Err.
+    std::env::remove_var("KB_EMBEDDING_API_KEY");
+    std::env::remove_var("OPENROUTER_API_KEY");
+    api::clear_kb_ctx().await;
+
+    let state = build_state(false, &[]);
+    let config = Arc::clone(&state.config);
+    let app: Router = Router::new().merge(api::router()).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resp = reqwest::get(format!("http://{addr}/api/v1/kb/documents"))
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 503, "no key -> not configured (cached Err)");
+
+    // Key arrives through config alone — the surface clear_kb_ctx does NOT
+    // cover. The next request must rebuild, not serve the cached Err.
+    {
+        let mut cfg = config.lock();
+        cfg.knowledge.embedding_api_key = Some("rantaiclaw_new_key".into());
+    }
+    let resp = reqwest::get(format!("http://{addr}/api/v1/kb/documents"))
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        200,
+        "a key change from any surface must invalidate the cached context"
+    );
+}

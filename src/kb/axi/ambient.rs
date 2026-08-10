@@ -18,12 +18,18 @@ use super::cli::resolve_kb_db_path;
 
 /// AXI ambient-context one-liner for the agent's system prompt.
 ///
-/// Returns `Some(text)` when a KB database is reachable at the resolved
-/// path (`KB_DB_PATH` env → active profile's `kb.db` → `./kb.db`). Returns `None`
-/// when no DB file is present — in that case the agent never learns
-/// about the capability and never shells out to it, which is the
-/// correct deny-by-default behavior.
-pub fn kb_ambient_context() -> Option<String> {
+/// Returns `Some(text)` when the operator has activated the Knowledge Base
+/// AND a database is reachable at the resolved path (`KB_DB_PATH` env →
+/// active profile's `kb.db` → `./kb.db`). Deliberately gated on intent
+/// rather than on the file alone: `kb.db` survives a credential clear, and a
+/// hint the agent cannot act on produces a failing shell call every turn
+/// (plan 105). The file check stays — an enabled KB with no database has
+/// nothing to search. On `None` the agent never learns about the capability
+/// and never shells out to it.
+pub fn kb_ambient_context(knowledge: &crate::config::KnowledgeConfig) -> Option<String> {
+    if !knowledge.enabled {
+        return None;
+    }
     let path = resolve_kb_db_path();
     if !Path::new(&path).exists() {
         return None;
