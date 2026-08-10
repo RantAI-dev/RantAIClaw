@@ -85,9 +85,12 @@ pub async fn process_image(
         }
         #[cfg(not(feature = "kb-ocr"))]
         {
-            // TODO(kb-ocr): same Ollama-OCR TODO as `process_pdf` in super.
             return Err(KbError::Other(
-                "OCR pipeline not yet implemented; set use_ocr_pipeline=false".into(),
+                "Local OCR for images needs a build with --features kb-ocr (plus \
+                 KB_EXTRACT_OCR_BASE_URL / KB_EXTRACT_OCR_MODEL). Without it, set \
+                 use_ocr_pipeline=false — images are read through the vision \
+                 extractor instead."
+                    .into(),
             ));
         }
     }
