@@ -819,10 +819,62 @@ async fn set_secrets(
 #[cfg(feature = "kb")]
 #[derive(serde::Deserialize)]
 struct KnowledgeBody {
+    /// Omitted leaves the current value — same contract as the key fields.
+    #[serde(default)]
+    enabled: Option<bool>,
     #[serde(default)]
     embedding_api_key: Option<String>,
     #[serde(default)]
     vision_api_key: Option<String>,
+}
+
+/// Probe the configured embedding endpoint with a one-token input so the
+/// probe exercises the REAL path (endpoint + model + key) a KB call will
+/// take. Returns `Err(message)` only on an explicit 4xx auth/validation
+/// rejection — a credential the provider rejects must not be saved (mirrors
+/// the `getMe` probe in `connect_telegram`). Transport errors are NOT fatal:
+/// an operator configuring the KB while offline must still be able to store
+/// a key. The message names the status only; never the key, never the
+/// upstream body.
+///
+/// Endpoint viability verified live (plan 103 open question): OpenRouter's
+/// `/api/v1/embeddings` serves the default `qwen/qwen3-embedding-8b`.
+#[cfg(feature = "kb")]
+async fn probe_embedding_key(kb_cfg: &crate::kb::KbConfig, key: &str) -> Result<(), String> {
+    let body = serde_json::json!({
+        "model": kb_cfg.embedding_model,
+        "input": ["ping"],
+    });
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // cannot even build a client — do not fail closed
+    };
+    match client
+        .post(&kb_cfg.embedding_base_url)
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_client_error() {
+                Err(format!(
+                    "embedding provider rejected the key (http {})",
+                    status.as_u16()
+                ))
+            } else {
+                // 2xx = valid; 5xx = provider trouble, not the key's fault.
+                Ok(())
+            }
+        }
+        // Offline/proxy/DNS: store the key; the KB call path will surface
+        // transport problems where they belong.
+        Err(_) => Ok(()),
+    }
 }
 
 /// Effective source of a resolved key, reported without revealing it.
@@ -857,6 +909,7 @@ async fn get_knowledge(
         cfg.knowledge.vision_api_key.as_deref(),
     );
     Ok(Json(json!({
+        "enabled": cfg.knowledge.enabled,
         "embedding_configured": emb_src != "none",
         "vision_configured": vis_src != "none",
         "source": emb_src,
@@ -891,6 +944,34 @@ async fn set_knowledge(
             Some(k.to_string())
         };
     }
+    if let Some(e) = body.enabled {
+        cfg.knowledge.enabled = e;
+    }
+
+    // Validate ONLY when this request would leave the KB enabled with a key
+    // — deactivating or clearing a key never makes a network call. A typo'd
+    // key used to persist happily and fail later as a 502 on every KB call,
+    // far from the action that caused it (plan 103).
+    if cfg.knowledge.enabled {
+        if let Some(key) = cfg
+            .knowledge
+            .embedding_api_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+        {
+            let kb_cfg = crate::kb::KbConfig::from_env_with_keys(Some(key), None)
+                .map_err(|e| err_400(format!("kb config: {e}")))?;
+            if let Err(msg) = probe_embedding_key(&kb_cfg, key).await {
+                return Err(err_400(msg));
+            }
+        } else if body.enabled == Some(true) {
+            // Turning ON with no key anywhere is an operator mistake worth
+            // stopping at the source.
+            return Err(err_400(
+                "cannot activate the knowledge base without an embedding key",
+            ));
+        }
+    }
     persist_and_swap(&state, cfg).await?;
     // New credentials invalidate any cached KB embedding/extraction context.
     // `clear_kb_ctx` is sufficient: the next KB request rebuilds the context
@@ -903,6 +984,7 @@ async fn set_knowledge(
     crate::kb::axi::clear_kb_ctx().await;
     let cfg = state.config.lock().clone();
     Ok(Json(json!({
+        "enabled": cfg.knowledge.enabled,
         "embedding_configured": cfg.knowledge.embedding_api_key.is_some(),
         "vision_configured": cfg.knowledge.vision_api_key.is_some(),
     })))
