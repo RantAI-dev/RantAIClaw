@@ -752,7 +752,7 @@ Gateway config API (for the management console; key values are never returned):
 | Env var | Default | Purpose |
 |---|---|---|
 | `KB_EMBEDDING_MODEL` | `qwen/qwen3-embedding-8b` | Embedding model ID |
-| `KB_EMBEDDING_DIM` | `4096` | Vector dimension; must match the chosen model |
+| `KB_EMBEDDING_DIM` | `4096` | Vector dimension; must match the chosen model. Fixed at database creation — changing it against an existing `kb.db` is refused (no in-place migration; start a new database and re-ingest) |
 | `KB_EMBEDDING_BASE_URL` | `https://openrouter.ai/api/v1/embeddings` | Embedding endpoint; point at a TEI sidecar for on-prem use |
 | `KB_EMBEDDING_API_KEY` | unset | Bearer for the embedding endpoint; falls back to `OPENROUTER_API_KEY` when empty |
 | `KB_EMBED_BATCH_SIZE` | `128` | Batch size for embedding requests |
