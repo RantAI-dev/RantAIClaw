@@ -975,3 +975,46 @@ async fn kb_ingest_missing_file_field_returns_400() {
         "detail should mention missing file: {body}"
     );
 }
+
+#[tokio::test]
+async fn kb_json_routes_reject_oversized_bodies() {
+    // Plan 087: the raised upload limit must apply to the POST /documents arm
+    // ONLY. Body extractors run before the in-handler auth check, so a raised
+    // limit on a JSON route would let an unauthenticated caller make the
+    // process buffer megabytes per request. The KB router enforces the same
+    // 64 KiB cap as the rest of /api/v1 on its JSON routes.
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let client = reqwest::Client::new();
+
+    // ~1 MiB query — far over the 64 KiB cap. Must be refused with 413
+    // before the handler (and its KB-context build) ever runs.
+    let big = "a".repeat(1024 * 1024);
+    let resp = client
+        .post(format!("{}/api/v1/kb/search", h.base_url))
+        .json(&serde_json::json!({ "query": big }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        413,
+        "oversized JSON body must be rejected by the KB router's default cap"
+    );
+
+    // Control: a small multipart upload on the exempted POST /documents arm
+    // must NOT hit the 413 path (it may fail later for other reasons — the
+    // assertion is only that the body limit did not reject it). Without this
+    // control, a mistake that shrinks every limit would pass the test above.
+    let form = reqwest::multipart::Form::new().text("title", "body-limit control");
+    let resp = client
+        .post(format!("{}/api/v1/kb/documents", h.base_url))
+        .multipart(form)
+        .send()
+        .await
+        .expect("request");
+    assert_ne!(
+        resp.status(),
+        413,
+        "the upload arm must keep its raised limit"
+    );
+}

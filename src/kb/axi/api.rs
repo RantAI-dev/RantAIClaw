@@ -32,7 +32,6 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use crate::gateway::AppState;
@@ -77,16 +76,32 @@ fn effective_graph_limit(requested: Option<usize>, default: usize) -> usize {
 /// Build the `/api/v1/kb/*` router. Merged into the main gateway router by
 /// `gateway::run_gateway` so it shares state and timeout layers.
 ///
-/// The gateway-wide [`RequestBodyLimitLayer`] (64 KiB) is too small for the
-/// ingest route (PDFs / office docs / large markdown). We disable the default
-/// body limit on this subtree and apply a larger per-route limit
-/// ([`KB_UPLOAD_MAX_BYTES`]). Read-only routes (search/list/get/drift) still
-/// receive small JSON bodies; the bigger limit is harmless because axum drops
-/// the body if it exceeds Content-Length before any handler is called.
+/// The gateway's 64 KiB body cap is deliberately NOT applied to this router
+/// (see the layer comment in `gateway::mod`), so the limit must be enforced
+/// here. Only the `POST /documents` upload arm gets the raised
+/// [`KB_UPLOAD_MAX_BYTES`]; every other KB route gets the same 64 KiB cap as
+/// the rest of `/api/v1` ([`crate::gateway::MAX_BODY_SIZE`]). The scope
+/// matters: body extractors run before the handler body, and `check_auth`
+/// lives in the handler body, so any route with a raised limit lets an
+/// unauthenticated caller make the process buffer that many bytes per
+/// request before the 401 is issued.
+///
+/// Mechanism: axum's [`DefaultBodyLimit`] is an extension the extractors
+/// consult, and a route-level value overrides the router-level one — the
+/// documented pattern for "one route with a larger limit". A nested
+/// tower-http `RequestBodyLimitLayer` pair would NOT work here: both wrap
+/// the body, so the smaller outer cap would reject uploads first.
 pub fn router() -> Router<AppState> {
+    // Raised body limit on the upload arm alone. `GET /documents` shares the
+    // path but not the exemption — layering the MethodRouter keeps the two
+    // apart without splitting the public route.
+    let documents_route = post(ingest)
+        .layer(DefaultBodyLimit::max(KB_UPLOAD_MAX_BYTES))
+        .merge(get(list));
+
     Router::new()
         .route("/api/v1/kb/search", post(search))
-        .route("/api/v1/kb/documents", post(ingest).get(list))
+        .route("/api/v1/kb/documents", documents_route)
         .route("/api/v1/kb/documents/{id}", get(get_doc).delete(delete_doc))
         .route("/api/v1/kb/groups", get(list_groups).post(create_group))
         .route(
@@ -112,8 +127,7 @@ pub fn router() -> Router<AppState> {
             post(re_extract_document),
         )
         .route("/api/v1/kb/graph", get(get_graph))
-        .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(KB_UPLOAD_MAX_BYTES))
+        .layer(DefaultBodyLimit::max(crate::gateway::MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(KB_REQUEST_TIMEOUT_SECS),
