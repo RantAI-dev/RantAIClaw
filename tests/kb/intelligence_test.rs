@@ -842,3 +842,53 @@ async fn store_intelligence_reingest_idempotent() {
         graph.nodes
     );
 }
+
+#[tokio::test]
+async fn relations_survive_entity_name_case_mismatch() {
+    // Plan 094: entity dedup lowercases via canonical_key, but relation
+    // wiring matched raw names — "techcorp" in a relation vs "TechCorp" in
+    // the entity list silently deleted the edge, with no counter and no log.
+    use async_trait::async_trait;
+    use rantaiclaw::kb::intelligence::extract::{EntityRelationExtractor, Extracted};
+    use rantaiclaw::kb::intelligence::extract_document_intelligence;
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use tempfile::TempDir;
+
+    struct CannedExtractor;
+    #[async_trait]
+    impl EntityRelationExtractor for CannedExtractor {
+        async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
+            Ok(Extracted {
+                entities: vec![
+                    (0, "Alice".into(), EntityType::Person, 0.9),
+                    (0, "TechCorp".into(), EntityType::Organization, 0.95),
+                ],
+                // The model refers to the same entities with different casing
+                // and stray punctuation in its relations array — the common
+                // real-world shape this plan fixes.
+                relations: vec![(
+                    "alice".into(),
+                    "techcorp.".into(),
+                    RelationType::WorksFor,
+                    0.85,
+                )],
+            })
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let summary =
+        extract_document_intelligence(&store, &CannedExtractor, "d_case", &["c0"], "exact")
+            .await
+            .unwrap();
+    assert_eq!(
+        summary.relations, 1,
+        "a casing/punctuation mismatch between entity and relation names must not drop the edge"
+    );
+    let (_entities, relations) = store.intelligence_for_document("d_case").await.unwrap();
+    assert_eq!(relations.len(), 1, "the relation row must be stored");
+}
