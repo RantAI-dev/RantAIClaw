@@ -178,6 +178,27 @@ fn sample_doc(id: &str, title: &str) -> Document {
 /// the TOON/JSON output the test asserts on. Each test also sets a fresh
 /// `HOME` to keep the binary's profile bootstrap out of the developer's
 /// real `~/.rantaiclaw/`.
+
+/// Plan 107: the KB data subcommands gate on `[knowledge].enabled`, and a
+/// fresh sandbox HOME yields a default (disabled) config. Each spawn writes
+/// an activated config into the sandbox so the e2e tests exercise the data
+/// paths, mirroring the api_test harness setting `enabled = true`.
+fn write_enabled_config(fake_home: &std::path::Path) {
+    let dir = fake_home.join(".rantaiclaw");
+    std::fs::create_dir_all(&dir).expect("create sandbox config dir");
+    // The three root fields are the schema's only required ones (same
+    // minimal shape as tests/fixtures/legacy_layout).
+    std::fs::write(
+        dir.join("config.toml"),
+        "schema_version = 18\n\
+         default_provider = \"openrouter\"\n\
+         default_model = \"rantaiclaw_test_model\"\n\
+         default_temperature = 0.7\n\
+         [knowledge]\nenabled = true\n",
+    )
+    .expect("write sandbox config");
+}
+
 fn run_kb(db_path: &PathBuf, args: &[&str]) -> (i32, String, String) {
     // Use the same parent as the DB for a profile dir so the binary's
     // "first-run profile bootstrap" doesn't touch the developer's HOME.
@@ -185,6 +206,7 @@ fn run_kb(db_path: &PathBuf, args: &[&str]) -> (i32, String, String) {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/tmp"));
+    write_enabled_config(&fake_home);
 
     let output = Command::new(binary_path())
         .arg("kb")
@@ -424,6 +446,7 @@ fn run_kb_with_env(
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/tmp"));
+    write_enabled_config(&fake_home);
     let mut cmd = Command::new(binary_path());
     cmd.arg("kb")
         .args(args)
@@ -690,4 +713,65 @@ async fn kb_ingest_contextual_prefix_reaches_the_embedding() {
         stored >= 1,
         "contextual prefix must be stored in chunk metadata"
     );
+}
+
+/// Plan 107: with the KB off (default fresh config), data subcommands must
+/// answer a parseable kb_disabled TOON error with exit 1 — not an empty
+/// result the agent misreads as "no documents".
+#[test]
+fn kb_data_subcommands_gate_on_disabled() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    // Deliberately NO write_enabled_config: the sandbox default is off.
+    let fake_home = tmp.path().to_path_buf();
+    let output = Command::new(binary_path())
+        .arg("kb")
+        .args(["list"])
+        .env("KB_DB_PATH", &db)
+        .env("KB_EMBEDDING_DIM", "4")
+        .env("OPENROUTER_API_KEY", "")
+        .env("KB_EMBEDDING_API_KEY", "")
+        .env("RANTAICLAW_LOG_STDERR", "1")
+        .env("RUST_LOG", "warn")
+        .env("HOME", &fake_home)
+        .output()
+        .expect("spawn binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "disabled KB must exit 1");
+    assert!(
+        stdout.contains("kb_disabled"),
+        "must answer the parseable kb_disabled error, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("kb enable"),
+        "must name the way out, got: {stdout}"
+    );
+}
+
+/// Plan 107: `kb status` works while disabled and reports the state.
+#[test]
+fn kb_status_reports_disabled_state() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let fake_home = tmp.path().to_path_buf();
+    let output = Command::new(binary_path())
+        .arg("kb")
+        .args(["status"])
+        .env("KB_DB_PATH", &db)
+        .env("KB_EMBEDDING_DIM", "4")
+        .env("OPENROUTER_API_KEY", "")
+        .env("KB_EMBEDDING_API_KEY", "")
+        .env("RANTAICLAW_LOG_STDERR", "1")
+        .env("RUST_LOG", "warn")
+        .env("HOME", &fake_home)
+        .output()
+        .expect("spawn binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "status must work while off: {stdout}"
+    );
+    assert!(stdout.starts_with("status["), "TOON status block: {stdout}");
+    assert!(stdout.contains("false"), "reports disabled: {stdout}");
 }

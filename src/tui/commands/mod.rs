@@ -5,6 +5,8 @@ mod calls;
 mod config;
 mod core;
 mod cron;
+#[cfg(feature = "kb")]
+mod kb;
 mod mcp;
 mod memory;
 mod model;
@@ -203,6 +205,10 @@ impl CommandRegistry {
         self.register(Box::new(pairing::PairCommand));
         self.register(Box::new(calls::CallsCommand));
         self.register(Box::new(mcp::McpCommand));
+        // Feature-gated: a non-KB build must not register a command that
+        // cannot work (plan 107).
+        #[cfg(feature = "kb")]
+        self.register(Box::new(kb::KbCommand));
     }
 
     pub fn register(&mut self, handler: Box<dyn CommandHandler>) {

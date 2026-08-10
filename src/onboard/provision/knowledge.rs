@@ -45,6 +45,14 @@ impl TuiProvisioner for KnowledgeProvisioner {
         KNOWLEDGE_DESC
     }
 
+    fn category(&self) -> crate::onboard::provision::traits::ProvisionerCategory {
+        // Must match the first-run wizard, which lists `knowledge` under
+        // Integrations — without this override the trait default (Core) made
+        // the same item appear in different groups depending on the entry
+        // point (plan 107). Pinned by category_matches_first_run_wizard.
+        crate::onboard::provision::traits::ProvisionerCategory::Integration
+    }
+
     async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
         let ProvisionIo {
             events,
