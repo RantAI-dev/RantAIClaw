@@ -118,6 +118,54 @@ impl DoctorCheck for ProviderKeyCheck {
     }
 }
 
+/// Is `api_url` a URL at all?
+///
+/// Nothing else reports this shape. `ConfigSchemaCheck` never looked at the
+/// field, and the gateway only validates values arriving over its own API — a
+/// value typed into `config.toml` by hand, or carried in from an older install,
+/// is used as a base URL unexamined.
+///
+/// Credential-shaped values are not this check's job: [`Config::load_or_init`]
+/// drops those at load and tells the operator to rotate the key, so by the time
+/// any check runs they are gone. What survives is the harmless-but-wrong case —
+/// a typo, a bare hostname, a non-HTTP scheme — which is kept precisely so it
+/// can be reported here rather than silently discarded.
+pub struct ApiUrlCheck;
+
+#[async_trait]
+impl DoctorCheck for ApiUrlCheck {
+    fn name(&self) -> &'static str {
+        "config.api_url"
+    }
+    fn category(&self) -> &'static str {
+        "config"
+    }
+    async fn run(&self, ctx: &DoctorContext) -> CheckResult {
+        let Some(api_url) = ctx
+            .config
+            .api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return CheckResult::ok(self.name(), "no api_url override set")
+                .with_category(self.category());
+        };
+
+        match crate::config::api_url::validate_api_url(api_url) {
+            Ok(()) => CheckResult::ok(self.name(), format!("api_url is a valid URL ({api_url})"))
+                .with_category(self.category()),
+            // Warn, not Fail: most providers ignore `api_url` entirely, so a bad
+            // value here breaks nothing for them. It is still wrong, and for the
+            // providers that do honour it (llama.cpp, remote Ollama) it is the
+            // difference between reaching the server and not.
+            Err(reason) => CheckResult::warn(self.name(), format!("api_url is unusable: {reason}"))
+                .with_category(self.category())
+                .with_hint("run: rantaiclaw setup provider"),
+        }
+    }
+}
+
 pub struct PathsCheck;
 
 #[async_trait]
@@ -216,6 +264,52 @@ mod tests {
         let (ctx, _tmp) = ctx_with_config(cfg);
         let result = ConfigSchemaCheck.run(&ctx).await;
         assert_eq!(result.severity, Severity::Ok, "msg: {}", result.message);
+    }
+
+    #[tokio::test]
+    async fn api_url_check_passes_when_unset_or_a_real_url() {
+        let cfg = Config::default();
+        assert!(
+            cfg.api_url.is_none(),
+            "precondition: default sets no api_url"
+        );
+        let (ctx, _tmp) = ctx_with_config(cfg);
+        assert_eq!(ApiUrlCheck.run(&ctx).await.severity, Severity::Ok);
+
+        let mut cfg = Config::default();
+        cfg.api_url = Some("http://localhost:8080/v1".into());
+        let (ctx, _tmp) = ctx_with_config(cfg);
+        assert_eq!(ApiUrlCheck.run(&ctx).await.severity, Severity::Ok);
+    }
+
+    /// The case the field is kept for: a value that is wrong but not secret is
+    /// left in place at load, so something has to say it is wrong.
+    #[tokio::test]
+    async fn api_url_check_warns_on_a_value_that_is_not_a_url() {
+        for bad in ["not-a-url", "ftp://api.example.com", "api.example.com"] {
+            let mut cfg = Config::default();
+            cfg.api_url = Some(bad.into());
+            let (ctx, _tmp) = ctx_with_config(cfg);
+
+            let result = ApiUrlCheck.run(&ctx).await;
+            assert_eq!(
+                result.severity,
+                Severity::Warn,
+                "{bad} should be reported, got: {}",
+                result.message
+            );
+        }
+    }
+
+    /// A whitespace-only override is an empty override, not a broken URL —
+    /// warning about it would be noise on a config that is doing nothing wrong.
+    #[tokio::test]
+    async fn api_url_check_treats_a_blank_override_as_unset() {
+        let mut cfg = Config::default();
+        cfg.api_url = Some("   ".into());
+        let (ctx, _tmp) = ctx_with_config(cfg);
+
+        assert_eq!(ApiUrlCheck.run(&ctx).await.severity, Severity::Ok);
     }
 
     /// The gap this check closes: a fresh install has `default_provider =

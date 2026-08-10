@@ -3819,7 +3819,23 @@ impl Config {
                 toml::from_str(&contents).context("Failed to parse config file as TOML")?;
             let migrated = crate::config::migrations::migrate(&mut raw)
                 .context("Failed to migrate config schema")?;
-            if migrated {
+            // A credential that ended up in `api_url` sits on disk in plaintext
+            // (unlike `api_key`, which is encrypted) and is echoed back to the
+            // console's base-URL field. The gateway has rejected such writes
+            // since v0.18.0, but that guard is write-only — configs written
+            // before it kept the value. Drop it here, between read and parse, so
+            // the write-back below also takes it off disk.
+            let stripped_credential = crate::config::api_url::strip_credential_api_url(&mut raw);
+            if stripped_credential {
+                tracing::warn!(
+                    "removed an API key that was stored in `api_url` in {}. \
+                     That value was held in plaintext and shown in the web console's \
+                     base-URL field — rotate the key with your provider, then set it \
+                     as the API key rather than the base URL.",
+                    config_path.display()
+                );
+            }
+            if migrated || stripped_credential {
                 let serialized =
                     toml::to_string_pretty(&raw).context("Failed to serialise migrated config")?;
                 if let Err(e) = fs::write(&config_path, serialized).await {
@@ -3827,10 +3843,20 @@ impl Config {
                     // memory. Warn so the user knows the next load
                     // will redo the work.
                     tracing::warn!(
-                        "config migrated in memory but write-back to {} failed: {e:#}",
+                        "config updated in memory but write-back to {} failed: {e:#}",
                         config_path.display()
                     );
-                } else {
+                    if stripped_credential {
+                        // The in-memory drop still holds, but the plaintext key
+                        // is on disk until a later save succeeds. Say so plainly
+                        // — the operator may be relying on the warning above.
+                        tracing::warn!(
+                            "the API key removed from `api_url` is still present in {} \
+                             because the write-back failed — remove the `api_url` line by hand.",
+                            config_path.display()
+                        );
+                    }
+                } else if migrated {
                     tracing::info!(
                         "config schema migrated to v{} ({})",
                         crate::config::migrations::CURRENT_VERSION,

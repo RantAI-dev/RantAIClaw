@@ -35,6 +35,20 @@ Schema export command:
 | `default_provider` | `openrouter` | provider ID or alias |
 | `default_model` | `anthropic/claude-sonnet-4-6` | model routed through selected provider |
 | `default_temperature` | `0.7` | model temperature |
+| `api_url` | unset | base-URL override for the **active** provider only; most providers ignore it, llama.cpp and remote Ollama honour it |
+
+Notes on `api_url`:
+
+- It is stored in plaintext, unlike `api_key`, which is encrypted at rest. Never put a
+  credential here. A value that starts like a provider key (`sk-`, `sk_`, `gsk_`, `xai-`,
+  `AIza`, `hf_`) is rejected on write by the config API, dropped from `config.toml` on the
+  next load with a warning, and withheld from `GET /api/v1/secrets` so the web console
+  cannot render it.
+- **If a key was ever stored here, rotate it with your provider.** It sat unencrypted on
+  disk and was shown in the console's base-URL field; removing it does not undo that.
+- A merely malformed value (a typo, a bare hostname, a non-HTTP scheme) is *kept* — it is
+  not a secret, and silently discarding it would hide the mistake. `rantaiclaw doctor`
+  reports it as `config.api_url`.
 
 ## `[observability]`
 
