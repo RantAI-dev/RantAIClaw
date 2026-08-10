@@ -5,7 +5,20 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.18.4-alpha] — 2026-08-10
+
+One security fix (#444) and the console pin that completes it: an API key
+stored in `api_url` was held on disk in plaintext and rendered in the web
+console's base-URL field.
+
+Patch rather than minor: no new surface and no config schema change, so this
+rolls back freely. The one behaviour change worth knowing is that a
+credential-shaped `api_url` is removed from `config.toml` on the next load —
+see the note below, and rotate the key if this applies to you.
+
+Console pin moves to claw-ui **v0.3.16**, which stops the base-URL field
+holding a value the gateway has stopped returning. Without it the key stays
+on screen until a page reload even after this release withholds it.
 
 ### Security
 
@@ -37,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unencrypted and rendered in the browser; removing it does not undo that.
   Restart the daemon after upgrading so the running process stops holding the
   old value in memory.
+
+### Changed
+
+- **Console pin moves to claw-ui v0.3.16.** The Providers form mirrored
+  `GET /secrets` into the base-URL field behind a truthy guard, so it only ever
+  filled the field and never emptied it. A value the gateway stopped returning
+  stayed on screen until a page reload — which is exactly what the withholding
+  above causes. Both fields also gained real labels; they sit next to each
+  other, one takes a URL and one takes a credential, and pasting a key into the
+  wrong one is what created the finding above.
 
 ## [0.18.3-alpha] — 2026-08-09
 
