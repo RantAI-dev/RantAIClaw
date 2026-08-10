@@ -24,7 +24,6 @@ pub struct KbConfig {
     pub query_expansion_enabled: bool,
     pub query_expansion_model: String,
     pub query_expansion_paraphrases: usize,
-    pub standalone_query_enabled: bool,
     pub extract_vision_base_url: String,
     pub extract_vision_api_key: String,
     pub extract_mineru_base_url: String,
@@ -35,7 +34,7 @@ pub struct KbConfig {
     pub query_embed_cache_size: usize,
     pub query_embed_cache_ttl_ms: u64,
     /// OpenRouter chat-completions endpoint shared by query_expansion,
-    /// contextual retrieval, and standalone_query rewriter. Reads
+    /// and contextual retrieval. Reads
     /// `KB_OPENROUTER_CHAT_URL` from env; tests + on-prem deployments
     /// override this. Mirrors the same env-override pattern as
     /// `KB_EMBEDDING_BASE_URL`.
@@ -89,8 +88,6 @@ impl KbConfig {
             query_expansion_model: env::var("KB_QUERY_EXPANSION_MODEL")
                 .unwrap_or_else(|_| "openai/gpt-4.1-nano".into()),
             query_expansion_paraphrases: parse_env::<usize>("KB_QUERY_EXPANSION_PARAPHRASES", 3)?,
-            standalone_query_enabled: env::var("KB_STANDALONE_QUERY_ENABLED").as_deref()
-                == Ok("true"),
             extract_vision_base_url: env::var("KB_EXTRACT_VISION_BASE_URL")
                 .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".into()),
             extract_vision_api_key: env::var("KB_EXTRACT_VISION_API_KEY").unwrap_or_default(),

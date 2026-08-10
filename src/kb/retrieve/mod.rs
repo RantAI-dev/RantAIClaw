@@ -2,14 +2,13 @@
 //! optional rerank, and prompt-context formatting.
 //!
 //! Port of `src/lib/rag/retriever.ts`, `hybrid-merge.ts`, `query-expansion.ts`,
-//! `contextual-retrieval.ts`, and `standalone-query.ts`. Sub-modules mirror the
+//! and `contextual-retrieval.ts`. Sub-modules mirror the
 //! TS surface 1:1 so the port stays line-by-line auditable.
 
 pub mod contextual;
 pub mod format;
 pub mod query_expansion;
 pub mod rrf;
-pub mod standalone_query;
 
 pub use query_expansion::expand_query;
 pub use rrf::{reciprocal_rank_fusion, RrfOptions};

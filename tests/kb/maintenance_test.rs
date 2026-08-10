@@ -85,7 +85,6 @@ fn cfg_with_model(model: &str) -> KbConfig {
         query_expansion_enabled: false,
         query_expansion_model: "rantaiclaw_test_model_a".into(),
         query_expansion_paraphrases: 3,
-        standalone_query_enabled: false,
         extract_vision_base_url: String::new(),
         extract_vision_api_key: String::new(),
         extract_mineru_base_url: String::new(),
