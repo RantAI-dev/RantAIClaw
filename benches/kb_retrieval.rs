@@ -130,6 +130,8 @@ fn bench_cfg() -> KbConfig {
         embed_concurrency: 4,
         query_embed_cache_size: 256,
         query_embed_cache_ttl_ms: 5 * 60 * 1_000,
+        chat_api_key: String::new(),
+        rerank_api_key: String::new(),
         openrouter_chat_url: "bench://fake".into(),
         intelligence_enabled: false,
         intelligence_model: "openai/gpt-4.1-nano".into(),

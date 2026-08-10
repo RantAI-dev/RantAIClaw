@@ -164,3 +164,33 @@ fn config_rejects_unimplemented_resolution_strategy() {
         "error must say what to do, got: {msg}"
     );
 }
+
+#[test]
+fn chat_key_falls_back_to_embedding_key_from_config() {
+    // Plan 108: the single console-entered credential must drive the chat
+    // features too. With no OPENROUTER_API_KEY in the env, from_env_with_keys
+    // copies the supplied embedding key into chat_api_key.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard(vec![
+        "OPENROUTER_API_KEY",
+        "KB_RERANK_API_KEY",
+        "COHERE_API_KEY",
+    ]);
+    unsafe {
+        std::env::remove_var("OPENROUTER_API_KEY");
+        std::env::remove_var("KB_RERANK_API_KEY");
+        std::env::remove_var("COHERE_API_KEY");
+    }
+    let cfg = rantaiclaw::kb::KbConfig::from_env_with_keys(Some("cfg-embed-key"), None).unwrap();
+    assert_eq!(
+        cfg.chat_api_key, "cfg-embed-key",
+        "chat credential must borrow the embedding key when env has none"
+    );
+
+    // Env still wins when present (precedence unchanged).
+    unsafe {
+        std::env::set_var("OPENROUTER_API_KEY", "env-chat-key");
+    }
+    let cfg = rantaiclaw::kb::KbConfig::from_env_with_keys(Some("cfg-embed-key"), None).unwrap();
+    assert_eq!(cfg.chat_api_key, "env-chat-key");
+}

@@ -61,7 +61,11 @@ async fn llm_rerank_returns_all_when_fewer_candidates_than_final_k() {
     }
     let _guard = EnvGuard(vec!["OPENROUTER_API_KEY"]);
 
-    let r = LlmReranker::new("test-model".into(), "http://127.0.0.1:1/never".into());
+    let r = LlmReranker::new(
+        "test-model".into(),
+        "http://127.0.0.1:1/never".into(),
+        "test-key".into(),
+    );
     let c = cands(3);
     let out = r.rerank("q", &c, 5).await.expect("short-circuit ok");
     assert_eq!(out.len(), 3, "fewer candidates than final_k returns all");
@@ -90,7 +94,7 @@ async fn llm_rerank_parses_index_array() {
         .mount(&server)
         .await;
 
-    let r = LlmReranker::new("test-model".into(), server.uri());
+    let r = LlmReranker::new("test-model".into(), server.uri(), "test-key".into());
     let c = cands(3);
     let out = r.rerank("q", &c, 3).await.expect("rerank ok");
     assert_eq!(out.len(), 3);
@@ -118,7 +122,7 @@ async fn llm_rerank_handles_malformed_response() {
         .mount(&server)
         .await;
 
-    let r = LlmReranker::new("test-model".into(), server.uri());
+    let r = LlmReranker::new("test-model".into(), server.uri(), "test-key".into());
     let c = cands(5);
     let out = r.rerank("q", &c, 3).await.expect("fallback ok");
     // Falls back to original order, returns final_k items.
@@ -144,7 +148,7 @@ async fn llm_rerank_skips_out_of_range_indices() {
         .mount(&server)
         .await;
 
-    let r = LlmReranker::new("test-model".into(), server.uri());
+    let r = LlmReranker::new("test-model".into(), server.uri(), "test-key".into());
     let c = cands(5);
     let out = r.rerank("q", &c, 4).await.expect("rerank ok");
     assert_eq!(out.len(), 4);
@@ -155,21 +159,23 @@ async fn llm_rerank_skips_out_of_range_indices() {
 }
 
 #[tokio::test]
-async fn llm_rerank_returns_error_on_missing_api_key() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: serialized via ENV_LOCK.
-    unsafe {
-        std::env::remove_var("OPENROUTER_API_KEY");
-    }
-
-    let r = LlmReranker::new("test-model".into(), "http://127.0.0.1:1/unused".into());
+async fn llm_rerank_with_empty_key_still_fails_fast_as_backstop() {
+    // Plan 108 moved credential resolution to construction: make_reranker
+    // refuses to build an LlmReranker without a key, so this per-call check
+    // is a defensive backstop, not the primary gate (that test is
+    // make_reranker_returns_none_without_chat_credential below).
+    let r = LlmReranker::new(
+        "test-model".into(),
+        "http://127.0.0.1:1/unused".into(),
+        String::new(),
+    );
     let err = r
         .rerank("q", &cands(5), 3)
         .await
-        .expect_err("missing key must fail-fast");
+        .expect_err("empty key must fail-fast");
     match err {
         KbError::Config(msg) => {
-            assert!(msg.contains("OPENROUTER_API_KEY"), "msg = {msg}");
+            assert!(msg.contains("no chat credential"), "msg = {msg}");
         }
         other => panic!("expected KbError::Config, got {other:?}"),
     }
@@ -190,7 +196,7 @@ async fn llm_rerank_returns_error_on_4xx() {
         .mount(&server)
         .await;
 
-    let r = LlmReranker::new("test-model".into(), server.uri());
+    let r = LlmReranker::new("test-model".into(), server.uri(), "test-key".into());
     let err = r
         .rerank("q", &cands(5), 3)
         .await
@@ -384,4 +390,26 @@ async fn vllm_rerank_errors_on_5xx() {
         }
         other => panic!("expected KbError::ChatApi(503), got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn make_reranker_returns_none_without_chat_credential() {
+    // Plan 108: an LlmReranker with no credential fails EVERY query and
+    // apply_rerank quietly falls back — rerank silently off. Construction
+    // must refuse instead: None is the honest "no rerank stage".
+    use rantaiclaw::kb::rerank::make_reranker;
+    // from_env under ENV_LOCK: other suites in this binary mutate KB_* vars.
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cfg = rantaiclaw::kb::KbConfig::from_env().expect("cfg");
+    cfg.rerank_enabled = true;
+    cfg.rerank_provider = String::new(); // default -> LlmReranker arm
+    cfg.chat_api_key = String::new();
+    assert!(
+        make_reranker(&cfg).is_none(),
+        "no chat credential must mean no rerank stage"
+    );
+
+    // Control: with a credential the stage is constructed.
+    cfg.chat_api_key = "test-key".into();
+    assert!(make_reranker(&cfg).is_some());
 }

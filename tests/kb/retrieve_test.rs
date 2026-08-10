@@ -145,6 +145,8 @@ fn test_cfg() -> KbConfig {
         query_embed_cache_ttl_ms: 60_000,
         // Default points at the public URL; per-test we overwrite to
         // `server.uri()` so we don't have to set KB_OPENROUTER_CHAT_URL.
+        chat_api_key: String::new(),
+        rerank_api_key: String::new(),
         openrouter_chat_url: "http://localhost".into(),
         intelligence_enabled: false,
         intelligence_model: "openai/gpt-4.1-nano".into(),
@@ -741,12 +743,10 @@ mod query_expansion_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
-
+        // Plan 108: the credential now flows through cfg.chat_api_key —
+        // resolved once at config construction — not a per-call env read.
         let mut cfg = test_cfg();
+        cfg.chat_api_key = "test-key".into();
         cfg.query_expansion_enabled = true;
         cfg.openrouter_chat_url = server.uri();
         let out = expand_query(&cfg, "what is X?").await;
@@ -777,12 +777,10 @@ mod query_expansion_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
-
+        // Plan 108: the credential now flows through cfg.chat_api_key —
+        // resolved once at config construction — not a per-call env read.
         let mut cfg = test_cfg();
+        cfg.chat_api_key = "test-key".into();
         cfg.query_expansion_enabled = true;
         cfg.openrouter_chat_url = server.uri();
         let out = expand_query(&cfg, "what is X?").await;
@@ -806,12 +804,10 @@ mod query_expansion_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
-
+        // Plan 108: the credential now flows through cfg.chat_api_key —
+        // resolved once at config construction — not a per-call env read.
         let mut cfg = test_cfg();
+        cfg.chat_api_key = "test-key".into();
         cfg.query_expansion_enabled = true;
         cfg.openrouter_chat_url = server.uri();
         let out = expand_query(&cfg, "what is X?").await;
@@ -835,12 +831,10 @@ mod query_expansion_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
-
+        // Plan 108: the credential now flows through cfg.chat_api_key —
+        // resolved once at config construction — not a per-call env read.
         let mut cfg = test_cfg();
+        cfg.chat_api_key = "test-key".into();
         cfg.query_expansion_enabled = true;
         cfg.openrouter_chat_url = server.uri();
         let a = expand_query(&cfg, "cache me").await;
@@ -870,12 +864,10 @@ mod query_expansion_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
-
+        // Plan 108: the credential now flows through cfg.chat_api_key —
+        // resolved once at config construction — not a per-call env read.
         let mut cfg = test_cfg();
+        cfg.chat_api_key = "test-key".into();
         cfg.query_expansion_enabled = true;
         cfg.openrouter_chat_url = server.uri();
         cfg.query_expansion_model = "model-a".into();
@@ -952,11 +944,9 @@ mod contextual_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
+        // Plan 108: credential flows through cfg.chat_api_key now.
         let mut cfg = test_cfg();
+        cfg.chat_api_key = "test-key".into();
         cfg.contextual_retrieval_enabled = true;
         cfg.openrouter_chat_url = server.uri();
         let chunks = vec!["a".into(), "b".into(), "c".into()];
@@ -983,11 +973,9 @@ mod contextual_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
+        // Plan 108: credential flows through cfg.chat_api_key now.
         let mut cfg = test_cfg();
+        cfg.chat_api_key = "test-key".into();
         cfg.contextual_retrieval_enabled = true;
         cfg.openrouter_chat_url = server.uri();
         let chunks = vec!["a".into(), "b".into(), "c".into()];
@@ -1009,11 +997,9 @@ mod contextual_tests {
             .mount(&server)
             .await;
 
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
+        // Plan 108: credential flows through cfg.chat_api_key now.
         let mut cfg = test_cfg();
+        cfg.chat_api_key = "test-key".into();
         cfg.contextual_retrieval_enabled = true;
         cfg.openrouter_chat_url = server.uri();
         let chunks = vec!["a".into(), "b".into()];

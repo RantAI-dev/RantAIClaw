@@ -348,9 +348,8 @@ async fn cmd_ingest(
     // prefix. Must run BEFORE the embed map below so the prefix reaches the
     // vector through prepare_chunk_for_embedding (plan 090); writing it to
     // the DB after embedding would store text the vector never saw.
-    // Credential caveat: generate_contextual_prefixes reads
-    // OPENROUTER_API_KEY from env only — a console-configured key does not
-    // reach it until plan 108 unifies KB credentials.
+    // Credential: cfg.chat_api_key, resolved once at config construction
+    // (plan 108) — console-configured keys reach this path.
 
     let bodies: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
     let prefixes = crate::kb::retrieve::contextual::generate_contextual_prefixes(

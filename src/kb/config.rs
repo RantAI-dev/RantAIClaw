@@ -39,6 +39,16 @@ pub struct KbConfig {
     /// override this. Mirrors the same env-override pattern as
     /// `KB_EMBEDDING_BASE_URL`.
     pub openrouter_chat_url: String,
+    /// Credential for the chat endpoint shared by query expansion, contextual
+    /// retrieval and the LLM reranker. Reads `OPENROUTER_API_KEY`; falls back
+    /// to the embedding key in `from_env_with_keys` so a single
+    /// console-entered credential works everywhere. Resolved ONCE here —
+    /// consumers must not call `env::var` (plan 108).
+    pub chat_api_key: String,
+    /// Credential for a managed rerank provider. Reads `KB_RERANK_API_KEY`
+    /// then `COHERE_API_KEY`; the Cohere reranker falls back to
+    /// `chat_api_key` when both are empty.
+    pub rerank_api_key: String,
     /// Enable document intelligence (graph extraction, entity linking).
     /// Reads `KB_INTELLIGENCE_ENABLED`; off by default.
     pub intelligence_enabled: bool,
@@ -107,6 +117,10 @@ impl KbConfig {
             )?,
             openrouter_chat_url: env::var("KB_OPENROUTER_CHAT_URL")
                 .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".into()),
+            chat_api_key: env::var("OPENROUTER_API_KEY").unwrap_or_default(),
+            rerank_api_key: env::var("KB_RERANK_API_KEY")
+                .or_else(|_| env::var("COHERE_API_KEY"))
+                .unwrap_or_default(),
             intelligence_enabled: env::var("KB_INTELLIGENCE_ENABLED")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
@@ -143,6 +157,13 @@ impl KbConfig {
         }
         if let Some(k) = vision.filter(|s| !s.is_empty()) {
             cfg.extract_vision_api_key = k.to_string();
+        }
+        // A single console-entered key must drive every consumer: when no
+        // OPENROUTER_API_KEY is in the env, the chat-side features (query
+        // expansion, contextual retrieval, LLM rerank) borrow the embedding
+        // credential — same provider account in the common case (plan 108).
+        if cfg.chat_api_key.is_empty() && !cfg.embedding_api_key.is_empty() {
+            cfg.chat_api_key = cfg.embedding_api_key.clone();
         }
         Ok(cfg)
     }
