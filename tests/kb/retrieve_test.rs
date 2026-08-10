@@ -5,7 +5,7 @@
 //! - 7.2 Retriever orchestrator (fake store + fake embedder)
 //! - 7.3 Query expansion (wiremock)
 //! - 7.4 Contextual retrieval (wiremock)
-//! - 7.5 format_context_for_prompt + standalone query rewriter (wiremock)
+//! - 7.5 format_context_for_prompt (wiremock)
 //!
 //! Tests that mutate `OPENROUTER_API_KEY` serialize on `ENV_LOCK` from
 //! `tests/kb/common.rs` and intentionally hold the guard across `.await`
@@ -29,7 +29,7 @@ use rantaiclaw::kb::{
 
 // Process-wide env-mutation lock lives in `crate::kb::common::ENV_LOCK`
 // so every test module in this binary serializes against the SAME mutex.
-// The query_expansion_tests, contextual_tests, and standalone_tests modules
+// The query_expansion_tests and contextual_tests modules
 // all mutate `OPENROUTER_API_KEY` and `KB_OPENROUTER_CHAT_URL` — a per-file
 // or per-module lock would only serialize within its own scope, letting
 // cross-module tests race on shared env state. Re-export under this file's
@@ -134,7 +134,6 @@ fn test_cfg() -> KbConfig {
         query_expansion_enabled: false,
         query_expansion_model: "rantaiclaw_test_model_a".into(),
         query_expansion_paraphrases: 3,
-        standalone_query_enabled: false,
         extract_vision_base_url: String::new(),
         extract_vision_api_key: String::new(),
         extract_mineru_base_url: String::new(),
@@ -1023,7 +1022,7 @@ mod contextual_tests {
     }
 }
 
-// ---- Task 7.5: format + standalone query rewriter -------------------
+// ---- Task 7.5: format_context_for_prompt ---------------------------
 
 mod format_tests {
     use rantaiclaw::kb::retrieve::format::format_context_for_prompt;
@@ -1093,203 +1092,5 @@ mod format_tests {
             out.contains("- Doc B\n") || out.ends_with("- Doc B"),
             "no-section entry has no trailing colon"
         );
-    }
-}
-
-mod standalone_tests {
-    use rantaiclaw::kb::retrieve::standalone_query::{_clear_cache_for_tests, rewrite_standalone};
-    use serde_json::json;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-    use super::{test_cfg, ENV_LOCK};
-
-    struct EnvGuard(Vec<&'static str>);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for k in &self.0 {
-                unsafe {
-                    std::env::remove_var(k);
-                }
-            }
-        }
-    }
-
-    /// Only `OPENROUTER_API_KEY` is env-resolved now; the chat URL is per-cfg.
-    fn clear_env() {
-        unsafe {
-            std::env::remove_var("OPENROUTER_API_KEY");
-        }
-    }
-
-    #[tokio::test]
-    async fn standalone_returns_original_on_empty_history() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_env();
-        _clear_cache_for_tests().await;
-        let cfg = test_cfg();
-        let out = rewrite_standalone(&cfg, "what?", &[]).await.unwrap();
-        assert_eq!(out, "what?");
-    }
-
-    #[tokio::test]
-    async fn standalone_rewrites_with_history() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_env();
-        _clear_cache_for_tests().await;
-        let server = MockServer::start().await;
-
-        // Capture the request body so we can assert the history is embedded.
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let captured_clone = captured.clone();
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .respond_with(move |req: &Request| {
-                let body = String::from_utf8_lossy(&req.body).to_string();
-                *captured_clone.lock().unwrap() = body;
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "choices": [{
-                        "message": { "content": "exclusions for policy X" }
-                    }]
-                }))
-            })
-            .mount(&server)
-            .await;
-
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
-
-        let mut cfg = test_cfg();
-        cfg.standalone_query_enabled = true;
-        cfg.openrouter_chat_url = server.uri();
-        let history = vec![
-            ("user".to_string(), "tell me about policy X".to_string()),
-            (
-                "assistant".to_string(),
-                "Policy X covers a, b, and c".to_string(),
-            ),
-            ("user".to_string(), "and exclusions?".to_string()),
-        ];
-        let out = rewrite_standalone(&cfg, "tell me more", &history)
-            .await
-            .unwrap();
-        assert_eq!(
-            out, "exclusions for policy X",
-            "model output returned verbatim"
-        );
-
-        let captured_body = captured.lock().unwrap().clone();
-        assert!(
-            captured_body.contains("policy X"),
-            "history turns embedded in prompt body, got: {captured_body}"
-        );
-        assert!(
-            captured_body.contains("tell me more"),
-            "latest question embedded in prompt body"
-        );
-    }
-
-    #[tokio::test]
-    async fn standalone_fails_soft() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_env();
-        _clear_cache_for_tests().await;
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
-            .mount(&server)
-            .await;
-
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
-
-        let mut cfg = test_cfg();
-        cfg.standalone_query_enabled = true;
-        cfg.openrouter_chat_url = server.uri();
-        let history = vec![(
-            "user".to_string(),
-            "earlier turn that anchors disambiguation".to_string(),
-        )];
-        let out = rewrite_standalone(&cfg, "follow up?", &history)
-            .await
-            .unwrap();
-        assert_eq!(
-            out, "follow up?",
-            "5xx → original query returned (fail-soft)"
-        );
-    }
-
-    #[tokio::test]
-    async fn standalone_disabled_returns_query_only() {
-        // Even with non-empty history AND a valid API key AND a mock server
-        // that would otherwise rewrite the query, the disabled flag must
-        // short-circuit. Mirrors TS `KB_STANDALONE_QUERY_ENABLED !== "true"`.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_env();
-        _clear_cache_for_tests().await;
-        let server = MockServer::start().await;
-        // expect(0) — the mock must never be hit when the gate is off.
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{ "message": { "content": "should not be returned" } }]
-            })))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
-
-        let mut cfg = test_cfg(); // standalone_query_enabled = false by default
-        cfg.openrouter_chat_url = server.uri();
-        let history = vec![("user".to_string(), "prior turn".to_string())];
-        let out = rewrite_standalone(&cfg, "what?", &history).await.unwrap();
-        assert_eq!(out, "what?", "disabled gate → query returned unchanged");
-        // wiremock's expect(0) auto-asserts on Drop that the mock was not hit.
-    }
-
-    #[tokio::test]
-    async fn standalone_cache_invalidates_on_model_change() {
-        // Cache key includes cfg.query_expansion_model (the model the
-        // rewriter shares with query_expansion). Changing the model between
-        // two calls of the same (query, history) MUST force a second
-        // upstream hit — otherwise stale rewrites cross model boundaries.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_env();
-        _clear_cache_for_tests().await;
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{ "message": { "content": "rewritten output" } }]
-            })))
-            .expect(2) // ← TWO upstream hits, one per distinct model
-            .mount(&server)
-            .await;
-
-        let _env = EnvGuard(vec!["OPENROUTER_API_KEY"]);
-        unsafe {
-            std::env::set_var("OPENROUTER_API_KEY", "test-key");
-        }
-
-        let mut cfg = test_cfg();
-        cfg.standalone_query_enabled = true;
-        cfg.openrouter_chat_url = server.uri();
-        cfg.query_expansion_model = "model-a".into();
-        let history = vec![("user".to_string(), "earlier turn anchor".to_string())];
-        let _ = rewrite_standalone(&cfg, "follow up?", &history)
-            .await
-            .unwrap();
-
-        cfg.query_expansion_model = "model-b".into();
-        let _ = rewrite_standalone(&cfg, "follow up?", &history)
-            .await
-            .unwrap();
-        // wiremock auto-asserts .expect(2) on Drop.
     }
 }

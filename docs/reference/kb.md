@@ -8,7 +8,7 @@ Last verified: **May 15, 2026** (Phase 14 — feature-gated, off by default).
 
 - **Storage**: SQLite with the `sqlite-vec` virtual table for embeddings, plus FTS5 for BM25 lexical search. One `kb.db` per profile (`~/.rantaiclaw/profiles/<name>/kb.db`), so each profile keeps a separate corpus.
 - **Embedding**: OpenRouter by default (`qwen/qwen3-embedding-8b` at 4096 dimensions). A Text Embeddings Inference (TEI) sidecar is supported via `KB_EMBEDDING_BASE_URL`.
-- **Retrieval**: hybrid (vector + BM25 via Reciprocal Rank Fusion) with optional reranker (LLM via OpenRouter, Cohere, or vLLM sidecar). Optional query expansion and Anthropic-style contextual retrieval.
+- **Retrieval**: hybrid (vector + BM25 via Reciprocal Rank Fusion) with optional reranker (LLM via OpenRouter, Cohere, or vLLM sidecar). Optional query expansion and Anthropic-style contextual retrieval. Follow-up questions are searched verbatim — multi-turn query rewriting is not implemented; agents should phrase KB queries self-containedly.
 - **Extraction**: smart-router PDF pipeline. Defaults to unpdf; falls through to a vision LLM (or MinerU sidecar) when text-layer signals indicate the PDF needs OCR. Image OCR uses an OpenRouter vision LLM.
 - **Surfaces**: three ways to consume the KB
   - In-process Rust API (used by rantaiclaw's own agent loop)

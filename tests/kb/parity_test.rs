@@ -99,8 +99,9 @@ async fn rag_golden_parity() {
 
     for entry in entries {
         // Only `lookup` entries carry a directly-assertable expectedDocs
-        // contract. `followup` depends on standalone-query rewrite which
-        // is a separate test surface, `oos` expects refusal not retrieval,
+        // contract. `followup` needs multi-turn query rewriting, which is
+        // NOT implemented (the standalone-query rewriter was removed in plan
+        // 092 — there is no channel for chat history to reach the KB), `oos` expects refusal not retrieval,
         // and `enumerate` checks group membership coverage that the
         // current corpus doesn't model.
         let kind = entry["kind"].as_str().unwrap_or("");

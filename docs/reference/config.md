@@ -769,7 +769,6 @@ Gateway config API (for the management console; key values are never returned):
 | `KB_QUERY_EXPANSION_ENABLED` | `false` | LLM-generated paraphrases of the query before retrieval |
 | `KB_QUERY_EXPANSION_MODEL` | `openai/gpt-4.1-nano` | Model used for paraphrase generation |
 | `KB_QUERY_EXPANSION_PARAPHRASES` | `3` | Number of paraphrases per query |
-| `KB_STANDALONE_QUERY_ENABLED` | `false` | Rewrite multi-turn queries to be self-contained before retrieval |
 | `KB_CONTEXTUAL_RETRIEVAL_ENABLED` | `false` | Anthropic-style contextual prefix prepended to each chunk during ingest |
 | `KB_CONTEXTUAL_RETRIEVAL_MODEL` | `openai/gpt-4.1-nano` | Model used for contextual prefix generation |
 
