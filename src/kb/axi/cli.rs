@@ -40,7 +40,13 @@ use crate::kb::{Document, DocumentId, KbConfig, KbResult, SearchResult};
 /// Preview length used when rendering chunk content into TOON rows. Keeps
 /// the row narrow enough to be useful to a downstream LLM without blowing
 /// the per-cell budget. 120 chars matches the value documented in the plan.
-const CONTENT_PREVIEW_CHARS: usize = 120;
+/// Per-chunk preview width in the TOON `chunks` table. The table is a
+/// machine-readable index; the full chunk text reaches the agent through the
+/// retrieval `context` block printed above it (see `cmd_search`), so this cap
+/// only bounds the table row — it must stay wide enough to identify a chunk,
+/// not carry the whole answer. Chunks are built at ~800 chars
+/// (`SmartChunkOptions::default`).
+const CONTENT_PREVIEW_CHARS: usize = 600;
 
 #[derive(Subcommand, Debug)]
 pub enum KbCommand {
@@ -259,6 +265,27 @@ async fn cmd_search(
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
+        // The TOON table below is the machine-readable index; `context` is
+        // what the model actually reads from. It carries the full chunk text
+        // under `[Title - Section]` headers plus the document inventory, and
+        // it is the ONLY place a zero-chunk result still reports what the KB
+        // contains — without it the agent reads an empty table and concludes
+        // the KB is empty while `context` holds the document list.
+        if !result.context.is_empty() {
+            println!("{}", result.context);
+        }
+        if result.chunks.is_empty() {
+            if result.context.is_empty() {
+                // No inventory either: the scope genuinely holds nothing.
+                println!("No documents found in this knowledge-base scope.");
+            } else {
+                println!(
+                    "No chunk crossed the relevance threshold. The documents \
+                     listed above are present in scope — try a more specific \
+                     query."
+                );
+            }
+        }
         print!("{}", format_search_toon(&result.chunks));
     }
     Ok(0)

@@ -31,7 +31,8 @@ pub fn kb_ambient_context() -> Option<String> {
     Some(
         "Knowledge base available. To search documents, run:\n\
          `rantaiclaw kb search \"<question>\" --top 5`\n\
-         Output is TOON. List: `rantaiclaw kb list`. Detail: `rantaiclaw kb get <id>`."
+         Output: the retrieved excerpts (with sources), then a TOON summary \
+         table. List: `rantaiclaw kb list`. Detail: `rantaiclaw kb get <id>`."
             .to_string(),
     )
 }

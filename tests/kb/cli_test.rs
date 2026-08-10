@@ -407,9 +407,133 @@ async fn kb_ingest_then_search_returns_toon() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&search.stdout);
-    assert!(
-        stdout.starts_with("chunks["),
-        "expected chunks TOON: {stdout}"
-    );
+    // Since plan 088 the context block precedes the TOON table; the table is
+    // still present and still parseable.
+    assert!(stdout.contains("chunks["), "expected chunks TOON: {stdout}");
     assert!(stdout.contains("Health Insurance"));
+}
+
+/// Like [`run_kb`] but with extra env vars — used by the offline-embedder
+/// tests below to point `KB_EMBEDDING_BASE_URL` at a local wiremock server.
+fn run_kb_with_env(
+    db_path: &PathBuf,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> (i32, String, String) {
+    let fake_home = db_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let mut cmd = Command::new(binary_path());
+    cmd.arg("kb")
+        .args(args)
+        .env("KB_DB_PATH", db_path)
+        .env("KB_EMBEDDING_DIM", "4")
+        .env("OPENROUTER_API_KEY", "")
+        .env("KB_EMBEDDING_API_KEY", "")
+        .env("RANTAICLAW_LOG_STDERR", "1")
+        .env("RUST_LOG", "warn")
+        .env("HOME", &fake_home);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("failed to spawn rantaiclaw binary");
+    let code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (code, stdout, stderr)
+}
+
+/// Plan 088: the non-JSON search output must carry the retrieval `context`
+/// (full chunk text under `[Title]` headers + the document inventory), not
+/// only the 600-char TOON preview table. Before the fix the agent's ONLY KB
+/// path returned 120-char previews and discarded `context` entirely.
+///
+/// Offline: a wiremock server plays the embedding endpoint (TEI-shaped —
+/// the base URL contains no "openrouter.ai", so the binary omits auth).
+#[tokio::test]
+async fn kb_search_prints_context_block_before_toon_table() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // One vector per input item, dim 4. Ingest sends a 1-chunk batch and the
+    // search sends a single query — both get one identical unit vector, so
+    // the stored chunk always matches the query with similarity 1.0.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [1.0, 0.0, 0.0, 0.0] } ]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let md = tmp.path().join("doc.md");
+    std::fs::write(
+        &md,
+        "# Health Insurance\nCoverage is up to one hundred thousand dollars per year.",
+    )
+    .unwrap();
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+
+    let (code, stdout, stderr) = run_kb_with_env(&db, &["ingest", md.to_str().unwrap()], &mock_env);
+    assert_eq!(
+        code, 0,
+        "ingest must succeed: stdout={stdout} stderr={stderr}"
+    );
+
+    let (code, stdout, _stderr) = run_kb_with_env(
+        &db,
+        &["search", "what is the coverage?", "--top", "3"],
+        &mock_env,
+    );
+    assert_eq!(code, 0, "search must succeed: {stdout}");
+    // Context block: inventory + [title] header + FULL chunk text.
+    assert!(
+        stdout.contains("## Documents in this knowledge base"),
+        "document inventory missing from search output: {stdout}"
+    );
+    assert!(
+        stdout.contains("Coverage is up to one hundred thousand dollars"),
+        "full chunk text (not just a preview) must reach the agent: {stdout}"
+    );
+    // The TOON table still follows, and after the context block — the table
+    // is the index, the context is the content.
+    let ctx_pos = stdout.find("## Documents").unwrap();
+    let toon_pos = stdout.find("chunks[").expect("TOON table present");
+    assert!(
+        ctx_pos < toon_pos,
+        "context must precede the TOON table: {stdout}"
+    );
+}
+
+/// Plan 088: a search over an empty scope must say so instead of printing a
+/// bare empty table the agent reads as "the KB is empty" ambiguity.
+#[tokio::test]
+async fn kb_search_empty_scope_says_so() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [1.0, 0.0, 0.0, 0.0] } ]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+
+    let (code, stdout, _stderr) =
+        run_kb_with_env(&db, &["search", "anything at all", "--top", "3"], &mock_env);
+    assert_eq!(code, 0, "empty-scope search must still exit 0: {stdout}");
+    assert!(
+        stdout.contains("No documents found in this knowledge-base scope."),
+        "empty scope must be stated explicitly: {stdout}"
+    );
 }
