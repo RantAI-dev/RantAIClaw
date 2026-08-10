@@ -39,6 +39,11 @@ pub struct KbConfig {
     /// override this. Mirrors the same env-override pattern as
     /// `KB_EMBEDDING_BASE_URL`.
     pub openrouter_chat_url: String,
+    /// Vision model for image ingestion (`process_image` posts image content
+    /// to the chat endpoint with this model). Reads `KB_VISION_MODEL`;
+    /// defaults to `openai/gpt-5-mini`. Promoted from a hardcoded const in
+    /// `file/image.rs` whose own comment prescribed this home (plan 113).
+    pub vision_model: String,
     /// Credential for the chat endpoint shared by query expansion, contextual
     /// retrieval and the LLM reranker. Reads `OPENROUTER_API_KEY`; falls back
     /// to the embedding key in `from_env_with_keys` so a single
@@ -117,6 +122,8 @@ impl KbConfig {
             )?,
             openrouter_chat_url: env::var("KB_OPENROUTER_CHAT_URL")
                 .unwrap_or_else(|_| "https://openrouter.ai/api/v1/chat/completions".into()),
+            vision_model: env::var("KB_VISION_MODEL")
+                .unwrap_or_else(|_| "openai/gpt-5-mini".into()),
             chat_api_key: env::var("OPENROUTER_API_KEY").unwrap_or_default(),
             rerank_api_key: env::var("KB_RERANK_API_KEY")
                 .or_else(|_| env::var("COHERE_API_KEY"))

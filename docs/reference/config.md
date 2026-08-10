@@ -811,6 +811,7 @@ Opt-in entity + relation extraction and cross-document knowledge graph. Off by d
 |---|---|---|
 | `KB_INTELLIGENCE_ENABLED` | `false` | Enable entity/relation extraction at ingest |
 | `KB_INTELLIGENCE_MODEL` | `openai/gpt-4.1-nano` | Extraction model; routed through `KB_OPENROUTER_CHAT_URL` |
+| `KB_VISION_MODEL` | `openai/gpt-5-mini` | Vision model for single-image ingestion (was a hardcoded constant) |
 | `KB_INTELLIGENCE_RESOLUTION` | `exact` | Entity merge strategy: `exact` (normalized name+type) or `embedding` (future) |
 | `KB_GRAPH_MAX_NODES` | `200` | Node cap for the whole-KB graph response (top-N by degree) |
 | `KB_GRAPHRAG_ENABLED` | `false` | GraphRAG: augment retrieval with chunks reached via the entity graph (query → matched entities → 1-hop neighbours → their chunks), merged into the RRF fusion. Requires a populated graph |

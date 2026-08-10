@@ -95,6 +95,7 @@ fn cfg_with_model(model: &str) -> KbConfig {
         embed_concurrency: 2,
         query_embed_cache_size: 8,
         query_embed_cache_ttl_ms: 60_000,
+        vision_model: "rantaiclaw_test_vision_model/x".into(),
         chat_api_key: String::new(),
         rerank_api_key: String::new(),
         openrouter_chat_url: "http://localhost".into(),

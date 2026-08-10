@@ -28,14 +28,6 @@ use tokio::time::sleep;
 use crate::kb::file::ProcessingOptions;
 use crate::kb::{KbConfig, KbError, KbResult};
 
-/// Vision model for image ingestion. Still deliberately not a config knob; if
-/// one is requested it should land in `KbConfig`, not be tunneled through
-/// `ProcessingOptions`.
-///
-/// Was pinned to `openai/gpt-4o-mini`, with a comment citing a line number in a
-/// file from another project. Both the pin and the citation had gone stale.
-pub const VISION_MODEL: &str = "openai/gpt-5-mini";
-
 /// Verbatim port of the prompt from `file-processor.ts:206-211`. Load-bearing
 /// for output quality on small models.
 const IMAGE_PROMPT: &str =
@@ -108,7 +100,7 @@ pub async fn process_image(
     let data_url = format!("data:{mime};base64,{base64}");
 
     let body = json!({
-        "model": VISION_MODEL,
+        "model": cfg.vision_model,
         "messages": [
             {
                 "role": "user",
