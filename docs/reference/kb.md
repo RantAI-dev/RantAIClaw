@@ -117,7 +117,7 @@ All KB settings are environment-driven. The full list of `KB_*` variables and th
 |---|---|---|
 | `KB_DB_PATH` | active profile's `~/.rantaiclaw/profiles/<name>/kb.db` | Path to the SQLite file |
 | `KB_EMBEDDING_MODEL` | `qwen/qwen3-embedding-8b` | Embedding model ID |
-| `KB_EMBEDDING_DIM` | `4096` | Vector dimension; must match the model |
+| `KB_EMBEDDING_DIM` | `4096` | Vector dimension; must match the model. Fixed at database creation — a mismatched value is refused at open (no in-place migration) |
 | `KB_HYBRID_BM25_ENABLED` | `true` | Hybrid vector + BM25 retrieval (set `false` to disable BM25) |
 | `KB_RERANK_ENABLED` | `false` | Opt-in LLM/Cohere/vLLM reranker |
 | `KB_EXTRACT_PRIMARY` | `smart` | PDF extraction: `smart`, `unpdf`, `vision`, `mineru` |

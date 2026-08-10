@@ -3,7 +3,11 @@
 //! Vector storage flows through the sqlite-vec `vec0` virtual table, joined
 //! back to `chunk` + `document` on the chunk row id. The dimension contract is
 //! enforced **before** any INSERT runs — see [`SqliteStore::store_chunks_impl`]
-//! — to match the TS guard in `vector-store.ts:502-534`.
+//! — to match the TS guard in `vector-store.ts:502-534`. That up-front check
+//! compares against the CONFIGURED dimension, which is sound only because
+//! `schema::migrate` refuses to open a database whose recorded dimension
+//! disagrees with the configuration (plan 098) — so by the time any insert
+//! runs, configured == recorded == vec0 column width.
 
 use std::collections::HashMap;
 

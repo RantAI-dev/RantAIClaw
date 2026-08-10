@@ -9,7 +9,7 @@ use std::sync::Once;
 
 use rusqlite::{ffi, Connection};
 
-use crate::kb::KbResult;
+use crate::kb::{KbError, KbResult};
 
 /// Raw signature SQLite expects for an extension entry point. Matches the
 /// `xEntryPoint` parameter type in `sqlite3_auto_extension`.
@@ -19,7 +19,10 @@ type SqliteEntryPoint = unsafe extern "C" fn(
     _: *const ffi::sqlite3_api_routines,
 ) -> c_int;
 
-/// Schema version — bump and add a migration branch when fields change.
+/// Schema version recorded in `kb_meta`. Informational today: `migrate()` is
+/// pure CREATE-IF-NOT-EXISTS and has NO migration branches — any change to an
+/// existing table shape must add real migration machinery first, not just
+/// bump this number.
 pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 /// Register the sqlite-vec extension as an auto-extension once per process.
@@ -135,9 +138,11 @@ pub(crate) fn migrate(conn: &Connection, embedding_dim: usize) -> KbResult<()> {
         CREATE INDEX IF NOT EXISTS chunk_document_idx ON chunk(document_id);
         CREATE INDEX IF NOT EXISTS chunk_embed_model_idx ON chunk(embedding_model);
 
-        -- sqlite-vec virtual table for vectors. The dimension is fixed at table
-        -- creation; changing KB_EMBEDDING_DIM requires migration via the
-        -- bulk_re_embed path. `distance_metric=cosine` matches the TS schema
+        -- sqlite-vec virtual table for vectors. The dimension is fixed at
+        -- table creation and there is NO in-place dimension migration —
+        -- bulk_re_embed writes into this same fixed-width table. Changing
+        -- KB_EMBEDDING_DIM requires a new database (migrate() refuses a
+        -- mismatched open). `distance_metric=cosine` matches the TS schema
         -- (vector-store.ts uses SurrealDB MTREE DIST COSINE), so the
         -- similarity values returned by `search_by_vector` are comparable
         -- across backends.
@@ -189,6 +194,21 @@ pub(crate) fn migrate(conn: &Connection, embedding_dim: usize) -> KbResult<()> {
     "#,
         dim = embedding_dim
     ))?;
+
+    // Read BEFORE the write below — the INSERT OR REPLACE would otherwise
+    // destroy the only evidence a mismatch existed. `CREATE VIRTUAL TABLE IF
+    // NOT EXISTS` above is a no-op on an existing database, so the vec0
+    // column keeps its original width regardless of what the caller
+    // configured; opening with a different KB_EMBEDDING_DIM used to rewrite
+    // kb_meta to the new value on the very next `kb list`, making the
+    // corruption unprovable (plan 098).
+    if let Some(existing) = current_embedding_dim(conn)? {
+        if existing != embedding_dim {
+            return Err(KbError::Config(format!(
+                "KB embedding dimension mismatch: this database was created with                  {existing}, but KB_EMBEDDING_DIM is {embedding_dim}. The vector                  table's width is fixed at creation. Either set                  KB_EMBEDDING_DIM={existing}, or start a new database (move                  kb.db aside and re-ingest) — there is no in-place dimension                  migration."
+            )));
+        }
+    }
 
     conn.execute(
         "INSERT OR REPLACE INTO kb_meta(key, value) VALUES('schema_version', ?1)",

@@ -606,3 +606,55 @@ async fn store_document_with_chunks_rolls_back_on_chunk_failure() {
         docs.len()
     );
 }
+
+#[tokio::test]
+async fn reopen_with_different_dim_is_refused_and_evidence_survives() {
+    // Plan 098: the vec0 column width is fixed at creation; a reopen with a
+    // different KB_EMBEDDING_DIM used to silently rewrite kb_meta (destroying
+    // the evidence) and then corrupt inserts at the sqlite-vec layer.
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("kb.db");
+    {
+        let _store = SqliteStore::open(&path, 4).await.unwrap();
+    }
+    let err = SqliteStore::open(&path, 8)
+        .await
+        .err()
+        .expect("opening a dim-4 database with dim 8 must be refused, not silently accepted");
+    let msg = err.to_string();
+    assert!(
+        msg.contains('4') && msg.contains('8'),
+        "error must name both dimensions: {msg}"
+    );
+
+    // The point of the plan: the recorded value survives the failed open.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let recorded: String = conn
+        .query_row(
+            "SELECT value FROM kb_meta WHERE key='embedding_dim'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, "4", "evidence must survive the refused open");
+}
+
+#[tokio::test]
+async fn reopen_with_same_dim_succeeds() {
+    // Control for the guard above: without this, a guard that rejects EVERY
+    // reopen would pass the mismatch test.
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("kb.db");
+    {
+        let _store = SqliteStore::open(&path, 4).await.unwrap();
+    }
+    SqliteStore::open(&path, 4)
+        .await
+        .expect("same-dim reopen must succeed");
+}
