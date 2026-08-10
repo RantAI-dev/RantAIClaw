@@ -13,6 +13,14 @@ use crate::kb::store::IntelligenceStore;
 use crate::kb::KbResult;
 
 /// Counts returned for logging / API response.
+///
+/// `entities` answers "how many distinct entities does THIS document
+/// contribute" — distinct `canonical_key`s in this extraction run, the same
+/// key `store_intelligence` dedups rows on, so the number matches the
+/// Entities tab beside it. It still legitimately differs from the graph's
+/// `total_entities` (corpus-wide, cross-document) — two questions, two
+/// answers. `relations` counts relation rows actually handed to the store,
+/// not raw model output.
 #[derive(Debug, Clone, Copy)]
 pub struct IntelligenceSummary {
     pub entities: usize,
@@ -39,7 +47,6 @@ pub async fn extract_document_intelligence(
     let mut entity_id_by_name: HashMap<String, String> = HashMap::new();
     let mut entities: Vec<Entity> = Vec::new();
     let mut mentions: Vec<EntityMention> = Vec::new();
-    let mut n_ent = 0usize;
 
     // 1) LLM entities — one mention per (entity, chunk). The chunk index MUST
     // be stored: GraphRAG's chunk join matches on
@@ -70,7 +77,6 @@ pub async fn extract_document_intelligence(
         // first — the same tie-break canonical_key dedup applies, and better
         // than dropping the edge.
         entity_id_by_name.entry(normalize_name(name)).or_insert(id);
-        n_ent += 1;
     }
 
     // 2) Pattern entities — per chunk (chunk_index = Some(idx)).
@@ -95,7 +101,6 @@ pub async fn extract_document_intelligence(
                 source: ExtractSource::Pattern,
             });
             entity_id_by_name.entry(normalize_name(&name)).or_insert(id);
-            n_ent += 1;
         }
     }
 
@@ -104,7 +109,6 @@ pub async fn extract_document_intelligence(
     // punctuation mismatch between the model's entities and relations arrays
     // no longer deletes the edge.
     let mut relations: Vec<Relation> = Vec::new();
-    let mut n_rel = 0usize;
     let mut dropped_relations = 0usize;
     for (src, tgt, rty, conf) in &llm.relations {
         match (
@@ -121,7 +125,6 @@ pub async fn extract_document_intelligence(
                     document_id: document_id.to_string(),
                     metadata: serde_json::json!({}),
                 });
-                n_rel += 1;
             }
             _ => dropped_relations += 1,
         }
@@ -144,8 +147,18 @@ pub async fn extract_document_intelligence(
         .store_intelligence(document_id, &entities, &mentions, &relations)
         .await?;
 
+    // Count what is stored, not what was extracted: dedup by the same
+    // canonical_key the store dedups rows on (see the doc comment on
+    // IntelligenceSummary). Raw extraction counts drift arbitrarily far
+    // from the visible graph — one email in ten chunks is ten extractions
+    // and one row.
+    let unique_entities = entities
+        .iter()
+        .map(|e| e.canonical_key.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     Ok(IntelligenceSummary {
-        entities: n_ent,
-        relations: n_rel,
+        entities: unique_entities,
+        relations: relations.len(),
     })
 }
