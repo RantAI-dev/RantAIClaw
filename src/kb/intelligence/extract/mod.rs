@@ -16,6 +16,13 @@ use crate::kb::KbResult;
 pub struct Extracted {
     pub entities: Vec<(usize, String, EntityType, f32)>,
     pub relations: Vec<(String, String, RelationType, f32)>,
+    /// Chunks the extractor could not process at all. A non-zero value with
+    /// zero entities means extraction FAILED — it does not mean the document
+    /// has no entities. Callers must be able to tell those apart.
+    pub failed_chunks: usize,
+    /// First failure reason, for operator-facing display. Never contains the
+    /// upstream body or any credential.
+    pub first_error: Option<String>,
 }
 
 #[async_trait::async_trait]

@@ -153,18 +153,25 @@ impl EntityRelationExtractor for CombinedLlmExtractor {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(error = %e, "LLM extractor: HTTP request failed, skipping chunk");
+                    out.failed_chunks += 1;
+                    out.first_error
+                        .get_or_insert_with(|| "transport error".into());
                     continue;
                 }
             };
 
             let status = resp.status();
             if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
+                // Status only — the upstream body may echo request contents
+                // or credential material and never belongs in logs (matches
+                // the api.rs upstream-error policy).
                 tracing::warn!(
                     status = status.as_u16(),
-                    body = %text,
                     "LLM extractor: non-success response, skipping chunk"
                 );
+                out.failed_chunks += 1;
+                out.first_error
+                    .get_or_insert_with(|| format!("http {}", status.as_u16()));
                 continue;
             }
 
@@ -172,6 +179,9 @@ impl EntityRelationExtractor for CombinedLlmExtractor {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "LLM extractor: failed to deserialize chat response, skipping chunk");
+                    out.failed_chunks += 1;
+                    out.first_error
+                        .get_or_insert_with(|| "invalid response".into());
                     continue;
                 }
             };
@@ -180,6 +190,9 @@ impl EntityRelationExtractor for CombinedLlmExtractor {
                 Some(c) => c.message.content,
                 None => {
                     tracing::warn!("LLM extractor: empty choices array, skipping chunk");
+                    out.failed_chunks += 1;
+                    out.first_error
+                        .get_or_insert_with(|| "empty response".into());
                     continue;
                 }
             };
@@ -187,11 +200,14 @@ impl EntityRelationExtractor for CombinedLlmExtractor {
             let payload: ExtractionPayload = match serde_json::from_str(&content) {
                 Ok(p) => p,
                 Err(e) => {
+                    // Content echoes model output over document text — keep
+                    // it out of logs for the same reason as the body above.
                     tracing::warn!(
                         error = %e,
-                        content = %content,
                         "LLM extractor: content is not valid extraction JSON, skipping chunk"
                     );
+                    out.failed_chunks += 1;
+                    out.first_error.get_or_insert_with(|| "invalid json".into());
                     continue;
                 }
             };

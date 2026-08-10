@@ -1091,3 +1091,95 @@ async fn kb_ingest_bogus_group_field_404s_before_storing() {
         "a rejected ingest must leave no document behind: {body}"
     );
 }
+
+#[tokio::test]
+async fn re_extract_total_failure_returns_502_not_zero_entities() {
+    // Plan 109: a wholly-failed extraction used to return
+    // 200 { entities: 0 } — indistinguishable from a document with no
+    // entities. Re-extract is synchronous, so the truth can be delivered.
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let chat = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&chat)
+        .await;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            let mut doc = sample_doc("rantaiclaw_doc_xf", "Doc XF");
+            doc.content = "Alice works at TechCorp on embedded systems.".into();
+            store.create_document(&doc).await.unwrap();
+        })
+    })
+    .await;
+    // Harness holds ENV_LOCK for its lifetime; safe to add env here.
+    std::env::set_var("KB_OPENROUTER_CHAT_URL", chat.uri());
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/v1/kb/documents/rantaiclaw_doc_xf/re-extract",
+            h.base_url
+        ))
+        .send()
+        .await
+        .expect("request");
+    std::env::remove_var("KB_OPENROUTER_CHAT_URL");
+    assert_eq!(
+        resp.status(),
+        502,
+        "total extraction failure must not present as success"
+    );
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"], "extraction_failed");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("http 401"), "reason surfaces: {body}");
+    assert!(
+        !detail.contains("test-embedding-key"),
+        "credential must never surface: {body}"
+    );
+}
+
+#[tokio::test]
+async fn re_extract_success_still_returns_200_with_zero_failed() {
+    // Control for the 502 above: a working extraction stays a 200 and now
+    // reports failed_chunks: 0.
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let chat = MockServer::start().await;
+    let content =
+        r#"{"entities":[{"name":"NQRust","type":"Product","confidence":0.9}],"relations":[]}"#;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices":[{"message":{"content": content}}]})))
+        .mount(&chat)
+        .await;
+
+    let h = start_harness(|store| {
+        Box::pin(async move {
+            let mut doc = sample_doc("rantaiclaw_doc_xs", "Doc XS");
+            doc.content = "NQRust is a product.".into();
+            store.create_document(&doc).await.unwrap();
+        })
+    })
+    .await;
+    std::env::set_var("KB_OPENROUTER_CHAT_URL", chat.uri());
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/v1/kb/documents/rantaiclaw_doc_xs/re-extract",
+            h.base_url
+        ))
+        .send()
+        .await
+        .expect("request");
+    std::env::remove_var("KB_OPENROUTER_CHAT_URL");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["failed_chunks"], 0, "{body}");
+    assert!(body["entities"].as_u64().unwrap() >= 1, "{body}");
+}

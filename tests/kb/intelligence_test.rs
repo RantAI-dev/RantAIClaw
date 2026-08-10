@@ -203,6 +203,7 @@ async fn orchestration_merges_same_entity_across_two_documents() {
             Ok(Extracted {
                 entities: vec![(0, "NQRust".into(), EntityType::Product, 0.9)],
                 relations: vec![],
+                ..Default::default()
             })
         }
     }
@@ -321,6 +322,7 @@ async fn graph_expand_chunks_surfaces_neighbor_only_chunks() {
                     RelationType::WorksFor,
                     0.85,
                 )],
+                ..Default::default()
             })
         }
     }
@@ -389,6 +391,7 @@ async fn llm_mentions_always_carry_a_chunk_index() {
                     (1, "Beta".into(), EntityType::Concept, 0.9),
                 ],
                 relations: vec![],
+                ..Default::default()
             })
         }
     }
@@ -804,6 +807,7 @@ async fn store_intelligence_reingest_idempotent() {
                     RelationType::PartOf,
                     0.8,
                 )],
+                ..Default::default()
             })
         }
     }
@@ -873,6 +877,7 @@ async fn relations_survive_entity_name_case_mismatch() {
                     RelationType::WorksFor,
                     0.85,
                 )],
+                ..Default::default()
             })
         }
     }
@@ -915,6 +920,7 @@ async fn summary_counts_deduped_entities_not_raw_extractions() {
                     (2, "techcorp".into(), EntityType::Organization, 0.9),
                 ],
                 relations: vec![],
+                ..Default::default()
             })
         }
     }
@@ -1032,4 +1038,103 @@ async fn graph_node_selection_uses_deduped_degree() {
         g.nodes[0].degree, 0,
         "within-view degree with no co-selected neighbours"
     );
+}
+
+#[tokio::test]
+async fn extractor_counts_failed_chunks_on_upstream_401() {
+    // Plan 109: every failure mode used to `continue` and return
+    // Ok(Extracted::default()) — a total failure was indistinguishable from
+    // "this document has no entities".
+    use rantaiclaw::kb::intelligence::extract::llm::CombinedLlmExtractor;
+    use rantaiclaw::kb::intelligence::extract::EntityRelationExtractor;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let ext = CombinedLlmExtractor::new(
+        "test-model".into(),
+        server.uri(),
+        "rantaiclaw_test_key".into(),
+    );
+    let out = ext
+        .extract(&["chunk a", "chunk b", "chunk c"])
+        .await
+        .unwrap();
+    assert_eq!(out.entities.len(), 0);
+    assert_eq!(
+        out.failed_chunks, 3,
+        "every chunk failed and must be counted"
+    );
+    let reason = out.first_error.expect("reason recorded");
+    assert_eq!(reason, "http 401");
+    // Never the upstream body or a credential.
+    assert!(!reason.contains("rantaiclaw_test_key"));
+}
+
+#[tokio::test]
+async fn extractor_reports_zero_failures_on_success() {
+    // Control: an over-eager fix must not turn every extraction into an
+    // error.
+    use rantaiclaw::kb::intelligence::extract::llm::CombinedLlmExtractor;
+    use rantaiclaw::kb::intelligence::extract::EntityRelationExtractor;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let content =
+        r#"{"entities":[{"name":"NQRust","type":"Product","confidence":0.9}],"relations":[]}"#;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices":[{"message":{"content": content}}]})))
+        .mount(&server)
+        .await;
+
+    let ext = CombinedLlmExtractor::new(
+        "test-model".into(),
+        server.uri(),
+        "rantaiclaw_test_key".into(),
+    );
+    let out = ext.extract(&["chunk a", "chunk b"]).await.unwrap();
+    assert_eq!(out.entities.len(), 2);
+    assert_eq!(out.failed_chunks, 0, "successes must not count as failures");
+    assert!(out.first_error.is_none());
+}
+
+#[tokio::test]
+async fn extractor_counts_partial_failures() {
+    // Mixed: first call 500s, the second succeeds (wiremock consumes the
+    // 1-shot mount first).
+    use rantaiclaw::kb::intelligence::extract::llm::CombinedLlmExtractor;
+    use rantaiclaw::kb::intelligence::extract::EntityRelationExtractor;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let content =
+        r#"{"entities":[{"name":"NQRust","type":"Product","confidence":0.9}],"relations":[]}"#;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices":[{"message":{"content": content}}]})))
+        .mount(&server)
+        .await;
+
+    let ext = CombinedLlmExtractor::new(
+        "test-model".into(),
+        server.uri(),
+        "rantaiclaw_test_key".into(),
+    );
+    let out = ext.extract(&["chunk a", "chunk b"]).await.unwrap();
+    assert_eq!(out.failed_chunks, 1, "exactly the failed chunk counts");
+    assert_eq!(out.entities.len(), 1, "the surviving chunk still extracts");
+    assert_eq!(out.first_error.as_deref(), Some("http 500"));
 }

@@ -21,10 +21,15 @@ use crate::kb::KbResult;
 /// `total_entities` (corpus-wide, cross-document) — two questions, two
 /// answers. `relations` counts relation rows actually handed to the store,
 /// not raw model output.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct IntelligenceSummary {
     pub entities: usize,
     pub relations: usize,
+    /// Chunks the extractor failed on. Non-zero with zero entities means
+    /// extraction FAILED, not "no entities" (plan 109).
+    pub failed_chunks: usize,
+    /// First failure reason (short, no upstream body, no credential).
+    pub error: Option<String>,
 }
 
 fn new_id() -> String {
@@ -160,5 +165,7 @@ pub async fn extract_document_intelligence(
     Ok(IntelligenceSummary {
         entities: unique_entities,
         relations: relations.len(),
+        failed_chunks: llm.failed_chunks,
+        error: llm.first_error,
     })
 }
