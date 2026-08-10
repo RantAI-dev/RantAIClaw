@@ -239,6 +239,7 @@ refused at open (no in-place migration). Known-good pairs:
 
 Any OpenAI-shaped or TEI endpoint works via `KB_EMBEDDING_BASE_URL`; the dim
 must match whatever the model actually emits.
+Provider-by-provider verification status: [kb-providers.md](kb-providers.md).
 
 ### Changing the embedding model — the safe procedure
 

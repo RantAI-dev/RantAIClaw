@@ -42,10 +42,14 @@ pub trait EmbeddingProvider: Send + Sync {
 
 /// Build a provider. Dispatch is URL-based: any base URL containing
 /// `openrouter.ai` routes to [`openrouter::OpenRouterEmbedding`]; everything
-/// else routes to [`tei::TeiEmbedding`]. Self-hosted TEI deployments behind a
-/// CDN whose hostname ends in `openrouter.ai` would misclassify; the operator
-/// in that case should pick a different base URL (TEI typically runs on a
-/// private network, so this collision is unlikely in practice).
+/// else routes to [`tei::TeiEmbedding`] — which, despite the name, is the
+/// generic OpenAI-shaped `/embeddings` client: it serves TEI, vLLM, LocalAI,
+/// hosted OpenAI, Ollama's OpenAI-compat mode, and anything else speaking
+/// that wire shape (verification status per provider:
+/// `docs/reference/kb-providers.md`). Self-hosted deployments behind a CDN
+/// whose hostname ends in `openrouter.ai` would misclassify; the operator
+/// in that case should pick a different base URL (self-hosted endpoints
+/// typically run on a private network, so this collision is unlikely).
 ///
 /// **Call once at startup** — each invocation constructs a new
 /// `reqwest::Client` with its own connection pool. Hold the returned
