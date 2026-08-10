@@ -893,8 +893,14 @@ async fn set_knowledge(
     }
     persist_and_swap(&state, cfg).await?;
     // New credentials invalidate any cached KB embedding/extraction context.
+    // `clear_kb_ctx` is sufficient: the next KB request rebuilds the context
+    // in-process with the new key. Do NOT call `schedule_daemon_reload()` here
+    // — the managed service hosts this gateway (`daemon::run` spawns
+    // `run_gateway`), so a restart would take the console offline mid-save.
+    // Channel connects/disconnects still reload, because the channels
+    // supervisor captures its channel set at startup and can't pick up the
+    // change any other way; a KB key needs no such bounce.
     crate::kb::axi::clear_kb_ctx().await;
-    schedule_daemon_reload();
     let cfg = state.config.lock().clone();
     Ok(Json(json!({
         "embedding_configured": cfg.knowledge.embedding_api_key.is_some(),
