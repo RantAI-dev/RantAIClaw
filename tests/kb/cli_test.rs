@@ -490,6 +490,16 @@ async fn kb_search_prints_context_block_before_toon_table() {
         &mock_env,
     );
     assert_eq!(code, 0, "search must succeed: {stdout}");
+    // Plan 089: the context arrives wrapped in the RAG instruction block
+    // (cite inline, refuse cleanly) with the source list appended.
+    assert!(
+        stdout.contains("## Knowledge Base Context"),
+        "RAG instruction block missing from search output: {stdout}"
+    );
+    assert!(
+        stdout.contains("Sources:"),
+        "source list missing from search output: {stdout}"
+    );
     // Context block: inventory + [title] header + FULL chunk text.
     assert!(
         stdout.contains("## Documents in this knowledge base"),

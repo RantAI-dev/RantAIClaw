@@ -32,6 +32,7 @@ use crate::kb::maintenance::{
     check_drift, run_bulk_re_embed, BulkReEmbedOptions, BulkReEmbedReport, DriftReport,
 };
 use crate::kb::rerank;
+use crate::kb::retrieve::format::format_context_for_prompt;
 use crate::kb::retrieve::{RetrieveOptions, Retriever, SourceRef};
 use crate::kb::store::sqlite::SqliteStore;
 use crate::kb::store::{Graph, IntelligenceStore, KbStore};
@@ -272,7 +273,12 @@ async fn cmd_search(
         // contains — without it the agent reads an empty table and concludes
         // the KB is empty while `context` holds the document list.
         if !result.context.is_empty() {
-            println!("{}", result.context);
+            // `format_context_for_prompt` wraps the excerpts in the RAG
+            // instruction block (cite inline, refuse cleanly, no invented
+            // facts) and appends the source list. This is the block whose
+            // module doc calls the wording load-bearing — before plan 089 it
+            // had zero production callers and no model had ever received it.
+            println!("{}", format_context_for_prompt(&result));
         }
         if result.chunks.is_empty() {
             if result.context.is_empty() {
