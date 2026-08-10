@@ -703,6 +703,22 @@ async fn graph_exposes_capability() {
             .contains('/'),
         "extraction_model: {body}"
     );
+    // Plan 097: the block must answer "why is this graph empty" — pin the
+    // three added distinctions. `credential_configured` is asserted by
+    // presence/type only: resolve_key falls back to OPENROUTER_API_KEY in
+    // the process env, so its VALUE depends on the machine running the test.
+    assert!(
+        body["capability"]["credential_configured"].is_boolean(),
+        "capability must carry credential_configured: {body}"
+    );
+    assert_eq!(
+        body["capability"]["graphrag_enabled"], false,
+        "capability: {body}"
+    );
+    assert_eq!(
+        body["capability"]["resolution"], "exact",
+        "capability: {body}"
+    );
 }
 
 #[tokio::test]
