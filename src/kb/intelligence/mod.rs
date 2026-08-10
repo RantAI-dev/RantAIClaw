@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::kb::intelligence::extract::pattern::extract_pattern_entities;
 use crate::kb::intelligence::extract::EntityRelationExtractor;
-use crate::kb::intelligence::resolve::canonical_key;
+use crate::kb::intelligence::resolve::{canonical_key, normalize_name};
 use crate::kb::intelligence::types::{Entity, EntityMention, ExtractSource, Relation};
 use crate::kb::store::IntelligenceStore;
 use crate::kb::KbResult;
@@ -65,7 +65,11 @@ pub async fn extract_document_intelligence(
             context: None,
             source: ExtractSource::Llm,
         });
-        entity_id_by_name.entry(name.clone()).or_insert(id);
+        // Keyed by the same normalization entity dedup uses. Two entities
+        // sharing a name but not a type collide here; or_insert keeps the
+        // first — the same tie-break canonical_key dedup applies, and better
+        // than dropping the edge.
+        entity_id_by_name.entry(normalize_name(name)).or_insert(id);
         n_ent += 1;
     }
 
@@ -90,27 +94,46 @@ pub async fn extract_document_intelligence(
                 context: None,
                 source: ExtractSource::Pattern,
             });
-            entity_id_by_name.entry(name).or_insert(id);
+            entity_id_by_name.entry(normalize_name(&name)).or_insert(id);
             n_ent += 1;
         }
     }
 
-    // 3) Relations (from the LLM), wired by entity name.
+    // 3) Relations (from the LLM), wired by NORMALIZED entity name — the
+    // same normalization canonical_key uses for entity dedup, so a casing or
+    // punctuation mismatch between the model's entities and relations arrays
+    // no longer deletes the edge.
     let mut relations: Vec<Relation> = Vec::new();
     let mut n_rel = 0usize;
+    let mut dropped_relations = 0usize;
     for (src, tgt, rty, conf) in &llm.relations {
-        if let (Some(s), Some(t)) = (entity_id_by_name.get(src), entity_id_by_name.get(tgt)) {
-            relations.push(Relation {
-                id: new_id(),
-                source_entity_id: s.clone(),
-                target_entity_id: t.clone(),
-                relation_type: rty.clone(),
-                confidence: *conf,
-                document_id: document_id.to_string(),
-                metadata: serde_json::json!({}),
-            });
-            n_rel += 1;
+        match (
+            entity_id_by_name.get(&normalize_name(src)),
+            entity_id_by_name.get(&normalize_name(tgt)),
+        ) {
+            (Some(s), Some(t)) => {
+                relations.push(Relation {
+                    id: new_id(),
+                    source_entity_id: s.clone(),
+                    target_entity_id: t.clone(),
+                    relation_type: rty.clone(),
+                    confidence: *conf,
+                    document_id: document_id.to_string(),
+                    metadata: serde_json::json!({}),
+                });
+                n_rel += 1;
+            }
+            _ => dropped_relations += 1,
         }
+    }
+    if dropped_relations > 0 {
+        // Names are document content — count them, never log them.
+        tracing::warn!(
+            target: "kb::intelligence",
+            document_id,
+            dropped = dropped_relations,
+            "relations referenced entity names with no extracted entity"
+        );
     }
 
     // One transactional round-trip for the whole batch. The store resolves
