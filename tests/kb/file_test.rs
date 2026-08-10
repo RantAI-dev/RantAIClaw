@@ -364,9 +364,11 @@ async fn process_pdf_with_ocr_pipeline_flag_returns_not_implemented_error() {
         .await
         .expect_err("ocr pipeline flag must surface NotImplemented");
     let msg = err.to_string();
+    // Plan 110: the message must name what IS available, not just tell the
+    // operator to unset their own flag.
     assert!(
-        msg.contains("OCR pipeline not yet implemented"),
-        "error must explain OCR pipeline isn't ported: {msg}"
+        msg.contains("not implemented for PDFs") && msg.contains("KB_EXTRACT_PRIMARY"),
+        "error must name the vision-model alternative: {msg}"
     );
 }
 

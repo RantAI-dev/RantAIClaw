@@ -217,6 +217,16 @@ When `--features kb` is enabled **and** a `kb.db` exists at the resolved path, r
 
 No MCP server, tool registration, or schema declaration is required — the agent uses its existing `shell` capability with the standard policy + autonomy gates. If the autonomy preset doesn't permit `rantaiclaw` in the shell allowlist, the agent simply can't reach the KB. Operators can either add `rantaiclaw` to `[autonomy].allowed_commands` or implement a dedicated tool.
 
+
+## OCR (scanned documents)
+
+What handles scanned content today:
+
+- **Scanned PDFs** — the vision-LLM extractor: set `KB_EXTRACT_PRIMARY` to a vision-capable model (default `openai/gpt-4.1-nano`); pages are read as images through the chat endpoint. There is **no local OCR for PDFs** — page rasterization (PDF → image) is not implemented (it would pull a native dependency such as pdfium/poppler; see the open question in [ocr-design](../kb/ocr-design.md)).
+- **Single images** — a local Ollama OCR path exists behind the non-default `kb-ocr` Cargo feature: build with `--features kb-ocr` and set `KB_EXTRACT_OCR_BASE_URL` / `KB_EXTRACT_OCR_MODEL`, then ingest with `use_ocr_pipeline=true`. Without the feature (the default build), images are read through the vision extractor.
+
+Setting `use_ocr_pipeline=true` for a PDF fails with an error naming the vision-model alternative — it does not silently fall back.
+
 ## Document Intelligence
 
 Entity and relation extraction over ingested documents, building a cross-document knowledge graph. This is opt-in and off by default — it does not affect ingest, retrieval, or any existing KB behavior unless enabled.

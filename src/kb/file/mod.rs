@@ -35,9 +35,11 @@ pub enum SupportedFileType {
     Text,
 }
 
-/// Document-type hint forwarded to a hypothetical OCR pipeline. Currently
-/// only carried through `ProcessingOptions`; consumed once the Ollama OCR
-/// port lands in a later phase.
+/// Document-type hint intended for an OCR pipeline. **Consumed by nothing
+/// today** — it rides through `ProcessingOptions` and no reader exists;
+/// setting it changes no behaviour. Kept because the `kb-ocr` image spike is
+/// the seam a consumer would land on; if that port is abandoned, delete this
+/// with it rather than leaving it looking wired (plan 110).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentTypeHint {
     PrintedText,
@@ -282,18 +284,25 @@ async fn process_pdf(cfg: &KbConfig, bytes: &[u8], opts: &ProcessingOptions) -> 
         #[cfg(feature = "kb-ocr")]
         {
             return Err(KbError::Other(
-                "OCR pipeline is available for images under --features kb-ocr, but PDF page \
-                 rasterization is not implemented yet; ingest as an image or set \
-                 use_ocr_pipeline=false"
+                "OCR is available for single images under --features kb-ocr, but PDF page \
+                 rasterization is not implemented; ingest pages as images, or set \
+                 use_ocr_pipeline=false and use KB_EXTRACT_PRIMARY with a vision model \
+                 (e.g. `openai/gpt-4.1-nano`) to read scanned pages"
                     .into(),
             ));
         }
         #[cfg(not(feature = "kb-ocr"))]
         {
-            // TODO(kb-ocr): port `src/lib/ocr` (Ollama models) in a later phase.
-            // For now fail-fast rather than silently fall back to vision-LLM.
+            // Fail-fast rather than silently falling back to vision-LLM —
+            // and say what IS available (plan 110): telling the operator to
+            // unset their own flag names no alternative.
             return Err(KbError::Other(
-                "OCR pipeline not yet implemented; set use_ocr_pipeline=false".into(),
+                "The OCR pipeline is not implemented for PDFs. Set \
+                 use_ocr_pipeline=false and use KB_EXTRACT_PRIMARY with a vision \
+                 model (e.g. `openai/gpt-4.1-nano`), which reads scanned pages \
+                 through the vision extractor. Local OCR is available for single \
+                 images with --features kb-ocr."
+                    .into(),
             ));
         }
     }
