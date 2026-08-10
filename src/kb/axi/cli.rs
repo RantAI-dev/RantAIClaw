@@ -38,9 +38,6 @@ use crate::kb::store::sqlite::SqliteStore;
 use crate::kb::store::{Graph, IntelligenceStore, KbStore};
 use crate::kb::{Document, DocumentId, KbConfig, KbResult, SearchResult};
 
-/// Preview length used when rendering chunk content into TOON rows. Keeps
-/// the row narrow enough to be useful to a downstream LLM without blowing
-/// the per-cell budget. 120 chars matches the value documented in the plan.
 /// Per-chunk preview width in the TOON `chunks` table. The table is a
 /// machine-readable index; the full chunk text reaches the agent through the
 /// retrieval `context` block printed above it (see `cmd_search`), so this cap
@@ -345,9 +342,13 @@ async fn cmd_ingest(
         return Ok(1);
     }
 
-    // 4. Embed each chunk's content.
+    // 4. Embed each chunk's metadata-prefixed text (plan 090) — same recipe
+    //    as the HTTP ingest and bulk re-embed paths.
     let embedder = embed::make_provider(cfg)?;
-    let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    let texts: Vec<String> = chunks
+        .iter()
+        .map(crate::kb::chunk::prepare::prepare_chunk_for_embedding)
+        .collect();
     let embeddings = embedder.embed_many(&texts).await?;
 
     // 5. Persist document + chunks. The DocumentId is a fresh UUID so
@@ -386,7 +387,7 @@ async fn cmd_ingest(
         &document,
         &chunks,
         &embeddings,
-        embedder.model(),
+        &crate::kb::chunk::prepare::tagged_model(embedder.model()),
     )
     .await?;
 

@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::kb::chunk::prepare::tagged_model;
 use crate::kb::store::KbStore;
 use crate::kb::{KbConfig, KbResult};
 
@@ -28,20 +29,26 @@ pub struct DriftReport {
     pub in_sync: bool,
 }
 
-/// Detect chunks embedded with a model other than `cfg.embedding_model`.
+/// Detect chunks embedded with a model+recipe other than the current one.
+///
+/// The comparison target is [`tagged_model`]`(&cfg.embedding_model)`, not the
+/// bare model name: the embedding input recipe is part of vector identity.
+/// Rows tagged with the bare model name (pre-recipe corpora) count as stale
+/// by design — their vectors were computed from different text.
 ///
 /// Read-only. Safe to call from an admin endpoint or a periodic cron — the
 /// underlying aggregation is a single `GROUP BY` query in the SQLite backend.
 pub async fn check_drift(cfg: &KbConfig, store: &Arc<dyn KbStore>) -> KbResult<DriftReport> {
+    let current = tagged_model(&cfg.embedding_model);
     let by_model = store.count_by_embedding_model().await?;
     let stale_chunk_count: usize = by_model
         .iter()
-        .filter(|(model, _)| model.as_deref() != Some(cfg.embedding_model.as_str()))
+        .filter(|(model, _)| model.as_deref() != Some(current.as_str()))
         .map(|(_, n)| *n)
         .sum();
     let in_sync = stale_chunk_count == 0;
     Ok(DriftReport {
-        current_model: cfg.embedding_model.clone(),
+        current_model: current,
         by_model,
         stale_chunk_count,
         in_sync,

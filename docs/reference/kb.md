@@ -87,6 +87,28 @@ rantaiclaw kb re-embed --dry-run             # preview a re-embed run
 rantaiclaw kb re-embed --include-current     # force re-embed every chunk
 ```
 
+### Embedding recipe tag and the v0.18.5 re-embed migration
+
+Chunks are embedded from a metadata-prefixed text (`Category:` / `Topic:` /
+`Section:` lines above the body), and the stored `chunk.embedding_model` tag
+carries an input-recipe marker, e.g. `qwen/qwen3-embedding-8b+meta1`. The
+suffix is intentional — it is not corruption. Nothing parses it; drift and
+re-embed compare the whole string.
+
+Earlier releases embedded the raw chunk body and tagged rows with the bare
+model name. After upgrading:
+
+- `kb drift` reports every pre-existing chunk as stale **by design** — those
+  vectors were computed from different text and live in a different region of
+  the embedding space than fresh ones.
+- Run `rantaiclaw kb re-embed --include-current` once per knowledge base to
+  migrate. This calls the embedding provider once per chunk and costs money
+  on paid providers.
+- Rolling back the binary after a re-embed leaves prefixed vectors queried by
+  code that no longer builds the prefix: restore the matching `kb.db` backup
+  together with the binary, or not at all.
+
+
 ## Configuration
 
 All KB settings are environment-driven. The full list of `KB_*` variables and their defaults is in [config-reference.md](config.md#kb-knowledge-base). The most commonly tuned knobs:

@@ -21,6 +21,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::kb::chunk::prepare::{prepare_chunk_for_embedding, tagged_model};
 use crate::kb::embed::EmbeddingProvider;
 use crate::kb::store::KbStore;
 use crate::kb::{KbConfig, KbResult};
@@ -84,7 +85,10 @@ pub async fn run_bulk_re_embed(
     let started = Instant::now();
     // Guard against degenerate input — a zero batch_size would loop forever.
     let batch_size = opts.batch_size.max(1);
-    let target_model = cfg.embedding_model.clone();
+    // Model + recipe tag: the same value ingest writes. Skipping and writing
+    // both use the tagged form so pre-recipe rows (bare model name) are
+    // re-embedded rather than skipped.
+    let target_model = tagged_model(&cfg.embedding_model);
     let skip_model: Option<&str> = if opts.include_already_current {
         None
     } else {
@@ -112,7 +116,7 @@ pub async fn run_bulk_re_embed(
 
         let (ids, texts): (Vec<_>, Vec<_>) = page
             .into_iter()
-            .map(|(id, content, _)| (id, content))
+            .map(|(id, chunk, _)| (id, prepare_chunk_for_embedding(&chunk)))
             .unzip();
 
         // Embed the page. Provider errors are per-batch — record and move on.

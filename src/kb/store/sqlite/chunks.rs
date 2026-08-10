@@ -198,7 +198,7 @@ impl SqliteStore {
         batch_size: usize,
         after_id: Option<&str>,
         skip_model: Option<&str>,
-    ) -> KbResult<Vec<(ChunkId, String, Option<String>)>> {
+    ) -> KbResult<Vec<(ChunkId, Chunk, Option<String>)>> {
         if batch_size == 0 {
             return Ok(Vec::new());
         }
@@ -207,45 +207,55 @@ impl SqliteStore {
         let skip_model = skip_model.map(str::to_string);
         let batch_size_i = batch_size as i64;
 
-        tokio::task::spawn_blocking(
-            move || -> KbResult<Vec<(ChunkId, String, Option<String>)>> {
-                let conn = conn.blocking_lock();
-                // Build SQL with optional predicates inlined as `?` placeholders.
-                // Lexical ordering on TEXT id is deterministic, which is enough
-                // for pagination — the bulk driver never relies on a particular
-                // visit order, only that each chunk is visited exactly once.
-                let mut sql = String::from(
-                    "SELECT c.id, c.content, c.embedding_model
+        tokio::task::spawn_blocking(move || -> KbResult<Vec<(ChunkId, Chunk, Option<String>)>> {
+            let conn = conn.blocking_lock();
+            // Build SQL with optional predicates inlined as `?` placeholders.
+            // Lexical ordering on TEXT id is deterministic, which is enough
+            // for pagination — the bulk driver never relies on a particular
+            // visit order, only that each chunk is visited exactly once.
+            let mut sql = String::from(
+                "SELECT c.id, c.content, c.embedding_model, c.metadata_json
                      FROM chunk c
                      JOIN document d ON d.id = c.document_id
                      WHERE d.deleted_at IS NULL",
-                );
-                let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-                if let Some(skip) = &skip_model {
-                    sql.push_str(" AND (c.embedding_model IS NULL OR c.embedding_model != ?)");
-                    params.push(Box::new(skip.clone()));
-                }
-                if let Some(after) = &after_id {
-                    sql.push_str(" AND c.id > ?");
-                    params.push(Box::new(after.clone()));
-                }
-                sql.push_str(" ORDER BY c.id LIMIT ?");
-                params.push(Box::new(batch_size_i));
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            if let Some(skip) = &skip_model {
+                sql.push_str(" AND (c.embedding_model IS NULL OR c.embedding_model != ?)");
+                params.push(Box::new(skip.clone()));
+            }
+            if let Some(after) = &after_id {
+                sql.push_str(" AND c.id > ?");
+                params.push(Box::new(after.clone()));
+            }
+            sql.push_str(" ORDER BY c.id LIMIT ?");
+            params.push(Box::new(batch_size_i));
 
-                let mut stmt = conn.prepare(&sql)?;
-                let param_refs: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|b| b.as_ref()).collect();
-                let rows = stmt
-                    .query_map(param_refs.as_slice(), |row| {
-                        let id: String = row.get(0)?;
-                        let content: String = row.get(1)?;
-                        let model: Option<String> = row.get(2)?;
-                        Ok((ChunkId(id), content, model))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            },
-        )
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt
+                .query_map(param_refs.as_slice(), |row| {
+                    let id: String = row.get(0)?;
+                    let content: String = row.get(1)?;
+                    let model: Option<String> = row.get(2)?;
+                    let metadata_json: String = row.get(3)?;
+                    // Same lenient parse as the search path: a row whose
+                    // metadata does not deserialize still re-embeds, just
+                    // without a prefix (defaults are all-empty/None).
+                    let metadata: ChunkMetadata = serde_json::from_str(&metadata_json)
+                        .unwrap_or_else(|_| ChunkMetadata {
+                            document_title: String::new(),
+                            category: String::new(),
+                            subcategory: None,
+                            section: None,
+                            chunk_index: 0,
+                            contextual_prefix: None,
+                        });
+                    Ok((ChunkId(id), Chunk { content, metadata }, model))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
         .await
         .map_err(|e| KbError::Other(format!("join: {e}")))?
     }

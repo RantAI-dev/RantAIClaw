@@ -303,3 +303,14 @@ fn omits_missing_metadata_lines() {
     // "Category: INS\n\nbody only" — blank line between metadata and body.
     assert_eq!(text, "Category: INS\n\nbody only");
 }
+
+#[test]
+fn tagged_model_appends_recipe() {
+    use rantaiclaw::kb::chunk::prepare::{tagged_model, EMBEDDING_RECIPE};
+    // Plan 090: the recipe tag makes an input-text change visible to drift.
+    assert_eq!(EMBEDDING_RECIPE, "meta1");
+    assert_eq!(
+        tagged_model("qwen/qwen3-embedding-8b"),
+        "qwen/qwen3-embedding-8b+meta1"
+    );
+}

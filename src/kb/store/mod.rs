@@ -117,13 +117,15 @@ pub trait KbStore: Send + Sync {
     /// ordering on chunk.id), or `None` for the first page. `skip_model`, if
     /// `Some(m)`, excludes chunks already tagged with `m` — used by the bulk
     /// re-embed driver to skip already-current chunks. Returns tuples of
-    /// `(chunk_id, content, current_embedding_model)`.
+    /// `(chunk_id, chunk, current_embedding_model)` — the full [`Chunk`]
+    /// (content + metadata) so the driver can rebuild the embedding-input
+    /// prefix (`prepare_chunk_for_embedding`) exactly as ingest does.
     async fn list_chunks_for_re_embed(
         &self,
         batch_size: usize,
         after_id: Option<&str>,
         skip_model: Option<&str>,
-    ) -> KbResult<Vec<(ChunkId, String, Option<String>)>>;
+    ) -> KbResult<Vec<(ChunkId, Chunk, Option<String>)>>;
 
     /// Update an existing chunk's embedding vector and `embedding_model`
     /// tag. Validates `new_embedding.len()` against the store's configured
