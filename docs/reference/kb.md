@@ -241,7 +241,7 @@ The extractor calls `KB_OPENROUTER_CHAT_URL` (the shared KB chat-completions end
 |---|---|---|
 | `KB_INTELLIGENCE_ENABLED` | `false` | Enable entity/relation extraction at ingest |
 | `KB_INTELLIGENCE_MODEL` | `openai/gpt-4.1-nano` | Extraction model; routed through `KB_OPENROUTER_CHAT_URL` |
-| `KB_INTELLIGENCE_RESOLUTION` | `exact` | Entity merge strategy: `exact` (normalized name+type), `embedding` (fuzzy — future option) |
+| `KB_INTELLIGENCE_RESOLUTION` | `exact` | Entity merge strategy. Only `exact` (normalized name+type) is implemented; any other value fails config load |
 | `KB_GRAPH_MAX_NODES` | `200` | Cap on nodes returned by the whole-KB graph endpoint (top-N by degree) |
 | `KB_GRAPHRAG_ENABLED` | `false` | Enable GraphRAG retrieval augmentation (see below) |
 | `KB_GRAPHRAG_MAX_NEIGHBORS` | `20` | Cap on 1-hop neighbour entities expanded per query during GraphRAG |

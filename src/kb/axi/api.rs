@@ -585,12 +585,24 @@ struct IntelligenceStats {
 }
 
 /// Capability/status the console needs to render honest empty vs disabled
-/// states: whether intelligence extraction is enabled, and the model it uses.
-/// The model name is not a secret.
+/// states. An empty graph has four different causes — intelligence off, no
+/// credential (extraction fails per chunk and is swallowed), GraphRAG off,
+/// or genuinely no entities — and the console can only tell them apart if
+/// this block carries the distinctions. The model name is not a secret.
 #[derive(Debug, Serialize, Default)]
 struct Capability {
     intelligence_enabled: bool,
     extraction_model: String,
+    /// Whether a credential resolves for the extraction endpoint. Presence
+    /// only — the key itself is never returned, mirroring
+    /// `GET /config/knowledge`. Uses the SAME resolution
+    /// `build_intelligence_extractor` uses, so this flag cannot lie about
+    /// what extraction will do.
+    credential_configured: bool,
+    /// Whether retrieval augments results through the entity graph.
+    graphrag_enabled: bool,
+    /// Entity-resolution strategy actually in effect.
+    resolution: String,
 }
 
 impl Capability {
@@ -598,6 +610,9 @@ impl Capability {
         Self {
             intelligence_enabled: cfg.intelligence_enabled,
             extraction_model: cfg.intelligence_model.clone(),
+            credential_configured: !KbConfig::resolve_key(&cfg.embedding_api_key).is_empty(),
+            graphrag_enabled: cfg.graphrag_enabled,
+            resolution: cfg.intelligence_resolution.clone(),
         }
     }
 }

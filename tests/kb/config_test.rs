@@ -146,3 +146,21 @@ fn intelligence_config_defaults_and_overrides() {
     assert!(cfg.intelligence_enabled);
     assert_eq!(cfg.graph_max_nodes, 50);
 }
+
+#[test]
+fn config_rejects_unimplemented_resolution_strategy() {
+    // Plan 097: `fuzzy` was documented and silently behaved as `exact`.
+    // Anything but `exact` must now fail config load with an actionable
+    // message instead of no-opping.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard(vec!["KB_INTELLIGENCE_RESOLUTION"]);
+    unsafe {
+        std::env::set_var("KB_INTELLIGENCE_RESOLUTION", "fuzzy");
+    }
+    let err = rantaiclaw::kb::KbConfig::from_env().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not implemented") && msg.contains("exact"),
+        "error must say what to do, got: {msg}"
+    );
+}

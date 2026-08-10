@@ -45,8 +45,11 @@ pub struct KbConfig {
     /// Model used by the intelligence extractor (entity/relation extraction).
     /// Reads `KB_INTELLIGENCE_MODEL`; defaults to `openai/gpt-4.1-nano`.
     pub intelligence_model: String,
-    /// Resolution mode for intelligence extraction (`exact` or `fuzzy`).
-    /// Reads `KB_INTELLIGENCE_RESOLUTION`; defaults to `exact`.
+    /// Entity-resolution strategy. Only `exact` (canonical-key match) is
+    /// implemented; config load rejects anything else rather than silently
+    /// ignoring it. Reads `KB_INTELLIGENCE_RESOLUTION`; defaults to `exact`.
+    /// The value is threaded to `extract_document_intelligence` as the seam
+    /// a future strategy would use.
     pub intelligence_resolution: String,
     /// Maximum nodes retained in the in-memory knowledge graph.
     /// Reads `KB_GRAPH_MAX_NODES`; defaults to `200`.
@@ -109,8 +112,17 @@ impl KbConfig {
                 .unwrap_or(false),
             intelligence_model: env::var("KB_INTELLIGENCE_MODEL")
                 .unwrap_or_else(|_| "openai/gpt-4.1-nano".into()),
-            intelligence_resolution: env::var("KB_INTELLIGENCE_RESOLUTION")
-                .unwrap_or_else(|_| "exact".into()),
+            intelligence_resolution: {
+                let v = env::var("KB_INTELLIGENCE_RESOLUTION").unwrap_or_else(|_| "exact".into());
+                // Fail fast on anything unimplemented: `fuzzy` used to be
+                // advertised and silently behaved as `exact` (plan 097).
+                if v != "exact" {
+                    return Err(KbError::Config(format!(
+                        "KB_INTELLIGENCE_RESOLUTION={v} is not implemented;                          only 'exact' is supported — unset the variable or set it to 'exact'"
+                    )));
+                }
+                v
+            },
             graph_max_nodes: parse_env("KB_GRAPH_MAX_NODES", 200)?,
             graphrag_enabled: env::var("KB_GRAPHRAG_ENABLED")
                 .map(|v| v == "true" || v == "1")
