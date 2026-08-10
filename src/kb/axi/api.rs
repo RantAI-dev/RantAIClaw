@@ -746,6 +746,12 @@ struct ReExtractResponse {
     document_id: String,
     entities: usize,
     relations: usize,
+    /// Chunks the extractor failed on. Non-zero with zero entities means the
+    /// extraction FAILED — the console must not render it as "no entities".
+    failed_chunks: usize,
+    /// First failure reason (short; never the upstream body or a credential).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 impl ReExtractResponse {
@@ -754,6 +760,8 @@ impl ReExtractResponse {
             document_id,
             entities: summary.entities,
             relations: summary.relations,
+            failed_chunks: summary.failed_chunks,
+            error: summary.error,
         }
     }
 }
@@ -1040,6 +1048,28 @@ async fn re_extract_document(
     )
     .await
     .map_err(ApiError::from)?;
+
+    // A TOTAL failure is not a successful extraction of nothing: when every
+    // chunk failed, answer 502 with the reason instead of 200 { entities: 0 }
+    // — re-extract is the synchronous, operator-initiated path where the
+    // truth can actually be delivered (plan 109).
+    if !chunk_refs.is_empty() && summary.failed_chunks >= chunk_refs.len() {
+        let reason = summary
+            .error
+            .clone()
+            .unwrap_or_else(|| "unknown extraction error".into());
+        return Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            body: ErrorBody {
+                error: "extraction_failed".into(),
+                detail: Some(format!(
+                    "extraction failed on all {} chunks: {reason}",
+                    summary.failed_chunks
+                )),
+            },
+        }
+        .into());
+    }
 
     Ok(Json(ReExtractResponse::new(id, summary)))
 }
@@ -1491,7 +1521,7 @@ async fn ingest(
         tokio::spawn(async move {
             let extractor = build_intelligence_extractor(&cfg);
             let chunk_refs: Vec<&str> = chunk_texts.iter().map(String::as_str).collect();
-            if let Err(e) = extract_document_intelligence(
+            match extract_document_intelligence(
                 &*intel,
                 &extractor,
                 &extract_doc_id,
@@ -1500,12 +1530,27 @@ async fn ingest(
             )
             .await
             {
-                tracing::warn!(
-                    target: "kb::ingest",
-                    document_id = %extract_doc_id,
-                    error = %e,
-                    "document intelligence extraction failed (fire-and-forget)"
-                );
+                Err(e) => {
+                    tracing::warn!(
+                        target: "kb::ingest",
+                        document_id = %extract_doc_id,
+                        error = %e,
+                        "document intelligence extraction failed (fire-and-forget)"
+                    );
+                }
+                // Per-chunk failures don't Err (fail-soft extractor) — one
+                // line with count + reason is the only trace an operator
+                // gets on this detached path (plan 109).
+                Ok(summary) if summary.failed_chunks > 0 => {
+                    tracing::warn!(
+                        target: "kb::ingest",
+                        document_id = %extract_doc_id,
+                        failed_chunks = summary.failed_chunks,
+                        reason = summary.error.as_deref().unwrap_or("unknown"),
+                        "document intelligence extraction failed on some chunks"
+                    );
+                }
+                Ok(_) => {}
             }
         });
     }
