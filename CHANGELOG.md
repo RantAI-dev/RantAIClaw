@@ -5,6 +5,39 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **An API key stored in `api_url` is no longer kept on disk or shown in the web
+  console.** `api_url` is written to `config.toml` in plaintext, unlike `api_key`,
+  which is encrypted at rest. v0.18.0-alpha started rejecting credential-shaped
+  writes at the config API, but that guard is write-only: every config that
+  already held such a value kept it, and `GET /api/v1/secrets` returned it
+  verbatim into the console's **API base URL** field — a plain-text input, not a
+  password one — so the key was displayed in the browser.
+
+  Observed on a real profile: `api_key = "enc2:…"` (encrypted) next to
+  `api_url = "sk-or-…"` (an OpenRouter key, plaintext).
+
+  Three layers now apply one rule — credential-shaped values are never stored,
+  never echoed, always warned about:
+
+  | layer | behaviour |
+  | --- | --- |
+  | `Config::load_or_init` | drops the value between read and parse, writes the cleaned config back, and warns naming the file and telling the operator to rotate the key |
+  | `GET /api/v1/secrets` | withholds a credential-shaped `api_url` so the console cannot render it |
+  | `rantaiclaw doctor` | new `config.api_url` check reports a value that is not a usable URL |
+
+  A malformed-but-harmless value (a typo, a bare hostname) is deliberately
+  *kept*: it is not a secret, and dropping it silently would hide the operator's
+  mistake. That is the case the new `doctor` check reports.
+
+  **Operators: if a key was ever stored in `api_url`, rotate it.** It was held
+  unencrypted and rendered in the browser; removing it does not undo that.
+  Restart the daemon after upgrading so the running process stops holding the
+  old value in memory.
+
 ## [0.18.3-alpha] — 2026-08-09
 
 One fix: `doctor models` reported a passed check for a provider it could not
