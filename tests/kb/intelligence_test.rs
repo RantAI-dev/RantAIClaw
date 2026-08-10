@@ -28,7 +28,9 @@ async fn llm_extractor_parses_entities_and_relations_from_chat() {
         .await
         .unwrap();
     assert_eq!(out.entities.len(), 1);
-    assert_eq!(out.entities[0].0, "NQRust");
+    // Tuple is (chunk_index, name, type, confidence) since plan 093.
+    assert_eq!(out.entities[0].0, 0, "single-chunk input -> chunk_index 0");
+    assert_eq!(out.entities[0].1, "NQRust");
     assert_eq!(out.relations.len(), 1);
 }
 
@@ -61,7 +63,7 @@ async fn llm_extractor_sanitizes_zero_confidence_to_nonzero() {
         .unwrap();
     assert_eq!(out.entities.len(), 1);
     assert!(
-        out.entities[0].2 > 0.0,
+        out.entities[0].3 > 0.0,
         "entity confidence must be sanitised above 0"
     );
     assert_eq!(out.relations.len(), 1);
@@ -199,7 +201,7 @@ async fn orchestration_merges_same_entity_across_two_documents() {
     impl EntityRelationExtractor for CannedExtractor {
         async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
             Ok(Extracted {
-                entities: vec![("NQRust".into(), EntityType::Product, 0.9)],
+                entities: vec![(0, "NQRust".into(), EntityType::Product, 0.9)],
                 relations: vec![],
             })
         }
@@ -223,8 +225,15 @@ async fn orchestration_merges_same_entity_across_two_documents() {
 
 #[tokio::test]
 async fn graph_expand_chunks_surfaces_neighbor_only_chunks() {
+    // Plan 093: drives the PRODUCTION orchestrator (extract_document_intelligence)
+    // instead of hand-seeding mention rows. The previous version seeded
+    // `ExtractSource::Llm` mentions WITH `chunk_index: Some(_)` — a row shape
+    // the real extractor never produced (it wrote NULL), which is exactly how
+    // the NULL-join defect stayed green in CI.
+    use async_trait::async_trait;
     use chrono::Utc;
-    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, Relation};
+    use rantaiclaw::kb::intelligence::extract::{EntityRelationExtractor, Extracted};
+    use rantaiclaw::kb::intelligence::extract_document_intelligence;
     use rantaiclaw::kb::store::sqlite::SqliteStore;
     use rantaiclaw::kb::store::{IntelligenceStore, KbStore};
     use rantaiclaw::kb::{Chunk, ChunkMetadata, Document, DocumentId};
@@ -294,75 +303,39 @@ async fn graph_expand_chunks_surfaces_neighbor_only_chunks() {
         .await
         .unwrap();
 
-    let alice = store
-        .upsert_entity(&Entity {
-            id: "e_alice".into(),
-            canonical_key: "alice:Person".into(),
-            name: "Alice".into(),
-            entity_type: EntityType::Person,
-            confidence: 0.9,
-            metadata: serde_json::json!({}),
-        })
-        .await
-        .unwrap();
-    let corp = store
-        .upsert_entity(&Entity {
-            id: "e_corp".into(),
-            canonical_key: "techcorp:Organization".into(),
-            name: "TechCorp".into(),
-            entity_type: EntityType::Organization,
-            confidence: 0.95,
-            metadata: serde_json::json!({}),
-        })
-        .await
-        .unwrap();
-    // Alice mentioned in chunk 0; TechCorp in chunks 0 and 1.
-    store
-        .add_mention(&EntityMention {
-            id: "m1".into(),
-            entity_id: alice.clone(),
-            document_id: "d_graphrag".into(),
-            chunk_index: Some(0),
-            context: None,
-            source: ExtractSource::Llm,
-        })
-        .await
-        .unwrap();
-    store
-        .add_mention(&EntityMention {
-            id: "m2".into(),
-            entity_id: corp.clone(),
-            document_id: "d_graphrag".into(),
-            chunk_index: Some(0),
-            context: None,
-            source: ExtractSource::Llm,
-        })
-        .await
-        .unwrap();
-    store
-        .add_mention(&EntityMention {
-            id: "m3".into(),
-            entity_id: corp.clone(),
-            document_id: "d_graphrag".into(),
-            chunk_index: Some(1),
-            context: None,
-            source: ExtractSource::Llm,
-        })
-        .await
-        .unwrap();
-    // Alice —WorksFor→ TechCorp: the 1-hop edge graph expansion follows.
-    store
-        .add_relation(&Relation {
-            id: "r1".into(),
-            source_entity_id: alice.clone(),
-            target_entity_id: corp.clone(),
-            relation_type: RelationType::WorksFor,
-            confidence: 0.85,
-            document_id: "d_graphrag".into(),
-            metadata: serde_json::json!({}),
-        })
-        .await
-        .unwrap();
+    // Stub LLM extractor emitting what a real model would for those chunks:
+    // Alice in chunk 0, TechCorp in chunks 0 and 1, one WorksFor relation.
+    struct CannedExtractor;
+    #[async_trait]
+    impl EntityRelationExtractor for CannedExtractor {
+        async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
+            Ok(Extracted {
+                entities: vec![
+                    (0, "Alice".into(), EntityType::Person, 0.9),
+                    (0, "TechCorp".into(), EntityType::Organization, 0.95),
+                    (1, "TechCorp".into(), EntityType::Organization, 0.95),
+                ],
+                relations: vec![(
+                    "Alice".into(),
+                    "TechCorp".into(),
+                    RelationType::WorksFor,
+                    0.85,
+                )],
+            })
+        }
+    }
+    extract_document_intelligence(
+        &store,
+        &CannedExtractor,
+        "d_graphrag",
+        &[
+            "Alice works at TechCorp.",
+            "TechCorp builds embedded systems.",
+        ],
+        "exact",
+    )
+    .await
+    .unwrap();
 
     // Query names only "Alice" → seed Alice → 1-hop neighbour TechCorp.
     let got = store
@@ -391,6 +364,63 @@ async fn graph_expand_chunks_surfaces_neighbor_only_chunks() {
     assert!(
         none.is_empty(),
         "no entity match must yield no graph chunks: {none:?}"
+    );
+}
+
+#[tokio::test]
+async fn llm_mentions_always_carry_a_chunk_index() {
+    // Plan 093 invariant: the SQL join in graph_expand_chunks depends on
+    // every LLM mention carrying its chunk index. A NULL here silently
+    // removes the entity from retrieval — pin it where a refactor of the
+    // orchestrator will trip over it.
+    use async_trait::async_trait;
+    use rantaiclaw::kb::intelligence::extract::{EntityRelationExtractor, Extracted};
+    use rantaiclaw::kb::intelligence::extract_document_intelligence;
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use tempfile::TempDir;
+
+    struct CannedExtractor;
+    #[async_trait]
+    impl EntityRelationExtractor for CannedExtractor {
+        async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
+            Ok(Extracted {
+                entities: vec![
+                    (0, "Alpha".into(), EntityType::Concept, 0.9),
+                    (1, "Beta".into(), EntityType::Concept, 0.9),
+                ],
+                relations: vec![],
+            })
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    extract_document_intelligence(&store, &CannedExtractor, "d1", &["c0", "c1"], "exact")
+        .await
+        .unwrap();
+
+    // Inspect the raw mention rows: none from the LLM source may be NULL.
+    let conn = rusqlite::Connection::open(tmp.path().join("kb.db")).unwrap();
+    let null_llm: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_mention WHERE source = 'llm' AND chunk_index IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let total_llm: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entity_mention WHERE source = 'llm'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(total_llm >= 2, "expected llm mentions to be stored");
+    assert_eq!(
+        null_llm, 0,
+        "an LLM mention with a NULL chunk_index is invisible to GraphRAG's chunk join"
     );
 }
 
@@ -765,8 +795,8 @@ async fn store_intelligence_reingest_idempotent() {
         async fn extract(&self, _c: &[&str]) -> rantaiclaw::kb::KbResult<Extracted> {
             Ok(Extracted {
                 entities: vec![
-                    ("NQRust".into(), EntityType::Product, 0.9),
-                    ("NexusQuantum".into(), EntityType::Organization, 0.85),
+                    (0, "NQRust".into(), EntityType::Product, 0.9),
+                    (0, "NexusQuantum".into(), EntityType::Organization, 0.85),
                 ],
                 relations: vec![(
                     "NQRust".into(),

@@ -134,7 +134,7 @@ impl EntityRelationExtractor for CombinedLlmExtractor {
     async fn extract(&self, chunks: &[&str]) -> KbResult<Extracted> {
         let mut out = Extracted::default();
 
-        for &chunk in chunks {
+        for (chunk_index, &chunk) in chunks.iter().enumerate() {
             let prompt = build_prompt(chunk);
             let body = serde_json::json!({
                 "model": &self.model,
@@ -198,6 +198,7 @@ impl EntityRelationExtractor for CombinedLlmExtractor {
 
             for ent in payload.entities {
                 out.entities.push((
+                    chunk_index,
                     ent.name,
                     EntityType::from_str_lenient(&ent.entity_type),
                     sanitize_confidence(ent.confidence),

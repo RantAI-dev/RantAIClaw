@@ -41,9 +41,13 @@ pub async fn extract_document_intelligence(
     let mut mentions: Vec<EntityMention> = Vec::new();
     let mut n_ent = 0usize;
 
-    // 1) LLM entities — aggregated for the whole document (chunk_index = None).
+    // 1) LLM entities — one mention per (entity, chunk). The chunk index MUST
+    // be stored: GraphRAG's chunk join matches on
+    // `m.chunk_index = c.chunk_index`, and a NULL index never matches, so a
+    // document-level mention is invisible to retrieval (the pre-fix state:
+    // only pattern entities could ever surface a chunk).
     let llm = extractor.extract(chunks).await?;
-    for (name, ty, conf) in &llm.entities {
+    for (chunk_index, name, ty, conf) in &llm.entities {
         let id = new_id();
         entities.push(Entity {
             id: id.clone(),
@@ -57,7 +61,7 @@ pub async fn extract_document_intelligence(
             id: new_id(),
             entity_id: id.clone(),
             document_id: document_id.to_string(),
-            chunk_index: None,
+            chunk_index: Some(i64::try_from(*chunk_index).unwrap_or(0)),
             context: None,
             source: ExtractSource::Llm,
         });
