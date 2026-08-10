@@ -709,6 +709,7 @@ The KB subsystem is gated behind the `kb` Cargo feature (enabled in the default 
 
 | Key | Default | Purpose |
 |---|---|---|
+| `enabled` | `false` | Whether the Knowledge Base is active. Off means the agent is not told the KB exists, `/api/v1/kb/*` reports `kb_disabled`, and the console shows an activation screen. Deactivating does **not** clear the keys below — reactivation is one click; deleting a key is a separate, explicit action. Upgrade rule (schema v17→v18): a config that already carries an embedding key (file or `KB_EMBEDDING_API_KEY` env) migrates to `true` |
 | `embedding_api_key` | unset | Bearer for KB document embedding (search/ingest) |
 | `vision_api_key` | unset | Bearer for OCR/vision extraction of PDFs and images; falls back to `embedding_api_key` when unset |
 

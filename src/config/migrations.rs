@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 17;
+pub const CURRENT_VERSION: u32 = 18;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -252,8 +252,16 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v17(raw);
     }
 
-    // Future migrations (v18, v19, …) inserted here in order.
-    // if from < 18 { migrate_v18(raw)?; }
+    // v17 → v18: `[knowledge] enabled` gates the Knowledge Base explicitly.
+    // Existing installs that already carry an embedding key were configured
+    // deliberately, so they upgrade ON. A config with no key upgrades OFF,
+    // which matches what it already did.
+    if from < 18 {
+        migrate_v18(raw);
+    }
+
+    // Future migrations (v19, v20, …) inserted here in order.
+    // if from < 19 { migrate_v19(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -282,6 +290,54 @@ fn migrate_v17(raw: &mut Value) {
 
     for key in REMOVED {
         memory.remove(key);
+    }
+}
+
+/// v17 → v18: add `[knowledge] enabled`.
+///
+/// The default is `false` (fresh installs get no KB until activated), but the
+/// migration must not strip a working KB from an existing operator: a config
+/// that already carries a non-empty `embedding_api_key` — plaintext or
+/// `enc2:`-encrypted, presence is what matters — was configured on purpose
+/// and upgrades to `enabled = true`.
+///
+/// Env case: `KB_EMBEDDING_API_KEY` folds onto `config.knowledge` at LOAD,
+/// after this migration runs on the file — an operator supplying the key only
+/// via env has nothing in the file and would silently migrate OFF. A
+/// non-empty `KB_EMBEDDING_API_KEY` in the process environment therefore
+/// counts as evidence too.
+fn migrate_v18(raw: &mut Value) {
+    let file_key_present = raw
+        .get("knowledge")
+        .and_then(|k| k.get("embedding_api_key"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty());
+    let env_key_present = std::env::var("KB_EMBEDDING_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let enabled = file_key_present || env_key_present;
+
+    // Do NOT inject a `[knowledge]` table into configs that lack one — the
+    // serde default already yields `enabled = false` at load, and the
+    // v9→v10 invariant (additive fields ride on serde defaults) is pinned by
+    // test. Only two cases need writing: the table exists (set the flag per
+    // the rule), or the env carries a key with no table (the one state serde
+    // cannot represent — it must migrate ON).
+    let Some(table) = raw.as_table_mut() else {
+        // Non-table root errors in the runner's own validation; nothing to do.
+        return;
+    };
+    match table.get_mut("knowledge").and_then(|k| k.as_table_mut()) {
+        Some(kt) => {
+            // Idempotent: an existing `enabled` value (v18 config re-run) wins.
+            kt.entry("enabled").or_insert(Value::Boolean(enabled));
+        }
+        None if env_key_present => {
+            let mut kt = toml::map::Map::new();
+            kt.insert("enabled".into(), Value::Boolean(true));
+            table.insert("knowledge".into(), Value::Table(kt));
+        }
+        None => {}
     }
 }
 
@@ -633,5 +689,90 @@ backend = \"markdown\"
         // some weird cases; ensure we don't silently corrupt them.
         let mut v = Value::Integer(7);
         assert!(migrate(&mut v).is_err());
+    }
+
+    /// Serialize the v18 tests against every env-mutating test in the crate
+    /// and scrub `KB_EMBEDDING_API_KEY` for their duration — migrate_v18
+    /// reads it as configuration evidence, so an ambient value on a dev/CI
+    /// machine would flip the no-key expectations.
+    struct V18EnvGuard {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl V18EnvGuard {
+        fn scrubbed() -> Self {
+            let lock = crate::test_env::ENV_LOCK.blocking_lock();
+            let prev = std::env::var_os("KB_EMBEDDING_API_KEY");
+            std::env::remove_var("KB_EMBEDDING_API_KEY");
+            Self { _lock: lock, prev }
+        }
+    }
+    impl Drop for V18EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("KB_EMBEDDING_API_KEY", v),
+                None => std::env::remove_var("KB_EMBEDDING_API_KEY"),
+            }
+        }
+    }
+
+    #[test]
+    fn v18_env_key_alone_upgrades_on() {
+        // The env-only operator: key never written to the file. Without the
+        // env check they would silently migrate OFF and lose the KB.
+        let _guard = V18EnvGuard::scrubbed();
+        std::env::set_var("KB_EMBEDDING_API_KEY", "rantaiclaw_test_key");
+        let mut v = parse("schema_version = 17\n");
+        migrate(&mut v).unwrap();
+        std::env::remove_var("KB_EMBEDDING_API_KEY");
+        let k = v.get("knowledge").unwrap().as_table().unwrap();
+        assert_eq!(k.get("enabled").unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn v18_configured_install_upgrades_on() {
+        let _guard = V18EnvGuard::scrubbed();
+        // THE protective test: an operator with a working KB (key present)
+        // must not lose it on upgrade. Fails if the rule is inverted.
+        let mut v = parse("schema_version = 17\n[knowledge]\nembedding_api_key = \"enc2:abc\"\n");
+        migrate(&mut v).unwrap();
+        assert_eq!(version_of(&v), Some(18));
+        let k = v.get("knowledge").unwrap().as_table().unwrap();
+        assert_eq!(
+            k.get("enabled").unwrap().as_bool(),
+            Some(true),
+            "a config that carries a key was configured on purpose — upgrade ON"
+        );
+    }
+
+    #[test]
+    fn v18_unconfigured_install_upgrades_off() {
+        let _guard = V18EnvGuard::scrubbed();
+        // No key anywhere: the migration must not inject a [knowledge]
+        // table (v9->v10 invariant — serde default yields enabled = false
+        // at load), so the KB stays off exactly as it already was.
+        let mut v = parse("schema_version = 17\n");
+        migrate(&mut v).unwrap();
+        assert!(
+            v.get("knowledge").is_none(),
+            "no key -> no injected table; serde default supplies enabled=false"
+        );
+    }
+
+    #[test]
+    fn v18_existing_enabled_false_with_key_is_preserved() {
+        let _guard = V18EnvGuard::scrubbed();
+        // Idempotence for the deliberate deactivated-but-configured state:
+        // re-running migration on a v18-shaped config must NOT flip it on.
+        let mut v = parse(
+            "schema_version = 17\n[knowledge]\nenabled = false\nembedding_api_key = \"enc2:abc\"\n",
+        );
+        migrate(&mut v).unwrap();
+        let k = v.get("knowledge").unwrap().as_table().unwrap();
+        assert_eq!(
+            k.get("enabled").unwrap().as_bool(),
+            Some(false),
+            "an explicit enabled value must win over the derivation"
+        );
     }
 }
