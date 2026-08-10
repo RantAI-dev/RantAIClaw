@@ -324,7 +324,7 @@ async fn cmd_ingest(
         .first()
         .cloned()
         .unwrap_or_else(|| "RANTAICLAW".to_string());
-    let chunks = smart_chunk_document(
+    let mut chunks = smart_chunk_document(
         &processed.content,
         &title,
         &primary_category,
@@ -340,6 +340,29 @@ async fn cmd_ingest(
             &format!("no chunks produced from {}", path.display()),
         );
         return Ok(1);
+    }
+
+    // Opt-in contextual prefixes (plan 091): one chat call per document,
+    // producing a one-line situating sentence per chunk. Fail-soft — every
+    // error path returns empty strings and the chunk indexes without a
+    // prefix. Must run BEFORE the embed map below so the prefix reaches the
+    // vector through prepare_chunk_for_embedding (plan 090); writing it to
+    // the DB after embedding would store text the vector never saw.
+    // Credential caveat: generate_contextual_prefixes reads
+    // OPENROUTER_API_KEY from env only — a console-configured key does not
+    // reach it until plan 108 unifies KB credentials.
+
+    let bodies: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    let prefixes = crate::kb::retrieve::contextual::generate_contextual_prefixes(
+        cfg,
+        &processed.content,
+        &bodies,
+    )
+    .await;
+    for (chunk, prefix) in chunks.iter_mut().zip(prefixes) {
+        if !prefix.trim().is_empty() {
+            chunk.metadata.contextual_prefix = Some(prefix);
+        }
     }
 
     // 4. Embed each chunk's metadata-prefixed text (plan 090) — same recipe
