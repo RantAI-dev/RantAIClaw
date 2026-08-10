@@ -1034,3 +1034,60 @@ async fn kb_json_routes_reject_oversized_bodies() {
         "the upload arm must keep its raised limit"
     );
 }
+
+#[tokio::test]
+async fn membership_route_404s_on_bogus_group() {
+    // Plan 099: POST /kb/groups/{id}/documents used to insert a membership
+    // row for ANY ids and return {"ok": true} — inflating document_count
+    // while list_group_documents showed nothing.
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/v1/kb/groups/no_such_group/documents",
+            h.base_url
+        ))
+        .json(&serde_json::json!({ "document_id": "also_bogus" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        404,
+        "bogus ids must not create a membership row"
+    );
+}
+
+#[tokio::test]
+async fn kb_ingest_bogus_group_field_404s_before_storing() {
+    // Plan 099 step 2: group ids are validated BEFORE staging/embedding, so
+    // a typo'd group leaves no document behind.
+    let h = start_harness(|_store| Box::pin(async move {})).await;
+    let client = reqwest::Client::new();
+    let form = reqwest::multipart::Form::new()
+        .text("groups", "no_such_group")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"# Doc\nBody.".to_vec()).file_name("doc.md"),
+        );
+    let resp = client
+        .post(format!("{}/api/v1/kb/documents", h.base_url))
+        .multipart(form)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 404, "bogus group must fail the upload");
+
+    // Nothing persisted.
+    let body: Value = reqwest::get(format!("{}/api/v1/kb/documents", h.base_url))
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        body.as_array().map(|a| a.len()),
+        Some(0),
+        "a rejected ingest must leave no document behind: {body}"
+    );
+}

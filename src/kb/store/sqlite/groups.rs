@@ -207,12 +207,38 @@ impl SqliteStore {
         let group_id = group_id.to_string();
         let now = Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(move || -> KbResult<()> {
-            let conn = conn.blocking_lock();
-            conn.execute(
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            // PRAGMA foreign_keys is off (see module docs), so the declared
+            // references are not enforced. Check explicitly — an unchecked
+            // INSERT OR IGNORE creates a membership row pointing at nothing,
+            // which inflates `document_count` while `list_group_documents`
+            // shows nothing. Same transaction as the insert, so a concurrent
+            // delete cannot slip between check and write.
+            let group_ok: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM knowledge_base_group WHERE id = ?1",
+                params![group_id],
+                |r| r.get(0),
+            )?;
+            if group_ok == 0 {
+                return Err(KbError::NotFound(format!("group {group_id}")));
+            }
+            // Soft-deleted documents excluded deliberately: attaching one
+            // would produce a membership row no listing can ever show.
+            let doc_ok: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM document WHERE id = ?1 AND deleted_at IS NULL",
+                params![document_id],
+                |r| r.get(0),
+            )?;
+            if doc_ok == 0 {
+                return Err(KbError::NotFound(format!("document {document_id}")));
+            }
+            tx.execute(
                 "INSERT OR IGNORE INTO document_group (document_id, group_id, created_at)
                  VALUES (?1, ?2, ?3)",
                 params![document_id, group_id, now],
             )?;
+            tx.commit()?;
             Ok(())
         })
         .await
