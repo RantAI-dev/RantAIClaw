@@ -73,7 +73,9 @@ impl SqliteStore {
             let conn = conn.blocking_lock();
             let mut stmt = conn.prepare(
                 "SELECT g.id, g.name, g.description, g.color,
-                        (SELECT COUNT(*) FROM document_group dg WHERE dg.group_id = g.id)
+                        (SELECT COUNT(*) FROM document_group dg
+                          JOIN document d ON d.id = dg.document_id
+                         WHERE dg.group_id = g.id AND d.deleted_at IS NULL)
                             AS document_count
                  FROM knowledge_base_group g
                  ORDER BY g.created_at DESC",

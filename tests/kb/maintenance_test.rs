@@ -481,3 +481,58 @@ async fn bulk_re_embed_respects_batch_size() {
         "25 chunks at batch_size=10 -> 3 embed_many calls"
     );
 }
+
+#[tokio::test]
+async fn drift_count_matches_what_re_embed_will_walk() {
+    // Plan 100: count_by_embedding_model had no soft-delete filter while
+    // list_chunks_for_re_embed skips soft-deleted parents — so drift
+    // reported N stale, re-embed walked fewer than N, and the operator
+    // could never reach in_sync. The PAIR is the invariant.
+    let (_tmp, store) = fresh_store().await;
+    let cfg = cfg_with_model("rantaiclaw_model_current");
+
+    let d1 = sample_doc("rantaiclaw_doc_dr1");
+    let d2 = sample_doc("rantaiclaw_doc_dr2");
+    store.create_document(&d1).await.unwrap();
+    store.create_document(&d2).await.unwrap();
+    let chunks1: Vec<_> = (0..2).map(|i| sample_chunk(&d1.title, i)).collect();
+    let chunks2: Vec<_> = (0..3).map(|i| sample_chunk(&d2.title, i)).collect();
+    store
+        .store_chunks(&d1.id, &chunks1, &vec![ones(); 2], "rantaiclaw_model_old")
+        .await
+        .unwrap();
+    store
+        .store_chunks(&d2.id, &chunks2, &vec![ones(); 3], "rantaiclaw_model_old")
+        .await
+        .unwrap();
+
+    store.delete_document(&d1.id, true).await.unwrap(); // soft
+
+    let report = check_drift(&cfg, &store).await.unwrap();
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(ConstantEmbedder::new(DIM));
+    let run = run_bulk_re_embed(
+        &cfg,
+        &store,
+        &embedder,
+        BulkReEmbedOptions {
+            include_already_current: true,
+            dry_run: false,
+            batch_size: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.stale_chunk_count, run.total_chunks_examined,
+        "drift's stale count must equal what re-embed actually walks"
+    );
+    assert_eq!(
+        report.stale_chunk_count, 3,
+        "only the live document's chunks"
+    );
+
+    // And after the re-embed, drift reaches in_sync — the loop that never
+    // terminated before this fix.
+    let after = check_drift(&cfg, &store).await.unwrap();
+    assert!(after.in_sync, "re-embed must reach in_sync: {after:?}");
+}

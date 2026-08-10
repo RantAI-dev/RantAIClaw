@@ -694,3 +694,45 @@ async fn membership_rejects_nonexistent_group_and_document() {
         .await
         .expect("valid membership must still insert");
 }
+
+#[tokio::test]
+async fn group_document_count_excludes_soft_deleted() {
+    // Plan 100: the card count (list_groups.document_count) and the detail
+    // list (list_group_documents) must agree after a soft delete — the bug
+    // was the pair disagreeing ("5 docs" card, 4 listed) forever.
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::KbStore;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+    let d1 = sample_doc("rantaiclaw_doc_sd1", "Doc SD1");
+    let d2 = sample_doc("rantaiclaw_doc_sd2", "Doc SD2");
+    store.create_document(&d1).await.unwrap();
+    store.create_document(&d2).await.unwrap();
+    let group = store.create_group("SoftDel", None, None).await.unwrap();
+    store
+        .add_document_to_group(&d1.id.0, &group.id)
+        .await
+        .unwrap();
+    store
+        .add_document_to_group(&d2.id.0, &group.id)
+        .await
+        .unwrap();
+
+    store.delete_document(&d1.id, true).await.unwrap();
+
+    let summaries = store.list_groups().await.unwrap();
+    let listed = store.list_group_documents(&group.id).await.unwrap();
+    assert_eq!(
+        summaries[0].document_count, 1,
+        "card count must exclude the soft-deleted document"
+    );
+    assert_eq!(
+        summaries[0].document_count,
+        listed.len() as i64,
+        "card count and detail list must agree"
+    );
+}
