@@ -2249,7 +2249,7 @@ pub async fn run(
     // teach the agent about the `rantaiclaw kb …` shell capability so
     // it can shell out via its existing `shell` tool. No `Tool` impl.
     #[cfg(feature = "kb")]
-    if let Some(line) = crate::kb::axi::kb_ambient_context() {
+    if let Some(line) = crate::kb::axi::kb_ambient_context(&config.knowledge) {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&line);
     }
@@ -2672,7 +2672,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 
     // ── AXI principle #7: ambient KB discovery ───────────────────
     #[cfg(feature = "kb")]
-    if let Some(line) = crate::kb::axi::kb_ambient_context() {
+    if let Some(line) = crate::kb::axi::kb_ambient_context(&config.knowledge) {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&line);
     }
