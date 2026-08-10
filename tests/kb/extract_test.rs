@@ -836,3 +836,87 @@ async fn vision_llm_extracts_real_pdf() {
         .expect("live extract should succeed");
     assert!(!r.text.is_empty());
 }
+
+#[test]
+fn signals_cjk_thin_text_is_insufficient_by_characters() {
+    // Plan 112 item 1: min_chars_per_page is CHARACTERS. CJK is 3 bytes per
+    // character in UTF-8, so a byte-count comparison overcounted 3x and a
+    // thin Chinese extraction cleared the threshold — OCR fallback never
+    // fired. This string is UNDER the per-page character minimum but OVER it
+    // in bytes; it must be judged insufficient.
+    let opts = RouterOpts::default();
+    let per_page = opts.min_chars_per_page;
+    // Half the required characters, but 1.5x the required bytes (3 B each).
+    let text: String = "文".repeat(per_page / 2);
+    assert!(
+        text.len() > per_page,
+        "precondition: bytes clear the threshold"
+    );
+    assert!(
+        text.chars().count() < per_page,
+        "precondition: characters do not"
+    );
+    assert!(
+        !is_unpdf_sufficient(&text, 1, &opts),
+        "thin CJK text must trigger the OCR fallback"
+    );
+}
+
+#[test]
+fn hybrid_merge_repeated_sentence_substitutes_in_document_order() {
+    // Plan 112 item 5: try_substitute searched from position 0 per block, so
+    // two prose blocks sharing their opening phrase both anchored to the
+    // FIRST occurrence — the second block resolved a wrong (over-long) span,
+    // failed the length ratio, and fell back to raw. The markers below exist
+    // ONLY in the text layer, mid-sentence (outside both anchors), so they
+    // can reach the output through a successful substitution alone — a raw
+    // fallback cannot fake a pass.
+    let structural = "\
+The quarterly report shows steady growth in all divisions this year overall.\n\
+\n\
+The quarterly report shows steady growth in the northern alpine region too.";
+    let text_layer = "\
+The quarterly report shows steady LAYERONE growth in all divisions this year overall. \
+The quarterly report shows steady LAYERTWO growth in the northern alpine region too.";
+    let merged = merge_structural_with_text_layer(structural, text_layer);
+    assert!(
+        merged.contains("LAYERONE"),
+        "first block must substitute its layer span: {merged}"
+    );
+    assert!(
+        merged.contains("LAYERTWO"),
+        "second block must substitute ITS OWN span (forward search from the \
+         previous match), not fall back after anchoring to the first \
+         occurrence: {merged}"
+    );
+    let first = merged.find("LAYERONE").unwrap();
+    let second = merged.find("LAYERTWO").unwrap();
+    assert!(first < second, "document order: {merged}");
+}
+
+/// Plan 112 item 3 measurement: split_pdf clones the parsed document once
+/// per segment. Run manually (`--ignored`) to get the wall-clock number for
+/// an 8-page fixture split into 1-page segments (8 clones). Recorded in the
+/// plan-112 PR; the clone-per-segment shape stays until a measurement on a
+/// REAL large corpus shows it matters — lopdf's delete_pages mutates in
+/// place, so avoiding the clone is an object-graph rewrite with its own
+/// correctness risk.
+#[tokio::test]
+#[ignore = "measurement, not a regression test"]
+async fn measure_pdf_splitter_clone_cost() {
+    use rantaiclaw::kb::extract::pdf_splitter::split_pdf_by_page_count;
+    let bytes = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-8-page.pdf"),
+    )
+    .expect("fixture");
+    let t0 = std::time::Instant::now();
+    let segs = split_pdf_by_page_count(&bytes, 1).await.expect("split");
+    let elapsed = t0.elapsed();
+    println!(
+        "split 8-page fixture into {} segments in {:?} ({:?}/segment)",
+        segs.len(),
+        elapsed,
+        elapsed / segs.len().max(1) as u32
+    );
+    assert_eq!(segs.len(), 8);
+}

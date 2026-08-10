@@ -1138,3 +1138,65 @@ async fn extractor_counts_partial_failures() {
     assert_eq!(out.entities.len(), 1, "the surviving chunk still extracts");
     assert_eq!(out.first_error.as_deref(), Some("http 500"));
 }
+
+#[tokio::test]
+async fn graph_edge_join_survives_past_sqlite_variable_limit() {
+    // Plan 112 item 4: the edge filter moved into SQL via a temp-table join.
+    // A naive `IN (?…)` would break past SQLite's default 999-variable limit
+    // — exercise the join with a node set well beyond it.
+    use rantaiclaw::kb::intelligence::types::{Entity, EntityMention, ExtractSource, Relation};
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::IntelligenceStore;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    const N: usize = 1200; // > 999
+    let entities: Vec<Entity> = (0..N)
+        .map(|i| Entity {
+            id: format!("e{i}"),
+            canonical_key: format!("ent{i}:Concept"),
+            name: format!("Ent{i}"),
+            entity_type: EntityType::Concept,
+            confidence: 0.9,
+            metadata: serde_json::json!({}),
+        })
+        .collect();
+    let mentions: Vec<EntityMention> = (0..N)
+        .map(|i| EntityMention {
+            id: format!("m{i}"),
+            entity_id: format!("e{i}"),
+            document_id: "d1".into(),
+            chunk_index: Some(0),
+            context: None,
+            source: ExtractSource::Llm,
+        })
+        .collect();
+    // A chain: e0->e1, e1->e2, … — N-1 distinct edges, all inside the set.
+    let relations: Vec<Relation> = (0..N - 1)
+        .map(|i| Relation {
+            id: format!("r{i}"),
+            source_entity_id: format!("e{i}"),
+            target_entity_id: format!("e{}", i + 1),
+            relation_type: RelationType::RelatedTo,
+            confidence: 0.8,
+            document_id: "d1".into(),
+            metadata: serde_json::json!({}),
+        })
+        .collect();
+    store
+        .store_intelligence("d1", &entities, &mentions, &relations)
+        .await
+        .unwrap();
+
+    let g = store.graph(None, N).await.unwrap();
+    assert_eq!(g.nodes.len(), N, "all nodes selected");
+    assert_eq!(
+        g.edges.len(),
+        N - 1,
+        "every in-set edge must survive the SQL join at this scale"
+    );
+}

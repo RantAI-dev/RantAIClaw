@@ -144,8 +144,15 @@ impl SmartChunker {
 
             // Update hierarchy if heading detected.
             if structure.chunk_type == BlockType::Heading {
-                if let Some(level) = structure.heading_level {
-                    current_hierarchy = update_hierarchy(&current_hierarchy, &block, level);
+                if let (Some(level), Some(section)) =
+                    (structure.heading_level, structure.section.as_deref())
+                {
+                    // Use the regex-captured heading TEXT, not the whole
+                    // block: blocks split on blank lines, so `# Title` with
+                    // prose on the next line used to push "Title\nbody…"
+                    // into the hierarchy and leak it into every inherited
+                    // `section` via join(" > ") (plan 112 item 2).
+                    current_hierarchy = update_hierarchy(&current_hierarchy, section, level);
                     structure.hierarchy_path = Some(current_hierarchy.clone());
                 }
             }

@@ -276,7 +276,18 @@ fn find_normalized(haystack_lc: &str, needle: &str, from_chars: usize) -> Option
     Some(haystack_lc[..abs_bytes].chars().count())
 }
 
-fn try_substitute(prose_raw: &str, normalized_text_layer: &str) -> Option<String> {
+/// `search_from_chars` threads the running document position through the
+/// merge: each prose block searches FORWARD from the previous match, so a
+/// phrase repeated across the document substitutes in document order instead
+/// of every block snapping to the first occurrence (plan 112 item 5). It
+/// also drops the per-block O(layer) rescan from position 0. On success the
+/// second tuple item is the char offset just past this block's span, to be
+/// fed into the next call.
+fn try_substitute(
+    prose_raw: &str,
+    normalized_text_layer: &str,
+    search_from_chars: usize,
+) -> Option<(String, usize)> {
     let prose = prose_raw.trim();
     let start_anchor = extract_anchor(prose, Position::Start, ANCHOR_WORDS);
     let end_anchor = extract_anchor(prose, Position::End, ANCHOR_WORDS);
@@ -295,7 +306,7 @@ fn try_substitute(prose_raw: &str, normalized_text_layer: &str) -> Option<String
         return None;
     }
 
-    let start_chars = find_normalized(&haystack_lc, &start_anchor, 0)?;
+    let start_chars = find_normalized(&haystack_lc, &start_anchor, search_from_chars)?;
     let start_anchor_lc_chars = normalize_space(&start_anchor)
         .to_lowercase()
         .chars()
@@ -324,7 +335,7 @@ fn try_substitute(prose_raw: &str, normalized_text_layer: &str) -> Option<String
     if !(LENGTH_RATIO_MIN..=LENGTH_RATIO_MAX).contains(&ratio) {
         return None;
     }
-    Some(span.to_string())
+    Some((span.to_string(), span_end_chars))
 }
 
 /// Merge MinerU-style structural markdown with unpdf-style text-layer prose.
@@ -343,13 +354,18 @@ pub fn merge_structural_with_text_layer(structural: &str, text_layer: &str) -> S
     let normalized = normalize_space(text_layer);
     let blocks = parse_blocks(structural);
     let mut out: Vec<String> = Vec::with_capacity(blocks.len());
+    // Running char offset into the text layer — see try_substitute.
+    let mut cursor_chars = 0usize;
     for block in blocks {
         match block {
             Block::Blank => out.push(String::new()),
-            Block::Prose(raw) => {
-                let sub = try_substitute(&raw, &normalized);
-                out.push(sub.unwrap_or(raw));
-            }
+            Block::Prose(raw) => match try_substitute(&raw, &normalized, cursor_chars) {
+                Some((span, next_cursor)) => {
+                    cursor_chars = next_cursor;
+                    out.push(span);
+                }
+                None => out.push(raw),
+            },
             Block::Heading(raw) | Block::Table(raw) | Block::Code(raw) | Block::Latex(raw) => {
                 out.push(raw);
             }

@@ -314,3 +314,26 @@ fn tagged_model_appends_recipe() {
         "qwen/qwen3-embedding-8b+meta1"
     );
 }
+
+#[test]
+fn heading_without_blank_line_yields_clean_section() {
+    // Plan 112 item 2: blocks split on BLANK lines, so `# Title` followed
+    // directly by prose is ONE block. The whole block used to be pushed into
+    // the hierarchy, leaking "Title\nbody…" into `section` for every
+    // inherited chunk.
+    let md = "# Title\nbody text right under the heading with no blank line.\n\nMore prose in a second block that inherits the section.";
+    let chunks = smart_chunk_document(md, "Doc", "GEN", None, SmartChunkOptions::default());
+    assert!(!chunks.is_empty());
+    for c in &chunks {
+        if let Some(sec) = &c.metadata.section {
+            assert!(
+                !sec.contains('\n'),
+                "section must be the heading text alone, got: {sec:?}"
+            );
+            assert!(
+                sec.contains("Title"),
+                "section should carry the heading, got: {sec:?}"
+            );
+        }
+    }
+}

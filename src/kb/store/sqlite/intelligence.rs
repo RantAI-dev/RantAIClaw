@@ -318,24 +318,42 @@ impl IntelligenceStore for SqliteStore {
             // Edges = relations whose BOTH endpoints are in the selected node
             // set, deduplicated by (source, target, relation_type) with a
             // `weight` counting how many relation rows collapsed into each.
-            let node_ids: std::collections::HashSet<String> =
-                nodes.iter().map(|n| n.id.clone()).collect();
+            // Push the endpoint filter into SQL via a TEMP table of the
+            // selected node ids — a plain full-table scan filtered in Rust
+            // walked every relation row per request (plan 112 item 4). A
+            // temp table instead of `IN (?…)` because the node set can reach
+            // the 5000 hard cap (api.rs GRAPH_HARD_CAP), past SQLite's
+            // default 999-variable limit. Temp tables are connection-local,
+            // so concurrent graph() calls (one shared conn behind a mutex
+            // here) cannot collide; dropped in the same scope.
+            conn.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS graph_node_ids (id TEXT PRIMARY KEY);
+                 DELETE FROM graph_node_ids;",
+            )?;
+            {
+                let mut ins = conn.prepare("INSERT INTO graph_node_ids (id) VALUES (?1)")?;
+                for n in &nodes {
+                    ins.execute(params![n.id])?;
+                }
+            }
             let mut ew: std::collections::HashMap<(String, String, String), usize> =
                 std::collections::HashMap::new();
             {
                 let mut stmt = conn.prepare(
-                    "SELECT source_entity_id, target_entity_id, relation_type FROM entity_relation",
+                    "SELECT r.source_entity_id, r.target_entity_id, r.relation_type
+                     FROM entity_relation r
+                     JOIN graph_node_ids s ON s.id = r.source_entity_id
+                     JOIN graph_node_ids t ON t.id = r.target_entity_id",
                 )?;
                 let mut rows = stmt.query([])?;
                 while let Some(row) = rows.next()? {
                     let (s, t): (String, String) =
                         (row.get("source_entity_id")?, row.get("target_entity_id")?);
-                    if node_ids.contains(&s) && node_ids.contains(&t) {
-                        let r: String = row.get("relation_type")?;
-                        *ew.entry((s, t, r)).or_insert(0) += 1;
-                    }
+                    let r: String = row.get("relation_type")?;
+                    *ew.entry((s, t, r)).or_insert(0) += 1;
                 }
             }
+            conn.execute("DELETE FROM graph_node_ids", [])?;
             let edges: Vec<GraphEdge> = ew
                 .into_iter()
                 .map(|((source, target, relation_type), weight)| GraphEdge {
