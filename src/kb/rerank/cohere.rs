@@ -51,9 +51,14 @@ impl CohereReranker {
     /// factory wires successfully — the actual rerank call returns a
     /// `KbError::Config` hard error before any network I/O.
     pub fn from_env(cfg: &KbConfig) -> Self {
-        let api_key = std::env::var("KB_RERANK_API_KEY")
-            .or_else(|_| std::env::var("COHERE_API_KEY"))
-            .unwrap_or_default();
+        // Credential resolved once into KbConfig (plan 108): the dedicated
+        // rerank key, else the shared chat key — so a console-entered
+        // credential reaches this provider too.
+        let api_key = if cfg.rerank_api_key.is_empty() {
+            cfg.chat_api_key.clone()
+        } else {
+            cfg.rerank_api_key.clone()
+        };
         let endpoint = std::env::var("KB_RERANK_BASE_URL").ok();
         Self::new(cfg.rerank_model.clone(), api_key, endpoint)
     }

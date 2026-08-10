@@ -47,6 +47,8 @@ fn make_kb_cfg(vision_base_url: String) -> KbConfig {
         embed_concurrency: 2,
         query_embed_cache_size: 8,
         query_embed_cache_ttl_ms: 60_000,
+        chat_api_key: String::new(),
+        rerank_api_key: String::new(),
         openrouter_chat_url: "http://localhost".into(),
         intelligence_enabled: false,
         intelligence_model: "openai/gpt-4.1-nano".into(),

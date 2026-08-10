@@ -6,7 +6,8 @@
 //! chunks-of-the-same-doc calls hit Anthropic-style prompt caching.
 //!
 //! Returns `vec![""; chunks.len()]` on every failure path — disabled, missing
-//! API key, network error, parse error, length mismatch. Never throws.
+//! API key (`cfg.chat_api_key`, resolved at config construction), network
+//! error, parse error, length mismatch. Never throws.
 
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ const PROMPT_HEADER: &str = "You are helping index a knowledge base. Given the f
 ///
 /// Returns `vec![""; chunks.len()]` when:
 /// - `cfg.contextual_retrieval_enabled` is false
-/// - `OPENROUTER_API_KEY` is unset
+/// - no chat credential resolves (`cfg.chat_api_key` empty)
 /// - HTTP call fails or returns non-2xx
 /// - response can't be parsed as a JSON array
 /// - parsed array length doesn't match `chunks.len()`
@@ -42,7 +43,9 @@ pub async fn generate_contextual_prefixes(
     if chunks.is_empty() {
         return Vec::new();
     }
-    let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+    // Resolved once at config construction (plan 108) — a console-entered
+    // key reaches this path; env::var here would silently miss it.
+    let api_key = cfg.chat_api_key.clone();
     if api_key.is_empty() {
         return empty();
     }

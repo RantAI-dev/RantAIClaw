@@ -30,14 +30,19 @@ static INDEX_ARRAY_RE: LazyLock<Regex> =
 pub struct LlmReranker {
     model: String,
     chat_url: String,
+    api_key: String,
     http: Client,
 }
 
 impl LlmReranker {
-    pub fn new(model: String, chat_url: String) -> Self {
+    /// The credential arrives at construction (from `KbConfig.chat_api_key`,
+    /// plan 108) — `make_reranker` refuses to build one without it, so the
+    /// per-call env read is gone and a console-entered key works.
+    pub fn new(model: String, chat_url: String, api_key: String) -> Self {
         Self {
             model,
             chat_url,
+            api_key,
             http: Client::new(),
         }
     }
@@ -55,11 +60,11 @@ impl Reranker for LlmReranker {
         candidates: &[Candidate],
         final_k: usize,
     ) -> KbResult<Vec<Reranked>> {
-        // Fail fast on missing key — mirrors `llm-reranker.ts:31`.
-        let api_key = std::env::var("OPENROUTER_API_KEY")
-            .ok()
+        // Fail fast on missing key — mirrors `llm-reranker.ts:31`. Normally
+        // unreachable: make_reranker refuses construction without a key.
+        let api_key = Some(self.api_key.clone())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| KbError::Config("OPENROUTER_API_KEY is not set".into()))?;
+            .ok_or_else(|| KbError::Config("no chat credential resolves for rerank".into()))?;
 
         if candidates.is_empty() {
             return Ok(Vec::new());

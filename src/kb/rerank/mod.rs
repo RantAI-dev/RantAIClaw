@@ -87,10 +87,25 @@ pub fn make_reranker(cfg: &KbConfig) -> Option<Box<dyn Reranker>> {
             }
         },
         "cohere" => Some(Box::new(CohereReranker::from_env(cfg))),
-        _ => Some(Box::new(LlmReranker::new(
-            cfg.rerank_model.clone(),
-            cfg.openrouter_chat_url.clone(),
-        ))),
+        _ => {
+            // Decide at construction, not per call: an LlmReranker without a
+            // credential fails EVERY query and apply_rerank quietly falls
+            // back, so rerank is off and nothing says so. None is the honest
+            // representation of "no rerank stage" and matches the vllm
+            // init-failure branch above (plan 108).
+            if cfg.chat_api_key.is_empty() {
+                tracing::warn!(
+                    target: "kb::rerank",
+                    "rerank is enabled but no chat credential resolves; skipping the rerank stage",
+                );
+                return None;
+            }
+            Some(Box::new(LlmReranker::new(
+                cfg.rerank_model.clone(),
+                cfg.openrouter_chat_url.clone(),
+                cfg.chat_api_key.clone(),
+            )))
+        }
     }
 }
 

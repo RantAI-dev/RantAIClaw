@@ -46,7 +46,9 @@ pub async fn expand_query(cfg: &KbConfig, query: &str) -> Vec<String> {
         return vec![q.to_string()];
     }
 
-    let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+    // Resolved once at config construction (plan 108) — a console-entered
+    // key reaches this path; env::var here would silently miss it.
+    let api_key = cfg.chat_api_key.clone();
     if api_key.is_empty() {
         return vec![q.to_string()];
     }
