@@ -41,7 +41,8 @@ pub fn has_columnar_lines(text: &str, threshold: usize) -> bool {
     let mut count = 0usize;
     for raw in text.split('\n') {
         let line = raw.trim();
-        if line.len() < 10 {
+        // Character count, same reasoning as is_unpdf_sufficient.
+        if line.chars().count() < 10 {
             continue;
         }
         let mut matches = 0usize;
@@ -127,7 +128,10 @@ pub fn has_dense_currency(text: &str, threshold: usize) -> bool {
 /// Port of `isUnpdfSufficient` from TS.
 pub fn is_unpdf_sufficient(text: &str, page_count: u32, opts: &RouterOpts) -> bool {
     let pages = page_count.max(1) as usize;
-    if text.is_empty() || text.len() < opts.min_chars_per_page * pages {
+    // chars().count(), not len(): min_chars_per_page is CHARACTERS. Bytes
+    // overcount 2-3x on CJK/Arabic/Cyrillic, so a thin non-Latin extraction
+    // cleared the threshold and OCR fallback never fired (plan 112 item 1).
+    if text.is_empty() || text.chars().count() < opts.min_chars_per_page * pages {
         return false;
     }
     if has_columnar_lines(text, opts.max_columnar_lines) {

@@ -747,6 +747,8 @@ fn build_intelligence_extractor(cfg: &KbConfig) -> CombinedLlmExtractor {
         cfg.openrouter_chat_url.clone(),
         KbConfig::resolve_key(&cfg.embedding_api_key),
     )
+    // One knob governs both HTTP fan-outs (plan 112 item 6).
+    .with_concurrency(cfg.embed_concurrency)
 }
 
 /// JSON/TOON row for an entity. `entity_type` is the string form of the typed
