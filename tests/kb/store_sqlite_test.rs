@@ -736,3 +736,105 @@ async fn group_document_count_excludes_soft_deleted() {
         "card count and detail list must agree"
     );
 }
+
+#[tokio::test]
+async fn group_scoped_search_finds_chunks_far_outside_global_topk() {
+    // Plan 101: the old shape fetched a limit*4 GLOBAL window then
+    // post-filtered — a small group whose chunks all rank outside the global
+    // top-K returned zero results. The KNN query is now scoped to the
+    // group's rowids, so recall is exact.
+    use rantaiclaw::kb::store::sqlite::SqliteStore;
+    use rantaiclaw::kb::store::{KbStore, SearchFilter};
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(tmp.path().join("kb.db"), 4)
+        .await
+        .unwrap();
+
+    // 20 documents × 10 chunks. Documents 0..18 get vectors very close to
+    // the query direction [1,0,0,0]; the group's two documents (18, 19) get
+    // vectors far from it — every group chunk ranks behind all 180 others.
+    let query = vec![1.0_f32, 0.0, 0.0, 0.0];
+    let mut group_doc_ids: Vec<String> = Vec::new();
+    for d in 0..20 {
+        let doc = sample_doc(&format!("rantaiclaw_doc_r{d}"), &format!("Doc R{d}"));
+        store.create_document(&doc).await.unwrap();
+        let near = d < 18;
+        let chunks: Vec<_> = (0..10)
+            .map(|i| Chunk {
+                content: format!("chunk {i} of doc {d}"),
+                metadata: ChunkMetadata {
+                    document_title: doc.title.clone(),
+                    category: "FAQ".into(),
+                    subcategory: None,
+                    section: None,
+                    chunk_index: i,
+                    contextual_prefix: None,
+                },
+            })
+            .collect();
+        let embeds: Vec<Vec<f32>> = (0..10)
+            .map(|i| {
+                if near {
+                    // Distinct but all near the query direction.
+                    let e = 0.001 * (d * 10 + i) as f32;
+                    vec![1.0, e, 0.0, 0.0]
+                } else {
+                    // Orthogonal-ish: worst global rank.
+                    let e = 0.001 * i as f32;
+                    vec![0.1, 1.0, e, 0.0]
+                }
+            })
+            .collect();
+        store
+            .store_chunks(&doc.id, &chunks, &embeds, "rantaiclaw_model_r")
+            .await
+            .unwrap();
+        if !near {
+            group_doc_ids.push(doc.id.0.clone());
+        }
+    }
+    let group = store.create_group("SmallKb", None, None).await.unwrap();
+    for id in &group_doc_ids {
+        store.add_document_to_group(id, &group.id).await.unwrap();
+    }
+
+    // Group-scoped search MUST find the group's chunks even though they rank
+    // ~181st..200th globally (old behaviour: zero results).
+    let filter = SearchFilter {
+        group_ids: vec![group.id.clone()],
+        ..Default::default()
+    };
+    let scoped = store.search_by_vector(&query, 5, &filter).await.unwrap();
+    assert_eq!(
+        scoped.len(),
+        5,
+        "group-scoped search must fill the limit from in-scope chunks"
+    );
+    assert!(
+        scoped
+            .iter()
+            .all(|r| group_doc_ids.contains(&r.document_id.0)),
+        "every hit must belong to the group"
+    );
+
+    // Control: the same search UNFILTERED must return the globally nearest
+    // chunks — a fix that simply widened the window to the whole index would
+    // fail this by latency and this assertion by content.
+    let unfiltered = store
+        .search_by_vector(&query, 5, &SearchFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(unfiltered.len(), 5);
+    assert!(
+        unfiltered
+            .iter()
+            .all(|r| !group_doc_ids.contains(&r.document_id.0)),
+        "unfiltered search must still return the global nearest, got: {:?}",
+        unfiltered
+            .iter()
+            .map(|r| r.document_id.0.clone())
+            .collect::<Vec<_>>()
+    );
+}
