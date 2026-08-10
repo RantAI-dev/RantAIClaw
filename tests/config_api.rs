@@ -193,3 +193,161 @@ async fn get_channels_returns_200() {
         "GET /api/v1/channels should return a channel status map, got: {body}"
     );
 }
+
+// ── Plan 103: /config/knowledge carries `enabled`; key probed on activation ──
+
+#[tokio::test]
+async fn knowledge_activate_without_key_returns_400() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    let base_url = spawn_test_gateway(test_config(workspace.path())).await;
+
+    let resp = reqwest::Client::new()
+        .put(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({ "enabled": true }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+
+    // Nothing persisted: GET still reports disabled.
+    let got: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(got["enabled"], false, "{got}");
+}
+
+#[tokio::test]
+async fn knowledge_rejected_key_is_never_persisted() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let embed = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&embed)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    std::env::set_var("KB_EMBEDDING_BASE_URL", embed.uri());
+    let base_url = spawn_test_gateway(test_config(workspace.path())).await;
+
+    let resp = reqwest::Client::new()
+        .put(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "embedding_api_key": "rantaiclaw_wrong_key",
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json");
+
+    let got: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    std::env::remove_var("KB_EMBEDDING_BASE_URL");
+    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("401"), "status named: {body}");
+    assert!(
+        !detail.contains("rantaiclaw_wrong_key"),
+        "key must never surface: {body}"
+    );
+    assert_eq!(
+        got["embedding_configured"], false,
+        "rejected key must not persist: {got}"
+    );
+    assert_eq!(got["enabled"], false, "{got}");
+}
+
+#[tokio::test]
+async fn knowledge_accepted_key_activates_and_deactivate_keeps_it() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let embed = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [0.1, 0.2] } ]
+        })))
+        .mount(&embed)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config_dir = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
+    std::env::set_var("KB_EMBEDDING_BASE_URL", embed.uri());
+    let base_url = spawn_test_gateway(test_config(workspace.path())).await;
+    let client = reqwest::Client::new();
+
+    // Accepted key + enabled -> 200 with enabled true.
+    let resp = client
+        .put(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({
+            "embedding_api_key": "rantaiclaw_good_key",
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(body["enabled"], true, "{body}");
+    assert_eq!(body["embedding_configured"], true, "{body}");
+
+    // Deactivate: 200, and the key SURVIVES — deactivate is not delete;
+    // this is the whole point of the feature (plan 102/103).
+    let resp = client
+        .put(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .json(&serde_json::json!({ "enabled": false }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(body["enabled"], false, "{body}");
+    assert_eq!(
+        body["embedding_configured"], true,
+        "deactivating must keep the credential: {body}"
+    );
+
+    // GET reflects the deactivated-but-configured state.
+    let got: serde_json::Value = client
+        .get(format!("{base_url}/api/v1/config/knowledge"))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    std::env::remove_var("KB_EMBEDDING_BASE_URL");
+    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    assert_eq!(got["enabled"], false, "{got}");
+    assert_eq!(got["embedding_configured"], true, "{got}");
+}
