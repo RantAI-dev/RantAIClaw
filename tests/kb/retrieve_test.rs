@@ -310,7 +310,7 @@ impl KbStore for FakeStore {
         _batch_size: usize,
         _after_id: Option<&str>,
         _skip_model: Option<&str>,
-    ) -> KbResult<Vec<(ChunkId, String, Option<String>)>> {
+    ) -> KbResult<Vec<(ChunkId, Chunk, Option<String>)>> {
         Ok(Vec::new())
     }
     async fn update_chunk_embedding(

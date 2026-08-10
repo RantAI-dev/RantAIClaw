@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tempfile::TempDir;
 
+use rantaiclaw::kb::chunk::prepare::tagged_model;
 use rantaiclaw::kb::embed::EmbeddingProvider;
 use rantaiclaw::kb::maintenance::{check_drift, run_bulk_re_embed, BulkReEmbedOptions};
 use rantaiclaw::kb::store::sqlite::SqliteStore;
@@ -125,14 +126,19 @@ async fn drift_report_in_sync_when_all_match() {
     let chunks: Vec<_> = (0..3).map(|i| sample_chunk(&doc.title, i)).collect();
     let embeds = vec![ones(); 3];
     store
-        .store_chunks(&doc.id, &chunks, &embeds, &cfg.embedding_model)
+        .store_chunks(
+            &doc.id,
+            &chunks,
+            &embeds,
+            &tagged_model(&cfg.embedding_model),
+        )
         .await
         .unwrap();
 
     let report = check_drift(&cfg, &store).await.unwrap();
     assert!(report.in_sync);
     assert_eq!(report.stale_chunk_count, 0);
-    assert_eq!(report.current_model, "rantaiclaw_model_current");
+    assert_eq!(report.current_model, "rantaiclaw_model_current+meta1");
 }
 
 #[tokio::test]
@@ -151,7 +157,12 @@ async fn drift_report_counts_stale() {
         .await
         .unwrap();
     store
-        .store_chunks(&doc.id, &chunks[2..], &embeds[..2], &cfg.embedding_model)
+        .store_chunks(
+            &doc.id,
+            &chunks[2..],
+            &embeds[..2],
+            &tagged_model(&cfg.embedding_model),
+        )
         .await
         .unwrap();
 
@@ -161,7 +172,7 @@ async fn drift_report_counts_stale() {
     // Both models surface in by_model.
     let labels: Vec<Option<String>> = report.by_model.iter().map(|(m, _)| m.clone()).collect();
     assert!(labels.contains(&Some("rantaiclaw_model_old".into())));
-    assert!(labels.contains(&Some("rantaiclaw_model_current".into())));
+    assert!(labels.contains(&Some("rantaiclaw_model_current+meta1".into())));
 }
 
 #[tokio::test]
@@ -179,7 +190,12 @@ async fn drift_report_treats_null_model_as_stale() {
     let chunks: Vec<_> = (0..2).map(|i| sample_chunk(&doc.title, i)).collect();
     let embeds = vec![ones(); 2];
     store
-        .store_chunks(&doc.id, &chunks, &embeds, &cfg.embedding_model)
+        .store_chunks(
+            &doc.id,
+            &chunks,
+            &embeds,
+            &tagged_model(&cfg.embedding_model),
+        )
         .await
         .unwrap();
 
@@ -214,7 +230,7 @@ async fn drift_report_includes_current_model() {
     let (_tmp, store) = fresh_store().await;
     let cfg = cfg_with_model("rantaiclaw_model_xyz");
     let report = check_drift(&cfg, &store).await.unwrap();
-    assert_eq!(report.current_model, "rantaiclaw_model_xyz");
+    assert_eq!(report.current_model, "rantaiclaw_model_xyz+meta1");
     assert!(report.in_sync, "empty store has no stale chunks");
     assert!(report.by_model.is_empty());
 }
@@ -299,7 +315,7 @@ async fn bulk_re_embed_skips_already_current_chunks() {
     let doc = sample_doc("rantaiclaw_doc_skip");
     store.create_document(&doc).await.unwrap();
     // 3 chunks already on current model, 3 on an old model.
-    seed_chunks(&store, &doc, 0, 3, &cfg.embedding_model).await;
+    seed_chunks(&store, &doc, 0, 3, &tagged_model(&cfg.embedding_model)).await;
     seed_chunks(&store, &doc, 3, 3, "rantaiclaw_model_old").await;
 
     let embedder: Arc<dyn EmbeddingProvider> = Arc::new(ConstantEmbedder::new(DIM));
@@ -338,7 +354,7 @@ async fn bulk_re_embed_processes_all_when_include_current() {
 
     let doc = sample_doc("rantaiclaw_doc_all");
     store.create_document(&doc).await.unwrap();
-    seed_chunks(&store, &doc, 0, 3, &cfg.embedding_model).await;
+    seed_chunks(&store, &doc, 0, 3, &tagged_model(&cfg.embedding_model)).await;
     seed_chunks(&store, &doc, 3, 3, "rantaiclaw_model_old").await;
 
     let embedder: Arc<dyn EmbeddingProvider> = Arc::new(ConstantEmbedder::new(DIM));

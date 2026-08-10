@@ -9,6 +9,19 @@
 
 use crate::kb::Chunk;
 
+/// Version tag for the text sent to the embedding provider. Bump whenever
+/// the composed embedding input changes shape — the stored `embedding_model`
+/// tag carries it so `kb drift` can tell a stale corpus from a current one.
+/// The model name alone cannot: the model does not change, the input does.
+pub const EMBEDDING_RECIPE: &str = "meta1";
+
+/// The value written to `chunk.embedding_model`, e.g.
+/// `qwen/qwen3-embedding-8b+meta1`. Nothing parses this back apart —
+/// drift and bulk re-embed compare it whole.
+pub fn tagged_model(model: &str) -> String {
+    format!("{model}+{EMBEDDING_RECIPE}")
+}
+
 /// Build the embedding-ready text for a chunk by prepending metadata
 /// lines. Layout:
 ///

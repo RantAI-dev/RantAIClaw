@@ -547,3 +547,69 @@ async fn kb_search_empty_scope_says_so() {
         "empty scope must be stated explicitly: {stdout}"
     );
 }
+
+/// Plan 090: ingest must embed the metadata-PREFIXED text, not the raw chunk
+/// body. The category below is a distinctive token that appears nowhere in
+/// the document body — it can only reach the embedding request through
+/// prepare_chunk_for_embedding. Inspects the wiremock request bodies.
+#[tokio::test]
+async fn kb_ingest_embeds_metadata_prefixed_text() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [ { "embedding": [1.0, 0.0, 0.0, 0.0] } ]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("kb.db");
+    let md = tmp.path().join("doc.md");
+    std::fs::write(&md, "# Plain Title\nBody text with nothing special.").unwrap();
+    let uri = server.uri();
+    let mock_env = [("KB_EMBEDDING_BASE_URL", uri.as_str())];
+
+    let (code, stdout, stderr) = run_kb_with_env(
+        &db,
+        &[
+            "ingest",
+            md.to_str().unwrap(),
+            "--category",
+            "XyzzyDistinctiveCategory",
+        ],
+        &mock_env,
+    );
+    assert_eq!(
+        code, 0,
+        "ingest must succeed: stdout={stdout} stderr={stderr}"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty(), "embedder must have been called");
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains("Category: XyzzyDistinctiveCategory")),
+        "embedding request must carry the metadata prefix, got bodies: {bodies:?}"
+    );
+
+    // And the stored model tag carries the recipe marker so drift can see a
+    // pre-metadata corpus (plan 090 step 3 verify).
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let model: String = conn
+        .query_row("SELECT DISTINCT embedding_model FROM chunk", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(
+        model.ends_with("+meta1"),
+        "stored embedding_model must carry the recipe tag, got: {model}"
+    );
+}

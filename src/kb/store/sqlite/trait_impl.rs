@@ -132,7 +132,7 @@ impl KbStore for SqliteStore {
         batch_size: usize,
         after_id: Option<&str>,
         skip_model: Option<&str>,
-    ) -> KbResult<Vec<(ChunkId, String, Option<String>)>> {
+    ) -> KbResult<Vec<(ChunkId, Chunk, Option<String>)>> {
         self.list_chunks_for_re_embed_impl(batch_size, after_id, skip_model)
             .await
     }

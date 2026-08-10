@@ -1347,7 +1347,14 @@ async fn ingest(
         .into());
     }
 
-    let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    // Embed the metadata-prefixed text, not the raw body — the prefix
+    // (Category/Topic/Section) is the semantic context the pipeline was
+    // designed around (plan 090). Must stay in lockstep with the CLI ingest
+    // and bulk re-embed paths: all three feed prepare_chunk_for_embedding.
+    let texts: Vec<String> = chunks
+        .iter()
+        .map(crate::kb::chunk::prepare::prepare_chunk_for_embedding)
+        .collect();
     let embeddings = ctx.embedder.embed_many(&texts).await.map_err(|e| {
         tracing::warn!(
             target: "kb::ingest",
@@ -1394,7 +1401,7 @@ async fn ingest(
         &document,
         &chunks,
         &embeddings,
-        ctx.embedder.model(),
+        &crate::kb::chunk::prepare::tagged_model(ctx.embedder.model()),
     )
     .await
     {
