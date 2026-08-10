@@ -198,6 +198,13 @@ GET    /api/v1/kb/drift              # staleness report
 POST   /api/v1/kb/re-embed           # JSON body: { "include_current?", "dry_run?", "batch_size?" }
 ```
 
+HTTP error codes specific to this surface (all 503):
+
+- `kb_disabled` — the operator turned the Knowledge Base off (`[knowledge].enabled = false`). Activate it in Configuration → Knowledge Base.
+- `kb_not_configured` — the KB is on but no embedding key resolves. Add a key under Knowledge Base settings.
+- `kb_unavailable` — the KB context failed to initialize for another reason (see gateway logs); fix the environment and restart the gateway.
+
+
 Authentication mirrors the rest of `/api/v1/*`: pairing/bearer-token rules from `[gateway]` apply unchanged. When `require_pairing = false`, requests pass through.
 
 Upload size cap: **32 MiB per ingest request**. Larger files are rejected before any handler runs.
