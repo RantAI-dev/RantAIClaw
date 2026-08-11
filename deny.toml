@@ -11,6 +11,11 @@ yanked = "deny"
 # Each entry cites (a) the crate, (b) the upstream chain blocking the upgrade,
 # and (c) why the risk is acceptable for our usage.
 ignore = [
+    # bitmaps v3.2.1 via matrix-sdk 0.16 → imbl / imbl-sized-chunks — the
+    # crate is declared unmaintained (notice only, no vulnerability). It
+    # implements fixed-size bitmap ops with no I/O and no untrusted-input
+    # surface in our usage. Unblocks when matrix-sdk moves off imbl.
+    "RUSTSEC-2026-0247",
     # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete.
     "RUSTSEC-2025-0141",
     # paste v1.0.15 via ratatui 0.29 — archived proc-macro, no runtime surface.
