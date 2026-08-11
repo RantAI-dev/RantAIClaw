@@ -5,6 +5,112 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0-alpha] — 2026-08-11
+
+The Knowledge Base release: 29 fixes and features from a full-subsystem audit
+(plans 086–114), every guard mutation-tested, every surface driven live (TUI
+via tmux, web console via browser automation) before this cut.
+
+Minor, not patch: config schema moves **v17 → v18** (`[knowledge] enabled`),
+the CLI gains a new surface (`kb status|enable|disable`, TUI `/kb`), and two
+KB API responses gain fields. **The schema migration is one-way** — after any
+command of this release touches `config.toml`, older binaries refuse it.
+
+Console pin moves to claw-ui **v0.3.17** (activation screen, honest empty
+states, accurate upload accept list).
+
+### Operators: read before upgrading
+
+- **Every existing knowledge base must be re-embedded once.** Chunks are now
+  embedded with their metadata prefix and tagged `<model>+meta1`; `kb drift`
+  reports your whole pre-upgrade corpus as stale **by design**. Run
+  `rantaiclaw kb re-embed --include-current` (calls your embedding provider
+  once per chunk — costs money on paid providers). Rolling back the binary
+  after a re-embed needs the matching `kb.db` backup restored with it.
+- **The KB now has an explicit on/off switch.** Fresh installs start OFF; an
+  install that already carries an embedding key (config or
+  `KB_EMBEDDING_API_KEY` env) migrates **ON** automatically. While off, KB
+  routes answer `503 kb_disabled` and the agent is not told the KB exists.
+  Deactivating keeps your credentials; removing a key is a separate action.
+- **A `kb.db` whose recorded embedding dimension disagrees with
+  `KB_EMBEDDING_DIM` now refuses to open**, naming both values. That is a
+  pre-existing corruption surfacing, not a regression: either restore the
+  original dimension or start a new database.
+- `KB_INTELLIGENCE_RESOLUTION=fuzzy` (documented but never implemented) now
+  fails config load instead of silently behaving as `exact`.
+
+### Added
+
+- `[knowledge] enabled` (schema v18) with an intent-preserving migration;
+  gateway `GET/PUT /config/knowledge` carries it, and activation live-probes
+  the embedding key so a rejected credential is never persisted (mirrors the
+  Telegram `getMe` pattern).
+- CLI `kb status` (read-only — never rewrites `kb_meta`), `kb enable`
+  (refuses without a resolvable key), `kb disable` (credentials kept); data
+  subcommands answer a parseable `kb_disabled` TOON error with exit 1 while
+  off. TUI `/kb` shows the same status and toggles.
+- `KB_VISION_MODEL` — image ingestion's model is a config knob instead of a
+  hardcoded constant (default unchanged: `openai/gpt-5-mini`).
+- Model registry documentation: known-good embedding model/dimension pairs,
+  the safe model-change procedure, and a per-provider verified compatibility
+  matrix (`docs/reference/kb.md`, `docs/reference/kb-providers.md`).
+- Graph API capability block now answers *why* a graph is empty:
+  `credential_configured`, `graphrag_enabled`, `resolution` (additive).
+- Re-extract reports `failed_chunks` + `error`, and answers `502
+  extraction_failed` when every chunk failed — a total failure is no longer
+  indistinguishable from a document with no entities.
+
+### Fixed
+
+- **Agent search output** carries the full retrieval context and the RAG
+  citation-discipline block instead of 120-character previews; a zero-hit
+  search states whether the scope is empty or nothing crossed the threshold.
+- **Chunks are embedded with their Category/Topic/Section prefix** on all
+  three paths (HTTP ingest, CLI ingest, bulk re-embed) — the pipeline's
+  design intent, previously reaching zero of them.
+- **GraphRAG can see LLM-extracted entities** (mentions were stored with a
+  NULL chunk index the SQL join can never match) and **relations survive
+  casing/punctuation mismatches** between the model's entity and relation
+  arrays; unmatched relations are counted, not silently dropped.
+- **Group-scoped vector search finds chunks that rank outside the global
+  top-K** — the KNN is now constrained to the group's rowids (sqlite-vec
+  0.1.9 `rowid IN`), so a small knowledge base in a large corpus no longer
+  returns zero results.
+- Graph node selection orders by the same deduplicated degree it displays;
+  entity counts report the stored (deduplicated) set; group document counts
+  and drift totals exclude soft-deleted documents, so `kb drift` can reach
+  `in_sync` again after a console delete.
+- Membership rows validate both the group and the document inside the insert
+  transaction (foreign keys are off in SQLite here).
+- A key entered in the console reaches **every** KB consumer — query
+  expansion, contextual retrieval, and the LLM reranker read the unified
+  `chat_api_key` instead of raw env; a credential-less reranker is skipped
+  with one warning instead of erroring per query.
+- The ambient KB hint follows the operator's intent (`enabled`), not the
+  existence of `kb.db`; the KB context cache is keyed on the credentials, so
+  a key changed from any surface takes effect without a restart.
+- The KB 32 MiB upload body limit applies to the upload route alone — other
+  KB routes return to the standard 64 KiB cap (unauthenticated callers could
+  previously make the gateway buffer 32 MiB per request on any KB route).
+- Saving a KB key no longer restarts the gateway mid-request.
+- Contextual retrieval and the RAG instruction block, both shipped dead, are
+  wired; the standalone query rewriter, dead with a live env knob, is
+  removed (`KB_STANDALONE_QUERY_ENABLED` no longer exists).
+- Hygiene: character (not byte) thresholds in OCR-fallback detection for
+  non-Latin scripts; heading blocks no longer leak body text into section
+  paths; hybrid-merge substitutes repeated phrases in document order; graph
+  edge filtering pushed into SQL; LLM extraction runs concurrently
+  (bounded by `KB_EMBED_CONCURRENCY`); honest error messages for the OCR
+  feature gap; bare-word extractor sentinels fail at config load.
+
+### Changed
+
+- Console pin moves to claw-ui **v0.3.17**: the KB panel is an activation
+  screen while the KB is off (no more stacked error panels), a rejected key
+  shows inline on the form, Deactivate keeps the key, the graph/drawer empty
+  states name the actual cause, and the upload picker only offers formats
+  the backend accepts.
+
 ## [0.18.4-alpha] — 2026-08-10
 
 One security fix (#444) and the console pin that completes it: an API key
