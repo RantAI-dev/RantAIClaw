@@ -90,6 +90,19 @@ pub trait Channel: Send + Sync {
         crate::channels::format::RenderTarget::Plain
     }
 
+    /// Replace this channel's runtime sender allowlist.
+    ///
+    /// Called by the channels runtime when `config.toml` changes, so an allowlist
+    /// edit from the console or the CLI reaches a **running** listener without a
+    /// restart. Before this existed, the console's only way to apply one was to
+    /// restart the whole managed service — which is the process hosting the
+    /// gateway, so saving an allowlist killed the request handler that saved it.
+    ///
+    /// Defaults to a no-op: a channel that holds its allowlist as a plain `Vec`
+    /// keeps its boot-time list until it is restarted, exactly as before. Channels
+    /// that hold it behind a lock override this — see `TelegramChannel`.
+    fn apply_allowed_senders(&self, _allowed: &[String]) {}
+
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
