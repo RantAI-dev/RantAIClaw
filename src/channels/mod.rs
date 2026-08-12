@@ -479,8 +479,27 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
 }
 
+/// The conversation this message belongs to, for history and `/model` routing.
+///
+/// Keyed by the **chat**, not the person. It used to be `channel_sender`, so one
+/// person's private DM, every group the bot shared with them and every forum
+/// topic collapsed into a single thread — turns from a private conversation were
+/// injected verbatim into the prompt when that same person next spoke in a
+/// public group, and persisted to `brain.db` so it survived restarts.
+///
+/// `reply_target` is the chat id on every channel that has one (Telegram
+/// `chat_id[:thread_id]`, Discord/Slack `channel_id`), and it is stable per
+/// conversation — checked against Telegram, Discord, Slack and Matrix before
+/// this was adopted. Matrix sets `reply_target` to the sender, but a Matrix
+/// channel is pinned to one configured room, so there is only ever one
+/// conversation there and nothing merges.
+///
+/// Route overrides use this same value, so a `/model` pin follows the
+/// conversation rather than following the person into every chat they are in.
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}", msg.channel, msg.sender)
+    conversation::ConversationKey::new(&msg.channel, &msg.reply_target)
+        .in_thread(msg.thread_ts.as_deref())
+        .resolve()
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
@@ -596,7 +615,16 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
                     }
                 }
             }
-            _ => {}
+            // Any other role (`system`, `tool`, …). Nothing writes one to this
+            // store today, so this is a trap rather than a live bug — but the
+            // store is a general message vector, and a silent drop here would be
+            // permanent after the next compaction. Say what was lost.
+            (_, role) => {
+                tracing::debug!(
+                    role = %role,
+                    "dropping cached channel turn with an unexpected role"
+                );
+            }
         }
     }
 
@@ -4069,6 +4097,12 @@ pub async fn start_channels_with_cancellation(
     // Seed the in-memory map from disk so a restart resumes live threads.
     let mut seeded_histories: HashMap<String, Vec<ChatMessage>> = HashMap::new();
     if let Some(store) = history_store.as_ref() {
+        // Before loading: drop rows keyed by the pre-conversation-scope scheme
+        // (unreachable now, and they hold the cross-chat transcripts that scheme
+        // produced) and rows past the retention window.
+        if let Err(e) = store.prune_at_startup() {
+            tracing::warn!("channel history maintenance failed (non-fatal): {e}");
+        }
         match store.load_all() {
             Ok(loaded) => {
                 if !loaded.is_empty() {
@@ -5197,7 +5231,8 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Provider switched to `openrouter`"));
 
-        let route_key = "telegram_alice";
+        let route_key = conversation::ConversationKey::new("telegram", "chat-1").resolve();
+        let route_key = route_key.as_str();
         let route = runtime_ctx
             .route_overrides
             .lock()
@@ -5229,7 +5264,7 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
         provider_cache_seed.insert("openrouter".to_string(), routed_provider);
 
-        let route_key = "telegram_alice".to_string();
+        let route_key = conversation::ConversationKey::new("telegram", "chat-1").resolve();
         let mut route_overrides = HashMap::new();
         route_overrides.insert(
             route_key,
@@ -6824,6 +6859,120 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// The reported leak, at the runtime level: the same person messaging the bot
+    /// privately and in a group used to share one history, so private turns were
+    /// injected verbatim into the prompt for the public chat — and persisted, so
+    /// it survived restarts.
+    #[test]
+    fn dm_and_group_history_do_not_merge() {
+        let dm = conversation_history_key(&traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "private-chat".into(),
+            content: "secret".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+            thread_ts: None,
+        });
+        let group = conversation_history_key(&traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "2".into(),
+            sender: "alice".into(),
+            reply_target: "-1009999".into(),
+            content: "public".into(),
+            channel: "telegram".into(),
+            timestamp: 2,
+            thread_ts: None,
+        });
+
+        assert_ne!(
+            dm, group,
+            "one person's DM and a group they share with the bot are not one conversation"
+        );
+    }
+
+    /// A forum topic / platform thread is its own conversation, so replies in one
+    /// topic do not carry another topic's turns.
+    #[test]
+    fn threads_resolve_to_their_own_conversation() {
+        let base = traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "chan99".into(),
+            content: "hi".into(),
+            channel: "discord".into(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+        let parent = conversation_history_key(&base);
+        let threaded = conversation_history_key(&traits::ChannelMessage {
+            thread_ts: Some("thread42".into()),
+            ..base
+        });
+
+        assert_ne!(parent, threaded);
+    }
+
+    /// History and `/model` routing must share one key. Leaving them different
+    /// reintroduces the same class in a quieter form: a pin set in one chat
+    /// following the person into every other chat they are in.
+    #[test]
+    fn route_override_key_follows_the_conversation_not_the_person() {
+        let chat_a = conversation_history_key(&traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "chat-a".into(),
+            content: "/model".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+            thread_ts: None,
+        });
+        let chat_b = conversation_history_key(&traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "2".into(),
+            sender: "alice".into(),
+            reply_target: "chat-b".into(),
+            content: "hi".into(),
+            channel: "telegram".into(),
+            timestamp: 2,
+            thread_ts: None,
+        });
+
+        assert_ne!(
+            chat_a, chat_b,
+            "a /model pin must not follow the sender into another chat"
+        );
+    }
+
+    /// A role the normalizer does not expect is dropped from the rebuilt turn
+    /// list. Nothing writes one today; this pins that the loss is reported rather
+    /// than silent, since it would be permanent after the next compaction.
+    #[test]
+    fn non_standard_role_is_dropped_without_corrupting_the_pairing() {
+        let turns = vec![
+            ChatMessage::user("q1"),
+            ChatMessage {
+                role: "tool".to_string(),
+                ..ChatMessage::assistant("tool output")
+            },
+            ChatMessage::assistant("a1"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+
+        assert_eq!(
+            normalized.len(),
+            2,
+            "the unexpected role is not smuggled into the pairing"
+        );
+        assert_eq!(normalized[0].role, "user");
+        assert_eq!(normalized[1].role, "assistant");
+        assert_eq!(normalized[1].content, "a1");
+    }
+
     #[tokio::test]
     async fn message_dispatch_processes_messages_in_parallel() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -7828,7 +7977,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_alice")
+            .get(&conversation::ConversationKey::new("test-channel", "chat-ctx").resolve())
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
@@ -7846,7 +7995,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
         let mut histories = HashMap::new();
         histories.insert(
-            "telegram_alice".to_string(),
+            conversation::ConversationKey::new("telegram", "chat-telegram").resolve(),
             vec![
                 ChatMessage::assistant("stale assistant"),
                 ChatMessage::user("earlier user question"),

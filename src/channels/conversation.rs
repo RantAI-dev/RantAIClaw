@@ -46,24 +46,89 @@ impl<'a> ConversationKey<'a> {
         self
     }
 
-    /// The stable conversation id: `surface:sender[:thread]`.
+    /// The stable conversation id: `surface:sender[:thread]`, with `:` inside
+    /// `sender` and `thread` percent-encoded as `%3A` (and a literal `%` as
+    /// `%25`, so the encoding is itself unambiguous).
     ///
-    /// Deterministic and collision-free across surfaces because the surface
-    /// name prefixes the id. Behaviour-preserving for existing call sites that
-    /// used `format!("{surface}:{sender}")` when no thread is set.
+    /// The encoding is not cosmetic. Matrix senders are `@localpart:homeserver`
+    /// (`src/channels/matrix.rs`), and Telegram forum targets are
+    /// `chat_id:thread_id`, so a plain join made two different conversations
+    /// resolve to one id: `("matrix", "@bob", Some("example.org"))` and
+    /// `("matrix", "@bob:example.org", None)` both produced
+    /// `matrix:@bob:example.org`. The previous docstring claimed this function
+    /// was collision-free, which invited callers to rely on a property it did
+    /// not have.
+    ///
+    /// Ids for senders and threads containing no `:` or `%` are unchanged, so
+    /// existing call sites keep their current values.
     pub fn resolve(&self) -> String {
         match self.thread {
-            Some(thread) if !thread.is_empty() => {
-                format!("{}:{}:{}", self.surface, self.sender, thread)
-            }
-            _ => format!("{}:{}", self.surface, self.sender),
+            Some(thread) if !thread.is_empty() => format!(
+                "{}:{}:{}",
+                self.surface,
+                encode_component(self.sender),
+                encode_component(thread)
+            ),
+            _ => format!("{}:{}", self.surface, encode_component(self.sender)),
         }
     }
+}
+
+/// Percent-encode the two characters that would otherwise make the joined id
+/// ambiguous. `%` first, so an input already containing `%3A` cannot be
+/// confused with an encoded colon.
+fn encode_component(value: &str) -> String {
+    if !value.contains(':') && !value.contains('%') {
+        return value.to_string();
+    }
+    value.replace('%', "%25").replace(':', "%3A")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported shape of the leak, at the id level: one person's DM and a
+    /// group they share with the bot must not resolve to one conversation.
+    #[test]
+    fn different_chats_with_the_same_person_are_different_conversations() {
+        let dm = ConversationKey::new("telegram", "12345").resolve();
+        let group = ConversationKey::new("telegram", "-100999").resolve();
+        assert_ne!(dm, group);
+    }
+
+    /// Matrix senders are `@localpart:homeserver` and Telegram forum targets are
+    /// `chat_id:thread_id`, so a plain `:` join made two different conversations
+    /// produce one id. The docstring used to claim this was collision-free.
+    #[test]
+    fn a_colon_in_the_sender_cannot_forge_a_thread_scope() {
+        let threaded = ConversationKey::new("matrix", "@bob")
+            .in_thread(Some("example.org"))
+            .resolve();
+        let plain = ConversationKey::new("matrix", "@bob:example.org").resolve();
+        assert_ne!(
+            threaded, plain,
+            "a colon inside the sender must not read as the thread separator"
+        );
+    }
+
+    /// The encoding must itself be unambiguous, or it just moves the collision.
+    #[test]
+    fn an_encoded_colon_in_the_input_is_not_confused_with_a_real_one() {
+        let literal = ConversationKey::new("telegram", "a%3Ab").resolve();
+        let actual = ConversationKey::new("telegram", "a:b").resolve();
+        assert_ne!(literal, actual);
+    }
+
+    /// Ids for ordinary senders keep their existing value, so this is not a
+    /// silent re-keying of every conversation.
+    #[test]
+    fn ordinary_ids_are_unchanged_by_the_encoding() {
+        assert_eq!(
+            ConversationKey::new("discord", "C123").resolve(),
+            "discord:C123"
+        );
+    }
 
     #[test]
     fn whole_channel_id_is_surface_and_sender() {

@@ -68,6 +68,63 @@ impl ChannelHistoryStore {
         })
     }
 
+    /// How long an untouched conversation is kept on disk.
+    ///
+    /// Rows accumulated for every chat that ever messaged the bot and were never
+    /// removed. Not a config key: there is no concrete reason yet for operators
+    /// to vary it, and §3.2 says not to add the knob until there is.
+    const RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+
+    /// One-time maintenance at startup: drop rows the runtime can no longer
+    /// address, and rows nothing has touched inside the retention window.
+    ///
+    /// **Legacy keys.** History used to be keyed `channel_sender`, which merged
+    /// one person's DM with every group they shared with the bot. It is now
+    /// keyed by the conversation (`surface:chat[:thread]`), so every live key
+    /// contains a `:` and no legacy key does. Those rows are unreachable under
+    /// the new scheme — leaving them would keep leaked cross-chat transcripts on
+    /// disk while nothing could ever read or prune them. A one-time reset of
+    /// channel history is the honest outcome; a silent orphan is not.
+    ///
+    /// Returns `(legacy_removed, expired_removed)`.
+    pub fn prune_at_startup(&self) -> anyhow::Result<(usize, usize)> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff = now.saturating_sub(Self::RETENTION_SECS);
+
+        let conn = self.conn.lock();
+        let legacy = conn.execute(
+            "DELETE FROM channel_history WHERE instr(history_key, ':') = 0",
+            [],
+        )?;
+        // `updated_at` has existed since the table was created and was read by
+        // nothing; this is what it was for.
+        let expired = conn.execute(
+            "DELETE FROM channel_history WHERE updated_at > 0 AND updated_at < ?1",
+            params![cutoff],
+        )?;
+        drop(conn);
+
+        if legacy > 0 {
+            tracing::info!(
+                rows = legacy,
+                "Removed channel history rows keyed by the pre-conversation-scope \
+                 scheme; those conversations start fresh"
+            );
+        }
+        if expired > 0 {
+            tracing::info!(
+                rows = expired,
+                retention_days = Self::RETENTION_SECS / (24 * 60 * 60),
+                "Pruned channel history rows untouched inside the retention window"
+            );
+        }
+
+        Ok((legacy, expired))
+    }
+
     /// Load every persisted conversation into a map keyed by history key.
     ///
     /// Rows whose `turns_json` fails to deserialize are skipped (with a warning)
@@ -106,6 +163,13 @@ impl ChannelHistoryStore {
     ///
     /// An empty `turns` slice deletes the row instead of storing an empty entry,
     /// keeping the table free of dead keys.
+    ///
+    /// The whole turn list is rewritten on each call, which is bounded rather
+    /// than unbounded: `append_sender_turn` trims to `MAX_CHANNEL_HISTORY`
+    /// before persisting, so a write is at most that many turns however long the
+    /// conversation runs. A second cap here would be duplicated policy with no
+    /// current caller needing it (§3.2), so the growth this store actually had —
+    /// rows accumulating forever — is handled by `prune_at_startup` instead.
     pub fn save(&self, history_key: &str, turns: &[ChatMessage]) -> anyhow::Result<()> {
         if turns.is_empty() {
             return self.delete(history_key);
@@ -145,6 +209,68 @@ impl ChannelHistoryStore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Rows keyed by the pre-conversation-scope `channel_sender` shape are
+    /// unreachable once history is keyed by the conversation, and they hold the
+    /// cross-chat transcripts that scheme produced. They must not be left to rot.
+    #[test]
+    fn legacy_keyed_rows_are_removed_at_startup() {
+        let tmp = TempDir::new().unwrap();
+        let store = ChannelHistoryStore::open(tmp.path()).unwrap();
+        store
+            .save("telegram_alice", &[ChatMessage::user("leaked DM turn")])
+            .unwrap();
+        store
+            .save("telegram:chat-1", &[ChatMessage::user("kept")])
+            .unwrap();
+
+        let (legacy, _) = store.prune_at_startup().unwrap();
+        assert_eq!(legacy, 1, "exactly the legacy-shaped row");
+
+        let loaded = store.load_all().unwrap();
+        assert!(
+            !loaded.contains_key("telegram_alice"),
+            "the unreachable row is gone"
+        );
+        assert!(
+            loaded.contains_key("telegram:chat-1"),
+            "conversation-scoped rows are untouched"
+        );
+    }
+
+    /// Rows accumulated for every chat that ever messaged the bot and were never
+    /// removed. `updated_at` existed for this and was read by nothing.
+    #[test]
+    fn rows_past_the_retention_window_are_pruned() {
+        let tmp = TempDir::new().unwrap();
+        let store = ChannelHistoryStore::open(tmp.path()).unwrap();
+        store
+            .save("telegram:chat-old", &[ChatMessage::user("ancient")])
+            .unwrap();
+        store
+            .save("telegram:chat-new", &[ChatMessage::user("recent")])
+            .unwrap();
+
+        // Age one row past the window without touching the other.
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE channel_history SET updated_at = 1 WHERE history_key = ?1",
+                params!["telegram:chat-old"],
+            )
+            .unwrap();
+        }
+
+        let (_, expired) = store.prune_at_startup().unwrap();
+        assert_eq!(expired, 1, "only the aged row");
+
+        let loaded = store.load_all().unwrap();
+        assert!(!loaded.contains_key("telegram:chat-old"));
+        assert!(
+            loaded.contains_key("telegram:chat-new"),
+            "a live conversation must survive maintenance"
+        );
+    }
 
     #[test]
     fn roundtrip_persists_across_reopen() {
