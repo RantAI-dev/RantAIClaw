@@ -1,6 +1,4 @@
-use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
-};
+use crate::channels::SendMessage;
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
@@ -374,66 +372,23 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
-    match channel.to_ascii_lowercase().as_str() {
-        "telegram" => {
-            let tg = config
-                .channels_config
-                .telegram
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("telegram channel not configured"))?;
-            let channel = TelegramChannel::new(
-                tg.bot_token.clone(),
-                tg.allowed_users.clone(),
-                tg.mention_only,
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
-        }
-        "discord" => {
-            let dc = config
-                .channels_config
-                .discord
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
-            let channel = DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
-        }
-        "slack" => {
-            let sl = config
-                .channels_config
-                .slack
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("slack channel not configured"))?;
-            let channel = SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.channel_id.clone(),
-                sl.allowed_users.clone(),
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
-        }
-        "mattermost" => {
-            let mm = config
-                .channels_config
-                .mattermost
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
-            let channel = MattermostChannel::new(
-                mm.url.clone(),
-                mm.bot_token.clone(),
-                mm.channel_id.clone(),
-                mm.allowed_users.clone(),
-                mm.thread_replies.unwrap_or(true),
-                mm.mention_only.unwrap_or(false),
-            );
-            channel.send(&SendMessage::new(output, target)).await?;
-        }
-        other => anyhow::bail!("unsupported delivery channel: {other}"),
+    // Construction goes through the channels factory, so cron cannot drift from
+    // what the runtime and the doctor build — these four were hand-rolled here
+    // with their own copies of every constructor argument list.
+    //
+    // The *gate* deliberately stays `channel_supports_announce_delivery`. The
+    // factory can build fifteen channels; widening delivery to all of them is a
+    // capability change, not a refactor, so it is surfaced rather than taken.
+    let key = channel.to_ascii_lowercase();
+    if !crate::channels::channel_supports_announce_delivery(&key) {
+        anyhow::bail!("unsupported delivery channel: {key}");
     }
+
+    let built = crate::channels::build_configured_channels(config);
+    let Some((_, _, channel_impl)) = built.into_iter().find(|(k, _, _)| *k == key) else {
+        anyhow::bail!("{key} channel not configured");
+    };
+    channel_impl.send(&SendMessage::new(output, target)).await?;
 
     Ok(())
 }
