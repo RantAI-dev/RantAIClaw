@@ -3039,33 +3039,78 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
-/// Canonical channel roster: `(display label, configured?)` for every channel
-/// type in a stable order. Single source of truth shared by `channel list` and
-/// `status` so the two surfaces can never disagree on which channels exist.
-/// Matrix/Lark are additionally gated on their build features.
-pub(crate) fn channel_roster(config: &Config) -> [(&'static str, bool); 16] {
+/// Every channel type this build knows about: `(key, display)` in a stable,
+/// operator-facing order.
+///
+/// `key` is the lowercase `Channel::name()` value, which is what
+/// `build_configured_channels` emits and what cron delivery selects on.
+/// `channel_roster` reports this list and the factory builds from it, so a
+/// channel cannot exist on one surface and not the other — the previous roster
+/// was a *separate* hand-maintained list documented as "the single source of
+/// truth… so the two surfaces can never disagree", and they disagreed anyway.
+///
+/// `webhook` is included because operators think of it as a channel and both
+/// `channel list` and the doctor report it, but it is **not** a `Channel`
+/// implementer — it is served by the gateway — so the factory never builds it.
+/// `channel_keys_are_buildable_or_documented` pins that exception.
+pub(crate) const CHANNEL_CATALOG: [(&str, &str); 16] = [
+    ("telegram", "Telegram"),
+    ("discord", "Discord"),
+    ("slack", "Slack"),
+    ("mattermost", "Mattermost"),
+    ("webhook", "Webhook"),
+    ("imessage", "iMessage"),
+    ("matrix", "Matrix"),
+    ("signal", "Signal"),
+    ("whatsapp", "WhatsApp"),
+    ("linq", "Linq"),
+    ("nextcloud_talk", "Nextcloud Talk"),
+    ("email", "Email"),
+    ("irc", "IRC"),
+    ("lark", "Lark"),
+    ("dingtalk", "DingTalk"),
+    ("qq", "QQ"),
+];
+
+/// The one channel key in [`CHANNEL_CATALOG`] that is not a `Channel`
+/// implementer: the webhook is served by the gateway, so the factory never
+/// builds it and the doctor reports it separately.
+pub(crate) const NON_CHANNEL_CATALOG_KEYS: [&str; 1] = ["webhook"];
+
+/// Whether `key` is configured in this build. Matrix and Lark are additionally
+/// gated on their build features, so a channel configured in a build that cannot
+/// run it reports as not configured rather than as silently missing.
+pub(crate) fn channel_is_configured(key: &str, config: &Config) -> bool {
     let c = &config.channels_config;
-    [
-        ("Telegram", c.telegram.is_some()),
-        ("Discord", c.discord.is_some()),
-        ("Slack", c.slack.is_some()),
-        ("Mattermost", c.mattermost.is_some()),
-        ("Webhook", c.webhook.is_some()),
-        ("iMessage", c.imessage.is_some()),
-        (
-            "Matrix",
-            cfg!(feature = "channel-matrix") && c.matrix.is_some(),
-        ),
-        ("Signal", c.signal.is_some()),
-        ("WhatsApp", c.whatsapp.is_some()),
-        ("Linq", c.linq.is_some()),
-        ("Nextcloud Talk", c.nextcloud_talk.is_some()),
-        ("Email", c.email.is_some()),
-        ("IRC", c.irc.is_some()),
-        ("Lark", cfg!(feature = "channel-lark") && c.lark.is_some()),
-        ("DingTalk", c.dingtalk.is_some()),
-        ("QQ", c.qq.is_some()),
-    ]
+    match key {
+        "telegram" => c.telegram.is_some(),
+        "discord" => c.discord.is_some(),
+        "slack" => c.slack.is_some(),
+        "mattermost" => c.mattermost.is_some(),
+        "webhook" => c.webhook.is_some(),
+        "imessage" => c.imessage.is_some(),
+        "matrix" => cfg!(feature = "channel-matrix") && c.matrix.is_some(),
+        "signal" => c.signal.is_some(),
+        "whatsapp" => c.whatsapp.is_some(),
+        "linq" => c.linq.is_some(),
+        "nextcloud_talk" => c.nextcloud_talk.is_some(),
+        "email" => c.email.is_some(),
+        "irc" => c.irc.is_some(),
+        "lark" => cfg!(feature = "channel-lark") && c.lark.is_some(),
+        "dingtalk" => c.dingtalk.is_some(),
+        "qq" => c.qq.is_some(),
+        _ => false,
+    }
+}
+
+/// Canonical channel roster: `(display label, configured?)` for every channel
+/// type in a stable order, derived from [`CHANNEL_CATALOG`] rather than
+/// maintained beside it.
+pub(crate) fn channel_roster(config: &Config) -> Vec<(&'static str, bool)> {
+    CHANNEL_CATALOG
+        .iter()
+        .map(|(key, display)| (*display, channel_is_configured(key, config)))
+        .collect()
 }
 
 /// Guidance for `channel add`, which configures nothing itself.
@@ -3180,11 +3225,29 @@ fn classify_health_result(
 }
 
 /// Run health checks for configured channels.
-pub async fn doctor_channels(config: Config) -> Result<()> {
-    let mut channels: Vec<(&'static str, Arc<dyn Channel>)> = Vec::new();
+/// Every channel the config actually configures, as `(key, display, channel)`.
+///
+/// The single construction site. It was written out separately in `doctor_channels`
+/// and `start_channels_with_cancellation` (and, until it was deleted, a third copy
+/// in the channel registry), and the copies had already drifted with a
+/// user-visible consequence: the doctor had **no Mattermost branch**, so an
+/// operator whose Mattermost bot token expired was told everything was healthy
+/// while that channel silently never answered. `MattermostChannel::health_check`
+/// had no live caller at all.
+///
+/// `key` is the lowercase `Channel::name()` value — the same identifier
+/// `channels_by_name`, the per-channel allowlists and cron delivery use. `display`
+/// is operator-facing. The two WhatsApp variants share the key `whatsapp` because
+/// they share `Channel::name()`; they are mutually exclusive, selected by
+/// `wa.mode`, so only one is ever built.
+pub(crate) fn build_configured_channels(
+    config: &Config,
+) -> Vec<(&'static str, &'static str, Arc<dyn Channel>)> {
+    let mut channels: Vec<(&'static str, &'static str, Arc<dyn Channel>)> = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
         channels.push((
+            "telegram",
             "Telegram",
             Arc::new(
                 TelegramChannel::new(
@@ -3199,6 +3262,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if let Some(ref dc) = config.channels_config.discord {
         channels.push((
+            "discord",
             "Discord",
             Arc::new(DiscordChannel::new(
                 dc.bot_token.clone(),
@@ -3212,6 +3276,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if let Some(ref sl) = config.channels_config.slack {
         channels.push((
+            "slack",
             "Slack",
             Arc::new(SlackChannel::new(
                 sl.bot_token.clone(),
@@ -3221,8 +3286,24 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         ));
     }
 
+    if let Some(ref mm) = config.channels_config.mattermost {
+        channels.push((
+            "mattermost",
+            "Mattermost",
+            Arc::new(MattermostChannel::new(
+                mm.url.clone(),
+                mm.bot_token.clone(),
+                mm.channel_id.clone(),
+                mm.allowed_users.clone(),
+                mm.thread_replies.unwrap_or(true),
+                mm.mention_only.unwrap_or(false),
+            )),
+        ));
+    }
+
     if let Some(ref im) = config.channels_config.imessage {
         channels.push((
+            "imessage",
             "iMessage",
             Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
         ));
@@ -3231,6 +3312,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     #[cfg(feature = "channel-matrix")]
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push((
+            "matrix",
             "Matrix",
             Arc::new(MatrixChannel::new_with_session_hint(
                 mx.homeserver.clone(),
@@ -3252,6 +3334,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if let Some(ref sig) = config.channels_config.signal {
         channels.push((
+            "signal",
             "Signal",
             Arc::new(SignalChannel::new(
                 sig.http_url.clone(),
@@ -3276,6 +3359,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
                 if wa.is_cloud_config() {
                     channels.push((
+                        "whatsapp",
                         "WhatsApp",
                         Arc::new(WhatsAppChannel::new(
                             wa.access_token.clone().unwrap_or_default(),
@@ -3293,6 +3377,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 #[cfg(feature = "whatsapp-web")]
                 if wa.is_web_config() {
                     channels.push((
+                        "whatsapp",
                         "WhatsApp",
                         Arc::new(WhatsAppWebChannel::new(
                             wa.session_path.clone().unwrap_or_default(),
@@ -3317,6 +3402,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if let Some(ref lq) = config.channels_config.linq {
         channels.push((
+            "linq",
             "Linq",
             Arc::new(LinqChannel::new(
                 lq.api_token.clone(),
@@ -3328,6 +3414,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
         channels.push((
+            "nextcloud_talk",
             "Nextcloud Talk",
             Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
@@ -3338,11 +3425,16 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref email_cfg) = config.channels_config.email {
-        channels.push(("Email", Arc::new(EmailChannel::new(email_cfg.clone()))));
+        channels.push((
+            "email",
+            "Email",
+            Arc::new(EmailChannel::new(email_cfg.clone())),
+        ));
     }
 
     if let Some(ref irc) = config.channels_config.irc {
         channels.push((
+            "irc",
             "IRC",
             Arc::new(IrcChannel::new(irc::IrcChannelConfig {
                 server: irc.server.clone(),
@@ -3361,7 +3453,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     #[cfg(feature = "channel-lark")]
     if let Some(ref lk) = config.channels_config.lark {
-        channels.push(("Lark", Arc::new(LarkChannel::from_config(lk))));
+        channels.push(("lark", "Lark", Arc::new(LarkChannel::from_config(lk))));
     }
 
     #[cfg(not(feature = "channel-lark"))]
@@ -3373,6 +3465,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if let Some(ref dt) = config.channels_config.dingtalk {
         channels.push((
+            "dingtalk",
             "DingTalk",
             Arc::new(DingTalkChannel::new(
                 dt.client_id.clone(),
@@ -3384,6 +3477,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if let Some(ref qq) = config.channels_config.qq {
         channels.push((
+            "qq",
             "QQ",
             Arc::new(QQChannel::new(
                 qq.app_id.clone(),
@@ -3392,6 +3486,12 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
             )),
         ));
     }
+
+    channels
+}
+
+pub async fn doctor_channels(config: Config) -> Result<()> {
+    let channels = build_configured_channels(&config);
 
     if channels.is_empty() {
         println!("No real-time channels configured. Run `rantaiclaw onboard` first.");
@@ -3405,7 +3505,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     let mut unhealthy = 0_u32;
     let mut timeout = 0_u32;
 
-    for (name, channel) in channels {
+    for (_key, name, channel) in channels {
         let result = tokio::time::timeout(Duration::from_secs(10), channel.health_check()).await;
         let state = classify_health_result(&result);
 
@@ -3649,189 +3749,13 @@ pub async fn start_channels_with_cancellation(
     }
 
     // Collect active channels
-    let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
-
-    if let Some(ref tg) = config.channels_config.telegram {
-        channels.push(Arc::new(
-            TelegramChannel::new(
-                tg.bot_token.clone(),
-                tg.allowed_users.clone(),
-                tg.mention_only,
-            )
-            .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
-        ));
-    }
-
-    if let Some(ref dc) = config.channels_config.discord {
-        channels.push(Arc::new(DiscordChannel::new(
-            dc.bot_token.clone(),
-            dc.guild_id.clone(),
-            dc.allowed_users.clone(),
-            dc.listen_to_bots,
-            dc.mention_only,
-        )));
-    }
-
-    if let Some(ref sl) = config.channels_config.slack {
-        channels.push(Arc::new(SlackChannel::new(
-            sl.bot_token.clone(),
-            sl.channel_id.clone(),
-            sl.allowed_users.clone(),
-        )));
-    }
-
-    if let Some(ref mm) = config.channels_config.mattermost {
-        channels.push(Arc::new(MattermostChannel::new(
-            mm.url.clone(),
-            mm.bot_token.clone(),
-            mm.channel_id.clone(),
-            mm.allowed_users.clone(),
-            mm.thread_replies.unwrap_or(true),
-            mm.mention_only.unwrap_or(false),
-        )));
-    }
-
-    if let Some(ref im) = config.channels_config.imessage {
-        channels.push(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())));
-    }
-
-    #[cfg(feature = "channel-matrix")]
-    if let Some(ref mx) = config.channels_config.matrix {
-        channels.push(Arc::new(MatrixChannel::new_with_session_hint(
-            mx.homeserver.clone(),
-            mx.access_token.clone(),
-            mx.room_id.clone(),
-            mx.allowed_users.clone(),
-            mx.user_id.clone(),
-            mx.device_id.clone(),
-        )));
-    }
-
-    #[cfg(not(feature = "channel-matrix"))]
-    if config.channels_config.matrix.is_some() {
-        tracing::warn!(
-            "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix runtime startup."
-        );
-    }
-
-    if let Some(ref sig) = config.channels_config.signal {
-        channels.push(Arc::new(SignalChannel::new(
-            sig.http_url.clone(),
-            sig.account.clone(),
-            sig.group_id.clone(),
-            sig.allowed_from.clone(),
-            sig.ignore_attachments,
-            sig.ignore_stories,
-        )));
-    }
-
-    if let Some(ref wa) = config.channels_config.whatsapp {
-        if wa.is_ambiguous_config() {
-            tracing::warn!(
-                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
-            );
-        }
-        // Runtime negotiation: detect backend type from config
-        match wa.backend_type() {
-            "cloud" => {
-                // Cloud API mode: requires phone_number_id, access_token, verify_token
-                if wa.is_cloud_config() {
-                    channels.push(Arc::new(WhatsAppChannel::new(
-                        wa.access_token.clone().unwrap_or_default(),
-                        wa.phone_number_id.clone().unwrap_or_default(),
-                        wa.verify_token.clone().unwrap_or_default(),
-                        wa.allowed_numbers.clone(),
-                    )));
-                } else {
-                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
-                }
-            }
-            "web" => {
-                // Web mode: requires session_path
-                #[cfg(feature = "whatsapp-web")]
-                if wa.is_web_config() {
-                    channels.push(Arc::new(WhatsAppWebChannel::new(
-                        wa.session_path.clone().unwrap_or_default(),
-                        wa.pair_phone.clone(),
-                        wa.pair_code.clone(),
-                        wa.allowed_numbers.clone(),
-                    )));
-                } else {
-                    tracing::warn!("WhatsApp Web configured but session_path not set");
-                }
-                #[cfg(not(feature = "whatsapp-web"))]
-                {
-                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
-                }
-            }
-            _ => {
-                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
-            }
-        }
-    }
-
-    if let Some(ref lq) = config.channels_config.linq {
-        channels.push(Arc::new(LinqChannel::new(
-            lq.api_token.clone(),
-            lq.from_phone.clone(),
-            lq.allowed_senders.clone(),
-        )));
-    }
-
-    if let Some(ref nc) = config.channels_config.nextcloud_talk {
-        channels.push(Arc::new(NextcloudTalkChannel::new(
-            nc.base_url.clone(),
-            nc.app_token.clone(),
-            nc.allowed_users.clone(),
-        )));
-    }
-
-    if let Some(ref email_cfg) = config.channels_config.email {
-        channels.push(Arc::new(EmailChannel::new(email_cfg.clone())));
-    }
-
-    if let Some(ref irc) = config.channels_config.irc {
-        channels.push(Arc::new(IrcChannel::new(irc::IrcChannelConfig {
-            server: irc.server.clone(),
-            port: irc.port,
-            nickname: irc.nickname.clone(),
-            username: irc.username.clone(),
-            channels: irc.channels.clone(),
-            allowed_users: irc.allowed_users.clone(),
-            server_password: irc.server_password.clone(),
-            nickserv_password: irc.nickserv_password.clone(),
-            sasl_password: irc.sasl_password.clone(),
-            verify_tls: irc.verify_tls.unwrap_or(true),
-        })));
-    }
-
-    #[cfg(feature = "channel-lark")]
-    if let Some(ref lk) = config.channels_config.lark {
-        channels.push(Arc::new(LarkChannel::from_config(lk)));
-    }
-
-    #[cfg(not(feature = "channel-lark"))]
-    if config.channels_config.lark.is_some() {
-        tracing::warn!(
-            "Lark channel is configured but this build was compiled without `channel-lark`; skipping Lark runtime startup."
-        );
-    }
-
-    if let Some(ref dt) = config.channels_config.dingtalk {
-        channels.push(Arc::new(DingTalkChannel::new(
-            dt.client_id.clone(),
-            dt.client_secret.clone(),
-            dt.allowed_users.clone(),
-        )));
-    }
-
-    if let Some(ref qq) = config.channels_config.qq {
-        channels.push(Arc::new(QQChannel::new(
-            qq.app_id.clone(),
-            qq.app_secret.clone(),
-            qq.allowed_users.clone(),
-        )));
-    }
+    // One construction site: the doctor probes exactly what the runtime starts.
+    // These were written out separately and had already drifted — the doctor was
+    // missing Mattermost entirely.
+    let channels: Vec<Arc<dyn Channel>> = build_configured_channels(&config)
+        .into_iter()
+        .map(|(_key, _display, channel)| channel)
+        .collect();
 
     if channels.is_empty() {
         tracing::info!("No channels configured. Run `rantaiclaw onboard` to set up channels.");
@@ -6729,6 +6653,191 @@ BTC is currently around $65,000 based on latest tool output."#
         let text = channel_remove_guidance("telegram");
         assert!(text.contains("telegram"));
         assert!(text.contains("config.toml"), "says where to make the edit");
+    }
+
+    /// Populate every channel section, so the factory has to build all of them.
+    ///
+    /// Built through serde from minimal objects, matching how the gateway
+    /// constructs config (`config_api.rs`); several channel config structs have
+    /// no `Default`, and adding one is a production change this test does not own.
+    fn config_with_every_channel() -> Config {
+        use serde_json::json;
+        let mut config = Config::default();
+        let c = &mut config.channels_config;
+        c.telegram = serde_json::from_value(json!({
+            "bot_token": "111:aaaaaaaaaaaaaaaaaaaaaaaaa", "allowed_users": []
+        }))
+        .expect("telegram");
+        c.discord = serde_json::from_value(json!({"bot_token": "t", "allowed_users": []}))
+            .expect("discord");
+        c.slack = serde_json::from_value(json!({
+            "bot_token": "t", "app_token": "a", "channel_id": "C1", "allowed_users": []
+        }))
+        .expect("slack");
+        c.mattermost = serde_json::from_value(json!({
+            "url": "https://example.com", "bot_token": "t", "channel_id": "C1", "allowed_users": []
+        }))
+        .expect("mattermost");
+        c.webhook = serde_json::from_value(json!({"port": 8080})).expect("webhook");
+        c.imessage = serde_json::from_value(json!({"allowed_contacts": []})).expect("imessage");
+        c.matrix = serde_json::from_value(json!({
+            "homeserver": "https://example.org", "access_token": "t",
+            "room_id": "!r:example.org", "allowed_users": []
+        }))
+        .expect("matrix");
+        c.signal = serde_json::from_value(json!({
+            "http_url": "http://localhost:8080", "account": "+15550000000",
+            "allowed_from": [], "ignore_attachments": false, "ignore_stories": true
+        }))
+        .expect("signal");
+        c.whatsapp = serde_json::from_value(json!({
+            "mode": "cloud", "phone_number_id": "1", "access_token": "t",
+            "verify_token": "v", "allowed_numbers": []
+        }))
+        .expect("whatsapp");
+        c.linq = serde_json::from_value(json!({
+            "api_token": "k", "from_phone": "+15550000001", "allowed_senders": []
+        }))
+        .expect("linq");
+        c.nextcloud_talk = serde_json::from_value(json!({
+            "base_url": "https://example.com", "app_token": "t", "allowed_users": []
+        }))
+        .expect("nextcloud_talk");
+        c.email = serde_json::from_value(json!({
+            "imap_host": "imap.example.com", "imap_port": 993, "imap_folder": "INBOX",
+            "smtp_host": "smtp.example.com", "smtp_port": 587, "smtp_tls": true,
+            "username": "u", "password": "p", "from_address": "bot@example.com",
+            "idle_timeout_secs": 60
+        }))
+        .expect("email");
+        c.irc = serde_json::from_value(json!({
+            "server": "irc.example.org", "port": 6697, "nickname": "bot",
+            "channels": ["#c"], "allowed_users": []
+        }))
+        .expect("irc");
+        c.lark = serde_json::from_value(json!({
+            "app_id": "a", "app_secret": "s", "allowed_users": [],
+            "use_feishu": false, "receive_mode": "webhook"
+        }))
+        .expect("lark");
+        c.dingtalk = serde_json::from_value(json!({
+            "client_id": "a", "client_secret": "s", "allowed_users": []
+        }))
+        .expect("dingtalk");
+        c.qq = serde_json::from_value(json!({
+            "app_id": "a", "app_secret": "s", "allowed_users": []
+        }))
+        .expect("qq");
+        config
+    }
+
+    /// The test that would have caught the reported defect: `channels doctor`
+    /// had no Mattermost branch, so an operator whose Mattermost bot token had
+    /// expired was told everything was healthy while that channel silently never
+    /// answered. `MattermostChannel::health_check` had no live caller at all.
+    ///
+    /// The doctor and the runtime now build from one factory, so this asserts the
+    /// factory covers every catalog entry that is a real `Channel`.
+    #[test]
+    fn every_configured_channel_is_built_by_the_factory() {
+        let config = config_with_every_channel();
+        let built: Vec<&str> = build_configured_channels(&config)
+            .into_iter()
+            .map(|(key, _, _)| key)
+            .collect();
+
+        for (key, display) in CHANNEL_CATALOG {
+            if NON_CHANNEL_CATALOG_KEYS.contains(&key) {
+                continue;
+            }
+            // Feature-gated channels are absent from a build that cannot run them.
+            if !channel_is_configured(key, &config) {
+                continue;
+            }
+            assert!(
+                built.contains(&key),
+                "{display} is configured but the factory does not build it — \
+                 this is the drift that lost Mattermost from `channels doctor`"
+            );
+        }
+    }
+
+    /// The roster is what `channel list` and `status` report. It used to be a
+    /// separate hand-maintained list documented as the single source of truth,
+    /// and it disagreed with what was actually constructed.
+    #[test]
+    fn roster_covers_exactly_the_catalog() {
+        let config = config_with_every_channel();
+        let roster = channel_roster(&config);
+
+        assert_eq!(roster.len(), CHANNEL_CATALOG.len());
+        for ((key, display), (roster_display, configured)) in CHANNEL_CATALOG.iter().zip(&roster) {
+            assert_eq!(display, roster_display, "roster order follows the catalog");
+            assert_eq!(
+                *configured,
+                channel_is_configured(key, &config),
+                "{display} disagrees with the catalog's own predicate"
+            );
+        }
+    }
+
+    /// Feature-gated channels must be reported as unconfigured in a build that
+    /// cannot run them, never silently dropped.
+    #[test]
+    fn feature_gated_channels_follow_the_build() {
+        let config = config_with_every_channel();
+        let built: Vec<&str> = build_configured_channels(&config)
+            .into_iter()
+            .map(|(key, _, _)| key)
+            .collect();
+
+        assert_eq!(
+            built.contains(&"matrix"),
+            cfg!(feature = "channel-matrix"),
+            "matrix must be built exactly when its feature is on"
+        );
+        assert_eq!(
+            built.contains(&"lark"),
+            cfg!(feature = "channel-lark"),
+            "lark must be built exactly when its feature is on"
+        );
+        assert_eq!(
+            channel_is_configured("lark", &config),
+            cfg!(feature = "channel-lark"),
+            "the roster agrees with the factory about the build"
+        );
+    }
+
+    /// The "keep in sync" comment on `channel_supports_announce_delivery` asks
+    /// for an invariant nothing enforced. The factory can build fifteen channels;
+    /// cron delivers to four. That gap is deliberate — widening delivery is a
+    /// capability change, not a refactor — so this pins the advertised set
+    /// instead of letting it drift silently in either direction.
+    #[test]
+    fn announce_delivery_advertises_a_subset_of_what_the_factory_builds() {
+        let config = config_with_every_channel();
+        let built: Vec<&str> = build_configured_channels(&config)
+            .into_iter()
+            .map(|(key, _, _)| key)
+            .collect();
+
+        let advertised: Vec<&str> = CHANNEL_CATALOG
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| channel_supports_announce_delivery(key))
+            .collect();
+
+        assert_eq!(
+            advertised,
+            vec!["telegram", "discord", "slack", "mattermost"],
+            "cron delivery set changed — this is a capability change, not a refactor"
+        );
+        for key in &advertised {
+            assert!(
+                built.contains(key),
+                "{key} is advertised for cron delivery but the factory cannot build it"
+            );
+        }
     }
 
     #[test]
