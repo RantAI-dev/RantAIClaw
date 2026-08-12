@@ -1838,6 +1838,26 @@ impl Channel for TelegramChannel {
         crate::channels::format::RenderTarget::TelegramHtml
     }
 
+    /// Replace the live allowlist from a reloaded config.
+    ///
+    /// Normalized through the same helper the constructor uses, so an entry
+    /// applied here and the same entry supplied at boot end up identical — a
+    /// mismatch would make the gate depend on which path wrote it.
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        let normalized = Self::normalize_allowed_users(allowed.to_vec());
+        if let Ok(mut users) = self.allowed_users.write() {
+            if *users != normalized {
+                tracing::info!(
+                    target: "channels",
+                    channel = "telegram",
+                    count = normalized.len(),
+                    "applied updated allowlist from config"
+                );
+                *users = normalized;
+            }
+        }
+    }
+
     fn supports_draft_updates(&self) -> bool {
         self.stream_mode != StreamMode::Off
     }
@@ -2665,6 +2685,34 @@ mod tests {
     fn telegram_user_denied_when_none_of_identities_match() {
         let ch = TelegramChannel::new("t".into(), vec!["alice".into(), "987654321".into()], false);
         assert!(!ch.is_any_user_allowed(["unknown", "123456789"]));
+    }
+
+    /// An entry applied through the runtime path and the same entry supplied at
+    /// construction must end up in the identical stored form. If they diverge,
+    /// whether a sender is allowed depends on which path wrote the list.
+    #[test]
+    fn telegram_apply_allowed_senders_normalizes_like_the_constructor() {
+        use crate::channels::traits::Channel;
+
+        let via_ctor = TelegramChannel::new(
+            "111:aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            vec!["@Alice".to_string(), "  bob  ".to_string()],
+            false,
+        );
+        let via_runtime =
+            TelegramChannel::new("111:aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(), vec![], false);
+        via_runtime.apply_allowed_senders(&["@Alice".to_string(), "  bob  ".to_string()]);
+
+        let ctor_list = via_ctor.allowed_users.read().expect("ctor lock").clone();
+        let runtime_list = via_runtime
+            .allowed_users
+            .read()
+            .expect("runtime lock")
+            .clone();
+        assert_eq!(
+            ctor_list, runtime_list,
+            "runtime-applied allowlist must normalize identically to the constructor's"
+        );
     }
 
     #[test]

@@ -179,6 +179,56 @@ struct ChannelRuntimeDefaults {
     /// so without carrying this the prompt kept describing whatever preset was
     /// active when the daemon started — the gate moved, the briefing did not.
     autonomy_preset: crate::approval::policy_writer::PolicyPreset,
+    /// Per-channel sender allowlists, keyed by the same lowercase channel name
+    /// used by `channels_by_name`. Reloaded from disk so a console or CLI
+    /// allowlist edit reaches a running listener without restarting the daemon —
+    /// which, since the daemon hosts the gateway, used to kill the request that
+    /// made the edit.
+    allowlists: Arc<HashMap<String, Vec<String>>>,
+}
+
+/// Per-channel sender allowlists, keyed by `Channel::name()`.
+///
+/// The field each channel stores its allowlist in differs (`allowed_users`,
+/// `allowed_from`, `allowed_numbers`, `allowed_senders`, `allowed_contacts`), so
+/// this mirrors the field choices in `pairing::apply_pairing` exactly rather than
+/// picking different ones.
+///
+/// It is a second copy of that mapping, which is duplication this subsystem has
+/// too much of already. Consolidating it belongs with the other cross-file
+/// allowlist work (`plans/129-…`), which owns `pairing.rs`; doing it here would
+/// put two plans in one file. Until then: **change both or neither.**
+fn channel_allowlists(cc: &crate::config::ChannelsConfig) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    let mut put = |name: &str, list: Option<&Vec<String>>| {
+        if let Some(list) = list {
+            out.insert(name.to_string(), list.clone());
+        }
+    };
+    put("telegram", cc.telegram.as_ref().map(|c| &c.allowed_users));
+    put("discord", cc.discord.as_ref().map(|c| &c.allowed_users));
+    put("slack", cc.slack.as_ref().map(|c| &c.allowed_users));
+    put(
+        "mattermost",
+        cc.mattermost.as_ref().map(|c| &c.allowed_users),
+    );
+    put("matrix", cc.matrix.as_ref().map(|c| &c.allowed_users));
+    put("irc", cc.irc.as_ref().map(|c| &c.allowed_users));
+    put("lark", cc.lark.as_ref().map(|c| &c.allowed_users));
+    put("dingtalk", cc.dingtalk.as_ref().map(|c| &c.allowed_users));
+    put("qq", cc.qq.as_ref().map(|c| &c.allowed_users));
+    put(
+        "nextcloud_talk",
+        cc.nextcloud_talk.as_ref().map(|c| &c.allowed_users),
+    );
+    put("signal", cc.signal.as_ref().map(|c| &c.allowed_from));
+    put("whatsapp", cc.whatsapp.as_ref().map(|c| &c.allowed_numbers));
+    put("linq", cc.linq.as_ref().map(|c| &c.allowed_senders));
+    put(
+        "imessage",
+        cc.imessage.as_ref().map(|c| &c.allowed_contacts),
+    );
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,6 +585,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         allowed_commands: Arc::new(config.autonomy.allowed_commands.clone()),
         autonomy_level: config.autonomy.level,
         autonomy_preset: crate::approval::policy_writer::preset_for_autonomy(&config.autonomy),
+        allowlists: Arc::new(channel_allowlists(&config.channels_config)),
     }
 }
 
@@ -569,6 +620,12 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         approval_owners: Arc::clone(&ctx.approval_owners),
         guest_gate: Arc::clone(&ctx.guest_gate),
         allowed_commands: Arc::new(Vec::new()),
+        // Empty on the fallback path: this branch has no config to read
+        // allowlists from, and an empty map means "apply nothing", so every
+        // channel keeps the list it was constructed with. Inventing entries
+        // here would let a fallback *widen* a gate, which is the opposite of
+        // what a fallback should be able to do.
+        allowlists: Arc::new(HashMap::new()),
         autonomy_level: ctx.security.effective_autonomy(),
         // Fallback path only (the store has no entry — ad-hoc/tests). The
         // live policy carries the enforced level but not `always_ask`, which
@@ -686,6 +743,20 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     // `runtime_allowlist` (`/allow <cmd> --persist`), the rate-limit window and
     // the approval registry are process state and are deliberately untouched.
     ctx.security.apply_config(&next_autonomy);
+
+    // Push per-channel allowlists into the live channel handles, for the same
+    // reason the autonomy swap above happens here: an allowlist change is
+    // safety-relevant, so it must apply even when the — usually unrelated — new
+    // provider cannot be built. Doing it on the success path only would mean a
+    // tightened allowlist silently waited on an API key.
+    //
+    // Channels that hold their allowlist as a plain `Vec` inherit the no-op
+    // default on `Channel::apply_allowed_senders` and keep their boot-time list.
+    for (name, allowed) in next_defaults.allowlists.iter() {
+        if let Some(channel) = ctx.channels_by_name.get(name.as_str()) {
+            channel.apply_allowed_senders(allowed);
+        }
+    }
 
     let next_default_provider = match providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
@@ -4105,12 +4176,22 @@ mod tests {
     #[derive(Default)]
     struct TelegramRecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
+        /// Every `apply_allowed_senders` call, in order. A `std::sync::Mutex`
+        /// because the trait method is sync.
+        applied_allowlists: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
             "telegram"
+        }
+
+        fn apply_allowed_senders(&self, allowed: &[String]) {
+            self.applied_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(allowed.to_vec());
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -4987,6 +5068,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         allowed_commands: Arc::new(Vec::new()),
                         autonomy_level: crate::security::AutonomyLevel::Supervised,
                         autonomy_preset: crate::approval::policy_writer::PolicyPreset::Manual,
+                        allowlists: Arc::new(HashMap::new()),
                     },
                     last_applied_stamp: None,
                     last_reload_error: None,
@@ -5183,6 +5265,184 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             live_approval_owners(&ctx).as_slice(),
             &["rantaiclaw_user".to_string()]
+        );
+
+        {
+            let mut store = runtime_config_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.remove(&config_path);
+        }
+    }
+
+    /// Build a `ChannelRuntimeContext` around one recording Telegram channel,
+    /// pointed at `dir` for config reloads. Shared by the allowlist tests below.
+    fn allowlist_test_ctx(
+        dir: &std::path::Path,
+        channel: Arc<TelegramRecordingChannel>,
+    ) -> ChannelRuntimeContext {
+        let mut channels_by_name: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        channels_by_name.insert("telegram".to_string(), channel);
+        ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("startup-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                rantaiclaw_dir: Some(dir.to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+        }
+    }
+
+    /// The operator-reported bug: saving a Telegram allowlist from the console
+    /// used to require restarting the whole managed service — which hosts the
+    /// gateway, so the save killed the request that made it. The runtime holds
+    /// every live channel handle and already re-reads config per message, so the
+    /// new list must reach the channel with no restart at all.
+    #[tokio::test]
+    async fn allowlist_edit_reaches_the_live_channel_without_restart() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+
+        let write_config = |allowed: Vec<String>| {
+            let mut config = crate::config::Config::default();
+            config.default_provider = Some("openrouter".to_string());
+            // Built through serde from a minimal object, matching how the
+            // gateway constructs one (`config_api.rs`) — TelegramConfig has no
+            // `Default`, and adding one is a production change this plan does
+            // not own.
+            config.channels_config.telegram = Some(
+                serde_json::from_value(serde_json::json!({
+                    "bot_token": "111:aaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "allowed_users": allowed,
+                }))
+                .expect("build TelegramConfig"),
+            );
+            let toml = toml::to_string(&config).expect("serialize config");
+            std::fs::write(&config_path, toml).expect("write config");
+        };
+
+        write_config(vec!["user_a".to_string()]);
+
+        let channel = Arc::new(TelegramRecordingChannel::default());
+        let ctx = allowlist_test_ctx(temp.path(), Arc::clone(&channel));
+
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("initial apply");
+
+        // Stamp is mtime+len, so the rewrite must be distinguishable.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_config(vec!["user_a".to_string(), "user_b".to_string()]);
+
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload apply");
+
+        let applied = channel
+            .applied_allowlists
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            applied.last().map(Vec::as_slice),
+            Some(["user_a".to_string(), "user_b".to_string()].as_slice()),
+            "the edited allowlist reached the live channel handle"
+        );
+
+        {
+            let mut store = runtime_config_store()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.remove(&config_path);
+        }
+    }
+
+    /// An allowlist change is safety-relevant, so it must apply even when the
+    /// — usually unrelated — new provider cannot be built. Applying it only on
+    /// the success path would mean a *tightened* allowlist silently waited on an
+    /// API key, which is the same shape as the autonomy bug fixed earlier.
+    #[tokio::test]
+    async fn allowlist_applies_even_when_the_provider_fails_to_build() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+
+        let write_config = |allowed: Vec<String>| {
+            let mut config = crate::config::Config::default();
+            // No API key for a provider that requires one -> build fails.
+            config.default_provider = Some("openai".to_string());
+            config.api_key = None;
+            // Built through serde from a minimal object, matching how the
+            // gateway constructs one (`config_api.rs`) — TelegramConfig has no
+            // `Default`, and adding one is a production change this plan does
+            // not own.
+            config.channels_config.telegram = Some(
+                serde_json::from_value(serde_json::json!({
+                    "bot_token": "111:aaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "allowed_users": allowed,
+                }))
+                .expect("build TelegramConfig"),
+            );
+            let toml = toml::to_string(&config).expect("serialize config");
+            std::fs::write(&config_path, toml).expect("write config");
+        };
+
+        write_config(vec!["user_a".to_string(), "user_b".to_string()]);
+
+        let channel = Arc::new(TelegramRecordingChannel::default());
+        let ctx = allowlist_test_ctx(temp.path(), Arc::clone(&channel));
+
+        // The reload must not fail even though the provider build does.
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("apply despite provider build failure");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Tighten: remove user_b. This is the direction that must never stall.
+        write_config(vec!["user_a".to_string()]);
+
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload despite provider build failure");
+
+        let applied = channel
+            .applied_allowlists
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            applied.last().map(Vec::as_slice),
+            Some(["user_a".to_string()].as_slice()),
+            "tightened allowlist applied even though the provider could not be built"
         );
 
         {

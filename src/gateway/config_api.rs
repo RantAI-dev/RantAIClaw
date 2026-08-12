@@ -568,6 +568,24 @@ fn schedule_daemon_reload() {
     });
 }
 
+/// Whether a `POST /channels/telegram` needs the channels runtime restarted.
+///
+/// Only a new token does. It creates or replaces the channel itself, which the
+/// running runtime cannot swap in place.
+///
+/// An allowlist-only edit must NOT restart: the runtime re-reads config on its
+/// next message and pushes the new list into the live channel through
+/// `Channel::apply_allowed_senders`. Restarting would be actively harmful — the
+/// daemon hosts this gateway, so it kills the request that made the edit, and
+/// with no debounce repeated saves can trip systemd's start limit and leave the
+/// unit `failed`.
+///
+/// Extracted as a pure function so the decision is testable without observing
+/// the detached restart task.
+fn needs_runtime_restart(token_changed: bool) -> bool {
+    token_changed
+}
+
 /// Connect a Telegram channel from the console: validate the token against
 /// Telegram, then persist it into `channels_config.telegram`. The token is a
 /// secret and is never echoed back in responses. NOTE: channel tokens are
@@ -626,10 +644,19 @@ async fn connect_telegram(
     cfg.channels_config.telegram = Some(tg);
     persist_and_swap(&state, cfg).await?;
 
-    // The running channels runtime doesn't hot-reload channel config from disk,
-    // so ask a managed daemon to restart and pick up the change (detached, after
-    // the response flushes).
-    schedule_daemon_reload();
+    // A new token creates or replaces the channel itself, which the running
+    // runtime cannot swap in place — that still needs a restart.
+    //
+    // An allowlist-only edit does NOT. The channels runtime re-reads config on
+    // its next message and pushes the new list into the live channel via
+    // `Channel::apply_allowed_senders`, so restarting here would be pure cost:
+    // the daemon hosts this gateway, so it would kill the request that made the
+    // edit — and with no debounce, repeated saves could trip systemd's start
+    // limit and leave the unit `failed`.
+    let restarts_runtime = needs_runtime_restart(new_token.is_some());
+    if restarts_runtime {
+        schedule_daemon_reload();
+    }
 
     let warning = if body.allowed_users.is_empty() {
         Some("allowed_users is empty — the bot will deny ALL senders until you add Telegram user ids/usernames.")
@@ -644,7 +671,11 @@ async fn connect_telegram(
         "bot_username": bot_username,
         "allowed_users": body.allowed_users.len(),
         "warning": warning,
-        "note": "Saved. Reloading the runtime to apply — automatic if RantaiClaw runs as a managed service, otherwise restart `rantaiclaw daemon`.",
+        "note": if restarts_runtime {
+            "Saved. Reloading the runtime to apply the new token — automatic if RantaiClaw runs as a managed service, otherwise restart `rantaiclaw daemon`."
+        } else {
+            "Saved. The running channel picks this up on its next message — no restart."
+        },
     })))
 }
 
@@ -1281,6 +1312,28 @@ mod tests {
         assert!(
             updated.mention_only,
             "options preserved when token replaced"
+        );
+    }
+
+    #[test]
+    fn allowlist_only_update_does_not_restart_the_runtime() {
+        // The operator-reported bug: saving an allowlist restarted the managed
+        // service, which hosts this gateway, so the save killed the request that
+        // made it. The runtime applies allowlists live now — restarting for one
+        // is pure cost, and repeated saves could trip systemd's start limit.
+        assert!(
+            !needs_runtime_restart(false),
+            "an allowlist-only edit must not restart the channels runtime"
+        );
+    }
+
+    #[test]
+    fn token_change_still_restarts_the_runtime() {
+        // A new token creates or replaces the channel itself; the running
+        // runtime cannot swap that in place.
+        assert!(
+            needs_runtime_restart(true),
+            "a token change must still restart the channels runtime"
         );
     }
 
