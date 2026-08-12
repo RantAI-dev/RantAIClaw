@@ -60,6 +60,13 @@ jobs:
               env:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
               run: ./scripts/ci/rust_strict_delta_gate.sh
+            # Source-level guards. Cheap greps, no build — they belong here rather
+            # than in `features`, which is label-gated and would not run on the PRs
+            # that introduce these regressions.
+            - name: Provisioner probe hosts match their channel modules
+              run: ./scripts/ci/check_provisioner_probe_hosts.sh
+            - name: Channel config fields have runtime readers
+              run: ./scripts/ci/check_channel_config_readers.sh
 
     test:
         name: Test
@@ -108,6 +115,32 @@ jobs:
               # time was ~5s, so running serially costs well under the job cap.
               # Cross-module env-lock hygiene is the follow-up that lifts this.
               run: cargo test --locked --workspace -- --test-threads=1
+
+    # `channel-lark` gets its own job rather than a row in the `features` matrix
+    # below, for two reasons: that matrix is label-gated behind `ci:full` (so it
+    # would not run on the PRs that change Lark), and it only runs `cargo check`
+    # (which would not have caught the defects in `src/channels/lark.rs` — 1,774
+    # lines including a hand-rolled websocket codec and an axum server that no CI
+    # job compiled until now).
+    #
+    # Unlike `channel-matrix`, this feature has no upstream blocker: it pulls only
+    # `prost`. Verified building clean at f189422 in ~3m.
+    channel-lark:
+        name: Channel Lark (build + test)
+        needs: [changes, lint]
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
+        runs-on: ubuntu-latest
+        timeout-minutes: 25
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  key: channel-lark
+            - name: Build and test channel-lark
+              run: cargo test --locked --features channel-lark --lib channels::lark
 
     features:
         name: Features (${{ matrix.name }})

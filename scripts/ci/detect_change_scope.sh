@@ -74,8 +74,14 @@ while IFS= read -r file; do
 
   docs_only=false
 
+  # `scripts/ci/*` counts as a Rust change: those scripts ARE the Rust gate
+  # (quality gate, strict-lint delta, provisioner probe hosts, config readers).
+  # Without this, a PR that edits a gate script skips every job that runs it —
+  # so the gate lands green having never executed, which is the failure mode
+  # these gates exist to prevent.
   if [[ "$file" == src/* ]] \
     || [[ "$file" == tests/* ]] \
+    || [[ "$file" == scripts/ci/* ]] \
     || [[ "$file" == "Cargo.toml" ]] \
     || [[ "$file" == "Cargo.lock" ]] \
     || [[ "$file" == "deny.toml" ]]; then
