@@ -84,7 +84,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
@@ -207,6 +207,25 @@ struct ChannelRuntimeDefaults {
     /// which, since the daemon hosts the gateway, used to kill the request that
     /// made the edit.
     allowlists: Arc<HashMap<String, Vec<String>>>,
+    /// Per-message behaviour knobs that used to be read from the boot-time
+    /// `ctx`, so editing them in `config.toml` did nothing until a restart even
+    /// though the reload reported success. They carry no gate semantics — the
+    /// timeout bounds a turn, the iteration cap bounds a tool loop — so they
+    /// live here purely to close the "reload said applied, nothing changed" gap.
+    message_timeout_secs: u64,
+    max_tool_iterations: usize,
+    auto_save_memory: bool,
+    min_relevance_score: f64,
+    /// `[channels_config] autonomous_tools`. Reloaded so an operator can re-arm
+    /// the in-chat approval gate without a restart. This is the security-relevant
+    /// direction: `false` means "gate tools", and before this it was read once at
+    /// startup, so turning the gate back **on** was reported as applied and did
+    /// nothing. The `ApprovalManager` itself is now always constructed at boot,
+    /// so flipping this flag costs nothing per message.
+    autonomous_tools: bool,
+    /// Per-channel `mention_only`, carried only so reload can detect an edit it
+    /// cannot apply and say so. See `channel_mention_only`.
+    mention_only: Arc<HashMap<String, bool>>,
 }
 
 /// Per-channel sender allowlists, keyed by `Channel::name()`.
@@ -220,6 +239,29 @@ struct ChannelRuntimeDefaults {
 /// too much of already. Consolidating it belongs with the other cross-file
 /// allowlist work (`plans/129-…`), which owns `pairing.rs`; doing it here would
 /// put two plans in one file. Until then: **change both or neither.**
+/// Per-channel `mention_only`, keyed like `channel_allowlists`.
+///
+/// Only the three channels whose config carries the flag appear. Unlike the
+/// allowlists this is **not** applied on reload: `mention_only` is passed into
+/// the channel constructors and lives inside the channel objects, so applying it
+/// live needs a `Channel` trait method, which is a cross-file change this plan
+/// does not own. It is tracked here purely so a reload can *tell the operator*
+/// that their edit needs a restart instead of reporting success and doing
+/// nothing.
+fn channel_mention_only(cc: &crate::config::ChannelsConfig) -> HashMap<String, bool> {
+    let mut out = HashMap::new();
+    if let Some(c) = cc.telegram.as_ref() {
+        out.insert("telegram".to_string(), c.mention_only);
+    }
+    if let Some(c) = cc.discord.as_ref() {
+        out.insert("discord".to_string(), c.mention_only);
+    }
+    if let Some(c) = cc.mattermost.as_ref() {
+        out.insert("mattermost".to_string(), c.mention_only.unwrap_or(false));
+    }
+    out
+}
+
 fn channel_allowlists(cc: &crate::config::ChannelsConfig) -> HashMap<String, Vec<String>> {
     let mut out = HashMap::new();
     let mut put = |name: &str, list: Option<&Vec<String>>| {
@@ -259,6 +301,24 @@ struct ConfigFileStamp {
     len: u64,
 }
 
+/// What one channel runtime knows about its config file: the applied state, plus
+/// warn-once latches for the two paths that used to fail in total silence.
+///
+/// The latches live here rather than in a `static` so they cannot couple one
+/// test to another — which is the defect that removing the global store fixed.
+#[derive(Default)]
+struct RuntimeConfigSlot {
+    state: Option<RuntimeConfigState>,
+    /// Set once `runtime_defaults_snapshot` has reported taking its synthesised
+    /// fallback. That fallback hands the model a *guessed* autonomy preset the
+    /// gate is not enforcing, so it must be visible — but it is consulted per
+    /// message, so it must not be visible once per message.
+    fallback_warned: bool,
+    /// Set once an unreadable/unstattable config file has been reported. Cleared
+    /// on the next successful stat so a later outage is reported again.
+    stamp_error_warned: bool,
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeConfigState {
     defaults: ChannelRuntimeDefaults,
@@ -268,20 +328,16 @@ struct RuntimeConfigState {
     last_reload_error: Option<String>,
 }
 
-fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
-    static STORE: OnceLock<Mutex<HashMap<PathBuf, RuntimeConfigState>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// The most recent reload failure reason for `config_path`, if the runtime kept
 /// the previous provider instead of swapping to a broken one. Exposed so an
 /// operator surface can report why a channel didn't follow a provider switch.
 #[cfg_attr(not(test), allow(dead_code))]
-fn last_reload_error(config_path: &Path) -> Option<String> {
-    runtime_config_store()
+fn last_reload_error(ctx: &ChannelRuntimeContext) -> Option<String> {
+    ctx.runtime_config
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(config_path)
+        .state
+        .as_ref()
         .and_then(|s| s.last_reload_error.clone())
 }
 
@@ -292,6 +348,15 @@ const OPENRC_RESTART_ARGS: [&str; 2] = ["rantaiclaw", "restart"];
 
 #[derive(Clone)]
 struct ChannelRuntimeContext {
+    /// Reloaded config state for *this* runtime's config file.
+    ///
+    /// Was a process-global `HashMap<PathBuf, _>` keyed by config path. Entries
+    /// were inserted and never removed, a gateway and a channel runtime in one
+    /// process shared and clobbered each other's entry, and every test that
+    /// touched it was order-dependent on every other. One context owns one
+    /// state; `None` means nothing has been loaded yet, which is the same
+    /// condition the old "no entry for this path" fallback keyed on.
+    runtime_config: Arc<Mutex<RuntimeConfigSlot>>,
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     provider: Arc<dyn Provider>,
     default_provider: Arc<String>,
@@ -635,6 +700,14 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         autonomy_level: config.autonomy.level,
         autonomy_preset: crate::approval::policy_writer::preset_for_autonomy(&config.autonomy),
         allowlists: Arc::new(channel_allowlists(&config.channels_config)),
+        message_timeout_secs: effective_channel_message_timeout_secs(
+            config.channels_config.message_timeout_secs,
+        ),
+        max_tool_iterations: config.agent.max_tool_iterations,
+        auto_save_memory: config.memory.auto_save,
+        min_relevance_score: config.memory.min_relevance_score,
+        autonomous_tools: config.channels_config.autonomous_tools,
+        mention_only: Arc::new(channel_mention_only(&config.channels_config)),
     }
 }
 
@@ -646,19 +719,30 @@ fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
 }
 
 fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefaults {
-    if let Some(config_path) = runtime_config_path(ctx) {
-        let store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(state) = store.get(&config_path) {
+    {
+        let mut slot = ctx.runtime_config.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = slot.state.as_ref() {
             return state.defaults.clone();
+        }
+        // No state loaded: everything below is synthesised. In production
+        // `start_channels` always seeds this, so reaching here means the runtime
+        // is answering messages against a *guessed* autonomy preset that the
+        // live gate is not enforcing. Say so — but once, since this is consulted
+        // per message.
+        if !slot.fallback_warned {
+            slot.fallback_warned = true;
+            tracing::warn!(
+                "Channel runtime has no loaded config state; falling back to \
+                 boot-time context values and a guessed autonomy preset. The \
+                 enforced policy is whatever SecurityPolicy holds, not this."
+            );
         }
     }
 
-    // Fallback only when the store has no entry for this config path. The store
-    // is seeded at startup in `start_channels`, so in production the snapshot
-    // above is authoritative; this mirrors the startup `ctx` fields for the
-    // ad-hoc/test path.
+    // Fallback only when nothing has been loaded for this runtime. It is seeded
+    // at startup in `start_channels`, so in production the snapshot above is
+    // authoritative; this mirrors the startup `ctx` fields for the ad-hoc/test
+    // path.
     ChannelRuntimeDefaults {
         default_provider: ctx.default_provider.as_str().to_string(),
         model: ctx.model.as_str().to_string(),
@@ -675,6 +759,20 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         // here would let a fallback *widen* a gate, which is the opposite of
         // what a fallback should be able to do.
         allowlists: Arc::new(HashMap::new()),
+        // Behaviour knobs mirror the boot-time `ctx`, which is exactly what this
+        // fallback is for. Unlike the gate-bearing fields above these carry no
+        // authority, so mirroring them cannot widen anything.
+        message_timeout_secs: ctx.message_timeout_secs,
+        max_tool_iterations: ctx.max_tool_iterations,
+        auto_save_memory: ctx.auto_save_memory,
+        min_relevance_score: ctx.min_relevance_score,
+        // The fallback must not be the permissive answer: `false` keeps the gate
+        // armed. A path with no config to read may not decide that tools run
+        // unattended.
+        autonomous_tools: false,
+        // Empty: with no config to compare against, the reload has nothing to
+        // report a divergence from.
+        mention_only: Arc::new(HashMap::new()),
         autonomy_level: ctx.security.effective_autonomy(),
         // Fallback path only (the store has no entry — ad-hoc/tests). The
         // live policy carries the enforced level but not `always_ask`, which
@@ -703,10 +801,21 @@ fn live_approval_owners(ctx: &ChannelRuntimeContext) -> Arc<Vec<String>> {
     runtime_defaults_snapshot(ctx).approval_owners
 }
 
-async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    let modified = metadata.modified().ok()?;
-    Some(ConfigFileStamp {
+/// Stat the config file for change detection.
+///
+/// Returns `Result` rather than `Option` because both failures used to be
+/// swallowed by `.ok()?` and the caller then returned success with nothing
+/// logged — the atomic temp-file-and-rename write this project uses makes a
+/// briefly-absent config a real occurrence, and an operator whose edit never
+/// applied had no way to find out why.
+async fn config_file_stamp(path: &Path) -> Result<ConfigFileStamp> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("Failed to stat {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("No modification time for {}", path.display()))?;
+    Ok(ConfigFileStamp {
         modified,
         len: metadata.len(),
     })
@@ -756,15 +865,35 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         return Ok(());
     };
 
-    let Some(stamp) = config_file_stamp(&config_path).await else {
-        return Ok(());
+    let stamp = match config_file_stamp(&config_path).await {
+        Ok(stamp) => {
+            // Recovered: re-arm the latch so a later outage is reported again.
+            let mut slot = ctx.runtime_config.lock().unwrap_or_else(|e| e.into_inner());
+            slot.stamp_error_warned = false;
+            stamp
+        }
+        Err(err) => {
+            // Cannot tell whether the config changed, so nothing is applied.
+            // This used to return `Ok(())` silently, which is indistinguishable
+            // from "nothing to do" — an operator whose edit never landed saw no
+            // reason at all. The stamp is deliberately NOT advanced, so a later
+            // successful read still applies the edit.
+            let mut slot = ctx.runtime_config.lock().unwrap_or_else(|e| e.into_inner());
+            if !slot.stamp_error_warned {
+                slot.stamp_error_warned = true;
+                tracing::warn!(
+                    path = %config_path.display(),
+                    "Cannot stat the channel config file, so config changes are not being \
+                     applied: {err:#}"
+                );
+            }
+            return Ok(());
+        }
     };
 
     {
-        let store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(state) = store.get(&config_path) {
+        let slot = ctx.runtime_config.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = slot.state.as_ref() {
             if state.last_applied_stamp == Some(stamp) {
                 return Ok(());
             }
@@ -792,6 +921,24 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     // `runtime_allowlist` (`/allow <cmd> --persist`), the rate-limit window and
     // the approval registry are process state and are deliberately untouched.
     ctx.security.apply_config(&next_autonomy);
+
+    // `mention_only` is constructor-injected into the channel objects, so this
+    // reload cannot apply it. Saying nothing would repeat the bug this plan
+    // exists to fix — "Applied updated channel runtime config from disk" while
+    // the edit did nothing — so name the channel and state that a restart is
+    // required. Compared against the previously *applied* snapshot, so the
+    // warning fires once per edit rather than on every reload.
+    for (name, next_value) in next_defaults.mention_only.iter() {
+        let previous = prev_defaults.mention_only.get(name.as_str());
+        if previous.is_some_and(|prev| prev != next_value) {
+            tracing::warn!(
+                channel = %name,
+                mention_only = *next_value,
+                "mention_only changed on disk but cannot be applied to a running \
+                 channel — restart the channel runtime for it to take effect"
+            );
+        }
+    }
 
     // Push per-channel allowlists into the live channel handles, for the same
     // reason the autonomy swap above happens here: an allowlist change is
@@ -826,26 +973,33 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
                 provider = %next_defaults.default_provider,
                 "Config reload kept the previous provider — could not build the new one: {err}"
             );
-            let mut store = runtime_config_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let entry = store
-                .entry(config_path.clone())
-                .or_insert_with(|| RuntimeConfigState {
-                    defaults: prev_defaults.clone(),
-                    last_applied_stamp: None,
-                    last_reload_error: None,
-                });
+            let mut guard = ctx.runtime_config.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = guard.state.get_or_insert_with(|| RuntimeConfigState {
+                defaults: prev_defaults.clone(),
+                last_applied_stamp: None,
+                last_reload_error: None,
+            });
             // Keeping the old provider must not also keep the old *policy*.
-            // `apply_config` already moved the live gate above, so carry the
-            // autonomy-derived defaults forward too — otherwise the prompt
-            // would keep briefing the model on the pre-reload preset while the
-            // gate enforced the new one, which is the divergence this whole
-            // path exists to avoid. Provider/model/credentials stay as they
-            // were, deliberately.
-            entry.defaults.autonomy_preset = next_defaults.autonomy_preset;
-            entry.defaults.autonomy_level = next_defaults.autonomy_level;
-            entry.defaults.allowed_commands = Arc::clone(&next_defaults.allowed_commands);
+            //
+            // This applies the whole reloaded config and then puts back only the
+            // fields that genuinely depend on the provider we failed to build.
+            // The inversion is the point: an include-list freezes every field
+            // added to `ChannelRuntimeDefaults` in future unless someone
+            // remembers to extend it, and forgetting is silent. It had already
+            // happened — `approval_owners`, `guest_gate` and `allowlists` were
+            // dropped here, so removing a compromised owner in the same edit
+            // that left the provider unbuildable persisted the removal to disk
+            // and never applied it, and the stamp advanced so nothing retried.
+            //
+            // With the exclusion list, a new field applies by default and
+            // freezing one is a deliberate act that has to be written down here.
+            let mut applied = next_defaults.clone();
+            applied.default_provider = entry.defaults.default_provider.clone();
+            applied.model = entry.defaults.model.clone();
+            applied.api_key = entry.defaults.api_key.clone();
+            applied.api_url = entry.defaults.api_url.clone();
+            applied.reliability = entry.defaults.reliability.clone();
+            entry.defaults = applied;
             entry.last_applied_stamp = Some(stamp);
             entry.last_reload_error = Some(reason);
             return Ok(());
@@ -872,17 +1026,12 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     // (autonomy level + allowed_commands were already applied above, before the
     // provider build, so they take effect even on the keep-old-provider branch.)
     {
-        let mut store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        store.insert(
-            config_path.clone(),
-            RuntimeConfigState {
-                defaults: next_defaults.clone(),
-                last_applied_stamp: Some(stamp),
-                last_reload_error: None,
-            },
-        );
+        let mut guard = ctx.runtime_config.lock().unwrap_or_else(|e| e.into_inner());
+        guard.state = Some(RuntimeConfigState {
+            defaults: next_defaults.clone(),
+            last_applied_stamp: Some(stamp),
+            last_reload_error: None,
+        });
     }
 
     // If the operator changed the provider or default model (Web-UI switch or a
@@ -1864,7 +2013,9 @@ async fn process_channel_message(
         .in_thread(msg.thread_ts.as_deref())
         .resolve();
 
-    if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+    if runtime_defaults.auto_save_memory
+        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+    {
         let autosave_key = conversation_memory_key(&msg);
         // Raw inbound text, stored unread and re-injected into later prompts as
         // established context. Screen it the same way an agent-initiated write
@@ -1923,7 +2074,7 @@ async fn process_channel_message(
         let memory_context = build_memory_context(
             ctx.memory.as_ref(),
             &msg.content,
-            ctx.min_relevance_score,
+            runtime_defaults.min_relevance_score,
             Some(conversation_scope.as_str()),
         )
         .await;
@@ -2047,20 +2198,27 @@ async fn process_channel_message(
     // In-chat owner approval (Layer A): only when tool-gating is active AND an
     // owner is configured AND we can post back to the chat. Otherwise the loop
     // keeps the auto-deny default — channels never gain approval power silently.
-    let chat_relay_backend =
-        if ctx.channel_approval.is_some() && !runtime_defaults.approval_owners.is_empty() {
-            target_channel.as_ref().map(|chan| {
-                approval_relay::ChatRelayApprovalBackend::new(
-                    Arc::clone(&ctx.tool_approvals),
-                    Arc::clone(chan),
-                    msg.reply_target.clone(),
-                    msg.thread_ts.clone(),
-                    msg.channel.clone(),
-                )
-            })
-        } else {
-            None
-        };
+    // `autonomous_tools = true` opts out of gating; anything else keeps it armed.
+    // Read from the reloaded defaults, not from boot, so re-arming applies live.
+    let tool_gate = if runtime_defaults.autonomous_tools {
+        None
+    } else {
+        ctx.channel_approval.as_deref()
+    };
+    let chat_relay_backend = if tool_gate.is_some() && !runtime_defaults.approval_owners.is_empty()
+    {
+        target_channel.as_ref().map(|chan| {
+            approval_relay::ChatRelayApprovalBackend::new(
+                Arc::clone(&ctx.tool_approvals),
+                Arc::clone(chan),
+                msg.reply_target.clone(),
+                msg.thread_ts.clone(),
+                msg.channel.clone(),
+            )
+        })
+    } else {
+        None
+    };
     let chat_relay_backend_ref = chat_relay_backend
         .as_ref()
         .map(|b| b as &dyn crate::approval::ApprovalBackend);
@@ -2074,8 +2232,10 @@ async fn process_channel_message(
         Some(runtime_defaults.guest_gate.as_ref())
     };
 
-    let timeout_budget_secs =
-        channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let timeout_budget_secs = channel_message_timeout_budget_secs(
+        runtime_defaults.message_timeout_secs,
+        runtime_defaults.max_tool_iterations,
+    );
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -2089,14 +2249,14 @@ async fn process_channel_message(
                 route.model.as_str(),
                 runtime_defaults.temperature,
                 true,
-                ctx.channel_approval.as_deref(),
+                tool_gate,
                 msg.channel.as_str(),
                 // Origin chat → `cron_add` delivery safety net (announce channels).
                 Some(msg.reply_target.as_str()),
                 chat_relay_backend_ref,
                 guest_gate_ref,
                 &ctx.multimodal,
-                ctx.max_tool_iterations,
+                runtime_defaults.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
                 None,
@@ -2309,7 +2469,9 @@ async fn process_channel_message(
         LlmExecutionResult::Completed(Err(_)) => {
             let timeout_msg = format!(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
-                timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
+                timeout_budget_secs,
+                runtime_defaults.message_timeout_secs,
+                runtime_defaults.max_tool_iterations
             );
             tracing::error!(
                 target: "channels",
@@ -3464,20 +3626,19 @@ pub async fn start_channels_with_cancellation(
         tracing::warn!("Provider warmup failed (non-fatal): {e}");
     }
 
-    let initial_stamp = config_file_stamp(&config.config_path).await;
-    {
-        let mut store = runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        store.insert(
-            config.config_path.clone(),
-            RuntimeConfigState {
-                defaults: runtime_defaults_from_config(&config),
-                last_applied_stamp: initial_stamp,
-                last_reload_error: None,
-            },
-        );
-    }
+    // Seed the state this runtime owns. It used to go into a process-global map
+    // keyed by config path, which the reload then looked up under a *separately
+    // derived* key; the two derivations agreeing was an invariant nothing
+    // checked. Owning one state removes the key, and with it that whole class.
+    let initial_stamp = config_file_stamp(&config.config_path).await.ok();
+    let runtime_config = Arc::new(Mutex::new(RuntimeConfigSlot {
+        state: Some(RuntimeConfigState {
+            defaults: runtime_defaults_from_config(&config),
+            last_applied_stamp: initial_stamp,
+            last_reload_error: None,
+        }),
+        ..RuntimeConfigSlot::default()
+    }));
 
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -3925,6 +4086,7 @@ pub async fn start_channels_with_cancellation(
     }
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        runtime_config,
         channels_by_name,
         provider: Arc::clone(&provider),
         default_provider: Arc::new(provider_name),
@@ -3957,18 +4119,16 @@ pub async fn start_channels_with_cancellation(
         // unattended execution. Default (off) → deny tools that need
         // approval; the bot answers from context/RAG but won't run tools
         // for an arbitrary chat sender. Matches the gateway default.
-        channel_approval: if config.channels_config.autonomous_tools {
-            None
-        } else {
-            // Attach the same policy the tools hold, so a config reload that
-            // changes autonomy also moves the approval gate. Built once at
-            // startup, this manager would otherwise stay pinned to the level
-            // that was on disk at boot.
-            Some(Arc::new(
-                crate::approval::ApprovalManager::from_config(&config.autonomy)
-                    .with_policy(Arc::clone(&security)),
-            ))
-        },
+        // Always built, never conditional on `autonomous_tools`. Whether the
+        // gate is *active* is decided per message from the reloaded
+        // `autonomous_tools` flag; constructing the manager here means an
+        // operator can re-arm the gate live instead of needing a restart. It
+        // holds the same `Arc<SecurityPolicy>` the tools hold, so a reload that
+        // changes autonomy moves the gate with it.
+        channel_approval: Some(Arc::new(
+            crate::approval::ApprovalManager::from_config(&config.autonomy)
+                .with_policy(Arc::clone(&security)),
+        )),
         approval_owners: Arc::clone(&approval_owners),
         // 5-minute deadline: an unanswered in-chat approval auto-denies so a
         // forgotten prompt never leaves a tool call hanging (secure default).
@@ -4260,6 +4420,7 @@ mod tests {
         );
 
         let ctx = ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(HashMap::new()),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -4764,6 +4925,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -4832,6 +4994,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(RawToolArtifactProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -4900,6 +5063,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingAliasProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -4977,6 +5141,7 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("openrouter".to_string(), fallback_provider);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -5075,6 +5240,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -5155,6 +5321,7 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), reloaded_provider);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&startup_provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -5224,40 +5391,43 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
 
         let temp = tempfile::TempDir::new().expect("temp dir");
-        let config_path = temp.path().join("config.toml");
 
-        {
-            let mut store = runtime_config_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            store.insert(
-                config_path.clone(),
-                RuntimeConfigState {
-                    defaults: ChannelRuntimeDefaults {
-                        default_provider: "test-provider".to_string(),
-                        model: "hot-reloaded-model".to_string(),
-                        temperature: 0.5,
-                        api_key: None,
-                        api_url: None,
-                        reliability: crate::config::ReliabilityConfig::default(),
-                        approval_owners: Arc::new(Vec::new()),
-                        guest_gate: Arc::new(crate::approval::GuestGate::new(
-                            Vec::<String>::new(),
-                            &[],
-                            &[],
-                        )),
-                        allowed_commands: Arc::new(Vec::new()),
-                        autonomy_level: crate::security::AutonomyLevel::Supervised,
-                        autonomy_preset: crate::approval::policy_writer::PolicyPreset::Manual,
-                        allowlists: Arc::new(HashMap::new()),
-                    },
-                    last_applied_stamp: None,
-                    last_reload_error: None,
+        // Owned by the context under test, not a process global — no teardown,
+        // and no ordering coupling with any other test.
+        let seeded_runtime_config = Arc::new(Mutex::new(RuntimeConfigSlot {
+            state: Some(RuntimeConfigState {
+                defaults: ChannelRuntimeDefaults {
+                    default_provider: "test-provider".to_string(),
+                    model: "hot-reloaded-model".to_string(),
+                    temperature: 0.5,
+                    api_key: None,
+                    api_url: None,
+                    reliability: crate::config::ReliabilityConfig::default(),
+                    approval_owners: Arc::new(Vec::new()),
+                    guest_gate: Arc::new(crate::approval::GuestGate::new(
+                        Vec::<String>::new(),
+                        &[],
+                        &[],
+                    )),
+                    allowed_commands: Arc::new(Vec::new()),
+                    autonomy_level: crate::security::AutonomyLevel::Supervised,
+                    autonomy_preset: crate::approval::policy_writer::PolicyPreset::Manual,
+                    allowlists: Arc::new(HashMap::new()),
+                    message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+                    max_tool_iterations: 5,
+                    auto_save_memory: false,
+                    min_relevance_score: 0.0,
+                    autonomous_tools: false,
+                    mention_only: Arc::new(HashMap::new()),
                 },
-            );
-        }
+                last_applied_stamp: None,
+                last_reload_error: None,
+            }),
+            ..RuntimeConfigSlot::default()
+        }));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::clone(&seeded_runtime_config),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -5312,13 +5482,6 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        {
-            let mut store = runtime_config_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            store.remove(&config_path);
-        }
-
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 1);
         assert_eq!(
             provider_impl
@@ -5361,6 +5524,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let ctx = ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("openrouter".to_string()),
@@ -5447,13 +5611,6 @@ BTC is currently around $65,000 based on latest tool output."#
             live_approval_owners(&ctx).as_slice(),
             &["rantaiclaw_user".to_string()]
         );
-
-        {
-            let mut store = runtime_config_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            store.remove(&config_path);
-        }
     }
 
     /// Build a `ChannelRuntimeContext` around one recording Telegram channel,
@@ -5465,6 +5622,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name: HashMap<String, Arc<dyn Channel>> = HashMap::new();
         channels_by_name.insert("telegram".to_string(), channel);
         ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("openrouter".to_string()),
@@ -5559,13 +5717,6 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(["user_a".to_string(), "user_b".to_string()].as_slice()),
             "the edited allowlist reached the live channel handle"
         );
-
-        {
-            let mut store = runtime_config_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            store.remove(&config_path);
-        }
     }
 
     /// An allowlist change is safety-relevant, so it must apply even when the
@@ -5625,13 +5776,298 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(["user_a".to_string()].as_slice()),
             "tightened allowlist applied even though the provider could not be built"
         );
+    }
 
+    /// Write a config whose provider cannot be built (no key for a provider that
+    /// requires one), carrying the owner list, guest allowances, temperature and
+    /// `autonomous_tools` under test. Everything here is on the *security* half
+    /// of the config, which the failure branch used to drop.
+    fn write_broken_provider_config(
+        config_path: &std::path::Path,
+        owners: Vec<String>,
+        guest_tools: Vec<String>,
+        temperature: f64,
+        autonomous_tools: bool,
+    ) {
+        let mut config = crate::config::Config::default();
+        config.default_provider = Some("openai".to_string());
+        config.api_key = None;
+        config.default_temperature = temperature;
+        config.channels_config.approval_owners = owners;
+        config.channels_config.guest_allowed_tools = guest_tools;
+        config.channels_config.autonomous_tools = autonomous_tools;
+        let toml = toml::to_string(&config).expect("serialize config");
+        std::fs::write(config_path, toml).expect("write config");
+    }
+
+    /// The failure branch used to carry forward exactly three fields, so an
+    /// operator removing a compromised owner in the same edit that left the
+    /// provider unbuildable got the removal persisted to disk and never applied
+    /// — and the stamp advanced, so nothing retried it.
+    #[tokio::test]
+    async fn owner_removal_applies_even_when_the_provider_fails_to_build() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let channel = Arc::new(TelegramRecordingChannel::default());
+        let ctx = allowlist_test_ctx(temp.path(), Arc::clone(&channel));
+
+        write_broken_provider_config(
+            &config_path,
+            vec![
+                "rantaiclaw_operator".to_string(),
+                "revoked_user".to_string(),
+            ],
+            Vec::new(),
+            0.0,
+            false,
+        );
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("apply despite provider build failure");
+        assert_eq!(live_approval_owners(&ctx).len(), 2, "both owners applied");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_broken_provider_config(
+            &config_path,
+            vec!["rantaiclaw_operator".to_string()],
+            Vec::new(),
+            0.0,
+            false,
+        );
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload despite provider build failure");
+
+        assert_eq!(
+            live_approval_owners(&ctx).as_slice(),
+            &["rantaiclaw_operator".to_string()],
+            "revoking an owner must apply even when the provider cannot be built"
+        );
+    }
+
+    /// Same shape for the guest ceiling: it decides what a non-owner may run, so
+    /// a tightened guest list stalling behind a broken API key is a live gate
+    /// staying wider than the operator asked for.
+    #[tokio::test]
+    async fn guest_gate_applies_when_the_provider_fails_to_build() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let channel = Arc::new(TelegramRecordingChannel::default());
+        let ctx = allowlist_test_ctx(temp.path(), Arc::clone(&channel));
+
+        write_broken_provider_config(
+            &config_path,
+            Vec::new(),
+            vec!["web_search".to_string(), "shell".to_string()],
+            0.0,
+            false,
+        );
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("apply despite provider build failure");
+        let wide = runtime_defaults_snapshot(&ctx).guest_gate;
+        assert!(
+            wide.tool_permitted("shell"),
+            "seeded with the wider ceiling"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_broken_provider_config(
+            &config_path,
+            Vec::new(),
+            vec!["web_search".to_string()],
+            0.0,
+            false,
+        );
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload despite provider build failure");
+
+        let tightened = runtime_defaults_snapshot(&ctx).guest_gate;
+        assert!(
+            !tightened.tool_permitted("shell"),
+            "tightening the guest ceiling must apply even when the provider cannot be built"
+        );
+    }
+
+    /// Regression guard for the inversion itself. `temperature` is not on the
+    /// exclusion list, so it must survive a provider-build failure. Under the old
+    /// include-list shape it did not — and neither would any field added later.
+    #[tokio::test]
+    async fn a_non_excluded_defaults_field_is_applied_when_the_provider_fails() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let channel = Arc::new(TelegramRecordingChannel::default());
+        let ctx = allowlist_test_ctx(temp.path(), Arc::clone(&channel));
+
+        write_broken_provider_config(&config_path, Vec::new(), Vec::new(), 0.25, false);
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("apply despite provider build failure");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_broken_provider_config(&config_path, Vec::new(), Vec::new(), 0.75, false);
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload despite provider build failure");
+
+        let applied = runtime_defaults_snapshot(&ctx);
+        assert!(
+            (applied.temperature - 0.75).abs() < f64::EPSILON,
+            "a field absent from the exclusion list must apply, got {}",
+            applied.temperature
+        );
+        assert_eq!(
+            applied.default_provider, "openrouter",
+            "the excluded provider field must still be held back"
+        );
+    }
+
+    /// `autonomous_tools = false` re-arms the in-chat approval gate. It was read
+    /// once at startup, so an operator turning the gate back **on** was told
+    /// "Applied updated channel runtime config from disk" and got nothing.
+    #[tokio::test]
+    async fn autonomous_tools_change_is_applied_on_reload() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let channel = Arc::new(TelegramRecordingChannel::default());
+        let ctx = allowlist_test_ctx(temp.path(), Arc::clone(&channel));
+
+        write_broken_provider_config(&config_path, Vec::new(), Vec::new(), 0.0, true);
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("apply despite provider build failure");
+        assert!(
+            runtime_defaults_snapshot(&ctx).autonomous_tools,
+            "opted out of gating"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_broken_provider_config(&config_path, Vec::new(), Vec::new(), 0.0, false);
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("reload despite provider build failure");
+
+        assert!(
+            !runtime_defaults_snapshot(&ctx).autonomous_tools,
+            "re-arming the approval gate must not need a restart"
+        );
+    }
+
+    /// An unstattable config used to return `Ok(())` with nothing logged, which
+    /// is indistinguishable from "nothing to do". The stamp must NOT advance, so
+    /// the edit still applies once the file is readable again — the atomic
+    /// temp-file-and-rename write makes a briefly-absent config real.
+    #[tokio::test]
+    async fn unreadable_config_warns_once_and_does_not_advance_the_stamp() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        let channel = Arc::new(TelegramRecordingChannel::default());
+        let ctx = allowlist_test_ctx(temp.path(), Arc::clone(&channel));
+
+        // No config file on disk yet.
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("an unreadable config is not an error for the caller");
         {
-            let mut store = runtime_config_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            store.remove(&config_path);
+            let slot = ctx.runtime_config.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(slot.stamp_error_warned, "the failure was reported");
+            assert!(
+                slot.state.is_none(),
+                "nothing was applied and no stamp was recorded"
+            );
         }
+
+        // The file appears: the edit must still land.
+        write_broken_provider_config(
+            &config_path,
+            vec!["rantaiclaw_operator".to_string()],
+            Vec::new(),
+            0.0,
+            false,
+        );
+        maybe_apply_runtime_config_update(&ctx)
+            .await
+            .expect("apply once the config is readable");
+
+        assert_eq!(
+            live_approval_owners(&ctx).as_slice(),
+            &["rantaiclaw_operator".to_string()],
+            "the stamp must not have been advanced past an unread config"
+        );
+        let slot = ctx.runtime_config.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !slot.stamp_error_warned,
+            "the latch re-arms so a later outage is reported again"
+        );
+    }
+
+    /// The synthesised fallback hands the model a *guessed* autonomy preset that
+    /// the live gate is not enforcing. It must not be silent.
+    #[tokio::test]
+    async fn snapshot_fallback_warns_once() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let channel = Arc::new(TelegramRecordingChannel::default());
+        let ctx = allowlist_test_ctx(temp.path(), Arc::clone(&channel));
+
+        assert!(
+            !ctx.runtime_config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .fallback_warned,
+            "nothing consulted the snapshot yet"
+        );
+
+        let _ = runtime_defaults_snapshot(&ctx);
+        assert!(
+            ctx.runtime_config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .fallback_warned,
+            "taking the synthesised fallback must be reported"
+        );
+
+        // Still exactly one report after repeated per-message consultation.
+        let _ = runtime_defaults_snapshot(&ctx);
+        assert!(
+            ctx.runtime_config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .fallback_warned
+        );
+    }
+
+    /// Two runtimes in one process used to share a global map keyed by config
+    /// path, so they clobbered each other's applied state. Each context now owns
+    /// its own.
+    #[tokio::test]
+    async fn two_runtimes_do_not_share_applied_config_state() {
+        let temp_a = tempfile::TempDir::new().expect("temp dir");
+        let temp_b = tempfile::TempDir::new().expect("temp dir");
+        let ctx_a =
+            allowlist_test_ctx(temp_a.path(), Arc::new(TelegramRecordingChannel::default()));
+        let ctx_b =
+            allowlist_test_ctx(temp_b.path(), Arc::new(TelegramRecordingChannel::default()));
+
+        write_broken_provider_config(
+            &temp_a.path().join("config.toml"),
+            vec!["owner_a".to_string()],
+            Vec::new(),
+            0.0,
+            false,
+        );
+        maybe_apply_runtime_config_update(&ctx_a)
+            .await
+            .expect("apply for runtime A");
+
+        assert_eq!(
+            live_approval_owners(&ctx_a).as_slice(),
+            &["owner_a".to_string()]
+        );
+        assert!(
+            live_approval_owners(&ctx_b).is_empty(),
+            "runtime B must not see runtime A's applied state"
+        );
     }
 
     /// A config reload whose NEW provider can't be built must still apply the
@@ -5664,6 +6100,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let ctx = ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("openrouter".to_string()),
@@ -5724,7 +6161,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         // We took the keep-old-provider branch (the failure is recorded)...
         assert!(
-            last_reload_error(&config_path).is_some(),
+            last_reload_error(&ctx).is_some(),
             "a failed provider build should be recorded"
         );
         // ...yet the safety autonomy downgrade STILL took effect.
@@ -5766,13 +6203,6 @@ BTC is currently around $65,000 based on latest tool output."#
             !ctx.security.is_path_allowed("/newly-forbidden/secret.txt"),
             "a forbidden path added by a reload must be enforced without a restart"
         );
-
-        {
-            let mut store = runtime_config_store()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            store.remove(&config_path);
-        }
     }
 
     #[tokio::test]
@@ -5799,6 +6229,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let ctx = ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("openrouter".to_string()),
@@ -5875,11 +6306,6 @@ BTC is currently around $65,000 based on latest tool output."#
             route.model, "model-c",
             "pinned sender re-based to the new model"
         );
-
-        runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&config_path);
     }
 
     #[tokio::test]
@@ -5906,6 +6332,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let ctx = ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("openrouter".to_string()),
@@ -5966,14 +6393,9 @@ BTC is currently around $65,000 based on latest tool output."#
             "kept the working provider instead of swapping to a broken one"
         );
         assert!(
-            last_reload_error(&config_path).is_some(),
+            last_reload_error(&ctx).is_some(),
             "recorded the reload failure reason for surfacing"
         );
-
-        runtime_config_store()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&config_path);
     }
 
     // When a provider+tool return the *same* call and result on every
@@ -5991,6 +6413,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(IterativeToolProvider {
                 required_tool_iterations: 11,
@@ -6069,6 +6492,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(IterativeToolProvider {
                 required_tool_iterations: 20,
@@ -6331,6 +6755,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(FailingProvider {
                 error: format!("upstream rejected credential {secret}"),
@@ -6408,6 +6833,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(SlowProvider {
                 delay: Duration::from_millis(250),
@@ -6500,6 +6926,7 @@ BTC is currently around $65,000 based on latest tool output."#
         });
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
@@ -6600,6 +7027,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(SlowProvider {
                 delay: Duration::from_millis(180),
@@ -6684,6 +7112,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(SlowProvider {
                 delay: Duration::from_millis(20),
@@ -7235,6 +7664,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
@@ -7330,6 +7760,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
@@ -7424,6 +7855,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
@@ -7530,6 +7962,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
