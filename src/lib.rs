@@ -138,8 +138,6 @@ dingtalk, qq.")]
         /// matrix, signal, whatsapp, linq, nextcloud_talk, email, irc, lark,
         /// dingtalk, qq)
         channel_type: String,
-        /// Optional configuration as JSON
-        config: String,
     },
     /// Remove a channel (currently redirects to config edit — see long help)
     #[command(long_about = "\
