@@ -112,6 +112,28 @@ const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
+
+/// Recorded in place of an assistant turn when a reply could not be delivered,
+/// or when the turn ended in a timeout, an error, or a cancellation.
+///
+/// Without it the user turn appended at the start of the turn stays unpaired,
+/// and `normalize_cached_channel_turns` merges consecutive user turns into one
+/// blob — so the model sees the retried question concatenated onto the failed
+/// one with no marker that the first attempt died.
+const UNDELIVERED_TURN_MARKER: &str = "(the previous reply was not delivered)";
+const TIMED_OUT_TURN_MARKER: &str = "(the previous attempt timed out)";
+const FAILED_TURN_MARKER: &str = "(the previous attempt failed)";
+
+/// Backstop for waiting on a previous in-flight turn to signal completion.
+///
+/// `CompletionGuard` releases the signal even on a panic, so this should never
+/// fire. It exists because the wait sits on the path that drains the shared
+/// message bus for **all** channels: if it ever hangs, every platform goes quiet
+/// with nothing logged. Generous enough not to cut a legitimately slow turn
+/// short — the turn budget bounds that separately.
+const IN_FLIGHT_COMPLETION_WAIT_TIMEOUT_SECS: u64 = 120;
+const IN_FLIGHT_COMPLETION_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(IN_FLIGHT_COMPLETION_WAIT_TIMEOUT_SECS);
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
@@ -354,10 +376,37 @@ impl InFlightTaskCompletion {
     }
 
     async fn wait(&self) {
+        // Register the waiter BEFORE re-checking `done`.
+        //
+        // `notify_waiters()` stores no permit — it only wakes waiters that are
+        // already registered — and `notified()` does not register until first
+        // polled. Checking `done` and then awaiting left a window where a
+        // `mark_done()` on another worker landed between the two and was lost,
+        // parking this sender's next message forever.
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if self.done.load(Ordering::Acquire) {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
+    }
+}
+
+/// Marks an [`InFlightTaskCompletion`] done on drop, including on unwind.
+///
+/// `mark_done()` used to be the last statement of the worker closure, so a panic
+/// anywhere in the message path — provider, tool loop, renderer, a channel's
+/// `send` — skipped it. The next message from that sender then waited on a
+/// signal that would never come, and the worker's semaphore permit was never
+/// released. After enough of those the dispatch loop stops draining its queue
+/// and **every** channel goes quiet, with nothing logging a deadlock because the
+/// task never finishes.
+struct CompletionGuard(Arc<InFlightTaskCompletion>);
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        self.0.mark_done();
     }
 }
 
@@ -877,13 +926,27 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
     }
 }
 
+/// Look up a sender's pinned route, falling back to the current defaults.
+///
+/// **Lock-order invariant: the runtime-config store is acquired BEFORE
+/// `route_overrides`, never while holding it.**
+///
+/// `default_route_selection` reaches the global config store via
+/// `runtime_defaults_snapshot`. Written as one expression, the `route_overrides`
+/// guard is a temporary that lives to the end of the statement — so the fallback
+/// ran while still holding it, taking the two locks in the opposite order from
+/// `set_route_selection` directly below. Both are `std::sync::Mutex` held inside
+/// async tasks, so a cycle would wedge the entire dispatch loop with no error
+/// and no recovery short of a restart. Binding the lookup drops the guard first.
 fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> ChannelRouteSelection {
-    ctx.route_overrides
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(sender_key)
-        .cloned()
-        .unwrap_or_else(|| default_route_selection(ctx))
+    let existing = {
+        ctx.route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(sender_key)
+            .cloned()
+    };
+    existing.unwrap_or_else(|| default_route_selection(ctx))
 }
 
 fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
@@ -1458,13 +1521,25 @@ fn sanitize_tool_json_value(
     None
 }
 
-fn is_line_isolated_json_segment(message: &str, start: usize, end: usize) -> bool {
+/// Whether anything but whitespace precedes `start` on its line.
+///
+/// The cheap half of [`is_line_isolated_json_segment`], split out because it
+/// needs only `start` — so it can reject a candidate *before* paying for a
+/// parse. A `{` in the middle of prose is the common case, and the loop used to
+/// parse the entire remaining message for each one, then advance a single char
+/// and do it again: O(braces x bytes) on every delivered reply, for a purely
+/// cosmetic strip.
+fn json_candidate_starts_its_line(message: &str, start: usize) -> bool {
     let line_start = message[..start].rfind('\n').map_or(0, |idx| idx + 1);
+    message[line_start..start].trim().is_empty()
+}
+
+fn is_line_isolated_json_segment(message: &str, start: usize, end: usize) -> bool {
     let line_end = message[end..]
         .find('\n')
         .map_or(message.len(), |idx| end + idx);
 
-    message[line_start..start].trim().is_empty() && message[end..line_end].trim().is_empty()
+    json_candidate_starts_its_line(message, start) && message[end..line_end].trim().is_empty()
 }
 
 fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<String>) -> String {
@@ -1481,11 +1556,21 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
         let start = cursor + rel_start;
         cleaned.push_str(&message[cursor..start]);
 
-        let candidate = &message[start..];
-        let mut stream =
-            serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+        // Reject before parsing when the candidate cannot be line-isolated
+        // anyway. This is the whole performance fix: the parse below reads the
+        // entire remaining message, and without this guard every `{` in prose
+        // paid for one.
+        let mut stream = if json_candidate_starts_its_line(message, start) {
+            Some(
+                serde_json::Deserializer::from_str(&message[start..])
+                    .into_iter::<serde_json::Value>(),
+            )
+        } else {
+            None
+        };
 
-        if let Some(Ok(value)) = stream.next() {
+        if let Some(Ok(value)) = stream.as_mut().and_then(|s| s.next()) {
+            let stream = stream.as_ref().expect("checked above");
             let consumed = stream.byte_offset();
             if consumed > 0 {
                 let end = start + consumed;
@@ -2065,11 +2150,6 @@ async fn process_channel_message(
                 format!("{tool_summary}\n{delivered_response}")
             };
 
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
-            );
             // Deliver the model's answer only: history keeps the tool summary,
             // but the user must never receive a bare `[Used tools: …]` line or an
             // empty bubble (e.g. when the model ends a turn after tool calls
@@ -2080,30 +2160,61 @@ async fn process_channel_message(
                 "channel reply: {}",
                 truncate_with_ellipsis(&delivered_response, 80)
             );
-            if let Some(channel) = target_channel.as_ref() {
+
+            // Deliver FIRST, record after. The append used to run before the
+            // send, so a failed delivery left the model believing it had
+            // answered — on the next turn it would reference a reply the user
+            // never received.
+            let delivered = if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
-                    if let Err(e) = channel
+                    match channel
                         .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
                     {
-                        tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!("Failed to finalize draft: {e}; sending as new message");
+                            channel
+                                .send(
+                                    &SendMessage::new(&delivered_response, &msg.reply_target)
+                                        .in_thread(msg.thread_ts.clone()),
+                                )
+                                .await
+                                .is_ok()
+                        }
                     }
-                } else if let Err(e) = channel
-                    .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await
-                {
-                    tracing::error!(channel = %channel.name(), "failed to reply: {e}");
+                } else {
+                    match channel
+                        .send(
+                            &SendMessage::new(&delivered_response, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::error!(channel = %channel.name(), "failed to reply: {e}");
+                            false
+                        }
+                    }
                 }
-            }
+            } else {
+                // No channel in the runtime map. Nothing was delivered, but that
+                // is a routing problem with its own finding; preserve the
+                // existing recording behaviour rather than changing an unrelated
+                // path from inside this fix.
+                true
+            };
+
+            append_sender_turn(
+                ctx.as_ref(),
+                &history_key,
+                if delivered {
+                    ChatMessage::assistant(&history_response)
+                } else {
+                    ChatMessage::assistant(UNDELIVERED_TURN_MARKER)
+                },
+            );
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
             if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
@@ -2130,10 +2241,13 @@ async fn process_channel_message(
                 } else {
                     "⚠️ Context window exceeded for this conversation. Please resend your last message."
                 };
-                eprintln!(
-                    "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
-                    started_at.elapsed().as_millis(),
-                    compacted
+                tracing::warn!(
+                    target: "channels",
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    compacted,
+                    "context window exceeded"
                 );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
@@ -2152,19 +2266,40 @@ async fn process_channel_message(
                 return;
             }
 
-            eprintln!(
-                "  ❌ LLM error after {}ms: {e}",
-                started_at.elapsed().as_millis()
+            tracing::error!(
+                target: "channels",
+                channel = %msg.channel,
+                sender = %msg.sender,
+                elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "LLM error: {e:#}"
             );
+            // Sanitize before it reaches a chat. Not every error on this arm
+            // comes from the provider (tool execution, filesystem, transport),
+            // so the raw chain can carry local absolute paths, internal URLs and
+            // response fragments — delivered verbatim to an arbitrary sender,
+            // including a guest, and unbounded in length. The sibling failure
+            // path already does this; this one did not.
+            //
+            // The unredacted error stays in the `tracing` record above, where
+            // the operator can still see it.
+            // Pair the user turn appended at the start of this turn, so the
+            // next question is not merged onto the failed one.
+            append_sender_turn(
+                ctx.as_ref(),
+                &history_key,
+                ChatMessage::assistant(FAILED_TURN_MARKER),
+            );
+            let safe_err = providers::sanitize_api_error(&format!("{e:#}"));
+            let reply = format!("⚠️ Error: {safe_err}");
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                        .finalize_draft(&msg.reply_target, draft_id, &reply)
                         .await;
                 } else {
                     let _ = channel
                         .send(
-                            &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                            &SendMessage::new(reply, &msg.reply_target)
                                 .in_thread(msg.thread_ts.clone()),
                         )
                         .await;
@@ -2176,10 +2311,17 @@ async fn process_channel_message(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
                 timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
             );
-            eprintln!(
-                "  ❌ {} (elapsed: {}ms)",
-                timeout_msg,
-                started_at.elapsed().as_millis()
+            tracing::error!(
+                target: "channels",
+                channel = %msg.channel,
+                sender = %msg.sender,
+                elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "{timeout_msg}"
+            );
+            append_sender_turn(
+                ctx.as_ref(),
+                &history_key,
+                ChatMessage::assistant(TIMED_OUT_TURN_MARKER),
             );
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
@@ -2284,6 +2426,10 @@ async fn run_message_dispatch_loop(
             let completion = Arc::new(InFlightTaskCompletion::new());
             let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
+            // Releases waiters on EVERY exit path, including a panic. Held for
+            // the rest of the closure; see `CompletionGuard`.
+            let _completion_guard = CompletionGuard(Arc::clone(&completion));
+
             if interrupt_enabled {
                 let previous = {
                     let mut active = in_flight.lock().await;
@@ -2304,7 +2450,25 @@ async fn run_message_dispatch_loop(
                         "Interrupting previous in-flight request for sender"
                     );
                     previous.cancellation.cancel();
-                    previous.completion.wait().await;
+                    // Bounded: the guard above makes a lost signal far less
+                    // likely, but this wait is on the path that stops the whole
+                    // dispatch loop draining, so it must not be able to hang.
+                    // Two overlapping turns for one sender is strictly better
+                    // than a channel that never answers again.
+                    if tokio::time::timeout(
+                        IN_FLIGHT_COMPLETION_WAIT_TIMEOUT,
+                        previous.completion.wait(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            channel = %msg.channel,
+                            sender = %msg.sender,
+                            timeout_secs = IN_FLIGHT_COMPLETION_WAIT_TIMEOUT.as_secs(),
+                            "previous in-flight request did not signal completion; proceeding anyway"
+                        );
+                    }
                 }
             }
 
@@ -2319,8 +2483,6 @@ async fn run_message_dispatch_loop(
                     active.remove(&sender_scope_key);
                 }
             }
-
-            completion.mark_done();
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -4270,6 +4432,25 @@ mod tests {
         }
     }
 
+    /// Fails every turn with an error carrying a secret-shaped token, so a test
+    /// can assert what actually reaches the chat on the LLM-error arm.
+    struct FailingProvider {
+        error: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FailingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!("{}", self.error))
+        }
+    }
+
     struct ToolCallingProvider;
 
     fn tool_call_payload() -> String {
@@ -6060,6 +6241,162 @@ BTC is currently around $65,000 based on latest tool output."#
         async fn health_check(&self) -> bool {
             true
         }
+    }
+
+    #[tokio::test]
+    async fn completion_guard_releases_waiters_on_panic() {
+        // The bug: `mark_done()` was the last statement of the worker closure,
+        // so a panic anywhere in the message path skipped it. The next message
+        // from that sender then waited on a signal that would never come, and
+        // after enough of those the dispatch loop stopped draining for EVERY
+        // channel with nothing logging a deadlock.
+        let completion = Arc::new(InFlightTaskCompletion::new());
+
+        let guarded = Arc::clone(&completion);
+        let handle = tokio::spawn(async move {
+            let _guard = CompletionGuard(Arc::clone(&guarded));
+            panic!("worker panicked mid-turn");
+        });
+        assert!(handle.await.is_err(), "the worker task must have panicked");
+
+        // Bounded: a regression here hangs rather than fails, and a hanging test
+        // in CI is worse than the bug.
+        tokio::time::timeout(std::time::Duration::from_secs(5), completion.wait())
+            .await
+            .expect("waiters must be released even when the worker panics");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completion_wait_survives_a_concurrent_mark_done() {
+        // `notify_waiters()` stores no permit and `notified()` does not register
+        // until first polled, so checking `done` and *then* awaiting left a
+        // window where a concurrent `mark_done()` was lost.
+        //
+        // NOTE: this is a stress test, not a proof. The window is two adjacent
+        // statements, so it does not reproduce deterministically; it is here to
+        // catch a regression under load. The fix itself rests on Tokio's
+        // documented `Notified::enable()` semantics.
+        for _ in 0..500 {
+            let completion = Arc::new(InFlightTaskCompletion::new());
+            let marker = Arc::clone(&completion);
+            let waiter = Arc::clone(&completion);
+
+            let m = tokio::spawn(async move { marker.mark_done() });
+            let w = tokio::spawn(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(5), waiter.wait()).await
+            });
+
+            m.await.expect("marker task");
+            w.await
+                .expect("waiter task")
+                .expect("wait must not hang when mark_done races it");
+        }
+    }
+
+    #[test]
+    fn json_candidate_mid_line_is_rejected_before_parsing() {
+        // The cheap guard that makes the stripper linear: a `{` with prose to its
+        // left cannot be line-isolated, so it must be rejected without paying for
+        // a parse of the entire remaining message.
+        let msg = "the shape is {\"a\": 1} inline\n{\"b\": 2}\n";
+        let inline = msg.find('{').expect("inline brace");
+        assert!(
+            !json_candidate_starts_its_line(msg, inline),
+            "a brace preceded by prose must be rejected before parsing"
+        );
+
+        let isolated = msg[inline + 1..].find('{').expect("isolated brace") + inline + 1;
+        assert!(
+            json_candidate_starts_its_line(msg, isolated),
+            "a brace that starts its line must still be considered"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_error_replies_are_sanitized_before_delivery() {
+        // The LLM-error arm delivered its raw error chain verbatim to an
+        // arbitrary sender, including a guest, while the sibling failure path
+        // sanitized. This drives the real dispatch loop rather than calling the
+        // sanitizer directly, so reverting the call site fails the test.
+        //
+        // Scope note: `sanitize_api_error` scrubs secret-shaped tokens and caps
+        // length. It does NOT strip local filesystem paths — the sibling path
+        // does not either. Path leakage is a separate pre-existing defect on
+        // both arms; this test pins only what this change delivers.
+        let secret = "sk-not-a-real-key";
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(FailingProvider {
+                error: format!("upstream rejected credential {secret}"),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            history_store: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+        tx.send(traits::ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: "1".to_string(),
+            sender: "guest_user".to_string(),
+            reply_target: "guest_user".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        run_message_dispatch_loop(rx, runtime_ctx, 1).await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1, "the error arm must still reply");
+        assert!(
+            !sent_messages[0].contains(secret),
+            "a secret-shaped token must not reach a chat reply: {}",
+            sent_messages[0]
+        );
+        assert!(
+            sent_messages[0].contains("[REDACTED]"),
+            "the reply must carry the scrubbed marker: {}",
+            sent_messages[0]
+        );
     }
 
     #[tokio::test]
