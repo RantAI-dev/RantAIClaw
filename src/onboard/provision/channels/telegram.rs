@@ -6,6 +6,7 @@ use super::super::traits::{
 use crate::config::schema::TelegramConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -97,37 +98,26 @@ impl TuiProvisioner for TelegramProvisioner {
         .await?;
 
         let validate_url = format!("https://api.telegram.org/bot{}/getMe", bot_token.trim());
-        match probe_get(&validate_url, &[]).await {
-            Ok(result) if result.status == 200 => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Bot token validated successfully.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Bot token may be invalid (non-200 response).".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate token (network error): {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+        let probe = probe_get(&validate_url, &[]).await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "bot token",
+        )
+        .await?
+        .should_persist()
+        {
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "Bot token not saved — Telegram is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "bot token failed validation and was not saved".into(),
+            ));
         }
 
         // Allowed users
