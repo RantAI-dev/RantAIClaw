@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Telegram reports the numeric user id as the sender, not the `@username`.**
+  A Telegram handle can be released and re-registered, and pairing writes
+  whichever form the channel reports into `approval_owners` — so whoever took a
+  released handle inherited owner authority. The username is kept as an alias,
+  so an owner already recorded by handle is still recognised, but the primary
+  form is now the one that cannot be transferred.
+
+  **This changes the conversation-scope key, so existing Telegram threads start
+  a fresh history.** Nothing is deleted; the old history is keyed under the
+  username and simply no longer matched.
+
+  `rantaiclaw permissions show` now flags any non-numeric owner entry while
+  Telegram is configured, so you can see which of your entries are transferable
+  and re-add them by id.
+
 - **IRC resolves identity from the services account, not the nick.** A nick is
   a first-come lease: anyone who connects while the owner is offline — or
   forces them off with a ghost or a netsplit — takes it, and was resolved as
@@ -33,6 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration deliberately does not grant the opt-in on an operator's behalf.
 
 ### Fixed
+
+- **Telegram typing indicators no longer fight between chats.** One typing slot
+  was shared by the whole channel, so starting typing for chat B silently killed
+  chat A's indicator — and with the runtime's parallel message path, concurrent
+  chats are the normal case. Handles are now keyed by recipient. The channel's
+  own 4-second refresh loop is gone as well: the runtime already calls
+  `start_typing` on a 4-second cadence, so every tick aborted the task spawned
+  four seconds earlier and spawned another.
+
+- **Telegram streaming drafts are no longer truncated for CJK and emoji.** The
+  draft was gated and cut in *bytes* against a *character* limit, so a
+  non-Latin reply was cut at roughly a third of its intended length. The
+  neighbouring `finalize_draft` had this right already.
 
 - **IRC replies stopped vanishing after a disconnect.** The write half survived
   the listener, so `send()` wrote into a half-closed socket and returned
