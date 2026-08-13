@@ -6,6 +6,7 @@ use super::super::traits::{
 use crate::config::schema::{LarkConfig, LarkReceiveMode};
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_post;
+use crate::onboard::provision::validate::numeric;
 use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
@@ -112,6 +113,32 @@ impl TuiProvisioner for LarkProvisioner {
             return Ok(ProvisionOutcome::Aborted("App Secret is required.".into()));
         }
 
+        // Region. Asked before the probe because it decides which host the app
+        // credentials are sent to: Feishu and Lark are separate deployments and
+        // a credential from one is not valid on the other. The branch that
+        // picked the host was hardcoded to never take the Feishu arm, and
+        // `use_feishu` was written as a literal false, so a Feishu tenant could
+        // not be configured from the TUI at all — the CLI wizard asked properly.
+        send(
+            &events,
+            ProvisionEvent::Choose {
+                id: "region".into(),
+                label: "Region".into(),
+                options: vec![
+                    "Feishu (CN)".to_string(),
+                    "Lark (International)".to_string(),
+                ],
+                multi: false,
+            },
+        )
+        .await?;
+        let use_feishu = recv_selection(&mut responses)
+            .await?
+            .first()
+            .copied()
+            .unwrap_or(0)
+            == 0;
+
         // Validate by getting tenant access token
         send(
             &events,
@@ -122,7 +149,7 @@ impl TuiProvisioner for LarkProvisioner {
         )
         .await?;
 
-        let token_url = if false {
+        let token_url = if use_feishu {
             "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
         } else {
             "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
@@ -231,21 +258,20 @@ impl TuiProvisioner for LarkProvisioner {
             }
         };
 
-        // Port for webhook mode
+        // Port for webhook mode. An unparseable answer used to yield `None`,
+        // which left webhook mode configured with no port — a failure deferred
+        // from setup, where it can be corrected, to runtime, where it cannot.
         let port = if receive_mode == LarkReceiveMode::Webhook {
-            send(
-                &events,
-                ProvisionEvent::Prompt {
-                    id: "port".into(),
-                    label: "HTTP port for webhook (e.g. 8080)".into(),
-                    default: Some("8080".into()),
-                    secret: false,
-                },
+            Some(
+                numeric::prompt_number(
+                    &events,
+                    &mut responses,
+                    "port",
+                    "HTTP port for webhook (e.g. 8080)",
+                    8080u16,
+                )
+                .await?,
             )
-            .await?;
-            let p = recv_text(&mut responses).await?;
-            let parsed = p.trim().parse::<u16>().ok();
-            parsed
         } else {
             None
         };
@@ -276,7 +302,7 @@ impl TuiProvisioner for LarkProvisioner {
             encrypt_key,
             verification_token,
             allowed_users,
-            use_feishu: false,
+            use_feishu,
             receive_mode,
             port,
         });

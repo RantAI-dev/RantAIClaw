@@ -6,6 +6,8 @@ use super::super::traits::{
 use crate::config::schema::SignalConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::allowlist;
+use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -114,7 +116,11 @@ impl TuiProvisioner for SignalProvisioner {
             ));
         }
 
-        // Validate socket path exists (it's HTTP-based so we just check connectivity)
+        // This used to print "Checking signal-cli daemon at …" and check
+        // nothing — the module did not even import a probe helper. It now hits
+        // the same endpoint `SignalChannel::health_check` uses, so the claim is
+        // true. A daemon the operator has not started yet is a transport
+        // failure, which is inconclusive and still lets setup finish.
         send(
             &events,
             ProvisionEvent::Message {
@@ -123,6 +129,28 @@ impl TuiProvisioner for SignalProvisioner {
             },
         )
         .await?;
+
+        let probe = probe_get(&format!("{http_url}/api/v1/check"), &[]).await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "signal-cli daemon",
+        )
+        .await?
+        .should_persist()
+        {
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "Signal was not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "the signal-cli daemon check failed and nothing was saved".into(),
+            ));
+        }
 
         // Allowed senders
         send(
@@ -146,28 +174,13 @@ impl TuiProvisioner for SignalProvisioner {
             .collect();
         allowlist::warn_on_reach(&events, &allowed_from, "Allowed sender numbers").await?;
 
-        // Group ID filter
-        send(
-            &events,
-            ProvisionEvent::Choose {
-                id: "group_filter".into(),
-                label: "Which messages to receive?".into(),
-                options: vec![
-                    "All messages (DMs and groups)".to_string(),
-                    "Direct messages only".to_string(),
-                ],
-                multi: false,
-            },
-        )
-        .await?;
-
-        let group_id = {
-            let sel = recv_selection(&mut responses).await?;
-            match sel.first().copied() {
-                Some(1) => Some("dm".to_string()),
-                _ => None,
-            }
-        };
+        // `group_id` is an inclusion filter: the runtime keeps only messages
+        // from the group whose id matches. There is no DM-only predicate for it
+        // to express, so the old "Direct messages only" option wrote the
+        // literal `"dm"` and the channel then dropped everything that was not
+        // from a group actually called `dm` — silencing the bot completely.
+        // Until a real DM-only filter exists, the honest value is None.
+        let group_id: Option<String> = None;
 
         // Write config
         config.channels_config.signal = Some(SignalConfig {

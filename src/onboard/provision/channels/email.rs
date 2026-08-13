@@ -6,6 +6,7 @@ use super::super::traits::{
 use crate::channels::email_channel::EmailConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::allowlist;
+use crate::onboard::provision::validate::numeric;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -88,22 +89,14 @@ impl TuiProvisioner for EmailProvisioner {
         }
 
         // IMAP port
-        send(
+        let imap_port: u16 = numeric::prompt_number(
             &events,
-            ProvisionEvent::Prompt {
-                id: "imap_port".into(),
-                label: "IMAP port (Enter for default 993)".into(),
-                default: Some("993".into()),
-                secret: false,
-            },
+            &mut responses,
+            "imap_port",
+            "IMAP port (Enter for default 993)",
+            993u16,
         )
         .await?;
-
-        let imap_port: u16 = recv_text(&mut responses)
-            .await?
-            .trim()
-            .parse()
-            .unwrap_or(993);
 
         // IMAP folder
         send(
@@ -150,22 +143,14 @@ impl TuiProvisioner for EmailProvisioner {
         }
 
         // SMTP port
-        send(
+        let smtp_port: u16 = numeric::prompt_number(
             &events,
-            ProvisionEvent::Prompt {
-                id: "smtp_port".into(),
-                label: "SMTP port (Enter for default 587)".into(),
-                default: Some("587".into()),
-                secret: false,
-            },
+            &mut responses,
+            "smtp_port",
+            "SMTP port (Enter for default 587)",
+            587u16,
         )
         .await?;
-
-        let smtp_port: u16 = recv_text(&mut responses)
-            .await?
-            .trim()
-            .parse()
-            .unwrap_or(587);
 
         // From address
         send(
@@ -263,22 +248,14 @@ impl TuiProvisioner for EmailProvisioner {
         allowlist::warn_on_reach(&events, &allowed_senders, "Allowed sender addresses").await?;
 
         // IDLE timeout
-        send(
+        let idle_timeout_secs: u64 = numeric::prompt_number(
             &events,
-            ProvisionEvent::Prompt {
-                id: "idle_timeout".into(),
-                label: "IDLE timeout in seconds (Enter for default 1740 = 29 min)".into(),
-                default: Some("1740".into()),
-                secret: false,
-            },
+            &mut responses,
+            "idle_timeout",
+            "IDLE timeout in seconds (Enter for default 1740 = 29 min)",
+            1740u64,
         )
         .await?;
-
-        let idle_timeout_secs: u64 = recv_text(&mut responses)
-            .await?
-            .trim()
-            .parse()
-            .unwrap_or(1740);
 
         // Write config
         config.channels_config.email = Some(EmailConfig {

@@ -119,8 +119,13 @@ impl TuiProvisioner for IMessageProvisioner {
             ));
         }
 
-        // Check if chat.db is accessible
-        let chat_db = std::path::Path::new("/Users/Library/Messages/chat.db");
+        // Resolve the same path `IMessageChannel::listen` opens. The old check
+        // looked at `/Users/Library/Messages/chat.db` — a path that exists on
+        // no macOS system, because the username between `/Users` and `Library`
+        // is missing — so the Full Disk Access check could only ever fail.
+        let chat_db = directories::UserDirs::new()
+            .map(|u| u.home_dir().join("Library/Messages/chat.db"))
+            .unwrap_or_default();
         if chat_db.exists() {
             send(
                 &events,

@@ -4,6 +4,7 @@ use super::super::traits::{
     ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::Config;
+use crate::onboard::provision::validate::numeric;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -88,19 +89,14 @@ impl TuiProvisioner for GatewayProvisioner {
         }
 
         // Port
-        send(
+        let port: u16 = numeric::prompt_number(
             &events,
-            ProvisionEvent::Prompt {
-                id: "port".into(),
-                label: "Gateway port (Enter for default 9393)".into(),
-                default: Some("9393".into()),
-                secret: false,
-            },
+            &mut responses,
+            "port",
+            "Gateway port (Enter for default 9393)",
+            9393u16,
         )
         .await?;
-
-        let port_str = recv_text(&mut responses).await?;
-        let port: u16 = port_str.trim().parse().unwrap_or(9393);
 
         // Host
         send(

@@ -123,13 +123,15 @@ impl TuiProvisioner for NextcloudTalkProvisioner {
         )
         .await?;
 
+        // Authenticate the way the channel does. The probe used to send Basic
+        // auth with an empty username, which Nextcloud rejects — so a valid app
+        // token still produced a warning, and operators learned to ignore it.
         let ocs_url = format!("{}/ocs/v2.php/cloud/user", base_url);
-        let encoded = base64::encode(format!("{}:{}", "", app_token.trim())); // user is empty for app token
         let probe = probe_get(
             &ocs_url,
             &[
                 ("OCS-APIRequest", "true"),
-                ("Authorization", &format!("Basic {}", encoded)),
+                ("Authorization", &format!("Bearer {}", app_token.trim())),
             ],
         )
         .await;

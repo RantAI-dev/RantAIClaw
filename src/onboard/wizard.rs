@@ -4474,9 +4474,12 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     style("— HTTP endpoint for custom integrations").dim()
                 );
 
-                let port: String = Input::new()
+                // Typed, so dialoguer re-asks on a typo. It used to read a
+                // String and `parse().unwrap_or(8080)`, silently discarding
+                // whatever the operator actually typed.
+                let port: u16 = Input::new()
                     .with_prompt("  Port")
-                    .default("8080".into())
+                    .default(8080u16)
                     .interact_text()?;
 
                 let secret: String = Password::new()
@@ -4485,7 +4488,7 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     .interact()?;
 
                 config.webhook = Some(WebhookConfig {
-                    port: port.parse().unwrap_or(8080),
+                    port,
                     secret: if secret.is_empty() {
                         None
                     } else {
@@ -4791,11 +4794,11 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                 }
 
                 let port = if receive_mode == LarkReceiveMode::Webhook {
-                    let p: String = Input::new()
+                    let p: u16 = Input::new()
                         .with_prompt("  Webhook Port")
-                        .default("8080".into())
+                        .default(8080u16)
                         .interact_text()?;
-                    Some(p.parse().unwrap_or(8080))
+                    Some(p)
                 } else {
                     None
                 };

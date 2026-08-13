@@ -6,6 +6,7 @@ use super::super::traits::{
 use crate::config::schema::IrcConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::allowlist;
+use crate::onboard::provision::validate::numeric;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -87,23 +88,14 @@ impl TuiProvisioner for IrcProvisioner {
             return Ok(ProvisionOutcome::Aborted("Server is required.".into()));
         }
 
-        // Port
-        send(
+        let port: u16 = numeric::prompt_number(
             &events,
-            ProvisionEvent::Prompt {
-                id: "port".into(),
-                label: "Port (Enter for default 6697 = TLS)".into(),
-                default: Some("6697".into()),
-                secret: false,
-            },
+            &mut responses,
+            "port",
+            "Port (Enter for default 6697 = TLS)",
+            6697u16,
         )
         .await?;
-
-        let port: u16 = recv_text(&mut responses)
-            .await?
-            .trim()
-            .parse()
-            .unwrap_or(6697);
 
         // Nickname
         send(
@@ -204,6 +196,27 @@ impl TuiProvisioner for IrcProvisioner {
             Some(nickserv_password.trim().to_string())
         };
 
+        // SASL. `IRC_DESC` advertises "NickServ/SASL passwords" but this path
+        // never asked and wrote `sasl_password: None`, so a network that
+        // requires SASL could not be configured from the TUI at all.
+        send(
+            &events,
+            ProvisionEvent::Prompt {
+                id: "sasl_password".into(),
+                label: "SASL PLAIN password (Enter to skip)".into(),
+                default: None,
+                secret: true,
+            },
+        )
+        .await?;
+
+        let sasl_password = recv_text(&mut responses).await?;
+        let sasl_password = if sasl_password.trim().is_empty() {
+            None
+        } else {
+            Some(sasl_password.trim().to_string())
+        };
+
         // Channels
         send(
             &events,
@@ -254,7 +267,7 @@ impl TuiProvisioner for IrcProvisioner {
             allowed_users,
             server_password,
             nickserv_password,
-            sasl_password: None,
+            sasl_password,
             verify_tls: Some(verify_tls),
         });
 
