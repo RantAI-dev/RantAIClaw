@@ -1,7 +1,7 @@
 //! Matrix provisioner — implements [`TuiProvisioner`] for in-TUI Matrix setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::MatrixConfig;
 use crate::config::Config;
@@ -42,7 +42,12 @@ impl TuiProvisioner for MatrixProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -79,7 +84,9 @@ impl TuiProvisioner for MatrixProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "Homeserver URL is required.".into(),
+            ));
         }
 
         // Access token
@@ -103,7 +110,9 @@ impl TuiProvisioner for MatrixProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "Access token is required.".into(),
+            ));
         }
 
         // Validate token
@@ -215,7 +224,7 @@ impl TuiProvisioner for MatrixProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Room ID is required.".into()));
         }
 
         // Allowed users
@@ -255,7 +264,7 @@ impl TuiProvisioner for MatrixProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

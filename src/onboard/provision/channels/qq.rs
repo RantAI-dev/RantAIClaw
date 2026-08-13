@@ -1,7 +1,7 @@
 //! QQ provisioner — implements [`TuiProvisioner`] for in-TUI QQ Official Bot setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::QQConfig;
 use crate::config::Config;
@@ -42,7 +42,12 @@ impl TuiProvisioner for QqProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -78,7 +83,7 @@ impl TuiProvisioner for QqProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("App ID is required.".into()));
         }
 
         // App Secret
@@ -102,7 +107,7 @@ impl TuiProvisioner for QqProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("App Secret is required.".into()));
         }
 
         // Validate credentials
@@ -194,7 +199,7 @@ impl TuiProvisioner for QqProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

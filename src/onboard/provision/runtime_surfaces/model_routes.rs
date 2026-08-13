@@ -1,7 +1,7 @@
 //! Model Routes provisioner — implements [`TuiProvisioner`] for in-TUI model routing rules setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::ModelRouteConfig;
 use crate::config::Config;
@@ -42,7 +42,12 @@ impl TuiProvisioner for ModelRoutesProvisioner {
         ProvisionerCategory::Routing
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -170,7 +175,7 @@ impl TuiProvisioner for ModelRoutesProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

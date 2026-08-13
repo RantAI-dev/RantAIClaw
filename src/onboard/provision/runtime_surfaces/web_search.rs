@@ -1,7 +1,7 @@
 //! Web Search provisioner — implements [`TuiProvisioner`] for in-TUI web search setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::WebSearchConfig;
 use crate::config::Config;
@@ -42,7 +42,12 @@ impl TuiProvisioner for WebSearchProvisioner {
         ProvisionerCategory::Integration
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -137,7 +142,7 @@ impl TuiProvisioner for WebSearchProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

@@ -1,7 +1,7 @@
 //! Lark provisioner — implements [`TuiProvisioner`] for in-TUI Lark/Feishu setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::{LarkConfig, LarkReceiveMode};
 use crate::config::Config;
@@ -43,7 +43,12 @@ impl TuiProvisioner for LarkProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -79,7 +84,7 @@ impl TuiProvisioner for LarkProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("App ID is required.".into()));
         }
 
         // App secret
@@ -103,7 +108,7 @@ impl TuiProvisioner for LarkProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("App Secret is required.".into()));
         }
 
         // Validate by getting tenant access token
@@ -288,7 +293,7 @@ impl TuiProvisioner for LarkProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

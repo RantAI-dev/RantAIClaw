@@ -1,7 +1,7 @@
 //! Signal provisioner — implements [`TuiProvisioner`] for in-TUI Signal setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::SignalConfig;
 use crate::config::Config;
@@ -41,7 +41,12 @@ impl TuiProvisioner for SignalProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -78,7 +83,7 @@ impl TuiProvisioner for SignalProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("HTTP URL is required.".into()));
         }
 
         // Account phone number
@@ -103,7 +108,9 @@ impl TuiProvisioner for SignalProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "Account phone number is required.".into(),
+            ));
         }
 
         // Validate socket path exists (it's HTTP-based so we just check connectivity)
@@ -181,7 +188,7 @@ impl TuiProvisioner for SignalProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

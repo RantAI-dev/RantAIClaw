@@ -1,7 +1,7 @@
 //! Email provisioner — implements [`TuiProvisioner`] for in-TUI Email setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::channels::email_channel::EmailConfig;
 use crate::config::Config;
@@ -41,7 +41,12 @@ impl TuiProvisioner for EmailProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -78,7 +83,7 @@ impl TuiProvisioner for EmailProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("IMAP host is required.".into()));
         }
 
         // IMAP port
@@ -140,7 +145,7 @@ impl TuiProvisioner for EmailProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("SMTP host is required.".into()));
         }
 
         // SMTP port
@@ -183,7 +188,9 @@ impl TuiProvisioner for EmailProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "From address is required.".into(),
+            ));
         }
 
         // Username
@@ -226,7 +233,7 @@ impl TuiProvisioner for EmailProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Password is required.".into()));
         }
 
         // Allowed senders
@@ -296,7 +303,7 @@ impl TuiProvisioner for EmailProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

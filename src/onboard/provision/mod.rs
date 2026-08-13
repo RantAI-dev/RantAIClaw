@@ -18,7 +18,8 @@ pub mod whatsapp_web;
 pub use registry::{available, provisioner_for};
 #[allow(unused_imports)]
 pub use traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, ProvisionerCategory, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, ProvisionerCategory,
+    Severity, TuiProvisioner,
 };
 
 /// After a channel provisioner succeeds, install the always-on core skill.

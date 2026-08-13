@@ -1,7 +1,7 @@
 //! Discord provisioner — implements [`TuiProvisioner`] for in-TUI Discord bot setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::DiscordConfig;
 use crate::config::Config;
@@ -42,7 +42,12 @@ impl TuiProvisioner for DiscordProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -78,7 +83,7 @@ impl TuiProvisioner for DiscordProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Bot token is required.".into()));
         }
 
         // Validate token
@@ -210,7 +215,7 @@ impl TuiProvisioner for DiscordProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

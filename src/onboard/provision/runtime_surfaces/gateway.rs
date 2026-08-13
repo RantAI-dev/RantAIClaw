@@ -1,7 +1,7 @@
 //! Gateway provisioner — implements [`TuiProvisioner`] for in-TUI webhook gateway setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::Config;
 use crate::profile::Profile;
@@ -41,7 +41,12 @@ impl TuiProvisioner for GatewayProvisioner {
         ProvisionerCategory::Runtime
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -79,7 +84,7 @@ impl TuiProvisioner for GatewayProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Configured);
         }
 
         // Port
@@ -180,7 +185,7 @@ impl TuiProvisioner for GatewayProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 
@@ -233,7 +238,7 @@ mod tests {
     }
 
     /// Drive the provisioner through its four prompts with scripted answers.
-    async fn run_with(config: &mut Config, host: &str) -> Result<()> {
+    async fn run_with(config: &mut Config, host: &str) -> Result<ProvisionOutcome> {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
         let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(32);
         // Drain events so the provisioner's sends never block.

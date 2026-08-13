@@ -1,7 +1,7 @@
 //! Composio provisioner — implements [`TuiProvisioner`] for in-TUI Composio setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::ComposioConfig;
 use crate::config::Config;
@@ -43,7 +43,12 @@ impl TuiProvisioner for ComposioProvisioner {
         ProvisionerCategory::Integration
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -79,7 +84,7 @@ impl TuiProvisioner for ComposioProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("API key is required.".into()));
         }
 
         // Validate
@@ -176,7 +181,7 @@ impl TuiProvisioner for ComposioProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

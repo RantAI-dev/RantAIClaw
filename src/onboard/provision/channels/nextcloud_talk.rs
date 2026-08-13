@@ -1,7 +1,7 @@
 //! Nextcloud Talk provisioner — implements [`TuiProvisioner`] for in-TUI Nextcloud Talk setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::NextcloudTalkConfig;
 use crate::config::Config;
@@ -43,7 +43,12 @@ impl TuiProvisioner for NextcloudTalkProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -80,7 +85,7 @@ impl TuiProvisioner for NextcloudTalkProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Server URL is required.".into()));
         }
 
         // App token
@@ -104,7 +109,7 @@ impl TuiProvisioner for NextcloudTalkProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("App token is required.".into()));
         }
 
         // Validate credentials
@@ -215,7 +220,7 @@ impl TuiProvisioner for NextcloudTalkProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

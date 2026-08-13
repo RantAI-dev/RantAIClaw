@@ -1,7 +1,7 @@
 //! Slack provisioner — implements [`TuiProvisioner`] for in-TUI Slack bot setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::SlackConfig;
 use crate::config::Config;
@@ -43,7 +43,12 @@ impl TuiProvisioner for SlackProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -79,7 +84,7 @@ impl TuiProvisioner for SlackProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Bot token is required.".into()));
         }
 
         // Optional app-level token
@@ -204,7 +209,7 @@ impl TuiProvisioner for SlackProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

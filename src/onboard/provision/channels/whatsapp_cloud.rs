@@ -4,7 +4,7 @@
 //! webhook-based integration.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::WhatsAppConfig;
 use crate::config::Config;
@@ -46,7 +46,12 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -82,7 +87,9 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "Access token is required.".into(),
+            ));
         }
 
         // Phone number ID
@@ -106,7 +113,9 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "Phone number ID is required.".into(),
+            ));
         }
 
         // Validate with probe
@@ -243,7 +252,7 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

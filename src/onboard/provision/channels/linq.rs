@@ -1,7 +1,7 @@
 //! Linq provisioner — implements [`TuiProvisioner`] for in-TUI Linq setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::LinqConfig;
 use crate::config::Config;
@@ -42,7 +42,12 @@ impl TuiProvisioner for LinqProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -78,7 +83,7 @@ impl TuiProvisioner for LinqProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("API token is required.".into()));
         }
 
         // Validate token
@@ -151,7 +156,9 @@ impl TuiProvisioner for LinqProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "Sender phone is required.".into(),
+            ));
         }
 
         // Optional webhook signing secret
@@ -209,7 +216,7 @@ impl TuiProvisioner for LinqProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

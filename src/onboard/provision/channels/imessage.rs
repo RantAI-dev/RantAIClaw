@@ -3,7 +3,7 @@
 //! macOS only. Checks for Full Disk Access before proceeding.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::IMessageConfig;
 use crate::config::Config;
@@ -43,7 +43,12 @@ impl TuiProvisioner for IMessageProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -58,7 +63,7 @@ impl TuiProvisioner for IMessageProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("iMessage is macOS-only.".into()));
         }
 
         send(
@@ -109,7 +114,9 @@ impl TuiProvisioner for IMessageProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "iMessage setup cancelled — prerequisites not met.".into(),
+            ));
         }
 
         // Check if chat.db is accessible
@@ -168,7 +175,7 @@ impl TuiProvisioner for IMessageProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

@@ -57,6 +57,38 @@ pub enum Severity {
     Success,
 }
 
+/// What a provisioner actually did, as distinct from whether it crashed.
+///
+/// `run` used to return `Result<()>`, so a provisioner that emitted
+/// `ProvisionEvent::Failed` for a missing required field and then bailed with
+/// `Ok(())` was indistinguishable from one that configured a channel. Both
+/// drivers read that `Ok` as success and went on to install the core skill and
+/// save the config — the exact false "channel is set up" signal that
+/// `install_core_skills_after_channel`'s own doc says the ordering prevents.
+///
+/// A deliberate user skip is not an error, which is why this is a variant of
+/// the success type rather than an `Err`: the TUI's overlay-freeze protection
+/// treats `Err` as exceptional and surfaces it as a crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionOutcome {
+    /// The provisioner completed and its config mutations should be persisted.
+    Configured,
+    /// The provisioner stopped early — a missing required field, a rejected
+    /// credential, or a user skip. Nothing should be persisted or installed.
+    Aborted(String),
+}
+
+impl ProvisionOutcome {
+    /// Convenience for the common `Aborted` construction from a `&str`.
+    pub fn aborted(reason: impl Into<String>) -> Self {
+        Self::Aborted(reason.into())
+    }
+
+    pub fn is_configured(&self) -> bool {
+        matches!(self, Self::Configured)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ProvisionResponse {
     Text(String),
@@ -81,7 +113,7 @@ pub trait TuiProvisioner: Send {
         config: &mut crate::config::Config,
         profile: &crate::profile::Profile,
         io: ProvisionIo,
-    ) -> Result<()>;
+    ) -> Result<ProvisionOutcome>;
 }
 
 #[cfg(test)]
@@ -119,8 +151,8 @@ mod tests {
                 _: &mut crate::config::Config,
                 _: &crate::profile::Profile,
                 _: ProvisionIo,
-            ) -> Result<()> {
-                Ok(())
+            ) -> Result<ProvisionOutcome> {
+                Ok(ProvisionOutcome::Configured)
             }
         }
         assert_eq!(DummyProvisioner.category(), ProvisionerCategory::Core);

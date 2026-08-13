@@ -3049,12 +3049,20 @@ async fn run_provisioner_headless(
         Ok((prov_result, _)) => {
             match prov_result {
                 Err(e) => eprintln!("\n❌ provisioner error: {e}"),
+                // Nothing was configured, so nothing gets installed — the skill
+                // would otherwise be left behind as a false "channel is set up"
+                // signal for a provisioner that bailed on a missing field.
+                Ok(onboard::provision::ProvisionOutcome::Aborted(reason)) => {
+                    eprintln!("\n⏹️  provisioner stopped, nothing saved: {reason}");
+                }
                 // A configured multi-user channel is the point at which the
                 // owner needs to be able to manage permissions from chat.
-                Ok(()) => onboard::provision::install_core_skills_after_channel(
-                    provisioner_category,
-                    profile,
-                ),
+                Ok(onboard::provision::ProvisionOutcome::Configured) => {
+                    onboard::provision::install_core_skills_after_channel(
+                        provisioner_category,
+                        profile,
+                    )
+                }
             }
         }
         Err(_) => {

@@ -1,7 +1,7 @@
 //! Hardware provisioner — implements [`TuiProvisioner`] for in-TUI hardware/peripheral setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::{HardwareConfig, HardwareTransport};
 use crate::config::Config;
@@ -42,7 +42,12 @@ impl TuiProvisioner for HardwareProvisioner {
         ProvisionerCategory::Hardware
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -80,7 +85,7 @@ impl TuiProvisioner for HardwareProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Configured);
         }
 
         send(
@@ -188,7 +193,7 @@ impl TuiProvisioner for HardwareProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

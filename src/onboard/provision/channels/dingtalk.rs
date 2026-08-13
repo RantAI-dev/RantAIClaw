@@ -1,7 +1,7 @@
 //! DingTalk provisioner — implements [`TuiProvisioner`] for in-TUI DingTalk setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::DingTalkConfig;
 use crate::config::Config;
@@ -46,7 +46,12 @@ impl TuiProvisioner for DingTalkProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -82,7 +87,7 @@ impl TuiProvisioner for DingTalkProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Client ID is required.".into()));
         }
 
         // Client Secret
@@ -106,7 +111,9 @@ impl TuiProvisioner for DingTalkProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "Client Secret is required.".into(),
+            ));
         }
 
         // Validate credentials
@@ -199,7 +206,7 @@ impl TuiProvisioner for DingTalkProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

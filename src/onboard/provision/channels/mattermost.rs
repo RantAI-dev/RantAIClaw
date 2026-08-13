@@ -1,7 +1,7 @@
 //! Mattermost provisioner — implements [`TuiProvisioner`] for in-TUI Mattermost setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::MattermostConfig;
 use crate::config::Config;
@@ -42,7 +42,12 @@ impl TuiProvisioner for MattermostProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -79,7 +84,7 @@ impl TuiProvisioner for MattermostProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Server URL is required.".into()));
         }
 
         // Bot token
@@ -103,7 +108,7 @@ impl TuiProvisioner for MattermostProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Bot token is required.".into()));
         }
 
         // Validate token
@@ -230,7 +235,7 @@ impl TuiProvisioner for MattermostProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

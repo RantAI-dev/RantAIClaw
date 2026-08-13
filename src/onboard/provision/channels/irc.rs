@@ -1,7 +1,7 @@
 //! IRC provisioner — implements [`TuiProvisioner`] for in-TUI IRC setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::IrcConfig;
 use crate::config::Config;
@@ -41,7 +41,12 @@ impl TuiProvisioner for IrcProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -78,7 +83,7 @@ impl TuiProvisioner for IrcProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Server is required.".into()));
         }
 
         // Port
@@ -121,7 +126,7 @@ impl TuiProvisioner for IrcProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Nickname is required.".into()));
         }
 
         // Optional username
@@ -259,7 +264,7 @@ impl TuiProvisioner for IrcProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

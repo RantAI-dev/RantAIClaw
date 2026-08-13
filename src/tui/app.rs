@@ -3901,7 +3901,19 @@ impl TuiApp {
                 responses: response_rx,
             };
             match prov.run(&mut config, &profile, io).await {
-                Ok(()) => {
+                // A provisioner that stopped early has configured nothing.
+                // Installing the core skill or saving here would produce the
+                // false "channel is set up" signal that the skill-install
+                // ordering exists to prevent. `save_tx` drops unsent, so the
+                // wizard's advance gate sees `Closed` and holds the overlay
+                // open on the `Failed` event the provisioner already emitted.
+                Ok(crate::onboard::provision::ProvisionOutcome::Aborted(reason)) => {
+                    tracing::info!(
+                        provisioner = prov_name,
+                        "provisioner aborted, nothing persisted: {reason}"
+                    );
+                }
+                Ok(crate::onboard::provision::ProvisionOutcome::Configured) => {
                     // A configured multi-user channel is the point at which
                     // the owner needs to manage permissions from chat, so make
                     // sure the skill that explains those tools is present.

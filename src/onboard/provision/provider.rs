@@ -9,7 +9,9 @@
 //!
 //! Config writes: `config.api_key`, `config.default_provider`, `config.default_model`, `config.api_url`
 
-use super::traits::{ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner};
+use super::traits::{
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
+};
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_get;
 use crate::profile::Profile;
@@ -44,7 +46,12 @@ impl TuiProvisioner for ProviderProvisioner {
         PROVIDER_DESC
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -165,7 +172,9 @@ impl TuiProvisioner for ProviderProvisioner {
                     },
                 )
                 .await?;
-                return Ok(());
+                return Ok(ProvisionOutcome::Aborted(
+                    "Custom provider requires a base URL.".into(),
+                ));
             }
 
             send(
@@ -213,7 +222,7 @@ impl TuiProvisioner for ProviderProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Configured);
         }
 
         send(
@@ -510,7 +519,7 @@ impl TuiProvisioner for ProviderProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 
