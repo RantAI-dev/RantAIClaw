@@ -524,6 +524,15 @@ impl IrcChannel {
             .collect()
     }
 
+    /// The nick to try after a `433`, or `None` once the cap is reached.
+    ///
+    /// Uncapped, a server that rejects every candidate produced an unbounded
+    /// NICK flood — which is itself a disconnect, so the loop could never
+    /// succeed and never stopped trying.
+    fn next_nick_candidate(current: &str, retries: u8) -> Option<String> {
+        (retries < MAX_NICK_RETRIES).then(|| format!("{current}_"))
+    }
+
     /// How long to wait before writing chunk `index`.
     ///
     /// Chunks used to go out back-to-back, which most networks disconnect as
@@ -851,14 +860,13 @@ impl IrcChannel {
 
                 // ERR_NICKNAMEINUSE (433)
                 "433" => {
-                    nick_retries += 1;
-                    if nick_retries > MAX_NICK_RETRIES {
+                    let Some(alt) = Self::next_nick_candidate(&current_nick, nick_retries) else {
                         anyhow::bail!(
                             "IRC: {MAX_NICK_RETRIES} nickname candidates were all in use \
                              (last: {current_nick}); giving up rather than flooding NICK"
                         );
-                    }
-                    let alt = format!("{current_nick}_");
+                    };
+                    nick_retries += 1;
                     tracing::warn!("IRC nickname {current_nick} is in use, trying {alt}");
                     let mut guard = self.writer.lock().await;
                     if let Some(ref mut w) = *guard {
@@ -1699,12 +1707,18 @@ nickname = "bot"
 
     #[test]
     fn nick_retry_is_capped() {
-        // The cap is what stops an unbounded NICK flood against a server that
-        // rejects every candidate; a flood is itself a disconnect.
-        assert!(
-            MAX_NICK_RETRIES > 0 && MAX_NICK_RETRIES <= 5,
-            "a cap of {MAX_NICK_RETRIES} is not a cap"
-        );
+        // Walk the retry sequence the 433 arm walks: it must terminate rather
+        // than keep minting candidates for a server that rejects every one.
+        let mut nick = "bot".to_string();
+        let mut retries = 0_u8;
+        while let Some(next) = IrcChannel::next_nick_candidate(&nick, retries) {
+            nick = next;
+            retries += 1;
+            assert!(retries <= 10, "the retry loop did not terminate");
+        }
+        assert_eq!(retries, MAX_NICK_RETRIES);
+        assert_eq!(nick, "bot___");
+        assert!(IrcChannel::next_nick_candidate(&nick, retries).is_none());
     }
 
     #[tokio::test]
