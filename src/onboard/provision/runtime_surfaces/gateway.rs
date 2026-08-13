@@ -1,10 +1,12 @@
 //! Gateway provisioner — implements [`TuiProvisioner`] for in-TUI webhook gateway setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner,
 };
 use crate::config::Config;
+use crate::onboard::provision::io::{recv_selection, recv_text, send};
 use crate::onboard::provision::validate::numeric;
+use crate::onboard::provision::ProvisionerCategory;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -185,53 +187,10 @@ impl TuiProvisioner for GatewayProvisioner {
     }
 }
 
-use crate::onboard::provision::ProvisionerCategory;
-
-async fn send(
-    events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
-    ev: ProvisionEvent,
-) -> Result<()> {
-    events
-        .send(ev)
-        .await
-        .map_err(|e| anyhow::anyhow!("send failed: {e}"))
-}
-
-async fn recv_selection(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    match responses.recv().await {
-        Some(ProvisionResponse::Selection(indices)) => Ok(indices),
-        Some(ProvisionResponse::Cancelled) => anyhow::bail!("cancelled"),
-        Some(_) => anyhow::bail!("unexpected response"),
-        None => anyhow::bail!("channel closed"),
-    }
-}
-
-async fn recv_text(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<String> {
-    match responses.recv().await {
-        Some(ProvisionResponse::Text(t)) => Ok(t),
-        Some(ProvisionResponse::Cancelled) => anyhow::bail!("cancelled"),
-        Some(_) => anyhow::bail!("unexpected response"),
-        None => anyhow::bail!("channel closed"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn provisioner_name_is_gateway() {
-        assert_eq!(GatewayProvisioner::new().name(), "gateway");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!GatewayProvisioner::new().description().is_empty());
-    }
+    use crate::onboard::provision::traits::ProvisionResponse;
 
     /// Drive the provisioner through its four prompts with scripted answers.
     async fn run_with(config: &mut Config, host: &str) -> Result<ProvisionOutcome> {

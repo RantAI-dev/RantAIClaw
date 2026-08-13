@@ -9,10 +9,9 @@
 //!
 //! Config writes: `config.api_key`, `config.default_provider`, `config.default_model`, `config.api_url`
 
-use super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
-};
+use super::traits::{ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner};
 use crate::config::Config;
+use crate::onboard::provision::io::{recv_selection, recv_text, send};
 use crate::onboard::provision::validate::http::probe_get;
 use crate::profile::Profile;
 use anyhow::{anyhow, Result};
@@ -551,54 +550,5 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3".to_string(),
         "llamacpp" => "llama3".to_string(),
         _ => "default".to_string(),
-    }
-}
-
-async fn send(
-    events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
-    ev: ProvisionEvent,
-) -> Result<()> {
-    events
-        .send(ev)
-        .await
-        .map_err(|e| anyhow!("send failed: {e}"))
-}
-
-async fn recv_selection(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    match responses.recv().await {
-        Some(ProvisionResponse::Selection(indices)) => Ok(indices),
-        Some(ProvisionResponse::Cancelled) => anyhow::bail!("cancelled"),
-        Some(_) => anyhow::bail!("unexpected response"),
-        None => anyhow::bail!("channel closed"),
-    }
-}
-
-async fn recv_text(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<String> {
-    match responses.recv().await {
-        Some(ProvisionResponse::Text(t)) => Ok(t),
-        Some(ProvisionResponse::Cancelled) => anyhow::bail!("cancelled"),
-        Some(_) => anyhow::bail!("unexpected response"),
-        None => anyhow::bail!("channel closed"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_provider() {
-        let p = ProviderProvisioner::new();
-        assert_eq!(p.name(), "provider");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = ProviderProvisioner::new();
-        assert!(!p.description().is_empty());
     }
 }

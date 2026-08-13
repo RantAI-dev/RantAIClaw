@@ -1,6 +1,7 @@
 pub mod approvals;
 pub mod channels;
 #[cfg(feature = "kb")]
+pub mod io;
 pub mod knowledge;
 pub mod login;
 pub mod mcp;

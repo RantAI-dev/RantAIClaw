@@ -287,20 +287,3 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_whatsapp_web() {
-        let p = WhatsAppWebProvisioner::default();
-        assert_eq!(p.name(), "whatsapp-web");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = WhatsAppWebProvisioner::default();
-        assert!(!p.description().is_empty());
-    }
-}

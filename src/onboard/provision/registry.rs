@@ -364,6 +364,48 @@ mod tests {
         assert!(provisioner_for("nope").is_none());
     }
 
+    /// Replaces 74 per-module tests that each asserted a string constant
+    /// equalled itself. Those could not fail, but they made coverage tooling
+    /// report every provisioner module as tested.
+    ///
+    /// This one can fail, in four ways the old ones could not: a provisioner
+    /// listed in `available()` that `provisioner_for` cannot build, a key that
+    /// disagrees with the provisioner's own `name()`, a duplicate key, and an
+    /// empty description.
+    #[test]
+    fn every_listed_provisioner_resolves_and_agrees_with_its_own_name() {
+        let listed = available();
+        assert!(!listed.is_empty(), "the registry lists nothing");
+
+        let mut seen = std::collections::HashSet::new();
+        for (key, description) in &listed {
+            assert!(!key.trim().is_empty(), "a registry key is blank");
+            assert!(
+                !description.trim().is_empty(),
+                "`{key}` is listed with no description"
+            );
+            assert!(
+                seen.insert(*key),
+                "`{key}` is listed twice — one of them is unreachable"
+            );
+
+            let built = provisioner_for(key)
+                .unwrap_or_else(|| panic!("`{key}` is listed but `provisioner_for` returns None"));
+            assert_eq!(
+                built.name(),
+                *key,
+                "`{key}` builds a provisioner that calls itself `{}` — the CLI \
+                 addresses it by the registry key, so the two must match",
+                built.name()
+            );
+            assert_eq!(
+                built.description(),
+                *description,
+                "`{key}` is listed with a description its provisioner does not report"
+            );
+        }
+    }
+
     #[test]
     fn persona_is_always_registered() {
         let p = provisioner_for("persona");
