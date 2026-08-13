@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 18;
+pub const CURRENT_VERSION: u32 = 19;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -260,8 +260,21 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         migrate_v18(raw);
     }
 
-    // Future migrations (v19, v20, …) inserted here in order.
-    // if from < 19 { migrate_v19(raw)?; }
+    // v18 → v19: `[channels.email] require_authenticated_sender` (bool,
+    // default `false`) was added. It refuses mail whose `From:` is not backed
+    // by a passing SPF/DKIM/DMARC result. Additive with a serde default, and
+    // the default is the *old* behaviour, so an existing mailbox keeps working
+    // exactly as before; nothing to transform. Independently of the flag, mail
+    // claiming an `approval_owners` address is now refused when it did not
+    // authenticate — that tightening is unconditional and carries no key, so it
+    // cannot be expressed as a transformation either. This arm burns a version
+    // slot so the schema_drift fingerprint is accepted with intent.
+    if from < 19 {
+        // (no transformation; additive field whose default preserves behaviour)
+    }
+
+    // Future migrations (v20, v21, …) inserted here in order.
+    // if from < 20 { migrate_v20(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -736,7 +749,7 @@ backend = \"markdown\"
         // must not lose it on upgrade. Fails if the rule is inverted.
         let mut v = parse("schema_version = 17\n[knowledge]\nembedding_api_key = \"enc2:abc\"\n");
         migrate(&mut v).unwrap();
-        assert_eq!(version_of(&v), Some(18));
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
         let k = v.get("knowledge").unwrap().as_table().unwrap();
         assert_eq!(
             k.get("enabled").unwrap().as_bool(),
@@ -756,6 +769,33 @@ backend = \"markdown\"
         assert!(
             v.get("knowledge").is_none(),
             "no key -> no injected table; serde default supplies enabled=false"
+        );
+    }
+
+    #[test]
+    fn v19_email_config_is_untouched_and_stamped() {
+        // v18 -> v19 is additive: `require_authenticated_sender` defaults to
+        // `false`, which is the old behaviour, so an existing email config must
+        // come through byte-identical and only the stamp moves. The flag is
+        // supplied by serde at load, exactly like the v9->v10 invariant.
+        let _guard = V18EnvGuard::scrubbed();
+        let mut v = parse(
+            "schema_version = 18\n[channels.email]\nimap_host = \"imap.example.com\"\nsmtp_host = \"smtp.example.com\"\n",
+        );
+        migrate(&mut v).unwrap();
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        let email = v
+            .get("channels")
+            .and_then(|c| c.get("email"))
+            .and_then(Value::as_table)
+            .expect("email table survives");
+        assert_eq!(
+            email.get("imap_host").and_then(Value::as_str),
+            Some("imap.example.com")
+        );
+        assert!(
+            email.get("require_authenticated_sender").is_none(),
+            "the migration must not inject the key — serde's default supplies it"
         );
     }
 
