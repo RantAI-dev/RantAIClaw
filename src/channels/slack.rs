@@ -12,6 +12,14 @@ pub struct SlackChannel {
 }
 
 impl SlackChannel {
+    /// Whether a Slack Web API response reports success.
+    ///
+    /// Slack signals application-level failure in the body with HTTP 200, so
+    /// the status alone says nothing.
+    fn api_response_is_ok(body: &serde_json::Value) -> bool {
+        body.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
     pub fn new(bot_token: String, channel_id: Option<String>, allowed_users: Vec<String>) -> Self {
         Self {
             bot_token,
@@ -266,19 +274,50 @@ impl Channel for SlackChannel {
         }
     }
 
+    /// Slack answers `auth.test` with **HTTP 200 and `{"ok": false}`** for a
+    /// revoked or invalid token, so a status-only probe reported healthy for
+    /// exactly the condition it exists to catch. `send()` in this same file
+    /// already reads the `ok` field; this now does too.
     async fn health_check(&self) -> bool {
-        self.http_client()
+        let Ok(resp) = self
+            .http_client()
             .get("https://slack.com/api/auth.test")
             .bearer_auth(&self.bot_token)
             .send()
             .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+        else {
+            return false;
+        };
+        if !resp.status().is_success() {
+            return false;
+        }
+        let Ok(body) = resp.json::<serde_json::Value>().await else {
+            return false;
+        };
+        Self::api_response_is_ok(&body)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Slack answers a revoked token with HTTP 200 and `{"ok": false}`, so the
+    /// old status-only probe could not fail for the one condition it existed
+    /// to catch.
+    #[test]
+    fn slack_health_check_fails_on_ok_false() {
+        let revoked = serde_json::json!({"ok": false, "error": "invalid_auth"});
+        assert!(
+            !SlackChannel::api_response_is_ok(&revoked),
+            "a 200 with ok:false is not healthy"
+        );
+
+        let good = serde_json::json!({"ok": true, "user_id": "U0000000000"});
+        assert!(SlackChannel::api_response_is_ok(&good));
+
+        // A body with no `ok` at all is not evidence of health either.
+        assert!(!SlackChannel::api_response_is_ok(&serde_json::json!({})));
+    }
+
     use super::*;
 
     #[test]
