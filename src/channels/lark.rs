@@ -208,7 +208,12 @@ pub struct LarkChannel {
     app_secret: String,
     verification_token: String,
     port: Option<u16>,
-    allowed_users: Vec<String>,
+    /// Runtime-mutable so a successful `/bind`/`/claim` takes effect without a
+    /// daemon restart, and so `apply_allowed_senders` can push a config edit
+    /// into the live channel. `std::sync::RwLock`, matching Slack and Telegram:
+    /// `is_user_allowed` is called from sync context and an async lock would
+    /// force it — and every caller — to become async for no gain.
+    allowed_users: Arc<std::sync::RwLock<Vec<String>>>,
     /// When true, use Feishu (CN) endpoints; when false, use Lark (international).
     use_feishu: bool,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
@@ -239,7 +244,7 @@ impl LarkChannel {
             app_secret,
             verification_token,
             port,
-            allowed_users,
+            allowed_users: Arc::new(std::sync::RwLock::new(allowed_users)),
             use_feishu: true,
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             encrypt_key: None,
@@ -769,9 +774,27 @@ impl LarkChannel {
         }
     }
 
+    /// Append a freshly-paired identity to the runtime allowlist (deduped) so
+    /// access is effective immediately. The persisted config, written by the
+    /// pairing core, remains the source of truth across restarts.
+    fn add_allowed_identity_runtime(&self, identity: &str) {
+        let identity = identity.trim();
+        if identity.is_empty() {
+            return;
+        }
+        if let Ok(mut users) = self.allowed_users.write() {
+            if !users.iter().any(|u| u == identity) {
+                users.push(identity.to_string());
+            }
+        }
+    }
+
     /// Check if a user open_id is allowed
     fn is_user_allowed(&self, open_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == open_id)
+        self.allowed_users
+            .read()
+            .map(|users| users.iter().any(|u| u == "*" || u == open_id))
+            .unwrap_or(false)
     }
 
     /// Resolve the active profile root for the shared pairing-code store.
@@ -815,6 +838,11 @@ impl LarkChannel {
         else {
             return false;
         };
+
+        // The pairing core persisted the identity; mirror it into the live
+        // allowlist so the very next message from this person is accepted
+        // instead of waiting for a daemon restart.
+        self.add_allowed_identity_runtime(open_id);
 
         if let Err(e) = self.send(&SendMessage::new(reply, chat_id)).await {
             tracing::warn!("Lark pairing: failed to send reply: {e:#}");
@@ -1136,6 +1164,23 @@ impl Channel for LarkChannel {
         }
     }
 
+    /// Push an allowlist edit from `config.toml` into the running channel, so
+    /// an operator adding a user does not have to bounce the daemon. The trait
+    /// method plan 115 added; Lark was the last channel not implementing it.
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        if let Ok(mut users) = self.allowed_users.write() {
+            if users.as_slice() != allowed {
+                tracing::info!(
+                    target: "channels",
+                    channel = "lark",
+                    count = allowed.len(),
+                    "applied updated allowlist from config"
+                );
+                *users = allowed.to_vec();
+            }
+        }
+    }
+
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
     }
@@ -1288,7 +1333,10 @@ impl LarkChannel {
                 self.app_secret.clone(),
                 self.verification_token.clone(),
                 None,
-                self.allowed_users.clone(),
+                self.allowed_users
+                    .read()
+                    .map(|u| u.clone())
+                    .unwrap_or_default(),
             )),
             tx,
         };
@@ -1557,6 +1605,61 @@ fn should_respond_in_group(mentions: &[serde_json::Value], identity: Option<&Bot
 
         id_match || name_match
     })
+}
+
+#[cfg(test)]
+mod allowlist_runtime_tests {
+    use super::LarkChannel;
+    use crate::channels::traits::Channel;
+
+    fn ch(users: Vec<&str>) -> LarkChannel {
+        LarkChannel::new(
+            "cli_test_app_id".into(),
+            "test_app_secret".into(),
+            "test_verification_token".into(),
+            None,
+            users.into_iter().map(String::from).collect(),
+        )
+    }
+
+    /// A freshly paired identity must work on the very next message. Before
+    /// this the allowlist was a plain `Vec` fixed at construction, so pairing
+    /// persisted to `config.toml` and then did nothing until a restart.
+    #[test]
+    fn a_paired_identity_is_allowed_immediately() {
+        let c = ch(vec![]);
+        assert!(!c.is_user_allowed("ou_newcomer"));
+        c.add_allowed_identity_runtime("ou_newcomer");
+        assert!(c.is_user_allowed("ou_newcomer"));
+    }
+
+    #[test]
+    fn granting_twice_does_not_duplicate() {
+        let c = ch(vec![]);
+        c.add_allowed_identity_runtime("ou_newcomer");
+        c.add_allowed_identity_runtime("ou_newcomer");
+        assert_eq!(c.allowed_users.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn blank_identities_are_ignored() {
+        let c = ch(vec![]);
+        c.add_allowed_identity_runtime("   ");
+        assert!(c.allowed_users.read().unwrap().is_empty());
+    }
+
+    /// A config edit reaches the live channel, including a removal — the point
+    /// of the trait method, not just additions.
+    #[test]
+    fn apply_allowed_senders_replaces_the_live_list() {
+        let c = ch(vec!["ou_old"]);
+        c.apply_allowed_senders(&["ou_new".to_string()]);
+        assert!(c.is_user_allowed("ou_new"));
+        assert!(
+            !c.is_user_allowed("ou_old"),
+            "a removal must take effect too, or revoking access needs a restart"
+        );
+    }
 }
 
 #[cfg(test)]
