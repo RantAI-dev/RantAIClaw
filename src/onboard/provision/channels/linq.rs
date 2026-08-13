@@ -1,13 +1,15 @@
 //! Linq provisioner — implements [`TuiProvisioner`] for in-TUI Linq setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner,
 };
 use crate::config::schema::LinqConfig;
 use crate::config::Config;
+use crate::onboard::provision::io::{recv_text, send};
 use crate::onboard::provision::validate::allowlist;
 use crate::onboard::provision::validate::http::probe_get;
 use crate::onboard::provision::validate::verdict;
+use crate::onboard::provision::ProvisionerCategory;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -211,46 +213,12 @@ impl TuiProvisioner for LinqProvisioner {
     }
 }
 
-use crate::onboard::provision::ProvisionerCategory;
-
 /// The endpoint the token probe hits, derived from the base the channel itself
 /// talks to so the two cannot drift apart. `/phonenumbers` is what
 /// `LinqChannel::health_check` already uses: it needs the Partner token and
 /// returns 200 only when that token is valid.
 fn linq_probe_url() -> String {
     format!("{}/phonenumbers", crate::channels::linq::LINQ_API_BASE)
-}
-
-async fn send(
-    events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
-    ev: ProvisionEvent,
-) -> Result<()> {
-    events
-        .send(ev)
-        .await
-        .map_err(|e| anyhow::anyhow!("send failed: {e}"))
-}
-
-async fn recv_selection(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    match responses.recv().await {
-        Some(ProvisionResponse::Selection(indices)) => Ok(indices),
-        Some(ProvisionResponse::Cancelled) => anyhow::bail!("cancelled"),
-        Some(_) => anyhow::bail!("unexpected response"),
-        None => anyhow::bail!("channel closed"),
-    }
-}
-
-async fn recv_text(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<String> {
-    match responses.recv().await {
-        Some(ProvisionResponse::Text(t)) => Ok(t),
-        Some(ProvisionResponse::Cancelled) => anyhow::bail!("cancelled"),
-        Some(_) => anyhow::bail!("unexpected response"),
-        None => anyhow::bail!("channel closed"),
-    }
 }
 
 #[cfg(test)]

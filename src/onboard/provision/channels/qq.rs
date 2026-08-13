@@ -1,12 +1,14 @@
 //! QQ provisioner — implements [`TuiProvisioner`] for in-TUI QQ Official Bot setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner,
 };
 use crate::config::schema::QQConfig;
 use crate::config::Config;
+use crate::onboard::provision::io::{recv_text, send};
 use crate::onboard::provision::validate::http::probe_post;
 use crate::onboard::provision::validate::verdict;
+use crate::onboard::provision::ProvisionerCategory;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -201,8 +203,6 @@ impl TuiProvisioner for QqProvisioner {
     }
 }
 
-use crate::onboard::provision::ProvisionerCategory;
-
 /// The token-exchange request body, mirroring what `QqChannel` sends.
 fn qq_probe_body(app_id: &str, app_secret: &str) -> String {
     serde_json::json!({
@@ -226,38 +226,6 @@ fn qq_probe_succeeded(status: u16, body: &str) -> bool {
                 .and_then(|t| t.as_str().map(|s| !s.is_empty()))
         })
         .unwrap_or(false)
-}
-
-async fn send(
-    events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
-    ev: ProvisionEvent,
-) -> Result<()> {
-    events
-        .send(ev)
-        .await
-        .map_err(|e| anyhow::anyhow!("send failed: {e}"))
-}
-
-async fn recv_selection(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    match responses.recv().await {
-        Some(ProvisionResponse::Selection(indices)) => Ok(indices),
-        Some(ProvisionResponse::Cancelled) => anyhow::bail!("cancelled"),
-        Some(_) => anyhow::bail!("unexpected response"),
-        None => anyhow::bail!("channel closed"),
-    }
-}
-
-async fn recv_text(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<String> {
-    match responses.recv().await {
-        Some(ProvisionResponse::Text(t)) => Ok(t),
-        Some(ProvisionResponse::Cancelled) => anyhow::bail!("cancelled"),
-        Some(_) => anyhow::bail!("unexpected response"),
-        None => anyhow::bail!("channel closed"),
-    }
 }
 
 #[cfg(test)]

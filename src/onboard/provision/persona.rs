@@ -8,6 +8,7 @@
 
 use super::traits::{ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner};
 use crate::config::Config;
+use crate::onboard::provision::io::{recv_selection, recv_text, send};
 use crate::persona::{self, PersonaToml, PresetId};
 use crate::profile::Profile;
 use anyhow::Result;
@@ -221,42 +222,6 @@ impl TuiProvisioner for PersonaProvisioner {
         .await?;
 
         Ok(ProvisionOutcome::Configured)
-    }
-}
-
-async fn send(
-    events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
-    ev: ProvisionEvent,
-) -> Result<()> {
-    events
-        .send(ev)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to send provision event: {e}"))
-}
-
-async fn recv_selection(
-    responses: &mut tokio::sync::mpsc::Receiver<super::traits::ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    match responses.recv().await {
-        Some(super::traits::ProvisionResponse::Selection(indices)) => Ok(indices),
-        Some(super::traits::ProvisionResponse::Cancelled) => {
-            anyhow::bail!("persona setup cancelled by user")
-        }
-        Some(_) => anyhow::bail!("unexpected response type"),
-        None => anyhow::bail!("response channel closed unexpectedly"),
-    }
-}
-
-async fn recv_text(
-    responses: &mut tokio::sync::mpsc::Receiver<super::traits::ProvisionResponse>,
-) -> Result<String> {
-    match responses.recv().await {
-        Some(super::traits::ProvisionResponse::Text(t)) => Ok(t),
-        Some(super::traits::ProvisionResponse::Cancelled) => {
-            anyhow::bail!("persona setup cancelled by user")
-        }
-        Some(_) => anyhow::bail!("unexpected response type"),
-        None => anyhow::bail!("response channel closed unexpectedly"),
     }
 }
 

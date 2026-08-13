@@ -12,6 +12,7 @@
 
 use super::traits::{ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner};
 use crate::config::Config;
+use crate::onboard::provision::io::{recv_selection, recv_text, send};
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -249,42 +250,6 @@ async fn prompt_embedding_key(
         Ok(None)
     } else {
         Ok(Some(trimmed.to_string()))
-    }
-}
-
-async fn send(
-    events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
-    ev: ProvisionEvent,
-) -> Result<()> {
-    events
-        .send(ev)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to send provision event: {e}"))
-}
-
-async fn recv_selection(
-    responses: &mut tokio::sync::mpsc::Receiver<super::traits::ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    match responses.recv().await {
-        Some(super::traits::ProvisionResponse::Selection(indices)) => Ok(indices),
-        Some(super::traits::ProvisionResponse::Cancelled) => {
-            anyhow::bail!("knowledge setup cancelled")
-        }
-        Some(_) => anyhow::bail!("unexpected response type"),
-        None => anyhow::bail!("response channel closed unexpectedly"),
-    }
-}
-
-async fn recv_text(
-    responses: &mut tokio::sync::mpsc::Receiver<super::traits::ProvisionResponse>,
-) -> Result<String> {
-    match responses.recv().await {
-        Some(super::traits::ProvisionResponse::Text(t)) => Ok(t),
-        Some(super::traits::ProvisionResponse::Cancelled) => {
-            anyhow::bail!("knowledge setup cancelled")
-        }
-        Some(_) => anyhow::bail!("unexpected response type"),
-        None => anyhow::bail!("response channel closed unexpectedly"),
     }
 }
 
