@@ -11,6 +11,17 @@
 
 use qrcode::render::unicode;
 use qrcode::{EcLevel, QrCode};
+use std::io::IsTerminal as _;
+
+/// Whether the pairing secret may be written to stderr.
+///
+/// A managed daemon's stderr is captured by the journal, so rendering a pair
+/// code or a QR payload there writes a credential — one that links a device to
+/// the account — into a log an operator did not choose to hold. Render only for
+/// an interactive terminal; otherwise point at where to run the flow.
+fn stderr_is_interactive() -> bool {
+    std::io::stderr().is_terminal()
+}
 
 /// Print a framed QR for `payload` to stderr, with `header` above it and a
 /// reminder line below. `payload` is the raw text the phone will decode —
@@ -20,6 +31,15 @@ use qrcode::{EcLevel, QrCode};
 /// glare and partial occlusion) and Unicode half-block characters so the
 /// QR comes out roughly square on most terminal fonts.
 pub fn render_qr_with_header(payload: &str, header: &str) {
+    if !stderr_is_interactive() {
+        tracing::info!(
+            "WhatsApp Web is waiting to be linked, but stderr is not a terminal so the QR \
+             is not being rendered (it would be written to the journal as a credential). \
+             Run the pairing flow interactively: `rantaiclaw channels pair whatsapp`."
+        );
+        return;
+    }
+
     let code = match QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M) {
         Ok(c) => c,
         Err(e) => {
@@ -54,6 +74,15 @@ pub fn render_qr_with_header(payload: &str, header: &str) {
 /// Print a human-readable pair code in a framed block. Used when the device
 /// supports the digit-based pairing path (e.g. WhatsApp's 8-character code).
 pub fn render_pair_code(code: &str) {
+    if !stderr_is_interactive() {
+        tracing::info!(
+            "WhatsApp Web issued a pair code, but stderr is not a terminal so it is not being \
+             printed (it would be written to the journal as a credential). Run the pairing flow \
+             interactively: `rantaiclaw channels pair whatsapp`."
+        );
+        return;
+    }
+
     eprintln!();
     eprintln!("┌─ Pair code received");
     eprintln!();
@@ -80,6 +109,22 @@ mod tests {
         assert!(!art.is_empty());
         // Sanity: lines are non-trivial in length.
         assert!(art.lines().any(|l| l.chars().count() > 10));
+    }
+
+    /// Both renderers refuse to write the secret when stderr is not a
+    /// terminal — a managed daemon's stderr goes to the journal, and a pair
+    /// code links a device to the account.
+    #[test]
+    fn secrets_are_not_rendered_to_a_non_tty() {
+        // The test harness captures stderr, so this is the non-TTY path; both
+        // calls must return without printing. They are covered here for the
+        // no-panic contract as well.
+        assert!(
+            !stderr_is_interactive(),
+            "the test harness should not hand us a TTY"
+        );
+        render_pair_code("ABCD-EFGH");
+        render_qr_with_header("1@payload", "header");
     }
 
     #[test]
