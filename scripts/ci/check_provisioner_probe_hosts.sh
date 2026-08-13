@@ -38,7 +38,6 @@ CHAN_DIR="src/channels"
 # host<TAB>provisioner — each MUST name the plan that resolves it.
 # Delete a line when its plan lands; the check then enforces it for real.
 KNOWN_MISMATCHES=$(cat <<'EOF'
-api.linq.com	linq	plan 132 — provisioner probes api.linq.com, runtime uses api.linqapp.com
 EOF
 )
 

@@ -19,7 +19,7 @@ use crate::providers::{
 };
 use anyhow::{bail, Context, Result};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -2419,10 +2419,10 @@ pub(crate) fn setup_provider(
             anyhow::bail!("Custom provider requires a base URL.");
         }
 
-        let api_key: String = Input::new()
+        let api_key: String = Password::new()
             .with_prompt("  API key (or Enter to skip if not needed)")
-            .allow_empty(true)
-            .interact_text()?;
+            .allow_empty_password(true)
+            .interact()?;
 
         let model: String = Input::new()
             .with_prompt("  Model name (e.g. llama3, gpt-4o, mistral)")
@@ -2489,10 +2489,10 @@ pub(crate) fn setup_provider(
                 style(":cloud").yellow()
             ));
 
-            let key: String = Input::new()
+            let key: String = Password::new()
                 .with_prompt("  API key for remote Ollama endpoint (or Enter to skip)")
-                .allow_empty(true)
-                .interact_text()?;
+                .allow_empty_password(true)
+                .interact()?;
 
             if key.trim().is_empty() {
                 print_bullet(&format!(
@@ -2524,10 +2524,10 @@ pub(crate) fn setup_provider(
         ));
         print_bullet("No API key needed unless your llama.cpp server is started with --api-key.");
 
-        let key: String = Input::new()
+        let key: String = Password::new()
             .with_prompt("  API key for llama.cpp server (or Enter to skip)")
-            .allow_empty(true)
-            .interact_text()?;
+            .allow_empty_password(true)
+            .interact()?;
 
         if key.trim().is_empty() {
             print_bullet(&format!(
@@ -2560,10 +2560,10 @@ pub(crate) fn setup_provider(
                 String::new() // Empty key = will use CLI tokens
             } else {
                 print_bullet("Get your API key at: https://aistudio.google.com/app/apikey");
-                Input::new()
+                Password::new()
                     .with_prompt("  Paste your Gemini API key")
-                    .allow_empty(true)
-                    .interact_text()?
+                    .allow_empty_password(true)
+                    .interact()?
             }
         } else if std::env::var("GEMINI_API_KEY").is_ok() {
             print_bullet(&format!(
@@ -2576,10 +2576,10 @@ pub(crate) fn setup_provider(
             print_bullet("Or run `gemini` CLI to authenticate (tokens will be reused).");
             println!();
 
-            Input::new()
+            Password::new()
                 .with_prompt("  Paste your Gemini API key (or press Enter to skip)")
-                .allow_empty(true)
-                .interact_text()?
+                .allow_empty_password(true)
+                .interact()?
         }
     } else if canonical_provider_name(provider_name) == "anthropic" {
         if std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok() {
@@ -2604,10 +2604,10 @@ pub(crate) fn setup_provider(
             print_bullet("Or run `claude setup-token` to get an OAuth setup-token.");
             println!();
 
-            let key: String = Input::new()
+            let key: String = Password::new()
                 .with_prompt("  Paste your API key or setup-token (or press Enter to skip)")
-                .allow_empty(true)
-                .interact_text()?;
+                .allow_empty_password(true)
+                .interact()?;
 
             if key.is_empty() {
                 print_bullet(&format!(
@@ -2636,12 +2636,12 @@ pub(crate) fn setup_provider(
             print_bullet("You can also set QWEN_OAUTH_TOKEN directly.");
             println!();
 
-            let key: String = Input::new()
+            let key: String = Password::new()
                 .with_prompt(
                     "  Paste your Qwen OAuth token (or press Enter to auto-detect cached OAuth)",
                 )
-                .allow_empty(true)
-                .interact_text()?;
+                .allow_empty_password(true)
+                .interact()?;
 
             if key.trim().is_empty() {
                 print_bullet(&format!(
@@ -2725,10 +2725,10 @@ pub(crate) fn setup_provider(
             print_bullet("You can also set it later via env var or config file.");
             println!();
 
-            let key: String = Input::new()
+            let key: String = Password::new()
                 .with_prompt("  Paste your API key (or press Enter to skip)")
-                .allow_empty(true)
-                .interact_text()?;
+                .allow_empty_password(true)
+                .interact()?;
 
             if key.is_empty() {
                 let env_var = provider_env_var(provider_name);
@@ -3002,10 +3002,10 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         print_bullet("RantaiClaw uses Composio as a tool — your core agent stays local.");
         println!();
 
-        let api_key: String = Input::new()
+        let api_key: String = Password::new()
             .with_prompt("  Composio API key (or Enter to skip)")
-            .allow_empty(true)
-            .interact_text()?;
+            .allow_empty_password(true)
+            .interact()?;
 
         if api_key.trim().is_empty() {
             println!(
@@ -3558,9 +3558,9 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Copy the bot token and paste it below");
                 println!();
 
-                let token: String = Input::new()
+                let token: String = Password::new()
                     .with_prompt("  Bot token (from @BotFather)")
-                    .interact_text()?;
+                    .interact()?;
 
                 if token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
@@ -3657,7 +3657,7 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("4. Invite bot to your server with messages permission");
                 println!();
 
-                let token: String = Input::new().with_prompt("  Bot token").interact_text()?;
+                let token: String = Password::new().with_prompt("  Bot token").interact()?;
 
                 if token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
@@ -3755,9 +3755,9 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Install to workspace and copy the Bot Token");
                 println!();
 
-                let token: String = Input::new()
+                let token: String = Password::new()
                     .with_prompt("  Bot token (xoxb-...)")
-                    .interact_text()?;
+                    .interact()?;
 
                 if token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
@@ -3812,10 +3812,10 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let app_token: String = Input::new()
+                let app_token: String = Password::new()
                     .with_prompt("  App token (xapp-..., optional, Enter to skip)")
-                    .allow_empty(true)
-                    .interact_text()?;
+                    .allow_empty_password(true)
+                    .interact()?;
 
                 let channel: String = Input::new()
                     .with_prompt("  Default channel ID (optional, Enter to skip)")
@@ -3935,7 +3935,7 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                 }
 
                 let access_token: String =
-                    Input::new().with_prompt("  Access token").interact_text()?;
+                    Password::new().with_prompt("  Access token").interact()?;
 
                 if access_token.trim().is_empty() {
                     println!("  {} Skipped — token required", style("→").dim());
@@ -4151,9 +4151,9 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("4. Configure webhook URL to: https://your-domain/whatsapp");
                 println!();
 
-                let access_token: String = Input::new()
+                let access_token: String = Password::new()
                     .with_prompt("  Access token (from Meta Developers)")
-                    .interact_text()?;
+                    .interact()?;
 
                 if access_token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
@@ -4247,9 +4247,9 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                 print_bullet("3. Configure webhook URL to: https://your-domain/linq");
                 println!();
 
-                let api_token: String = Input::new()
+                let api_token: String = Password::new()
                     .with_prompt("  API token (Linq Partner API token)")
-                    .interact_text()?;
+                    .interact()?;
 
                 if api_token.trim().is_empty() {
                     println!("  {} Skipped", style("→").dim());
@@ -4310,10 +4310,10 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     users_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
 
-                let signing_secret: String = Input::new()
+                let signing_secret: String = Password::new()
                     .with_prompt("  Webhook signing secret (optional, press Enter to skip)")
-                    .allow_empty(true)
-                    .interact_text()?;
+                    .allow_empty_password(true)
+                    .interact()?;
 
                 config.linq = Some(LinqConfig {
                     api_token: api_token.trim().to_string(),
@@ -4412,20 +4412,20 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                 println!();
                 print_bullet("Optional authentication (press Enter to skip each):");
 
-                let server_password: String = Input::new()
+                let server_password: String = Password::new()
                     .with_prompt("  Server password (for bouncers like ZNC, leave empty if none)")
-                    .allow_empty(true)
-                    .interact_text()?;
+                    .allow_empty_password(true)
+                    .interact()?;
 
-                let nickserv_password: String = Input::new()
+                let nickserv_password: String = Password::new()
                     .with_prompt("  NickServ password (leave empty if none)")
-                    .allow_empty(true)
-                    .interact_text()?;
+                    .allow_empty_password(true)
+                    .interact()?;
 
-                let sasl_password: String = Input::new()
+                let sasl_password: String = Password::new()
                     .with_prompt("  SASL PLAIN password (leave empty if none)")
-                    .allow_empty(true)
-                    .interact_text()?;
+                    .allow_empty_password(true)
+                    .interact()?;
 
                 let verify_tls: bool = Confirm::new()
                     .with_prompt("  Verify TLS certificate?")
@@ -4479,10 +4479,10 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     .default("8080".into())
                     .interact_text()?;
 
-                let secret: String = Input::new()
+                let secret: String = Password::new()
                     .with_prompt("  Secret (optional, Enter to skip)")
-                    .allow_empty(true)
-                    .interact_text()?;
+                    .allow_empty_password(true)
+                    .interact()?;
 
                 config.webhook = Some(WebhookConfig {
                     port: port.parse().unwrap_or(8080),
@@ -4520,9 +4520,9 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let client_secret: String = Input::new()
+                let client_secret: String = Password::new()
                     .with_prompt("  Client Secret (AppSecret)")
-                    .interact_text()?;
+                    .interact()?;
 
                 // Test connection
                 print!("  {} Testing connection... ", style("⏳").dim());
@@ -4588,8 +4588,7 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let app_secret: String =
-                    Input::new().with_prompt("  App Secret").interact_text()?;
+                let app_secret: String = Password::new().with_prompt("  App Secret").interact()?;
 
                 // Test connection
                 print!("  {} Testing connection... ", style("⏳").dim());
@@ -4667,8 +4666,7 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let app_secret: String =
-                    Input::new().with_prompt("  App Secret").interact_text()?;
+                let app_secret: String = Password::new().with_prompt("  App Secret").interact()?;
                 let app_secret = app_secret.trim().to_string();
 
                 if app_secret.is_empty() {
@@ -4772,10 +4770,10 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                 };
 
                 let verification_token = if receive_mode == LarkReceiveMode::Webhook {
-                    let token: String = Input::new()
+                    let token: String = Password::new()
                         .with_prompt("  Verification Token (optional, for Webhook mode)")
-                        .allow_empty(true)
-                        .interact_text()?;
+                        .allow_empty_password(true)
+                        .interact()?;
                     if token.is_empty() {
                         None
                     } else {
@@ -4918,9 +4916,9 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
         1 => {
             println!();
             print_bullet("Get your tunnel token from the Cloudflare Zero Trust dashboard.");
-            let tunnel_value: String = Input::new()
+            let tunnel_value: String = Password::new()
                 .with_prompt("  Cloudflare tunnel token")
-                .interact_text()?;
+                .interact()?;
             if tunnel_value.trim().is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()
@@ -4970,9 +4968,9 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
             print_bullet(
                 "Get your auth token at https://dashboard.ngrok.com/get-started/your-authtoken",
             );
-            let auth_token: String = Input::new()
+            let auth_token: String = Password::new()
                 .with_prompt("  ngrok auth token")
-                .interact_text()?;
+                .interact()?;
             if auth_token.trim().is_empty() {
                 println!("  {} Skipped", style("→").dim());
                 TunnelConfig::default()

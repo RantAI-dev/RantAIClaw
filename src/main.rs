@@ -2979,8 +2979,17 @@ async fn run_provisioner_headless(
                 ProvisionEvent::QrCode { payload, caption } => {
                     println!("\n=== WhatsApp Web Pairing QR ===");
                     println!("{caption}");
-                    println!("Raw payload (for debugging): {payload}");
                     println!("=============================\n");
+                    let _ = std::io::stdout().flush();
+                    // The payload is device-linking credential material: anyone
+                    // who reads it out of a captured stdout can link their own
+                    // device. This is the headless path, whose stdout is what CI
+                    // and install scripts record — so render the QR the operator
+                    // actually needs instead of printing the secret behind it.
+                    rantaiclaw::channels::qr_terminal::render_qr_with_header(
+                        &payload,
+                        "WhatsApp Web Pairing QR",
+                    );
                     println!(
                         "Scan the QR code above with WhatsApp > Linked Devices > Link a Device"
                     );
