@@ -2567,7 +2567,7 @@ mod tests {
         ch.typing_handles.lock().insert(
             "123".to_string(),
             tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_mins(1)).await;
             }),
         );
 
@@ -2587,7 +2587,7 @@ mod tests {
             ch.typing_handles.lock().insert(
                 chat.to_string(),
                 tokio::spawn(async {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    tokio::time::sleep(Duration::from_mins(1)).await;
                 }),
             );
         }
@@ -2608,7 +2608,7 @@ mod tests {
         ch.typing_handles.lock().insert(
             "chat_a".to_string(),
             tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_mins(1)).await;
             }),
         );
 
@@ -2626,7 +2626,7 @@ mod tests {
             ch.typing_handles.lock().insert(
                 chat.to_string(),
                 tokio::spawn(async {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    tokio::time::sleep(Duration::from_mins(1)).await;
                 }),
             );
         }
