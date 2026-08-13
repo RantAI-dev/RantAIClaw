@@ -1,7 +1,12 @@
 pub mod approvals;
 pub mod channels;
-#[cfg(feature = "kb")]
+// `io` is not feature-gated: all 36 provisioner modules import it. It landed
+// between the `kb` attribute and `knowledge` in #486, which silently moved the
+// gate onto `io` — so a `--no-default-features` build lost the module and every
+// importer with it. The PR could not catch that: the feature matrix is
+// label-gated behind `ci:full` on pull requests and only runs on push to main.
 pub mod io;
+#[cfg(feature = "kb")]
 pub mod knowledge;
 pub mod login;
 pub mod mcp;
