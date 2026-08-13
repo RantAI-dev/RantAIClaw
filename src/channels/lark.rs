@@ -219,6 +219,9 @@ pub struct LarkChannel {
     encrypt_key: Option<String>,
     /// Cached tenant access token
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
+    /// Who this bot is, resolved once per listener start. `None` until
+    /// resolved, or permanently if the lookup failed.
+    bot_identity: Arc<RwLock<Option<BotIdentity>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
 }
@@ -241,6 +244,7 @@ impl LarkChannel {
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             encrypt_key: None,
             tenant_token: Arc::new(RwLock::new(None)),
+            bot_identity: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -419,6 +423,10 @@ impl LarkChannel {
     /// (the caller reconnects).
     #[allow(clippy::too_many_lines)]
     async fn listen_ws(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        // Resolve who we are before the first group message arrives, so the
+        // mention gate has something to compare against.
+        self.ensure_bot_identity().await;
+
         let (wss_url, client_config) = self.get_ws_endpoint().await?;
         let service_id = wss_url
             .split('?')
@@ -627,7 +635,10 @@ impl LarkChannel {
                     if text.is_empty() { continue; }
 
                     // Group-chat: only respond when explicitly @-mentioned
-                    if lark_msg.chat_type == "group" && !should_respond_in_group(&lark_msg.mentions) {
+                    let me = self.bot_identity.read().await.clone();
+                    if lark_msg.chat_type == "group"
+                        && !should_respond_in_group(&lark_msg.mentions, me.as_ref())
+                    {
                         continue;
                     }
 
@@ -692,6 +703,70 @@ impl LarkChannel {
             .filter(|o| o.starts_with("oc_"))
             .cloned()
             .collect()
+    }
+
+    /// Ask the platform who this bot is, so a group mention can be matched
+    /// against it.
+    ///
+    /// Called once when a listener starts, not per message: the answer does not
+    /// change while the process runs, and a per-message lookup would put a
+    /// network round trip in front of every group message.
+    async fn fetch_bot_identity(&self) -> anyhow::Result<BotIdentity> {
+        let token = self.get_tenant_access_token().await?;
+        let url = format!("{}/bot/v3/info", self.api_base());
+        let resp: serde_json::Value = self
+            .http_client()
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let bot = resp.get("bot").unwrap_or(&serde_json::Value::Null);
+        let identity = BotIdentity {
+            open_id: bot
+                .get("open_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: bot
+                .get("app_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        };
+
+        if identity.open_id.is_empty() && identity.name.is_empty() {
+            anyhow::bail!("bot info carried neither open_id nor app_name");
+        }
+        Ok(identity)
+    }
+
+    /// Resolve and cache the bot identity, warning — but not failing — when the
+    /// lookup does not work. See [`should_respond_in_group`] for why this
+    /// degrades permissively rather than going silent.
+    async fn ensure_bot_identity(&self) {
+        if self.bot_identity.read().await.is_some() {
+            return;
+        }
+        match self.fetch_bot_identity().await {
+            Ok(id) => {
+                tracing::info!(
+                    open_id = %id.open_id,
+                    name = %id.name,
+                    "Lark: resolved bot identity for group mention matching"
+                );
+                *self.bot_identity.write().await = Some(id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Lark: could not resolve the bot's own identity ({e}). Group mention \
+                     matching falls back to responding whenever anyone is mentioned — \
+                     noisier than intended, but the channel keeps working."
+                );
+            }
+        }
     }
 
     /// Check if a user open_id is allowed
@@ -1441,9 +1516,111 @@ fn strip_at_placeholders(text: &str) -> String {
     result
 }
 
-/// In group chats, only respond when the bot is explicitly @-mentioned.
-fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
-    !mentions.is_empty()
+/// Who the bot is, as the platform reports it. Used to tell a mention *of the
+/// bot* from a mention of anyone else.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BotIdentity {
+    pub open_id: String,
+    pub name: String,
+}
+
+/// In group chats, only respond when **the bot** is explicitly @-mentioned.
+///
+/// This used to be `!mentions.is_empty()`, so the bot answered whenever anyone
+/// at all was mentioned — in an active group that is close to answering
+/// everything.
+///
+/// Two sources, mirroring `contains_bot_mention_mm`: the mention's `id.open_id`
+/// and its display `name`. Lark populates the id for app mentions and the name
+/// for both, and neither is reliable alone.
+///
+/// `identity` is `None` when the bot-info lookup failed at startup. That falls
+/// back to the old permissive behaviour on purpose: the alternative — treating
+/// an unknown identity as "never mentioned" — silences the channel completely
+/// on a transient API error, which reads as a broken bot rather than a
+/// degraded one. The caller warns when it happens.
+fn should_respond_in_group(mentions: &[serde_json::Value], identity: Option<&BotIdentity>) -> bool {
+    let Some(me) = identity else {
+        return !mentions.is_empty();
+    };
+
+    mentions.iter().any(|m| {
+        let id_match = !me.open_id.is_empty()
+            && m.pointer("/id/open_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == me.open_id);
+
+        let name_match = !me.name.is_empty()
+            && m.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case(&me.name));
+
+        id_match || name_match
+    })
+}
+
+#[cfg(test)]
+mod mention_gate_tests {
+    use super::{should_respond_in_group, BotIdentity};
+
+    fn me() -> BotIdentity {
+        BotIdentity {
+            open_id: "ou_rantaiclaw_bot".into(),
+            name: "RantaiClawAgent".into(),
+        }
+    }
+
+    fn mention(open_id: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({ "key": "@_user_1", "id": { "open_id": open_id }, "name": name })
+    }
+
+    /// The defect: the gate was `!mentions.is_empty()`, so mentioning any
+    /// colleague in a busy group made the bot answer.
+    #[test]
+    fn someone_elses_mention_does_not_wake_the_bot() {
+        let others = vec![mention("ou_someone_else", "Another Person")];
+        assert!(!should_respond_in_group(&others, Some(&me())));
+    }
+
+    #[test]
+    fn the_bots_own_open_id_wakes_it() {
+        let m = vec![mention("ou_rantaiclaw_bot", "")];
+        assert!(should_respond_in_group(&m, Some(&me())));
+    }
+
+    /// Lark populates the id for app mentions and the name for both, so
+    /// neither source is sufficient alone.
+    #[test]
+    fn the_bots_display_name_also_wakes_it() {
+        let m = vec![mention("", "rantaiclawagent")];
+        assert!(
+            should_respond_in_group(&m, Some(&me())),
+            "name match must be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn the_bot_is_found_among_several_mentions() {
+        let m = vec![
+            mention("ou_someone_else", "Another Person"),
+            mention("ou_rantaiclaw_bot", "RantaiClawAgent"),
+        ];
+        assert!(should_respond_in_group(&m, Some(&me())));
+    }
+
+    #[test]
+    fn no_mentions_never_wakes_it() {
+        assert!(!should_respond_in_group(&[], Some(&me())));
+    }
+
+    /// When the identity lookup failed we keep the old permissive behaviour
+    /// rather than going silent — a degraded bot beats one that looks broken.
+    #[test]
+    fn an_unknown_identity_falls_back_to_permissive() {
+        let others = vec![mention("ou_someone_else", "Another Person")];
+        assert!(should_respond_in_group(&others, None));
+        assert!(!should_respond_in_group(&[], None));
+    }
 }
 
 #[cfg(test)]
