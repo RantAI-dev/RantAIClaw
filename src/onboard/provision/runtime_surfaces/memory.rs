@@ -210,18 +210,3 @@ impl TuiProvisioner for MemoryProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_memory() {
-        assert_eq!(MemoryProvisioner::new().name(), "memory");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!MemoryProvisioner::new().description().is_empty());
-    }
-}

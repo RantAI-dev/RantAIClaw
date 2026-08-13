@@ -24,7 +24,7 @@
 
 use crate::config::Config;
 use crate::onboard::provision::registry::{available, provisioner_for};
-use crate::onboard::provision::{ProvisionEvent, ProvisionIo, ProvisionResponse};
+use crate::onboard::provision::{ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse};
 use crate::profile::Profile;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -108,6 +108,84 @@ async fn run_provisioner_headless(
     Ok(events)
 }
 
+/// Drive a registered provisioner and hand back what it decided *and* what it
+/// wrote, so a caller can assert on both.
+///
+/// `wrote` reads the channel's own slot out of the config the provisioner
+/// mutated — the old runner dropped that config without looking at it, which
+/// is why a provisioner that wrote nothing still passed.
+async fn run_and_capture(
+    name: &str,
+    responses: Vec<ProvisionResponse>,
+    wrote: fn(&Config) -> bool,
+) -> (anyhow::Result<ProvisionOutcome>, Vec<ProvisionEvent>, bool) {
+    #[cfg(test)]
+    let _env = crate::test_env::ENV_LOCK.lock().await;
+    let _offline = OfflineProbes::engage();
+
+    let Some(provisioner) = provisioner_for(name) else {
+        return (
+            Err(anyhow::anyhow!("no provisioner registered: {name}")),
+            Vec::new(),
+            false,
+        );
+    };
+
+    let (event_tx, mut event_rx) = mpsc::channel::<ProvisionEvent>(64);
+    let (resp_tx, resp_rx) = mpsc::channel::<ProvisionResponse>(64);
+    let profile = Profile {
+        name: "provisioning-smoke".to_string(),
+        root: PathBuf::from("/tmp/rantaiclaw-smoke"),
+    };
+    let io = ProvisionIo {
+        events: event_tx,
+        responses: resp_rx,
+    };
+
+    let handle = tokio::spawn(async move {
+        let mut cfg = Config::default();
+        let outcome = provisioner.run(&mut cfg, &profile, io).await;
+        (outcome, cfg)
+    });
+
+    // Answer prompts from the script, in order. Anything past the end gets an
+    // empty answer, which every required field rejects — so a script that is
+    // too short shows up as an abort rather than as a hang.
+    let mut events = Vec::new();
+    let mut idx = 0usize;
+    while let Some(ev) = event_rx.recv().await {
+        events.push(ev.clone());
+        let reply = match &ev {
+            ProvisionEvent::Prompt { .. } => Some(
+                responses
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or(ProvisionResponse::Text(String::new())),
+            ),
+            ProvisionEvent::Choose { multi, .. } => Some(responses.get(idx).cloned().unwrap_or(
+                ProvisionResponse::Selection(if *multi { vec![] } else { vec![0] }),
+            )),
+            _ => None,
+        };
+        if let Some(r) = reply {
+            idx = idx.saturating_add(1);
+            let _ = resp_tx.send(r).await;
+        }
+    }
+
+    match handle.await {
+        Ok((outcome, cfg)) => {
+            let written = wrote(&cfg);
+            (outcome, events, written)
+        }
+        Err(e) => (
+            Err(anyhow::anyhow!("provisioner task died: {e}")),
+            events,
+            false,
+        ),
+    }
+}
+
 fn assert_terminal_event(events: &[ProvisionEvent], name: &str) {
     let has_terminal = events.iter().any(|e| {
         matches!(
@@ -120,6 +198,88 @@ fn assert_terminal_event(events: &[ProvisionEvent], name: &str) {
         "provisioner '{name}' never emitted Done or Failed — events: {:#?}",
         events
     );
+}
+
+// ── Outcome-and-config assertions ─────────────────────────────────────────────
+//
+// `assert_terminal_event` accepts `Failed` as a pass, and the config it ran
+// against was dropped without being looked at. Combined with a first response
+// of `Text("")` — which every channel's first prompt rejects as a missing
+// required field — no line of credential collection, probing, allowlist
+// parsing or config writing was ever executed. The pair below is what makes an
+// abort distinguishable from a success.
+
+/// A run that configured the channel: `Configured`, and the config section is
+/// actually populated.
+fn assert_configured(
+    outcome: &anyhow::Result<ProvisionOutcome>,
+    written: bool,
+    name: &str,
+    events: &[ProvisionEvent],
+) {
+    match outcome {
+        Ok(ProvisionOutcome::Configured) => {}
+        other => panic!("'{name}' should have configured; got {other:?}\nevents: {events:#?}"),
+    }
+    assert!(
+        written,
+        "'{name}' reported Configured but wrote no config section"
+    );
+}
+
+/// A run that stopped early: an abort, and the config section is untouched.
+fn assert_aborted(
+    outcome: &anyhow::Result<ProvisionOutcome>,
+    written: bool,
+    name: &str,
+    events: &[ProvisionEvent],
+) {
+    match outcome {
+        Ok(ProvisionOutcome::Aborted(_)) => {}
+        other => panic!("'{name}' should have aborted; got {other:?}\nevents: {events:#?}"),
+    }
+    assert!(
+        !written,
+        "'{name}' aborted but still wrote a config section"
+    );
+}
+
+/// Forces every credential probe to fail at the transport layer, whatever the
+/// runner's connectivity.
+///
+/// Without this the smoke tests are non-deterministic in the worst way: a
+/// runner *with* egress gets a real 401 from the platform — a `Rejected`
+/// verdict, whose safe default is to discard — while a runner *without* egress
+/// gets a transport error — `Inconclusive`, whose safe default is to persist.
+/// The same test would pass on one and fail on the other.
+///
+/// Port 1 is reserved and closed, so the proxy connect is refused instantly:
+/// no DNS, no eight-second timeout, and the probe reaches the provisioner as
+/// the inconclusive result a happy-path smoke run wants.
+struct OfflineProbes {
+    prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl OfflineProbes {
+    fn engage() -> Self {
+        let mut prev = Vec::new();
+        for key in ["HTTPS_PROXY", "HTTP_PROXY"] {
+            prev.push((key, std::env::var_os(key)));
+            std::env::set_var(key, "http://127.0.0.1:1");
+        }
+        Self { prev }
+    }
+}
+
+impl Drop for OfflineProbes {
+    fn drop(&mut self) {
+        for (key, value) in self.prev.drain(..) {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 }
 
 fn default_responses() -> Vec<ProvisionResponse> {
@@ -146,6 +306,15 @@ fn assert_no_panic(events: &[ProvisionEvent]) {
     }
 }
 
+/// A breadth sweep: every registered provisioner reaches a terminal state
+/// without panicking.
+///
+/// This is deliberately the weaker of the two layers. It cannot assert what a
+/// provisioner *wrote*, because it discards the config — so the fifteen
+/// channels each carry their own happy-path and abort pair below, where the
+/// config is captured and asserted on. Keeping the sweep as well is what
+/// covers the twenty-odd non-channel provisioners, and what catches a newly
+/// registered provisioner that hangs.
 #[tokio::test]
 async fn smoke_all_registered_provisioners() {
     for (name, desc) in available() {
@@ -306,112 +475,634 @@ mod skills {
 }
 
 mod telegram {
-    use super::*;
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.telegram.is_some()
+    }
 
     #[tokio::test]
-    async fn telegram_completes() {
-        let events = run_provisioner_headless(
+    async fn telegram_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
             "telegram",
             vec![
-                ProvisionResponse::Text(String::new()), // bot token
-                ProvisionResponse::Selection(vec![0]),  // enable/disable
+                ProvisionResponse::Text("00000000:placeholder-bot-token".into()),
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive → save anyway
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
             ],
+            wrote,
         )
-        .await
-        .unwrap();
+        .await;
         assert_no_panic(&events);
-        assert_terminal_event(&events, "telegram");
+        assert_configured(&outcome, written, "telegram", &events);
+    }
+
+    #[tokio::test]
+    async fn telegram_aborts_without_a_token() {
+        let (outcome, events, written) = run_and_capture(
+            "telegram",
+            vec![ProvisionResponse::Text(String::new())],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "telegram", &events);
     }
 }
 
 mod discord {
-    use super::*;
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.discord.is_some()
+    }
 
     #[tokio::test]
-    async fn discord_completes() {
-        let events = run_provisioner_headless(
+    async fn discord_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
             "discord",
             vec![
-                ProvisionResponse::Text(String::new()), // bot token
-                ProvisionResponse::Selection(vec![0]),  // enable/disable
+                ProvisionResponse::Text("placeholder-discord-bot-token".into()), // bot token
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text(String::new()), // guild id (optional)
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
+                ProvisionResponse::Selection(vec![0]), // bot mode
             ],
+            wrote,
         )
-        .await
-        .unwrap();
+        .await;
         assert_no_panic(&events);
-        assert_terminal_event(&events, "discord");
+        assert_configured(&outcome, written, "discord", &events);
+    }
+
+    #[tokio::test]
+    async fn discord_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) = run_and_capture(
+            "discord",
+            vec![ProvisionResponse::Text(String::new())],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "discord", &events);
     }
 }
 
 mod slack {
-    use super::*;
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.slack.is_some()
+    }
 
     #[tokio::test]
-    async fn slack_completes() {
-        let events = run_provisioner_headless(
+    async fn slack_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
             "slack",
             vec![
-                ProvisionResponse::Text(String::new()), // bot token
-                ProvisionResponse::Text(String::new()), // signing secret
+                // No `xoxb-` prefix on purpose: secret scanners match on the
+                // prefix, and this repo's fixtures have been rejected at push
+                // time for looking real. The provisioner does not check shape.
+                ProvisionResponse::Text("placeholder-slack-bot-token".into()), // bot token
+                ProvisionResponse::Text(String::new()), // app token (optional)
+                ProvisionResponse::Selection(vec![0]),  // probe inconclusive -> save anyway
+                ProvisionResponse::Text(String::new()), // default channel (optional)
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
             ],
+            wrote,
         )
-        .await
-        .unwrap();
+        .await;
         assert_no_panic(&events);
-        assert_terminal_event(&events, "slack");
+        assert_configured(&outcome, written, "slack", &events);
+    }
+
+    #[tokio::test]
+    async fn slack_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) =
+            run_and_capture("slack", vec![ProvisionResponse::Text(String::new())], wrote).await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "slack", &events);
     }
 }
 
 mod signal {
-    use super::*;
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.signal.is_some()
+    }
 
     #[tokio::test]
-    async fn signal_completes() {
-        let events =
-            run_provisioner_headless("signal", vec![ProvisionResponse::Text(String::new())])
-                .await
-                .unwrap();
+    async fn signal_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
+            "signal",
+            vec![
+                ProvisionResponse::Text("http://127.0.0.1:1".into()), // signal-cli daemon url
+                ProvisionResponse::Text("+15550001111".into()),       // account
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text("+15550002222".into()), // allowed senders
+            ],
+            wrote,
+        )
+        .await;
         assert_no_panic(&events);
-        assert_terminal_event(&events, "signal");
+        assert_configured(&outcome, written, "signal", &events);
+    }
+
+    #[tokio::test]
+    async fn signal_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) = run_and_capture(
+            "signal",
+            vec![ProvisionResponse::Text(String::new())],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "signal", &events);
     }
 }
 
 mod matrix {
-    use super::*;
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.matrix.is_some()
+    }
 
     #[tokio::test]
-    async fn matrix_completes() {
-        let events = run_provisioner_headless(
+    async fn matrix_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
             "matrix",
             vec![
-                ProvisionResponse::Text(String::new()), // homeserver
-                ProvisionResponse::Text(String::new()), // user_id
-                ProvisionResponse::Text(String::new()), // password/token
+                ProvisionResponse::Text("http://127.0.0.1:1".into()), // homeserver
+                ProvisionResponse::Text("placeholder-matrix-access-token".into()), // access token
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text("@rantaiclaw_user:example.com".into()), // user id
+                ProvisionResponse::Text(String::new()), // device id (optional)
+                ProvisionResponse::Text("!placeholder:example.com".into()), // room id
+                ProvisionResponse::Text("@rantaiclaw_user:example.com".into()), // allowed users
             ],
+            wrote,
         )
-        .await
-        .unwrap();
+        .await;
         assert_no_panic(&events);
-        assert_terminal_event(&events, "matrix");
+        assert_configured(&outcome, written, "matrix", &events);
+    }
+
+    #[tokio::test]
+    async fn matrix_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) = run_and_capture(
+            "matrix",
+            vec![ProvisionResponse::Text(String::new())],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "matrix", &events);
     }
 }
 
 mod mattermost {
-    use super::*;
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.mattermost.is_some()
+    }
 
     #[tokio::test]
-    async fn mattermost_completes() {
-        let events = run_provisioner_headless(
+    async fn mattermost_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
             "mattermost",
             vec![
-                ProvisionResponse::Text(String::new()), // server URL
-                ProvisionResponse::Text(String::new()), // token
+                ProvisionResponse::Text("http://127.0.0.1:1".into()), // server url
+                ProvisionResponse::Text("placeholder-mattermost-bot-token".into()), // bot token
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text(String::new()), // default channel (optional)
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
+                ProvisionResponse::Selection(vec![0]), // thread replies
             ],
+            wrote,
         )
-        .await
-        .unwrap();
+        .await;
         assert_no_panic(&events);
-        assert_terminal_event(&events, "mattermost");
+        assert_configured(&outcome, written, "mattermost", &events);
+    }
+
+    #[tokio::test]
+    async fn mattermost_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) = run_and_capture(
+            "mattermost",
+            vec![ProvisionResponse::Text(String::new())],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "mattermost", &events);
+    }
+}
+
+mod dingtalk {
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.dingtalk.is_some()
+    }
+
+    #[tokio::test]
+    async fn dingtalk_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
+            "dingtalk",
+            vec![
+                ProvisionResponse::Text("placeholder-client-id".into()), // client id
+                ProvisionResponse::Text("placeholder-client-secret".into()), // client secret
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
+            ],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_configured(&outcome, written, "dingtalk", &events);
+    }
+
+    #[tokio::test]
+    async fn dingtalk_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) = run_and_capture(
+            "dingtalk",
+            vec![ProvisionResponse::Text(String::new())],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "dingtalk", &events);
+    }
+}
+
+mod nextcloud_talk {
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.nextcloud_talk.is_some()
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
+            "nextcloud-talk",
+            vec![
+                ProvisionResponse::Text("http://127.0.0.1:1".into()), // base url
+                ProvisionResponse::Text("placeholder-app-token".into()), // app token
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text(String::new()), // webhook secret (optional)
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
+            ],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_configured(&outcome, written, "nextcloud-talk", &events);
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) = run_and_capture(
+            "nextcloud-talk",
+            vec![ProvisionResponse::Text(String::new())],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "nextcloud-talk", &events);
+    }
+}
+
+mod qq {
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.qq.is_some()
+    }
+
+    #[tokio::test]
+    async fn qq_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
+            "qq",
+            vec![
+                ProvisionResponse::Text("placeholder-app-id".into()), // app id
+                ProvisionResponse::Text("placeholder-app-secret".into()), // app secret
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
+            ],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_configured(&outcome, written, "qq", &events);
+    }
+
+    #[tokio::test]
+    async fn qq_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) =
+            run_and_capture("qq", vec![ProvisionResponse::Text(String::new())], wrote).await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "qq", &events);
+    }
+}
+
+mod whatsapp_cloud {
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.whatsapp.is_some()
+    }
+
+    #[tokio::test]
+    async fn whatsapp_cloud_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
+            "whatsapp-cloud",
+            vec![
+                ProvisionResponse::Text("placeholder-access-token".into()), // access token
+                ProvisionResponse::Text("000000000000000".into()),          // phone number id
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text("placeholder-verify-token".into()), // verify token
+                ProvisionResponse::Text(String::new()), // app secret (optional)
+                ProvisionResponse::Text("+15550002222".into()), // allowed numbers
+            ],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_configured(&outcome, written, "whatsapp-cloud", &events);
+    }
+
+    #[tokio::test]
+    async fn whatsapp_cloud_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) = run_and_capture(
+            "whatsapp-cloud",
+            vec![ProvisionResponse::Text(String::new())],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "whatsapp-cloud", &events);
+    }
+}
+
+mod linq {
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.linq.is_some()
+    }
+
+    #[tokio::test]
+    async fn linq_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
+            "linq",
+            vec![
+                ProvisionResponse::Text("placeholder-partner-api-token".into()), // api token
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text("+15550001111".into()), // from phone
+                ProvisionResponse::Text(String::new()), // signing secret (optional)
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed senders
+            ],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_configured(&outcome, written, "linq", &events);
+    }
+
+    #[tokio::test]
+    async fn linq_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) =
+            run_and_capture("linq", vec![ProvisionResponse::Text(String::new())], wrote).await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "linq", &events);
+    }
+}
+
+mod lark {
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.lark.is_some()
+    }
+
+    #[tokio::test]
+    async fn lark_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
+            "lark",
+            vec![
+                ProvisionResponse::Text("placeholder-app-id".into()), // app id
+                ProvisionResponse::Text("placeholder-app-secret".into()), // app secret
+                ProvisionResponse::Selection(vec![1]),                // region: Lark International
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text(String::new()), // encrypt key (optional)
+                ProvisionResponse::Text(String::new()), // verification token (optional)
+                ProvisionResponse::Selection(vec![0]), // receive mode: websocket
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
+            ],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_configured(&outcome, written, "lark", &events);
+    }
+
+    #[tokio::test]
+    async fn lark_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) =
+            run_and_capture("lark", vec![ProvisionResponse::Text(String::new())], wrote).await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "lark", &events);
+    }
+}
+
+mod irc {
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.irc.is_some()
+    }
+
+    #[tokio::test]
+    async fn irc_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
+            "irc",
+            vec![
+                ProvisionResponse::Text("irc.example.com".into()), // server
+                ProvisionResponse::Text(String::new()),            // port -> default
+                ProvisionResponse::Text("rantaiclaw_bot".into()),  // nickname
+                ProvisionResponse::Text(String::new()),            // username -> nickname
+                ProvisionResponse::Selection(vec![0]),             // TLS yes
+                ProvisionResponse::Text(String::new()),            // server password (skip)
+                ProvisionResponse::Text(String::new()),            // nickserv password (skip)
+                ProvisionResponse::Text(String::new()),            // sasl password (skip)
+                ProvisionResponse::Text("#rantaiclaw".into()),     // channels
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed nicknames
+            ],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_configured(&outcome, written, "irc", &events);
+    }
+
+    #[tokio::test]
+    async fn irc_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) =
+            run_and_capture("irc", vec![ProvisionResponse::Text(String::new())], wrote).await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "irc", &events);
+    }
+}
+
+mod email {
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.email.is_some()
+    }
+
+    #[tokio::test]
+    async fn email_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
+            "email",
+            vec![
+                ProvisionResponse::Text("imap.example.com".into()), // imap host
+                ProvisionResponse::Text(String::new()),             // imap port -> default
+                ProvisionResponse::Text(String::new()),             // imap folder -> INBOX
+                ProvisionResponse::Text("smtp.example.com".into()), // smtp host
+                ProvisionResponse::Text(String::new()),             // smtp port -> default
+                ProvisionResponse::Text("bot@example.com".into()),  // from address
+                ProvisionResponse::Text(String::new()),             // username -> from address
+                ProvisionResponse::Text("placeholder-app-password".into()), // password
+                ProvisionResponse::Text("bot@example.com".into()),  // allowed senders
+                ProvisionResponse::Text(String::new()),             // idle timeout -> default
+            ],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_configured(&outcome, written, "email", &events);
+    }
+
+    #[tokio::test]
+    async fn email_aborts_on_a_missing_required_field() {
+        let (outcome, events, written) =
+            run_and_capture("email", vec![ProvisionResponse::Text(String::new())], wrote).await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "email", &events);
+    }
+}
+
+// iMessage has no credential to probe; its abort path is declining the prerequisites.
+mod imessage {
+    use super::{
+        assert_aborted, assert_configured, assert_no_panic, run_and_capture, Config,
+        ProvisionEvent, ProvisionResponse,
+    };
+
+    fn wrote(c: &Config) -> bool {
+        c.channels_config.imessage.is_some()
+    }
+
+    /// iMessage is the one channel with no happy path off macOS: the
+    /// provisioner refuses on any other platform before it prompts at all.
+    /// Gated rather than deleted so the case is still covered where it can be.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn imessage_happy_path_writes_its_config() {
+        let (outcome, events, written) = run_and_capture(
+            "imessage",
+            vec![
+                ProvisionResponse::Selection(vec![0]), // prerequisites confirmed
+                ProvisionResponse::Text("rantaiclaw_user".into()), // allowed contacts
+            ],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_configured(&outcome, written, "imessage", &events);
+    }
+
+    /// Declining the prerequisites must write nothing.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn imessage_aborts_when_prerequisites_are_declined() {
+        let (outcome, events, written) = run_and_capture(
+            "imessage",
+            vec![ProvisionResponse::Selection(vec![1])],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "imessage", &events);
+    }
+
+    /// Everywhere else the refusal itself is the contract: abort, and no
+    /// config section — not a half-written one the runtime would later fail on.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn imessage_aborts_off_macos_without_writing() {
+        let (outcome, events, written) = run_and_capture(
+            "imessage",
+            vec![ProvisionResponse::Selection(vec![0])],
+            wrote,
+        )
+        .await;
+        assert_no_panic(&events);
+        assert_aborted(&outcome, written, "imessage", &events);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProvisionEvent::Failed { error } if error.contains("macOS")
+            )),
+            "the refusal must say why: {events:#?}"
+        );
     }
 }
 

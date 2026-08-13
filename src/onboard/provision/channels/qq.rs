@@ -232,16 +232,6 @@ fn qq_probe_succeeded(status: u16, body: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn provisioner_name_is_qq() {
-        assert_eq!(QqProvisioner::new().name(), "qq");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!QqProvisioner::new().description().is_empty());
-    }
-
     /// The old probe accepted 401 as success, so an unauthenticated request —
     /// which is what it sent, since it never included the secret — reported
     /// "Credentials validated." for any input at all.

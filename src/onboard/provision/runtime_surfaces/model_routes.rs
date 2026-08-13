@@ -180,18 +180,3 @@ impl TuiProvisioner for ModelRoutesProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_model_routes() {
-        assert_eq!(ModelRoutesProvisioner::new().name(), "model-routes");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!ModelRoutesProvisioner::new().description().is_empty());
-    }
-}

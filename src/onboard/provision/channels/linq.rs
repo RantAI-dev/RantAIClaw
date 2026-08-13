@@ -225,16 +225,6 @@ fn linq_probe_url() -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn provisioner_name_is_linq() {
-        assert_eq!(LinqProvisioner::new().name(), "linq");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!LinqProvisioner::new().description().is_empty());
-    }
-
     /// The probe must hit the host the channel talks to. It used to hit
     /// `api.linq.com` while the runtime used `api.linqapp.com`, so setup shipped
     /// the operator's Partner API token to a domain this project does not own —

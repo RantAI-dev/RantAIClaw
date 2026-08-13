@@ -211,16 +211,6 @@ mod tests {
     use super::*;
     use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
 
-    #[test]
-    fn provisioner_name_is_signal() {
-        assert_eq!(SignalProvisioner::new().name(), "signal");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!SignalProvisioner::new().description().is_empty());
-    }
-
     /// Declining the confirmation must leave the config untouched. Before this
     /// plan there was no confirmation at all: a failed probe warned and the
     /// write went ahead regardless, so `config.toml` ended up holding a

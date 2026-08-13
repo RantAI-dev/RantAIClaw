@@ -199,16 +199,6 @@ fn chat_db_path() -> std::path::PathBuf {
 mod tests {
     use super::*;
 
-    #[test]
-    fn provisioner_name_is_imessage() {
-        assert_eq!(IMessageProvisioner::new().name(), "imessage");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!IMessageProvisioner::new().description().is_empty());
-    }
-
     /// The probe must look where the channel looks. The old literal
     /// `/Users/Library/Messages/chat.db` is missing the username, so it names
     /// no file on any macOS system and the check could only ever fail.

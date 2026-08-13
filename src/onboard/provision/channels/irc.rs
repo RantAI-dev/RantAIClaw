@@ -336,14 +336,4 @@ mod tests {
             "the answer must reach the config, not be dropped for a hardcoded None"
         );
     }
-
-    #[test]
-    fn provisioner_name_is_irc() {
-        assert_eq!(IrcProvisioner::new().name(), "irc");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!IrcProvisioner::new().description().is_empty());
-    }
 }

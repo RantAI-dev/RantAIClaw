@@ -221,16 +221,4 @@ mod tests {
             "an aborted provisioner must not write a channel config"
         );
     }
-
-    #[test]
-    fn provisioner_name_is_telegram() {
-        let p = TelegramProvisioner::new();
-        assert_eq!(p.name(), "telegram");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = TelegramProvisioner::new();
-        assert!(!p.description().is_empty());
-    }
 }

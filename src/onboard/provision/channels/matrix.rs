@@ -258,18 +258,3 @@ impl TuiProvisioner for MatrixProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_matrix() {
-        assert_eq!(MatrixProvisioner::new().name(), "matrix");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!MatrixProvisioner::new().description().is_empty());
-    }
-}

@@ -224,20 +224,3 @@ impl TuiProvisioner for PersonaProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_persona() {
-        let p = PersonaProvisioner::new();
-        assert_eq!(p.name(), "persona");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = PersonaProvisioner::new();
-        assert!(!p.description().is_empty());
-    }
-}

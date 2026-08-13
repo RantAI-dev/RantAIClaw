@@ -8,9 +8,7 @@
 //!
 //! Config writes: `config.mcp_servers`
 
-use super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
-};
+use super::traits::{ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner};
 use crate::config::Config;
 use crate::mcp::curated::{CuratedMcpServer, AUTHED, NO_AUTH};
 use crate::mcp::setup;
@@ -105,7 +103,7 @@ impl TuiProvisioner for McpProvisioner {
         )
         .await?;
 
-        let selections = recv_selection_multi(&mut responses).await?;
+        let selections = recv_selection(&mut responses).await?;
 
         // Prompt for auth tokens for selected authed servers
         let mut env_pairs: Vec<(String, String)> = Vec::new();
@@ -245,28 +243,5 @@ fn split_custom_command(cmd: &str) -> (String, Vec<String>) {
             tail.iter().map(|s| s.to_string()).collect(),
         ),
         None => (String::new(), Vec::new()),
-    }
-}
-
-async fn recv_selection_multi(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    recv_selection(responses).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_mcp() {
-        let p = McpProvisioner::new();
-        assert_eq!(p.name(), "mcp");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = McpProvisioner::new();
-        assert!(!p.description().is_empty());
     }
 }

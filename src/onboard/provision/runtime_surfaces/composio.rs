@@ -175,18 +175,3 @@ impl TuiProvisioner for ComposioProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_composio() {
-        assert_eq!(ComposioProvisioner::new().name(), "composio");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!ComposioProvisioner::new().description().is_empty());
-    }
-}

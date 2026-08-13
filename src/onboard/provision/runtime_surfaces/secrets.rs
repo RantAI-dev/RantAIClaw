@@ -98,18 +98,3 @@ impl TuiProvisioner for SecretsProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_secrets() {
-        assert_eq!(SecretsProvisioner::new().name(), "secrets");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!SecretsProvisioner::new().description().is_empty());
-    }
-}

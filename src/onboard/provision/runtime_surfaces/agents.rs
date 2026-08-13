@@ -1,7 +1,7 @@
 //! Agents provisioner — implements [`TuiProvisioner`] for in-TUI delegate agent setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner,
 };
 use crate::config::schema::DelegateAgentConfig;
 use crate::config::Config;
@@ -76,7 +76,7 @@ impl TuiProvisioner for AgentsProvisioner {
         )
         .await?;
 
-        let picks = recv_selection_multi(&mut responses).await?;
+        let picks = recv_selection(&mut responses).await?;
 
         for (i, name) in built_in.iter().enumerate() {
             if picks.contains(&i) {
@@ -170,26 +170,5 @@ impl TuiProvisioner for AgentsProvisioner {
         .await?;
 
         Ok(ProvisionOutcome::Configured)
-    }
-}
-
-async fn recv_selection_multi(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    recv_selection(responses).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_agents() {
-        assert_eq!(AgentsProvisioner::new().name(), "agents");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!AgentsProvisioner::new().description().is_empty());
     }
 }

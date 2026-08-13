@@ -195,18 +195,6 @@ mod tests {
     use super::*;
     use crate::onboard::provision::traits::ProvisionResponse;
 
-    #[test]
-    fn provisioner_name_is_skills() {
-        let p = SkillsProvisioner::new();
-        assert_eq!(p.name(), "skills");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = SkillsProvisioner::new();
-        assert!(!p.description().is_empty());
-    }
-
     /// Restores `HOME` on drop.
     ///
     /// `Profile::skills_dir()` resolves through `profile::paths`, which reads

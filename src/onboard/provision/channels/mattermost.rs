@@ -229,18 +229,3 @@ impl TuiProvisioner for MattermostProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_mattermost() {
-        assert_eq!(MattermostProvisioner::new().name(), "mattermost");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!MattermostProvisioner::new().description().is_empty());
-    }
-}

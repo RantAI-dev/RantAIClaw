@@ -209,20 +209,3 @@ impl TuiProvisioner for DiscordProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_discord() {
-        let p = DiscordProvisioner::new();
-        assert_eq!(p.name(), "discord");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = DiscordProvisioner::new();
-        assert!(!p.description().is_empty());
-    }
-}

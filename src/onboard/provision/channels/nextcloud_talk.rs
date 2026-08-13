@@ -216,18 +216,3 @@ impl TuiProvisioner for NextcloudTalkProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_nextcloud_talk() {
-        assert_eq!(NextcloudTalkProvisioner::new().name(), "nextcloud-talk");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!NextcloudTalkProvisioner::new().description().is_empty());
-    }
-}

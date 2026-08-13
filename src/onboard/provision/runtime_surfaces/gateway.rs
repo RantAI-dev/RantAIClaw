@@ -192,16 +192,6 @@ mod tests {
     use super::*;
     use crate::onboard::provision::traits::ProvisionResponse;
 
-    #[test]
-    fn provisioner_name_is_gateway() {
-        assert_eq!(GatewayProvisioner::new().name(), "gateway");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!GatewayProvisioner::new().description().is_empty());
-    }
-
     /// Drive the provisioner through its four prompts with scripted answers.
     async fn run_with(config: &mut Config, host: &str) -> Result<ProvisionOutcome> {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);

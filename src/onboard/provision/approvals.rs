@@ -139,20 +139,3 @@ impl TuiProvisioner for ApprovalsProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_approvals() {
-        let p = ApprovalsProvisioner::new();
-        assert_eq!(p.name(), "approvals");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = ApprovalsProvisioner::new();
-        assert!(!p.description().is_empty());
-    }
-}

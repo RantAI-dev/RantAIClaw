@@ -202,18 +202,3 @@ impl TuiProvisioner for BrowserProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_browser() {
-        assert_eq!(BrowserProvisioner::new().name(), "browser");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!BrowserProvisioner::new().description().is_empty());
-    }
-}

@@ -213,18 +213,3 @@ async fn leave_disabled(
     .await?;
     Ok(ProvisionOutcome::Configured)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_login() {
-        assert_eq!(LoginProvisioner::new().name(), "login");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!LoginProvisioner::new().description().is_empty());
-    }
-}

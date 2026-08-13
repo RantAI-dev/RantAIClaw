@@ -136,18 +136,3 @@ impl TuiProvisioner for MultimodalProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_multimodal() {
-        assert_eq!(MultimodalProvisioner::new().name(), "multimodal");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!MultimodalProvisioner::new().description().is_empty());
-    }
-}

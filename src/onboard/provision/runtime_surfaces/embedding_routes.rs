@@ -180,18 +180,3 @@ impl TuiProvisioner for EmbeddingRoutesProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_embedding_routes() {
-        assert_eq!(EmbeddingRoutesProvisioner::new().name(), "embedding-routes");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!EmbeddingRoutesProvisioner::new().description().is_empty());
-    }
-}

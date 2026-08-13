@@ -252,20 +252,3 @@ async fn prompt_embedding_key(
         Ok(Some(trimmed.to_string()))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_knowledge() {
-        let p = KnowledgeProvisioner::new();
-        assert_eq!(p.name(), "knowledge");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = KnowledgeProvisioner::new();
-        assert!(!p.description().is_empty());
-    }
-}

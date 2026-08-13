@@ -1,7 +1,7 @@
 //! Proxy provisioner — implements [`TuiProvisioner`] for in-TUI proxy setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner,
 };
 use crate::config::schema::{ProxyConfig, ProxyScope};
 use crate::config::Config;
@@ -166,7 +166,7 @@ impl TuiProvisioner for ProxyProvisioner {
                 )
                 .await?;
 
-                let sel = recv_selection_multi(&mut responses).await?;
+                let sel = recv_selection(&mut responses).await?;
                 let labels = ["providers", "channels", "mcp", "skills"];
                 sel.iter()
                     .filter_map(|&i| labels.get(i).map(|s| s.to_string()))
@@ -201,26 +201,5 @@ impl TuiProvisioner for ProxyProvisioner {
         .await?;
 
         Ok(ProvisionOutcome::Configured)
-    }
-}
-
-async fn recv_selection_multi(
-    responses: &mut tokio::sync::mpsc::Receiver<ProvisionResponse>,
-) -> Result<Vec<usize>> {
-    recv_selection(responses).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_proxy() {
-        assert_eq!(ProxyProvisioner::new().name(), "proxy");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!ProxyProvisioner::new().description().is_empty());
     }
 }

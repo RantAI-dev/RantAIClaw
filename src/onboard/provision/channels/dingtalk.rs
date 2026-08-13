@@ -215,16 +215,6 @@ fn dingtalk_probe_body(client_id: &str, client_secret: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn provisioner_name_is_dingtalk() {
-        assert_eq!(DingTalkProvisioner::new().name(), "dingtalk");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!DingTalkProvisioner::new().description().is_empty());
-    }
-
     /// The AppSecret used to travel as `?appsecret=…`, where proxy and server
     /// access logs record it in the clear.
     #[test]

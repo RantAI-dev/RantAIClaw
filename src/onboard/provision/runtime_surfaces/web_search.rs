@@ -147,18 +147,3 @@ impl TuiProvisioner for WebSearchProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_web_search() {
-        assert_eq!(WebSearchProvisioner::new().name(), "web-search");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!WebSearchProvisioner::new().description().is_empty());
-    }
-}

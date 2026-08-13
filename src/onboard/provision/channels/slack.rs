@@ -226,20 +226,3 @@ fn slack_error(body: &str) -> String {
             |e| format!("Slack returned `{e}`"),
         )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_slack() {
-        let p = SlackProvisioner::new();
-        assert_eq!(p.name(), "slack");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = SlackProvisioner::new();
-        assert!(!p.description().is_empty());
-    }
-}

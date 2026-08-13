@@ -552,20 +552,3 @@ fn default_model_for_provider(provider: &str) -> String {
         _ => "default".to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_provider() {
-        let p = ProviderProvisioner::new();
-        assert_eq!(p.name(), "provider");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        let p = ProviderProvisioner::new();
-        assert!(!p.description().is_empty());
-    }
-}

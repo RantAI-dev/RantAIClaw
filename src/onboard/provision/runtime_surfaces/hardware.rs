@@ -198,18 +198,3 @@ impl TuiProvisioner for HardwareProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_hardware() {
-        assert_eq!(HardwareProvisioner::new().name(), "hardware");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!HardwareProvisioner::new().description().is_empty());
-    }
-}

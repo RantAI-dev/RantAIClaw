@@ -333,16 +333,6 @@ fn tenant_token_url(use_feishu: bool) -> &'static str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn provisioner_name_is_lark() {
-        assert_eq!(LarkProvisioner::new().name(), "lark");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!LarkProvisioner::new().description().is_empty());
-    }
-
     /// The region selection used to be a branch that could not take its Feishu
     /// arm, so a Feishu tenant's credentials were always sent to the Lark
     /// International host — where they can never be valid.

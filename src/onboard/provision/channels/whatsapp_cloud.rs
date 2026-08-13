@@ -246,18 +246,3 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_whatsapp_cloud() {
-        assert_eq!(WhatsAppCloudProvisioner::new().name(), "whatsapp-cloud");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!WhatsAppCloudProvisioner::new().description().is_empty());
-    }
-}

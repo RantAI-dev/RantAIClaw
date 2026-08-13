@@ -383,14 +383,4 @@ mod tests {
             t.messages()
         );
     }
-
-    #[test]
-    fn provisioner_name_is_email() {
-        assert_eq!(EmailProvisioner::new().name(), "email");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!EmailProvisioner::new().description().is_empty());
-    }
 }

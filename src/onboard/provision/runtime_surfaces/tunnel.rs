@@ -294,18 +294,3 @@ impl TuiProvisioner for TunnelProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_tunnel() {
-        assert_eq!(TunnelProvisioner::new().name(), "tunnel");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!TunnelProvisioner::new().description().is_empty());
-    }
-}

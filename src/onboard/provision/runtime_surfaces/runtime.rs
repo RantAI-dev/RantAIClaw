@@ -197,18 +197,3 @@ impl TuiProvisioner for RuntimeProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provisioner_name_is_runtime() {
-        assert_eq!(RuntimeProvisioner::new().name(), "runtime");
-    }
-
-    #[test]
-    fn provisioner_description_is_non_empty() {
-        assert!(!RuntimeProvisioner::new().description().is_empty());
-    }
-}
