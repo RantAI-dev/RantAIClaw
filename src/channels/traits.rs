@@ -106,14 +106,41 @@ pub trait Channel: Send + Sync {
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
-    /// Start listening for incoming messages (long-running)
+    /// Start listening for incoming messages (long-running).
+    ///
+    /// **Return contract.** `Ok(())` means the listener finished for a reason
+    /// that is not a fault: `cancel` fired, or `tx` was closed. `Err` means a
+    /// transport fault — a dropped socket, a rejected ticket, a rate limit. The
+    /// supervisor reads the two differently: a clean exit resets the reconnect
+    /// backoff, an error escalates it. Reporting a fault as `Ok(())` therefore
+    /// produces a reconnect storm that never backs off, which is exactly what
+    /// DingTalk did before plan 128.
+    ///
+    /// **Cancellation.** Implementations SHOULD return promptly once `cancel`
+    /// is triggered, and SHOULD complete any teardown the platform expects
+    /// first — IRC `QUIT`, IMAP `LOGOUT`, a WebSocket close frame, an HTTP
+    /// server's graceful shutdown. The supervisor also drops the future, but
+    /// that is a backstop for channels with nothing to tear down, not the
+    /// contract: a dropped future sends nothing and frees no port.
     async fn listen(
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()>;
 
-    /// Check if channel is healthy
+    /// Check if the channel is healthy.
+    ///
+    /// **Diagnostic-only.** The one production caller is `doctor channels`,
+    /// which runs it under a 10-second timeout. The supervisor's own health
+    /// tick does NOT consult it — it marks every running channel OK — so do
+    /// not read a green `doctor` as evidence the daemon is watching this.
+    /// Wiring it into the tick needs the same timeout plus a
+    /// consecutive-failure threshold; until that lands, treat this as a probe
+    /// an operator runs, not a monitor.
+    ///
+    /// An implementation MUST be able to fail for the condition it exists to
+    /// catch. A probe that only checks the HTTP status of an API that reports
+    /// errors in its body reports healthy for a revoked token.
     async fn health_check(&self) -> bool {
         true
     }
