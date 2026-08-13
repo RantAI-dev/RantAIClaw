@@ -5,10 +5,14 @@ use super::super::traits::{
 };
 use crate::config::schema::DingTalkConfig;
 use crate::config::Config;
-use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::http::probe_post;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
+
+/// Credential probe endpoint — the same one `DingTalkChannel` opens its gateway
+/// connection against, so a valid probe means a channel that can actually connect.
+const DINGTALK_PROBE_URL: &str = "https://api.dingtalk.com/v1.0/gateway/connections/open";
 
 pub const DINGTALK_NAME: &str = "dingtalk";
 pub const DINGTALK_DESC: &str = "DingTalk — client ID (AppKey), client secret, allowed users";
@@ -115,13 +119,18 @@ impl TuiProvisioner for DingTalkProvisioner {
         )
         .await?;
 
-        let token_url = format!(
-            "https://api.dingtalk.com/v1.0/oauth2/accessToken?appkey={}&appsecret={}",
-            client_id.trim(),
-            client_secret.trim()
-        );
+        // POST the secret in a JSON body, never in the query string: query
+        // strings land in proxy and server access logs, and this is the same
+        // endpoint and payload the CLI wizard already uses.
+        let body = dingtalk_probe_body(client_id.trim(), client_secret.trim());
 
-        match probe_get(&token_url, &[]).await {
+        match probe_post(
+            DINGTALK_PROBE_URL,
+            &[("Content-Type", "application/json")],
+            &body,
+        )
+        .await
+        {
             Ok(result) if result.status == 200 => {
                 send(
                     &events,
@@ -196,6 +205,16 @@ impl TuiProvisioner for DingTalkProvisioner {
 
 use crate::onboard::provision::ProvisionerCategory;
 
+/// The probe request body. Extracted so a test can assert the secret travels in
+/// the body without standing up an HTTP server.
+fn dingtalk_probe_body(client_id: &str, client_secret: &str) -> String {
+    serde_json::json!({
+        "clientId": client_id,
+        "clientSecret": client_secret,
+    })
+    .to_string()
+}
+
 async fn send(
     events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
     ev: ProvisionEvent,
@@ -240,5 +259,21 @@ mod tests {
     #[test]
     fn provisioner_description_is_non_empty() {
         assert!(!DingTalkProvisioner::new().description().is_empty());
+    }
+
+    /// The AppSecret used to travel as `?appsecret=…`, where proxy and server
+    /// access logs record it in the clear.
+    #[test]
+    fn dingtalk_probe_sends_no_query_string() {
+        let url = reqwest::Url::parse(DINGTALK_PROBE_URL).expect("probe url parses");
+        assert!(
+            url.query().is_none(),
+            "the probe url carries a query string: {url}"
+        );
+
+        let body = dingtalk_probe_body("placeholder-client-id", "placeholder-client-secret");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body is json");
+        assert_eq!(parsed["clientId"], "placeholder-client-id");
+        assert_eq!(parsed["clientSecret"], "placeholder-client-secret");
     }
 }

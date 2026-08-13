@@ -20,7 +20,13 @@ pub struct LinqChannel {
     client: reqwest::Client,
 }
 
-const LINQ_API_BASE: &str = "https://api.linqapp.com/api/partner/v3";
+/// Base URL every Linq request goes to.
+///
+/// `pub(crate)` on purpose: the setup provisioner validates the operator's
+/// Partner API token against this same base. When the two were independently
+/// editable the provisioner drifted to `api.linq.com` — a domain this project
+/// does not own — and shipped the live token there on every setup run.
+pub(crate) const LINQ_API_BASE: &str = "https://api.linqapp.com/api/partner/v3";
 
 impl LinqChannel {
     pub fn new(api_token: String, from_phone: String, allowed_senders: Vec<String>) -> Self {

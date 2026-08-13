@@ -9,7 +9,12 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
-const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
+/// Token endpoint the App ID + App Secret are exchanged at.
+///
+/// `pub(crate)` on purpose: the setup provisioner validates the operator's
+/// credentials against the same endpoint. Keeping one constant is what stops the
+/// provisioner probing a host the channel never contacts.
+pub(crate) const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {

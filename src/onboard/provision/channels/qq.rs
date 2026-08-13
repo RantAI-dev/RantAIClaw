@@ -5,7 +5,7 @@ use super::super::traits::{
 };
 use crate::config::schema::QQConfig;
 use crate::config::Config;
-use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::http::probe_post;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -115,14 +115,20 @@ impl TuiProvisioner for QqProvisioner {
         )
         .await?;
 
-        let verify_url = "https://api.sgroup.qq.com/gateway/bot".to_string();
-        match probe_get(
-            &verify_url,
-            &[("Authorization", &format!("Bot {}", app_id.trim()))],
+        // Exchange the credentials the operator actually typed. The old probe sent
+        // the App *ID* as a bearer token to the gateway endpoint and accepted 401
+        // as success, so every input — including no secret at all — was reported
+        // as "Credentials validated."
+        let body = qq_probe_body(app_id.trim(), app_secret.trim());
+
+        match probe_post(
+            crate::channels::qq::QQ_AUTH_URL,
+            &[("Content-Type", "application/json")],
+            &body,
         )
         .await
         {
-            Ok(result) if result.status == 200 || result.status == 401 => {
+            Ok(result) if qq_probe_succeeded(result.status, &result.body) => {
                 send(
                     &events,
                     ProvisionEvent::Message {
@@ -194,6 +200,31 @@ impl TuiProvisioner for QqProvisioner {
 
 use crate::onboard::provision::ProvisionerCategory;
 
+/// The token-exchange request body, mirroring what `QqChannel` sends.
+fn qq_probe_body(app_id: &str, app_secret: &str) -> String {
+    serde_json::json!({
+        "appId": app_id,
+        "clientSecret": app_secret,
+    })
+    .to_string()
+}
+
+/// A probe succeeds only when the endpoint hands back a token. A 401 means the
+/// credentials were rejected, which is exactly the case the old probe reported
+/// as success.
+fn qq_probe_succeeded(status: u16, body: &str) -> bool {
+    if status != 200 {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("access_token")
+                .and_then(|t| t.as_str().map(|s| !s.is_empty()))
+        })
+        .unwrap_or(false)
+}
+
 async fn send(
     events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
     ev: ProvisionEvent,
@@ -238,5 +269,40 @@ mod tests {
     #[test]
     fn provisioner_description_is_non_empty() {
         assert!(!QqProvisioner::new().description().is_empty());
+    }
+
+    /// The old probe accepted 401 as success, so an unauthenticated request —
+    /// which is what it sent, since it never included the secret — reported
+    /// "Credentials validated." for any input at all.
+    #[test]
+    fn qq_probe_rejects_a_401() {
+        assert!(!qq_probe_succeeded(401, ""));
+        assert!(!qq_probe_succeeded(401, r#"{"message":"unauthorized"}"#));
+    }
+
+    #[test]
+    fn qq_probe_requires_a_token_in_the_body() {
+        assert!(!qq_probe_succeeded(200, r#"{"message":"ok"}"#));
+        assert!(!qq_probe_succeeded(200, r#"{"access_token":""}"#));
+        assert!(!qq_probe_succeeded(200, "not json"));
+        assert!(qq_probe_succeeded(
+            200,
+            r#"{"access_token":"placeholder-token"}"#
+        ));
+    }
+
+    /// The credential the operator typed must be the credential that gets tested.
+    #[test]
+    fn qq_probe_body_carries_the_secret() {
+        let body = qq_probe_body("placeholder-app-id", "placeholder-app-secret");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body is json");
+        assert_eq!(parsed["appId"], "placeholder-app-id");
+        assert_eq!(parsed["clientSecret"], "placeholder-app-secret");
+    }
+
+    #[test]
+    fn qq_probe_url_has_no_query_string() {
+        let url = reqwest::Url::parse(crate::channels::qq::QQ_AUTH_URL).expect("probe url parses");
+        assert!(url.query().is_none());
     }
 }

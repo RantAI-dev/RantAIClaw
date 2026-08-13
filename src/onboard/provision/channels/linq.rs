@@ -92,7 +92,7 @@ impl TuiProvisioner for LinqProvisioner {
         .await?;
 
         match probe_get(
-            "https://api.linq.com/v1/account",
+            &linq_probe_url(),
             &[("Authorization", &format!("Bearer {}", api_token.trim()))],
         )
         .await
@@ -215,6 +215,14 @@ impl TuiProvisioner for LinqProvisioner {
 
 use crate::onboard::provision::ProvisionerCategory;
 
+/// The endpoint the token probe hits, derived from the base the channel itself
+/// talks to so the two cannot drift apart. `/phonenumbers` is what
+/// `LinqChannel::health_check` already uses: it needs the Partner token and
+/// returns 200 only when that token is valid.
+fn linq_probe_url() -> String {
+    format!("{}/phonenumbers", crate::channels::linq::LINQ_API_BASE)
+}
+
 async fn send(
     events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
     ev: ProvisionEvent,
@@ -259,5 +267,30 @@ mod tests {
     #[test]
     fn provisioner_description_is_non_empty() {
         assert!(!LinqProvisioner::new().description().is_empty());
+    }
+
+    /// The probe must hit the host the channel talks to. It used to hit
+    /// `api.linq.com` while the runtime used `api.linqapp.com`, so setup shipped
+    /// the operator's Partner API token to a domain this project does not own —
+    /// and warned "Token may be invalid" for a perfectly valid token.
+    ///
+    /// `scripts/ci/check_provisioner_probe_hosts.sh` enforces this across every
+    /// provisioner; this test pins the one that regressed.
+    #[test]
+    fn linq_probe_host_matches_the_channel_base_host() {
+        let probe_url = linq_probe_url();
+        assert!(
+            probe_url.starts_with(crate::channels::linq::LINQ_API_BASE),
+            "probe url {probe_url} is not derived from LINQ_API_BASE"
+        );
+
+        let probe = reqwest::Url::parse(&probe_url).expect("probe url parses");
+        let base =
+            reqwest::Url::parse(crate::channels::linq::LINQ_API_BASE).expect("base url parses");
+        assert_eq!(
+            probe.host_str(),
+            base.host_str(),
+            "provisioner probes a different host than the channel"
+        );
     }
 }
