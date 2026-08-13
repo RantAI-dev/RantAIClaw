@@ -174,7 +174,11 @@ pub fn render(config: &Config, safe_tools: &[String]) -> String {
     // Owners.
     out.push_str("Owners (full toolset, may approve):\n");
     if cc.approval_owners.is_empty() {
-        out.push_str("  (none — only the CLI/console operator is an owner)\n");
+        // Not "only the console operator is an owner" — with an empty list
+        // `can_approve_any` authorises nobody, the console included.
+        out.push_str(
+            "  (none — nobody may approve; add a sender id, e.g. \"cli:local\" for the console)\n",
+        );
     } else if cc.approval_owners.iter().any(|o| o == "*") {
         out.push_str("  * (ANY sender is an owner — insecure, review this)\n");
     } else {

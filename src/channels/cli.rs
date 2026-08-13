@@ -1,4 +1,13 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+
+/// Owner identity for the local console, qualified by its surface.
+pub const CLI_SENDER_ID: &str = "cli:local";
+
+/// The unqualified identity the console used before `cli:local`. Still accepted
+/// as an alias so an existing `approval_owners = ["user"]` keeps working, but it
+/// collides with any remote sender who picks that name.
+pub const LEGACY_CLI_SENDER_ID: &str = "user";
+
 use async_trait::async_trait;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use uuid::Uuid;
@@ -48,10 +57,17 @@ impl Channel for CliChannel {
             }
 
             let msg = ChannelMessage {
-                sender_aliases: Vec::new(),
                 id: Uuid::new_v4().to_string(),
-                sender: "user".to_string(),
-                reply_target: "user".to_string(),
+                // Channel-qualified so a remote sender cannot pick this name.
+                // It used to be the bare string "user", compared against
+                // `approval_owners` with no channel qualification — so an
+                // operator who followed the hint and added "user" also made a
+                // Telegram account renamed to `user`, or an IRC nick `user`, an
+                // owner. `sender_aliases` keeps existing `["user"]` configs
+                // working; `warn_on_legacy_cli_owner` tells them to migrate.
+                sender: CLI_SENDER_ID.to_string(),
+                sender_aliases: vec![LEGACY_CLI_SENDER_ID.to_string()],
+                reply_target: CLI_SENDER_ID.to_string(),
                 content: line,
                 channel: "cli".to_string(),
                 timestamp: std::time::SystemTime::now()
