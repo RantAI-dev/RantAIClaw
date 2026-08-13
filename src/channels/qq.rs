@@ -83,17 +83,6 @@ impl QQChannel {
         }
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("QQ pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Self-onboarding hook: if `content` is a `/bind`/`/claim` command, validate
     /// it against the shared [`crate::security::pairing_store`] (appending the
     /// sender openid to `allowed_users` and, for an owner-capable `/claim`, to
@@ -109,7 +98,7 @@ impl QQChannel {
         if parse_pairing_command(content).is_none() {
             return false;
         }
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("qq") else {
             return false;
         };
 

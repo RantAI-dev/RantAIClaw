@@ -196,17 +196,6 @@ impl MatrixChannel {
         allowed_users.iter().any(|u| u.eq_ignore_ascii_case(sender))
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("Matrix pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Self-onboarding hook: if `body` is a `/bind`/`/claim` command, validate it
     /// against the shared [`crate::security::pairing_store`] (appending the sender
     /// to `allowed_users` and, for an owner-capable `/claim`, to `approval_owners`,
@@ -221,7 +210,7 @@ impl MatrixChannel {
         if parse_pairing_command(body).is_none() {
             return false;
         }
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("matrix") else {
             return false;
         };
 

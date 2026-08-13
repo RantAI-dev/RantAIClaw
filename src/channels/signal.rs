@@ -170,17 +170,6 @@ impl SignalChannel {
         }
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("Signal pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Extract `(text, sender, reply_target)` from an inbound envelope for the
     /// shared pairing path — even when the sender is not (yet) allowlisted, so a
     /// brand-new user can self-onboard. Returns `None` for envelopes without a
@@ -218,7 +207,7 @@ impl SignalChannel {
         let Some(cmd) = parse_pairing_command(text) else {
             return false;
         };
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("signal") else {
             return false;
         };
         let now = std::time::SystemTime::now()

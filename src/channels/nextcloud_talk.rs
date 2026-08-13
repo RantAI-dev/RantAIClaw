@@ -50,17 +50,6 @@ impl NextcloudTalkChannel {
         }
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("Nextcloud Talk pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Extract `(room_token, actor_id, content)` from a webhook payload for the
     /// shared pairing path, *without* the allowlist gate (so an unenrolled actor's
     /// `/bind`/`/claim` is still seen). Bot-originated and non-comment events are
@@ -126,7 +115,7 @@ impl NextcloudTalkChannel {
         if parse_pairing_command(&content).is_none() {
             return false;
         }
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("nextcloud_talk") else {
             return false;
         };
 

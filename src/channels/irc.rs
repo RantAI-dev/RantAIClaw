@@ -454,17 +454,6 @@ impl IrcChannel {
         }
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("IRC pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Create a TLS connection to the IRC server.
     async fn connect(
         &self,
@@ -901,7 +890,7 @@ impl IrcChannel {
                         // with a `/bind`/`/claim <code>` minted via
                         // `rantaiclaw channels pair`. On success the nick lands in
                         // `allowed_users` (and, for an owner `/claim`, `approval_owners`).
-                        if let Some(root) = Self::pairing_profile_root() {
+                        if let Some(root) = crate::channels::pairing::profile_root("irc") {
                             // Pair the account when the network vouches for
                             // one — `approval_owners` on IRC holds services
                             // account names, not nicks.

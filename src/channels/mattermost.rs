@@ -72,17 +72,6 @@ impl MattermostChannel {
         }
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("Mattermost pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Self-onboarding hook for a not-yet-allowed sender's `/bind`/`/claim
     /// <code>` (minted via `rantaiclaw channels pair`). Returns `true` when the
     /// post was a pairing command that the shared store handled — the caller
@@ -95,7 +84,7 @@ impl MattermostChannel {
         if user_id.is_empty() || text.is_empty() {
             return false;
         }
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("mattermost") else {
             return false;
         };
         let identities = vec![user_id.to_string()];

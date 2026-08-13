@@ -86,17 +86,6 @@ impl WhatsAppChannel {
         }
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("WhatsApp pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Pull `(text, normalized_from)` for every inbound text message in a webhook
     /// payload — regardless of the allowlist — so an unknown sender's
     /// `/bind`/`/claim` can be processed. Non-text messages are skipped.
@@ -157,7 +146,7 @@ impl WhatsAppChannel {
         if candidates.is_empty() {
             return;
         }
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("whatsapp") else {
             return;
         };
         let now = std::time::SystemTime::now()

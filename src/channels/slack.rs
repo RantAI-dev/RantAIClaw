@@ -49,17 +49,6 @@ impl SlackChannel {
         }
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("Slack pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Get the bot's own user ID so we can ignore our own messages
     async fn get_bot_user_id(&self) -> Option<String> {
         let resp: serde_json::Value = self
@@ -221,7 +210,7 @@ impl Channel for SlackChannel {
                         // `rantaiclaw channels pair`. On success the sender lands in
                         // `allowed_users` (and, for an owner `/claim`, `approval_owners`).
                         if !text.is_empty() && ts > last_ts.as_str() {
-                            if let Some(root) = Self::pairing_profile_root() {
+                            if let Some(root) = crate::channels::pairing::profile_root("slack") {
                                 let identities = vec![user.to_string()];
                                 if let Some(reply) = crate::channels::pairing::try_handle_pairing(
                                     text,

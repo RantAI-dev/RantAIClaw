@@ -97,17 +97,6 @@ impl DiscordChannel {
         }
         identities
     }
-
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("Discord pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
 }
 
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -412,7 +401,7 @@ impl Channel for DiscordChannel {
                             .get("content")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("");
-                        if let Some(root) = Self::pairing_profile_root() {
+                        if let Some(root) = crate::channels::pairing::profile_root("discord") {
                             let identities = Self::extract_pairing_identities(d);
                             if let Some(reply) = crate::channels::pairing::try_handle_pairing(
                                 raw_content,

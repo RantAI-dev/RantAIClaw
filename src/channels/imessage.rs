@@ -49,14 +49,6 @@ impl IMessageChannel {
         }
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    /// Returns `None` (pairing simply unavailable) when no profile is active.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        crate::profile::ProfileManager::active()
-            .ok()
-            .map(|p| p.root)
-    }
-
     /// Try to handle an inbound `/bind`/`/claim` from `sender` against the shared
     /// pairing store. Returns `true` if the message WAS a pairing command (the
     /// caller must then NOT forward it to the agent). On a valid code the shared
@@ -72,7 +64,7 @@ impl IMessageChannel {
         if parse_pairing_command(text).is_none() {
             return false;
         }
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("imessage") else {
             return false;
         };
         let Some(reply) = try_handle_pairing(
