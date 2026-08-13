@@ -71,6 +71,15 @@ pub struct EmailConfig {
     /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+    /// Refuse mail whose `From:` is not backed by SPF/DKIM/DMARC.
+    ///
+    /// Off by default because a relay that strips `Authentication-Results`
+    /// would otherwise silence a working mailbox. It does **not** gate the
+    /// owner path: an address in `approval_owners` is refused when
+    /// unauthenticated regardless of this flag — see
+    /// [`EmailChannel::sender_identity`].
+    #[serde(default)]
+    pub require_authenticated_sender: bool,
 }
 
 impl std::fmt::Debug for EmailConfig {
@@ -92,6 +101,7 @@ impl std::fmt::Debug for EmailConfig {
             from_address,
             idle_timeout_secs,
             allowed_senders,
+            require_authenticated_sender,
         } = self;
 
         f.debug_struct("EmailConfig")
@@ -106,6 +116,7 @@ impl std::fmt::Debug for EmailConfig {
             .field("from_address", from_address)
             .field("idle_timeout_secs", idle_timeout_secs)
             .field("allowed_senders", allowed_senders)
+            .field("require_authenticated_sender", require_authenticated_sender)
             .finish()
     }
 }
@@ -140,6 +151,7 @@ impl Default for EmailConfig {
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
             allowed_senders: Vec::new(),
+            require_authenticated_sender: false,
         }
     }
 }
@@ -149,27 +161,69 @@ type ImapSession = Session<TlsStream<TcpStream>>;
 /// Email channel — IMAP IDLE for instant push notifications, SMTP for outbound
 pub struct EmailChannel {
     pub config: EmailConfig,
-    seen_messages: Arc<Mutex<HashSet<String>>>,
+    /// Addresses that may approve gated tools. Injected rather than loaded so
+    /// the owner check below needs no IO on the message path.
+    approval_owners: Vec<String>,
+    /// Runtime-mutable so a console or CLI allowlist edit reaches the running
+    /// channel. `std` lock because `is_sender_allowed` is called from sync
+    /// context. Seeded from `config.allowed_senders`, which stays the
+    /// across-restart source of truth.
+    allowed_senders: Arc<std::sync::RwLock<Vec<String>>>,
+    /// Bounded: an unbounded `HashSet` grew for the lifetime of the process,
+    /// one entry per message ever seen.
+    seen_messages: Arc<Mutex<(std::collections::VecDeque<String>, HashSet<String>)>>,
 }
 
 impl EmailChannel {
     pub fn new(config: EmailConfig) -> Self {
         Self {
+            allowed_senders: Arc::new(std::sync::RwLock::new(config.allowed_senders.clone())),
             config,
-            seen_messages: Arc::new(Mutex::new(HashSet::new())),
+            approval_owners: Vec::new(),
+            seen_messages: Arc::new(Mutex::new((
+                std::collections::VecDeque::new(),
+                HashSet::new(),
+            ))),
         }
+    }
+
+    /// Remember a message id, evicting the oldest once the window is full.
+    async fn remember_seen(&self, id: String) {
+        const MAX_SEEN: usize = 2_000;
+        let mut guard = self.seen_messages.lock().await;
+        let (order, set) = &mut *guard;
+        if !set.insert(id.clone()) {
+            return;
+        }
+        order.push_back(id);
+        while order.len() > MAX_SEEN {
+            if let Some(old) = order.pop_front() {
+                set.remove(&old);
+            }
+        }
+    }
+
+    /// Tell the channel which addresses carry owner authority, so it can refuse
+    /// to hand that authority to an unauthenticated `From:`.
+    #[must_use]
+    pub fn with_approval_owners(mut self, owners: Vec<String>) -> Self {
+        self.approval_owners = owners;
+        self
     }
 
     /// Check if a sender email is in the allowlist
     pub fn is_sender_allowed(&self, email: &str) -> bool {
-        if self.config.allowed_senders.is_empty() {
+        let Ok(senders) = self.allowed_senders.read() else {
+            return false; // A poisoned lock denies rather than admits.
+        };
+        if senders.is_empty() {
             return false; // Empty = deny all
         }
-        if self.config.allowed_senders.iter().any(|a| a == "*") {
+        if senders.iter().any(|a| a == "*") {
             return true; // Wildcard = allow all
         }
         let email_lower = email.to_lowercase();
-        self.config.allowed_senders.iter().any(|allowed| {
+        senders.iter().any(|allowed| {
             if allowed.starts_with('@') {
                 // Domain match with @ prefix: "@example.com"
                 email_lower.ends_with(&allowed.to_lowercase())
@@ -183,11 +237,158 @@ impl EmailChannel {
         })
     }
 
-    /// Strip HTML tags from content (basic)
+    /// Whether the receiving MTA vouched for the `From:` domain.
+    ///
+    /// `From:` is attacker-controlled — it is a header, not a credential — so
+    /// on its own it identifies nobody. `Authentication-Results` is written by
+    /// *our* MTA after it checked SPF/DKIM/DMARC, which is why it is the only
+    /// part of the message worth trusting here.
+    ///
+    /// Read through `mail_parser`'s header API rather than a hand-rolled
+    /// scanner: a bespoke parser for a security decision is how subtle
+    /// bypasses get in, and the plan forbids it.
+    ///
+    /// Accepts `dmarc=pass`, or `spf=pass`/`dkim=pass` whose stated domain
+    /// aligns with the `From:` domain. An unaligned pass proves someone
+    /// authenticated — just not the person the `From:` claims.
+    fn from_domain_is_authenticated(parsed: &mail_parser::Message, from_addr: &str) -> bool {
+        let Some(from_domain) = from_addr.rsplit('@').next().map(str::to_lowercase) else {
+            return false;
+        };
+        if from_domain.is_empty() {
+            return false;
+        }
+
+        let Some(header) = parsed.header("Authentication-Results") else {
+            return false;
+        };
+        let raw = match header.as_text() {
+            Some(t) => t.to_lowercase(),
+            None => return false,
+        };
+
+        if raw.contains("dmarc=pass") {
+            return true;
+        }
+
+        // An spf/dkim pass only counts when it names the From: domain.
+        for method in ["spf=pass", "dkim=pass"] {
+            let mut rest = raw.as_str();
+            while let Some(pos) = rest.find(method) {
+                let tail = &rest[pos + method.len()..];
+                // The domain appears in the same clause, before the next `;`.
+                let clause = tail.split(';').next().unwrap_or("");
+                if clause.contains(&from_domain) {
+                    return true;
+                }
+                rest = tail;
+            }
+        }
+        false
+    }
+
+    /// The sender to attribute a message to, or `None` when it must be dropped.
+    ///
+    /// Two independent refusals:
+    ///
+    /// 1. `require_authenticated_sender` is on and the mail is unauthenticated.
+    /// 2. The address carries owner authority and the mail is unauthenticated —
+    ///    **regardless of that flag**. Handing owner rights to a forgeable
+    ///    header is the one case with no acceptable default, so it is not
+    ///    configurable.
+    ///
+    /// Never falls back to `"unknown"`. That string is a shared identity: every
+    /// unattributable sender collapses into one principal, and anything keyed
+    /// on the sender then treats strangers as the same person.
+    fn sender_identity(&self, parsed: &mail_parser::Message) -> Option<String> {
+        let from = Self::extract_sender(parsed);
+        if from == "unknown" {
+            warn!("Email: dropping a message with no parseable From: address");
+            return None;
+        }
+
+        let authenticated = Self::from_domain_is_authenticated(parsed, &from);
+        if authenticated {
+            return Some(from);
+        }
+
+        let claims_owner = self
+            .approval_owners
+            .iter()
+            .any(|o| o.eq_ignore_ascii_case(&from));
+        if claims_owner {
+            warn!(
+                "Email: dropping mail claiming to be from approval owner {from} — \
+                 no SPF/DKIM/DMARC pass for that domain. From: is forgeable, so it \
+                 cannot grant owner authority on its own."
+            );
+            return None;
+        }
+
+        if self.config.require_authenticated_sender {
+            warn!(
+                "Email: dropping unauthenticated mail from {from} — \
+                 require_authenticated_sender is on and the message carries no \
+                 SPF/DKIM/DMARC pass for that domain."
+            );
+            return None;
+        }
+
+        Some(from)
+    }
+
+    /// Turn an HTML body into something worth putting in a prompt.
+    ///
+    /// Kept hand-rolled rather than pulling in an HTML-to-text crate: this is
+    /// a lossy best-effort for prompt text, not rendering, and CLAUDE.md treats
+    /// dependency weight as a product goal. The two things it got wrong are
+    /// fixed here instead.
+    ///
+    /// `<script>` and `<style>` bodies are skipped. Removing only the *tags*
+    /// left their contents behind, so a marketing email put its whole
+    /// stylesheet and tracking JavaScript into the prompt — tokens spent on
+    /// text no human would ever have seen, and attacker-influenced text at
+    /// that.
+    ///
+    /// The handful of entities that survive tag-stripping are decoded, since
+    /// `&amp;nbsp;` and `&amp;amp;` otherwise reach the model verbatim.
     pub fn strip_html(html: &str) -> String {
         let mut result = String::new();
         let mut in_tag = false;
-        for ch in html.chars() {
+        let mut rest = html;
+
+        while let Some(pos) = rest.find('<') {
+            let lower_tail = rest[pos..].to_lowercase();
+            let skipped = ["script", "style"].iter().find_map(|el| {
+                if lower_tail.starts_with(&format!("<{el}")) {
+                    lower_tail
+                        .find(&format!("</{el}"))
+                        .and_then(|end| rest[pos + end..].find('>').map(|c| pos + end + c + 1))
+                } else {
+                    None
+                }
+            });
+            match skipped {
+                Some(after) => {
+                    result.push_str(&rest[..pos]);
+                    result.push(' ');
+                    rest = &rest[after..];
+                }
+                None => {
+                    // Not a skipped element — hand this chunk to the tag
+                    // stripper below by advancing one character.
+                    let take = pos + rest[pos..].chars().next().map_or(1, char::len_utf8);
+                    let (head, tail) = rest.split_at(take);
+                    result.push_str(head);
+                    rest = tail;
+                }
+            }
+        }
+        result.push_str(rest);
+
+        let stripped = result;
+        let mut result = String::new();
+        for ch in stripped.chars() {
             match ch {
                 '<' => in_tag = true,
                 '>' => in_tag = false,
@@ -195,6 +396,15 @@ impl EmailChannel {
                 _ => {}
             }
         }
+        let result = result
+            .replace("&nbsp;", " ")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+            // `&amp;` last: decoding it first would turn `&amp;lt;` into `<`.
+            .replace("&amp;", "&");
         let mut normalized = String::with_capacity(result.len());
         for word in result.split_whitespace() {
             if !normalized.is_empty() {
@@ -280,75 +490,110 @@ impl EmailChannel {
         debug!("Found {} unseen messages", uids.len());
 
         let mut results = Vec::new();
-        let uid_set: String = uids
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let uid_set = Self::uid_list(&uids.iter().copied().collect::<Vec<_>>());
 
         // Fetch message bodies
         let messages = session.uid_fetch(&uid_set, "RFC822").await?;
         let messages: Vec<Fetch> = messages.try_collect().await?;
 
+        let mut parsed_uids: Vec<u32> = Vec::new();
+        let mut unparseable_uids: Vec<u32> = Vec::new();
+
         for msg in messages {
             let uid = msg.uid.unwrap_or(0);
-            if let Some(body) = msg.body() {
-                if let Some(parsed) = MessageParser::default().parse(body) {
-                    let sender = Self::extract_sender(&parsed);
-                    let subject = parsed.subject().unwrap_or("(no subject)").to_string();
-                    let body_text = Self::extract_text(&parsed);
-                    let content = format!("Subject: {}\n\n{}", subject, body_text);
-                    let msg_id = parsed
-                        .message_id()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
+            let Some(parsed) = msg.body().and_then(|b| MessageParser::default().parse(b)) else {
+                unparseable_uids.push(uid);
+                continue;
+            };
+            // Parsed — so it is accounted for either way below, including when
+            // the sender is refused.
+            parsed_uids.push(uid);
 
-                    #[allow(clippy::cast_sign_loss)]
-                    let ts = parsed
-                        .date()
-                        .map(|d| {
-                            let naive = chrono::NaiveDate::from_ymd_opt(
-                                d.year as i32,
-                                u32::from(d.month),
-                                u32::from(d.day),
-                            )
-                            .and_then(|date| {
-                                date.and_hms_opt(
-                                    u32::from(d.hour),
-                                    u32::from(d.minute),
-                                    u32::from(d.second),
-                                )
-                            });
-                            naive.map_or(0, |n| n.and_utc().timestamp() as u64)
-                        })
-                        .unwrap_or_else(|| {
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0)
-                        });
+            let Some(sender) = self.sender_identity(&parsed) else {
+                // Refused above, with the reason logged. Marked seen so
+                // the same forgery is not re-evaluated every poll.
+                self.remember_seen(uid.to_string()).await;
+                continue;
+            };
+            let subject = parsed.subject().unwrap_or("(no subject)").to_string();
+            let body_text = Self::extract_text(&parsed);
+            let content = format!("Subject: {}\n\n{}", subject, body_text);
+            let msg_id = parsed
+                .message_id()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
 
-                    results.push(ParsedEmail {
-                        _uid: uid,
-                        msg_id,
-                        sender,
-                        content,
-                        timestamp: ts,
-                    });
-                }
-            }
+            #[allow(clippy::cast_sign_loss)]
+            // `to_timestamp()` applies the header's UTC offset. The
+            // previous code rebuilt a `NaiveDate` from the parts and
+            // called `and_utc()`, which reads a local wall-clock time
+            // as if it were UTC — every message from a non-UTC sender
+            // was stamped hours off.
+            let ts = parsed
+                .date()
+                .map(|d| u64::try_from(d.to_timestamp()).unwrap_or(0))
+                .unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                });
+
+            results.push(ParsedEmail {
+                _uid: uid,
+                msg_id,
+                sender,
+                content,
+                timestamp: ts,
+            });
         }
 
-        // Mark fetched messages as seen
-        if !results.is_empty() {
+        if !unparseable_uids.is_empty() {
+            warn!(
+                "IMAP: {} message(s) could not be parsed; flagging them for review: {:?}",
+                unparseable_uids.len(),
+                unparseable_uids
+            );
+        }
+
+        for (set, flags) in Self::flag_stores(&parsed_uids, &unparseable_uids) {
             let _ = session
-                .uid_store(&uid_set, "+FLAGS (\\Seen)")
+                .uid_store(&set, flags)
                 .await?
                 .try_collect::<Vec<_>>()
                 .await;
         }
 
         Ok(results)
+    }
+
+    fn uid_list(uids: &[u32]) -> String {
+        uids.iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The `\Seen` stores a fetched batch needs, split by parse outcome.
+    ///
+    /// Previously one store covered the whole fetched set, and only when at
+    /// least one message parsed. That lost unparseable mail into `\Seen` with
+    /// no trace, and a batch where *every* message failed to parse flagged
+    /// nothing at all — so the next poll refetched the same UIDs, forever.
+    ///
+    /// Unparseable UIDs get `\Flagged` alongside `\Seen`: they leave UNSEEN so
+    /// the loop ends, and stay visible in the mailbox so they have not
+    /// silently vanished. A custom keyword would say more, but servers may
+    /// refuse one that is not in `PERMANENTFLAGS`; `\Flagged` is universal.
+    fn flag_stores(parsed: &[u32], unparseable: &[u32]) -> Vec<(String, &'static str)> {
+        let mut stores = Vec::new();
+        if !parsed.is_empty() {
+            stores.push((Self::uid_list(parsed), "+FLAGS (\\Seen)"));
+        }
+        if !unparseable.is_empty() {
+            stores.push((Self::uid_list(unparseable), "+FLAGS (\\Seen \\Flagged)"));
+        }
+        stores
     }
 
     /// Run the IDLE loop, returning when a new message arrives or timeout
@@ -477,8 +722,11 @@ impl EmailChannel {
             }
 
             let is_new = {
-                let mut seen = self.seen_messages.lock().await;
-                seen.insert(email.msg_id.clone())
+                let already = self.seen_messages.lock().await.1.contains(&email.msg_id);
+                if !already {
+                    self.remember_seen(email.msg_id.clone()).await;
+                }
+                !already
             };
             if !is_new {
                 continue;
@@ -504,15 +752,75 @@ impl EmailChannel {
         Ok(())
     }
 
+    /// Build the SMTP transport, refusing to put credentials on the wire in
+    /// the clear.
+    ///
+    /// `smtp_tls = false` used to mean `builder_dangerous` **with credentials
+    /// attached** — the mailbox username and password sent over an unencrypted
+    /// connection, to whoever is listening. Three branches now:
+    ///
+    /// - implicit TLS (`relay`, typically port 465),
+    /// - STARTTLS (`starttls_relay`, typically 587),
+    /// - plaintext, permitted only when there is no credential to leak.
+    ///
+    /// A credential-less local relay on port 25 is a legitimate setup, so
+    /// plaintext stays reachable — it just cannot carry a secret.
+    /// Replace the live allowlist so a console or CLI edit reaches this
+    /// channel without a restart. The trait method plan 115 added.
+    ///
+    /// Replaces rather than merges: a *removal* has to take effect too, or
+    /// revoking someone's access would need the daemon bounced.
+    ///
+    /// Note for plan 144: `is_sender_allowed`'s matching rules — bare domain,
+    /// `@domain`, full address, `*`, all case-insensitive — are undocumented
+    /// in the channel reference.
+    pub fn set_allowed_senders(&self, allowed: &[String]) {
+        if let Ok(mut senders) = self.allowed_senders.write() {
+            if senders.as_slice() != allowed {
+                info!(
+                    target: "channels",
+                    channel = "email",
+                    count = allowed.len(),
+                    "applied updated allowlist from config"
+                );
+                *senders = allowed.to_vec();
+            }
+        }
+    }
+
     fn create_smtp_transport(&self) -> Result<SmtpTransport> {
+        let has_credentials = !self.config.username.is_empty() || !self.config.password.is_empty();
+
+        if !self.config.smtp_tls && has_credentials {
+            return Err(anyhow!(
+                "Refusing to send SMTP credentials over a plaintext connection to {}:{}.\n\
+                 `smtp_tls = false` disables encryption, and the username and password would \
+                 travel in the clear.\n\
+                 Fix: set [channels_config.email] smtp_tls = true (port 465 for implicit TLS, \
+                 587 for STARTTLS), or clear `username` and `password` if this really is an \
+                 unauthenticated local relay.",
+                self.config.smtp_host,
+                self.config.smtp_port
+            ));
+        }
+
         let creds = Credentials::new(self.config.username.clone(), self.config.password.clone());
-        let transport = if self.config.smtp_tls {
-            SmtpTransport::relay(&self.config.smtp_host)?
+
+        let transport = if !self.config.smtp_tls {
+            // No credentials to protect — see the guard above.
+            SmtpTransport::builder_dangerous(&self.config.smtp_host)
+                .port(self.config.smtp_port)
+                .build()
+        } else if self.config.smtp_port == 587 {
+            // 587 is the submission port: the session starts in the clear and
+            // upgrades. `relay()` would try to negotiate TLS immediately and
+            // fail against a STARTTLS-only server.
+            SmtpTransport::starttls_relay(&self.config.smtp_host)?
                 .port(self.config.smtp_port)
                 .credentials(creds)
                 .build()
         } else {
-            SmtpTransport::builder_dangerous(&self.config.smtp_host)
+            SmtpTransport::relay(&self.config.smtp_host)?
                 .port(self.config.smtp_port)
                 .credentials(creds)
                 .build()
@@ -541,6 +849,10 @@ enum IdleWaitResult {
 impl Channel for EmailChannel {
     fn name(&self) -> &str {
         "email"
+    }
+
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        self.set_allowed_senders(allowed);
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -633,18 +945,76 @@ mod tests {
     async fn seen_messages_starts_empty() {
         let channel = EmailChannel::new(EmailConfig::default());
         let seen = channel.seen_messages.lock().await;
-        assert!(seen.is_empty());
+        assert!(seen.1.is_empty());
     }
 
     #[tokio::test]
     async fn seen_messages_tracks_unique_ids() {
         let channel = EmailChannel::new(EmailConfig::default());
-        let mut seen = channel.seen_messages.lock().await;
+        channel.remember_seen("first-id".to_string()).await;
+        channel.remember_seen("first-id".to_string()).await;
+        channel.remember_seen("second-id".to_string()).await;
 
-        assert!(seen.insert("first-id".to_string()));
-        assert!(!seen.insert("first-id".to_string()));
-        assert!(seen.insert("second-id".to_string()));
-        assert_eq!(seen.len(), 2);
+        let seen = channel.seen_messages.lock().await;
+        assert_eq!(seen.1.len(), 2, "a repeat id must not be counted twice");
+        assert_eq!(seen.0.len(), 2, "the eviction queue must stay in step");
+    }
+
+    /// The set used to grow for the lifetime of the process, one entry per
+    /// message ever seen.
+    #[tokio::test]
+    async fn seen_messages_is_bounded() {
+        let channel = EmailChannel::new(EmailConfig::default());
+        for i in 0..2_500 {
+            channel.remember_seen(format!("id-{i}")).await;
+        }
+        let seen = channel.seen_messages.lock().await;
+        assert_eq!(seen.1.len(), 2_000, "the window must cap");
+        assert_eq!(seen.0.len(), 2_000);
+        assert!(!seen.1.contains("id-0"), "the oldest must be evicted");
+        assert!(seen.1.contains("id-2499"), "the newest must be kept");
+    }
+
+    /// The `\Seen` store used to cover the whole fetched set, so a message the
+    /// parser rejected was filed as read and never seen by anyone.
+    #[test]
+    fn unparseable_message_is_not_marked_seen() {
+        let stores = EmailChannel::flag_stores(&[11], &[12]);
+        let plain = stores
+            .iter()
+            .find(|(_, flags)| *flags == "+FLAGS (\\Seen)")
+            .expect("parsed UIDs must still be marked seen");
+        assert_eq!(
+            plain.0, "11",
+            "only the parsed UID belongs in the plain \\Seen store"
+        );
+        let flagged = stores
+            .iter()
+            .find(|(_, flags)| flags.contains("\\Flagged"))
+            .expect("the unparseable UID must be flagged, not silently filed");
+        assert_eq!(flagged.0, "12");
+    }
+
+    /// A batch where every message failed to parse flagged nothing at all, so
+    /// the next `UNSEEN` search returned the same UIDs — forever.
+    #[test]
+    fn all_unparseable_batch_does_not_loop() {
+        let stores = EmailChannel::flag_stores(&[], &[7, 8]);
+        assert_eq!(
+            stores.len(),
+            1,
+            "an all-unparseable batch must still issue a store: {stores:?}"
+        );
+        assert_eq!(stores[0].0, "7,8");
+        assert!(
+            stores[0].1.contains("\\Seen"),
+            "the UIDs must leave UNSEEN or the poll refetches them"
+        );
+    }
+
+    #[test]
+    fn flag_stores_is_empty_for_an_empty_batch() {
+        assert!(EmailChannel::flag_stores(&[], &[]).is_empty());
     }
 
     // EmailConfig tests
@@ -679,6 +1049,7 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
             allowed_senders: vec!["allowed@example.com".to_string()],
+            require_authenticated_sender: false,
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -699,11 +1070,237 @@ mod tests {
             from_address: "bot@test.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
+            require_authenticated_sender: false,
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
         assert_eq!(cloned.smtp_port, config.smtp_port);
         assert_eq!(cloned.allowed_senders, config.allowed_senders);
+    }
+
+    // HTML to prompt text
+
+    /// The defect: only the tags were removed, so the stylesheet and the
+    /// tracking script landed in the prompt as text.
+    #[test]
+    fn script_and_style_bodies_do_not_reach_the_prompt() {
+        let html =
+            "<p>Hello</p><style>.x{color:red}</style><script>track('abc')</script><p>Bye</p>";
+        let out = EmailChannel::strip_html(html);
+        assert!(!out.contains("color:red"), "{out}");
+        assert!(!out.contains("track"), "{out}");
+        assert_eq!(out, "Hello Bye");
+    }
+
+    #[test]
+    fn entities_are_decoded() {
+        assert_eq!(
+            EmailChannel::strip_html("<p>a&nbsp;b &amp; c &lt;d&gt;</p>"),
+            "a b & c <d>"
+        );
+    }
+
+    /// `&amp;` must decode last, or `&amp;lt;` collapses to `<` and a literal
+    /// that was escaped on purpose turns back into markup.
+    #[test]
+    fn double_escaped_entities_decode_once() {
+        assert_eq!(EmailChannel::strip_html("<p>&amp;lt;</p>"), "&lt;");
+    }
+
+    #[test]
+    fn plain_html_still_works() {
+        assert_eq!(
+            EmailChannel::strip_html("<div><b>bold</b> and <i>italic</i></div>"),
+            "bold and italic"
+        );
+    }
+
+    // Runtime allowlist
+
+    /// A config edit must reach the running channel — including a removal,
+    /// which is the half that matters when revoking access.
+    #[test]
+    fn apply_allowed_senders_replaces_the_live_list() {
+        let ch = EmailChannel::new(EmailConfig {
+            allowed_senders: vec!["old@example.com".to_string()],
+            ..Default::default()
+        });
+        assert!(ch.is_sender_allowed("old@example.com"));
+
+        ch.apply_allowed_senders(&["new@example.com".to_string()]);
+        assert!(ch.is_sender_allowed("new@example.com"));
+        assert!(
+            !ch.is_sender_allowed("old@example.com"),
+            "a removal must take effect, or revoking access needs a restart"
+        );
+    }
+
+    /// The existing domain semantics must survive the move behind a lock.
+    #[test]
+    fn apply_allowed_senders_keeps_domain_matching() {
+        let ch = EmailChannel::new(EmailConfig::default());
+        ch.apply_allowed_senders(&["example.com".to_string()]);
+        assert!(ch.is_sender_allowed("anyone@example.com"));
+        assert!(!ch.is_sender_allowed("anyone@other.com"));
+    }
+
+    // SMTP transport safety
+
+    fn smtp_channel(tls: bool, port: u16, user: &str, pass: &str) -> EmailChannel {
+        EmailChannel::new(EmailConfig {
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: port,
+            smtp_tls: tls,
+            username: user.to_string(),
+            password: pass.to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// The defect: `smtp_tls = false` attached the mailbox credentials to an
+    /// unencrypted connection and sent them anyway.
+    #[test]
+    fn plaintext_with_credentials_is_refused() {
+        let ch = smtp_channel(false, 25, "bot@example.com", "placeholder-mailbox-password");
+        let err = ch.create_smtp_transport().unwrap_err().to_string();
+        assert!(err.contains("plaintext"), "{err}");
+        assert!(
+            !err.contains("placeholder-mailbox-password"),
+            "the error must not repeat the secret: {err}"
+        );
+    }
+
+    /// A password with no username is still a password.
+    #[test]
+    fn plaintext_with_only_a_password_is_still_refused() {
+        let ch = smtp_channel(false, 25, "", "placeholder-mailbox-password");
+        assert!(ch.create_smtp_transport().is_err());
+    }
+
+    /// An unauthenticated local relay is a legitimate setup and must keep working.
+    #[test]
+    fn plaintext_without_credentials_is_allowed() {
+        let ch = smtp_channel(false, 25, "", "");
+        assert!(ch.create_smtp_transport().is_ok());
+    }
+
+    #[test]
+    fn tls_ports_build_with_credentials() {
+        for port in [465u16, 587] {
+            let ch = smtp_channel(true, port, "bot@example.com", "placeholder-pass");
+            assert!(
+                ch.create_smtp_transport().is_ok(),
+                "port {port} should build"
+            );
+        }
+    }
+
+    // Sender authentication
+
+    /// Build a raw message with an optional `Authentication-Results` header.
+    fn raw_mail(from: &str, auth: Option<&str>) -> String {
+        let auth_line = auth.map_or(String::new(), |a| {
+            format!("Authentication-Results: {a}\r\n")
+        });
+        format!("From: {from}\r\n{auth_line}Subject: hi\r\n\r\nbody\r\n")
+    }
+
+    fn identity(channel: &EmailChannel, from: &str, auth: Option<&str>) -> Option<String> {
+        let raw = raw_mail(from, auth);
+        let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
+        channel.sender_identity(&parsed)
+    }
+
+    fn owner_channel(require_auth: bool) -> EmailChannel {
+        let config = EmailConfig {
+            allowed_senders: vec!["*".to_string()],
+            require_authenticated_sender: require_auth,
+            ..Default::default()
+        };
+        EmailChannel::new(config).with_approval_owners(vec!["owner@example.com".to_string()])
+    }
+
+    /// The core of the defect: `From:` is a header, not a credential.
+    #[test]
+    fn unauthenticated_mail_cannot_claim_to_be_an_approval_owner() {
+        let ch = owner_channel(false);
+        assert_eq!(
+            identity(&ch, "owner@example.com", None),
+            None,
+            "owner authority must never come from an unverified From:"
+        );
+        assert_eq!(
+            identity(&ch, "owner@example.com", Some("mx.example.com; spf=fail")),
+            None
+        );
+    }
+
+    #[test]
+    fn an_authenticated_owner_is_accepted() {
+        let ch = owner_channel(false);
+        assert_eq!(
+            identity(&ch, "owner@example.com", Some("mx.example.com; dmarc=pass")),
+            Some("owner@example.com".to_string())
+        );
+    }
+
+    /// A pass that names a different domain proves someone authenticated —
+    /// just not the person the `From:` claims to be.
+    #[test]
+    fn an_unaligned_pass_does_not_authenticate_the_from_domain() {
+        let ch = owner_channel(false);
+        assert_eq!(
+            identity(
+                &ch,
+                "owner@example.com",
+                Some("mx.example.com; spf=pass smtp.mailfrom=attacker.test")
+            ),
+            None
+        );
+        assert_eq!(
+            identity(
+                &ch,
+                "owner@example.com",
+                Some("mx.example.com; spf=pass smtp.mailfrom=example.com")
+            ),
+            Some("owner@example.com".to_string())
+        );
+    }
+
+    /// Non-owner mail still flows by default: a relay that strips the header
+    /// must not silence an otherwise working mailbox.
+    #[test]
+    fn ordinary_unauthenticated_mail_passes_when_the_flag_is_off() {
+        let ch = owner_channel(false);
+        assert_eq!(
+            identity(&ch, "someone@example.com", None),
+            Some("someone@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn the_flag_turns_ordinary_unauthenticated_mail_away() {
+        let ch = owner_channel(true);
+        assert_eq!(identity(&ch, "someone@example.com", None), None);
+        assert_eq!(
+            identity(
+                &ch,
+                "someone@example.com",
+                Some("mx; dkim=pass header.d=example.com")
+            ),
+            Some("someone@example.com".to_string())
+        );
+    }
+
+    /// `"unknown"` is a shared identity — every unattributable sender collapses
+    /// into one principal — so an unparseable `From:` is dropped, not renamed.
+    #[test]
+    fn an_unparseable_from_is_dropped_rather_than_called_unknown() {
+        let ch = owner_channel(false);
+        let parsed = MessageParser::default()
+            .parse(b"Subject: no from\r\n\r\nbody\r\n".as_slice())
+            .unwrap();
+        assert_eq!(ch.sender_identity(&parsed), None);
     }
 
     // EmailChannel tests
@@ -715,7 +1312,7 @@ mod tests {
         assert_eq!(channel.config.imap_host, config.imap_host);
 
         let seen_guard = channel.seen_messages.lock().await;
-        assert_eq!(seen_guard.len(), 0);
+        assert_eq!(seen_guard.1.len(), 0);
     }
 
     #[test]
@@ -899,10 +1496,12 @@ mod tests {
     }
 
     #[test]
+    /// Was an assertion that entities survive stripping — it encoded the old
+    /// behaviour, where the model was handed raw `&lt;` sequences to interpret.
     fn strip_html_special_characters() {
         assert_eq!(
             EmailChannel::strip_html("<span>&lt;tag&gt;</span>"),
-            "&lt;tag&gt;"
+            "<tag>"
         );
     }
 
@@ -944,6 +1543,7 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["allowed@example.com".to_string()],
+            require_authenticated_sender: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();

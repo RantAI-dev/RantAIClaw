@@ -272,6 +272,11 @@ impl TuiProvisioner for EmailProvisioner {
             from_address,
             idle_timeout_secs,
             allowed_senders,
+            // Left off by default: a relay that strips Authentication-Results
+            // would otherwise silence a working mailbox on first run. Mail
+            // claiming to be from an approval owner is refused when
+            // unauthenticated regardless of this flag.
+            require_authenticated_sender: false,
         });
 
         send(
