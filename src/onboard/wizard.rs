@@ -4463,6 +4463,10 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                         Some(sasl_password.trim().to_string())
                     },
                     verify_tls: Some(verify_tls),
+                    // Never enabled by setup: it exists to let an operator
+                    // override a refusal they have understood, not to be
+                    // answered in a wizard.
+                    allow_insecure_tls_with_password: false,
                 });
             }
             ChannelMenuChoice::Webhook => {

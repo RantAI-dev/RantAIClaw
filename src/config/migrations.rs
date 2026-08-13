@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 19;
+pub const CURRENT_VERSION: u32 = 20;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -273,8 +273,22 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive field whose default preserves behaviour)
     }
 
-    // Future migrations (v20, v21, …) inserted here in order.
-    // if from < 20 { migrate_v20(raw)?; }
+    // v19 → v20: `[channels.irc] allow_insecure_tls_with_password` (bool,
+    // default `false`) was added. It is the second, explicit opt-in for
+    // `verify_tls = false` alongside a configured password — the channel now
+    // refuses to start on that combination, because SASL PLAIN is reversible
+    // base64 and NickServ IDENTIFY is plaintext, so an unauthenticated link
+    // hands the credential to whoever answered it. The default leaves the
+    // refusal in force, which is the point; an operator who wants the old
+    // behaviour sets the key. Additive with a serde default, nothing to
+    // transform — this arm burns a version slot so the schema_drift
+    // fingerprint is accepted with intent.
+    if from < 20 {
+        // (no transformation; additive field, refusal is the new default)
+    }
+
+    // Future migrations (v21, v22, …) inserted here in order.
+    // if from < 21 { migrate_v21(raw)?; }
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -796,6 +810,30 @@ backend = \"markdown\"
         assert!(
             email.get("require_authenticated_sender").is_none(),
             "the migration must not inject the key — serde's default supplies it"
+        );
+    }
+
+    #[test]
+    fn v20_irc_config_is_untouched_and_stamped() {
+        // Additive: the refusal it gates is the new default, so an existing
+        // IRC config comes through byte-identical and only the stamp moves.
+        // An operator who needs the old behaviour writes the key themselves —
+        // a migration must not opt them back into a credential disclosure.
+        let _guard = V18EnvGuard::scrubbed();
+        let mut v = parse(
+            "schema_version = 19\n[channels.irc]\nserver = \"irc.example.com\"\nnickname = \"rantaiclaw_bot\"\nverify_tls = false\n",
+        );
+        migrate(&mut v).unwrap();
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        let irc = v
+            .get("channels")
+            .and_then(|c| c.get("irc"))
+            .and_then(Value::as_table)
+            .expect("irc table survives");
+        assert_eq!(irc.get("verify_tls").and_then(Value::as_bool), Some(false));
+        assert!(
+            irc.get("allow_insecure_tls_with_password").is_none(),
+            "the migration must not grant the opt-in on the operator's behalf"
         );
     }
 

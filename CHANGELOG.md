@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **IRC resolves identity from the services account, not the nick.** A nick is
+  a first-come lease: anyone who connects while the owner is offline — or
+  forces them off with a ghost or a netsplit — takes it, and was resolved as
+  that owner with the full toolset and authority to approve shell commands. The
+  client now negotiates `account-tag`/`extended-join` (via a proper `CAP LS`
+  intersection, so a server missing one capability no longer loses the others),
+  uses the account as the sender, and **refuses a message from a nick listed in
+  `approval_owners` that carries no account tag**. On a network without
+  services that means owner authority over IRC is unavailable — deliberately.
+  `approval_owners` for IRC now holds services account names. A literal `*`
+  there still means "the operator turned the owner gate off".
+
+- **IRC refuses to send a password over an unverified TLS link.** SASL PLAIN is
+  reversible base64 and NickServ IDENTIFY is plaintext, so `verify_tls = false`
+  plus any configured password handed the credential to whoever answered the
+  connection. That combination now fails at startup unless the new
+  `[channels.irc] allow_insecure_tls_with_password` is set, and disabling
+  verification always logs a warning naming the server. **Rotate any IRC
+  credential already used over such a link.**
+
+  **Config schema v19 → v20.** Additive; the refusal is the default, and the
+  migration deliberately does not grant the opt-in on an operator's behalf.
+
+### Fixed
+
+- **IRC replies stopped vanishing after a disconnect.** The write half survived
+  the listener, so `send()` wrote into a half-closed socket and returned
+  `Ok(())` with the reply lost and no error anywhere. Every exit from the
+  session now clears it, and `send()` reports "IRC not connected" instead.
+
+- **IRC no longer floods itself off the network.** Reply chunks went out
+  back-to-back, which most servers disconnect as excess flood — so a long reply
+  failed more reliably than a short one. Lines are now paced after a short
+  burst. The `433` nickname-in-use retry is capped as well, instead of
+  producing an unbounded NICK flood against a server that rejects every
+  candidate.
+
+- **The IRC health check no longer opens a connection per heartbeat**, which was
+  the single most reliable way to get the bot K-lined, and said nothing about
+  whether the live session worked. It now reports on that session.
+
+- **IRC allowlist edits reach the running channel** (`apply_allowed_senders`).
+
 - **Email now requires an authenticated sender before it honours `From:`.**
   The header was taken verbatim as the identity — no SPF, DKIM, DMARC or
   `Authentication-Results` check existed anywhere in the channel — so anyone

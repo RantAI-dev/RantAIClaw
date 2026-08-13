@@ -332,6 +332,10 @@ panic = "abort"
 
 [dev-dependencies]
 tempfile = "3.14"
+# Test-only: `start_paused` runtimes, so behaviour that waits (IRC flood
+# pacing) is asserted without the suite actually sleeping. No new crate and,
+# under resolver 2, no effect on the shipped binary's feature set.
+tokio = { version = "1.42", default-features = false, features = ["test-util"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs"] }
 insta = { version = "1", features = ["json"] }
