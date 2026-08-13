@@ -3474,7 +3474,10 @@ pub(crate) fn build_configured_channels(
         channels.push((
             "email",
             "Email",
-            Arc::new(EmailChannel::new(email_cfg.clone())),
+            Arc::new(
+                EmailChannel::new(email_cfg.clone())
+                    .with_approval_owners(config.channels_config.approval_owners.clone()),
+            ),
         ));
     }
 

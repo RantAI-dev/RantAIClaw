@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Email now requires an authenticated sender before it honours `From:`.**
+  The header was taken verbatim as the identity — no SPF, DKIM, DMARC or
+  `Authentication-Results` check existed anywhere in the channel — so anyone
+  who could deliver mail into the configured mailbox chose who the agent
+  thought was talking, including an address listed in `approval_owners`.
+  `Authentication-Results` is now parsed, and `dmarc=pass` or an aligned
+  `spf=pass`/`dkim=pass` is required. Mail claiming an owner address is
+  refused when it did not authenticate, **regardless of configuration**; the
+  new `[channels.email] require_authenticated_sender` (default `false`)
+  extends the same requirement to plain chat. Refused mail is dropped with a
+  warning, never renamed to the shared identity `"unknown"`.
+
+  **Config schema v18 → v19.** Additive with a serde default, and the default
+  is the previous behaviour, so existing mailboxes keep working; only the owner
+  path tightens unconditionally.
+
+- **Email no longer hands SMTP credentials to a plaintext transport.** With
+  `smtp_tls = false` the password went out in the clear with no warning. The
+  transport now branches three ways and refuses credentials over plaintext; a
+  credential-less local relay still builds.
+
+- **The mailbox password no longer renders in `Debug` output.** `EmailConfig`
+  derived `Debug` over the plaintext credential, so one `debug!(?config)` wrote
+  it to the log stream. **Rotate any mailbox password that may already sit in
+  retained logs** — the fix stops new leaks, it cannot recall old ones.
+
+### Fixed
+
+- **Email stopped losing mail and stopped refetching it forever.** Unparseable
+  messages were filed `\Seen` alongside good ones and vanished; a batch where
+  *every* message failed to parse flagged nothing at all, so the next poll
+  returned the same UIDs indefinitely. Unparseable UIDs now get `\Flagged` as
+  well, leaving UNSEEN while staying visible for review.
+
+- **Email timestamps were off by up to ±14 hours.** The date was rebuilt into a
+  `NaiveDate` and read as UTC, discarding the header's offset.
+
+- **`<script>` and `<style>` bodies no longer reach the agent's prompt**, and
+  HTML entities in mail bodies are decoded rather than passed through raw.
+
 ### Changed
 
 - **Setup no longer defaults a channel allowlist to "allow anyone".** Six
