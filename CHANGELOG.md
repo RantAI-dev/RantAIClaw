@@ -49,6 +49,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Long replies are no longer lost on Slack, Mattermost, WhatsApp and
+  Nextcloud Talk.** Only three of eighteen channels split; the rest posted the
+  whole rendered reply in one request, so any answer past the platform cap
+  failed the *entire* send and you got nothing at all. Four more now split, each
+  against a documented limit (Slack 4000, Mattermost 16383, WhatsApp 4096,
+  Nextcloud Talk 32000). The others are deliberately left unsplit — no
+  authoritative limit was found, and a wrong constant fails sends in a way that
+  looks like an outage.
+
+- **WhatsApp, Linq, Lark and DingTalk carry the platform message id** instead of
+  minting a UUID per inbound message, so a redelivery is detectable rather than
+  running the agent again on a message it already answered.
+
+- **The Slack health probe can fail for a revoked token.** Slack answers
+  `auth.test` with HTTP 200 and `{"ok": false}`, so a status-only probe reported
+  healthy for exactly the condition it existed to catch.
+
+- **The Linq chat id is percent-encoded** in the three URLs that interpolated it
+  raw. It arrives on the inbound webhook and the request carries a bearer token.
+
+- **A failed profile-root lookup is logged on every channel.** The helper was
+  copy-pasted into fifteen files and the iMessage copy had dropped its error log,
+  so a profile-resolution failure there presented as "no pairing code matched".
+
 - **DingTalk stopped reconnect-storming.** A WebSocket *error* was reported to
   the supervisor as a clean exit, and the clean-exit arm marks a health error
   *and* resets the backoff — one event read as both failure and success. An
