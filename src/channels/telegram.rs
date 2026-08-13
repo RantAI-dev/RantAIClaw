@@ -146,8 +146,13 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
 }
 
 /// Strip tool_call XML-style tags from message text.
-/// These tags are used internally but must not be sent to Telegram as raw markup,
-/// since Telegram's Markdown parser will reject them (causing status 400 errors).
+///
+/// These tags are internal syntax and must not be shown to the user. The
+/// original rationale — that Telegram's Markdown parser rejects them with a
+/// 400 — no longer holds: this channel renders `RenderTarget::TelegramHtml`
+/// and `escape_html` turns a literal `<` into `&lt;`, so an unstripped tag
+/// cannot produce a parse error. Leaked tool-call XML is still ugly, which is
+/// why the function stays.
 fn strip_tool_call_tags(message: &str) -> String {
     const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
         "<function_calls>",
@@ -239,7 +244,10 @@ fn strip_tool_call_tags(message: &str) -> String {
             continue;
         }
 
-        kept_segments.push(remaining[start..].to_string());
+        // Unterminated tag: drop it and everything after, rather than
+        // re-emitting the raw tags this function exists to remove. Anything
+        // following an unclosed tool-call opener is the tool payload, not
+        // prose for the user.
         remaining = "";
         break;
     }
@@ -310,7 +318,10 @@ pub struct TelegramChannel {
     allowed_users: Arc<RwLock<Vec<String>>>,
     pairing: Option<PairingGuard>,
     client: reqwest::Client,
-    typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Keyed by recipient. One shared slot meant starting typing for chat B
+    /// silently killed chat A's indicator, and with the runtime's parallel
+    /// message path concurrent chats are the normal case.
+    typing_handles: Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
@@ -368,7 +379,7 @@ impl TelegramChannel {
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
-            typing_handle: Mutex::new(None),
+            typing_handles: Mutex::new(std::collections::HashMap::new()),
             mention_only,
             bot_username: Mutex::new(None),
         }
@@ -526,6 +537,23 @@ impl TelegramChannel {
             .as_ref()
             .and_then(PairingGuard::pairing_code)
             .is_some()
+    }
+
+    /// The draft body to send: the rendered text, cut to Telegram's limit.
+    ///
+    /// Gated and cut in `chars`, the unit the limit is expressed in — the same
+    /// reasoning `finalize_draft` already carries. The gate used to read raw
+    /// `len()` bytes, so a CJK or emoji-heavy reply was truncated at roughly a
+    /// third of its intended length.
+    fn draft_display_text(rendered: &str) -> &str {
+        if rendered.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
+            return rendered;
+        }
+        let end = rendered
+            .char_indices()
+            .nth(TELEGRAM_MAX_MESSAGE_LENGTH)
+            .map_or(rendered.len(), |(idx, _)| idx);
+        &rendered[..end]
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -1091,19 +1119,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_i64)
             .map(|id| id.to_string());
 
-        let sender_identity = if username == "unknown" {
-            sender_id.clone().unwrap_or_else(|| "unknown".to_string())
-        } else {
-            username.clone()
-        };
+        // Prefer the numeric id: a Telegram `@username` can be released and
+        // re-registered, so whoever takes the handle would inherit whatever
+        // that handle was granted. The id cannot be transferred.
+        let sender_identity = sender_id
+            .clone()
+            .unwrap_or_else(|| username.clone())
+            .to_string();
 
-        // The alternate identity form for `sender` (the numeric id when
-        // `sender` is the username), so the owner gate can recognize an owner
+        // The alternate identity form for `sender` (the username when `sender`
+        // is the numeric id), so the owner gate can recognize an owner
         // recorded under either form — the same two-form logic the chat
         // allowlist already applies below.
-        let sender_aliases: Vec<String> = match sender_id.as_ref() {
-            Some(id) if id != &sender_identity => vec![id.clone()],
-            _ => Vec::new(),
+        let sender_aliases: Vec<String> = if username != "unknown" && username != sender_identity {
+            vec![username.clone()]
+        } else {
+            Vec::new()
         };
 
         let mut identities = vec![username.as_str()];
@@ -1933,19 +1964,7 @@ impl Channel for TelegramChannel {
         // so the UTF-8-safe cut runs on exactly what is sent.
         use crate::channels::format::{render_to_string, RenderTarget};
         let rendered = render_to_string(text, &RenderTarget::Plain);
-        let display_text = if rendered.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
-            let mut end = 0;
-            for (idx, ch) in rendered.char_indices() {
-                let next = idx + ch.len_utf8();
-                if next > TELEGRAM_MAX_MESSAGE_LENGTH {
-                    break;
-                }
-                end = next;
-            }
-            &rendered[..end]
-        } else {
-            &rendered
-        };
+        let display_text = Self::draft_display_text(&rendered);
 
         let message_id_parsed = match message_id.parse::<i64>() {
             Ok(id) => id,
@@ -2319,6 +2338,14 @@ Ensure only one `rantaiclaw` process is using this bot token."
         }
     }
 
+    /// One `sendChatAction` POST per call.
+    ///
+    /// There used to be a self-refreshing 4-second loop in here as well, while
+    /// the runtime's own `spawn_scoped_typing_task` calls this on a 4-second
+    /// interval — so every runtime tick aborted the task spawned four seconds
+    /// earlier and spawned another. The runtime cadence (4s) is inside
+    /// Telegram's ~5s indicator expiry, so the inner loop was redundant as
+    /// well as self-defeating.
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
         self.stop_typing(recipient).await?;
 
@@ -2326,27 +2353,26 @@ Ensure only one `rantaiclaw` process is using this bot token."
         let url = self.api_url("sendChatAction");
         let chat_id = recipient.to_string();
 
+        // Spawned rather than awaited so a slow POST does not hold up the
+        // reply it is announcing; the handle is kept so `stop_typing` can
+        // cancel one still in flight.
         let handle = tokio::spawn(async move {
-            loop {
-                let body = serde_json::json!({
-                    "chat_id": &chat_id,
-                    "action": "typing"
-                });
-                let _ = client.post(&url).json(&body).send().await;
-                // Telegram typing indicator expires after 5s; refresh at 4s
-                tokio::time::sleep(Duration::from_secs(4)).await;
-            }
+            let body = serde_json::json!({
+                "chat_id": &chat_id,
+                "action": "typing"
+            });
+            let _ = client.post(&url).json(&body).send().await;
         });
 
-        let mut guard = self.typing_handle.lock();
-        *guard = Some(handle);
+        self.typing_handles
+            .lock()
+            .insert(recipient.to_string(), handle);
 
         Ok(())
     }
 
-    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        let mut guard = self.typing_handle.lock();
-        if let Some(handle) = guard.take() {
+    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        if let Some(handle) = self.typing_handles.lock().remove(recipient) {
             handle.abort();
         }
         Ok(())
@@ -2507,49 +2533,112 @@ mod tests {
         assert_eq!(ch.name(), "telegram");
     }
 
+    /// The gate read raw bytes against a character limit, so a CJK reply was
+    /// cut at roughly a third of its intended length.
     #[test]
-    fn typing_handle_starts_as_none() {
+    fn draft_gate_counts_characters_not_bytes() {
+        // Just under the character limit, far over the byte limit: 3 bytes per
+        // character.
+        let cjk = "字".repeat(TELEGRAM_MAX_MESSAGE_LENGTH - 1);
+        assert!(cjk.len() > TELEGRAM_MAX_MESSAGE_LENGTH, "precondition");
+        assert_eq!(
+            TelegramChannel::draft_display_text(&cjk),
+            cjk,
+            "a reply inside the character limit must not be truncated"
+        );
+
+        // Over the character limit: cut to exactly the limit, on a boundary.
+        let over = "字".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 10);
+        let cut = TelegramChannel::draft_display_text(&over);
+        assert_eq!(cut.chars().count(), TELEGRAM_MAX_MESSAGE_LENGTH);
+        assert!(over.starts_with(cut));
+    }
+
+    #[test]
+    fn typing_handles_start_empty() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
-        let guard = ch.typing_handle.lock();
-        assert!(guard.is_none());
+        assert!(ch.typing_handles.lock().is_empty());
     }
 
     #[tokio::test]
-    async fn stop_typing_clears_handle() {
+    async fn stop_typing_clears_that_recipients_handle() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
 
-        // Manually insert a dummy handle
-        {
-            let mut guard = ch.typing_handle.lock();
-            *guard = Some(tokio::spawn(async {
+        ch.typing_handles.lock().insert(
+            "123".to_string(),
+            tokio::spawn(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-            }));
-        }
+            }),
+        );
 
-        // stop_typing should abort and clear
         ch.stop_typing("123").await.unwrap();
 
-        let guard = ch.typing_handle.lock();
-        assert!(guard.is_none());
+        assert!(ch.typing_handles.lock().is_empty());
+    }
+
+    /// Two concurrent conversations used to share one typing slot, so starting
+    /// typing for chat B silently killed chat A's indicator. With the runtime's
+    /// parallel message path that is the normal case, not an edge case.
+    #[tokio::test]
+    async fn concurrent_typing_handles_are_independent() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+
+        for chat in ["chat_a", "chat_b"] {
+            ch.typing_handles.lock().insert(
+                chat.to_string(),
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }),
+            );
+        }
+
+        ch.stop_typing("chat_b").await.unwrap();
+
+        let guard = ch.typing_handles.lock();
+        assert!(
+            guard.contains_key("chat_a"),
+            "stopping B must leave A's indicator alone"
+        );
+        assert!(!guard.contains_key("chat_b"));
     }
 
     #[tokio::test]
-    async fn start_typing_replaces_previous_handle() {
+    async fn stop_typing_only_stops_that_recipient() {
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+        ch.typing_handles.lock().insert(
+            "chat_a".to_string(),
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }),
+        );
+
+        // A recipient with no indicator running is a no-op, not a clear-all.
+        ch.stop_typing("chat_zzz").await.unwrap();
+
+        assert!(ch.typing_handles.lock().contains_key("chat_a"));
+    }
+
+    #[tokio::test]
+    async fn start_typing_replaces_that_recipients_handle_only() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
 
-        // Insert a dummy handle first
-        {
-            let mut guard = ch.typing_handle.lock();
-            *guard = Some(tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }));
+        for chat in ["123", "456"] {
+            ch.typing_handles.lock().insert(
+                chat.to_string(),
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }),
+            );
         }
 
-        // start_typing should abort the old handle and set a new one
         let _ = ch.start_typing("123").await;
 
-        let guard = ch.typing_handle.lock();
-        assert!(guard.is_some());
+        let guard = ch.typing_handles.lock();
+        assert!(guard.contains_key("123"));
+        assert!(
+            guard.contains_key("456"),
+            "another chat's indicator must survive"
+        );
     }
 
     #[test]
@@ -2880,7 +2969,9 @@ mod tests {
             .map(|(m, _)| m)
             .expect("message should parse");
 
-        assert_eq!(msg.sender, "alice");
+        // `sender` is the numeric id: a username can be released and
+        // re-registered, the id cannot.
+        assert_eq!(msg.sender, "555");
         assert_eq!(msg.reply_target, "-100200300");
         assert_eq!(msg.content, "hello");
         assert_eq!(msg.id, "telegram_-100200300_33");
@@ -2912,38 +3003,51 @@ mod tests {
         assert_eq!(msg.reply_target, "12345");
     }
 
-    #[test]
-    fn parse_update_message_records_numeric_id_as_sender_alias_for_owner_match() {
-        // A user with a username: `sender` resolves to the username, but the
-        // numeric id is kept as an alias so an owner recorded by numeric id is
-        // still recognized — parity with the two-form chat allowlist.
-        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
-        let update = serde_json::json!({
+    fn update_from(id: i64, username: &str) -> serde_json::Value {
+        serde_json::json!({
             "update_id": 4,
             "message": {
                 "message_id": 7,
                 "text": "hi",
-                "from": { "id": 1_360_247_715_i64, "username": "sulthannauval" },
+                "from": { "id": id, "username": username },
                 "chat": { "id": 4242 }
             }
-        });
+        })
+    }
 
+    /// A Telegram `@username` can be released and re-registered, and pairing
+    /// writes whatever form the channel reports into `approval_owners` — so
+    /// reporting the handle meant whoever took it inherited owner authority.
+    #[test]
+    fn sender_is_the_numeric_id_and_the_username_is_an_alias() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
         let msg = ch
-            .parse_update_message(&update)
+            .parse_update_message(&update_from(1_360_247_715, "rantaiclaw_user"))
             .map(|(m, _)| m)
             .expect("wildcard allowlist should pass");
 
-        assert_eq!(msg.sender, "sulthannauval");
-        assert_eq!(msg.sender_aliases, vec!["1360247715".to_string()]);
-        // Owner recorded by numeric id is recognized across the sender's forms,
-        // even though the runtime resolved `sender` to the username. The
-        // single-form check still misses it — the asymmetry this fix closes.
-        let owners = vec!["1360247715".to_string()];
+        assert_eq!(msg.sender, "1360247715");
+        assert_eq!(msg.sender_aliases, vec!["rantaiclaw_user".to_string()]);
+    }
+
+    /// The alias path must keep working, or the swap silently demotes every
+    /// owner recorded by handle.
+    #[test]
+    fn owner_listed_by_username_is_still_recognised() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let msg = ch
+            .parse_update_message(&update_from(1_360_247_715, "rantaiclaw_user"))
+            .map(|(m, _)| m)
+            .expect("wildcard allowlist should pass");
+
+        let owners = vec!["rantaiclaw_user".to_string()];
         assert!(crate::approval::can_approve_any(
             &owners,
             msg.sender_identities()
         ));
-        assert!(!crate::approval::can_approve(&owners, &msg.sender));
+        // And an owner recorded by numeric id, which is now the primary form.
+        let owners = vec!["1360247715".to_string()];
+        assert!(crate::approval::can_approve(&owners, &msg.sender));
     }
 
     #[test]
@@ -2970,7 +3074,7 @@ mod tests {
             .map(|(m, _)| m)
             .expect("message with thread_id should parse");
 
-        assert_eq!(msg.sender, "alice");
+        assert_eq!(msg.sender, "555");
         assert_eq!(msg.reply_target, "-100200300:789");
         assert_eq!(msg.content, "hello from topic");
         assert_eq!(msg.id, "telegram_-100200300_42");
@@ -3356,10 +3460,14 @@ mod tests {
     }
 
     #[test]
-    fn strip_tool_call_tags_handles_unclosed_tags() {
-        let input = "Hello <tool>world";
-        let result = strip_tool_call_tags(input);
-        assert_eq!(result, "Hello <tool>world");
+    /// Was an assertion that the raw tags come back out — the function
+    /// re-emitted exactly what it exists to remove.
+    fn unterminated_tool_tag_is_dropped_not_reemitted() {
+        assert_eq!(strip_tool_call_tags("Hello <tool>world"), "Hello");
+        assert_eq!(
+            strip_tool_call_tags("before <function_calls> leftover"),
+            "before"
+        );
     }
 
     #[test]

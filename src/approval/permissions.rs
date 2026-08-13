@@ -159,6 +159,15 @@ pub fn apply(config: &mut Config, target: Target, op: Op, value: &str) -> Change
     }
 }
 
+/// Whether an owner entry is a Telegram-style numeric id.
+///
+/// Numeric ids cannot be transferred; a `@username` can be released and
+/// re-registered by somebody else.
+fn is_numeric_identity(entry: &str) -> bool {
+    let e = entry.trim();
+    !e.is_empty() && e.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Render the current per-role permission state as a multi-line summary.
 ///
 /// `safe_tools` is the always-available read-only set (the autonomy
@@ -184,6 +193,30 @@ pub fn render(config: &Config, safe_tools: &[String]) -> String {
     } else {
         for o in &cc.approval_owners {
             let _ = writeln!(out, "  • {o}");
+        }
+        // A Telegram `@username` can be released and re-registered, so an owner
+        // recorded by handle is transferable to whoever claims it next. The
+        // channel now reports the numeric id, but existing entries were written
+        // under whatever form was reported at the time — show which ones.
+        if cc.telegram.is_some() {
+            let transferable: Vec<&String> = cc
+                .approval_owners
+                .iter()
+                .filter(|o| !is_numeric_identity(o))
+                .collect();
+            if !transferable.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  ⚠ Telegram is configured, and these owner entries are not numeric ids: {}.\n    \
+                     A Telegram @username can be released and re-registered, so whoever claims it\n    \
+                     next inherits owner authority. Re-add them by numeric id.",
+                    transferable
+                        .iter()
+                        .map(|o| o.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         }
     }
 
@@ -224,6 +257,42 @@ pub fn render(config: &Config, safe_tools: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Telegram `@username` can be released and re-registered, so an owner
+    /// entry recorded under one is transferable to whoever claims it next.
+    /// The operator has to be able to see which of their entries those are.
+    #[test]
+    fn permissions_show_flags_transferable_telegram_owner_entries() {
+        let mut c = cfg();
+        c.channels_config.telegram = Some(crate::config::schema::TelegramConfig {
+            bot_token: "placeholder-token".to_string(),
+            allowed_users: vec![],
+            stream_mode: crate::config::schema::StreamMode::default(),
+            draft_update_interval_ms: 1_000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        c.channels_config.approval_owners =
+            vec!["1360247715".to_string(), "rantaiclaw_user".to_string()];
+
+        let out = render(&c, &[]);
+        assert!(
+            out.contains("rantaiclaw_user"),
+            "the transferable entry must be named: {out}"
+        );
+        assert!(out.contains("not numeric ids"), "{out}");
+
+        // Numeric-only: no warning at all.
+        c.channels_config.approval_owners = vec!["1360247715".to_string()];
+        let out = render(&c, &[]);
+        assert!(!out.contains("not numeric ids"), "{out}");
+
+        // No Telegram configured: the warning is Telegram-specific.
+        c.channels_config.telegram = None;
+        c.channels_config.approval_owners = vec!["rantaiclaw_user".to_string()];
+        let out = render(&c, &[]);
+        assert!(!out.contains("not numeric ids"), "{out}");
+    }
 
     /// A config with empty lists so each test starts from a known-clean slate
     /// (the default autonomy allowlist ships with `git`/`cargo`/etc.).
