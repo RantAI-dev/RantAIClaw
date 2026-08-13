@@ -18,6 +18,13 @@ pub struct NextcloudTalkChannel {
     client: reqwest::Client,
 }
 
+/// Nextcloud Talk: "The maximum allowed limit is 32000 characters", returning
+/// 413 above it (1000 before Nextcloud 16.0.1). An installation can report its
+/// own value via the `spreed => config => chat => max-length` capability; this
+/// is the documented default, not a per-server read.
+/// <https://nextcloud-talk.readthedocs.io/en/latest/chat/>
+const NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH: usize = 32000;
+
 impl NextcloudTalkChannel {
     pub fn new(base_url: String, app_token: String, allowed_users: Vec<String>) -> Self {
         Self {
@@ -46,17 +53,6 @@ impl NextcloudTalkChannel {
         if let Ok(mut users) = self.allowed_users.write() {
             if !users.iter().any(|u| u == id) {
                 users.push(id.to_string());
-            }
-        }
-    }
-
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("Nextcloud Talk pairing: couldn't resolve profile root: {e:#}");
-                None
             }
         }
     }
@@ -126,7 +122,7 @@ impl NextcloudTalkChannel {
         if parse_pairing_command(&content).is_none() {
             return false;
         }
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("nextcloud_talk") else {
             return false;
         };
 
@@ -333,11 +329,23 @@ impl Channel for NextcloudTalkChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Nextcloud Talk renders no markup — strip to readable text. Rendered here
         // (agent replies only); `send_to_room` also carries plain pairing messages.
-        let rendered = crate::channels::format::render_to_string(
+        //
+        // Split before sending: the whole reply used to go in one request, and
+        // Talk answers 413 past its per-message limit, failing the entire send.
+        let blocks = crate::channels::format::render(
             &message.content,
             &crate::channels::format::RenderTarget::Plain,
         );
-        self.send_to_room(&message.recipient, &rendered).await
+        let chunks = crate::channels::format::split(&blocks, NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH);
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            self.send_to_room(&message.recipient, chunk).await?;
+            if index + 1 < chunks.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        Ok(())
     }
 
     async fn listen(
@@ -412,6 +420,39 @@ pub fn verify_nextcloud_talk_signature(
 
 #[cfg(test)]
 mod tests {
+    /// The splitter test above proves the constant and the splitter behave; a
+    /// `send()` that never calls the splitter passes it anyway. This asserts
+    /// the wiring, since `send()` needs a live API to drive.
+    #[test]
+    fn nextcloud_talk_send_routes_through_the_splitter() {
+        let src = include_str!("nextcloud_talk.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let send_body = production
+            .split("async fn send(")
+            .nth(1)
+            .expect("send exists");
+        let split_at = send_body
+            .find("format::split(")
+            .expect("send must route through format::split");
+        let next_fn = send_body.find("\n    async fn ").unwrap_or(send_body.len());
+        assert!(
+            split_at < next_fn,
+            "the split call must be inside send(), not a later function"
+        );
+    }
+
+    #[test]
+    fn long_reply_is_split_on_nextcloud_talk() {
+        let long = "word ".repeat(NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH);
+        let blocks =
+            crate::channels::format::render(&long, &crate::channels::format::RenderTarget::Plain);
+        let chunks = crate::channels::format::split(&blocks, NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH);
+        assert!(chunks.len() > 1, "expected several chunks");
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH);
+        }
+    }
+
     /// Pairing used to append to the persisted config only, so a freshly-paired
     /// actor stayed locked out until the daemon restarted.
     #[test]

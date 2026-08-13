@@ -11,7 +11,62 @@ pub struct SlackChannel {
     allowed_users: Arc<RwLock<Vec<String>>>,
 }
 
+/// Slack's own guidance for `chat.postMessage`: "For best results, limit the
+/// number of characters in the text field to 4,000 characters."
+/// <https://docs.slack.dev/changelog/2018-truncating-really-long-messages/>
+const SLACK_MAX_MESSAGE_LENGTH: usize = 4000;
+
 impl SlackChannel {
+    /// POST one already-split chunk.
+    async fn post_chunk(&self, message: &SendMessage, chunk: &str) -> anyhow::Result<()> {
+        let mut body = serde_json::json!({
+            "channel": message.recipient,
+            "text": chunk
+        });
+
+        if let Some(ref ts) = message.thread_ts {
+            body["thread_ts"] = serde_json::json!(ts);
+        }
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            anyhow::bail!("Slack chat.postMessage failed ({status}): {body}");
+        }
+
+        // Slack returns 200 for most app-level errors; check JSON "ok" field
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if !Self::api_response_is_ok(&parsed) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack chat.postMessage failed: {err}");
+        }
+
+        Ok(())
+    }
+
+    /// Whether a Slack Web API response reports success.
+    ///
+    /// Slack signals application-level failure in the body with HTTP 200, so
+    /// the status alone says nothing.
+    fn api_response_is_ok(body: &serde_json::Value) -> bool {
+        body.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
     pub fn new(bot_token: String, channel_id: Option<String>, allowed_users: Vec<String>) -> Self {
         Self {
             bot_token,
@@ -45,17 +100,6 @@ impl SlackChannel {
         if let Ok(mut users) = self.allowed_users.write() {
             if !users.iter().any(|u| u == identity) {
                 users.push(identity.to_string());
-            }
-        }
-    }
-
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("Slack pairing: couldn't resolve profile root: {e:#}");
-                None
             }
         }
     }
@@ -105,43 +149,17 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let rendered =
-            crate::channels::format::render_to_string(&message.content, &self.render_target());
-        let mut body = serde_json::json!({
-            "channel": message.recipient,
-            "text": rendered
-        });
+        // Render per-platform, then split without cutting a fenced block. The
+        // whole reply used to go out in one request, so anything past Slack's
+        // limit failed the entire send and the user got nothing at all.
+        let blocks = crate::channels::format::render(&message.content, &self.render_target());
+        let chunks = crate::channels::format::split(&blocks, SLACK_MAX_MESSAGE_LENGTH);
 
-        if let Some(ref ts) = message.thread_ts {
-            body["thread_ts"] = serde_json::json!(ts);
-        }
-
-        let resp = self
-            .http_client()
-            .post("https://slack.com/api/chat.postMessage")
-            .bearer_auth(&self.bot_token)
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-
-        if !status.is_success() {
-            anyhow::bail!("Slack chat.postMessage failed ({status}): {body}");
-        }
-
-        // Slack returns 200 for most app-level errors; check JSON "ok" field
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            let err = parsed
-                .get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("unknown");
-            anyhow::bail!("Slack chat.postMessage failed: {err}");
+        for (index, chunk) in chunks.iter().enumerate() {
+            self.post_chunk(message, chunk).await?;
+            if index + 1 < chunks.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         }
 
         Ok(())
@@ -221,7 +239,7 @@ impl Channel for SlackChannel {
                         // `rantaiclaw channels pair`. On success the sender lands in
                         // `allowed_users` (and, for an owner `/claim`, `approval_owners`).
                         if !text.is_empty() && ts > last_ts.as_str() {
-                            if let Some(root) = Self::pairing_profile_root() {
+                            if let Some(root) = crate::channels::pairing::profile_root("slack") {
                                 let identities = vec![user.to_string()];
                                 if let Some(reply) = crate::channels::pairing::try_handle_pairing(
                                     text,
@@ -277,19 +295,97 @@ impl Channel for SlackChannel {
         }
     }
 
+    /// Slack answers `auth.test` with **HTTP 200 and `{"ok": false}`** for a
+    /// revoked or invalid token, so a status-only probe reported healthy for
+    /// exactly the condition it exists to catch. `send()` in this same file
+    /// already reads the `ok` field; this now does too.
     async fn health_check(&self) -> bool {
-        self.http_client()
+        let Ok(resp) = self
+            .http_client()
             .get("https://slack.com/api/auth.test")
             .bearer_auth(&self.bot_token)
             .send()
             .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+        else {
+            return false;
+        };
+        if !resp.status().is_success() {
+            return false;
+        }
+        let Ok(body) = resp.json::<serde_json::Value>().await else {
+            return false;
+        };
+        Self::api_response_is_ok(&body)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The splitter test above proves the constant and the splitter behave; a
+    /// `send()` that never calls the splitter passes it anyway. This asserts
+    /// the wiring, since `send()` needs a live API to drive.
+    #[test]
+    fn slack_send_routes_through_the_splitter() {
+        let src = include_str!("slack.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let send_body = production
+            .split("async fn send(")
+            .nth(1)
+            .expect("send exists");
+        let split_at = send_body
+            .find("format::split(")
+            .expect("send must route through format::split");
+        let next_fn = send_body.find("\n    async fn ").unwrap_or(send_body.len());
+        assert!(
+            split_at < next_fn,
+            "the split call must be inside send(), not a later function"
+        );
+    }
+
+    /// The whole reply used to go out in one request, so anything past the
+    /// limit failed the entire send and the user got nothing at all.
+    #[test]
+    fn long_reply_is_split_on_slack() {
+        let long = "word ".repeat(SLACK_MAX_MESSAGE_LENGTH);
+        let blocks = crate::channels::format::render(
+            &long,
+            &crate::channels::format::RenderTarget::LightMarkup {
+                links: crate::channels::format::LinkStyle::Slack,
+            },
+        );
+        let chunks = crate::channels::format::split(&blocks, SLACK_MAX_MESSAGE_LENGTH);
+        assert!(
+            chunks.len() > 1,
+            "expected several chunks, got {}",
+            chunks.len()
+        );
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= SLACK_MAX_MESSAGE_LENGTH,
+                "a chunk exceeded the limit: {} chars",
+                chunk.chars().count()
+            );
+        }
+    }
+
+    /// Slack answers a revoked token with HTTP 200 and `{"ok": false}`, so the
+    /// old status-only probe could not fail for the one condition it existed
+    /// to catch.
+    #[test]
+    fn slack_health_check_fails_on_ok_false() {
+        let revoked = serde_json::json!({"ok": false, "error": "invalid_auth"});
+        assert!(
+            !SlackChannel::api_response_is_ok(&revoked),
+            "a 200 with ok:false is not healthy"
+        );
+
+        let good = serde_json::json!({"ok": true, "user_id": "U0000000000"});
+        assert!(SlackChannel::api_response_is_ok(&good));
+
+        // A body with no `ok` at all is not evidence of health either.
+        assert!(!SlackChannel::api_response_is_ok(&serde_json::json!({})));
+    }
+
     use super::*;
 
     #[test]

@@ -729,17 +729,6 @@ impl TelegramChannel {
         Some((text.to_string(), chat_id, identities))
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("Telegram pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Shared-store fallback for a `/bind`/`/claim` whose code the in-memory
     /// [`PairingGuard`] did not recognize.
     ///
@@ -770,7 +759,7 @@ impl TelegramChannel {
         let Some(cmd) = parse_pairing_command(text) else {
             return false;
         };
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("telegram") else {
             return false;
         };
         let now = std::time::SystemTime::now()

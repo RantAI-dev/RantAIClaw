@@ -128,18 +128,6 @@ impl WhatsAppWebChannel {
         }
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    #[cfg(feature = "whatsapp-web")]
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("WhatsApp Web pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Try to handle `text` from `phone` (already normalized to `+E.164`) as a
     /// `/bind`/`/claim` against the shared pairing store at `root` (surface
     /// `"whatsapp"`).
@@ -204,7 +192,7 @@ impl WhatsAppWebChannel {
         phone: &str,
         chat_jid: wa_rs_binary::jid::Jid,
     ) -> bool {
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("whatsapp_web") else {
             return false;
         };
         let Some(reply) = Self::handle_pairing_for(allowed_numbers, text, phone, &root).await

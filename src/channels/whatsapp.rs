@@ -32,7 +32,43 @@ pub struct WhatsAppChannel {
     allowed_numbers: Arc<RwLock<Vec<String>>>,
 }
 
+/// WhatsApp Cloud API: "A text message can be a maximum of 4096 characters
+/// long." <https://docs.360dialog.com/partner/messaging/sending-and-receiving-messages/text-messages>
+const WHATSAPP_MAX_MESSAGE_LENGTH: usize = 4096;
+
 impl WhatsAppChannel {
+    /// POST one already-split chunk.
+    async fn post_chunk(&self, url: &str, to: &str, chunk: &str) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "text",
+            "text": {
+                "preview_url": false,
+                "body": chunk
+            }
+        });
+
+        let resp = self
+            .http_client()
+            .post(url)
+            .bearer_auth(&self.access_token)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_body = resp.text().await.unwrap_or_default();
+            tracing::error!("WhatsApp send failed: {status} — {error_body}");
+            anyhow::bail!("WhatsApp API error: {status}");
+        }
+
+        Ok(())
+    }
+
     pub fn new(
         access_token: String,
         endpoint_id: String,
@@ -82,17 +118,6 @@ impl WhatsAppChannel {
         if let Ok(mut allowed) = self.allowed_numbers.write() {
             if !allowed.iter().any(|n| n == phone) {
                 allowed.push(phone.to_string());
-            }
-        }
-    }
-
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("WhatsApp pairing: couldn't resolve profile root: {e:#}");
-                None
             }
         }
     }
@@ -157,7 +182,7 @@ impl WhatsAppChannel {
         if candidates.is_empty() {
             return;
         }
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("whatsapp") else {
             return;
         };
         let now = std::time::SystemTime::now()
@@ -283,9 +308,17 @@ impl WhatsAppChannel {
                                 .as_secs()
                         });
 
+                    // Carry the platform id (`wamid.…`): a UUID minted here
+                    // makes a redelivery undetectable, so the agent runs again
+                    // on a message it already answered.
+                    let platform_id = msg
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map_or_else(|| Uuid::new_v4().to_string(), |id| format!("whatsapp_{id}"));
+
                     messages.push(ChannelMessage {
                         sender_aliases: Vec::new(),
-                        id: Uuid::new_v4().to_string(),
+                        id: platform_id,
                         reply_target: normalized_from.clone(),
                         sender: normalized_from,
                         content,
@@ -330,35 +363,19 @@ impl Channel for WhatsAppChannel {
             .strip_prefix('+')
             .unwrap_or(&message.recipient);
 
-        let rendered =
-            crate::channels::format::render_to_string(&message.content, &self.render_target());
-        let body = serde_json::json!({
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": to,
-            "type": "text",
-            "text": {
-                "preview_url": false,
-                "body": rendered
-            }
-        });
-
         ensure_https(&url)?;
 
-        let resp = self
-            .http_client()
-            .post(&url)
-            .bearer_auth(&self.access_token)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        // Render per-platform, then split without cutting a fenced block. The
+        // whole reply used to go out in one request, so anything past
+        // WhatsApp's 4096-character body limit failed the entire send.
+        let blocks = crate::channels::format::render(&message.content, &self.render_target());
+        let chunks = crate::channels::format::split(&blocks, WHATSAPP_MAX_MESSAGE_LENGTH);
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_body = resp.text().await.unwrap_or_default();
-            tracing::error!("WhatsApp send failed: {status} — {error_body}");
-            anyhow::bail!("WhatsApp API error: {status}");
+        for (index, chunk) in chunks.iter().enumerate() {
+            self.post_chunk(&url, to, chunk).await?;
+            if index + 1 < chunks.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         }
 
         Ok(())
@@ -403,6 +420,39 @@ impl Channel for WhatsAppChannel {
 
 #[cfg(test)]
 mod tests {
+    /// The splitter test above proves the constant and the splitter behave; a
+    /// `send()` that never calls the splitter passes it anyway. This asserts
+    /// the wiring, since `send()` needs a live API to drive.
+    #[test]
+    fn whatsapp_send_routes_through_the_splitter() {
+        let src = include_str!("whatsapp.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let send_body = production
+            .split("async fn send(")
+            .nth(1)
+            .expect("send exists");
+        let split_at = send_body
+            .find("format::split(")
+            .expect("send must route through format::split");
+        let next_fn = send_body.find("\n    async fn ").unwrap_or(send_body.len());
+        assert!(
+            split_at < next_fn,
+            "the split call must be inside send(), not a later function"
+        );
+    }
+
+    #[test]
+    fn long_reply_is_split_on_whatsapp() {
+        let long = "word ".repeat(WHATSAPP_MAX_MESSAGE_LENGTH);
+        let blocks =
+            crate::channels::format::render(&long, &crate::channels::format::RenderTarget::Plain);
+        let chunks = crate::channels::format::split(&blocks, WHATSAPP_MAX_MESSAGE_LENGTH);
+        assert!(chunks.len() > 1, "expected several chunks");
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= WHATSAPP_MAX_MESSAGE_LENGTH);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -508,6 +558,9 @@ mod tests {
         assert_eq!(msgs[0].sender, "+1234567890");
         assert_eq!(msgs[0].content, "Hello RantaiClaw!");
         assert_eq!(msgs[0].channel, "whatsapp");
+        // The platform id, not a fresh UUID: a redelivery has to be
+        // recognisable as one.
+        assert_eq!(msgs[0].id, "whatsapp_wamid.xxx");
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
     }
 

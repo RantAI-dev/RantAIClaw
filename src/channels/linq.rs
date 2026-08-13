@@ -28,6 +28,18 @@ pub struct LinqChannel {
 /// does not own — and shipped the live token there on every setup run.
 pub(crate) const LINQ_API_BASE: &str = "https://api.linqapp.com/api/partner/v3";
 
+/// Percent-encode a chat id for use as a single URL path segment.
+///
+/// The value originates in the inbound webhook payload and the request carries
+/// a bearer token, so a `/` or `?` in it used to reshape the URL the token is
+/// presented to. `NON_ALPHANUMERIC` is deliberate rather than a lighter set:
+/// Linq chat ids observed in this codebase's own fixtures are opaque
+/// alphanumeric handles with no path structure, so nothing legitimate is
+/// altered by encoding everything else.
+fn encode_chat_id(chat_id: &str) -> String {
+    urlencoding::encode(chat_id).into_owned()
+}
+
 impl LinqChannel {
     pub fn new(api_token: String, from_phone: String, allowed_senders: Vec<String>) -> Self {
         Self {
@@ -296,9 +308,17 @@ impl LinqChannel {
             chat_id
         };
 
+        // Carry the platform id: a UUID minted here makes a redelivery
+        // undetectable, so the agent runs again on a message it answered.
+        let platform_id = data
+            .get("message_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map_or_else(|| Uuid::new_v4().to_string(), |id| format!("linq_{id}"));
+
         messages.push(ChannelMessage {
             sender_aliases: Vec::new(),
-            id: Uuid::new_v4().to_string(),
+            id: platform_id,
             reply_target,
             sender: normalized_from,
             content,
@@ -339,7 +359,10 @@ impl Channel for LinqChannel {
         });
 
         // Try sending to existing chat (recipient is chat_id)
-        let url = format!("{LINQ_API_BASE}/chats/{recipient}/messages");
+        let url = format!(
+            "{LINQ_API_BASE}/chats/{}/messages",
+            encode_chat_id(recipient)
+        );
 
         let resp = self
             .client
@@ -424,7 +447,7 @@ impl Channel for LinqChannel {
     }
 
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
-        let url = format!("{LINQ_API_BASE}/chats/{recipient}/typing");
+        let url = format!("{LINQ_API_BASE}/chats/{}/typing", encode_chat_id(recipient));
 
         let resp = self
             .client
@@ -441,7 +464,7 @@ impl Channel for LinqChannel {
     }
 
     async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
-        let url = format!("{LINQ_API_BASE}/chats/{recipient}/typing");
+        let url = format!("{LINQ_API_BASE}/chats/{}/typing", encode_chat_id(recipient));
 
         let resp = self
             .client
@@ -500,6 +523,40 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
 
 #[cfg(test)]
 mod tests {
+    /// The chat id comes from the inbound webhook payload and the request
+    /// carries a bearer token, so a path metacharacter used to reshape the URL
+    /// that token is presented to.
+    #[test]
+    fn linq_recipient_with_a_metacharacter_is_encoded() {
+        assert_eq!(encode_chat_id("chat-123"), "chat-123");
+        assert_eq!(
+            encode_chat_id("../../admin"),
+            "..%2F..%2Fadmin",
+            "a path traversal must not survive into the URL"
+        );
+        assert_eq!(encode_chat_id("a?b=c"), "a%3Fb%3Dc");
+        assert_eq!(encode_chat_id("a b"), "a%20b");
+    }
+
+    /// A UUID minted per inbound message makes a redelivery undetectable, so
+    /// the agent runs again on a message it already answered.
+    #[test]
+    fn linq_platform_message_id_is_carried() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "message_id": "msg-abc",
+                "chat_id": "chat-789",
+                "from": "1234567890",
+                "message": { "parts": [{ "type": "text", "value": "hello" }] }
+            }
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1, "expected one parsed message: {msgs:?}");
+        assert_eq!(msgs[0].id, "linq_msg-abc");
+    }
+
     use super::*;
 
     fn make_channel() -> LinqChannel {

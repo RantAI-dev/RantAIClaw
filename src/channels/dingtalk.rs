@@ -151,17 +151,6 @@ impl DingTalkChannel {
             .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
     }
 
-    /// Resolve the active profile root for the shared pairing-code store.
-    fn pairing_profile_root() -> Option<std::path::PathBuf> {
-        match crate::profile::ProfileManager::active() {
-            Ok(p) => Some(p.root),
-            Err(e) => {
-                tracing::warn!("DingTalk pairing: couldn't resolve profile root: {e:#}");
-                None
-            }
-        }
-    }
-
     /// Self-onboarding hook: if `content` is a `/bind`/`/claim` command, validate
     /// it against the shared [`crate::security::pairing_store`] (appending the
     /// sender staff id to `allowed_users` and, for an owner-capable `/claim`, to
@@ -182,7 +171,7 @@ impl DingTalkChannel {
         if parse_pairing_command(content).is_none() {
             return false;
         }
-        let Some(root) = Self::pairing_profile_root() else {
+        let Some(root) = crate::channels::pairing::profile_root("dingtalk") else {
             return false;
         };
 
@@ -496,9 +485,17 @@ impl Channel for DingTalkChannel {
                         .await;
                     }
 
+                    // Carry the platform id: a UUID minted here makes a
+                    // redelivery undetectable, and DingTalk redelivers.
+                    let platform_id = if message_id.is_empty() {
+                        Uuid::new_v4().to_string()
+                    } else {
+                        format!("dingtalk_{message_id}")
+                    };
+
                     let channel_msg = ChannelMessage {
                         sender_aliases: Vec::new(),
-                        id: Uuid::new_v4().to_string(),
+                        id: platform_id,
                         sender: sender_id.to_string(),
                         reply_target: chat_id,
                         content: content.to_string(),

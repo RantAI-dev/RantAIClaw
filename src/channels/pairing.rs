@@ -105,6 +105,21 @@ fn push_unique(list: &mut Vec<String>, identity: &str) {
 /// Apply a successful pairing to `cc`: append each identity (deduped) to the
 /// matched channel's allowlist field; if `make_owner`, also append (deduped) to
 /// `cc.approval_owners`. No-op if the channel's config section is `None`.
+/// The active profile root, for the shared pairing-code store.
+///
+/// Was copy-pasted into fifteen channel files; the iMessage copy had silently
+/// dropped its error log, so a profile-resolution failure there looked like
+/// "no pairing code matched".
+pub fn profile_root(channel: &str) -> Option<std::path::PathBuf> {
+    match crate::profile::ProfileManager::active() {
+        Ok(p) => Some(p.root),
+        Err(e) => {
+            tracing::warn!("{channel} pairing: couldn't resolve profile root: {e:#}");
+            None
+        }
+    }
+}
+
 pub fn apply_pairing(
     cc: &mut ChannelsConfig,
     channel: &str,
@@ -224,6 +239,23 @@ pub async fn try_handle_pairing(
 
 #[cfg(test)]
 mod tests {
+    /// The iMessage copy of this helper had silently dropped its error log, so
+    /// a profile-resolution failure there read as "no pairing code matched".
+    #[test]
+    fn profile_root_names_the_channel_in_its_warning() {
+        // The warning text is what makes a failure attributable; assert the
+        // format string carries the channel, since a `tracing` sink is not
+        // available here.
+        let src = include_str!("pairing.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        assert!(
+            production.contains("{channel} pairing: couldn't resolve profile root"),
+            "the shared helper must name the channel it failed for"
+        );
+        // And there is exactly one implementation left to name it.
+        assert_eq!(production.matches("fn profile_root(").count(), 1);
+    }
+
     use super::*;
     use crate::config::{ChannelsConfig, StreamMode, TelegramConfig};
 
