@@ -10,6 +10,8 @@ pub mod registry;
 pub mod runtime_surfaces;
 pub mod skills;
 pub mod smoke;
+#[cfg(test)]
+pub mod test_support;
 pub mod traits;
 pub mod validate;
 #[cfg(feature = "whatsapp-web")]
@@ -59,6 +61,58 @@ pub fn install_core_skills_after_channel(
             tracing::warn!("could not install the owner-permissions skill: {e}");
         }
     }
+}
+
+/// Everything a channel provisioner's caller must do once it reports
+/// [`ProvisionOutcome::Configured`]: install the core skill, and hand back the
+/// owner-claim guidance if the operator still needs it.
+///
+/// The guidance is returned rather than emitted because the two drivers render
+/// it differently — the TUI overlay takes a [`ProvisionEvent::Message`], the
+/// headless driver writes to stderr — and by the time this runs, `run` has
+/// already consumed the event sender it was given. Keeping the *policy* here
+/// and the rendering at each driver is what makes both paths say the same
+/// thing.
+pub fn finalize_channel(
+    category: ProvisionerCategory,
+    profile: &crate::profile::Profile,
+    config: &crate::config::Config,
+) -> Option<String> {
+    install_core_skills_after_channel(category, profile);
+    owner_claim_guidance(category, config)
+}
+
+/// The note a freshly configured channel needs when nobody can approve on it
+/// yet, or `None` when an owner is already set.
+///
+/// An empty `approval_owners` is the correct default — it is what keeps a
+/// gated tool from being approvable by a stranger who found the bot. But the
+/// TUI provisioning path, the one the module doc calls "the one users take",
+/// never said so. A channel came up with every gated tool auto-denying and no
+/// explanation, which reads as broken rather than as secure.
+///
+/// This deliberately does **not** seed an owner. Only the explanation was
+/// missing.
+pub fn owner_claim_guidance(
+    category: ProvisionerCategory,
+    config: &crate::config::Config,
+) -> Option<String> {
+    if category != ProvisionerCategory::Channel {
+        return None;
+    }
+    if !config.channels_config.approval_owners.is_empty() {
+        return None;
+    }
+    Some(
+        "No approval owner is set, so any tool needing approval will be \
+         auto-denied over this channel.\n\
+         Claim ownership from chat (captures your real id):\n  \
+         1. Start the channel runtime: `rantaiclaw channels` — with an empty \
+         allowed_users it prints a one-time pairing code.\n  \
+         2. DM your bot: `/claim <code>` — registers you as an approval owner.\n\
+         Or set it by hand: [channels_config] approval_owners = [\"<your id>\"]"
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -138,6 +192,56 @@ mod core_skill_hook_tests {
             assert!(
                 !profile.skills_dir().join(core).exists(),
                 "{category:?} must not trigger a core-skill install"
+            );
+        }
+    }
+
+    /// A TUI-provisioned channel used to come up with every gated tool
+    /// auto-denying and no explanation, because this path never printed the
+    /// claim guidance the CLI section path does. That reads as broken rather
+    /// than as the secure default it is.
+    #[test]
+    fn owner_guidance_is_emitted_when_approval_owners_is_empty() {
+        let config = crate::config::Config::default();
+        assert!(config.channels_config.approval_owners.is_empty());
+
+        let guidance = owner_claim_guidance(ProvisionerCategory::Channel, &config)
+            .expect("an unowned channel must be explained");
+        assert!(guidance.contains("/claim"), "{guidance}");
+        assert!(guidance.contains("approval_owners"), "{guidance}");
+    }
+
+    /// The corollary: once an owner exists there is nothing to explain, and
+    /// this must never seed one itself.
+    #[test]
+    fn owner_guidance_is_silent_once_an_owner_exists() {
+        let mut config = crate::config::Config::default();
+        config
+            .channels_config
+            .approval_owners
+            .push("rantaiclaw_operator".to_string());
+
+        assert!(owner_claim_guidance(ProvisionerCategory::Channel, &config).is_none());
+        assert_eq!(
+            config.channels_config.approval_owners,
+            vec!["rantaiclaw_operator".to_string()],
+            "reading the guidance must not mutate the owner list"
+        );
+    }
+
+    #[test]
+    fn owner_guidance_is_only_for_channels() {
+        let config = crate::config::Config::default();
+        for category in [
+            ProvisionerCategory::Core,
+            ProvisionerCategory::Integration,
+            ProvisionerCategory::Runtime,
+            ProvisionerCategory::Hardware,
+            ProvisionerCategory::Routing,
+        ] {
+            assert!(
+                owner_claim_guidance(category, &config).is_none(),
+                "{category:?} has no channel for anyone to own"
             );
         }
     }

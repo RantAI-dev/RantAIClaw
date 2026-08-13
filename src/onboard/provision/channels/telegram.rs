@@ -218,6 +218,41 @@ async fn recv_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+
+    /// The plan's primary case. A provisioner that stops on a missing required
+    /// field used to emit `Failed` and then return `Ok(())`, which both drivers
+    /// read as success — so they installed the core skill and saved the config,
+    /// producing the false "channel is set up" signal the skill-install
+    /// ordering exists to prevent.
+    ///
+    /// The skill-install half is gated in the drivers' match arms; what is
+    /// unit-testable here is that the outcome says `Aborted` and that nothing
+    /// was written. Without the first, the second cannot be enforced.
+    #[tokio::test]
+    async fn aborted_provisioner_writes_no_config() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &TelegramProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![Answer::Text("   ")],
+        )
+        .await;
+
+        assert!(
+            t.aborted(),
+            "an empty bot token must abort, got {:?}",
+            t.outcome
+        );
+        assert!(
+            config.channels_config.telegram.is_none(),
+            "an aborted provisioner must not write a channel config"
+        );
+    }
 
     #[test]
     fn provisioner_name_is_telegram() {

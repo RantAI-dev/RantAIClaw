@@ -149,11 +149,7 @@ impl TuiProvisioner for LarkProvisioner {
         )
         .await?;
 
-        let token_url = if use_feishu {
-            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-        } else {
-            "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
-        };
+        let token_url = tenant_token_url(use_feishu);
 
         let body = serde_json::json!({
             "app_id": app_id.trim(),
@@ -321,6 +317,18 @@ impl TuiProvisioner for LarkProvisioner {
 
 use crate::onboard::provision::ProvisionerCategory;
 
+/// The tenant-token endpoint for the selected region.
+///
+/// Feishu and Lark are separate deployments; a credential issued by one is not
+/// valid on the other, so probing the wrong one can only ever fail.
+fn tenant_token_url(use_feishu: bool) -> &'static str {
+    if use_feishu {
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    } else {
+        "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
+    }
+}
+
 async fn send(
     events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
     ev: ProvisionEvent,
@@ -365,5 +373,26 @@ mod tests {
     #[test]
     fn provisioner_description_is_non_empty() {
         assert!(!LarkProvisioner::new().description().is_empty());
+    }
+
+    /// The region selection used to be a branch that could not take its Feishu
+    /// arm, so a Feishu tenant's credentials were always sent to the Lark
+    /// International host — where they can never be valid.
+    ///
+    /// Deliberately a pure check: driving the provisioner through this point
+    /// would make a real request to Lark or Feishu, which is neither
+    /// deterministic nor available on a CI runner without egress.
+    #[test]
+    fn lark_feishu_selection_picks_the_feishu_probe_host() {
+        let feishu = reqwest::Url::parse(tenant_token_url(true)).expect("feishu url parses");
+        let intl = reqwest::Url::parse(tenant_token_url(false)).expect("lark url parses");
+
+        assert_eq!(feishu.host_str(), Some("open.feishu.cn"));
+        assert_eq!(intl.host_str(), Some("open.larksuite.com"));
+        assert_ne!(
+            feishu.host_str(),
+            intl.host_str(),
+            "the two regions must not collapse onto one host"
+        );
     }
 }

@@ -321,6 +321,100 @@ async fn recv_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+
+    /// An empty answer used to be mapped to `vec!["*"]` — allow every sender —
+    /// under a prompt whose own label reads "empty = deny all".
+    #[tokio::test]
+    async fn empty_allowlist_answer_yields_an_empty_list() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &EmailProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Text("imap.example.com"),
+                Answer::Text(""), // imap port -> default
+                Answer::Text(""), // folder -> INBOX
+                Answer::Text("smtp.example.com"),
+                Answer::Text(""), // smtp port -> default
+                Answer::Text("bot@example.com"),
+                Answer::Text(""), // username -> from address
+                Answer::Text("placeholder-app-password"),
+                Answer::Text(""), // allowed senders -> EMPTY
+                Answer::Text(""), // idle timeout -> default
+            ],
+        )
+        .await;
+
+        assert!(
+            t.configured(),
+            "expected a configured run, got {:?}",
+            t.outcome
+        );
+        let email = config
+            .channels_config
+            .email
+            .as_ref()
+            .expect("email config written");
+        assert!(
+            email.allowed_senders.is_empty(),
+            "an empty answer must stay empty, got {:?}",
+            email.allowed_senders
+        );
+        assert!(
+            t.messages().iter().any(|m| m.contains("EVERY sender")),
+            "the operator must be told the channel now ignores everyone: {:?}",
+            t.messages()
+        );
+    }
+
+    /// The other end of the same prompt: `*` still works, and still warns.
+    #[tokio::test]
+    async fn wildcard_allowlist_warns() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &EmailProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Text("imap.example.com"),
+                Answer::Text(""),
+                Answer::Text(""),
+                Answer::Text("smtp.example.com"),
+                Answer::Text(""),
+                Answer::Text("bot@example.com"),
+                Answer::Text(""),
+                Answer::Text("placeholder-app-password"),
+                Answer::Text("*"),
+                Answer::Text(""),
+            ],
+        )
+        .await;
+
+        assert!(t.configured());
+        assert_eq!(
+            config
+                .channels_config
+                .email
+                .as_ref()
+                .expect("email config written")
+                .allowed_senders,
+            vec!["*".to_string()],
+            "a typed `*` must still be honoured"
+        );
+        assert!(
+            t.messages().iter().any(|m| m.contains("ANYONE")),
+            "a wildcard must warn: {:?}",
+            t.messages()
+        );
+    }
 
     #[test]
     fn provisioner_name_is_email() {

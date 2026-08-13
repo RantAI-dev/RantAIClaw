@@ -241,6 +241,7 @@ async fn recv_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
 
     #[test]
     fn provisioner_name_is_signal() {
@@ -250,5 +251,78 @@ mod tests {
     #[test]
     fn provisioner_description_is_non_empty() {
         assert!(!SignalProvisioner::new().description().is_empty());
+    }
+
+    /// Declining the confirmation must leave the config untouched. Before this
+    /// plan there was no confirmation at all: a failed probe warned and the
+    /// write went ahead regardless, so `config.toml` ended up holding a
+    /// credential the platform had already refused.
+    #[tokio::test]
+    async fn a_declined_probe_does_not_persist_the_credential() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &SignalProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Text("http://127.0.0.1:1"),
+                Answer::Text("+15550001111"),
+                Answer::Pick(1), // "No — let me correct it"
+            ],
+        )
+        .await;
+
+        assert!(t.aborted(), "expected an abort, got {:?}", t.outcome);
+        assert!(
+            config.channels_config.signal.is_none(),
+            "a declined probe must write nothing"
+        );
+    }
+
+    /// The old "Direct messages only" option wrote `group_id = Some("dm")`.
+    /// `SignalChannel` reads `group_id` as an *inclusion* filter, so it then
+    /// dropped every message not from a group literally named `dm` — choosing
+    /// the option silenced the bot. There is no DM-only predicate to express.
+    ///
+    /// Port 1 is reserved and closed, so the daemon check fails instantly
+    /// without DNS: an inconclusive verdict, whose headless default is to
+    /// carry on. That is the air-gapped path, exercised here for free.
+    #[tokio::test]
+    async fn signal_dm_option_does_not_write_a_group_id() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &SignalProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Text("http://127.0.0.1:1"),
+                Answer::Text("+15550001111"),
+                Answer::Pick(0), // daemon unreachable -> "save anyway"
+                Answer::Text("+15550002222"),
+            ],
+        )
+        .await;
+
+        assert!(t.configured(), "expected configured, got {:?}", t.outcome);
+        let signal = config
+            .channels_config
+            .signal
+            .as_ref()
+            .expect("signal config written");
+        assert_eq!(
+            signal.group_id, None,
+            "no answer may produce a group id the runtime would filter on"
+        );
+        assert!(
+            !t.prompts().iter().any(|p| p.contains("Which messages")),
+            "the DM-only choice must be gone: {:?}",
+            t.prompts()
+        );
     }
 }

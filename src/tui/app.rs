@@ -3919,10 +3919,18 @@ impl TuiApp {
                     // sure the skill that explains those tools is present.
                     // Runs before the config save below because it touches the
                     // profile's skills dir, not the config.
-                    crate::onboard::provision::install_core_skills_after_channel(
+                    if let Some(guidance) = crate::onboard::provision::finalize_channel(
                         prov_category,
                         &profile,
-                    );
+                        &config,
+                    ) {
+                        let _ = save_failure_tx
+                            .send(crate::onboard::provision::ProvisionEvent::Message {
+                                severity: crate::onboard::provision::Severity::Warn,
+                                text: guidance,
+                            })
+                            .await;
+                    }
 
                     // Persist the mutated config to disk. Without this,
                     // every provisioner mutation is lost when the spawned

@@ -320,6 +320,54 @@ async fn recv_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+
+    /// `IRC_DESC` advertises "NickServ/SASL passwords", but the TUI path never
+    /// asked and hardcoded `sasl_password: None`, so a network requiring SASL
+    /// could not be configured from here at all.
+    #[tokio::test]
+    async fn irc_sasl_prompt_is_reachable() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &IrcProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Text("irc.example.com"),
+                Answer::Text(""), // port -> default
+                Answer::Text("rantaiclaw_bot"),
+                Answer::Text(""), // username -> nickname
+                Answer::Pick(0),  // TLS yes
+                Answer::Text(""), // server password -> skip
+                Answer::Text(""), // NickServ -> skip
+                Answer::Text("placeholder-sasl-secret"),
+                Answer::Text("#rantaiclaw"),
+                Answer::Text("rantaiclaw_user"),
+            ],
+        )
+        .await;
+
+        assert!(t.configured(), "expected configured, got {:?}", t.outcome);
+        assert!(
+            t.prompts().iter().any(|p| p.contains("SASL")),
+            "a SASL prompt must be offered: {:?}",
+            t.prompts()
+        );
+        assert_eq!(
+            config
+                .channels_config
+                .irc
+                .as_ref()
+                .expect("irc config written")
+                .sasl_password
+                .as_deref(),
+            Some("placeholder-sasl-secret"),
+            "the answer must reach the config, not be dropped for a hardcoded None"
+        );
+    }
 
     #[test]
     fn provisioner_name_is_irc() {
