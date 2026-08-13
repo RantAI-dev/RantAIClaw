@@ -2,6 +2,7 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Nextcloud Talk channel in webhook mode.
@@ -11,7 +12,9 @@ use uuid::Uuid;
 pub struct NextcloudTalkChannel {
     base_url: String,
     app_token: String,
-    allowed_users: Vec<String>,
+    /// Runtime-mutable so a `/bind`/`/claim` — or a console allowlist edit —
+    /// reaches the running channel instead of waiting for a restart.
+    allowed_users: Arc<std::sync::RwLock<Vec<String>>>,
     client: reqwest::Client,
 }
 
@@ -20,13 +23,31 @@ impl NextcloudTalkChannel {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             app_token,
-            allowed_users,
+            allowed_users: Arc::new(std::sync::RwLock::new(allowed_users)),
             client: reqwest::Client::new(),
         }
     }
 
     fn is_user_allowed(&self, actor_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == actor_id)
+        let Ok(users) = self.allowed_users.read() else {
+            return false;
+        };
+        users.iter().any(|u| u == "*" || u == actor_id)
+    }
+
+    /// Append a freshly-paired actor id to the runtime allowlist so access is
+    /// effective immediately. The persisted config (saved by the pairing core)
+    /// stays the source of truth across restarts.
+    fn add_allowed_identity_runtime(&self, id: &str) {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        if let Ok(mut users) = self.allowed_users.write() {
+            if !users.iter().any(|u| u == id) {
+                users.push(id.to_string());
+            }
+        }
     }
 
     /// Resolve the active profile root for the shared pairing-code store.
@@ -113,13 +134,16 @@ impl NextcloudTalkChannel {
             &content,
             "nextcloud_talk",
             AllowlistField::AllowedUsers,
-            &[actor_id],
+            std::slice::from_ref(&actor_id),
             &root,
         )
         .await
         else {
             return false;
         };
+
+        // Effective immediately; the pairing core persists it for next start.
+        self.add_allowed_identity_runtime(&actor_id);
 
         if let Err(e) = self.send_to_room(&room_token, &reply).await {
             tracing::warn!("Nextcloud Talk pairing: failed to send reply: {e:#}");
@@ -332,6 +356,12 @@ impl Channel for NextcloudTalkChannel {
         }
     }
 
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        if let Ok(mut users) = self.allowed_users.write() {
+            *users = allowed.to_vec();
+        }
+    }
+
     async fn health_check(&self) -> bool {
         let url = format!("{}/status.php", self.base_url);
 
@@ -382,6 +412,33 @@ pub fn verify_nextcloud_talk_signature(
 
 #[cfg(test)]
 mod tests {
+    /// Pairing used to append to the persisted config only, so a freshly-paired
+    /// actor stayed locked out until the daemon restarted.
+    #[test]
+    fn nextcloud_pairing_grants_immediate_access() {
+        let ch = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "placeholder-token".into(),
+            vec![],
+        );
+        assert!(!ch.is_user_allowed("actor-1"));
+        ch.add_allowed_identity_runtime("actor-1");
+        assert!(ch.is_user_allowed("actor-1"));
+    }
+
+    #[test]
+    fn nextcloud_allowlist_edit_reaches_the_channel() {
+        let ch = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "placeholder-token".into(),
+            vec!["*".into()],
+        );
+        assert!(ch.is_user_allowed("anyone"));
+        ch.apply_allowed_senders(&["actor-1".to_string()]);
+        assert!(ch.is_user_allowed("actor-1"));
+        assert!(!ch.is_user_allowed("anyone"));
+    }
+
     use super::*;
 
     fn make_channel() -> NextcloudTalkChannel {

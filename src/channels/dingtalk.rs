@@ -14,10 +14,38 @@ const DINGTALK_BOT_CALLBACK_TOPIC: &str = "/v1.0/im/bot/messages/get";
 pub struct DingTalkChannel {
     client_id: String,
     client_secret: String,
-    allowed_users: Vec<String>,
-    /// Per-chat session webhooks for sending replies (chatID -> webhook URL).
-    /// DingTalk provides a unique webhook URL with each incoming message.
-    session_webhooks: Arc<RwLock<HashMap<String, String>>>,
+    /// Runtime-mutable so a `/bind`/`/claim` — or a console allowlist edit —
+    /// reaches the running channel instead of waiting for a restart.
+    allowed_users: Arc<std::sync::RwLock<Vec<String>>>,
+    /// Per-chat session webhooks for sending replies (chatID -> URL + expiry).
+    /// DingTalk provides a unique webhook URL with each incoming message, and
+    /// tells us when it stops working — the map used to keep every one of them
+    /// forever, two entries per message, and ignore the expiry entirely.
+    session_webhooks: Arc<RwLock<HashMap<String, SessionWebhook>>>,
+}
+
+/// A reply URL and the moment DingTalk says it stops working.
+#[derive(Debug, Clone)]
+struct SessionWebhook {
+    url: String,
+    /// Unix milliseconds, as DingTalk sends it.
+    expires_at_ms: i64,
+}
+
+/// Host suffixes a session webhook may point at.
+///
+/// The URL arrives on the message plane and is stored before the allowlist
+/// gate, so without this its integrity rests entirely on DingTalk's. Replies —
+/// which carry whatever the agent just produced — go wherever it says.
+const DINGTALK_WEBHOOK_HOST_SUFFIXES: [&str; 2] = ["dingtalk.com", "dingtalkapi.com"];
+
+/// The three ways a websocket frame can end the read loop, plus "ignore me".
+#[derive(Debug, PartialEq, Eq)]
+enum FrameOutcome {
+    Text(tokio_tungstenite::tungstenite::Utf8Bytes),
+    CleanClose,
+    Fault(String),
+    Ignore,
 }
 
 /// Response from DingTalk gateway connection registration.
@@ -32,7 +60,7 @@ impl DingTalkChannel {
         Self {
             client_id,
             client_secret,
-            allowed_users,
+            allowed_users: Arc::new(std::sync::RwLock::new(allowed_users)),
             session_webhooks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -42,7 +70,85 @@ impl DingTalkChannel {
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        let Ok(users) = self.allowed_users.read() else {
+            return false;
+        };
+        users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    /// Append a freshly-paired staff id to the runtime allowlist so access is
+    /// effective immediately. The persisted config (saved by the pairing core)
+    /// stays the source of truth across restarts.
+    fn add_allowed_identity_runtime(&self, user_id: &str) {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return;
+        }
+        if let Ok(mut users) = self.allowed_users.write() {
+            if !users.iter().any(|u| u == user_id) {
+                users.push(user_id.to_string());
+            }
+        }
+    }
+
+    fn now_ms() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        )
+        .unwrap_or(i64::MAX)
+    }
+
+    /// A zero/absent expiry means DingTalk did not say — treat it as live and
+    /// let the POST fail on its own rather than dropping a usable URL.
+    fn is_expired(entry: &SessionWebhook, now_ms: i64) -> bool {
+        entry.expires_at_ms > 0 && entry.expires_at_ms <= now_ms
+    }
+
+    /// Store a reply URL under both routing keys, dropping expired entries and
+    /// refusing one that is not a DingTalk HTTPS endpoint.
+    async fn remember_session_webhook(&self, keys: &[&str], url: &str, expires_at_ms: i64) {
+        if !Self::is_valid_session_webhook(url) {
+            tracing::warn!(
+                "DingTalk: refusing a session webhook that is not an HTTPS DingTalk endpoint; \
+                 replies for this chat will not be routed to it"
+            );
+            return;
+        }
+        let now = Self::now_ms();
+        let mut webhooks = self.session_webhooks.write().await;
+        webhooks.retain(|_, entry| !Self::is_expired(entry, now));
+        for key in keys {
+            webhooks.insert(
+                (*key).to_string(),
+                SessionWebhook {
+                    url: url.to_string(),
+                    expires_at_ms,
+                },
+            );
+        }
+    }
+
+    /// Whether a session webhook may be stored and later posted to.
+    ///
+    /// HTTPS, and a host inside DingTalk's own domains. A plain-HTTP or
+    /// off-domain URL on the message plane would redirect the agent's replies.
+    fn is_valid_session_webhook(url: &str) -> bool {
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if parsed.scheme() != "https" {
+            return false;
+        }
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        let host = host.to_ascii_lowercase();
+        DINGTALK_WEBHOOK_HOST_SUFFIXES
+            .iter()
+            .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
     }
 
     /// Resolve the active profile root for the shared pairing-code store.
@@ -92,18 +198,39 @@ impl DingTalkChannel {
             return false;
         };
 
+        // The paired id reaches the running allowlist immediately; the pairing
+        // core persists it for the next start.
+        self.add_allowed_identity_runtime(sender_id);
+
         // Register the session webhook so the reply (and future messages) can be
         // sent back to this now-paired chat.
         if let Some(webhook) = session_webhook {
-            let mut webhooks = self.session_webhooks.write().await;
-            webhooks.insert(chat_id.to_string(), webhook.to_string());
-            webhooks.insert(sender_id.to_string(), webhook.to_string());
+            self.remember_session_webhook(&[chat_id, sender_id], webhook, 0)
+                .await;
         }
 
         if let Err(e) = self.send(&SendMessage::new(reply, chat_id)).await {
             tracing::warn!("DingTalk pairing: failed to send reply: {e:#}");
         }
         true
+    }
+
+    /// How one websocket frame ends — or does not end — the read loop.
+    ///
+    /// A transport fault used to `break` into `Ok(())`, which the supervisor's
+    /// clean-exit arm reads as "the listener ran successfully": it marks a
+    /// health error *and* resets the backoff, treating one event as both
+    /// failure and success. An expired ticket or a rate limit therefore
+    /// reconnected every two seconds forever, never escalating toward the
+    /// 60-second cap, burning the exact API budget backing off would protect.
+    /// A server-side `Close` is genuinely clean and stays `Ok`.
+    fn classify_frame(msg: Result<Message, tokio_tungstenite::tungstenite::Error>) -> FrameOutcome {
+        match msg {
+            Ok(Message::Text(t)) => FrameOutcome::Text(t),
+            Ok(Message::Close(_)) => FrameOutcome::CleanClose,
+            Ok(_) => FrameOutcome::Ignore,
+            Err(e) => FrameOutcome::Fault(e.to_string()),
+        }
     }
 
     fn parse_stream_data(frame: &serde_json::Value) -> Option<serde_json::Value> {
@@ -181,14 +308,26 @@ impl Channel for DingTalkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let webhooks = self.session_webhooks.read().await;
-        let webhook_url = webhooks.get(&message.recipient).ok_or_else(|| {
-            anyhow::anyhow!(
-                "No session webhook found for chat {}. \
-                 The user must send a message first to establish a session.",
-                message.recipient
-            )
-        })?;
+        // Clone out and drop the guard before the POST: the URL used to borrow
+        // from the map, so the read lock was held for the whole request.
+        let webhook_url = {
+            let webhooks = self.session_webhooks.read().await;
+            let entry = webhooks.get(&message.recipient).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No session webhook found for chat {}. \
+                     The user must send a message first to establish a session.",
+                    message.recipient
+                )
+            })?;
+            if Self::is_expired(entry, Self::now_ms()) {
+                anyhow::bail!(
+                    "The session webhook for chat {} has expired. \
+                     DingTalk issues a fresh one with the user's next message.",
+                    message.recipient
+                );
+            }
+            entry.url.clone()
+        };
 
         let title = message.subject.as_deref().unwrap_or("RantaiClaw");
         let rendered =
@@ -203,7 +342,7 @@ impl Channel for DingTalkChannel {
 
         let resp = self
             .http_client()
-            .post(webhook_url)
+            .post(&webhook_url)
             .json(&body)
             .send()
             .await?;
@@ -234,14 +373,11 @@ impl Channel for DingTalkChannel {
         tracing::info!("DingTalk: connected and listening for messages...");
 
         while let Some(msg) = read.next().await {
-            let msg = match msg {
-                Ok(Message::Text(t)) => t,
-                Ok(Message::Close(_)) => break,
-                Err(e) => {
-                    tracing::warn!("DingTalk WebSocket error: {e}");
-                    break;
-                }
-                _ => continue,
+            let msg = match Self::classify_frame(msg) {
+                FrameOutcome::Text(t) => t,
+                FrameOutcome::CleanClose => break,
+                FrameOutcome::Fault(e) => anyhow::bail!("DingTalk WebSocket error: {e}"),
+                FrameOutcome::Ignore => continue,
             };
 
             let frame: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
@@ -285,6 +421,28 @@ impl Channel for DingTalkChannel {
                         }
                     };
 
+                    // ACK first, before any filter. Every `continue` below —
+                    // empty content, a consumed pairing code, an unpaired
+                    // sender — used to skip the ACK entirely, so DingTalk
+                    // redelivered frames from exactly the population the
+                    // pairing flow exists to serve. Mirrors the Lark websocket
+                    // path, which ACKs first for the same reason.
+                    let message_id = frame
+                        .get("headers")
+                        .and_then(|h| h.get("messageId"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("");
+                    let ack = serde_json::json!({
+                        "code": 200,
+                        "headers": {
+                            "contentType": "application/json",
+                            "messageId": message_id,
+                        },
+                        "message": "OK",
+                        "data": "",
+                    });
+                    let _ = write.send(Message::Text(ack.to_string().into())).await;
+
                     // Extract message content
                     let content = data
                         .get("text")
@@ -323,32 +481,20 @@ impl Channel for DingTalkChannel {
                         continue;
                     }
 
-                    // Store session webhook for later replies
+                    // Store session webhook for later replies, under both
+                    // routing keys so group and private flows both resolve.
                     if let Some(webhook) = data.get("sessionWebhook").and_then(|w| w.as_str()) {
-                        let webhook = webhook.to_string();
-                        let mut webhooks = self.session_webhooks.write().await;
-                        // Use both keys so reply routing works for both group and private flows.
-                        webhooks.insert(chat_id.clone(), webhook.clone());
-                        webhooks.insert(sender_id.to_string(), webhook);
+                        let expires_at_ms = data
+                            .get("sessionWebhookExpiredTime")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0);
+                        self.remember_session_webhook(
+                            &[chat_id.as_str(), sender_id],
+                            webhook,
+                            expires_at_ms,
+                        )
+                        .await;
                     }
-
-                    // Acknowledge the event
-                    let message_id = frame
-                        .get("headers")
-                        .and_then(|h| h.get("messageId"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("");
-
-                    let ack = serde_json::json!({
-                        "code": 200,
-                        "headers": {
-                            "contentType": "application/json",
-                            "messageId": message_id,
-                        },
-                        "message": "OK",
-                        "data": "",
-                    });
-                    let _ = write.send(Message::Text(ack.to_string().into())).await;
 
                     let channel_msg = ChannelMessage {
                         sender_aliases: Vec::new(),
@@ -376,6 +522,12 @@ impl Channel for DingTalkChannel {
         anyhow::bail!("DingTalk WebSocket stream ended")
     }
 
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        if let Ok(mut users) = self.allowed_users.write() {
+            *users = allowed.to_vec();
+        }
+    }
+
     async fn health_check(&self) -> bool {
         self.register_connection().await.is_ok()
     }
@@ -384,6 +536,137 @@ impl Channel for DingTalkChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE plan's primary test. A socket error surfacing as `Ok(())` made the
+    /// supervisor mark a health error *and* reset the backoff — so a reconnect
+    /// storm was indistinguishable from a healthy restart.
+    #[test]
+    fn dingtalk_transport_error_returns_err() {
+        let fault = DingTalkChannel::classify_frame(Err(
+            tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+        ));
+        assert!(
+            matches!(fault, FrameOutcome::Fault(_)),
+            "a transport error must not be a clean exit: {fault:?}"
+        );
+
+        // A server-side close is genuinely clean and stays so.
+        assert_eq!(
+            DingTalkChannel::classify_frame(Ok(Message::Close(None))),
+            FrameOutcome::CleanClose
+        );
+        assert_eq!(
+            DingTalkChannel::classify_frame(Ok(Message::Text("hi".into()))),
+            FrameOutcome::Text("hi".into())
+        );
+        assert_eq!(
+            DingTalkChannel::classify_frame(Ok(Message::Ping(Vec::new().into()))),
+            FrameOutcome::Ignore
+        );
+    }
+
+    /// The reply URL arrives on the message plane and is stored before the
+    /// allowlist gate, so without a check its integrity rests entirely on
+    /// DingTalk's — and replies carry whatever the agent just produced.
+    #[test]
+    fn dingtalk_rejects_an_off_domain_reply_url() {
+        assert!(DingTalkChannel::is_valid_session_webhook(
+            "https://oapi.dingtalk.com/robot/sendBySession?session=abc"
+        ));
+        assert!(DingTalkChannel::is_valid_session_webhook(
+            "https://api.dingtalkapi.com/robot/send"
+        ));
+
+        assert!(
+            !DingTalkChannel::is_valid_session_webhook(
+                "http://oapi.dingtalk.com/robot/sendBySession"
+            ),
+            "plain HTTP must be refused"
+        );
+        assert!(
+            !DingTalkChannel::is_valid_session_webhook("https://evil.example.com/collect"),
+            "an off-domain host must be refused"
+        );
+        assert!(
+            !DingTalkChannel::is_valid_session_webhook("https://dingtalk.com.evil.example.com/x"),
+            "a suffix that only looks like the domain must be refused"
+        );
+        assert!(!DingTalkChannel::is_valid_session_webhook("not a url"));
+    }
+
+    /// A refused URL must not land in the map at all — otherwise `send` would
+    /// happily post to it later.
+    #[tokio::test]
+    async fn dingtalk_refuses_to_store_an_off_domain_webhook() {
+        let ch = DingTalkChannel::new("id".into(), "secret".into(), vec!["*".into()]);
+        ch.remember_session_webhook(&["chat1"], "https://evil.example.com/collect", 0)
+            .await;
+        assert!(ch.session_webhooks.read().await.is_empty());
+
+        ch.remember_session_webhook(&["chat1", "user1"], "https://oapi.dingtalk.com/robot/x", 0)
+            .await;
+        assert_eq!(ch.session_webhooks.read().await.len(), 2);
+    }
+
+    /// DingTalk ships an expiry with every webhook and it was ignored, so the
+    /// map grew for the life of the process, two entries per message.
+    #[tokio::test]
+    async fn dingtalk_drops_expired_session_webhooks() {
+        let ch = DingTalkChannel::new("id".into(), "secret".into(), vec!["*".into()]);
+        let past = DingTalkChannel::now_ms() - 1_000;
+        ch.remember_session_webhook(&["old"], "https://oapi.dingtalk.com/robot/old", past)
+            .await;
+        // Inserting again sweeps anything already expired.
+        ch.remember_session_webhook(&["fresh"], "https://oapi.dingtalk.com/robot/fresh", 0)
+            .await;
+
+        let webhooks = ch.session_webhooks.read().await;
+        assert!(!webhooks.contains_key("old"), "an expired entry must go");
+        assert!(webhooks.contains_key("fresh"));
+    }
+
+    /// Every filter below the ACK used to `continue` past it, so DingTalk
+    /// redelivered frames from exactly the population pairing exists to serve.
+    #[test]
+    fn dingtalk_acks_a_filtered_frame() {
+        let src = include_str!("dingtalk.rs");
+        // Stop at the test module, so this test's own mentions do not count.
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let listen_body = production
+            .split("async fn listen(")
+            .nth(1)
+            .expect("listen exists");
+        let ack_at = listen_body
+            .find("let _ = write.send(Message::Text(ack.to_string().into())).await;")
+            .expect("the ACK send is in listen");
+        let unauthorized_at = listen_body
+            .find("ignoring message from unauthorized user")
+            .expect("the allowlist filter is in listen");
+        let empty_at = listen_body
+            .find("if content.is_empty()")
+            .expect("the empty-content filter is in listen");
+        assert!(
+            ack_at < unauthorized_at && ack_at < empty_at,
+            "the ACK must be sent before any filter that can `continue`"
+        );
+    }
+
+    #[test]
+    fn dingtalk_pairing_grants_immediate_access() {
+        let ch = DingTalkChannel::new("id".into(), "secret".into(), vec![]);
+        assert!(!ch.is_user_allowed("staff-1"));
+        ch.add_allowed_identity_runtime("staff-1");
+        assert!(ch.is_user_allowed("staff-1"));
+    }
+
+    #[test]
+    fn dingtalk_allowlist_edit_reaches_the_channel() {
+        let ch = DingTalkChannel::new("id".into(), "secret".into(), vec!["*".into()]);
+        assert!(ch.is_user_allowed("anyone"));
+        ch.apply_allowed_senders(&["staff-1".to_string()]);
+        assert!(ch.is_user_allowed("staff-1"));
+        assert!(!ch.is_user_allowed("anyone"));
+    }
 
     #[test]
     fn dingtalk_render_target_is_std_markdown() {
