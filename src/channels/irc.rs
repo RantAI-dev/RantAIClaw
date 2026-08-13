@@ -15,6 +15,18 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
 /// Monotonic counter to ensure unique message IDs under burst traffic.
 static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Lines written back-to-back before pacing starts.
+const BURST_LINES: usize = 2;
+
+/// Delay between paced lines — roughly two per second, the rate most networks
+/// tolerate indefinitely.
+const CHUNK_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many times to accept a `433` (nickname in use) before giving up.
+/// Without a cap a server that rejects every candidate produced an unbounded
+/// NICK flood, which is itself a disconnect.
+const MAX_NICK_RETRIES: u8 = 3;
+
 /// IRC over TLS channel.
 ///
 /// Connects to an IRC server using TLS, joins configured channels,
@@ -29,15 +41,28 @@ pub struct IrcChannel {
     /// `Arc<RwLock<..>>` so a successful `/bind`/`/claim` can append the sender's
     /// nick at runtime (immediate access without a channel restart).
     allowed_users: Arc<std::sync::RwLock<Vec<String>>>,
+    /// Nicks/accounts that may approve gated tools. Held here so the channel
+    /// can refuse to hand owner authority to an unauthenticated nick, which an
+    /// IRC nick always is until services vouch for it.
+    approval_owners: Vec<String>,
     server_password: Option<String>,
     nickserv_password: Option<String>,
     sasl_password: Option<String>,
     verify_tls: bool,
+    /// Second, explicit opt-in for the one genuinely dangerous combination:
+    /// `verify_tls = false` together with a configured password.
+    allow_insecure_tls_with_password: bool,
     /// Shared write half of the TLS stream for sending messages.
     writer: Arc<Mutex<Option<WriteHalf>>>,
 }
 
-type WriteHalf = tokio::io::WriteHalf<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+/// The write half of the live session.
+///
+/// Boxed rather than the concrete `WriteHalf<TlsStream<TcpStream>>` so the
+/// session teardown and the outbound pacing can be driven in a test against an
+/// in-memory pipe. IRC writes a handful of lines per reply, so the dynamic
+/// dispatch is not measurable.
+type WriteHalf = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
 
 /// Style instruction prepended to every IRC message before it reaches the LLM.
 /// IRC clients render plain text only — no markdown, no HTML, no XML.
@@ -54,20 +79,70 @@ const SENDER_PREFIX_RESERVE: usize = 64;
 /// A parsed IRC message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IrcMessage {
+    /// IRCv3 message tags (`@account=alice;time=… `). Empty on a server that
+    /// does not send them, or when the capability was never negotiated.
+    tags: Vec<(String, String)>,
     prefix: Option<String>,
     command: String,
     params: Vec<String>,
 }
 
+/// Decode an IRCv3 tag value: `\:` is `;`, `\s` is a space, `\\` is a
+/// backslash, `\r`/`\n` are the line terminators. An unknown escape yields the
+/// escaped character itself, and a trailing lone `\` is dropped — both per the
+/// IRCv3 message-tags spec.
+fn unescape_tag_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some(':') => out.push(';'),
+            Some('s') => out.push(' '),
+            Some('\\') => out.push('\\'),
+            Some('r') => out.push('\r'),
+            Some('n') => out.push('\n'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+fn parse_tags(raw: &str) -> Vec<(String, String)> {
+    raw.split(';')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| {
+            let (key, value) = kv.split_once('=').unwrap_or((kv, ""));
+            (key.to_string(), unescape_tag_value(value))
+        })
+        .collect()
+}
+
 impl IrcMessage {
     /// Parse a raw IRC line into an `IrcMessage`.
     ///
-    /// IRC format: `[:<prefix>] <command> [<params>] [:<trailing>]`
+    /// IRC format: `[@<tags>] [:<prefix>] <command> [<params>] [:<trailing>]`
     fn parse(line: &str) -> Option<Self> {
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             return None;
         }
+
+        // Tags come first and are the only part introduced by `@`. Without
+        // this branch the whole tag blob was read as the command, so every
+        // tagged message — which is every message once a capability is
+        // negotiated — parsed as garbage.
+        let (tags, line) = match line.strip_prefix('@') {
+            Some(stripped) => {
+                let space = stripped.find(' ')?;
+                (parse_tags(&stripped[..space]), &stripped[space + 1..])
+            }
+            None => (Vec::new(), line),
+        };
 
         let (prefix, rest) = if let Some(stripped) = line.strip_prefix(':') {
             let space = stripped.find(' ')?;
@@ -95,10 +170,30 @@ impl IrcMessage {
         }
 
         Some(IrcMessage {
+            tags,
             prefix,
             command,
             params,
         })
+    }
+
+    /// The value of one message tag, if the server sent it.
+    fn tag(&self, name: &str) -> Option<&str> {
+        self.tags
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The authenticated services account behind this message, if any.
+    ///
+    /// `*` is the spec's "not logged in" marker and must not survive: it is
+    /// also the wildcard the owner gate reads as "anybody", so letting it
+    /// through would turn a logged-out user into every owner at once.
+    fn account(&self) -> Option<&str> {
+        self.tag("account")
+            .map(str::trim)
+            .filter(|a| !a.is_empty() && *a != "*")
     }
 
     /// Extract the nickname from the prefix (nick!user@host → nick).
@@ -239,6 +334,8 @@ pub struct IrcChannelConfig {
     pub nickserv_password: Option<String>,
     pub sasl_password: Option<String>,
     pub verify_tls: bool,
+    pub allow_insecure_tls_with_password: bool,
+    pub approval_owners: Vec<String>,
 }
 
 impl IrcChannel {
@@ -251,12 +348,85 @@ impl IrcChannel {
             username,
             channels: cfg.channels,
             allowed_users: Arc::new(std::sync::RwLock::new(cfg.allowed_users)),
+            approval_owners: cfg.approval_owners,
             server_password: cfg.server_password,
             nickserv_password: cfg.nickserv_password,
             sasl_password: cfg.sasl_password,
             verify_tls: cfg.verify_tls,
+            allow_insecure_tls_with_password: cfg.allow_insecure_tls_with_password,
             writer: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Refuse the one combination that discloses a credential: no peer
+    /// authentication plus a password on the wire. SASL PLAIN is reversible
+    /// base64, and NickServ IDENTIFY is plaintext, so an unauthenticated link
+    /// hands both to whoever answered the connection.
+    ///
+    /// Returns the error the caller should fail to start with.
+    fn insecure_credential_refusal(&self) -> Option<String> {
+        if self.verify_tls || self.allow_insecure_tls_with_password {
+            return None;
+        }
+        let configured: Vec<&str> = [
+            ("sasl_password", self.sasl_password.as_ref()),
+            ("nickserv_password", self.nickserv_password.as_ref()),
+            ("server_password", self.server_password.as_ref()),
+        ]
+        .into_iter()
+        .filter(|(_, v)| v.is_some_and(|s| !s.trim().is_empty()))
+        .map(|(name, _)| name)
+        .collect();
+        if configured.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "IRC refuses to start: verify_tls = false accepts any certificate for {}, and {} would be sent over that link. \
+             Set verify_tls = true, or — only if you understand that the credential is disclosed to whoever answers — \
+             set allow_insecure_tls_with_password = true. Rotate any credential already used over such a link.",
+            self.server,
+            configured.join(", ")
+        ))
+    }
+
+    /// The identity forms for an inbound message, or `None` when the message
+    /// must be dropped.
+    ///
+    /// An IRC nick is a first-come lease, not an identity: anyone who connects
+    /// while the owner is offline — or forces them off with a ghost or a
+    /// netsplit — holds it. So the services account, when the network supplies
+    /// one, is the primary identity and the nick is demoted to an alias. With
+    /// no account tag the nick still serves the chat allowlist, but a nick
+    /// listed in `approval_owners` is refused outright rather than granted that
+    /// authority on the strength of a name.
+    ///
+    /// A literal `*` in `approval_owners` is the operator switching the owner
+    /// gate off; honour that rather than dropping every message on the network.
+    fn resolve_identity(&self, account: Option<&str>, nick: &str) -> Option<String> {
+        if let Some(account) = account {
+            // The nick is deliberately NOT carried as an alias. Aliases are
+            // matched by the owner gate, so passing the nick along would let
+            // whoever holds it borrow an owner entry recorded under that name
+            // while authenticated as somebody else entirely.
+            return Some(account.to_string());
+        }
+        if self.approval_owners.iter().any(|o| o.trim() == "*") {
+            return Some(nick.to_string());
+        }
+        let claims_owner = self
+            .approval_owners
+            .iter()
+            .any(|o| o.trim().trim_start_matches('@').eq_ignore_ascii_case(nick));
+        if claims_owner {
+            tracing::warn!(
+                "IRC: dropped a message from {nick}, which is listed in approval_owners, \
+                 because the server sent no account tag. An IRC nick is a lease, not an \
+                 identity. Identify to services on a network that offers the account-tag \
+                 capability to use owner authority."
+            );
+            return None;
+        }
+        Some(nick.to_string())
     }
 
     fn is_user_allowed(&self, nick: &str) -> bool {
@@ -309,6 +479,12 @@ impl IrcChannel {
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         } else {
+            tracing::warn!(
+                "IRC: TLS certificate verification is DISABLED for {}:{} — any host that answers \
+                 this connection is trusted, including one that intercepted it.",
+                self.server,
+                self.port
+            );
             rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerify))
@@ -320,6 +496,42 @@ impl IrcChannel {
         let tls = connector.connect(domain, tcp).await?;
 
         Ok(tls)
+    }
+
+    /// Capability names from a `CAP LS`/`ACK` list, dropping any `=value`
+    /// suffix (`sasl=PLAIN` is the capability `sasl`).
+    fn parse_cap_list(listed: &str) -> Vec<String> {
+        listed
+            .split_whitespace()
+            .map(|cap| cap.split('=').next().unwrap_or(cap).to_string())
+            .collect()
+    }
+
+    /// The capabilities to request: what this channel needs, intersected with
+    /// what the server offered.
+    ///
+    /// `account-tag` is the whole point — it is the only per-message evidence
+    /// that a nick belongs to the account it claims. `extended-join` carries
+    /// the same account on JOIN.
+    fn caps_to_request(offered: &[String], want_sasl: bool) -> Vec<&'static str> {
+        let mut wanted = vec!["account-tag", "extended-join"];
+        if want_sasl {
+            wanted.push("sasl");
+        }
+        wanted
+            .into_iter()
+            .filter(|cap| offered.iter().any(|o| o == cap))
+            .collect()
+    }
+
+    /// How long to wait before writing chunk `index`.
+    ///
+    /// Chunks used to go out back-to-back, which most networks disconnect as
+    /// excess flood — so a long reply failed more reliably than a short one.
+    /// A short burst is allowed (networks tolerate a few lines), then roughly
+    /// two lines per second.
+    fn pace_before(index: usize) -> Option<std::time::Duration> {
+        (index >= BURST_LINES).then_some(CHUNK_DELAY)
     }
 
     /// Send a raw IRC line (appends \r\n).
@@ -400,18 +612,55 @@ impl Channel for IrcChannel {
         let max_payload = 512_usize.saturating_sub(overhead);
         let chunks = split_message(&rendered, max_payload);
 
-        for chunk in chunks {
+        for (index, chunk) in chunks.iter().enumerate() {
+            if let Some(delay) = Self::pace_before(index) {
+                tokio::time::sleep(delay).await;
+            }
             Self::send_raw(writer, &format!("PRIVMSG {} :{chunk}", message.recipient)).await?;
         }
 
         Ok(())
     }
 
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        if let Ok(mut users) = self.allowed_users.write() {
+            *users = allowed.to_vec();
+        }
+    }
+
     async fn listen(
+        &self,
+        tx: mpsc::Sender<ChannelMessage>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        // Every exit from the session — the read timeout, the `n == 0` bail,
+        // any `?` — used to leave the write half in place. `send()` then wrote
+        // into a half-closed socket, returned `Ok(())`, and the reply vanished
+        // with no error anywhere. Clearing it here routes into the existing
+        // "IRC not connected" path.
+        let result = self.run_session(tx, cancel).await;
+        *self.writer.lock().await = None;
+        result
+    }
+
+    async fn health_check(&self) -> bool {
+        // Report on the live session. Dialling a fresh TCP+TLS connection
+        // every heartbeat is the single most reliable way to get a bot
+        // K-lined, and it says nothing about whether the *session* works.
+        self.writer.lock().await.is_some()
+    }
+}
+
+impl IrcChannel {
+    async fn run_session(
         &self,
         tx: mpsc::Sender<ChannelMessage>,
         _cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
+        if let Some(refusal) = self.insecure_credential_refusal() {
+            anyhow::bail!(refusal);
+        }
+
         let mut current_nick = self.nickname.clone();
         tracing::info!(
             "IRC channel connecting to {}:{} as {}...",
@@ -421,12 +670,15 @@ impl Channel for IrcChannel {
         );
 
         let tls = self.connect().await?;
-        let (reader, mut writer) = tokio::io::split(tls);
+        let (reader, writer) = tokio::io::split(tls);
+        let mut writer: WriteHalf = Box::new(writer);
 
-        // --- SASL negotiation ---
-        if self.sasl_password.is_some() {
-            Self::send_raw(&mut writer, "CAP REQ :sasl").await?;
-        }
+        // --- Capability negotiation ---
+        // `CAP LS` first so the REQ only asks for what the server offers: a
+        // REQ is atomic, so bundling `sasl` with `account-tag` on a server
+        // that lacks one would lose both. A server with no CAP support ignores
+        // this line and registration proceeds unchanged.
+        Self::send_raw(&mut writer, "CAP LS 302").await?;
 
         // --- Server password ---
         if let Some(ref pass) = self.server_password {
@@ -450,7 +702,9 @@ impl Channel for IrcChannel {
         let mut buf_reader = BufReader::new(reader);
         let mut line = String::new();
         let mut registered = false;
-        let mut sasl_pending = self.sasl_password.is_some();
+        let mut sasl_pending = false;
+        let mut offered_caps: Vec<String> = Vec::new();
+        let mut nick_retries = 0_u8;
 
         loop {
             line.clear();
@@ -476,27 +730,59 @@ impl Channel for IrcChannel {
                     }
                 }
 
-                // CAP responses for SASL
-                "CAP"
-                    if sasl_pending && msg.params.iter().any(|p| p.contains("sasl")) => {
-                        if msg.params.iter().any(|p| p.contains("ACK")) {
-                            // CAP * ACK :sasl — server accepted, start SASL auth
+                // Capability negotiation: `CAP <target> <sub> [*] :<caps>`.
+                "CAP" => {
+                    let sub = msg.params.get(1).map_or("", String::as_str);
+                    // A `*` in the third position means the list continues in
+                    // a further CAP line; only the final one may be answered.
+                    let continues = msg.params.get(2).is_some_and(|p| p == "*");
+                    let listed = msg.params.last().map_or("", String::as_str);
+
+                    match sub {
+                        "LS" => {
+                            offered_caps.extend(Self::parse_cap_list(listed));
+                            if !continues {
+                                let request = Self::caps_to_request(
+                                    &offered_caps,
+                                    self.sasl_password.is_some(),
+                                );
+                                let mut guard = self.writer.lock().await;
+                                if let Some(ref mut w) = *guard {
+                                    if request.is_empty() {
+                                        Self::send_raw(w, "CAP END").await?;
+                                    } else {
+                                        Self::send_raw(
+                                            w,
+                                            &format!("CAP REQ :{}", request.join(" ")),
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                        }
+                        "ACK" => {
+                            let acked = Self::parse_cap_list(listed);
+                            tracing::debug!("IRC capabilities acknowledged: {}", acked.join(" "));
                             let mut guard = self.writer.lock().await;
                             if let Some(ref mut w) = *guard {
-                                Self::send_raw(w, "AUTHENTICATE PLAIN").await?;
+                                if acked.iter().any(|c| c == "sasl") {
+                                    sasl_pending = true;
+                                    Self::send_raw(w, "AUTHENTICATE PLAIN").await?;
+                                } else {
+                                    Self::send_raw(w, "CAP END").await?;
+                                }
                             }
-                        } else if msg.params.iter().any(|p| p.contains("NAK")) {
-                            // CAP * NAK :sasl — server rejected SASL, proceed without it
-                            tracing::warn!(
-                                "IRC server does not support SASL, continuing without it"
-                            );
-                            sasl_pending = false;
+                        }
+                        "NAK" => {
+                            tracing::warn!("IRC server refused capabilities: {listed}");
                             let mut guard = self.writer.lock().await;
                             if let Some(ref mut w) = *guard {
                                 Self::send_raw(w, "CAP END").await?;
                             }
                         }
+                        _ => {}
                     }
+                }
 
                 "AUTHENTICATE"
                     // Server sends "AUTHENTICATE +" to request credentials
@@ -565,6 +851,13 @@ impl Channel for IrcChannel {
 
                 // ERR_NICKNAMEINUSE (433)
                 "433" => {
+                    nick_retries += 1;
+                    if nick_retries > MAX_NICK_RETRIES {
+                        anyhow::bail!(
+                            "IRC: {MAX_NICK_RETRIES} nickname candidates were all in use \
+                             (last: {current_nick}); giving up rather than flooding NICK"
+                        );
+                    }
                     let alt = format!("{current_nick}_");
                     tracing::warn!("IRC nickname {current_nick} is in use, trying {alt}");
                     let mut guard = self.writer.lock().await;
@@ -582,6 +875,7 @@ impl Channel for IrcChannel {
                     let target = msg.params.first().map_or("", String::as_str);
                     let text = msg.params.get(1).map_or("", String::as_str);
                     let sender_nick = msg.nick().unwrap_or("unknown");
+                    let account = msg.account();
 
                     // Skip messages from NickServ/ChanServ
                     if sender_nick.eq_ignore_ascii_case("NickServ")
@@ -600,7 +894,17 @@ impl Channel for IrcChannel {
                         // `rantaiclaw channels pair`. On success the nick lands in
                         // `allowed_users` (and, for an owner `/claim`, `approval_owners`).
                         if let Some(root) = Self::pairing_profile_root() {
-                            let identities = vec![sender_nick.to_string()];
+                            // Pair the account when the network vouches for
+                            // one — `approval_owners` on IRC holds services
+                            // account names, not nicks.
+                            if account.is_none() {
+                                tracing::warn!(
+                                    "IRC pairing from {sender_nick} with no account tag: \
+                                     the nick will be added to the chat allowlist, but owner \
+                                     authority cannot be granted to a nick."
+                                );
+                            }
+                            let identities = vec![account.unwrap_or(sender_nick).to_string()];
                             if let Some(reply) = crate::channels::pairing::try_handle_pairing(
                                 text,
                                 "irc",
@@ -635,10 +939,15 @@ impl Channel for IrcChannel {
                         format!("{IRC_STYLE_PREFIX}{text}")
                     };
 
+                    let Some(sender) = self.resolve_identity(account, sender_nick) else {
+                        // Refused above, with the reason logged.
+                        continue;
+                    };
+
                     let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
                     let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
                         id: format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
-                        sender: sender_nick.to_string(),
+                        sender,
                         reply_target,
                         content,
                         channel: "irc".to_string(),
@@ -661,18 +970,6 @@ impl Channel for IrcChannel {
 
                 _ => {}
             }
-        }
-    }
-
-    async fn health_check(&self) -> bool {
-        // Lightweight connectivity check: TLS connect + QUIT
-        match self.connect().await {
-            Ok(tls) => {
-                let (_, mut writer) = tokio::io::split(tls);
-                let _ = Self::send_raw(&mut writer, "QUIT :health check").await;
-                true
-            }
-            Err(_) => false,
         }
     }
 }
@@ -895,6 +1192,8 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            allow_insecure_tls_with_password: false,
+            approval_owners: Vec::new(),
         });
         assert!(ch.is_user_allowed("alice"));
         assert!(ch.is_user_allowed("bob"));
@@ -914,6 +1213,8 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            allow_insecure_tls_with_password: false,
+            approval_owners: Vec::new(),
         });
         assert!(ch.is_user_allowed("alice"));
         assert!(ch.is_user_allowed("ALICE"));
@@ -933,6 +1234,8 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            allow_insecure_tls_with_password: false,
+            approval_owners: Vec::new(),
         });
         assert!(!ch.is_user_allowed("anyone"));
     }
@@ -952,6 +1255,8 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            allow_insecure_tls_with_password: false,
+            approval_owners: Vec::new(),
         });
         assert_eq!(ch.username, "mybot");
     }
@@ -969,6 +1274,8 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            allow_insecure_tls_with_password: false,
+            approval_owners: Vec::new(),
         });
         assert_eq!(ch.username, "customuser");
         assert_eq!(ch.nickname, "mybot");
@@ -993,6 +1300,8 @@ mod tests {
             nickserv_password: Some("nspass".into()),
             sasl_password: Some("saslpass".into()),
             verify_tls: false,
+            allow_insecure_tls_with_password: true,
+            approval_owners: Vec::new(),
         });
         assert_eq!(ch.server, "irc.example.com");
         assert_eq!(ch.port, 6697);
@@ -1023,6 +1332,7 @@ mod tests {
             nickserv_password: Some("secret".into()),
             sasl_password: None,
             verify_tls: Some(true),
+            allow_insecure_tls_with_password: false,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -1083,6 +1393,8 @@ nickname = "bot"
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            allow_insecure_tls_with_password: false,
+            approval_owners: Vec::new(),
         })
     }
 
@@ -1128,6 +1440,7 @@ nickname = "bot"
                 nickserv_password: None,
                 sasl_password: None,
                 verify_tls: Some(true),
+                allow_insecure_tls_with_password: false,
             });
             seed.save().await.unwrap();
         }
@@ -1172,6 +1485,293 @@ nickname = "bot"
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            allow_insecure_tls_with_password: false,
+            approval_owners: Vec::new(),
         })
+    }
+
+    // ── Plan 126: identity, teardown, pacing, TLS ────────────────
+
+    fn channel_with_owners(owners: &[&str]) -> IrcChannel {
+        IrcChannel::new(IrcChannelConfig {
+            server: "irc.test".into(),
+            port: 6697,
+            nickname: "bot".into(),
+            username: None,
+            channels: vec![],
+            allowed_users: vec!["*".into()],
+            server_password: None,
+            nickserv_password: None,
+            sasl_password: None,
+            verify_tls: true,
+            allow_insecure_tls_with_password: false,
+            approval_owners: owners.iter().map(|o| (*o).to_string()).collect(),
+        })
+    }
+
+    /// THE plan's primary test. An IRC nick is a first-come lease: anyone who
+    /// connects while the owner is offline holds it. Resolving that nick as the
+    /// owner hands over the full toolset plus authority to approve shell
+    /// commands.
+    #[test]
+    fn nick_without_an_account_tag_is_not_an_owner() {
+        let ch = channel_with_owners(&["alice"]);
+        assert!(
+            ch.resolve_identity(None, "alice").is_none(),
+            "an unauthenticated nick that matches an owner must be dropped"
+        );
+        // Case-insensitively, too — IRC nicks are.
+        assert!(ch.resolve_identity(None, "ALICE").is_none());
+        // A stranger is unaffected: the chat allowlist still governs them.
+        assert_eq!(
+            ch.resolve_identity(None, "bob"),
+            Some("bob".to_string()),
+            "only the owner path fails closed; ordinary chat still works"
+        );
+    }
+
+    /// The account is the identity; the nick is not carried as an alias,
+    /// because aliases are matched by the owner gate and would let whoever
+    /// holds the nick borrow an owner entry recorded under that name.
+    #[test]
+    fn account_tag_is_the_primary_sender_and_the_nick_is_not_an_alias() {
+        let ch = channel_with_owners(&["alice"]);
+        assert_eq!(
+            ch.resolve_identity(Some("alice"), "alice_"),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            ch.resolve_identity(Some("mallory"), "alice"),
+            Some("mallory".to_string()),
+            "holding the owner's nick must not import the owner's authority"
+        );
+    }
+
+    /// `*` is the account-tag spec's "not logged in" marker — and the owner
+    /// gate's wildcard. Letting it through would make every logged-out user an
+    /// owner at once.
+    #[test]
+    fn a_star_account_tag_is_not_an_identity() {
+        let msg = IrcMessage::parse("@account=* :eve!e@host PRIVMSG #ch :hi").unwrap();
+        assert_eq!(msg.account(), None);
+        let msg = IrcMessage::parse("@account=alice :alice!a@host PRIVMSG #ch :hi").unwrap();
+        assert_eq!(msg.account(), Some("alice"));
+    }
+
+    /// A literal `*` in `approval_owners` is the operator switching the owner
+    /// gate off. Dropping every message on that network would be a worse
+    /// failure than the one being prevented.
+    #[test]
+    fn a_wildcard_owner_list_does_not_drop_messages() {
+        let ch = channel_with_owners(&["*"]);
+        assert_eq!(
+            ch.resolve_identity(None, "anyone"),
+            Some("anyone".to_string())
+        );
+    }
+
+    #[test]
+    fn tagged_lines_parse_and_untagged_lines_are_unaffected() {
+        let msg = IrcMessage::parse(
+            "@account=alice;time=2026-08-13T00:00:00Z :alice!a@h PRIVMSG #ch :yo",
+        )
+        .unwrap();
+        assert_eq!(msg.command, "PRIVMSG");
+        assert_eq!(msg.nick(), Some("alice"));
+        assert_eq!(msg.params, vec!["#ch", "yo"]);
+        assert_eq!(msg.tag("time"), Some("2026-08-13T00:00:00Z"));
+
+        let plain = IrcMessage::parse(":bob!b@h PRIVMSG #ch :yo").unwrap();
+        assert!(plain.tags.is_empty());
+        assert_eq!(plain.command, "PRIVMSG");
+    }
+
+    #[test]
+    fn tag_values_are_unescaped() {
+        let msg = IrcMessage::parse(r"@k=a\sb\:c\\d\r\n :n!u@h PING :x").unwrap();
+        assert_eq!(msg.tag("k"), Some("a b;c\\d\r\n"));
+        // A valueless tag is present with an empty value.
+        let msg = IrcMessage::parse("@bare :n!u@h PING :x").unwrap();
+        assert_eq!(msg.tag("bare"), Some(""));
+    }
+
+    #[test]
+    fn caps_requested_are_the_intersection_with_what_the_server_offers() {
+        let offered = IrcChannel::parse_cap_list("multi-prefix sasl=PLAIN account-tag");
+        assert_eq!(
+            IrcChannel::caps_to_request(&offered, true),
+            vec!["account-tag", "sasl"],
+            "extended-join was not offered, so it must not be requested"
+        );
+        assert_eq!(
+            IrcChannel::caps_to_request(&offered, false),
+            vec!["account-tag"],
+            "sasl must not be requested when no SASL password is configured"
+        );
+        assert!(
+            IrcChannel::caps_to_request(&[], true).is_empty(),
+            "a server that offers nothing gets no REQ at all"
+        );
+    }
+
+    /// The write half used to survive the listener, so `send()` wrote into a
+    /// half-closed socket, returned `Ok(())`, and the reply was lost silently.
+    #[tokio::test]
+    async fn send_after_listener_exit_is_an_error() {
+        let ch = channel_with_owners(&[]);
+        // Seed a live sink so the slot is occupied exactly as it would be
+        // mid-session; `listen()` then fails at connect and must clear it.
+        let (sink, _peer) = tokio::io::duplex(1024);
+        *ch.writer.lock().await = Some(Box::new(sink));
+        assert!(
+            ch.send(&SendMessage::new("probe".to_string(), "#ch".to_string()))
+                .await
+                .is_ok(),
+            "precondition: an occupied slot accepts a write"
+        );
+
+        let (tx, _rx) = mpsc::channel(1);
+        let result = ch
+            .listen(tx, tokio_util::sync::CancellationToken::new())
+            .await;
+        assert!(result.is_err(), "connecting to irc.test must fail");
+
+        assert!(
+            ch.writer.lock().await.is_none(),
+            "the listener must clear the write half on the way out"
+        );
+        let err = ch
+            .send(&SendMessage::new("hello".to_string(), "#ch".to_string()))
+            .await
+            .expect_err("send must report the dead session, not swallow it");
+        assert!(err.to_string().contains("not connected"), "got: {err}");
+        assert!(!ch.health_check().await);
+    }
+
+    /// Chunks went out back-to-back, which most networks disconnect as excess
+    /// flood — so a long reply failed more reliably than a short one.
+    #[test]
+    fn chunks_are_paced_after_a_short_burst() {
+        assert_eq!(IrcChannel::pace_before(0), None);
+        assert_eq!(IrcChannel::pace_before(BURST_LINES - 1), None);
+        assert_eq!(IrcChannel::pace_before(BURST_LINES), Some(CHUNK_DELAY));
+        assert_eq!(IrcChannel::pace_before(50), Some(CHUNK_DELAY));
+    }
+
+    /// The pacing is actually applied — on a paused clock, so the test does
+    /// not sleep. Every chunk still arrives, in order.
+    #[tokio::test(start_paused = true)]
+    async fn paced_send_still_delivers_every_line_in_order() {
+        let ch = channel_with_owners(&[]);
+        let (sink, mut peer) = tokio::io::duplex(64 * 1024);
+        *ch.writer.lock().await = Some(Box::new(sink));
+
+        // Long enough that IRC's own 512-byte splitter produces several
+        // PRIVMSGs; the renderer folds a multi-line body back into one line,
+        // so length is what makes chunks here.
+        let body = "a".repeat(2_000);
+        let started = tokio::time::Instant::now();
+        ch.send(&SendMessage::new(body, "#ch".to_string()))
+            .await
+            .expect("send");
+        let elapsed = started.elapsed();
+
+        // Close the write half so the read below terminates.
+        ch.writer.lock().await.take();
+        let mut written = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut peer, &mut written)
+            .await
+            .expect("read");
+        let written = String::from_utf8(written).expect("utf-8");
+        let lines = written.matches("PRIVMSG #ch :").count();
+        assert!(lines > BURST_LINES, "expected several chunks, got {lines}");
+        assert_eq!(
+            written.matches('a').count(),
+            2_000,
+            "every byte of the payload must be delivered"
+        );
+        assert_eq!(
+            elapsed,
+            CHUNK_DELAY * u32::try_from(lines - BURST_LINES).unwrap(),
+            "every line past the burst must be paced"
+        );
+    }
+
+    #[test]
+    fn nick_retry_is_capped() {
+        // The cap is what stops an unbounded NICK flood against a server that
+        // rejects every candidate; a flood is itself a disconnect.
+        assert!(
+            MAX_NICK_RETRIES > 0 && MAX_NICK_RETRIES <= 5,
+            "a cap of {MAX_NICK_RETRIES} is not a cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_tls_false_with_a_password_is_refused_without_the_opt_in() {
+        let insecure = |allow: bool, sasl: Option<&str>| {
+            IrcChannel::new(IrcChannelConfig {
+                server: "irc.test".into(),
+                port: 6697,
+                nickname: "bot".into(),
+                username: None,
+                channels: vec![],
+                allowed_users: vec![],
+                server_password: None,
+                nickserv_password: None,
+                sasl_password: sasl.map(str::to_string),
+                verify_tls: false,
+                allow_insecure_tls_with_password: allow,
+                approval_owners: Vec::new(),
+            })
+        };
+
+        let refusal = insecure(false, Some("hunter2"))
+            .insecure_credential_refusal()
+            .expect("a credential over an unauthenticated link must be refused");
+        assert!(refusal.contains("sasl_password"), "{refusal}");
+        assert!(
+            !refusal.contains("hunter2"),
+            "the refusal must not quote the credential: {refusal}"
+        );
+
+        assert!(
+            insecure(true, Some("hunter2"))
+                .insecure_credential_refusal()
+                .is_none(),
+            "the explicit opt-in must be honoured"
+        );
+        assert!(
+            insecure(false, None)
+                .insecure_credential_refusal()
+                .is_none(),
+            "no credential, no disclosure — an unverified link alone still starts"
+        );
+        assert!(
+            channel_with_owners(&[])
+                .insecure_credential_refusal()
+                .is_none(),
+            "verify_tls = true is unaffected"
+        );
+
+        // And the refusal reaches the caller, rather than only being logged.
+        let (tx, _rx) = mpsc::channel(1);
+        let err = insecure(false, Some("hunter2"))
+            .listen(tx, tokio_util::sync::CancellationToken::new())
+            .await
+            .expect_err("the channel must refuse to start");
+        assert!(err.to_string().contains("verify_tls"), "got: {err}");
+    }
+
+    #[test]
+    fn allowlist_edit_reaches_the_channel() {
+        let ch = channel_with_owners(&[]);
+        assert!(ch.is_user_allowed("anyone"), "seeded with *");
+        ch.apply_allowed_senders(&["alice".to_string()]);
+        assert!(ch.is_user_allowed("alice"));
+        assert!(
+            !ch.is_user_allowed("anyone"),
+            "the edit must replace the list, not append to it"
+        );
     }
 }

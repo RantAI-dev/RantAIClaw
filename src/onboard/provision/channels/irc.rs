@@ -271,6 +271,9 @@ impl TuiProvisioner for IrcProvisioner {
             nickserv_password,
             sasl_password,
             verify_tls: Some(verify_tls),
+            // Never enabled by setup: it exists to let an operator override a
+            // refusal they have understood, not to be answered in a wizard.
+            allow_insecure_tls_with_password: false,
         });
 
         send(

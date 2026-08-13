@@ -3077,6 +3077,15 @@ pub struct IrcConfig {
     pub sasl_password: Option<String>,
     /// Verify TLS certificate (default: true)
     pub verify_tls: Option<bool>,
+    /// Allow `verify_tls = false` together with a configured password.
+    ///
+    /// Off by default, and the channel refuses to start on that combination:
+    /// SASL PLAIN is reversible base64 and NickServ IDENTIFY is plaintext, so
+    /// a link with no peer authentication hands the credential to whoever
+    /// answered the connection. Set this only if that is understood and
+    /// intended (a lab bouncer with a self-signed certificate, say).
+    #[serde(default)]
+    pub allow_insecure_tls_with_password: bool,
 }
 
 fn default_irc_port() -> u16 {

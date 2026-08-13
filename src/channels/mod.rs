@@ -3496,6 +3496,8 @@ pub(crate) fn build_configured_channels(
                 nickserv_password: irc.nickserv_password.clone(),
                 sasl_password: irc.sasl_password.clone(),
                 verify_tls: irc.verify_tls.unwrap_or(true),
+                allow_insecure_tls_with_password: irc.allow_insecure_tls_with_password,
+                approval_owners: config.channels_config.approval_owners.clone(),
             })),
         ));
     }
