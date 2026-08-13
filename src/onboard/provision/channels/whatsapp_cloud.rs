@@ -4,11 +4,13 @@
 //! webhook-based integration.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::WhatsAppConfig;
 use crate::config::Config;
+use crate::onboard::provision::validate::allowlist;
 use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -46,7 +48,12 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -82,7 +89,9 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "Access token is required.".into(),
+            ));
         }
 
         // Phone number ID
@@ -106,7 +115,9 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "Phone number ID is required.".into(),
+            ));
         }
 
         // Validate with probe
@@ -123,42 +134,31 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
             "https://graph.facebook.com/v19.0/{}",
             phone_number_id.trim()
         );
-        match probe_get(
+        let probe = probe_get(
             &graph_url,
             &[("Authorization", &format!("Bearer {}", access_token.trim()))],
         )
-        .await
+        .await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "access token",
+        )
+        .await?
+        .should_persist()
         {
-            Ok(result) if result.status == 200 => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Credentials validated.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Credentials may be invalid.".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The access token was not saved — WhatsApp Cloud is not configured."
+                        .into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "access token failed validation and was not saved".into(),
+            ));
         }
 
         // Webhook verify token
@@ -200,23 +200,21 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
             ProvisionEvent::Prompt {
                 id: "allowed_numbers".into(),
                 label: "Allowed phone numbers (comma-separated E.164, or * for all)".into(),
-                default: Some("*".into()),
+                default: None,
                 secret: false,
             },
         )
         .await?;
 
         let allowed_raw = recv_text(&mut responses).await?;
-        let allowed_numbers: Vec<String> =
-            if allowed_raw.trim().is_empty() || allowed_raw.trim() == "*" {
-                vec!["*".to_string()]
-            } else {
-                allowed_raw
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
+        // An empty answer means empty, not "allow anyone". A typed `*` still
+        // yields `["*"]` through the same split.
+        let allowed_numbers: Vec<String> = allowed_raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        allowlist::warn_on_reach(&events, &allowed_numbers, "Allowed phone numbers").await?;
 
         // Write config (preserve any existing web-mode fields)
         let existing = config.channels_config.whatsapp.clone();
@@ -243,7 +241,7 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

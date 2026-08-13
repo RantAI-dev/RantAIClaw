@@ -1,9 +1,10 @@
 //! Gateway provisioner — implements [`TuiProvisioner`] for in-TUI webhook gateway setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::Config;
+use crate::onboard::provision::validate::numeric;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -41,7 +42,12 @@ impl TuiProvisioner for GatewayProvisioner {
         ProvisionerCategory::Runtime
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -79,23 +85,18 @@ impl TuiProvisioner for GatewayProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Configured);
         }
 
         // Port
-        send(
+        let port: u16 = numeric::prompt_number(
             &events,
-            ProvisionEvent::Prompt {
-                id: "port".into(),
-                label: "Gateway port (Enter for default 9393)".into(),
-                default: Some("9393".into()),
-                secret: false,
-            },
+            &mut responses,
+            "port",
+            "Gateway port (Enter for default 9393)",
+            9393u16,
         )
         .await?;
-
-        let port_str = recv_text(&mut responses).await?;
-        let port: u16 = port_str.trim().parse().unwrap_or(9393);
 
         // Host
         send(
@@ -180,7 +181,7 @@ impl TuiProvisioner for GatewayProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 
@@ -233,7 +234,7 @@ mod tests {
     }
 
     /// Drive the provisioner through its four prompts with scripted answers.
-    async fn run_with(config: &mut Config, host: &str) -> Result<()> {
+    async fn run_with(config: &mut Config, host: &str) -> Result<ProvisionOutcome> {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
         let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(32);
         // Drain events so the provisioner's sends never block.

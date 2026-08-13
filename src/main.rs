@@ -2961,9 +2961,6 @@ async fn run_provisioner_headless(
 
     let prov_name = provisioner.name().to_string();
     let provisioner_category = provisioner.category();
-    let prov_future = provisioner.run(config, profile, io);
-
-    tokio::pin!(prov_future);
 
     // Drive the provisioner future and the event-render loop
     // CONCURRENTLY. The previous code only awaited the event loop;
@@ -3041,20 +3038,36 @@ async fn run_provisioner_headless(
         }
     };
 
-    let timed = tokio::time::timeout(std::time::Duration::from_secs(120), async {
-        tokio::join!(prov_future, render_loop)
-    });
+    // Scoped so the provisioner's `&mut config` borrow ends here: the
+    // post-run hook below reads the config it just wrote.
+    let timed = {
+        let prov_future = provisioner.run(config, profile, io);
+        tokio::pin!(prov_future);
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            tokio::join!(prov_future, render_loop)
+        })
+        .await
+    };
 
-    match timed.await {
+    match timed {
         Ok((prov_result, _)) => {
             match prov_result {
                 Err(e) => eprintln!("\n❌ provisioner error: {e}"),
+                // Nothing was configured, so nothing gets installed — the skill
+                // would otherwise be left behind as a false "channel is set up"
+                // signal for a provisioner that bailed on a missing field.
+                Ok(onboard::provision::ProvisionOutcome::Aborted(reason)) => {
+                    eprintln!("\n⏹️  provisioner stopped, nothing saved: {reason}");
+                }
                 // A configured multi-user channel is the point at which the
                 // owner needs to be able to manage permissions from chat.
-                Ok(()) => onboard::provision::install_core_skills_after_channel(
-                    provisioner_category,
-                    profile,
-                ),
+                Ok(onboard::provision::ProvisionOutcome::Configured) => {
+                    if let Some(guidance) =
+                        onboard::provision::finalize_channel(provisioner_category, profile, config)
+                    {
+                        eprintln!("\n🔐 {guidance}");
+                    }
+                }
             }
         }
         Err(_) => {

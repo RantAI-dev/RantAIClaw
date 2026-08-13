@@ -8,7 +8,9 @@
 //!
 //! Config writes: `config.mcp_servers`
 
-use super::traits::{ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner};
+use super::traits::{
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
+};
 use crate::config::Config;
 use crate::mcp::curated::{CuratedMcpServer, AUTHED, NO_AUTH};
 use crate::mcp::setup;
@@ -44,7 +46,12 @@ impl TuiProvisioner for McpProvisioner {
         MCP_DESC
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -225,7 +232,7 @@ impl TuiProvisioner for McpProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

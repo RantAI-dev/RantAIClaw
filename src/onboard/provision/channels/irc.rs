@@ -1,10 +1,12 @@
 //! IRC provisioner — implements [`TuiProvisioner`] for in-TUI IRC setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::IrcConfig;
 use crate::config::Config;
+use crate::onboard::provision::validate::allowlist;
+use crate::onboard::provision::validate::numeric;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -41,7 +43,12 @@ impl TuiProvisioner for IrcProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -78,26 +85,17 @@ impl TuiProvisioner for IrcProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Server is required.".into()));
         }
 
-        // Port
-        send(
+        let port: u16 = numeric::prompt_number(
             &events,
-            ProvisionEvent::Prompt {
-                id: "port".into(),
-                label: "Port (Enter for default 6697 = TLS)".into(),
-                default: Some("6697".into()),
-                secret: false,
-            },
+            &mut responses,
+            "port",
+            "Port (Enter for default 6697 = TLS)",
+            6697u16,
         )
         .await?;
-
-        let port: u16 = recv_text(&mut responses)
-            .await?
-            .trim()
-            .parse()
-            .unwrap_or(6697);
 
         // Nickname
         send(
@@ -121,7 +119,7 @@ impl TuiProvisioner for IrcProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Nickname is required.".into()));
         }
 
         // Optional username
@@ -198,6 +196,27 @@ impl TuiProvisioner for IrcProvisioner {
             Some(nickserv_password.trim().to_string())
         };
 
+        // SASL. `IRC_DESC` advertises "NickServ/SASL passwords" but this path
+        // never asked and wrote `sasl_password: None`, so a network that
+        // requires SASL could not be configured from the TUI at all.
+        send(
+            &events,
+            ProvisionEvent::Prompt {
+                id: "sasl_password".into(),
+                label: "SASL PLAIN password (Enter to skip)".into(),
+                default: None,
+                secret: true,
+            },
+        )
+        .await?;
+
+        let sasl_password = recv_text(&mut responses).await?;
+        let sasl_password = if sasl_password.trim().is_empty() {
+            None
+        } else {
+            Some(sasl_password.trim().to_string())
+        };
+
         // Channels
         send(
             &events,
@@ -224,7 +243,7 @@ impl TuiProvisioner for IrcProvisioner {
                 id: "allowed_users".into(),
                 label: "Allowed nicknames (comma-separated, empty = deny all, * = allow all)"
                     .into(),
-                default: Some("*".into()),
+                default: None,
                 secret: false,
             },
         )
@@ -236,6 +255,7 @@ impl TuiProvisioner for IrcProvisioner {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        allowlist::warn_on_reach(&events, &allowed_users, "Allowed nicknames").await?;
 
         // Write config
         config.channels_config.irc = Some(IrcConfig {
@@ -247,7 +267,7 @@ impl TuiProvisioner for IrcProvisioner {
             allowed_users,
             server_password,
             nickserv_password,
-            sasl_password: None,
+            sasl_password,
             verify_tls: Some(verify_tls),
         });
 
@@ -259,7 +279,7 @@ impl TuiProvisioner for IrcProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 
@@ -300,6 +320,54 @@ async fn recv_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+
+    /// `IRC_DESC` advertises "NickServ/SASL passwords", but the TUI path never
+    /// asked and hardcoded `sasl_password: None`, so a network requiring SASL
+    /// could not be configured from here at all.
+    #[tokio::test]
+    async fn irc_sasl_prompt_is_reachable() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &IrcProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Text("irc.example.com"),
+                Answer::Text(""), // port -> default
+                Answer::Text("rantaiclaw_bot"),
+                Answer::Text(""), // username -> nickname
+                Answer::Pick(0),  // TLS yes
+                Answer::Text(""), // server password -> skip
+                Answer::Text(""), // NickServ -> skip
+                Answer::Text("placeholder-sasl-secret"),
+                Answer::Text("#rantaiclaw"),
+                Answer::Text("rantaiclaw_user"),
+            ],
+        )
+        .await;
+
+        assert!(t.configured(), "expected configured, got {:?}", t.outcome);
+        assert!(
+            t.prompts().iter().any(|p| p.contains("SASL")),
+            "a SASL prompt must be offered: {:?}",
+            t.prompts()
+        );
+        assert_eq!(
+            config
+                .channels_config
+                .irc
+                .as_ref()
+                .expect("irc config written")
+                .sasl_password
+                .as_deref(),
+            Some("placeholder-sasl-secret"),
+            "the answer must reach the config, not be dropped for a hardcoded None"
+        );
+    }
 
     #[test]
     fn provisioner_name_is_irc() {

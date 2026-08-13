@@ -9,7 +9,9 @@
 //!
 //! Config writes: none (skills live in `<profile>/skills/`)
 
-use super::traits::{ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner};
+use super::traits::{
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
+};
 use crate::config::Config;
 use crate::profile::Profile;
 use crate::skills::bundled::{self};
@@ -44,7 +46,12 @@ impl TuiProvisioner for SkillsProvisioner {
         SKILLS_DESC
     }
 
-    async fn run(&self, _config: &mut Config, profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        _config: &mut Config,
+        profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -180,7 +187,7 @@ impl TuiProvisioner for SkillsProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

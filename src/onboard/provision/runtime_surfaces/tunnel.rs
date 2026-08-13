@@ -1,7 +1,7 @@
 //! Tunnel provisioner — implements [`TuiProvisioner`] for in-TUI tunnel/public exposure setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::{
     CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TunnelConfig,
@@ -45,7 +45,12 @@ impl TuiProvisioner for TunnelProvisioner {
         ProvisionerCategory::Runtime
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -284,7 +289,7 @@ impl TuiProvisioner for TunnelProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

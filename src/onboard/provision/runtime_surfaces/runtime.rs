@@ -1,7 +1,7 @@
 //! Runtime provisioner — implements [`TuiProvisioner`] for in-TUI runtime (native/docker) setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::{DockerRuntimeConfig, RuntimeConfig};
 use crate::config::Config;
@@ -43,7 +43,12 @@ impl TuiProvisioner for RuntimeProvisioner {
         ProvisionerCategory::Runtime
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -187,7 +192,7 @@ impl TuiProvisioner for RuntimeProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

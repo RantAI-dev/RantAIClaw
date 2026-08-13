@@ -1,11 +1,12 @@
 //! Slack provisioner — implements [`TuiProvisioner`] for in-TUI Slack bot setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::SlackConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_post;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -43,7 +44,12 @@ impl TuiProvisioner for SlackProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -79,7 +85,7 @@ impl TuiProvisioner for SlackProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Bot token is required.".into()));
         }
 
         // Optional app-level token
@@ -111,43 +117,38 @@ impl TuiProvisioner for SlackProvisioner {
         )
         .await?;
 
-        match probe_post(
+        let probe = probe_post(
             "https://slack.com/api/auth.test",
             &[("Authorization", &format!("Bearer {}", bot_token.trim()))],
             "",
         )
-        .await
+        .await;
+        // Slack answers 200 even when it rejects the token, so the status says
+        // nothing and `classify_status` cannot be used here — `ok` in the body
+        // is the only signal. Anything that is neither `ok:true` nor `ok:false`
+        // is an unrecognised response, not evidence against the token.
+        let verdict = match &probe {
+            Ok(r) if r.body.contains("\"ok\":true") => verdict::ProbeVerdict::Accepted,
+            Ok(r) if r.body.contains("\"ok\":false") => {
+                verdict::ProbeVerdict::Rejected(slack_error(&r.body))
+            }
+            Ok(_) => verdict::ProbeVerdict::Inconclusive("unrecognised response".into()),
+            Err(e) => verdict::ProbeVerdict::Inconclusive(format!("{e}")),
+        };
+        if !verdict::resolve(&events, &mut responses, verdict, "bot token")
+            .await?
+            .should_persist()
         {
-            Ok(result) if result.body.contains("\"ok\":true") => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Bot token validated.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Bot token may be invalid.".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate token: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The bot token was not saved — Slack is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "bot token failed validation and was not saved".into(),
+            ));
         }
 
         // Optional channel ID
@@ -204,11 +205,27 @@ impl TuiProvisioner for SlackProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 
 use crate::onboard::provision::ProvisionerCategory;
+
+/// Slack reports the reason in `error` alongside `"ok": false`. Surfacing it
+/// turns "may be invalid" into something the operator can act on —
+/// `invalid_auth` and `account_inactive` need different fixes.
+fn slack_error(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str().map(|s| s.to_string()))
+        })
+        .map_or_else(
+            || "Slack rejected it".to_string(),
+            |e| format!("Slack returned `{e}`"),
+        )
+}
 
 async fn send(
     events: &tokio::sync::mpsc::Sender<ProvisionEvent>,

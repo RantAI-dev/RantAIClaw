@@ -1,7 +1,7 @@
 //! Memory provisioner — implements [`TuiProvisioner`] for in-TUI memory backend setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::MemoryConfig;
 use crate::config::Config;
@@ -41,7 +41,12 @@ impl TuiProvisioner for MemoryProvisioner {
         ProvisionerCategory::Runtime
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -139,7 +144,9 @@ impl TuiProvisioner for MemoryProvisioner {
                     },
                 )
                 .await?;
-                return Ok(());
+                return Ok(ProvisionOutcome::Aborted(
+                    "Postgres DSN is required.".into(),
+                ));
             }
             // DSN stored in storage provider config — note for now
             send(
@@ -198,7 +205,7 @@ impl TuiProvisioner for MemoryProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

@@ -10,7 +10,7 @@
 //! Mirrors [`super::persona`]. The provisioner only mutates
 //! `config.knowledge.*`; the driver persists the config afterward.
 
-use super::traits::{ProvisionEvent, ProvisionIo, Severity, TuiProvisioner};
+use super::traits::{ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner};
 use crate::config::Config;
 use crate::profile::Profile;
 use anyhow::Result;
@@ -53,7 +53,12 @@ impl TuiProvisioner for KnowledgeProvisioner {
         crate::onboard::provision::traits::ProvisionerCategory::Integration
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -89,7 +94,7 @@ impl TuiProvisioner for KnowledgeProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Configured);
         }
 
         // Step 2 — embedding key
@@ -157,7 +162,7 @@ impl TuiProvisioner for KnowledgeProvisioner {
                     },
                 )
                 .await?;
-                return Ok(());
+                return Ok(ProvisionOutcome::Configured);
             }
         };
 
@@ -220,7 +225,7 @@ impl TuiProvisioner for KnowledgeProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

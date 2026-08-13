@@ -1,11 +1,12 @@
 //! Mattermost provisioner — implements [`TuiProvisioner`] for in-TUI Mattermost setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::MattermostConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -42,7 +43,12 @@ impl TuiProvisioner for MattermostProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -79,7 +85,7 @@ impl TuiProvisioner for MattermostProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Server URL is required.".into()));
         }
 
         // Bot token
@@ -103,7 +109,7 @@ impl TuiProvisioner for MattermostProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Bot token is required.".into()));
         }
 
         // Validate token
@@ -116,42 +122,30 @@ impl TuiProvisioner for MattermostProvisioner {
         )
         .await?;
 
-        match probe_get(
+        let probe = probe_get(
             &format!("{}/api/v4/users/me", url),
             &[("Authorization", &format!("Bearer {}", bot_token.trim()))],
         )
-        .await
+        .await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "bot token",
+        )
+        .await?
+        .should_persist()
         {
-            Ok(result) if result.status == 200 => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Bot token validated.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Token may be invalid.".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate token: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The bot token was not saved — Mattermost is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "bot token failed validation and was not saved".into(),
+            ));
         }
 
         // Optional channel ID
@@ -230,7 +224,7 @@ impl TuiProvisioner for MattermostProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

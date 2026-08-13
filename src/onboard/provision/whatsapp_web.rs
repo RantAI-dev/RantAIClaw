@@ -6,7 +6,8 @@
 //! then write `config.channels_config.whatsapp` and save.
 
 use super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, ProvisionerCategory, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, ProvisionerCategory,
+    Severity, TuiProvisioner,
 };
 use crate::channels::whatsapp_web::{pair_once, PairEvent, PairOptions};
 use crate::config::schema::WhatsAppConfig;
@@ -46,7 +47,12 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -75,7 +81,7 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
                     })
                     .await
                     .ok();
-                return Ok(());
+                return Ok(ProvisionOutcome::Aborted("Cancelled.".into()));
             }
         };
 
@@ -99,7 +105,7 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
                     })
                     .await
                     .ok();
-                return Ok(());
+                return Ok(ProvisionOutcome::Aborted("Cancelled.".into()));
             }
         };
 
@@ -157,7 +163,9 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
                         })
                         .await
                         .ok();
-                    return Ok(());
+                    return Ok(ProvisionOutcome::Aborted(
+                        "Pairing timed out (120s). Try again.".into(),
+                    ));
                 }
                 PairEvent::Failed(e) => {
                     events
@@ -166,7 +174,7 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
                         })
                         .await
                         .ok();
-                    return Ok(());
+                    return Ok(ProvisionOutcome::Aborted(format!("Pairing failed: {e}")));
                 }
             }
         }
@@ -177,7 +185,9 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
                 })
                 .await
                 .ok();
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "Pair stream ended without Connected event.".into(),
+            ));
         }
 
         // ── 4. Prompt for allowed numbers ──────────────────────────
@@ -185,19 +195,27 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
             .send(ProvisionEvent::Prompt {
                 id: "allowed_numbers".into(),
                 label: "Allowed numbers (comma-separated E.164, or * for any)".into(),
-                default: Some("*".into()),
+                default: None,
                 secret: false,
             })
             .await
             .ok();
+        // An empty answer means empty. It used to fall through to `*`, so
+        // pressing Enter here linked a device and opened it to every number.
         let allowed_numbers: Vec<String> = match responses.recv().await {
-            Some(ProvisionResponse::Text(s)) if !s.trim().is_empty() => s
+            Some(ProvisionResponse::Text(s)) => s
                 .split(',')
                 .map(|n| n.trim().to_string())
                 .filter(|n| !n.is_empty())
                 .collect(),
-            _ => vec!["*".to_string()],
+            _ => Vec::new(),
         };
+        crate::onboard::provision::validate::allowlist::warn_on_reach(
+            &events,
+            &allowed_numbers,
+            "Allowed numbers",
+        )
+        .await?;
 
         // ── 5. Write config and save ───────────────────────────────
         let existing = config.channels_config.whatsapp.clone();
@@ -254,7 +272,9 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
                     })
                     .await
                     .ok();
-                return Ok(());
+                return Ok(ProvisionOutcome::Aborted(format!(
+                    "Failed to save config: {e}"
+                )));
             }
         }
 
@@ -264,7 +284,7 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
             })
             .await
             .ok();
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

@@ -6,7 +6,7 @@
 //!   3. Choose tone (formal / neutral / casual)
 //!   4. Prompt avoid (optional)
 
-use super::traits::{ProvisionEvent, ProvisionIo, Severity, TuiProvisioner};
+use super::traits::{ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner};
 use crate::config::Config;
 use crate::persona::{self, PersonaToml, PresetId};
 use crate::profile::Profile;
@@ -41,7 +41,12 @@ impl TuiProvisioner for PersonaProvisioner {
         PERSONA_DESC
     }
 
-    async fn run(&self, _config: &mut Config, profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        _config: &mut Config,
+        profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -215,7 +220,7 @@ impl TuiProvisioner for PersonaProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

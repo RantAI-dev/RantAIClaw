@@ -1,11 +1,12 @@
 //! Telegram provisioner — implements [`TuiProvisioner`] for in-TUI Telegram bot setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::TelegramConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -42,7 +43,12 @@ impl TuiProvisioner for TelegramProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -78,7 +84,7 @@ impl TuiProvisioner for TelegramProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("Bot token is required.".into()));
         }
 
         // Validate token
@@ -92,37 +98,26 @@ impl TuiProvisioner for TelegramProvisioner {
         .await?;
 
         let validate_url = format!("https://api.telegram.org/bot{}/getMe", bot_token.trim());
-        match probe_get(&validate_url, &[]).await {
-            Ok(result) if result.status == 200 => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Bot token validated successfully.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Bot token may be invalid (non-200 response).".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate token (network error): {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+        let probe = probe_get(&validate_url, &[]).await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "bot token",
+        )
+        .await?
+        .should_persist()
+        {
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "Bot token not saved — Telegram is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "bot token failed validation and was not saved".into(),
+            ));
         }
 
         // Allowed users
@@ -182,7 +177,7 @@ impl TuiProvisioner for TelegramProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 
@@ -223,6 +218,41 @@ async fn recv_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+
+    /// The plan's primary case. A provisioner that stops on a missing required
+    /// field used to emit `Failed` and then return `Ok(())`, which both drivers
+    /// read as success — so they installed the core skill and saved the config,
+    /// producing the false "channel is set up" signal the skill-install
+    /// ordering exists to prevent.
+    ///
+    /// The skill-install half is gated in the drivers' match arms; what is
+    /// unit-testable here is that the outcome says `Aborted` and that nothing
+    /// was written. Without the first, the second cannot be enforced.
+    #[tokio::test]
+    async fn aborted_provisioner_writes_no_config() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &TelegramProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![Answer::Text("   ")],
+        )
+        .await;
+
+        assert!(
+            t.aborted(),
+            "an empty bot token must abort, got {:?}",
+            t.outcome
+        );
+        assert!(
+            config.channels_config.telegram.is_none(),
+            "an aborted provisioner must not write a channel config"
+        );
+    }
 
     #[test]
     fn provisioner_name_is_telegram() {

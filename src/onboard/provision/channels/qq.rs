@@ -1,11 +1,12 @@
 //! QQ provisioner — implements [`TuiProvisioner`] for in-TUI QQ Official Bot setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::QQConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_post;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -42,7 +43,12 @@ impl TuiProvisioner for QqProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -78,7 +84,7 @@ impl TuiProvisioner for QqProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("App ID is required.".into()));
         }
 
         // App Secret
@@ -102,7 +108,7 @@ impl TuiProvisioner for QqProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("App Secret is required.".into()));
         }
 
         // Validate credentials
@@ -121,43 +127,40 @@ impl TuiProvisioner for QqProvisioner {
         // as "Credentials validated."
         let body = qq_probe_body(app_id.trim(), app_secret.trim());
 
-        match probe_post(
+        let probe = probe_post(
             crate::channels::qq::QQ_AUTH_URL,
             &[("Content-Type", "application/json")],
             &body,
         )
-        .await
+        .await;
+        // A token in the body is the only thing that proves the secret is good;
+        // `qq_probe_succeeded` already encodes that. A 401 is the platform
+        // rejecting the credentials outright.
+        let verdict = match &probe {
+            Ok(r) if qq_probe_succeeded(r.status, &r.body) => verdict::ProbeVerdict::Accepted,
+            Ok(r) if r.status == 401 || r.status == 403 => verdict::ProbeVerdict::Rejected(
+                format!("the platform refused them (HTTP {})", r.status),
+            ),
+            Ok(r) => verdict::ProbeVerdict::Inconclusive(format!(
+                "no access token in the response (HTTP {})",
+                r.status
+            )),
+            Err(e) => verdict::ProbeVerdict::Inconclusive(format!("{e}")),
+        };
+        if !verdict::resolve(&events, &mut responses, verdict, "credentials")
+            .await?
+            .should_persist()
         {
-            Ok(result) if qq_probe_succeeded(result.status, &result.body) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Credentials validated.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Credentials may be invalid.".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The credentials were not saved — QQ is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "credentials failed validation and were not saved".into(),
+            ));
         }
 
         // Allowed users
@@ -194,7 +197,7 @@ impl TuiProvisioner for QqProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

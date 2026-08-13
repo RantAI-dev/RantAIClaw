@@ -1,11 +1,13 @@
 //! Lark provisioner — implements [`TuiProvisioner`] for in-TUI Lark/Feishu setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::{LarkConfig, LarkReceiveMode};
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_post;
+use crate::onboard::provision::validate::numeric;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -43,7 +45,12 @@ impl TuiProvisioner for LarkProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -79,7 +86,7 @@ impl TuiProvisioner for LarkProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("App ID is required.".into()));
         }
 
         // App secret
@@ -103,8 +110,34 @@ impl TuiProvisioner for LarkProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("App Secret is required.".into()));
         }
+
+        // Region. Asked before the probe because it decides which host the app
+        // credentials are sent to: Feishu and Lark are separate deployments and
+        // a credential from one is not valid on the other. The branch that
+        // picked the host was hardcoded to never take the Feishu arm, and
+        // `use_feishu` was written as a literal false, so a Feishu tenant could
+        // not be configured from the TUI at all — the CLI wizard asked properly.
+        send(
+            &events,
+            ProvisionEvent::Choose {
+                id: "region".into(),
+                label: "Region".into(),
+                options: vec![
+                    "Feishu (CN)".to_string(),
+                    "Lark (International)".to_string(),
+                ],
+                multi: false,
+            },
+        )
+        .await?;
+        let use_feishu = recv_selection(&mut responses)
+            .await?
+            .first()
+            .copied()
+            .unwrap_or(0)
+            == 0;
 
         // Validate by getting tenant access token
         send(
@@ -116,57 +149,48 @@ impl TuiProvisioner for LarkProvisioner {
         )
         .await?;
 
-        let token_url = if false {
-            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-        } else {
-            "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
-        };
+        let token_url = tenant_token_url(use_feishu);
 
         let body = serde_json::json!({
             "app_id": app_id.trim(),
             "app_secret": app_secret.trim()
         });
 
-        match probe_post(
+        let probe = probe_post(
             token_url,
             &[],
             &serde_json::to_string(&body).unwrap_or_default(),
         )
-        .await
-        {
-            Ok(result)
-                if result.body.contains("\"code\":0")
-                    || result.body.contains("\"tenant_access_token\"") =>
+        .await;
+        // Lark answers 200 with a non-zero `code` when it rejects the app
+        // credentials, so the status alone proves nothing. A non-zero `code`
+        // is the platform saying no; anything else unrecognised is not.
+        let verdict = match &probe {
+            Ok(r)
+                if r.body.contains("\"code\":0") || r.body.contains("\"tenant_access_token\"") =>
             {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Credentials validated.".into(),
-                    },
-                )
-                .await?;
+                verdict::ProbeVerdict::Accepted
             }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Credentials may be invalid.".into(),
-                    },
-                )
-                .await?;
+            Ok(r) if r.body.contains("\"code\":") => {
+                verdict::ProbeVerdict::Rejected("the app credentials were refused".into())
             }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            Ok(_) => verdict::ProbeVerdict::Inconclusive("unrecognised response".into()),
+            Err(e) => verdict::ProbeVerdict::Inconclusive(format!("{e}")),
+        };
+        if !verdict::resolve(&events, &mut responses, verdict, "app credentials")
+            .await?
+            .should_persist()
+        {
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The app credentials were not saved — Lark is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "app credentials failed validation and were not saved".into(),
+            ));
         }
 
         // Optional encrypt key
@@ -230,21 +254,20 @@ impl TuiProvisioner for LarkProvisioner {
             }
         };
 
-        // Port for webhook mode
+        // Port for webhook mode. An unparseable answer used to yield `None`,
+        // which left webhook mode configured with no port — a failure deferred
+        // from setup, where it can be corrected, to runtime, where it cannot.
         let port = if receive_mode == LarkReceiveMode::Webhook {
-            send(
-                &events,
-                ProvisionEvent::Prompt {
-                    id: "port".into(),
-                    label: "HTTP port for webhook (e.g. 8080)".into(),
-                    default: Some("8080".into()),
-                    secret: false,
-                },
+            Some(
+                numeric::prompt_number(
+                    &events,
+                    &mut responses,
+                    "port",
+                    "HTTP port for webhook (e.g. 8080)",
+                    8080u16,
+                )
+                .await?,
             )
-            .await?;
-            let p = recv_text(&mut responses).await?;
-            let parsed = p.trim().parse::<u16>().ok();
-            parsed
         } else {
             None
         };
@@ -275,7 +298,7 @@ impl TuiProvisioner for LarkProvisioner {
             encrypt_key,
             verification_token,
             allowed_users,
-            use_feishu: false,
+            use_feishu,
             receive_mode,
             port,
         });
@@ -288,11 +311,23 @@ impl TuiProvisioner for LarkProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 
 use crate::onboard::provision::ProvisionerCategory;
+
+/// The tenant-token endpoint for the selected region.
+///
+/// Feishu and Lark are separate deployments; a credential issued by one is not
+/// valid on the other, so probing the wrong one can only ever fail.
+fn tenant_token_url(use_feishu: bool) -> &'static str {
+    if use_feishu {
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    } else {
+        "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
+    }
+}
 
 async fn send(
     events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
@@ -338,5 +373,26 @@ mod tests {
     #[test]
     fn provisioner_description_is_non_empty() {
         assert!(!LarkProvisioner::new().description().is_empty());
+    }
+
+    /// The region selection used to be a branch that could not take its Feishu
+    /// arm, so a Feishu tenant's credentials were always sent to the Lark
+    /// International host — where they can never be valid.
+    ///
+    /// Deliberately a pure check: driving the provisioner through this point
+    /// would make a real request to Lark or Feishu, which is neither
+    /// deterministic nor available on a CI runner without egress.
+    #[test]
+    fn lark_feishu_selection_picks_the_feishu_probe_host() {
+        let feishu = reqwest::Url::parse(tenant_token_url(true)).expect("feishu url parses");
+        let intl = reqwest::Url::parse(tenant_token_url(false)).expect("lark url parses");
+
+        assert_eq!(feishu.host_str(), Some("open.feishu.cn"));
+        assert_eq!(intl.host_str(), Some("open.larksuite.com"));
+        assert_ne!(
+            feishu.host_str(),
+            intl.host_str(),
+            "the two regions must not collapse onto one host"
+        );
     }
 }

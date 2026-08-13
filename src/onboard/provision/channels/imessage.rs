@@ -3,7 +3,7 @@
 //! macOS only. Checks for Full Disk Access before proceeding.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::IMessageConfig;
 use crate::config::Config;
@@ -43,7 +43,12 @@ impl TuiProvisioner for IMessageProvisioner {
         ProvisionerCategory::Channel
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -58,7 +63,7 @@ impl TuiProvisioner for IMessageProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted("iMessage is macOS-only.".into()));
         }
 
         send(
@@ -109,11 +114,16 @@ impl TuiProvisioner for IMessageProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Aborted(
+                "iMessage setup cancelled — prerequisites not met.".into(),
+            ));
         }
 
-        // Check if chat.db is accessible
-        let chat_db = std::path::Path::new("/Users/Library/Messages/chat.db");
+        // Resolve the same path `IMessageChannel::listen` opens. The old check
+        // looked at `/Users/Library/Messages/chat.db` — a path that exists on
+        // no macOS system, because the username between `/Users` and `Library`
+        // is missing — so the Full Disk Access check could only ever fail.
+        let chat_db = chat_db_path();
         if chat_db.exists() {
             send(
                 &events,
@@ -168,11 +178,22 @@ impl TuiProvisioner for IMessageProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 
 use crate::onboard::provision::ProvisionerCategory;
+
+/// The Messages database this machine actually has.
+///
+/// Must stay the path `IMessageChannel::listen` opens. It used to be the
+/// literal `/Users/Library/Messages/chat.db` — no username between the two
+/// segments — so the Full Disk Access check could only ever report failure.
+fn chat_db_path() -> std::path::PathBuf {
+    directories::UserDirs::new()
+        .map(|u| u.home_dir().join("Library/Messages/chat.db"))
+        .unwrap_or_default()
+}
 
 async fn send(
     events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
@@ -218,5 +239,31 @@ mod tests {
     #[test]
     fn provisioner_description_is_non_empty() {
         assert!(!IMessageProvisioner::new().description().is_empty());
+    }
+
+    /// The probe must look where the channel looks. The old literal
+    /// `/Users/Library/Messages/chat.db` is missing the username, so it names
+    /// no file on any macOS system and the check could only ever fail.
+    #[test]
+    fn imessage_probe_path_matches_the_channel_path() {
+        let probe = chat_db_path();
+        let channel_path = directories::UserDirs::new()
+            .map(|u| u.home_dir().join("Library/Messages/chat.db"))
+            .unwrap_or_default();
+
+        assert_eq!(
+            probe, channel_path,
+            "the provisioner must resolve the same chat.db the channel opens"
+        );
+        assert_ne!(
+            probe,
+            std::path::PathBuf::from("/Users/Library/Messages/chat.db"),
+            "that path has no username segment and exists nowhere"
+        );
+        assert!(
+            probe.ends_with("Library/Messages/chat.db"),
+            "unexpected shape: {}",
+            probe.display()
+        );
     }
 }

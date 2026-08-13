@@ -1,7 +1,7 @@
 //! Agents provisioner — implements [`TuiProvisioner`] for in-TUI delegate agent setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::DelegateAgentConfig;
 use crate::config::Config;
@@ -41,7 +41,12 @@ impl TuiProvisioner for AgentsProvisioner {
         ProvisionerCategory::Routing
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -162,7 +167,7 @@ impl TuiProvisioner for AgentsProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

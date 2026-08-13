@@ -5,6 +5,35 @@ All notable changes to RantaiClaw are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Setup no longer defaults a channel allowlist to "allow anyone".** Six
+  provisioners pre-filled the allowlist prompt with `*`, and three of them also
+  mapped an *empty* answer to `*` — under a prompt whose own label read
+  "empty = deny all". Pressing Enter through setup therefore opened the channel
+  to every sender on the platform. The prompts now start empty, an empty answer
+  stays empty, and both an empty list and a `*` list produce an explicit
+  warning. Typing `*` still works and is still honoured.
+
+  This tightens an exposure surface rather than widening one, so no config
+  schema change or version bump is involved — the affected defaults are setup
+  prompts, not `config.toml` values. Channels already configured are untouched;
+  this only changes what a *new* setup run writes. If you relied on pressing
+  Enter to get an open channel, type `*` at the prompt instead.
+
+- **Setup refuses to save a credential the platform rejected.** Every probing
+  provisioner used to warn and persist anyway, so a typo'd, expired or revoked
+  token was written to `config.toml` with the same "configured" state as a
+  working one. A 401/403 now stops the write unless you explicitly confirm.
+  A *transport* failure (DNS, timeout, offline) is treated as inconclusive and
+  still defaults to saving, so air-gapped and offline installs keep working.
+
+- **A provisioner that stops early no longer counts as success.** Emitting a
+  failure and then returning `Ok(())` made both setup drivers install the core
+  skill and save the config, producing a false "channel is set up" signal.
+
 ## [0.19.0-alpha] — 2026-08-11
 
 The Knowledge Base release: 29 fixes and features from a full-subsystem audit

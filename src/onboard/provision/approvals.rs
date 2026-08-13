@@ -7,7 +7,9 @@
 //!
 //! Config writes: `<profile>/policy/autonomy.toml`, `command_allowlist.toml`, `forbidden_paths.toml`
 
-use super::traits::{ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner};
+use super::traits::{
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
+};
 use crate::approval::policy_writer::{self, PolicyPreset};
 use crate::config::Config;
 use crate::profile::Profile;
@@ -42,7 +44,12 @@ impl TuiProvisioner for ApprovalsProvisioner {
         APPROVALS_DESC
     }
 
-    async fn run(&self, config: &mut Config, profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -130,7 +137,7 @@ impl TuiProvisioner for ApprovalsProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 

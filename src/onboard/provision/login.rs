@@ -14,7 +14,7 @@
 //! (`crate::onboard::section::login`), so `rantaiclaw setup login` works in the
 //! interactive terminal path too.
 
-use super::traits::{ProvisionEvent, ProvisionIo, Severity, TuiProvisioner};
+use super::traits::{ProvisionEvent, ProvisionIo, ProvisionOutcome, Severity, TuiProvisioner};
 use crate::config::Config;
 use crate::profile::Profile;
 use crate::security::login::IDLE_PRESETS;
@@ -49,7 +49,12 @@ impl TuiProvisioner for LoginProvisioner {
         LOGIN_DESC
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -90,7 +95,7 @@ impl TuiProvisioner for LoginProvisioner {
                 },
             )
             .await?;
-            return Ok(());
+            return Ok(ProvisionOutcome::Configured);
         }
 
         // Step 2 — username
@@ -178,15 +183,18 @@ impl TuiProvisioner for LoginProvisioner {
             },
         )
         .await?;
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 
 /// Emit a warning + terminal `Done` and return, leaving login disabled.
+/// Leaving console login disabled is a completed outcome, not an abort: the
+/// caller has already written the disabled state onto the config, and that
+/// write has to reach disk.
 async fn leave_disabled(
     events: &tokio::sync::mpsc::Sender<ProvisionEvent>,
     text: &str,
-) -> Result<()> {
+) -> Result<ProvisionOutcome> {
     send(
         events,
         ProvisionEvent::Message {
@@ -202,7 +210,7 @@ async fn leave_disabled(
         },
     )
     .await?;
-    Ok(())
+    Ok(ProvisionOutcome::Configured)
 }
 
 async fn send(

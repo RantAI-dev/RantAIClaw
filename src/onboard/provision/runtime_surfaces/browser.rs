@@ -1,7 +1,7 @@
 //! Browser provisioner — implements [`TuiProvisioner`] for in-TUI browser automation setup.
 
 use super::super::traits::{
-    ProvisionEvent, ProvisionIo, ProvisionResponse, Severity, TuiProvisioner,
+    ProvisionEvent, ProvisionIo, ProvisionOutcome, ProvisionResponse, Severity, TuiProvisioner,
 };
 use crate::config::schema::{BrowserComputerUseConfig, BrowserConfig};
 use crate::config::Config;
@@ -43,7 +43,12 @@ impl TuiProvisioner for BrowserProvisioner {
         ProvisionerCategory::Integration
     }
 
-    async fn run(&self, config: &mut Config, _profile: &Profile, io: ProvisionIo) -> Result<()> {
+    async fn run(
+        &self,
+        config: &mut Config,
+        _profile: &Profile,
+        io: ProvisionIo,
+    ) -> Result<ProvisionOutcome> {
         let ProvisionIo {
             events,
             mut responses,
@@ -192,7 +197,7 @@ impl TuiProvisioner for BrowserProvisioner {
         )
         .await?;
 
-        Ok(())
+        Ok(ProvisionOutcome::Configured)
     }
 }
 
