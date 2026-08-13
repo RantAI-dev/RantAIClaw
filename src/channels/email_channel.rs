@@ -36,7 +36,11 @@ use uuid::Uuid;
 use super::traits::{Channel, ChannelMessage, SendMessage};
 
 /// Email channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+///
+/// `Debug` is hand-written rather than derived: the derive rendered
+/// `password` in full, and this struct reaches `{:?}` on any config-dump or
+/// error path, which is how a mailbox password ends up in a retained log.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EmailConfig {
     /// IMAP server hostname
     pub imap_host: String,
@@ -67,6 +71,43 @@ pub struct EmailConfig {
     /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+}
+
+impl std::fmt::Debug for EmailConfig {
+    /// Every field except `password`, which renders as a fixed marker.
+    ///
+    /// Destructuring rather than skipping a field is deliberate: a credential
+    /// added later becomes a compile error here, so the next one cannot be
+    /// introduced and silently printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            imap_host,
+            imap_port,
+            imap_folder,
+            smtp_host,
+            smtp_port,
+            smtp_tls,
+            username,
+            password: _,
+            from_address,
+            idle_timeout_secs,
+            allowed_senders,
+        } = self;
+
+        f.debug_struct("EmailConfig")
+            .field("imap_host", imap_host)
+            .field("imap_port", imap_port)
+            .field("imap_folder", imap_folder)
+            .field("smtp_host", smtp_host)
+            .field("smtp_port", smtp_port)
+            .field("smtp_tls", smtp_tls)
+            .field("username", username)
+            .field("password", &"[redacted]")
+            .field("from_address", from_address)
+            .field("idle_timeout_secs", idle_timeout_secs)
+            .field("allowed_senders", allowed_senders)
+            .finish()
+    }
 }
 
 fn default_imap_port() -> u16 {
@@ -970,11 +1011,29 @@ mod tests {
 
     #[test]
     fn email_config_debug_output() {
+        // This asserted only that a hostname round-tripped, which the derive
+        // gave for free — it could not fail. What matters is the field it did
+        // not look at: `Debug` rendered the mailbox password in full, and this
+        // struct reaches `{:?}` on config-dump and error paths.
         let config = EmailConfig {
-            imap_host: "imap.debug.com".to_string(),
+            imap_host: "imap.example.com".to_string(),
+            username: "bot@example.com".to_string(),
+            password: "placeholder-mailbox-password".to_string(),
             ..Default::default()
         };
-        let debug_str = format!("{:?}", config);
-        assert!(debug_str.contains("imap.debug.com"));
+        let debug_str = format!("{config:?}");
+
+        assert!(
+            !debug_str.contains("placeholder-mailbox-password"),
+            "the password must never reach a log: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("[redacted]"),
+            "the field must still be visible as redacted, not silently dropped: {debug_str}"
+        );
+        // The non-secret fields still have to be there, or this "fix" would be
+        // a Debug impl that prints nothing useful.
+        assert!(debug_str.contains("imap.example.com"));
+        assert!(debug_str.contains("bot@example.com"));
     }
 }
