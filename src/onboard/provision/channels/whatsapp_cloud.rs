@@ -9,6 +9,7 @@ use super::super::traits::{
 use crate::config::schema::WhatsAppConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -132,42 +133,31 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
             "https://graph.facebook.com/v19.0/{}",
             phone_number_id.trim()
         );
-        match probe_get(
+        let probe = probe_get(
             &graph_url,
             &[("Authorization", &format!("Bearer {}", access_token.trim()))],
         )
-        .await
+        .await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "access token",
+        )
+        .await?
+        .should_persist()
         {
-            Ok(result) if result.status == 200 => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Credentials validated.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Credentials may be invalid.".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The access token was not saved — WhatsApp Cloud is not configured."
+                        .into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "access token failed validation and was not saved".into(),
+            ));
         }
 
         // Webhook verify token

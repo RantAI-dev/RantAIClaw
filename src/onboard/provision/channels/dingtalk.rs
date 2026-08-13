@@ -6,6 +6,7 @@ use super::super::traits::{
 use crate::config::schema::DingTalkConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_post;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -131,43 +132,31 @@ impl TuiProvisioner for DingTalkProvisioner {
         // endpoint and payload the CLI wizard already uses.
         let body = dingtalk_probe_body(client_id.trim(), client_secret.trim());
 
-        match probe_post(
+        let probe = probe_post(
             DINGTALK_PROBE_URL,
             &[("Content-Type", "application/json")],
             &body,
         )
-        .await
+        .await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "credentials",
+        )
+        .await?
+        .should_persist()
         {
-            Ok(result) if result.status == 200 => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Credentials validated.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Credentials may be invalid.".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The credentials was not saved — DingTalk is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "credentials failed validation and was not saved".into(),
+            ));
         }
 
         // Allowed users

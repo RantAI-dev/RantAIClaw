@@ -6,6 +6,7 @@ use super::super::traits::{
 use crate::config::schema::ComposioConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -97,42 +98,30 @@ impl TuiProvisioner for ComposioProvisioner {
         )
         .await?;
 
-        match probe_get(
+        let probe = probe_get(
             "https://backend.composio.dev/api/v2/auth/whoami",
             &[("X-API-Key", api_key.trim())],
         )
-        .await
+        .await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "API key",
+        )
+        .await?
+        .should_persist()
         {
-            Ok(result) if result.status == 200 => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "API key validated.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "API key may be invalid.".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The API key was not saved — Composio is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "API key failed validation and was not saved".into(),
+            ));
         }
 
         // Default tool packs (enable all recommended)

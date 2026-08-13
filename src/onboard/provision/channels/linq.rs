@@ -6,6 +6,7 @@ use super::super::traits::{
 use crate::config::schema::LinqConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -96,42 +97,30 @@ impl TuiProvisioner for LinqProvisioner {
         )
         .await?;
 
-        match probe_get(
+        let probe = probe_get(
             &linq_probe_url(),
             &[("Authorization", &format!("Bearer {}", api_token.trim()))],
         )
-        .await
+        .await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "API token",
+        )
+        .await?
+        .should_persist()
         {
-            Ok(result) if result.status == 200 => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "API token validated.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Token may be invalid.".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The API token was not saved — Linq is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "API token failed validation and was not saved".into(),
+            ));
         }
 
         // Sender phone

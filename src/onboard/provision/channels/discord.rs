@@ -6,6 +6,7 @@ use super::super::traits::{
 use crate::config::schema::DiscordConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -96,42 +97,30 @@ impl TuiProvisioner for DiscordProvisioner {
         )
         .await?;
 
-        match probe_get(
+        let probe = probe_get(
             "https://discord.com/api/v10/users/@me",
             &[("Authorization", &format!("Bot {}", bot_token.trim()))],
         )
-        .await
+        .await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "bot token",
+        )
+        .await?
+        .should_persist()
         {
-            Ok(result) if result.status == 200 => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Bot token validated.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Bot token may be invalid.".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate token: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The bot token was not saved — Discord is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "bot token failed validation and was not saved".into(),
+            ));
         }
 
         // Optional guild ID

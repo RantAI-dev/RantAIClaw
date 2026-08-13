@@ -6,6 +6,7 @@ use super::super::traits::{
 use crate::config::schema::{LarkConfig, LarkReceiveMode};
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_post;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -132,46 +133,41 @@ impl TuiProvisioner for LarkProvisioner {
             "app_secret": app_secret.trim()
         });
 
-        match probe_post(
+        let probe = probe_post(
             token_url,
             &[],
             &serde_json::to_string(&body).unwrap_or_default(),
         )
-        .await
-        {
-            Ok(result)
-                if result.body.contains("\"code\":0")
-                    || result.body.contains("\"tenant_access_token\"") =>
+        .await;
+        // Lark answers 200 with a non-zero `code` when it rejects the app
+        // credentials, so the status alone proves nothing. A non-zero `code`
+        // is the platform saying no; anything else unrecognised is not.
+        let verdict = match &probe {
+            Ok(r)
+                if r.body.contains("\"code\":0") || r.body.contains("\"tenant_access_token\"") =>
             {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Credentials validated.".into(),
-                    },
-                )
-                .await?;
+                verdict::ProbeVerdict::Accepted
             }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Credentials may be invalid.".into(),
-                    },
-                )
-                .await?;
+            Ok(r) if r.body.contains("\"code\":") => {
+                verdict::ProbeVerdict::Rejected("the app credentials were refused".into())
             }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            Ok(_) => verdict::ProbeVerdict::Inconclusive("unrecognised response".into()),
+            Err(e) => verdict::ProbeVerdict::Inconclusive(format!("{e}")),
+        };
+        if !verdict::resolve(&events, &mut responses, verdict, "app credentials")
+            .await?
+            .should_persist()
+        {
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The app credentials were not saved — Lark is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "app credentials failed validation and were not saved".into(),
+            ));
         }
 
         // Optional encrypt key

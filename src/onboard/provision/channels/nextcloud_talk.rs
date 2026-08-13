@@ -6,6 +6,7 @@ use super::super::traits::{
 use crate::config::schema::NextcloudTalkConfig;
 use crate::config::Config;
 use crate::onboard::provision::validate::http::probe_get;
+use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
 use anyhow::{self, Result};
 use async_trait::async_trait;
@@ -124,45 +125,33 @@ impl TuiProvisioner for NextcloudTalkProvisioner {
 
         let ocs_url = format!("{}/ocs/v2.php/cloud/user", base_url);
         let encoded = base64::encode(format!("{}:{}", "", app_token.trim())); // user is empty for app token
-        match probe_get(
+        let probe = probe_get(
             &ocs_url,
             &[
                 ("OCS-APIRequest", "true"),
                 ("Authorization", &format!("Basic {}", encoded)),
             ],
         )
-        .await
+        .await;
+        if !verdict::resolve(
+            &events,
+            &mut responses,
+            verdict::classify_status(&probe),
+            "app token",
+        )
+        .await?
+        .should_persist()
         {
-            Ok(result) if result.status == 200 => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Success,
-                        text: "Credentials validated.".into(),
-                    },
-                )
-                .await?;
-            }
-            Ok(_) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: "Token may be invalid.".into(),
-                    },
-                )
-                .await?;
-            }
-            Err(e) => {
-                send(
-                    &events,
-                    ProvisionEvent::Message {
-                        severity: Severity::Warn,
-                        text: format!("Could not validate: {e}. Continuing…"),
-                    },
-                )
-                .await?;
-            }
+            send(
+                &events,
+                ProvisionEvent::Failed {
+                    error: "The app token was not saved — Nextcloud Talk is not configured.".into(),
+                },
+            )
+            .await?;
+            return Ok(ProvisionOutcome::Aborted(
+                "app token failed validation and was not saved".into(),
+            ));
         }
 
         // Optional webhook secret
