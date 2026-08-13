@@ -5,6 +5,7 @@ use super::super::traits::{
 };
 use crate::channels::email_channel::EmailConfig;
 use crate::config::Config;
+use crate::onboard::provision::validate::allowlist;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -244,23 +245,22 @@ impl TuiProvisioner for EmailProvisioner {
                 label:
                     "Allowed sender addresses (comma-separated, empty = deny all, * = allow all)"
                         .into(),
-                default: Some("*".into()),
+                default: None,
                 secret: false,
             },
         )
         .await?;
 
         let allowed_raw = recv_text(&mut responses).await?;
-        let allowed_senders: Vec<String> =
-            if allowed_raw.trim().is_empty() || allowed_raw.trim() == "*" {
-                vec!["*".to_string()]
-            } else {
-                allowed_raw
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
+        // An empty answer means empty. It used to mean `*` — allow anyone —
+        // under a label that says "empty = deny all". A typed `*` still yields
+        // `["*"]`, so the explicit branch that did it was never needed.
+        let allowed_senders: Vec<String> = allowed_raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        allowlist::warn_on_reach(&events, &allowed_senders, "Allowed sender addresses").await?;
 
         // IDLE timeout
         send(

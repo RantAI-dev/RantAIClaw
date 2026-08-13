@@ -5,6 +5,7 @@ use super::super::traits::{
 };
 use crate::config::schema::LinqConfig;
 use crate::config::Config;
+use crate::onboard::provision::validate::allowlist;
 use crate::onboard::provision::validate::http::probe_get;
 use crate::onboard::provision::validate::verdict;
 use crate::profile::Profile;
@@ -176,7 +177,7 @@ impl TuiProvisioner for LinqProvisioner {
                 id: "allowed_senders".into(),
                 label: "Allowed sender handles (comma-separated, empty = deny all, * = allow all)"
                     .into(),
-                default: Some("*".into()),
+                default: None,
                 secret: false,
             },
         )
@@ -188,6 +189,7 @@ impl TuiProvisioner for LinqProvisioner {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        allowlist::warn_on_reach(&events, &allowed_senders, "Allowed sender handles").await?;
 
         // Write config
         config.channels_config.linq = Some(LinqConfig {

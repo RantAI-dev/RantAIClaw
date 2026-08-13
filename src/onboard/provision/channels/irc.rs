@@ -5,6 +5,7 @@ use super::super::traits::{
 };
 use crate::config::schema::IrcConfig;
 use crate::config::Config;
+use crate::onboard::provision::validate::allowlist;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -229,7 +230,7 @@ impl TuiProvisioner for IrcProvisioner {
                 id: "allowed_users".into(),
                 label: "Allowed nicknames (comma-separated, empty = deny all, * = allow all)"
                     .into(),
-                default: Some("*".into()),
+                default: None,
                 secret: false,
             },
         )
@@ -241,6 +242,7 @@ impl TuiProvisioner for IrcProvisioner {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        allowlist::warn_on_reach(&events, &allowed_users, "Allowed nicknames").await?;
 
         // Write config
         config.channels_config.irc = Some(IrcConfig {

@@ -5,6 +5,7 @@ use super::super::traits::{
 };
 use crate::config::schema::SignalConfig;
 use crate::config::Config;
+use crate::onboard::provision::validate::allowlist;
 use crate::profile::Profile;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -129,23 +130,21 @@ impl TuiProvisioner for SignalProvisioner {
             ProvisionEvent::Prompt {
                 id: "allowed_from".into(),
                 label: "Allowed sender numbers (comma-separated E.164, or * for all)".into(),
-                default: Some("*".into()),
+                default: None,
                 secret: false,
             },
         )
         .await?;
 
         let allowed_raw = recv_text(&mut responses).await?;
-        let allowed_from: Vec<String> =
-            if allowed_raw.trim().is_empty() || allowed_raw.trim() == "*" {
-                vec!["*".to_string()]
-            } else {
-                allowed_raw
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
+        // An empty answer means empty, not "allow anyone". A typed `*` still
+        // yields `["*"]` through the same split.
+        let allowed_from: Vec<String> = allowed_raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        allowlist::warn_on_reach(&events, &allowed_from, "Allowed sender numbers").await?;
 
         // Group ID filter
         send(

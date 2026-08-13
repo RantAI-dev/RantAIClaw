@@ -195,19 +195,27 @@ impl TuiProvisioner for WhatsAppWebProvisioner {
             .send(ProvisionEvent::Prompt {
                 id: "allowed_numbers".into(),
                 label: "Allowed numbers (comma-separated E.164, or * for any)".into(),
-                default: Some("*".into()),
+                default: None,
                 secret: false,
             })
             .await
             .ok();
+        // An empty answer means empty. It used to fall through to `*`, so
+        // pressing Enter here linked a device and opened it to every number.
         let allowed_numbers: Vec<String> = match responses.recv().await {
-            Some(ProvisionResponse::Text(s)) if !s.trim().is_empty() => s
+            Some(ProvisionResponse::Text(s)) => s
                 .split(',')
                 .map(|n| n.trim().to_string())
                 .filter(|n| !n.is_empty())
                 .collect(),
-            _ => vec!["*".to_string()],
+            _ => Vec::new(),
         };
+        crate::onboard::provision::validate::allowlist::warn_on_reach(
+            &events,
+            &allowed_numbers,
+            "Allowed numbers",
+        )
+        .await?;
 
         // ── 5. Write config and save ───────────────────────────────
         let existing = config.channels_config.whatsapp.clone();
