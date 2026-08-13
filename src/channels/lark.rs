@@ -213,6 +213,10 @@ pub struct LarkChannel {
     use_feishu: bool,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
+    /// Event-body encryption key, if the tenant configured one. Carried so
+    /// `listen_http` can refuse to start rather than accept a key it does not
+    /// use — see the startup check there.
+    encrypt_key: Option<String>,
     /// Cached tenant access token
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
@@ -235,6 +239,7 @@ impl LarkChannel {
             allowed_users,
             use_feishu: true,
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
+            encrypt_key: None,
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -251,6 +256,7 @@ impl LarkChannel {
         );
         ch.use_feishu = config.use_feishu;
         ch.receive_mode = config.receive_mode.clone();
+        ch.encrypt_key = config.encrypt_key.clone();
         ch
     }
 
@@ -643,9 +649,17 @@ impl LarkChannel {
 
                     self.try_add_ack_reaction(&lark_msg.message_id).await;
 
-                    let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
+                    let channel_msg = ChannelMessage {
+                        // The person, not the room. Every other channel reports
+                        // the individual here, and the owner gate compares
+                        // against it — reporting the chat id broke owner
+                        // authority outright, and the obvious workaround
+                        // (pasting the chat id into `approval_owners`) silently
+                        // promoted every member of that group to owner.
+                        // `reply_target` stays the chat: that part was right.
+                        sender_aliases: vec![lark_msg.chat_id.clone()],
                         id: Uuid::new_v4().to_string(),
-                        sender: lark_msg.chat_id.clone(),
+                        sender: sender_open_id.to_string(),
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: "lark".to_string(),
@@ -662,6 +676,22 @@ impl LarkChannel {
             }
         }
         Ok(())
+    }
+
+    /// Warn about `approval_owners` entries that name a conversation rather
+    /// than a person.
+    ///
+    /// While `sender` reported the chat id, the obvious way to make owner
+    /// approval work on Lark was to paste that chat id into `approval_owners`.
+    /// That silently granted owner authority to **every member** of the
+    /// conversation. Now that `sender` is the person, such an entry matches
+    /// nobody — so the operator has a broken gate either way and needs telling.
+    pub(crate) fn warn_on_chat_shaped_owners(owners: &[String]) -> Vec<String> {
+        owners
+            .iter()
+            .filter(|o| o.starts_with("oc_"))
+            .cloned()
+            .collect()
     }
 
     /// Check if a user open_id is allowed
@@ -955,9 +985,12 @@ impl LarkChannel {
             .unwrap_or(open_id);
 
         messages.push(ChannelMessage {
-            sender_aliases: Vec::new(),
+            // The person, not the room — see the websocket path for why. The
+            // chat id stays reachable as an alias for anything that matched on
+            // the old value.
+            sender_aliases: vec![chat_id.to_string()],
             id: Uuid::new_v4().to_string(),
-            sender: chat_id.to_string(),
+            sender: open_id.to_string(),
             reply_target: chat_id.to_string(),
             content: text,
             channel: "lark".to_string(),
@@ -1051,23 +1084,43 @@ impl LarkChannel {
 
         async fn handle_event(
             State(state): State<AppState>,
-            Json(payload): Json<serde_json::Value>,
+            body: axum::body::Bytes,
         ) -> axum::response::Response {
             use axum::http::StatusCode;
             use axum::response::IntoResponse;
 
-            // URL verification challenge
+            // Parse the bytes we were handed, so what gets authenticated below
+            // is what gets acted on. The previous `Json(payload)` extractor
+            // discarded the raw body, which is the same verify-what-you-parse
+            // mistake plan 130 fixes in the gateway.
+            let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+                return (StatusCode::BAD_REQUEST, "malformed body").into_response();
+            };
+
+            // Authenticity first — above the challenge reply, above the pairing
+            // interception, above `parse_event_payload`. The pairing path used
+            // to sit in front of the allowlist gate with nothing in front of
+            // *it*, so unlimited code guesses were free to anyone who could
+            // reach the port.
+            if let Err(rejection) = verify_callback(
+                payload.get("token").and_then(|t| t.as_str()),
+                &state.verification_token,
+                payload.get("encrypt").is_some(),
+            ) {
+                tracing::warn!(
+                    reason = rejection.as_str(),
+                    "Lark: refused an event callback"
+                );
+                return match rejection {
+                    CallbackRejection::EncryptedPayloadUnsupported => {
+                        (StatusCode::NOT_IMPLEMENTED, rejection.as_str()).into_response()
+                    }
+                    _ => (StatusCode::FORBIDDEN, "invalid token").into_response(),
+                };
+            }
+
+            // URL verification challenge — now behind the gate above.
             if let Some(challenge) = payload.get("challenge").and_then(|c| c.as_str()) {
-                // Verify token if present
-                let token_ok = payload
-                    .get("token")
-                    .and_then(|t| t.as_str())
-                    .map_or(true, |t| t == state.verification_token);
-
-                if !token_ok {
-                    return (StatusCode::FORBIDDEN, "invalid token").into_response();
-                }
-
                 let resp = serde_json::json!({ "challenge": challenge });
                 return (StatusCode::OK, Json(resp)).into_response();
             }
@@ -1108,6 +1161,51 @@ impl LarkChannel {
             anyhow::anyhow!("Lark webhook mode requires `port` to be set in [channels_config.lark]")
         })?;
 
+        if let Ok(cfg) = crate::config::Config::load_or_init().await {
+            let chat_shaped =
+                Self::warn_on_chat_shaped_owners(&cfg.channels_config.approval_owners);
+            if !chat_shaped.is_empty() {
+                tracing::warn!(
+                    entries = chat_shaped.join(", "),
+                    "Lark: [channels_config] approval_owners contains conversation ids \
+                     (oc_…) rather than user ids (ou_…). While this channel reported the \
+                     chat as the sender, that was the only way to make owner approval \
+                     work — and it granted owner authority to every member of those \
+                     conversations. It now matches nobody. Replace them with the ou_… of \
+                     each person who should approve."
+                );
+            }
+        }
+
+        // Fail closed at startup rather than serving an endpoint that trusts
+        // anyone. Mirrors the gateway's refusal to run without pairing material.
+        if self.verification_token.trim().is_empty() {
+            anyhow::bail!(
+                "Lark webhook mode refuses to start without `verification_token` in \
+                 [channels_config.lark] — the event endpoint would authenticate nothing, \
+                 so anyone who can reach the port could drive the agent. Copy the token \
+                 from the Lark developer console's Event Subscription page, or switch \
+                 `receive_mode` to \"websocket\", which needs no inbound endpoint."
+            );
+        }
+
+        // `encrypt_key` governs event-body encryption, which this build does not
+        // implement. Accepting the key while ignoring it is what let a tenant
+        // enable encryption and see silence: every event arrives as an `encrypt`
+        // envelope this code cannot read. Say so at startup instead.
+        if self
+            .encrypt_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty())
+        {
+            anyhow::bail!(
+                "Lark `encrypt_key` is set but this build does not decrypt event bodies. \
+                 With encryption enabled in the developer console every callback arrives \
+                 encrypted and none can be read. Clear `encrypt_key` and turn encryption \
+                 off in the console, or use `receive_mode = \"websocket\"`."
+            );
+        }
+
         let state = AppState {
             verification_token: self.verification_token.clone(),
             channel: Arc::new(LarkChannel::new(
@@ -1120,17 +1218,112 @@ impl LarkChannel {
             tx,
         };
 
+        // Body cap and request timeout, matching the gateway's router. An
+        // endpoint that fronts a pairing-code path needs a ceiling on both:
+        // without them a single large or slow request ties up the handler.
         let app = Router::new()
             .route("/lark", post(handle_event))
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(
+                crate::gateway::MAX_BODY_SIZE,
+            ))
+            .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                std::time::Duration::from_secs(crate::gateway::REQUEST_TIMEOUT_SECS),
+            ))
             .with_state(state);
 
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        // Loopback unless the operator has explicitly opted into public bind —
+        // the same gate `run_gateway` applies. This endpoint used to bind
+        // 0.0.0.0 unconditionally, so every interface served an endpoint that
+        // authenticated nothing.
+        let allow_public = crate::config::Config::load_or_init()
+            .await
+            .map(|c| c.gateway.allow_public_bind)
+            .unwrap_or(false);
+
+        let ip = if allow_public {
+            std::net::Ipv4Addr::UNSPECIFIED
+        } else {
+            std::net::Ipv4Addr::LOCALHOST
+        };
+        let addr = std::net::SocketAddr::from((ip, port));
+
+        if allow_public {
+            tracing::warn!(
+                "Lark callback server binding {addr} — [gateway] allow_public_bind is on, \
+                 so this endpoint is reachable from every interface."
+            );
+        }
         tracing::info!("Lark event callback server listening on {addr}");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
 
         Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Callback authenticity
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Why a callback was refused. Distinct variants because they need different
+/// operator responses: a missing token points at a misconfigured subscription,
+/// a mismatched one at traffic that is not from your tenant, and an encrypted
+/// body at a tenant setting this build cannot serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallbackRejection {
+    /// No `token` field in the body. Previously accepted — `map_or(true, …)`
+    /// treated an absent token as valid, so an unsigned, tokenless POST from
+    /// anyone who could reach the port drove the agent.
+    TokenMissing,
+    TokenMismatch,
+    /// The tenant sent an encrypted envelope. This build does not decrypt, so
+    /// it fails loudly instead of being dropped as unparseable — an operator
+    /// who set `encrypt_key` needs to know their events are not getting through.
+    EncryptedPayloadUnsupported,
+}
+
+impl CallbackRejection {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenMissing => "no verification token in the callback body",
+            Self::TokenMismatch => "verification token does not match",
+            Self::EncryptedPayloadUnsupported => {
+                "callback body is encrypted; this build verifies signatures but \
+                 does not decrypt event bodies"
+            }
+        }
+    }
+}
+
+/// Decide whether a callback is authentic.
+///
+/// The verification token, compared in constant time over the body we actually
+/// received. An absent token is a rejection — it used to be treated as valid,
+/// so an unsigned, tokenless POST from anyone who could reach the port drove
+/// the agent. An encrypted envelope is rejected rather than silently dropped.
+///
+/// **Signature verification (`X-Lark-Signature`) is deliberately not here.**
+/// Its digest construction cannot be derived from this repository — no
+/// implementation, no fixture, nothing to check an implementation against — and
+/// a construction that is subtly wrong rejects every legitimate callback while
+/// presenting as a working gate. That failure is worse than the gate's absence,
+/// because it looks like success. It needs the scheme confirmed against a live
+/// tenant, which is a follow-up plan, not a guess made here.
+pub(crate) fn verify_callback(
+    body_token: Option<&str>,
+    expected_token: &str,
+    body_has_encrypt_field: bool,
+) -> Result<(), CallbackRejection> {
+    if body_has_encrypt_field {
+        return Err(CallbackRejection::EncryptedPayloadUnsupported);
+    }
+
+    match body_token {
+        None => Err(CallbackRejection::TokenMissing),
+        Some(t) if crate::security::pairing::constant_time_eq(t, expected_token) => Ok(()),
+        Some(_) => Err(CallbackRejection::TokenMismatch),
     }
 }
 
@@ -1213,16 +1406,31 @@ fn parse_post_content(content: &str) -> Option<String> {
 fn strip_at_placeholders(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut chars = text.char_indices().peekable();
-    while let Some((_, ch)) = chars.next() {
+    while let Some((idx, ch)) = chars.next() {
         if ch == '@' {
-            let rest: String = chars.clone().map(|(_, c)| c).collect();
-            if let Some(after) = rest.strip_prefix("_user_") {
+            // Look ahead into the original string by byte offset. This used to
+            // collect the whole remaining text into a fresh `String` on every
+            // '@', which is an allocation and a copy per mention.
+            let rest = &text[idx + ch.len_utf8()..];
+            // A placeholder always carries an index. Without the digit check
+            // `@_user_` followed by anything at all was treated as one, so a
+            // literal `@_user_x` lost its prefix and the text was silently
+            // altered. Feishu never emits an unindexed placeholder.
+            if let Some(after) = rest
+                .strip_prefix("_user_")
+                .filter(|a| a.starts_with(|c: char| c.is_ascii_digit()))
+            {
                 let skip =
                     "_user_".len() + after.chars().take_while(|c| c.is_ascii_digit()).count();
-                for _ in 0..=skip {
+                // Exactly the placeholder, nothing more. `0..=skip` consumed one
+                // character too many. With a space after the mention the extra
+                // character was that space, so the result looked right; with no
+                // space — the normal case in CJK, Lark's primary market — it ate
+                // the first character of the message itself.
+                for _ in 0..skip {
                     chars.next();
                 }
-                if chars.peek().map(|(_, c)| *c == ' ').unwrap_or(false) {
+                if chars.peek().is_some_and(|(_, c)| *c == ' ') {
                     chars.next();
                 }
                 continue;
@@ -1236,6 +1444,54 @@ fn strip_at_placeholders(text: &str) -> String {
 /// In group chats, only respond when the bot is explicitly @-mentioned.
 fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
     !mentions.is_empty()
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::strip_at_placeholders;
+
+    /// The regression this fixes. Feishu injects `@_user_1` with no trailing
+    /// space in front of CJK text, and the old `0..=skip` ate the first real
+    /// character with it — so every mention-prefixed Chinese message arrived
+    /// missing its opening character.
+    #[test]
+    fn strips_the_placeholder_without_eating_the_next_character() {
+        assert_eq!(strip_at_placeholders("@_user_1你好世界"), "你好世界");
+        assert_eq!(strip_at_placeholders("@_user_12今天天气"), "今天天气");
+    }
+
+    /// The case that masked it: with a space after the mention the extra
+    /// consumed character happened to be that space, so the output looked
+    /// correct and the bug stayed invisible in ASCII testing.
+    #[test]
+    fn a_trailing_space_is_still_swallowed_exactly_once() {
+        assert_eq!(strip_at_placeholders("@_user_1 hello"), "hello");
+        assert_eq!(strip_at_placeholders("@_user_1  hello"), " hello");
+    }
+
+    #[test]
+    fn multiple_placeholders_are_all_removed() {
+        assert_eq!(
+            strip_at_placeholders("@_user_1 @_user_2 ping"),
+            "ping",
+            "each mention consumes itself and one following space"
+        );
+    }
+
+    /// A bare `@` or an unrelated handle must survive untouched.
+    #[test]
+    fn non_placeholder_at_signs_are_left_alone() {
+        assert_eq!(strip_at_placeholders("email me @ work"), "email me @ work");
+        assert_eq!(strip_at_placeholders("@someone hi"), "@someone hi");
+        assert_eq!(strip_at_placeholders("@_user_x hi"), "@_user_x hi");
+    }
+
+    /// Multi-byte input must not panic on the byte-offset lookahead.
+    #[test]
+    fn multibyte_text_without_placeholders_round_trips() {
+        let s = "こんにちは、世界！ 🎉";
+        assert_eq!(strip_at_placeholders(s), s);
+    }
 }
 
 #[cfg(test)]
@@ -1398,9 +1654,26 @@ mod tests {
         let msgs = ch.parse_event_payload(&payload);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello RantaiClaw!");
-        assert_eq!(msgs[0].sender, "oc_chat123");
         assert_eq!(msgs[0].channel, "lark");
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
+
+        // Identity is the person; the reply still routes to the room. This
+        // assertion used to read `sender == "oc_chat123"` — it encoded the bug
+        // rather than the contract, so the owner gate comparing against a chat
+        // id looked correct to the suite.
+        assert_eq!(
+            msgs[0].sender, "ou_testuser123",
+            "sender must be the person, or `approval_owners` matches a whole room"
+        );
+        assert_eq!(
+            msgs[0].reply_target, "oc_chat123",
+            "the reply still goes to the chat"
+        );
+        assert!(
+            msgs[0].sender_aliases.contains(&"oc_chat123".to_string()),
+            "the chat id stays reachable as an alias: {:?}",
+            msgs[0].sender_aliases
+        );
     }
 
     #[test]
@@ -1649,7 +1922,11 @@ mod tests {
 
     #[test]
     fn lark_parse_fallback_sender_to_open_id() {
-        // When chat_id is missing, sender should fall back to open_id
+        // `sender` is the open_id regardless; this covers the case where the
+        // event carries no chat_id, so `reply_target` has to fall back to it
+        // too. The comment here used to read "sender should fall back to
+        // open_id", which described the inverted model — the person was the
+        // fallback and the room was the identity.
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
