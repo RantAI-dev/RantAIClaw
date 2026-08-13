@@ -133,6 +133,16 @@ const IN_FLIGHT_COMPLETION_WAIT_TIMEOUT_SECS: u64 = 120;
 const IN_FLIGHT_COMPLETION_WAIT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(IN_FLIGHT_COMPLETION_WAIT_TIMEOUT_SECS);
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
+
+/// How long an unanswered in-chat approval waits before auto-denying.
+///
+/// Shared by the shell and tool registries so the two cannot drift, and read by
+/// `approval_relay::auto_deny_line` so the prompt states this value rather than
+/// a literal. The prompt used to promise "Auto-deny in 5 min" while the shell
+/// registry behind it had no deadline at all.
+const CHANNEL_APPROVAL_DEADLINE_SECS: u64 = 300;
+const CHANNEL_APPROVAL_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(CHANNEL_APPROVAL_DEADLINE_SECS);
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
 const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
@@ -2567,11 +2577,16 @@ async fn run_message_dispatch_loop(
             .sender_identities()
             .find(|id| crate::approval::can_approve(&live_owners, id))
             .unwrap_or(msg.sender.as_str());
+        // The chat this reply arrived in. Resolution used to consult neither the
+        // request id nor the origin the request already carried, so an approval
+        // posted into one chat could be answered from another.
         let approval_reply = approval_relay::try_handle_tool_reply(
             &msg.content,
             ctx.tool_approvals.as_ref(),
             approver,
             &live_owners,
+            &msg.channel,
+            &msg.reply_target,
         )
         .or_else(|| {
             approval_relay::try_handle_reply(
@@ -2579,6 +2594,8 @@ async fn run_message_dispatch_loop(
                 ctx.security.as_ref(),
                 approver,
                 &live_owners,
+                &msg.channel,
+                &msg.reply_target,
             )
         });
         if let Some(reply) = approval_reply {
@@ -3106,6 +3123,35 @@ pub(crate) fn channel_is_configured(key: &str, config: &Config) -> bool {
 /// Canonical channel roster: `(display label, configured?)` for every channel
 /// type in a stable order, derived from [`CHANNEL_CATALOG`] rather than
 /// maintained beside it.
+/// Say out loud what an `approval_owners` value actually grants.
+///
+/// `"*"` makes **every sender on every channel** an owner — the full toolset and
+/// the right to approve shell commands. The gateway already warns when
+/// `allowed_users` contains `*`; nothing warned for this, and no doc said the
+/// value was even accepted.
+///
+/// The bare `"user"` entry is the console's pre-`cli:local` identity. It is
+/// still honoured, but it matches any remote sender who picks that name.
+fn warn_on_risky_approval_owners(owners: &[String]) {
+    if owners.iter().any(|o| o.trim() == "*") {
+        tracing::warn!(
+            "approval_owners contains \"*\": EVERY sender on EVERY channel is an owner \
+             and may approve shell commands. Replace it with explicit sender ids."
+        );
+    }
+    if owners
+        .iter()
+        .any(|o| o.trim() == crate::channels::cli::LEGACY_CLI_SENDER_ID)
+    {
+        tracing::warn!(
+            "approval_owners contains \"{}\", the console's old unqualified identity — a \
+             remote sender using that same name is also an owner. Change it to \"{}\".",
+            crate::channels::cli::LEGACY_CLI_SENDER_ID,
+            crate::channels::cli::CLI_SENDER_ID
+        );
+    }
+}
+
 pub(crate) fn channel_roster(config: &Config) -> Vec<(&'static str, bool)> {
     CHANNEL_CATALOG
         .iter()
@@ -3610,10 +3656,20 @@ pub async fn start_channels_with_cancellation(
         &config.workspace_dir,
         policy_dir,
     ));
+    warn_on_risky_approval_owners(&config.channels_config.approval_owners);
+
     // Bind an async-approval registry to the policy so shell tool
     // calls in Supervised mode can ask the user via chat reply when
     // they hit an unknown basename.
-    let pending = Arc::new(crate::security::PendingApprovals::default());
+    //
+    // Built with an explicit deadline, matching the tool registry below.
+    // `PendingApprovals::default()` means *no* timeout — correct for the TUI,
+    // where a prompt should sit until the operator acts, and wrong here: nothing
+    // announces a shell request over chat, so an unanswered one blocked the
+    // agent's turn forever rather than auto-denying.
+    let pending = Arc::new(crate::security::PendingApprovals::new(Some(
+        CHANNEL_APPROVAL_DEADLINE,
+    )));
     security.set_pending(pending);
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
@@ -3918,10 +3974,11 @@ pub async fn start_channels_with_cancellation(
                 .with_policy(Arc::clone(&security)),
         )),
         approval_owners: Arc::clone(&approval_owners),
-        // 5-minute deadline: an unanswered in-chat approval auto-denies so a
-        // forgotten prompt never leaves a tool call hanging (secure default).
+        // An unanswered in-chat approval auto-denies so a forgotten prompt never
+        // leaves a tool call hanging (secure default). The prompt's "Auto-deny
+        // in N min" line is derived from this same value.
         tool_approvals: Arc::new(crate::security::PendingApprovals::new(Some(
-            std::time::Duration::from_secs(300),
+            CHANNEL_APPROVAL_DEADLINE,
         ))),
         // Role ceiling for non-owner senders: safe (auto-approved) tools +
         // configured guest_allowed_tools, with shell limited to

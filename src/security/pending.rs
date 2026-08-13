@@ -50,17 +50,33 @@ pub struct PendingRequest {
     /// Channel name that originated the request (e.g. `"tui"`, `"telegram"`).
     /// May be empty when the request didn't carry a channel hint.
     pub channel: String,
+    /// Chat/room the request can be answered from, alongside `channel`.
+    ///
+    /// Empty means **unscoped**: the registering surface had no message
+    /// context to attach. `ShellTool` is the live case — it is a `Tool`, and the
+    /// trait carries no originating message, so a shell approval genuinely
+    /// cannot name a chat. An unscoped request is deliberately NOT resolvable by
+    /// a bare `ok`/`y`; it needs its request handle. See
+    /// `resolve_by_basename_in`.
+    pub reply_target: String,
     /// Unix epoch seconds when the request was created.
     pub created_at: u64,
 }
 
 impl PendingRequest {
-    fn new(basename: String, full_command: String, channel: String) -> Self {
+    fn new_with_id(
+        id: Uuid,
+        basename: String,
+        full_command: String,
+        channel: String,
+        reply_target: String,
+    ) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id,
             basename,
             full_command,
             channel,
+            reply_target,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -162,7 +178,37 @@ impl PendingApprovals {
         full_command: impl Into<String>,
         channel: impl Into<String>,
     ) -> Decision {
-        let request = PendingRequest::new(basename.into(), full_command.into(), channel.into());
+        self.request_decision_in(
+            Uuid::new_v4(),
+            basename,
+            full_command,
+            channel,
+            String::new(),
+        )
+        .await
+    }
+
+    /// As [`request_decision`](Self::request_decision), but records the chat the
+    /// request can be answered from so a bare `ok` in a *different* chat cannot
+    /// resolve it.
+    /// The caller supplies `id` so it can show the request's handle in the
+    /// prompt it posts *before* awaiting the decision. The prompt has to name
+    /// the request it is about, and it is sent first.
+    pub async fn request_decision_in(
+        &self,
+        id: Uuid,
+        basename: impl Into<String>,
+        full_command: impl Into<String>,
+        channel: impl Into<String>,
+        reply_target: impl Into<String>,
+    ) -> Decision {
+        let request = PendingRequest::new_with_id(
+            id,
+            basename.into(),
+            full_command.into(),
+            channel.into(),
+            reply_target.into(),
+        );
         let id = request.id;
 
         let (tx, rx) = oneshot::channel();
@@ -228,7 +274,98 @@ impl PendingApprovals {
             None
         }
     }
+
+    /// Resolve a pending request matched by basename **within one chat**.
+    ///
+    /// This is what a bare `ok`/`y` from a channel goes through. Matching on the
+    /// basename alone let an approval posted into chat A be answered from chat B
+    /// on another channel entirely — no identity spoofing needed, because
+    /// resolution consulted neither the request id nor the origin the request
+    /// already carried.
+    ///
+    /// A request with an empty `reply_target` is **unscoped** and never matches
+    /// here: it has no chat to compare against, so the caller must name it by
+    /// handle instead of guessing.
+    pub fn resolve_by_basename_in(
+        &self,
+        basename: &str,
+        channel: &str,
+        reply_target: &str,
+        decision: Decision,
+    ) -> Option<Uuid> {
+        if reply_target.is_empty() {
+            return None;
+        }
+        let id = {
+            let snap = self.inner.snapshot.lock();
+            let matches: Vec<Uuid> = snap
+                .values()
+                .filter(|r| {
+                    r.basename == basename
+                        && r.channel == channel
+                        && !r.reply_target.is_empty()
+                        && r.reply_target == reply_target
+                })
+                .map(|r| r.id)
+                .collect();
+            if matches.len() != 1 {
+                return None;
+            }
+            matches[0]
+        };
+        if self.resolve(id, decision) {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Resolve the request whose id starts with `handle` (the short form shown
+    /// in the approval prompt). Returns the full id when exactly one matched.
+    ///
+    /// Scoped resolution cannot help a request that has no chat to compare
+    /// against, so naming it explicitly is the answer for those.
+    pub fn resolve_by_handle(&self, handle: &str, decision: Decision) -> Option<Uuid> {
+        let handle = handle.trim().to_ascii_lowercase();
+        if handle.len() < 4 {
+            return None;
+        }
+        let id = {
+            let snap = self.inner.snapshot.lock();
+            let matches: Vec<Uuid> = snap
+                .values()
+                .filter(|r| r.id.simple().to_string().starts_with(&handle))
+                .map(|r| r.id)
+                .collect();
+            if matches.len() != 1 {
+                return None;
+            }
+            matches[0]
+        };
+        if self.resolve(id, decision) {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// The auto-deny deadline this registry was built with, if any. Surfaces
+    /// exist that print it, and a printed deadline must come from here rather
+    /// than from a literal that can drift out of step.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.inner.timeout
+    }
+
+    /// The short handle shown to an operator for `id`.
+    pub fn handle_for(id: Uuid) -> String {
+        id.simple().to_string()[..REQUEST_HANDLE_LEN].to_string()
+    }
 }
+
+/// Characters of the request uuid shown in approval prompts. Long enough to be
+/// unambiguous in a queue an operator can actually read, short enough to retype
+/// from a phone.
+pub const REQUEST_HANDLE_LEN: usize = 6;
 
 impl Default for PendingApprovals {
     /// No timeout by default — the prompt waits indefinitely for an

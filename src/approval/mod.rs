@@ -383,6 +383,42 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `approval_owners = ["*"]` makes every sender on every channel an owner.
+    /// It is honoured — removing it silently would lock out anyone relying on it
+    /// — but nothing warned, and no doc said the value was even accepted.
+    #[test]
+    fn wildcard_owner_authorizes_anyone() {
+        assert!(can_approve_any(
+            &["*".to_string()],
+            ["some_stranger"].into_iter()
+        ));
+        assert!(can_approve_any(&["*".to_string()], ["anyone_at_all"]));
+    }
+
+    /// The console used the bare identity `user`, compared with no channel
+    /// qualification. An operator who added it also made any remote sender who
+    /// picked that name an owner.
+    #[test]
+    fn qualified_console_owner_does_not_match_a_remote_sender() {
+        let owners = vec![crate::channels::cli::CLI_SENDER_ID.to_string()];
+        assert!(
+            can_approve_any(&owners, [crate::channels::cli::CLI_SENDER_ID]),
+            "the console itself is still an owner"
+        );
+        assert!(
+            !can_approve_any(&owners, ["user"]),
+            "a remote sender named `user` must not inherit the console's authority"
+        );
+    }
+
+    /// An empty owner list authorises nobody — including the console. The
+    /// permissions output used to claim the opposite.
+    #[test]
+    fn empty_owner_list_authorizes_nobody() {
+        assert!(!can_approve_any(&[], ["user"]));
+        assert!(!can_approve_any(&[], [crate::channels::cli::CLI_SENDER_ID]));
+    }
     use crate::config::AutonomyConfig;
 
     /// Manual and Smart are both `Supervised`; the *only* thing separating
