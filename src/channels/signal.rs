@@ -73,6 +73,42 @@ struct GroupInfo {
     group_id: Option<String>,
 }
 
+/// Reconnect backoff for the SSE loop.
+///
+/// Split out because the reset used to fire the moment the HTTP response was
+/// 2xx — before a single event was read — so a server that accepted the
+/// connection and immediately dropped it reconnected every two seconds
+/// forever, never escalating toward the cap. Only a parsed envelope proves the
+/// stream works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SseBackoff {
+    secs: u64,
+    max_secs: u64,
+}
+
+impl SseBackoff {
+    const INITIAL_SECS: u64 = 2;
+
+    fn new(max_secs: u64) -> Self {
+        Self {
+            secs: Self::INITIAL_SECS,
+            max_secs,
+        }
+    }
+
+    /// The delay to wait before the next attempt, doubling for the one after.
+    fn next_delay(&mut self) -> std::time::Duration {
+        let delay = std::time::Duration::from_secs(self.secs);
+        self.secs = (self.secs * 2).min(self.max_secs);
+        delay
+    }
+
+    /// Called when the stream has actually produced an envelope.
+    fn note_healthy(&mut self) {
+        self.secs = Self::INITIAL_SECS;
+    }
+}
+
 impl SignalChannel {
     pub fn new(
         http_url: String,
@@ -229,15 +265,45 @@ impl SignalChannel {
         Uuid::parse_str(s).is_ok()
     }
 
-    fn parse_recipient_target(recipient: &str) -> RecipientTarget {
+    /// Complete lines available in `buffer`, leaving any partial tail behind.
+    ///
+    /// The stream used to be decoded chunk-by-chunk with `String::from_utf8`,
+    /// so a chunk that split a multi-byte character failed to decode and was
+    /// DISCARDED — silently lossy for any non-Latin traffic. Buffering bytes
+    /// and splitting on `\n` keeps a partial character until its rest arrives.
+    fn drain_lines(buffer: &mut Vec<u8>) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Some(newline_pos) = buffer.iter().position(|b| *b == b'\n') {
+            let line_bytes: Vec<u8> = buffer.drain(..=newline_pos).collect();
+            match std::str::from_utf8(&line_bytes[..newline_pos]) {
+                Ok(text) => lines.push(text.trim_end_matches('\r').to_string()),
+                Err(e) => {
+                    tracing::debug!("Signal SSE line is not valid UTF-8, skipping: {e}");
+                }
+            }
+        }
+        lines
+    }
+
+    /// The route for a reply target, or `None` when it is neither.
+    ///
+    /// Anything that was not an E.164 number or a UUID used to be treated as a
+    /// group id, so a typo, an empty string or a truncated identifier was sent
+    /// to signal-cli as a group — which fails opaquely, or worse, matches a
+    /// group that happens to share the string. `group:` is now the only route
+    /// to `Group`.
+    fn parse_recipient_target(recipient: &str) -> Option<RecipientTarget> {
         if let Some(group_id) = recipient.strip_prefix(GROUP_TARGET_PREFIX) {
-            return RecipientTarget::Group(group_id.to_string());
+            if group_id.trim().is_empty() {
+                return None;
+            }
+            return Some(RecipientTarget::Group(group_id.to_string()));
         }
 
         if Self::is_e164(recipient) || Self::is_uuid(recipient) {
-            RecipientTarget::Direct(recipient.to_string())
+            Some(RecipientTarget::Direct(recipient.to_string()))
         } else {
-            RecipientTarget::Group(recipient.to_string())
+            None
         }
     }
 
@@ -388,7 +454,14 @@ impl Channel for SignalChannel {
             &message.content,
             &crate::channels::format::RenderTarget::Plain,
         );
-        let params = match Self::parse_recipient_target(&message.recipient) {
+        let Some(target) = Self::parse_recipient_target(&message.recipient) else {
+            anyhow::bail!(
+                "Signal cannot route a reply to `{}`: expected an E.164 number, a UUID, \
+                 or a `group:` prefixed group id.",
+                message.recipient
+            );
+        };
+        let params = match target {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "recipient": [number],
                 "message": &rendered,
@@ -415,8 +488,7 @@ impl Channel for SignalChannel {
 
         tracing::info!("Signal channel listening via SSE on {}...", self.http_url);
 
-        let mut retry_delay_secs = 2u64;
-        let max_delay_secs = 60u64;
+        let mut backoff = SseBackoff::new(60);
 
         loop {
             let resp = self
@@ -432,22 +504,25 @@ impl Channel for SignalChannel {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
                     tracing::warn!("Signal SSE returned {status}: {body}");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay_secs)).await;
-                    retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
+                    tokio::time::sleep(backoff.next_delay()).await;
                     continue;
                 }
                 Err(e) => {
                     tracing::warn!("Signal SSE connect error: {e}, retrying...");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay_secs)).await;
-                    retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
+                    tokio::time::sleep(backoff.next_delay()).await;
                     continue;
                 }
             };
 
-            retry_delay_secs = 2;
-
+            // Deliberately NOT resetting the backoff here. A 2xx says the
+            // connection was accepted, not that the stream works: a server that
+            // accepts and immediately drops used to reconnect every two seconds
+            // forever. The reset moves to the first envelope actually parsed.
             let mut bytes_stream = resp.bytes_stream();
-            let mut buffer = String::new();
+            // Bytes, not a `String`: a chunk that split a multi-byte character
+            // failed `from_utf8` and was DISCARDED, so non-Latin traffic was
+            // silently lossy. A partial character now simply stays buffered.
+            let mut buffer: Vec<u8> = Vec::new();
             let mut current_data = String::new();
 
             while let Some(chunk) = bytes_stream.next().await {
@@ -459,20 +534,9 @@ impl Channel for SignalChannel {
                     }
                 };
 
-                let text = match String::from_utf8(chunk.to_vec()) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::debug!("Signal SSE invalid UTF-8, skipping chunk: {}", e);
-                        continue;
-                    }
-                };
+                buffer.extend_from_slice(&chunk);
 
-                buffer.push_str(&text);
-
-                while let Some(newline_pos) = buffer.find('\n') {
-                    let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
-                    buffer = buffer[newline_pos + 1..].to_string();
-
+                for line in Self::drain_lines(&mut buffer) {
                     // Skip SSE comments (keepalive)
                     if line.starts_with(':') {
                         continue;
@@ -483,6 +547,9 @@ impl Channel for SignalChannel {
                         if !current_data.is_empty() {
                             match serde_json::from_str::<SseEnvelope>(&current_data) {
                                 Ok(sse) => {
+                                    // The stream is proven healthy by an
+                                    // envelope arriving, not by a 2xx.
+                                    backoff.note_healthy();
                                     if let Some(ref envelope) = sse.envelope {
                                         // Intercept on-demand store-minted pairing
                                         // codes (`/bind`/`/claim`) before the
@@ -537,8 +604,13 @@ impl Channel for SignalChannel {
                 }
             }
 
-            tracing::debug!("Signal SSE stream ended, reconnecting...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            // Back off using the same variable the connect errors use — this
+            // used to sleep a literal 2 seconds, so a stream that was accepted
+            // and immediately ended reconnected at a fixed rate forever, and
+            // never escalated toward the cap.
+            let delay = backoff.next_delay();
+            tracing::debug!("Signal SSE stream ended, reconnecting in {delay:?}...");
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -557,7 +629,13 @@ impl Channel for SignalChannel {
     }
 
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
-        let params = match Self::parse_recipient_target(recipient) {
+        let Some(target) = Self::parse_recipient_target(recipient) else {
+            // A typing indicator is cosmetic; refusing quietly is right, and
+            // `send` reports the same target with a full error.
+            tracing::debug!("Signal: not typing at an unroutable target `{recipient}`");
+            return Ok(());
+        };
+        let params = match target {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "recipient": [number],
                 "account": &self.account,
@@ -580,6 +658,103 @@ impl Channel for SignalChannel {
 
 #[cfg(test)]
 mod tests {
+    /// The reset used to fire on a 2xx, before a single event was read, so a
+    /// server that accepted and immediately dropped reconnected every two
+    /// seconds forever without escalating toward the cap.
+    #[test]
+    fn signal_backoff_does_not_reset_on_a_bare_connect() {
+        let mut backoff = SseBackoff::new(60);
+        assert_eq!(backoff.next_delay().as_secs(), 2);
+        assert_eq!(backoff.next_delay().as_secs(), 4);
+        assert_eq!(backoff.next_delay().as_secs(), 8);
+
+        // Connecting is not health: nothing here resets it. Only an envelope.
+        backoff.note_healthy();
+        assert_eq!(
+            backoff.next_delay().as_secs(),
+            2,
+            "a healthy stream resets the delay"
+        );
+    }
+
+    /// The unit test above proves `SseBackoff` behaves; this proves the reset
+    /// is wired where the plan requires — a bare 2xx must not reach it. Source
+    /// inspection is the only lever without a live SSE server.
+    #[test]
+    fn signal_backoff_reset_is_wired_to_a_parsed_envelope() {
+        let src = include_str!("signal.rs");
+        // Stop at the test module, or this test's own mentions would count.
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let listen_body = production
+            .split("async fn listen(")
+            .nth(1)
+            .expect("listen exists");
+        assert_eq!(
+            listen_body.matches("backoff.note_healthy()").count(),
+            1,
+            "exactly one reset, or the wiring claim is unverifiable"
+        );
+        let reset_at = listen_body
+            .find("backoff.note_healthy()")
+            .expect("the reset is in listen");
+        let envelope_at = listen_body
+            .find("serde_json::from_str::<SseEnvelope>")
+            .expect("the envelope parse is in listen");
+        let status_at = listen_body
+            .find("r.status().is_success()")
+            .expect("the 2xx arm is in listen");
+        assert!(
+            reset_at > envelope_at && reset_at > status_at,
+            "the reset must sit inside the parsed-envelope branch, not the 2xx arm"
+        );
+    }
+
+    #[test]
+    fn signal_backoff_is_capped() {
+        let mut backoff = SseBackoff::new(60);
+        for _ in 0..20 {
+            backoff.next_delay();
+        }
+        assert_eq!(backoff.next_delay().as_secs(), 60);
+    }
+
+    /// A chunk that split a multi-byte character failed `String::from_utf8`
+    /// and the whole chunk was discarded — silently lossy for any non-Latin
+    /// traffic.
+    #[test]
+    fn signal_sse_survives_a_split_multibyte_character() {
+        let payload = "data: {\"m\":\"你好世界\"}\n";
+        let bytes = payload.as_bytes();
+
+        // Split mid-character: byte 13 lands inside the first CJK codepoint.
+        let split = 13;
+        assert!(
+            std::str::from_utf8(&bytes[..split]).is_err(),
+            "precondition: the split must land inside a character"
+        );
+
+        let mut buffer: Vec<u8> = Vec::new();
+        buffer.extend_from_slice(&bytes[..split]);
+        assert!(
+            SignalChannel::drain_lines(&mut buffer).is_empty(),
+            "a partial line yields nothing yet, and loses nothing"
+        );
+
+        buffer.extend_from_slice(&bytes[split..]);
+        let lines = SignalChannel::drain_lines(&mut buffer);
+        assert_eq!(lines, vec![payload.trim_end().to_string()]);
+        assert!(lines[0].contains("你好世界"), "got: {}", lines[0]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn signal_sse_keeps_a_partial_trailing_line_buffered() {
+        let mut buffer: Vec<u8> = b"first\nsec".to_vec();
+        assert_eq!(SignalChannel::drain_lines(&mut buffer), vec!["first"]);
+        buffer.extend_from_slice(b"ond\n");
+        assert_eq!(SignalChannel::drain_lines(&mut buffer), vec!["second"]);
+    }
+
     use super::*;
 
     fn make_channel() -> SignalChannel {
@@ -778,7 +953,7 @@ mod tests {
     fn parse_recipient_target_e164_is_direct() {
         assert_eq!(
             SignalChannel::parse_recipient_target("+1234567890"),
-            RecipientTarget::Direct("+1234567890".to_string())
+            Some(RecipientTarget::Direct("+1234567890".to_string()))
         );
     }
 
@@ -786,7 +961,7 @@ mod tests {
     fn parse_recipient_target_prefixed_group_is_group() {
         assert_eq!(
             SignalChannel::parse_recipient_target("group:abc123"),
-            RecipientTarget::Group("abc123".to_string())
+            Some(RecipientTarget::Group("abc123".to_string()))
         );
     }
 
@@ -795,16 +970,18 @@ mod tests {
         let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
         assert_eq!(
             SignalChannel::parse_recipient_target(uuid),
-            RecipientTarget::Direct(uuid.to_string())
+            Some(RecipientTarget::Direct(uuid.to_string()))
         );
     }
 
     #[test]
-    fn parse_recipient_target_non_e164_plus_is_group() {
-        assert_eq!(
-            SignalChannel::parse_recipient_target("+abc123"),
-            RecipientTarget::Group("+abc123".to_string())
-        );
+    /// Was `..._non_e164_plus_is_group`: anything unrecognised became a group
+    /// id, so a typo was sent to signal-cli as a group.
+    fn signal_rejects_a_malformed_recipient() {
+        assert_eq!(SignalChannel::parse_recipient_target("+abc123"), None);
+        assert_eq!(SignalChannel::parse_recipient_target(""), None);
+        assert_eq!(SignalChannel::parse_recipient_target("group:"), None);
+        assert_eq!(SignalChannel::parse_recipient_target("not-a-number"), None);
     }
 
     #[test]
@@ -879,7 +1056,7 @@ mod tests {
 
         // Verify reply routing: UUID sender in DM should route as Direct
         let target = SignalChannel::parse_recipient_target(&msg.reply_target);
-        assert_eq!(target, RecipientTarget::Direct(uuid.to_string()));
+        assert_eq!(target, Some(RecipientTarget::Direct(uuid.to_string())));
     }
 
     #[test]
@@ -913,7 +1090,10 @@ mod tests {
 
         // Verify reply routing: group message should still route as Group
         let target = SignalChannel::parse_recipient_target(&msg.reply_target);
-        assert_eq!(target, RecipientTarget::Group("testgroup".to_string()));
+        assert_eq!(
+            target,
+            Some(RecipientTarget::Group("testgroup".to_string()))
+        );
     }
 
     #[test]

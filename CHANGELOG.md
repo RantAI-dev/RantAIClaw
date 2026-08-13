@@ -49,6 +49,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **DingTalk stopped reconnect-storming.** A WebSocket *error* was reported to
+  the supervisor as a clean exit, and the clean-exit arm marks a health error
+  *and* resets the backoff — one event read as both failure and success. An
+  expired ticket or a rate limit therefore reconnected every two seconds
+  forever, never escalating toward the 60-second cap, burning the exact API
+  budget backing off would protect. A transport fault now returns `Err`; a
+  server-side `Close` stays a clean exit.
+
+- **Signal's backoff resets on a working stream, not on a bare connect.** It
+  reset the moment the HTTP response was 2xx, before a single event was read,
+  and then slept a literal two seconds after the stream ended rather than using
+  the backoff at all.
+
+- **Signal no longer drops non-Latin messages.** Any SSE chunk that split a
+  multi-byte character failed to decode and was discarded whole. The stream is
+  now buffered as bytes and split on line boundaries, so a partial character
+  simply waits for the rest of itself.
+
+- **Signal refuses an unroutable reply target.** Anything that was not an E.164
+  number or a UUID was treated as a group id, so a typo or a truncated
+  identifier was sent to signal-cli as a group. `group:` is now the only route
+  to a group, and `send` reports a clear error otherwise.
+
+- **QQ's dedup evicts the oldest id, not an arbitrary one.** Eviction walked an
+  unordered `HashSet` under a comment claiming it dropped the oldest, so a
+  just-inserted id could be discarded — and a dedup miss costs a complete extra
+  LLM turn plus a duplicate reply.
+
+- **DingTalk ACKs a frame before filtering it.** Empty content, a consumed
+  pairing code and an unpaired sender all skipped the ACK, so DingTalk
+  redelivered frames from exactly the population the pairing flow exists to
+  serve.
+
+- **DingTalk's session-webhook map is bounded and validated.** It stored two
+  entries per message forever and ignored the expiry DingTalk ships alongside
+  them. Entries now carry that expiry and are swept; a URL that is not an HTTPS
+  DingTalk endpoint is refused rather than stored, and the read lock is no
+  longer held across the outbound POST.
+
+- **Pairing grants access immediately on DingTalk, QQ, Nextcloud Talk and
+  Matrix.** Their allowlists were plain `Vec<String>`, so a successful
+  `/bind`/`/claim` was persisted but did nothing until the daemon restarted.
+  They now also honour a console or CLI allowlist edit at runtime.
+
 - **Telegram typing indicators no longer fight between chats.** One typing slot
   was shared by the whole channel, so starting typing for chat B silently killed
   chat A's indicator — and with the runtime's parallel message path, concurrent

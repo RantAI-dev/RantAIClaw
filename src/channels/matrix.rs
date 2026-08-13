@@ -23,7 +23,12 @@ pub struct MatrixChannel {
     homeserver: String,
     access_token: String,
     room_id: String,
-    allowed_users: Vec<String>,
+    /// Runtime-mutable so a `/bind`/`/claim` — or a console allowlist edit —
+    /// reaches the running channel instead of waiting for a restart.
+    ///
+    /// NOTE: this file is not built by any CI job (`matrix-sdk 0.16` overflows
+    /// the rustc recursion budget), so this conversion is by inspection.
+    allowed_users: Arc<std::sync::RwLock<Vec<String>>>,
     session_owner_hint: Option<String>,
     session_device_id_hint: Option<String>,
     resolved_room_id_cache: Arc<RwLock<Option<String>>>,
@@ -114,7 +119,7 @@ impl MatrixChannel {
         let homeserver = homeserver.trim_end_matches('/').to_string();
         let access_token = access_token.trim().to_string();
         let room_id = room_id.trim().to_string();
-        let allowed_users = allowed_users
+        let allowed_users: Vec<String> = allowed_users
             .into_iter()
             .map(|user| user.trim().to_string())
             .filter(|user| !user.is_empty())
@@ -124,7 +129,7 @@ impl MatrixChannel {
             homeserver,
             access_token,
             room_id,
-            allowed_users,
+            allowed_users: Arc::new(std::sync::RwLock::new(allowed_users)),
             session_owner_hint: Self::normalize_optional_field(owner_hint),
             session_device_id_hint: Self::normalize_optional_field(device_id_hint),
             resolved_room_id_cache: Arc::new(RwLock::new(None)),
@@ -159,7 +164,28 @@ impl MatrixChannel {
     }
 
     fn is_user_allowed(&self, sender: &str) -> bool {
-        Self::is_sender_allowed(&self.allowed_users, sender)
+        let Ok(users) = self.allowed_users.read() else {
+            return false;
+        };
+        Self::is_sender_allowed(&users, sender)
+    }
+
+    /// Append a freshly-paired sender to the runtime allowlist so access is
+    /// effective immediately. The persisted config (saved by the pairing core)
+    /// stays the source of truth across restarts.
+    fn add_allowed_identity_runtime(
+        allowed_users: &Arc<std::sync::RwLock<Vec<String>>>,
+        sender: &str,
+    ) {
+        let sender = sender.trim();
+        if sender.is_empty() {
+            return;
+        }
+        if let Ok(mut users) = allowed_users.write() {
+            if !users.iter().any(|u| u.eq_ignore_ascii_case(sender)) {
+                users.push(sender.to_string());
+            }
+        }
     }
 
     fn is_sender_allowed(allowed_users: &[String], sender: &str) -> bool {
@@ -597,14 +623,14 @@ impl Channel for MatrixChannel {
         let tx_handler = tx.clone();
         let target_room_for_handler = target_room.clone();
         let my_user_id_for_handler = my_user_id.clone();
-        let allowed_users_for_handler = self.allowed_users.clone();
+        let allowed_users_for_handler = Arc::clone(&self.allowed_users);
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
             let target_room = target_room_for_handler.clone();
             let my_user_id = my_user_id_for_handler.clone();
-            let allowed_users = allowed_users_for_handler.clone();
+            let allowed_users = Arc::clone(&allowed_users_for_handler);
             let dedupe = Arc::clone(&dedupe_for_handler);
 
             async move {
@@ -632,10 +658,15 @@ impl Channel for MatrixChannel {
                 // before the allowlist gate so unenrolled users can self-onboard
                 // without a daemon restart. Consumes the message when handled.
                 if MatrixChannel::try_handle_store_pairing(&room, &sender, &body).await {
+                    MatrixChannel::add_allowed_identity_runtime(&allowed_users, &sender);
                     return;
                 }
 
-                if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
+                let allowed_snapshot = match allowed_users.read() {
+                    Ok(users) => users.clone(),
+                    Err(_) => return,
+                };
+                if !MatrixChannel::is_sender_allowed(&allowed_snapshot, &sender) {
                     return;
                 }
 
@@ -688,6 +719,12 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        if let Ok(mut users) = self.allowed_users.write() {
+            *users = allowed.to_vec();
+        }
+    }
+
     async fn health_check(&self) -> bool {
         let Ok(room_id) = self.target_room_id().await else {
             return false;
@@ -720,7 +757,7 @@ mod tests {
         assert_eq!(ch.homeserver, "https://matrix.org");
         assert_eq!(ch.access_token, "syt_test_token");
         assert_eq!(ch.room_id, "!room:matrix.org");
-        assert_eq!(ch.allowed_users.len(), 1);
+        assert_eq!(ch.allowed_users.read().expect("allowlist lock").len(), 1);
     }
 
     /// A store-minted owner code consumed for the `matrix` surface appends the

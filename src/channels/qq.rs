@@ -2,7 +2,7 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
@@ -33,11 +33,17 @@ const DEDUP_CAPACITY: usize = 10_000;
 pub struct QQChannel {
     app_id: String,
     app_secret: String,
-    allowed_users: Vec<String>,
+    /// Runtime-mutable so a `/bind`/`/claim` — or a console allowlist edit —
+    /// reaches the running channel instead of waiting for a restart.
+    allowed_users: Arc<std::sync::RwLock<Vec<String>>>,
     /// Cached access token + expiry timestamp.
     token_cache: Arc<RwLock<Option<(String, u64)>>>,
-    /// Message deduplication set.
-    dedup: Arc<RwLock<HashSet<String>>>,
+    /// Message deduplication: the set answers membership in O(1), the deque
+    /// records arrival order so eviction drops the *oldest* id. It used to be
+    /// a bare `HashSet` evicted by `iter().take(..)` — whose order is
+    /// unspecified — so a just-inserted id could be dropped, and a dedup miss
+    /// costs a complete extra LLM turn plus a duplicate reply.
+    dedup: Arc<RwLock<(VecDeque<String>, HashSet<String>)>>,
 }
 
 impl QQChannel {
@@ -45,9 +51,9 @@ impl QQChannel {
         Self {
             app_id,
             app_secret,
-            allowed_users,
+            allowed_users: Arc::new(std::sync::RwLock::new(allowed_users)),
             token_cache: Arc::new(RwLock::new(None)),
-            dedup: Arc::new(RwLock::new(HashSet::new())),
+            dedup: Arc::new(RwLock::new((VecDeque::new(), HashSet::new()))),
         }
     }
 
@@ -56,7 +62,25 @@ impl QQChannel {
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        let Ok(users) = self.allowed_users.read() else {
+            return false;
+        };
+        users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    /// Append a freshly-paired openid to the runtime allowlist so access is
+    /// effective immediately. The persisted config (saved by the pairing core)
+    /// stays the source of truth across restarts.
+    fn add_allowed_identity_runtime(&self, id: &str) {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        if let Ok(mut users) = self.allowed_users.write() {
+            if !users.iter().any(|u| u == id) {
+                users.push(id.to_string());
+            }
+        }
     }
 
     /// Resolve the active profile root for the shared pairing-code store.
@@ -100,6 +124,9 @@ impl QQChannel {
         else {
             return false;
         };
+
+        // Effective immediately; the pairing core persists it for next start.
+        self.add_allowed_identity_runtime(user_id);
 
         if let Err(e) = self.send(&SendMessage::new(reply, chat_id)).await {
             tracing::warn!("QQ pairing: failed to send reply: {e:#}");
@@ -206,21 +233,20 @@ impl QQChannel {
             return false;
         }
 
-        let mut dedup = self.dedup.write().await;
+        let mut guard = self.dedup.write().await;
+        let (order, seen) = &mut *guard;
 
-        if dedup.contains(msg_id) {
+        if seen.contains(msg_id) {
             return true;
         }
 
-        // Evict oldest half when at capacity
-        if dedup.len() >= DEDUP_CAPACITY {
-            let to_remove: Vec<String> = dedup.iter().take(DEDUP_CAPACITY / 2).cloned().collect();
-            for key in to_remove {
-                dedup.remove(&key);
+        seen.insert(msg_id.to_string());
+        order.push_back(msg_id.to_string());
+        while order.len() > DEDUP_CAPACITY {
+            if let Some(oldest) = order.pop_front() {
+                seen.remove(&oldest);
             }
         }
-
-        dedup.insert(msg_id.to_string());
         false
     }
 }
@@ -521,6 +547,12 @@ impl Channel for QQChannel {
         anyhow::bail!("QQ WebSocket connection closed")
     }
 
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        if let Ok(mut users) = self.allowed_users.write() {
+            *users = allowed.to_vec();
+        }
+    }
+
     async fn health_check(&self) -> bool {
         self.fetch_access_token().await.is_ok()
     }
@@ -561,6 +593,60 @@ mod tests {
         assert!(!ch.is_duplicate("msg1").await);
         assert!(ch.is_duplicate("msg1").await);
         assert!(!ch.is_duplicate("msg2").await);
+    }
+
+    /// The set used to be evicted with `iter().take(CAPACITY/2)`, whose order
+    /// is unspecified — so a just-inserted id could be dropped, and a dedup
+    /// miss costs a complete extra LLM turn plus a duplicate reply.
+    #[tokio::test]
+    async fn qq_dedup_evicts_the_oldest() {
+        let ch = QQChannel::new("id".into(), "secret".into(), vec![]);
+
+        // Fill exactly to capacity, then push one more.
+        for i in 0..DEDUP_CAPACITY {
+            assert!(!ch.is_duplicate(&format!("msg-{i}")).await);
+        }
+        assert!(!ch.is_duplicate("newest").await);
+
+        {
+            let guard = ch.dedup.read().await;
+            assert_eq!(guard.0.len(), DEDUP_CAPACITY);
+            assert_eq!(guard.1.len(), DEDUP_CAPACITY);
+            assert!(
+                guard.1.contains("newest"),
+                "the most recent id must survive eviction"
+            );
+            assert!(
+                !guard.1.contains("msg-0"),
+                "the oldest id is the one that goes"
+            );
+            assert!(
+                guard.1.contains(&format!("msg-{}", DEDUP_CAPACITY - 1)),
+                "everything newer than the evicted head must stay"
+            );
+        }
+
+        // And the practical consequence: the newest id is still deduped.
+        assert!(ch.is_duplicate("newest").await);
+    }
+
+    /// Pairing used to append to the persisted config only, so a freshly-paired
+    /// user stayed locked out until the daemon restarted.
+    #[test]
+    fn qq_pairing_grants_immediate_access() {
+        let ch = QQChannel::new("id".into(), "secret".into(), vec![]);
+        assert!(!ch.is_user_allowed("openid-abc"));
+        ch.add_allowed_identity_runtime("openid-abc");
+        assert!(ch.is_user_allowed("openid-abc"));
+    }
+
+    #[test]
+    fn qq_allowlist_edit_reaches_the_channel() {
+        let ch = QQChannel::new("id".into(), "secret".into(), vec!["*".into()]);
+        assert!(ch.is_user_allowed("anyone"));
+        ch.apply_allowed_senders(&["openid-abc".to_string()]);
+        assert!(ch.is_user_allowed("openid-abc"));
+        assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[tokio::test]
