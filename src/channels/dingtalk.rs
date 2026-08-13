@@ -485,9 +485,17 @@ impl Channel for DingTalkChannel {
                         .await;
                     }
 
+                    // Carry the platform id: a UUID minted here makes a
+                    // redelivery undetectable, and DingTalk redelivers.
+                    let platform_id = if message_id.is_empty() {
+                        Uuid::new_v4().to_string()
+                    } else {
+                        format!("dingtalk_{message_id}")
+                    };
+
                     let channel_msg = ChannelMessage {
                         sender_aliases: Vec::new(),
-                        id: Uuid::new_v4().to_string(),
+                        id: platform_id,
                         sender: sender_id.to_string(),
                         reply_target: chat_id,
                         content: content.to_string(),

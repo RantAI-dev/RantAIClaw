@@ -674,7 +674,10 @@ impl LarkChannel {
                         // promoted every member of that group to owner.
                         // `reply_target` stays the chat: that part was right.
                         sender_aliases: vec![lark_msg.chat_id.clone()],
-                        id: Uuid::new_v4().to_string(),
+                        // Carry the platform id: a UUID minted here makes a
+                        // redelivery undetectable. Lark's own `ws_seen_ids`
+                        // dedup exists because of exactly that.
+                        id: format!("lark_{}", lark_msg.message_id),
                         sender: sender_open_id.to_string(),
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
@@ -1081,7 +1084,12 @@ impl LarkChannel {
             // chat id stays reachable as an alias for anything that matched on
             // the old value.
             sender_aliases: vec![chat_id.to_string()],
-            id: Uuid::new_v4().to_string(),
+            // Carry the platform id: a UUID minted here makes a redelivery
+            // undetectable, and Lark retries a callback it considers unacked.
+            id: event
+                .pointer("/message/message_id")
+                .and_then(|v| v.as_str())
+                .map_or_else(|| Uuid::new_v4().to_string(), |id| format!("lark_{id}")),
             sender: open_id.to_string(),
             reply_target: chat_id.to_string(),
             content: text,
@@ -1915,6 +1923,7 @@ mod tests {
                     "message_type": "text",
                     "content": "{\"text\":\"Hello RantaiClaw!\"}",
                     "chat_id": "oc_chat123",
+                    "message_id": "om_msg123",
                     "create_time": "1699999999000"
                 }
             }
@@ -1925,6 +1934,9 @@ mod tests {
         assert_eq!(msgs[0].content, "Hello RantaiClaw!");
         assert_eq!(msgs[0].channel, "lark");
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
+        // The platform id, not a fresh UUID: Lark retries a callback it
+        // considers unacked, and a UUID makes that redelivery undetectable.
+        assert_eq!(msgs[0].id, "lark_om_msg123");
 
         // Identity is the person; the reply still routes to the room. This
         // assertion used to read `sender == "oc_chat123"` — it encoded the bug

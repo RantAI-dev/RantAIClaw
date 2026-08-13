@@ -308,9 +308,17 @@ impl WhatsAppChannel {
                                 .as_secs()
                         });
 
+                    // Carry the platform id (`wamid.…`): a UUID minted here
+                    // makes a redelivery undetectable, so the agent runs again
+                    // on a message it already answered.
+                    let platform_id = msg
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map_or_else(|| Uuid::new_v4().to_string(), |id| format!("whatsapp_{id}"));
+
                     messages.push(ChannelMessage {
                         sender_aliases: Vec::new(),
-                        id: Uuid::new_v4().to_string(),
+                        id: platform_id,
                         reply_target: normalized_from.clone(),
                         sender: normalized_from,
                         content,
@@ -550,6 +558,9 @@ mod tests {
         assert_eq!(msgs[0].sender, "+1234567890");
         assert_eq!(msgs[0].content, "Hello RantaiClaw!");
         assert_eq!(msgs[0].channel, "whatsapp");
+        // The platform id, not a fresh UUID: a redelivery has to be
+        // recognisable as one.
+        assert_eq!(msgs[0].id, "whatsapp_wamid.xxx");
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
     }
 
