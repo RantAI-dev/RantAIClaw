@@ -22,7 +22,46 @@ pub struct MattermostChannel {
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// Mattermost's per-post maximum since v5.0 is 16383 multi-byte characters
+/// (`MaxPostSize`); it is hard-coded server-side and not configurable.
+/// <https://forum.mattermost.com/t/increasing-message-size-arbitrarily-from-16383-chars/11940>
+const MATTERMOST_MAX_MESSAGE_LENGTH: usize = 16383;
+
 impl MattermostChannel {
+    /// POST one already-split chunk into `channel_id`, optionally threaded.
+    async fn post_chunk(&self, channel_id: &str, root_id: Option<&str>, chunk: &str) -> Result<()> {
+        let mut body_map = serde_json::json!({
+            "channel_id": channel_id,
+            "message": chunk
+        });
+
+        if let Some(root) = root_id {
+            body_map.as_object_mut().unwrap().insert(
+                "root_id".to_string(),
+                serde_json::Value::String(root.to_string()),
+            );
+        }
+
+        let resp = self
+            .http_client()
+            .post(format!("{}/api/v4/posts", self.base_url))
+            .bearer_auth(&self.bot_token)
+            .json(&body_map)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
+            bail!("Mattermost post failed ({status}): {body}");
+        }
+
+        Ok(())
+    }
+
     pub fn new(
         base_url: String,
         bot_token: String,
@@ -172,35 +211,17 @@ impl Channel for MattermostChannel {
             (message.recipient.as_str(), None)
         };
 
-        let rendered =
-            crate::channels::format::render_to_string(&message.content, &self.render_target());
-        let mut body_map = serde_json::json!({
-            "channel_id": channel_id,
-            "message": rendered
-        });
+        // Render per-platform, then split without cutting a fenced block. The
+        // whole reply used to go out in one request, so anything past
+        // Mattermost's per-post limit failed the entire send.
+        let blocks = crate::channels::format::render(&message.content, &self.render_target());
+        let chunks = crate::channels::format::split(&blocks, MATTERMOST_MAX_MESSAGE_LENGTH);
 
-        if let Some(root) = root_id {
-            body_map.as_object_mut().unwrap().insert(
-                "root_id".to_string(),
-                serde_json::Value::String(root.to_string()),
-            );
-        }
-
-        let resp = self
-            .http_client()
-            .post(format!("{}/api/v4/posts", self.base_url))
-            .bearer_auth(&self.bot_token)
-            .json(&body_map)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            bail!("Mattermost post failed ({status}): {body}");
+        for (index, chunk) in chunks.iter().enumerate() {
+            self.post_chunk(channel_id, root_id, chunk).await?;
+            if index + 1 < chunks.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         }
 
         Ok(())
@@ -545,6 +566,43 @@ fn normalize_mattermost_content(
 
 #[cfg(test)]
 mod tests {
+    /// The splitter test above proves the constant and the splitter behave; a
+    /// `send()` that never calls the splitter passes it anyway. This asserts
+    /// the wiring, since `send()` needs a live API to drive.
+    #[test]
+    fn mattermost_send_routes_through_the_splitter() {
+        let src = include_str!("mattermost.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let send_body = production
+            .split("async fn send(")
+            .nth(1)
+            .expect("send exists");
+        let split_at = send_body
+            .find("format::split(")
+            .expect("send must route through format::split");
+        let next_fn = send_body.find("\n    async fn ").unwrap_or(send_body.len());
+        assert!(
+            split_at < next_fn,
+            "the split call must be inside send(), not a later function"
+        );
+    }
+
+    #[test]
+    fn long_reply_is_split_on_mattermost() {
+        let long = "word ".repeat(MATTERMOST_MAX_MESSAGE_LENGTH);
+        let blocks = crate::channels::format::render(
+            &long,
+            &crate::channels::format::RenderTarget::StdMarkdown {
+                tables_native: true,
+            },
+        );
+        let chunks = crate::channels::format::split(&blocks, MATTERMOST_MAX_MESSAGE_LENGTH);
+        assert!(chunks.len() > 1, "expected several chunks");
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= MATTERMOST_MAX_MESSAGE_LENGTH);
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
