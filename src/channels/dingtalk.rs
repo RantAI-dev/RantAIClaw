@@ -668,8 +668,6 @@ mod tests {
         assert!(!ch.is_user_allowed("anyone"));
     }
 
-    use super::*;
-
     #[test]
     fn dingtalk_render_target_is_std_markdown() {
         let ch = DingTalkChannel::new("id".into(), "secret".into(), vec![]);

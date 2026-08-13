@@ -134,7 +134,7 @@ impl NextcloudTalkChannel {
             &content,
             "nextcloud_talk",
             AllowlistField::AllowedUsers,
-            &[actor_id.clone()],
+            std::slice::from_ref(&actor_id),
             &root,
         )
         .await
