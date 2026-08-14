@@ -2388,21 +2388,21 @@ impl TuiApp {
         let channels_changed =
             channels_differ(prev_channels.as_ref(), new_channels.as_ref()) && !already_restarted;
         if channels_changed {
-            let msg = if new_channels_count == prev_channels_count {
-                "✓ Channel settings changed — restarting listener(s) now. \
-                 `/channels` shows the current state."
-                    .to_string()
-            } else if new_channels_count > prev_channels_count {
-                format!(
+            let msg = match new_channels_count.cmp(&prev_channels_count) {
+                // Count-neutral: a token rotation, or a one-for-one swap. The
+                // old detector could not see this case at all.
+                std::cmp::Ordering::Equal => "✓ Channel settings changed — restarting listener(s) \
+                     now. `/channels` shows the current state."
+                    .to_string(),
+                std::cmp::Ordering::Greater => format!(
                     "✓ {} new channel(s) configured — starting listener(s) now. \
                      `/channels` shows the current state.",
                     new_channels_count - prev_channels_count
-                )
-            } else {
-                format!(
+                ),
+                std::cmp::Ordering::Less => format!(
                     "✓ {} channel(s) removed — stopping their listener(s) now.",
                     prev_channels_count - new_channels_count
-                )
+                ),
             };
             let _ = self.context.append_system_message(&msg);
             self.scrollback_queue.push(("system".to_string(), msg));
