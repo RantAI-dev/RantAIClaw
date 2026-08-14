@@ -108,7 +108,7 @@ fn valid_pair_surfaces() -> Vec<&'static str> {
 }
 
 fn valid_pair_surface(candidate: &str) -> bool {
-    valid_pair_surfaces().iter().any(|s| *s == candidate)
+    valid_pair_surfaces().contains(&candidate)
 }
 
 /// Current unix time in seconds (the clock the store windows codes against).

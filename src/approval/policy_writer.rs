@@ -689,7 +689,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// `Off` is "no prompts". The Shift+Tab cycle is one keypress with no
     /// confirmation, and it used to walk straight into it.
     #[test]
