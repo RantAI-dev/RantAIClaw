@@ -1395,6 +1395,195 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     use wa_rs_core::store::traits::{LidPnMappingEntry, ProtocolStore, TcTokenEntry};
 
+    /// The persistence layer for end-to-end crypto had three tests: database
+    /// creation, one LID round trip, and expired-token deletion — for a file
+    /// implementing ~53 store methods. A round trip per family, in the shape
+    /// put → get → overwrite → delete → get-returns-None, so a method that
+    /// silently stops persisting is caught.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn identity_round_trips() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RusqliteStore::new(dir.path().join("wa.db")).expect("store opens");
+
+        assert!(
+            store.load_identity("peer.1").await.expect("get").is_none(),
+            "absent identity reads as None, not an error"
+        );
+
+        store.put_identity("peer.1", [7_u8; 32]).await.expect("put");
+        assert_eq!(
+            store.load_identity("peer.1").await.expect("get"),
+            Some(vec![7_u8; 32])
+        );
+
+        // Overwrite: the same address must replace, not duplicate.
+        store
+            .put_identity("peer.1", [9_u8; 32])
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            store.load_identity("peer.1").await.expect("get"),
+            Some(vec![9_u8; 32])
+        );
+
+        store.delete_identity("peer.1").await.expect("delete");
+        assert!(store.load_identity("peer.1").await.expect("get").is_none());
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn session_round_trips() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RusqliteStore::new(dir.path().join("wa.db")).expect("store opens");
+
+        assert!(store.get_session("peer.1").await.expect("get").is_none());
+        store
+            .put_session("peer.1", b"record-one")
+            .await
+            .expect("put");
+        assert_eq!(
+            store.get_session("peer.1").await.expect("get"),
+            Some(b"record-one".to_vec())
+        );
+        store
+            .put_session("peer.1", b"record-two")
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            store.get_session("peer.1").await.expect("get"),
+            Some(b"record-two".to_vec())
+        );
+        store.delete_session("peer.1").await.expect("delete");
+        assert!(store.get_session("peer.1").await.expect("get").is_none());
+    }
+
+    /// A prekey is single-use: loading it must not consume it, but `remove`
+    /// must, or the same one is handed out twice.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn prekey_round_trips_and_is_consumable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RusqliteStore::new(dir.path().join("wa.db")).expect("store opens");
+
+        assert!(store.load_prekey(1).await.expect("get").is_none());
+        store
+            .store_prekey(1, b"prekey-one", false)
+            .await
+            .expect("put");
+        assert_eq!(
+            store.load_prekey(1).await.expect("get"),
+            Some(b"prekey-one".to_vec())
+        );
+        // Reading twice must yield it twice — consumption is explicit.
+        assert!(store.load_prekey(1).await.expect("get").is_some());
+
+        store.remove_prekey(1).await.expect("remove");
+        assert!(store.load_prekey(1).await.expect("get").is_none());
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn signed_prekey_round_trips() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RusqliteStore::new(dir.path().join("wa.db")).expect("store opens");
+
+        store
+            .store_signed_prekey(1, b"signed-one")
+            .await
+            .expect("put");
+        store
+            .store_signed_prekey(2, b"signed-two")
+            .await
+            .expect("put");
+        assert_eq!(
+            store.load_signed_prekey(1).await.expect("get"),
+            Some(b"signed-one".to_vec())
+        );
+        assert_eq!(
+            store
+                .load_all_signed_prekeys()
+                .await
+                .expect("load all")
+                .len(),
+            2,
+            "both signed prekeys are listed"
+        );
+
+        store.remove_signed_prekey(1).await.expect("remove");
+        assert!(store.load_signed_prekey(1).await.expect("get").is_none());
+        assert_eq!(
+            store
+                .load_all_signed_prekeys()
+                .await
+                .expect("load all")
+                .len(),
+            1
+        );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn sender_key_round_trips() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RusqliteStore::new(dir.path().join("wa.db")).expect("store opens");
+
+        assert!(store
+            .get_sender_key("group.1")
+            .await
+            .expect("get")
+            .is_none());
+        store
+            .put_sender_key("group.1", b"sk-one")
+            .await
+            .expect("put");
+        assert_eq!(
+            store.get_sender_key("group.1").await.expect("get"),
+            Some(b"sk-one".to_vec())
+        );
+        store
+            .put_sender_key("group.1", b"sk-two")
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            store.get_sender_key("group.1").await.expect("get"),
+            Some(b"sk-two".to_vec())
+        );
+        store.delete_sender_key("group.1").await.expect("delete");
+        assert!(store
+            .get_sender_key("group.1")
+            .await
+            .expect("get")
+            .is_none());
+    }
+
+    /// Reopening an existing file must preserve its rows. A schema change that
+    /// silently recreated the database would otherwise look like a working
+    /// install that had simply lost its session.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn reopening_the_database_preserves_rows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("wa.db");
+
+        {
+            let store = RusqliteStore::new(&db).expect("store opens");
+            store.put_identity("peer.1", [3_u8; 32]).await.expect("put");
+            store.put_session("peer.1", b"record").await.expect("put");
+        }
+
+        let reopened = RusqliteStore::new(&db).expect("store reopens");
+        assert_eq!(
+            reopened.load_identity("peer.1").await.expect("get"),
+            Some(vec![3_u8; 32]),
+            "the identity must survive a reopen"
+        );
+        assert_eq!(
+            reopened.get_session("peer.1").await.expect("get"),
+            Some(b"record".to_vec())
+        );
+    }
+
     /// This file holds the account's long-term Signal keys. Every other
     /// credential store in this repo is 0600; this one was created at the
     /// process umask.
