@@ -333,13 +333,10 @@ impl Builder {
                     t.current_row = Vec::new();
                 }
             }
-            Tag::Link { dest_url, .. } => {
-                self.inline_stack.push(Vec::new());
-                self.link_urls.push(dest_url.to_string());
-            }
-            // Identical to `Link`: an image is an inline with a destination and
-            // a bracketed run, and it reuses the same URL stack.
-            Tag::Image { dest_url, .. } => {
+            // One arm for both: an image is an inline with a destination and a
+            // bracketed run, exactly like a link, and it reuses the same URL
+            // stack. They diverge at `end`, where the node type is chosen.
+            Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
                 self.inline_stack.push(Vec::new());
                 self.link_urls.push(dest_url.to_string());
             }
