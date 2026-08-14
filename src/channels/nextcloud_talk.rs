@@ -386,10 +386,15 @@ impl Channel for NextcloudTalkChannel {
 ///
 /// Signature calculation (official Talk bot docs):
 /// `hex(hmac_sha256(secret, X-Nextcloud-Talk-Random + raw_body))`
+/// `body` is the RAW request body.
+///
+/// It used to be a `&str` the caller produced with `from_utf8_lossy`, while the
+/// handler parsed the raw bytes — so the string that was verified was a
+/// many-to-one projection of the body that was acted on.
 pub fn verify_nextcloud_talk_signature(
     secret: &str,
     random: &str,
-    body: &str,
+    body: &[u8],
     signature: &str,
 ) -> bool {
     let random = random.trim();
@@ -409,11 +414,11 @@ pub fn verify_nextcloud_talk_signature(
         return false;
     };
 
-    let payload = format!("{random}{body}");
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
         return false;
     };
-    mac.update(payload.as_bytes());
+    mac.update(random.as_bytes());
+    mac.update(body);
 
     mac.verify_slice(&provided).is_ok()
 }
@@ -659,8 +664,65 @@ mod tests {
         let signature = hex::encode(mac.finalize().into_bytes());
 
         assert!(verify_nextcloud_talk_signature(
-            secret, random, body, &signature
+            secret,
+            random,
+            body.as_bytes(),
+            &signature
         ));
+    }
+
+    /// Same defect as Linq: the verifier saw a lossy copy, the handler parsed
+    /// the bytes.
+    #[test]
+    fn nextcloud_signature_verifies_over_raw_bytes() {
+        let secret = TEST_WEBHOOK_SECRET;
+        let random = "random-seed";
+
+        let body_a: Vec<u8> = [br#"{"a":""#.as_ref(), &[0xC3], br#""}"#.as_ref()].concat();
+        let body_b: Vec<u8> = [br#"{"a":""#.as_ref(), &[0xC2], br#""}"#.as_ref()].concat();
+        assert_eq!(
+            String::from_utf8_lossy(&body_a),
+            String::from_utf8_lossy(&body_b),
+            "precondition: lossy decoding erases the difference"
+        );
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(random.as_bytes());
+        mac.update(&body_a);
+        let sig_a = hex::encode(mac.finalize().into_bytes());
+
+        assert!(verify_nextcloud_talk_signature(
+            secret, random, &body_a, &sig_a
+        ));
+        assert!(
+            !verify_nextcloud_talk_signature(secret, random, &body_b, &sig_a),
+            "a signature for one body must not verify the other"
+        );
+    }
+
+    /// The missing-nonce guard had no test at all: deleting it left every
+    /// signature test green. Without a nonce the signature is over the body
+    /// alone, so a captured request replays forever.
+    #[test]
+    fn nextcloud_rejects_a_missing_nonce() {
+        let secret = TEST_WEBHOOK_SECRET;
+        let body = br#"{"type":"message"}"#;
+
+        // Sign exactly what an empty nonce would produce, so the ONLY thing
+        // that can reject this is the guard.
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(b"");
+        mac.update(body);
+        let signature = hex::encode(mac.finalize().into_bytes());
+
+        assert!(
+            !verify_nextcloud_talk_signature(secret, "", body, &signature),
+            "an empty nonce must be refused even when the HMAC matches"
+        );
+        assert!(
+            !verify_nextcloud_talk_signature(secret, "   ", body, &signature),
+            "a whitespace-only nonce is a missing nonce"
+        );
     }
 
     #[test]
@@ -668,7 +730,7 @@ mod tests {
         assert!(!verify_nextcloud_talk_signature(
             TEST_WEBHOOK_SECRET,
             "random-seed",
-            r#"{"type":"message"}"#,
+            br#"{"type":"message"}"#,
             "deadbeef"
         ));
     }
@@ -685,7 +747,10 @@ mod tests {
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
 
         assert!(verify_nextcloud_talk_signature(
-            secret, random, body, &signature
+            secret,
+            random,
+            body.as_bytes(),
+            &signature
         ));
     }
 

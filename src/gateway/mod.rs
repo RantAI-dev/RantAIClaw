@@ -2063,8 +2063,6 @@ async fn handle_linq_webhook(
         );
     };
 
-    let body_str = String::from_utf8_lossy(&body);
-
     // ── Security: the X-Webhook-Signature is the ONLY authentication for this
     // public webhook (the Linq server cannot pair). Without the shared signing
     // secret the sender cannot be verified, so refuse rather than process a
@@ -2089,12 +2087,11 @@ async fn handle_linq_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !crate::channels::linq::verify_linq_signature(
-        signing_secret,
-        &body_str,
-        timestamp,
-        signature,
-    ) {
+    // `&body`, not a lossily-decoded copy: the handler parses these exact
+    // bytes below, and `from_utf8_lossy` collapses every invalid sequence to
+    // U+FFFD — so the string that was verified was a many-to-one projection of
+    // the body that was acted on.
+    if !crate::channels::linq::verify_linq_signature(signing_secret, &body, timestamp, signature) {
         tracing::warn!(
             "Linq webhook signature verification failed (signature: {})",
             if signature.is_empty() {
@@ -2215,8 +2212,6 @@ async fn handle_nextcloud_talk_webhook(
         );
     };
 
-    let body_str = String::from_utf8_lossy(&body);
-
     // ── Security: the HMAC signature is the ONLY authentication for this public
     // webhook (the Nextcloud server cannot pair). Without the shared secret the
     // sender cannot be verified, so refuse rather than process a spoofable
@@ -2241,10 +2236,11 @@ async fn handle_nextcloud_talk_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // `&body`, not a lossily-decoded copy — see the Linq handler above.
     if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
         webhook_secret,
         random,
-        &body_str,
+        &body,
         signature,
     ) {
         tracing::warn!(
