@@ -1,0 +1,32 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "100000000000000",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "15550000000",
+              "phone_number_id": "100000000000001"
+            },
+            "contacts": [
+              { "profile": { "name": "rantaiclaw_user" }, "wa_id": "15550000001" }
+            ],
+            "messages": [
+              {
+                "from": "15550000001",
+                "id": "wamid.RANTAICLAWTESTID",
+                "timestamp": "1700000000",
+                "type": "text",
+                "text": { "body": "status please" }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

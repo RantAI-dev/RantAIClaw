@@ -1,0 +1,13 @@
+{
+  "event_type": "message.received",
+  "data": {
+    "message_id": "msg_rantaiclaw_0001",
+    "chat_id": "chat_rantaiclaw_0001",
+    "from": "15550000002",
+    "is_from_me": false,
+    "created_at": "2026-08-14T00:00:00Z",
+    "message": {
+      "parts": [{ "type": "text", "value": "status please" }]
+    }
+  }
+}
