@@ -1287,7 +1287,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         message: &str,
         chat_id: &str,
         thread_id: Option<&str>,
-        reply_to: Option<&str>,
+        reply_anchor: Option<&str>,
     ) -> anyhow::Result<()> {
         use crate::channels::format::{render_pair, split_paired, RenderTarget};
 
@@ -1312,7 +1312,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // Only the first chunk replies to the prompt; anchoring each chunk
             // renders as N replies to one message.
             if index == 0 {
-                if let Some(anchor) = reply_to {
+                if let Some(anchor) = reply_anchor {
                     html_body["reply_parameters"] = serde_json::json!({
                         "message_id": anchor.parse::<i64>().unwrap_or_default(),
                         // The user may have deleted the message between prompt
