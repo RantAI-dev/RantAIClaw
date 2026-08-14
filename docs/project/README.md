@@ -6,7 +6,13 @@ This directory holds two things:
    tag. See [`operating-conventions.md`](operating-conventions.md).
    Read this before touching code if you're new to the repo or
    coming back after a gap.
-2. **Archive** — superseded plans, gap trackers, and snapshot audits.
+2. **Open decisions** — date-stamped write-ups awaiting a maintainer
+   call. Currently:
+   [`2026-08-14-dependency-decisions.md`](2026-08-14-dependency-decisions.md)
+   (matrix-sdk, `whatsapp-web` in the default feature set, the duplicate
+   transport stacks). Move a decided one to `archive/` with the outcome
+   recorded at the top.
+3. **Archive** — superseded plans, gap trackers, and snapshot audits.
    See [`archive/`](archive/). Old plans live here for design-
    rationale history; do not edit them. Active planning lives in
    ClickUp ([v0.6.0 milestone](https://app.clickup.com/t/86exgu406)
