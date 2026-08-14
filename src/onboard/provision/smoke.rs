@@ -934,7 +934,6 @@ mod lark {
                 ProvisionResponse::Text("placeholder-app-secret".into()), // app secret
                 ProvisionResponse::Selection(vec![1]),                // region: Lark International
                 ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
-                ProvisionResponse::Text(String::new()), // encrypt key (optional)
                 ProvisionResponse::Text(String::new()), // verification token (optional)
                 ProvisionResponse::Selection(vec![0]), // receive mode: websocket
                 ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users

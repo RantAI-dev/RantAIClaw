@@ -195,24 +195,10 @@ impl TuiProvisioner for LarkProvisioner {
             ));
         }
 
-        // Optional encrypt key
-        send(
-            &events,
-            ProvisionEvent::Prompt {
-                id: "encrypt_key".into(),
-                label: "Encrypt key for webhook (Enter to skip)".into(),
-                default: None,
-                secret: true,
-            },
-        )
-        .await?;
-
-        let encrypt_key = recv_text(&mut responses).await?;
-        let encrypt_key = if encrypt_key.trim().is_empty() {
-            None
-        } else {
-            Some(encrypt_key.trim().to_string())
-        };
+        // No `encrypt_key` prompt. This build does not decrypt event bodies,
+        // and the channel now refuses to start when the key is set — so asking
+        // for it collected a secret whose only effect was a startup failure.
+        let encrypt_key: Option<String> = None;
 
         // Optional verification token
         send(

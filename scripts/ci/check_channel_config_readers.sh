@@ -34,7 +34,6 @@ SCHEMA="src/config/schema.rs"
 # field<TAB>struct<TAB>reason — each MUST name the plan that resolves it.
 KNOWN_UNREAD=$(cat <<'EOF'
 app_token	SlackConfig	plan 146 — build Socket Mode or delete the key
-encrypt_key	LarkConfig	plan 146 — implement Feishu event decryption or delete the key
 EOF
 )
 

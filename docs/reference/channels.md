@@ -495,7 +495,7 @@ Webhook-mode authenticity (accurate as of plan 124, merged):
   HMAC: it is replayable and it is in the request body rather than bound to it.
   If the endpoint is internet-facing, front it with an authenticating reverse
   proxy.
-- `encrypt_key` is **rejected at startup** if set (`src/channels/lark.rs:1312-1323`):
+- `encrypt_key` is **rejected at startup** if set (`src/channels/lark.rs:1312-1323`), and setup no longer asks for it:
   this build does not decrypt event bodies, so enabling encryption in the
   developer console makes every callback unreadable. Leave it empty, or use
   `receive_mode = "websocket"`, which needs no inbound endpoint at all.
