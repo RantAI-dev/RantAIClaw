@@ -578,6 +578,7 @@ Top-level channel options are configured under `channels_config`.
 | `guest_allowed_tools` | `[]` | Capability ceiling for allowed senders who are not owners. Empty = read-only file/memory tools and skills only |
 | `guest_allowed_commands` | `[]` | Shell globs a guest may run (needs `"shell"` in `guest_allowed_tools`). Hard ceiling — a non-matching command is denied, never escalated |
 | `autonomous_tools` | `false` | `true` skips the approval gate entirely for this channel, for every sender |
+| `thread_replies` | `true` | Reply in-thread where the platform supports it. `[channels_config.mattermost].thread_replies` overrides it per channel. See [Channels reference §4a](channels.md#4a-threading) |
 
 These four are the channel authorization model; see
 [Per-role channel permissions](../security/per-role-permissions.md) for the

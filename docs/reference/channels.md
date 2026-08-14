@@ -554,6 +554,41 @@ allowed_contacts = ["*"]
 
 ---
 
+## 4a. Threading
+
+Where the platform supports it, a reply attaches to the message that prompted
+it. Two fields, two meanings — they are not interchangeable:
+
+- **`reply_target`** — *where* the message goes (a channel, a chat, a Telegram
+  forum topic as `chat_id:thread_id`).
+- **`thread_ts`** — *what* it attaches to once there (a Slack parent `ts`, a
+  Discord `message_reference`, a Mattermost `root_id`, a Telegram
+  `reply_to_message_id`).
+
+| Channel | Threads today | Mechanism |
+|---|---|---|
+| Slack | yes | parent `ts` |
+| Discord | yes | `message_reference` on the prompting message |
+| Telegram | yes | `reply_parameters` (text sends; attachments are not anchored) |
+| Mattermost | yes | `root_id` |
+| Nextcloud Talk, QQ, Email, Lark, Matrix, Signal | not yet | see [the design note](../project/2026-08-14-threading-design.md) for each platform's mechanism and cost |
+| DingTalk, Linq, IRC, iMessage | no platform primitive | replies land in the conversation |
+
+Turn it off without turning off the channel:
+
+```toml
+[channels_config]
+thread_replies = true          # shared default
+
+[channels_config.mattermost]
+thread_replies = false         # per-channel override, wins where set
+```
+
+The switch is enforced once, centrally: the dispatch loop clears the reply
+anchor before the agent sees it, so every channel honours it identically.
+
+---
+
 ## 4b. Approval and Roles
 
 Every channel shares one authorization model, and its **secure default surprises

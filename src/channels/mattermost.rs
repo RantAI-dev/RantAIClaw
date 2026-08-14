@@ -29,6 +29,24 @@ const MATTERMOST_MAX_MESSAGE_LENGTH: usize = 16383;
 
 impl MattermostChannel {
     /// POST one already-split chunk into `channel_id`, optionally threaded.
+    /// Split a send into `(channel_id, root_id)`.
+    ///
+    /// The anchor is `thread_ts` — the typed field. The old
+    /// `"channel_id:root_id"` recipient packing is still accepted so a reply
+    /// built before this migration (or by a caller not yet moved) keeps
+    /// threading rather than silently flattening; `thread_ts` wins when both
+    /// are present.
+    fn resolve_post_target<'a>(
+        recipient: &'a str,
+        thread_ts: Option<&'a str>,
+    ) -> (&'a str, Option<&'a str>) {
+        let (channel_id, packed_root) = match recipient.split_once(':') {
+            Some((c, r)) => (c, Some(r)),
+            None => (recipient, None),
+        };
+        (channel_id, thread_ts.or(packed_root))
+    }
+
     async fn post_chunk(&self, channel_id: &str, root_id: Option<&str>, chunk: &str) -> Result<()> {
         let mut body_map = serde_json::json!({
             "channel_id": channel_id,
@@ -141,17 +159,21 @@ impl MattermostChannel {
 
         self.add_allowed_identity_runtime(user_id);
 
-        // Reply in-thread when the post is itself in a thread; else channel root.
+        // Reply in-thread when the post is itself in a thread; else anchor on
+        // the post so the reply starts one. This path does not pass through the
+        // dispatch loop, so it reads the channel's own switch.
         let root_id = post.get("root_id").and_then(|r| r.as_str()).unwrap_or("");
         let post_id = post.get("id").and_then(|i| i.as_str()).unwrap_or("");
-        let recipient = if !root_id.is_empty() {
-            format!("{channel_id}:{root_id}")
+        let anchor = if !root_id.is_empty() {
+            Some(root_id.to_string())
         } else if self.thread_replies && !post_id.is_empty() {
-            format!("{channel_id}:{post_id}")
+            Some(post_id.to_string())
         } else {
-            channel_id.to_string()
+            None
         };
-        let _ = self.send(&SendMessage::new(reply, recipient)).await;
+        let _ = self
+            .send(&SendMessage::new(reply, channel_id.to_string()).in_thread(anchor))
+            .await;
         true
     }
 
@@ -203,13 +225,13 @@ impl Channel for MattermostChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        // Mattermost supports threading via 'root_id'.
-        // We pack 'channel_id:root_id' into recipient if it's a thread.
-        let (channel_id, root_id) = if let Some((c, r)) = message.recipient.split_once(':') {
-            (c, Some(r))
-        } else {
-            (message.recipient.as_str(), None)
-        };
+        // Threading is `root_id`, carried by the trait's `thread_ts`. The old
+        // `"channel_id:root_id"` packing is still accepted so a reply built
+        // before this change (or by a caller that has not been migrated) keeps
+        // threading rather than silently flattening; `thread_ts` wins when both
+        // are present.
+        let (channel_id, root_id) =
+            Self::resolve_post_target(&message.recipient, message.thread_ts.as_deref());
 
         // Render per-platform, then split without cutting a fenced block. The
         // whole reply used to go out in one request, so anything past
@@ -417,28 +439,31 @@ impl MattermostChannel {
             text.to_string()
         };
 
-        // Reply routing depends on thread_replies config:
+        // The anchor lives in `thread_ts`, not packed into the recipient:
         //   - Existing thread (root_id set): always stay in the thread.
-        //   - Top-level post + thread_replies=true: thread on the original post.
-        //   - Top-level post + thread_replies=false: reply at channel level.
-        let reply_target = if !root_id.is_empty() {
-            format!("{}:{}", channel_id, root_id)
-        } else if self.thread_replies {
-            format!("{}:{}", channel_id, id)
+        //   - Top-level post: anchor on the post itself, so the reply starts a
+        //     thread under it.
+        // The `thread_replies` switch is applied once, centrally, in the
+        // dispatch loop — it clears `thread_ts` when threading is off, which is
+        // why this no longer reads the flag.
+        let thread_ts = if !root_id.is_empty() {
+            Some(root_id.to_string())
+        } else if id.is_empty() {
+            None
         } else {
-            channel_id.to_string()
+            Some(id.to_string())
         };
 
         Some(ChannelMessage {
             sender_aliases: Vec::new(),
             id: format!("mattermost_{id}"),
             sender: user_id.to_string(),
-            reply_target,
+            reply_target: channel_id.to_string(),
             content,
             channel: "mattermost".to_string(),
             #[allow(clippy::cast_sign_loss)]
             timestamp: (create_at / 1000) as u64,
-            thread_ts: None,
+            thread_ts,
         })
     }
 }
@@ -567,6 +592,33 @@ fn normalize_mattermost_content(
 
 #[cfg(test)]
 mod tests {
+    /// The migration's contract: same observable threading, new mechanism.
+    #[test]
+    fn mattermost_threading_survives_the_migration() {
+        // The typed field is the anchor.
+        assert_eq!(
+            MattermostChannel::resolve_post_target("chan789", Some("root789")),
+            ("chan789", Some("root789"))
+        );
+        // A reply built before the migration still threads instead of
+        // flattening into the channel.
+        assert_eq!(
+            MattermostChannel::resolve_post_target("chan789:root789", None),
+            ("chan789", Some("root789"))
+        );
+        // Both present: the typed field wins.
+        assert_eq!(
+            MattermostChannel::resolve_post_target("chan789:old", Some("new")),
+            ("chan789", Some("new"))
+        );
+        // Neither: a flat post, which is what the opt-out produces once the
+        // dispatch loop has cleared `thread_ts`.
+        assert_eq!(
+            MattermostChannel::resolve_post_target("chan789", None),
+            ("chan789", None)
+        );
+    }
+
     /// The splitter test above proves the constant and the splitter behave; a
     /// `send()` that never calls the splitter passes it anyway. This asserts
     /// the wiring, since `send()` needs a live API to drive.
@@ -684,7 +736,11 @@ mod tests {
             .unwrap();
         assert_eq!(msg.sender, "user456");
         assert_eq!(msg.content, "hello world");
-        assert_eq!(msg.reply_target, "chan789:post123"); // Default threaded reply
+        // Same observable outcome as before the migration off recipient
+        // packing: the reply threads under the post. The channel is now the
+        // recipient and the anchor is the typed field.
+        assert_eq!(msg.reply_target, "chan789");
+        assert_eq!(msg.thread_ts.as_deref(), Some("post123"));
     }
 
     #[test]
@@ -701,7 +757,8 @@ mod tests {
         let msg = ch
             .parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789")
             .unwrap();
-        assert_eq!(msg.reply_target, "chan789:post123"); // Threaded reply
+        assert_eq!(msg.reply_target, "chan789");
+        assert_eq!(msg.thread_ts.as_deref(), Some("post123"));
     }
 
     #[test]
@@ -718,7 +775,8 @@ mod tests {
         let msg = ch
             .parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789")
             .unwrap();
-        assert_eq!(msg.reply_target, "chan789:root789"); // Stays in the thread
+        assert_eq!(msg.reply_target, "chan789");
+        assert_eq!(msg.thread_ts.as_deref(), Some("root789"));
     }
 
     #[test]
@@ -765,7 +823,10 @@ mod tests {
         let msg = ch
             .parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789")
             .unwrap();
-        assert_eq!(msg.reply_target, "chan789"); // No thread suffix
+        // The per-channel switch is applied centrally now (the dispatch loop
+        // clears `thread_ts`), so the parser anchors unconditionally.
+        assert_eq!(msg.reply_target, "chan789");
+        assert_eq!(msg.thread_ts.as_deref(), Some("post123"));
     }
 
     #[test]
@@ -783,7 +844,8 @@ mod tests {
         let msg = ch
             .parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789")
             .unwrap();
-        assert_eq!(msg.reply_target, "chan789:root789"); // Stays in existing thread
+        assert_eq!(msg.reply_target, "chan789");
+        assert_eq!(msg.thread_ts.as_deref(), Some("root789"));
     }
 
     // ── mention_only tests ────────────────────────────────────────

@@ -322,6 +322,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`<script>` and `<style>` bodies no longer reach the agent's prompt**, and
   HTML entities in mail bodies are decoded rather than passed through raw.
 
+### Added
+
+- **Replies thread on Discord, Telegram and Mattermost.** The threading seam
+  existed and was plumbed through every dispatch site, but exactly one channel
+  (Slack) filled it — so in every busy group the bot's replies landed flat.
+  Discord now anchors on the prompting message (`message_reference`), Telegram
+  on `reply_parameters` for text sends, and Mattermost moved off packing
+  `"channel_id:root_id"` into the recipient onto the typed field, with its
+  observable behaviour unchanged. `[channels_config] thread_replies` (default
+  `true`, schema v22) turns it off without turning off the channel;
+  `[channels_config.mattermost] thread_replies` still overrides it. The
+  remaining nine channels are designed, not built — see
+  `docs/project/2026-08-14-threading-design.md`.
+
 ### Changed
 
 - **Setup no longer collects two credentials that nothing uses.** Slack's
