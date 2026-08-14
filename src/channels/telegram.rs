@@ -2935,6 +2935,36 @@ mod tests {
         );
     }
 
+    /// `is_any_user_allowed` was tested on its own, never through the function
+    /// `listen()` actually calls. Deleting the gate from `parse_update_message`
+    /// left the suite green.
+    #[test]
+    fn parse_update_message_drops_an_unlisted_sender() {
+        let ch = TelegramChannel::new("token".into(), vec!["555".into()], false);
+        let update = |id: i64| {
+            serde_json::json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 33,
+                    "text": "status please",
+                    "from": { "id": id },
+                    "chat": { "id": id }
+                }
+            })
+        };
+
+        assert!(
+            ch.parse_update_message(&update(999)).is_none(),
+            "a sender outside allowed_users must not produce a message"
+        );
+        // Control on the same fixture: the allowlisted id does.
+        let (msg, _) = ch
+            .parse_update_message(&update(555))
+            .expect("the allowlisted sender parses");
+        assert_eq!(msg.sender, "555");
+        assert_eq!(msg.content, "status please");
+    }
+
     #[test]
     fn parse_update_message_uses_chat_id_as_reply_target() {
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);

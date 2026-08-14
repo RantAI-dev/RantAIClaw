@@ -1906,6 +1906,36 @@ mod tests {
         assert!(msgs.is_empty());
     }
 
+    /// The gate that decides this lives inside `parse_event_payload`; the
+    /// suite only ever exercised `is_user_allowed` directly, so the two could
+    /// drift apart with everything green.
+    #[test]
+    fn lark_parse_event_payload_drops_an_unlisted_sender() {
+        let ch = make_channel();
+        let payload = |open_id: &str| {
+            serde_json::json!({
+                "header": { "event_type": "im.message.receive_v1" },
+                "event": {
+                    "sender": { "sender_id": { "open_id": open_id } },
+                    "message": {
+                        "message_type": "text",
+                        "content": "{\"text\":\"status please\"}",
+                        "chat_id": "oc_chat123",
+                        "message_id": "om_msg123",
+                        "create_time": "1699999999000"
+                    }
+                }
+            })
+        };
+
+        assert!(
+            ch.parse_event_payload(&payload("ou_stranger")).is_empty(),
+            "a sender outside allowed_users must not produce a message"
+        );
+        // Control on the same fixture: the allowlisted sender does.
+        assert_eq!(ch.parse_event_payload(&payload("ou_testuser123")).len(), 1);
+    }
+
     #[test]
     fn lark_parse_valid_text_message() {
         let ch = make_channel();
