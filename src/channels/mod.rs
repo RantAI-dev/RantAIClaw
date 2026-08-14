@@ -4229,10 +4229,7 @@ mod tests {
         ];
 
         for (channel, src, receiver, gate, delegate) in wiring {
-            let production = src
-                .split("#[cfg(test)]")
-                .next()
-                .expect("source has a production half");
+            let production = production_half(src);
             let body = fn_body(production, receiver)
                 .unwrap_or_else(|| panic!("{channel}: `{receiver}` not found in production code"));
             assert!(
@@ -4250,6 +4247,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Everything before the test module. Cutting at the first `#[cfg(test)]`
+    /// would be wrong twice over: telegram has a `#[cfg(test)]` helper among
+    /// its production methods, and whatsapp_web gates its test module on a
+    /// feature as well.
+    fn production_half(src: &str) -> &str {
+        let cut = ["\n#[cfg(test)]\nmod ", "\n#[cfg(all(test"]
+            .iter()
+            .filter_map(|marker| src.find(marker))
+            .min()
+            .unwrap_or(src.len());
+        &src[..cut]
     }
 
     /// Body of the first function whose signature starts with `header`, ending
