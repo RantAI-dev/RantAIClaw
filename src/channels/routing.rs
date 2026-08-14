@@ -36,6 +36,15 @@ pub(crate) fn channel_thread_replies(cc: &crate::config::ChannelsConfig) -> Hash
     out
 }
 
+/// Per-channel `mention_only`, keyed like `channel_allowlists`.
+///
+/// Only the three channels whose config carries the flag appear. Unlike the
+/// allowlists this is **not** applied on reload: `mention_only` is passed into
+/// the channel constructors and lives inside the channel objects, so applying it
+/// live needs a `Channel` trait method, which is a cross-file change this plan
+/// does not own. It is tracked here purely so a reload can *tell the operator*
+/// that their edit needs a restart instead of reporting success and doing
+/// nothing.
 pub(crate) fn channel_mention_only(cc: &crate::config::ChannelsConfig) -> HashMap<String, bool> {
     let mut out = HashMap::new();
     if let Some(c) = cc.telegram.as_ref() {

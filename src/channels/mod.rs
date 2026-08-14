@@ -14,6 +14,19 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod admin;
+
+// Four of the module's ten external symbols live in the CLI surface, so they
+// keep their `crate::channels::` path.
+pub use admin::doctor_channels;
+// `main.rs` declares its own `mod channels`, so the binary reaches these
+// through `channels::` while the library target does not use them — which the
+// lib-only lint pass reads as an unused import. The binary's use is real; the
+// allow is about which target is being compiled, not about dead code.
+#[allow(unused_imports)]
+pub(crate) use admin::{
+    announce_daemon_reload, channel_roster, handle_command, reload_managed_daemon,
+};
 pub mod approval_relay;
 pub mod auto_start_state;
 pub mod cli;
@@ -252,31 +265,10 @@ pub(crate) struct ChannelRuntimeDefaults {
     pub(crate) thread_replies: Arc<HashMap<String, bool>>,
 }
 
-/// Per-channel sender allowlists, keyed by `Channel::name()`.
-///
-/// The field each channel stores its allowlist in differs (`allowed_users`,
-/// `allowed_from`, `allowed_numbers`, `allowed_senders`, `allowed_contacts`), so
-/// this mirrors the field choices in `pairing::apply_pairing` exactly rather than
-/// picking different ones.
-///
-/// It is a second copy of that mapping, which is duplication this subsystem has
-/// too much of already. Consolidating it belongs with the other cross-file
-/// allowlist work (`plans/129-…`), which owns `pairing.rs`; doing it here would
-/// put two plans in one file. Until then: **change both or neither.**
-/// Per-channel `mention_only`, keyed like `channel_allowlists`.
-///
-/// Only the three channels whose config carries the flag appear. Unlike the
-/// allowlists this is **not** applied on reload: `mention_only` is passed into
-/// the channel constructors and lives inside the channel objects, so applying it
-/// live needs a `Channel` trait method, which is a cross-file change this plan
-/// does not own. It is tracked here purely so a reload can *tell the operator*
-/// that their edit needs a restart instead of reporting success and doing
-/// nothing.
-
-const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "rantaiclaw.service"];
-const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "rantaiclaw.service"];
-const OPENRC_STATUS_ARGS: [&str; 2] = ["rantaiclaw", "status"];
-const OPENRC_RESTART_ARGS: [&str; 2] = ["rantaiclaw", "restart"];
+pub(crate) const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "rantaiclaw.service"];
+pub(crate) const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "rantaiclaw.service"];
+pub(crate) const OPENRC_STATUS_ARGS: [&str; 2] = ["rantaiclaw", "status"];
+pub(crate) const OPENRC_RESTART_ARGS: [&str; 2] = ["rantaiclaw", "restart"];
 
 #[derive(Clone)]
 pub(crate) struct ChannelRuntimeContext {
@@ -1310,260 +1302,6 @@ async fn run_message_dispatch_loop(
     }
 }
 
-fn normalize_telegram_identity(value: &str) -> String {
-    value.trim().trim_start_matches('@').to_string()
-}
-
-async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
-    let normalized = normalize_telegram_identity(identity);
-    if normalized.is_empty() {
-        anyhow::bail!("Telegram identity cannot be empty");
-    }
-
-    let mut updated = config.clone();
-    let Some(telegram) = updated.channels_config.telegram.as_mut() else {
-        anyhow::bail!(
-            "Telegram channel is not configured. Run `rantaiclaw onboard --channels-only` first"
-        );
-    };
-
-    if telegram.allowed_users.iter().any(|u| u == "*") {
-        println!(
-            "⚠️ Telegram allowlist is currently wildcard (`*`) — binding is unnecessary until you remove '*'."
-        );
-    }
-
-    if telegram
-        .allowed_users
-        .iter()
-        .map(|entry| normalize_telegram_identity(entry))
-        .any(|entry| entry == normalized)
-    {
-        println!("✅ Telegram identity already bound: {normalized}");
-        return Ok(());
-    }
-
-    telegram.allowed_users.push(normalized.clone());
-    updated.save().await?;
-    println!("✅ Bound Telegram identity: {normalized}");
-    println!("   Saved to {}", updated.config_path.display());
-    announce_daemon_reload();
-    Ok(())
-}
-
-async fn unbind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
-    let normalized = normalize_telegram_identity(identity);
-    if normalized.is_empty() {
-        anyhow::bail!("Telegram identity cannot be empty");
-    }
-
-    let mut updated = config.clone();
-    let Some(telegram) = updated.channels_config.telegram.as_mut() else {
-        anyhow::bail!(
-            "Telegram channel is not configured. Run `rantaiclaw onboard --channels-only` first"
-        );
-    };
-
-    let before = telegram.allowed_users.len();
-    telegram
-        .allowed_users
-        .retain(|entry| normalize_telegram_identity(entry) != normalized);
-    let removed = before - telegram.allowed_users.len();
-
-    if removed == 0 {
-        println!("ℹ️ Telegram identity not in allowlist: {normalized} (nothing to remove)");
-        return Ok(());
-    }
-
-    let now_empty = telegram.allowed_users.is_empty();
-    updated.save().await?;
-    let plural = if removed == 1 { "entry" } else { "entries" };
-    println!("✅ Removed Telegram identity: {normalized} ({removed} {plural} dropped)");
-    println!("   Saved to {}", updated.config_path.display());
-    if now_empty {
-        println!(
-            "⚠️ The Telegram allowlist is now empty — the bot will respond to NO ONE. \
-             Add yourself with `rantaiclaw channel bind-telegram <your-username-or-id>`."
-        );
-    }
-    announce_daemon_reload();
-    Ok(())
-}
-
-/// Resolve the active profile root for the on-disk pairing-code store.
-fn pairing_profile_root() -> Result<PathBuf> {
-    Ok(crate::profile::ProfileManager::active()?.root)
-}
-
-/// Mint an on-demand pairing code for `channel` into the shared store and print
-/// the code plus `/bind`/`/claim` instructions. Works whether or not the daemon
-/// is running — a running daemon validates the code on the next pairing message
-/// without a restart.
-///
-/// `ttl_minutes` is the validity window; `max_uses` bounds claims (`None` =
-/// unlimited within the window); `grant_owner` permits `/claim` (owner). Returns
-/// the minted plaintext code (also used by tests to assert it is non-empty).
-fn pair_channel(
-    channel: &str,
-    ttl_minutes: i64,
-    max_uses: Option<u32>,
-    grant_owner: bool,
-) -> Result<String> {
-    let root = pairing_profile_root()?;
-    let now = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let code = crate::security::pairing_store::mint(
-        &root,
-        channel,
-        ttl_minutes.saturating_mul(60),
-        max_uses,
-        grant_owner,
-        now,
-    )
-    .with_context(|| format!("minting pairing code for {channel}"))?;
-
-    let uses = match max_uses {
-        Some(1) => "single-use".to_string(),
-        Some(n) => format!("up to {n} uses"),
-        None => "multi-use".to_string(),
-    };
-    println!("🔐 Pairing code for {channel}: {code}   (valid {ttl_minutes} min, {uses})");
-    println!("   DM the bot:  /bind {code}  (chat)  |  /claim {code}  (owner)");
-    println!(
-        "   No daemon restart needed — a running channel picks this up on the next pairing message."
-    );
-    Ok(code)
-}
-
-/// Try to reload a running managed daemon service after a config change, and
-/// print a clear note about what happened either way. Shared by the channel
-/// allowlist binder and the `permissions` CLI so config edits made on disk are
-/// picked up without the user having to remember to bounce the service.
-pub(crate) fn announce_daemon_reload() {
-    match maybe_restart_managed_daemon_service() {
-        Ok(true) => {
-            println!("🔄 Detected running managed daemon service; reloaded automatically.");
-        }
-        Ok(false) => {
-            println!(
-                "ℹ️ No managed daemon service detected. If `rantaiclaw daemon`/`channel start` is already running, restart it to load the change."
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "⚠️ Saved, but failed to reload daemon service automatically: {e}\n\
-                 Restart service manually with `rantaiclaw service stop && rantaiclaw service start`."
-            );
-        }
-    }
-}
-
-/// Reload a running managed daemon service (systemd / launchd / OpenRC) after a
-/// config change, for non-CLI callers (the gateway) that must not print to
-/// stdout. Returns `Ok(true)` if a managed service was restarted, `Ok(false)`
-/// when none is installed. Mirrors what [`announce_daemon_reload`] does for the
-/// CLI, minus the console output — callers log the outcome themselves.
-pub(crate) fn reload_managed_daemon() -> Result<bool> {
-    maybe_restart_managed_daemon_service()
-}
-
-fn maybe_restart_managed_daemon_service() -> Result<bool> {
-    if cfg!(target_os = "macos") {
-        let home = directories::UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
-        let plist = home
-            .join("Library")
-            .join("LaunchAgents")
-            .join("com.rantaiclaw.daemon.plist");
-        if !plist.exists() {
-            return Ok(false);
-        }
-
-        let list_output = Command::new("launchctl")
-            .arg("list")
-            .output()
-            .context("Failed to query launchctl list")?;
-        let listed = String::from_utf8_lossy(&list_output.stdout);
-        if !listed.contains("com.rantaiclaw.daemon") {
-            return Ok(false);
-        }
-
-        let _ = Command::new("launchctl")
-            .args(["stop", "com.rantaiclaw.daemon"])
-            .output();
-        let start_output = Command::new("launchctl")
-            .args(["start", "com.rantaiclaw.daemon"])
-            .output()
-            .context("Failed to start launchd daemon service")?;
-        if !start_output.status.success() {
-            let stderr = String::from_utf8_lossy(&start_output.stderr);
-            anyhow::bail!("launchctl start failed: {}", stderr.trim());
-        }
-
-        return Ok(true);
-    }
-
-    if cfg!(target_os = "linux") {
-        // OpenRC (system-wide) takes precedence over systemd (user-level)
-        let openrc_init_script = PathBuf::from("/etc/init.d/rantaiclaw");
-        if openrc_init_script.exists() {
-            if let Ok(status_output) = Command::new("rc-service").args(OPENRC_STATUS_ARGS).output()
-            {
-                // rc-service exits 0 if running, non-zero otherwise
-                if status_output.status.success() {
-                    let restart_output = Command::new("rc-service")
-                        .args(OPENRC_RESTART_ARGS)
-                        .output()
-                        .context("Failed to restart OpenRC daemon service")?;
-                    if !restart_output.status.success() {
-                        let stderr = String::from_utf8_lossy(&restart_output.stderr);
-                        anyhow::bail!("rc-service restart failed: {}", stderr.trim());
-                    }
-                    return Ok(true);
-                }
-            }
-        }
-
-        // Systemd (user-level)
-        let home = directories::UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .context("Could not find home directory")?;
-        let unit_path: PathBuf = home
-            .join(".config")
-            .join("systemd")
-            .join("user")
-            .join("rantaiclaw.service");
-        if !unit_path.exists() {
-            return Ok(false);
-        }
-
-        let active_output = Command::new("systemctl")
-            .args(SYSTEMD_STATUS_ARGS)
-            .output()
-            .context("Failed to query systemd service state")?;
-        let state = String::from_utf8_lossy(&active_output.stdout);
-        if !state.trim().eq_ignore_ascii_case("active") {
-            return Ok(false);
-        }
-
-        let restart_output = Command::new("systemctl")
-            .args(SYSTEMD_RESTART_ARGS)
-            .output()
-            .context("Failed to restart systemd daemon service")?;
-        if !restart_output.status.success() {
-            let stderr = String::from_utf8_lossy(&restart_output.stderr);
-            anyhow::bail!("systemctl restart failed: {}", stderr.trim());
-        }
-
-        return Ok(true);
-    }
-
-    Ok(false)
-}
-
 /// Every channel type this build knows about: `(key, display)` in a stable,
 /// operator-facing order.
 ///
@@ -1734,198 +1472,6 @@ pub(crate) fn configured_channel_count(config: &Config) -> usize {
 /// Canonical channel roster: `(display label, configured?)` for every channel
 /// type in a stable order, derived from [`CHANNEL_CATALOG`] rather than
 /// maintained beside it.
-/// Say out loud what an `approval_owners` value actually grants.
-///
-/// `"*"` makes **every sender on every channel** an owner — the full toolset and
-/// the right to approve shell commands. The gateway already warns when
-/// `allowed_users` contains `*`; nothing warned for this, and no doc said the
-/// value was even accepted.
-///
-/// The bare `"user"` entry is the console's pre-`cli:local` identity. It is
-/// still honoured, but it matches any remote sender who picks that name.
-fn warn_on_risky_approval_owners(owners: &[String]) {
-    if owners.iter().any(|o| o.trim() == "*") {
-        tracing::warn!(
-            "approval_owners contains \"*\": EVERY sender on EVERY channel is an owner \
-             and may approve shell commands. Replace it with explicit sender ids."
-        );
-    }
-    if owners
-        .iter()
-        .any(|o| o.trim() == crate::channels::cli::LEGACY_CLI_SENDER_ID)
-    {
-        tracing::warn!(
-            "approval_owners contains \"{}\", the console's old unqualified identity — a \
-             remote sender using that same name is also an owner. Change it to \"{}\".",
-            crate::channels::cli::LEGACY_CLI_SENDER_ID,
-            crate::channels::cli::CLI_SENDER_ID
-        );
-    }
-}
-
-pub(crate) fn channel_roster(config: &Config) -> Vec<(&'static str, bool)> {
-    CHANNEL_CATALOG
-        .iter()
-        .map(|(key, display)| (*display, channel_is_configured(key, config)))
-        .collect()
-}
-
-/// Guidance for `channel add`, which configures nothing itself.
-///
-/// Split out so the text is testable without capturing stdout. Both this and
-/// `channel_remove_guidance` used to be `bail!`, so a script wrapping
-/// `rantaiclaw channel add` saw a non-zero exit for an informational outcome.
-fn channel_add_guidance(channel_type: &str) -> String {
-    format!("Channel type '{channel_type}' — use `rantaiclaw onboard` to configure channels")
-}
-
-/// Guidance for `channel remove`. See [`channel_add_guidance`].
-fn channel_remove_guidance(name: &str) -> String {
-    format!("Remove channel '{name}' — edit ~/.rantaiclaw/config.toml directly")
-}
-
-pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
-    match command {
-        // Dispatched in `main.rs`, which owns the async runtime these need, so
-        // they never reach this match. They used to `bail!` with that routing
-        // detail as the user-visible error text — an internal invariant printed
-        // as if the operator had done something wrong.
-        crate::ChannelCommands::Start
-        | crate::ChannelCommands::Run
-        | crate::ChannelCommands::Doctor => {
-            unreachable!("channel start/run/doctor are dispatched in main.rs")
-        }
-        crate::ChannelCommands::List => {
-            crate::cli_style::section("channels");
-            crate::cli_style::status_row(true, "CLI", 14, "always");
-            for (name, configured) in channel_roster(config) {
-                crate::cli_style::status_row(
-                    configured,
-                    name,
-                    14,
-                    if configured {
-                        "configured"
-                    } else {
-                        "not configured"
-                    },
-                );
-            }
-            if !cfg!(feature = "channel-matrix") {
-                println!(
-                    "  {}",
-                    crate::cli_style::dim(
-                        "Matrix support is disabled in this build (enable `channel-matrix`)."
-                    )
-                );
-            }
-            if !cfg!(feature = "channel-lark") {
-                println!(
-                    "  {}",
-                    crate::cli_style::dim(
-                        "Lark support is disabled in this build (enable `channel-lark`)."
-                    )
-                );
-            }
-            println!();
-            println!(
-                "  {}",
-                crate::cli_style::dim(
-                    "start: rantaiclaw channel start  ·  health: channel doctor  ·  setup: onboard"
-                )
-            );
-            Ok(())
-        }
-        // Guidance, not failure. These bailed, so a script wrapping
-        // `rantaiclaw channel add` saw a non-zero exit for what is an
-        // informational outcome.
-        crate::ChannelCommands::Add { channel_type } => {
-            println!("{}", channel_add_guidance(&channel_type));
-            Ok(())
-        }
-        crate::ChannelCommands::Remove { name } => {
-            println!("{}", channel_remove_guidance(&name));
-            Ok(())
-        }
-        crate::ChannelCommands::BindTelegram { identity } => {
-            bind_telegram_identity(config, &identity).await
-        }
-        crate::ChannelCommands::UnbindTelegram { identity } => {
-            unbind_telegram_identity(config, &identity).await
-        }
-        crate::ChannelCommands::Pair {
-            channel,
-            ttl,
-            max_uses,
-            no_owner,
-        } => {
-            pair_channel(&channel, ttl, max_uses, !no_owner)?;
-            Ok(())
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChannelHealthState {
-    Healthy,
-    Unhealthy,
-    Timeout,
-}
-
-fn classify_health_result(
-    result: &std::result::Result<bool, tokio::time::error::Elapsed>,
-) -> ChannelHealthState {
-    match result {
-        Ok(true) => ChannelHealthState::Healthy,
-        Ok(false) => ChannelHealthState::Unhealthy,
-        Err(_) => ChannelHealthState::Timeout,
-    }
-}
-
-/// Run health checks for configured channels.
-
-pub async fn doctor_channels(config: Config) -> Result<()> {
-    let channels = factory::build_configured_channels(&config);
-
-    if channels.is_empty() {
-        println!("No real-time channels configured. Run `rantaiclaw onboard` first.");
-        return Ok(());
-    }
-
-    println!("🩺 RantaiClaw Channel Doctor");
-    println!();
-
-    let mut healthy = 0_u32;
-    let mut unhealthy = 0_u32;
-    let mut timeout = 0_u32;
-
-    for (_key, name, channel) in channels {
-        let result = tokio::time::timeout(Duration::from_secs(10), channel.health_check()).await;
-        let state = classify_health_result(&result);
-
-        match state {
-            ChannelHealthState::Healthy => {
-                healthy += 1;
-                println!("  ✅ {name:<9} healthy");
-            }
-            ChannelHealthState::Unhealthy => {
-                unhealthy += 1;
-                println!("  ❌ {name:<9} unhealthy (auth/config/network)");
-            }
-            ChannelHealthState::Timeout => {
-                timeout += 1;
-                println!("  ⏱️  {name:<9} timed out (>10s)");
-            }
-        }
-    }
-
-    if config.channels_config.webhook.is_some() {
-        println!("  ℹ️  Webhook   check via `rantaiclaw gateway` then GET /health");
-    }
-
-    println!();
-    println!("Summary: {healthy} healthy, {unhealthy} unhealthy, {timeout} timed out");
-    Ok(())
-}
 
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
@@ -2003,7 +1549,7 @@ pub async fn start_channels_with_cancellation(
         &config.workspace_dir,
         policy_dir,
     ));
-    warn_on_risky_approval_owners(&config.channels_config.approval_owners);
+    admin::warn_on_risky_approval_owners(&config.channels_config.approval_owners);
 
     // Bind an async-approval registry to the policy so shell tool
     // calls in Supervised mode can ask the user via chat reply when
@@ -2688,7 +2234,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (config, cfg_path) = telegram_config_in(&tmp, &["*", "rantaiclaw_user"]);
 
-        unbind_telegram_identity(&config, "*").await.unwrap();
+        admin::unbind_telegram_identity(&config, "*").await.unwrap();
 
         assert_eq!(reload_allowed_users(&cfg_path), vec!["rantaiclaw_user"]);
     }
@@ -2699,7 +2245,7 @@ mod tests {
         let (config, cfg_path) = telegram_config_in(&tmp, &["rantaiclaw_user", "123456789"]);
 
         // Leading '@' is stripped before comparison, mirroring bind/auth.
-        unbind_telegram_identity(&config, "@rantaiclaw_user")
+        admin::unbind_telegram_identity(&config, "@rantaiclaw_user")
             .await
             .unwrap();
 
@@ -2711,7 +2257,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (config, cfg_path) = telegram_config_in(&tmp, &["rantaiclaw_user"]);
 
-        unbind_telegram_identity(&config, "someone_else")
+        admin::unbind_telegram_identity(&config, "someone_else")
             .await
             .unwrap();
 
@@ -5382,7 +4928,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[tokio::test]
     async fn channel_add_reports_guidance_without_failing() {
         let config = Config::default();
-        let result = handle_command(
+        let result = admin::handle_command(
             crate::ChannelCommands::Add {
                 channel_type: "telegram".to_string(),
             },
@@ -5391,7 +4937,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         assert!(result.is_ok(), "guidance must not be reported as a failure");
-        let text = channel_add_guidance("telegram");
+        let text = admin::channel_add_guidance("telegram");
         assert!(text.contains("telegram"), "names the requested type");
         assert!(text.contains("onboard"), "points at the command that works");
     }
@@ -5400,7 +4946,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[tokio::test]
     async fn channel_remove_reports_guidance_without_failing() {
         let config = Config::default();
-        let result = handle_command(
+        let result = admin::handle_command(
             crate::ChannelCommands::Remove {
                 name: "telegram".to_string(),
             },
@@ -5409,7 +4955,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         assert!(result.is_ok(), "guidance must not be reported as a failure");
-        let text = channel_remove_guidance("telegram");
+        let text = admin::channel_remove_guidance("telegram");
         assert!(text.contains("telegram"));
         assert!(text.contains("config.toml"), "says where to make the edit");
     }
@@ -5527,7 +5073,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn roster_covers_exactly_the_catalog() {
         let config = config_with_every_channel();
-        let roster = channel_roster(&config);
+        let roster = admin::channel_roster(&config);
 
         assert_eq!(roster.len(), CHANNEL_CATALOG.len());
         for ((key, display), (roster_display, configured)) in CHANNEL_CATALOG.iter().zip(&roster) {
@@ -7159,14 +6705,14 @@ Mon Feb 20
 
     #[test]
     fn classify_health_ok_true() {
-        let state = classify_health_result(&Ok(true));
-        assert_eq!(state, ChannelHealthState::Healthy);
+        let state = admin::classify_health_result(&Ok(true));
+        assert_eq!(state, admin::ChannelHealthState::Healthy);
     }
 
     #[test]
     fn classify_health_ok_false() {
-        let state = classify_health_result(&Ok(false));
-        assert_eq!(state, ChannelHealthState::Unhealthy);
+        let state = admin::classify_health_result(&Ok(false));
+        assert_eq!(state, admin::ChannelHealthState::Unhealthy);
     }
 
     #[tokio::test]
@@ -7176,8 +6722,8 @@ Mon Feb 20
             true
         })
         .await;
-        let state = classify_health_result(&result);
-        assert_eq!(state, ChannelHealthState::Timeout);
+        let state = admin::classify_health_result(&result);
+        assert_eq!(state, admin::ChannelHealthState::Timeout);
     }
 
     struct AlwaysFailChannel {
