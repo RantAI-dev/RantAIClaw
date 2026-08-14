@@ -159,9 +159,13 @@ pub async fn fetch_image(
         match stream.chunk().await {
             Ok(Some(chunk)) => {
                 collected.extend_from_slice(&chunk);
-                if collected.len() as u64 > max_bytes {
+                // `usize::try_from` rather than `as`: on a 32-bit target a
+                // cap above 4 GiB would wrap, and the clamp below keeps the
+                // "one byte over" signal `accept_bytes` reads.
+                let ceiling = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+                if collected.len() > ceiling {
                     // Stop reading: past this point the answer cannot change.
-                    collected.truncate(max_bytes as usize + 1);
+                    collected.truncate(ceiling.saturating_add(1));
                     break;
                 }
             }

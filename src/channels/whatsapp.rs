@@ -631,7 +631,7 @@ mod tests {
 
         // The lookup returns a URL on the same test server.
         let mut messages = vec![ChannelMessage {
-            content: format!("look\n[WHATSAPP_MEDIA:media-1|image/png]"),
+            content: "look\n[WHATSAPP_MEDIA:media-1|image/png]".to_string(),
             ..Default::default()
         }];
         // Rewrite the placeholder the stub returns into a real URL.

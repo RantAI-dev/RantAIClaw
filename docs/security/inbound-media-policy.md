@@ -65,9 +65,10 @@ that is an operator-facing decision about where agent-received files live —
 
 ### 4. Interaction with `[multimodal].allow_remote_fetch`
 
-`allow_remote_fetch` gates **model-directed** fetches: an `[IMAGE:https://…]`
-marker in text the agent is processing, which the agent can be talked into
-emitting. It is off by default because it makes the agent an SSRF proxy.
+`allow_remote_fetch` gates **model-directed** fetches: an `[IMAGE:]` marker
+carrying a remote URL, in text the agent is processing, which the agent can be
+talked into emitting. It is off by default because it makes the agent an SSRF
+proxy.
 
 Inbound channel media is a **different case** and is not gated by it: the URL is
 not chosen by anyone in the conversation, it is the platform's own CDN endpoint
