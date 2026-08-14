@@ -233,8 +233,8 @@ impl ApprovalManager {
 /// - `"*"` ⇒ `true` for any sender (insecure; opt-in only).
 /// - Otherwise ⇒ sender match, normalized exactly like the per-channel
 ///   `allowed_users` gate: a leading `@` is stripped on both sides (so a
-///   hand-written `approval_owners = ["@dramnerf"]` authorizes sender
-///   `dramnerf`), but matching is otherwise exact and **case-sensitive** —
+///   hand-written `approval_owners = ["@rantaiclaw_owner"]` authorizes sender
+///   `rantaiclaw_owner`), but matching is otherwise exact and **case-sensitive** —
 ///   identical to `allowed_users`, so the two gates never disagree.
 pub fn can_approve(owners: &[String], sender: &str) -> bool {
     can_approve_any(owners, std::iter::once(sender))
@@ -567,10 +567,10 @@ mod tests {
         // Normalization matches the allowed_users gate exactly: a leading `@`
         // is stripped on both sides (so a hand-edited config doesn't silently
         // fail), but matching stays case-sensitive — the two gates never disagree.
-        let owners = vec!["@dramnerf".to_string()];
-        assert!(can_approve(&owners, "dramnerf"));
-        assert!(can_approve(&owners, "@dramnerf"));
-        assert!(!can_approve(&owners, "Dramnerf")); // case-sensitive, like allowed_users
+        let owners = vec!["@rantaiclaw_owner".to_string()];
+        assert!(can_approve(&owners, "rantaiclaw_owner"));
+        assert!(can_approve(&owners, "@rantaiclaw_owner"));
+        assert!(!can_approve(&owners, "RantaiClaw_Owner")); // case-sensitive, like allowed_users
         assert!(!can_approve(&owners, "someone_else"));
     }
 
@@ -580,16 +580,19 @@ mod tests {
         // sender to their username, but the numeric id is available as an alias
         // — the owner must be recognized, matching the chat allowlist which
         // already checks both forms.
-        let owners = vec!["1360247715".to_string()];
-        assert!(can_approve_any(&owners, ["sulthannauval", "1360247715"]));
+        let owners = vec!["100000001".to_string()];
+        assert!(can_approve_any(&owners, ["rantaiclaw_user", "100000001"]));
         // The single-form check still misses it — this is the asymmetry the
         // alias-aware check fixes.
-        assert!(!can_approve(&owners, "sulthannauval"));
+        assert!(!can_approve(&owners, "rantaiclaw_user"));
         // Secure default and wildcard behave like `can_approve`.
         assert!(!can_approve_any(&[], ["a", "b"]));
         assert!(can_approve_any(&["*".to_string()], ["anyone"]));
         // A leading `@` is tolerated on either side, as in `can_approve`.
-        assert!(can_approve_any(&["@dramnerf".to_string()], ["@dramnerf"]));
+        assert!(can_approve_any(
+            &["@rantaiclaw_owner".to_string()],
+            ["@rantaiclaw_owner"]
+        ));
     }
 
     // ── needs_approval ───────────────────────────────────────

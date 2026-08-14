@@ -1999,9 +1999,9 @@ async fn process_channel_message(
 
     // Pre-v0.6.7 used `println!` here, which leaks into the TUI's
     // alt-screen and corrupts rendering when channels are auto-started
-    // alongside `rantaiclaw` (see screenshot in v0.6.6 tester report:
-    // "[telegram] from sulthannauval: can you help me here?" appearing
-    // in the local chat surface). Tracing routes to the log file in TUI
+    // alongside `rantaiclaw` (a v0.6.6 tester saw an inbound Telegram line
+    // — "[telegram] from <sender>: ..." — printed straight into the local
+    // chat surface). Tracing routes to the log file in TUI
     // mode and to whatever subscriber daemon mode installs — operator
     // can `RUST_LOG=info` + tail the log file.
     tracing::info!(

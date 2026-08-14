@@ -3606,7 +3606,7 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     "Allowlist your own Telegram identity first (recommended for secure + fast setup).",
                 );
                 print_bullet(
-                    "Use your @username without '@' (example: argenis), or your numeric Telegram user ID.",
+                    "Use your @username without '@' (example: rantaiclaw_user), or your numeric Telegram user ID.",
                 );
                 print_bullet("Use '*' only for temporary open testing.");
 
@@ -6154,7 +6154,7 @@ mod tests {
     async fn scaffold_full_personalization() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext {
-            user_name: "Argenis".into(),
+            user_name: "RantaiClawOperator".into(),
             timezone: "US/Eastern".into(),
             agent_name: "Claw".into(),
             communication_style:
@@ -6178,7 +6178,7 @@ mod tests {
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
             .unwrap();
-        assert!(user_md.contains("**Name:** Argenis"));
+        assert!(user_md.contains("**Name:** RantaiClawOperator"));
         assert!(user_md.contains("**Timezone:** US/Eastern"));
         assert!(user_md.contains("Be friendly, human, and conversational"));
 
@@ -6190,7 +6190,7 @@ mod tests {
         let bootstrap = tokio::fs::read_to_string(tmp.path().join("BOOTSTRAP.md"))
             .await
             .unwrap();
-        assert!(bootstrap.contains("**Argenis**"));
+        assert!(bootstrap.contains("**RantaiClawOperator**"));
         assert!(bootstrap.contains("US/Eastern"));
         assert!(bootstrap.contains("Introduce yourself as Claw"));
 
