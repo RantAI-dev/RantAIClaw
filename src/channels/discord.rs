@@ -45,6 +45,27 @@ impl DiscordChannel {
     /// Check if a Discord user ID is in the allowlist.
     /// Empty list means deny everyone until explicitly configured.
     /// `"*"` means allow everyone.
+    /// The `POST /channels/{id}/messages` body for one chunk.
+    ///
+    /// Only the first chunk carries the reply reference: anchoring every chunk
+    /// renders as N separate replies to one message, which is noisier than the
+    /// flat behaviour this replaces.
+    fn message_body(chunk: &str, anchor: Option<&str>, is_first: bool) -> serde_json::Value {
+        let mut body = json!({ "content": chunk });
+        if is_first {
+            if let Some(anchor) = anchor {
+                body["message_reference"] = json!({
+                    "message_id": anchor,
+                    // The anchor may have been deleted between the prompt and
+                    // the reply; a strict reference fails the whole send, so
+                    // Discord is told to post it unanchored instead.
+                    "fail_if_not_exists": false,
+                });
+            }
+        }
+        body
+    }
+
     fn is_user_allowed(&self, user_id: &str) -> bool {
         self.allowed_users
             .read()
@@ -208,7 +229,7 @@ impl Channel for DiscordChannel {
                 message.recipient
             );
 
-            let body = json!({ "content": chunk });
+            let body = Self::message_body(chunk, message.thread_ts.as_deref(), i == 0);
 
             let resp = self
                 .http_client()
@@ -469,7 +490,16 @@ impl Channel for DiscordChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                        thread_ts: None,
+                        // The prompting message, so the reply carries a
+                        // `message_reference` back to it. Discord threads are
+                        // channels, so `recipient` already routes into a thread;
+                        // what was missing is the reply anchor that makes a busy
+                        // channel readable.
+                        thread_ts: if message_id.is_empty() {
+                            None
+                        } else {
+                            Some(message_id.to_string())
+                        },
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -528,6 +558,53 @@ impl Channel for DiscordChannel {
 
 #[cfg(test)]
 mod tests {
+    /// The reply anchor is what makes a busy channel readable, and it is
+    /// carried by `thread_ts` — the typed field — not by packing it into the
+    /// recipient.
+    /// The inbound capture is inside `listen()`'s socket loop, which no test
+    /// enters — setting `thread_ts: None` there passed every test in this file.
+    /// This is a source-position assertion and says so: it proves the anchor is
+    /// read from the payload, not that the loop runs.
+    #[test]
+    fn discord_inbound_thread_id_is_captured() {
+        let src = include_str!("discord.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+        let listen = production
+            .split("async fn listen(")
+            .nth(1)
+            .expect("listen exists");
+        let construct = listen
+            .find("thread_ts:")
+            .expect("the inbound message sets thread_ts");
+        let window = &listen[construct..construct + 200];
+        assert!(
+            window.contains("message_id"),
+            "the reply anchor must come from the inbound message id, got: {window}"
+        );
+    }
+
+    #[test]
+    fn discord_reply_targets_the_prompting_message() {
+        let body = DiscordChannel::message_body("hi", Some("msg-42"), true);
+        assert_eq!(body["content"], "hi");
+        assert_eq!(body["message_reference"]["message_id"], "msg-42");
+        // A deleted anchor must not fail the whole send.
+        assert_eq!(body["message_reference"]["fail_if_not_exists"], false);
+
+        // Only the first chunk anchors: N anchored chunks render as N replies.
+        let later = DiscordChannel::message_body("more", Some("msg-42"), false);
+        assert!(later.get("message_reference").is_none());
+    }
+
+    #[test]
+    fn discord_unanchored_send_carries_no_reference() {
+        let body = DiscordChannel::message_body("hi", None, true);
+        assert!(
+            body.get("message_reference").is_none(),
+            "a non-threaded inbound must not produce a threaded reply"
+        );
+    }
+
     use super::*;
 
     #[test]

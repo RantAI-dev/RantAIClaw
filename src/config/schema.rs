@@ -2727,6 +2727,17 @@ pub struct ChannelsConfig {
     /// gated even when this is on.
     #[serde(default)]
     pub autonomous_tools: bool,
+    /// Reply in-thread where the platform supports it (default `true`).
+    ///
+    /// Threading changes **where** a reply appears, so an operator must be able
+    /// to turn it off without turning off the channel. A per-channel key of the
+    /// same name (currently `[channels_config.mattermost]`) overrides this.
+    ///
+    /// Enforced once, in the inbound dispatch loop, which clears the message's
+    /// thread anchor before the agent sees it — channels do not read this flag,
+    /// so a channel added later cannot forget to honour it.
+    #[serde(default = "default_thread_replies")]
+    pub thread_replies: bool,
     /// Sender ids authorized to **approve** tool calls over a channel (the
     /// people whose `Y` / `A` reply to an in-chat approval prompt is honored).
     ///
@@ -2763,6 +2774,10 @@ pub struct ChannelsConfig {
     pub guest_allowed_commands: Vec<String>,
 }
 
+fn default_thread_replies() -> bool {
+    true
+}
+
 fn default_channel_message_timeout_secs() -> u64 {
     // Bumped 300 → 600 so slow models + tool loops have room to finish a turn
     // before the channel drops the response. Still scales up to 4x with depth.
@@ -2791,6 +2806,7 @@ impl Default for ChannelsConfig {
             qq: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             autonomous_tools: false,
+            thread_replies: default_thread_replies(),
             approval_owners: Vec::new(),
             guest_allowed_tools: Vec::new(),
             guest_allowed_commands: Vec::new(),
@@ -4894,6 +4910,7 @@ default_temperature = 0.7
                 qq: None,
                 message_timeout_secs: 300,
                 autonomous_tools: false,
+                thread_replies: true,
                 approval_owners: Vec::new(),
                 guest_allowed_tools: Vec::new(),
                 guest_allowed_commands: Vec::new(),
@@ -5556,6 +5573,7 @@ allowed_users = ["@ops:matrix.org"]
             qq: None,
             message_timeout_secs: 300,
             autonomous_tools: false,
+            thread_replies: true,
             approval_owners: Vec::new(),
             guest_allowed_tools: Vec::new(),
             guest_allowed_commands: Vec::new(),
@@ -5771,6 +5789,7 @@ channel_id = "C123"
             qq: None,
             message_timeout_secs: 300,
             autonomous_tools: false,
+            thread_replies: true,
             approval_owners: Vec::new(),
             guest_allowed_tools: Vec::new(),
             guest_allowed_commands: Vec::new(),

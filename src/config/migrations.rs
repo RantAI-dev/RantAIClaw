@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 21;
+pub const CURRENT_VERSION: u32 = 22;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -296,6 +296,17 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
     // schema_drift fingerprint is accepted with intent.
     if from < 21 {
         // (no transformation; a removed key that no code read)
+    }
+
+    // v21 → v22: `[channels_config] thread_replies` (bool, default `true`) was
+    // added — the shared switch for replying in-thread, with the existing
+    // `[channels_config.mattermost] thread_replies` still overriding it. The
+    // default preserves Mattermost's behaviour and turns threading on for the
+    // channels that just gained it, which is the intended change. Additive with
+    // a serde default, nothing to transform — this arm burns a version slot so
+    // the schema_drift fingerprint is accepted with intent.
+    if from < 22 {
+        // (no transformation; additive field whose default is the new behaviour)
     }
 
     // Future migrations (v21, v22, …) inserted here in order.
@@ -846,6 +857,34 @@ backend = \"markdown\"
             irc.get("allow_insecure_tls_with_password").is_none(),
             "the migration must not grant the opt-in on the operator's behalf"
         );
+    }
+
+    #[test]
+    fn v22_mattermost_thread_override_survives_the_shared_default() {
+        // The per-channel key predates the shared one and operators have it
+        // set; a migration that dropped it would silently re-enable threading
+        // on a channel where it was turned off.
+        let _guard = V18EnvGuard::scrubbed();
+        let mut v = parse(
+            "schema_version = 21\n[channels_config.mattermost]\nurl = \"https://mm.example.com\"\nbot_token = \"t\"\nthread_replies = false\n",
+        );
+        migrate(&mut v).unwrap();
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        let mm = v
+            .get("channels_config")
+            .and_then(|c| c.get("mattermost"))
+            .and_then(Value::as_table)
+            .expect("mattermost table survives");
+        assert_eq!(
+            mm.get("thread_replies").and_then(Value::as_bool),
+            Some(false)
+        );
+        // The shared key is left absent so the serde default (`true`) applies —
+        // the migration must not write an operator's preference for them.
+        assert!(v
+            .get("channels_config")
+            .and_then(|c| c.get("thread_replies"))
+            .is_none());
     }
 
     #[test]

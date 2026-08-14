@@ -234,6 +234,12 @@ struct ChannelRuntimeDefaults {
     /// Per-channel `mention_only`, carried only so reload can detect an edit it
     /// cannot apply and say so. See `channel_mention_only`.
     mention_only: Arc<HashMap<String, bool>>,
+    /// Whether replies thread, per channel: the shared
+    /// `[channels_config] thread_replies` with any per-channel override
+    /// applied. Reloaded like the rest so the switch takes effect without a
+    /// restart — threading moves where replies appear, and an operator turning
+    /// it off should not have to bounce the daemon.
+    thread_replies: Arc<HashMap<String, bool>>,
 }
 
 /// Per-channel sender allowlists, keyed by `Channel::name()`.
@@ -256,6 +262,22 @@ struct ChannelRuntimeDefaults {
 /// does not own. It is tracked here purely so a reload can *tell the operator*
 /// that their edit needs a restart instead of reporting success and doing
 /// nothing.
+/// Effective threading switch per channel: the shared default, overridden where
+/// a channel declares its own. Mattermost is the only per-channel key today —
+/// it predates the shared one and operators have it set.
+fn channel_thread_replies(cc: &crate::config::ChannelsConfig) -> HashMap<String, bool> {
+    let mut out = HashMap::new();
+    for (name, _) in CHANNEL_CATALOG {
+        out.insert((*name).to_string(), cc.thread_replies);
+    }
+    if let Some(c) = cc.mattermost.as_ref() {
+        if let Some(override_value) = c.thread_replies {
+            out.insert("mattermost".to_string(), override_value);
+        }
+    }
+    out
+}
+
 fn channel_mention_only(cc: &crate::config::ChannelsConfig) -> HashMap<String, bool> {
     let mut out = HashMap::new();
     if let Some(c) = cc.telegram.as_ref() {
@@ -744,6 +766,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         min_relevance_score: config.memory.min_relevance_score,
         autonomous_tools: config.channels_config.autonomous_tools,
         mention_only: Arc::new(channel_mention_only(&config.channels_config)),
+        thread_replies: Arc::new(channel_thread_replies(&config.channels_config)),
     }
 }
 
@@ -809,6 +832,10 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         // Empty: with no config to compare against, the reload has nothing to
         // report a divergence from.
         mention_only: Arc::new(HashMap::new()),
+        // Empty means "no entry", which the lookup reads as the shipped default
+        // (threading on). This carries no authority, so mirroring the default
+        // cannot widen anything.
+        thread_replies: Arc::new(HashMap::new()),
         autonomy_level: ctx.security.effective_autonomy(),
         // Fallback path only (the store has no entry — ad-hoc/tests). The
         // live policy carries the enforced level but not `always_ask`, which
@@ -833,6 +860,16 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
 /// Current approval owners from the live runtime-defaults store (or the startup
 /// `ctx` fallback). Mirrors `runtime_defaults_snapshot` so `/approve` / `/allow`
 /// reply authorization tracks owner changes without a `channels run` restart.
+/// Whether replies on `channel` should thread. Missing entry ⇒ the shipped
+/// default (`true`), which is what the fallback defaults path produces.
+fn thread_replies_enabled(ctx: &ChannelRuntimeContext, channel: &str) -> bool {
+    runtime_defaults_snapshot(ctx)
+        .thread_replies
+        .get(channel)
+        .copied()
+        .unwrap_or(true)
+}
+
 fn live_approval_owners(ctx: &ChannelRuntimeContext) -> Arc<Vec<String>> {
     runtime_defaults_snapshot(ctx).approval_owners
 }
@@ -2554,7 +2591,15 @@ async fn run_message_dispatch_loop(
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
-    while let Some(msg) = rx.recv().await {
+    while let Some(mut msg) = rx.recv().await {
+        // One place decides whether replies thread. Channels fill `thread_ts`
+        // unconditionally; clearing it here — before the message reaches the
+        // agent, the approval relay, or history — means a channel added later
+        // cannot forget to honour the switch, and the ten dispatch sites that
+        // copy `thread_ts` onto the outbound message need no change.
+        if !thread_replies_enabled(ctx.as_ref(), &msg.channel) {
+            msg.thread_ts = None;
+        }
         // Intercept approval replies before the message reaches the agent.
         // Try the whole-tool relay first (`/approve X`, `/deny X` — Layer A),
         // then the shell allowlist relay (`/allow X`, `y X`, … — Layer B). Both
@@ -4125,6 +4170,50 @@ pub async fn start_channels_with_cancellation(
 
 #[cfg(test)]
 mod tests {
+    /// Threading moves WHERE replies appear, so the switch has to work — and it
+    /// is enforced in one place, from a map built here.
+    #[test]
+    fn thread_replies_opt_out_disables_threading() {
+        use crate::config::schema::{ChannelsConfig, MattermostConfig};
+
+        let mut cc = ChannelsConfig::default();
+        assert!(cc.thread_replies, "threading ships on");
+        let on = channel_thread_replies(&cc);
+        assert_eq!(on.get("discord"), Some(&true));
+        assert_eq!(on.get("telegram"), Some(&true));
+
+        // The shared default turns every channel off at once.
+        cc.thread_replies = false;
+        let off = channel_thread_replies(&cc);
+        assert_eq!(off.get("discord"), Some(&false));
+        assert_eq!(off.get("slack"), Some(&false));
+
+        // A per-channel key overrides the shared default in both directions.
+        cc.mattermost = Some(MattermostConfig {
+            url: "https://mm.example.com".into(),
+            bot_token: "token".into(),
+            channel_id: Some("chan".into()),
+            allowed_users: vec!["*".into()],
+            thread_replies: Some(true),
+            mention_only: None,
+        });
+        let overridden = channel_thread_replies(&cc);
+        assert_eq!(
+            overridden.get("mattermost"),
+            Some(&true),
+            "the per-channel key wins over the shared default"
+        );
+        assert_eq!(overridden.get("discord"), Some(&false));
+
+        cc.thread_replies = true;
+        if let Some(mm) = cc.mattermost.as_mut() {
+            mm.thread_replies = Some(false);
+        }
+        let overridden = channel_thread_replies(&cc);
+        assert_eq!(overridden.get("mattermost"), Some(&false));
+        assert_eq!(overridden.get("discord"), Some(&true));
+    }
+
     /// Every channel keeps its allowlist gate inside the polling loop that
     /// `listen()` runs, and no test enters that loop — the gate line can be
     /// deleted with the whole suite still green. Only Slack's is extracted into
@@ -5650,6 +5739,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     min_relevance_score: 0.0,
                     autonomous_tools: false,
                     mention_only: Arc::new(HashMap::new()),
+                    thread_replies: Arc::new(HashMap::new()),
                 },
                 last_applied_stamp: None,
                 last_reload_error: None,

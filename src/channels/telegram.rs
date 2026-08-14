@@ -1206,7 +1206,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                thread_ts: None,
+                // The reply ANCHOR, not the forum topic. The topic is a
+                // destination and stays in `reply_target` (`chat_id:thread_id`)
+                // — carrying it in both fields would let the two disagree.
+                thread_ts: if message_id == 0 {
+                    None
+                } else {
+                    Some(message_id.to_string())
+                },
                 sender_aliases,
             },
             photo_file_id,
@@ -1280,6 +1287,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         message: &str,
         chat_id: &str,
         thread_id: Option<&str>,
+        reply_to: Option<&str>,
     ) -> anyhow::Result<()> {
         use crate::channels::format::{render_pair, split_paired, RenderTarget};
 
@@ -1300,6 +1308,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             });
             if let Some(tid) = thread_id {
                 html_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+            }
+            // Only the first chunk replies to the prompt; anchoring each chunk
+            // renders as N replies to one message.
+            if index == 0 {
+                if let Some(anchor) = reply_to {
+                    html_body["reply_parameters"] = serde_json::json!({
+                        "message_id": anchor.parse::<i64>().unwrap_or_default(),
+                        // The user may have deleted the message between prompt
+                        // and reply; without this the whole send fails.
+                        "allow_sending_without_reply": true,
+                    });
+                }
             }
 
             let resp = self
@@ -2028,7 +2048,7 @@ impl Channel for TelegramChannel {
                 Err(e) => {
                     tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
                     return self
-                        .send_text_chunks(text, &chat_id, thread_id.as_deref())
+                        .send_text_chunks(text, &chat_id, thread_id.as_deref(), None)
                         .await;
                 }
             };
@@ -2046,7 +2066,7 @@ impl Channel for TelegramChannel {
 
             // Fall back to chunked send
             return self
-                .send_text_chunks(text, &chat_id, thread_id.as_deref())
+                .send_text_chunks(text, &chat_id, thread_id.as_deref(), None)
                 .await;
         }
 
@@ -2055,7 +2075,7 @@ impl Channel for TelegramChannel {
             Err(e) => {
                 tracing::warn!("Invalid Telegram message_id '{message_id}': {e}");
                 return self
-                    .send_text_chunks(text, &chat_id, thread_id.as_deref())
+                    .send_text_chunks(text, &chat_id, thread_id.as_deref(), None)
                     .await;
             }
         };
@@ -2100,7 +2120,7 @@ impl Channel for TelegramChannel {
 
         // Edit failed entirely — fall back to new message
         tracing::warn!("Telegram finalize_draft edit failed; falling back to sendMessage");
-        self.send_text_chunks(text, &chat_id, thread_id.as_deref())
+        self.send_text_chunks(text, &chat_id, thread_id.as_deref(), None)
             .await
     }
 
@@ -2149,8 +2169,13 @@ impl Channel for TelegramChannel {
 
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
-                self.send_text_chunks(&text_without_markers, chat_id, thread_id)
-                    .await?;
+                self.send_text_chunks(
+                    &text_without_markers,
+                    chat_id,
+                    thread_id,
+                    message.thread_ts.as_deref(),
+                )
+                .await?;
             }
 
             for attachment in &attachments {
@@ -2166,7 +2191,8 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        self.send_text_chunks(&content, chat_id, thread_id).await
+        self.send_text_chunks(&content, chat_id, thread_id, message.thread_ts.as_deref())
+            .await
     }
 
     async fn listen(
@@ -3202,6 +3228,77 @@ mod tests {
         let requests = captured.lock().expect("capture lock");
         assert_eq!(requests.len(), 1, "expected exactly one request");
         requests[0].clone()
+    }
+
+    /// A forum topic is a DESTINATION and stays in `reply_target`; the reply
+    /// anchor is the prompting message and lives in `thread_ts`. Carrying the
+    /// topic in both is the failure this asserts against — they could disagree.
+    #[test]
+    fn telegram_forum_topic_and_reply_anchor_are_different_fields() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 4242,
+                "message_thread_id": 789,
+                "text": "in a topic",
+                "from": { "id": 555 },
+                "chat": { "id": -100_200_300 }
+            }
+        });
+
+        let (msg, _) = ch
+            .parse_update_message(&update)
+            .expect("the message parses");
+        assert_eq!(msg.reply_target, "-100200300:789", "topic = destination");
+        assert_eq!(
+            msg.thread_ts.as_deref(),
+            Some("4242"),
+            "anchor = the message"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_reply_anchors_on_the_prompting_message() {
+        let (base, captured) = spawn_bot_api().await;
+        let ch =
+            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
+
+        ch.send(
+            &SendMessage::new("threaded reply", "-100200300:789")
+                .in_thread(Some("4242".to_string())),
+        )
+        .await
+        .expect("the local Bot API accepts it");
+
+        let (path, body) = only_request(&captured);
+        assert_eq!(path, "/bot123:ABC/sendMessage");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(json["message_thread_id"], "789", "topic still routes");
+        assert_eq!(json["reply_parameters"]["message_id"], 4242);
+        // A deleted anchor must not fail the send.
+        assert_eq!(
+            json["reply_parameters"]["allow_sending_without_reply"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_unanchored_reply_carries_no_reply_parameters() {
+        let (base, captured) = spawn_bot_api().await;
+        let ch =
+            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
+
+        ch.send(&SendMessage::new("flat reply", "-100200300"))
+            .await
+            .expect("the local Bot API accepts it");
+
+        let (_, body) = only_request(&captured);
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert!(
+            json.get("reply_parameters").is_none(),
+            "a non-threaded inbound must not produce a threaded reply"
+        );
     }
 
     #[tokio::test]
