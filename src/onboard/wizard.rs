@@ -4478,21 +4478,15 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     style("— HTTP endpoint for custom integrations").dim()
                 );
 
-                // Typed, so dialoguer re-asks on a typo. It used to read a
-                // String and `parse().unwrap_or(8080)`, silently discarding
-                // whatever the operator actually typed.
-                let port: u16 = Input::new()
-                    .with_prompt("  Port")
-                    .default(8080u16)
-                    .interact_text()?;
-
+                // No port prompt: the webhook arrives on the gateway's own
+                // listener. Asking for one told operators to open a firewall
+                // port nothing binds, and then the callback never arrived.
                 let secret: String = Password::new()
                     .with_prompt("  Secret (optional, Enter to skip)")
                     .allow_empty_password(true)
                     .interact()?;
 
                 config.webhook = Some(WebhookConfig {
-                    port,
                     secret: if secret.is_empty() {
                         None
                     } else {
@@ -4500,9 +4494,9 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     },
                 });
                 println!(
-                    "  {} Webhook on port {}",
+                    "  {} Webhook enabled — it arrives on the gateway's port ({})",
                     style("✅").green().bold(),
-                    style(&port).cyan()
+                    style("rantaiclaw gateway").cyan()
                 );
             }
             ChannelMenuChoice::DingTalk => {

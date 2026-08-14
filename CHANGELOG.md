@@ -324,6 +324,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`[channels_config.webhook].port` was removed (schema v21).** Nothing read
+  it: the webhook arrives on the gateway's own listener (`[gateway].port`), so
+  the key told operators to open a firewall port nothing binds and then the
+  callback silently never arrived. An existing config that still carries it
+  loads unchanged — serde ignores the key — so there is nothing to do. The setup
+  wizard no longer asks for it.
+
 - **Setup no longer defaults a channel allowlist to "allow anyone".** Six
   provisioners pre-filled the allowlist prompt with `*`, and three of them also
   mapped an *empty* answer to `*` — under a prompt whose own label read

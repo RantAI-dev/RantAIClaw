@@ -392,11 +392,19 @@ Linq notes:
 
 ```toml
 [channels_config.webhook]
-port = 8080
 secret = "optional-shared-secret"
 ```
 
 Run with gateway/daemon and verify `/health`.
+
+Notes:
+
+- There is **no `port` key**. The endpoint is `POST /webhook` on the gateway's
+  own listener (`[gateway].port`, default 9393). A `port` key existed until
+  schema v21 and was read by nothing — it told operators to open a firewall port
+  nothing binds. A config still carrying it loads; the key is ignored.
+- Authentication is the pairing bearer token, or `X-Webhook-Secret` when
+  `secret` is set.
 
 ### 4.9 Email
 

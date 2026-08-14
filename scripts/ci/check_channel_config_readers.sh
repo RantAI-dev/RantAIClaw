@@ -35,7 +35,6 @@ SCHEMA="src/config/schema.rs"
 KNOWN_UNREAD=$(cat <<'EOF'
 app_token	SlackConfig	plan 146 — build Socket Mode or delete the key
 encrypt_key	LarkConfig	plan 146 — implement Feishu event decryption or delete the key
-port	WebhookConfig	plan 146 — delete; the gateway binds its own port
 EOF
 )
 

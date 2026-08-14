@@ -2895,8 +2895,6 @@ pub struct MattermostConfig {
 /// Webhook channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebhookConfig {
-    /// Port to listen on for incoming webhooks.
-    pub port: u16,
     /// Optional shared secret for webhook signature verification.
     pub secret: Option<String>,
 }
@@ -5637,12 +5635,13 @@ channel_id = "C123"
         assert_eq!(parsed.secret.as_deref(), Some("my-secret-key"));
     }
 
+    /// `port` was removed in schema v21 — nothing read it. A config still
+    /// carrying it must load, not error, because operators have it written.
     #[test]
-    async fn webhook_config_without_secret() {
+    async fn webhook_config_without_secret_ignores_the_removed_port_key() {
         let json = r#"{"port":8080}"#;
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.secret.is_none());
-        assert_eq!(parsed.port, 8080);
     }
 
     // ── WhatsApp config ──────────────────────────────────────
