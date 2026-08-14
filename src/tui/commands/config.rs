@@ -361,7 +361,12 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let (auto_label, auto_kind, auto_detail) = match snapshot() {
+    // ONE snapshot for the whole panel. It used to be read three times while
+    // building one panel, so the runtime row and the per-channel rows could
+    // disagree with each other inside a single render.
+    let runtime = snapshot();
+
+    let (auto_label, auto_kind, auto_detail) = match runtime.clone() {
         AutoStartState::NotDispatched => (
             "Auto-start",
             StatusKind::Info,
@@ -403,17 +408,30 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
     // Configured channels — detailed per-row state.
     if configured_count > 0 {
         let mut sec = InfoSection::new("Configured");
-        let polling_label = match snapshot() {
-            AutoStartState::Starting { since_unix } if now.saturating_sub(since_unix) >= 5 => {
-                "polling"
+        // The runtime state is process-wide: it says whether the channels task
+        // is alive, not whether THIS channel's listener is. Labelling it
+        // per-row implied knowledge the state does not carry, so each row now
+        // reports its own configured-ness and the runtime label is suffixed
+        // with "(runtime)" to say what it actually describes.
+        //
+        // The per-channel alternative — widening `AutoStartState` to a map —
+        // changes a contract shared with the CLI, and is recorded as the
+        // follow-up rather than done here.
+        let polling_label = match &runtime {
+            AutoStartState::Starting { .. }
+                if crate::channels::auto_start_state::looks_running() =>
+            {
+                "runtime polling"
             }
-            AutoStartState::Starting { .. } => "starting…",
-            AutoStartState::Terminated { .. } => "stopped",
-            AutoStartState::Failed { .. } => "failed",
+            AutoStartState::Starting { .. } => "runtime starting…",
+            AutoStartState::Terminated { .. } => "runtime stopped",
+            AutoStartState::Failed { .. } => "runtime failed",
             AutoStartState::NotDispatched => "configured",
         };
-        let kind = match snapshot() {
-            AutoStartState::Starting { since_unix } if now.saturating_sub(since_unix) >= 5 => {
+        let kind = match &runtime {
+            AutoStartState::Starting { .. }
+                if crate::channels::auto_start_state::looks_running() =>
+            {
                 StatusKind::Ok
             }
             AutoStartState::Starting { .. } => StatusKind::Info,

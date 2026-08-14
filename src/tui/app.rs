@@ -243,6 +243,23 @@ pub struct TuiApp {
     /// landed on disk, wiping everything else (provider, api_key, ...).
     /// Fix shipped in v0.6.56.
     pub setup_save_complete_rx: Option<tokio::sync::oneshot::Receiver<crate::config::Config>>,
+    /// Set when the save-complete branch has already restarted for the save
+    /// that `reload_config` is about to observe.
+    ///
+    /// The save branch restarts immediately (the point of this fix) and
+    /// `reload_config` runs on Esc right after, re-reading the same
+    /// configuration — the live drive showed two restart lines for one
+    /// `/setup`, which costs the Telegram 409 window twice. A fingerprint memo
+    /// cannot do this: `save()` encrypts credentials, so the config written to
+    /// disk does not serialise identically to the one held in memory.
+    pub channels_restarted_for_save: bool,
+
+    /// A channel restart owed once the first-run wizard finishes.
+    ///
+    /// The wizard saves several channels in sequence; restarting per save
+    /// would flap every listener once per provisioner, so the restart is
+    /// deferred to the end rather than dropped.
+    pub channels_restart_pending: bool,
     /// Active interactive list picker — Up/Down/Enter/Esc overlay used
     /// by `/model`, `/sessions`, `/resume`, `/personality`, etc. The
     /// `ListPicker.kind` tag tells the Enter handler what to do with the
@@ -518,6 +535,8 @@ impl TuiApp {
             setup_overlay: None,
             setup_event_rx: None,
             setup_save_complete_rx: None,
+            channels_restart_pending: false,
+            channels_restarted_for_save: false,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
@@ -1717,12 +1736,26 @@ impl TuiApp {
                         self.react_to_wizard_phase();
                     }
                     super::first_run_wizard::WizardPhase::Complete => {
+                        // Clear the wizard FIRST: the deferred restart below is
+                        // only deferred because a wizard was running.
+                        self.first_run_wizard = None;
                         // Reload config so the freshly-saved provisioner
                         // sections take effect in the running TUI.
                         if let Err(e) = self.reload_config() {
                             tracing::warn!("failed to reload config after wizard: {}", e);
                         }
-                        self.first_run_wizard = None;
+                        // The wizard saves several channels in sequence, so each
+                        // save deferred its restart to here rather than flapping
+                        // every listener once per provisioner. `reload_config`
+                        // may already have restarted; only fire if it did not.
+                        if std::mem::take(&mut self.channels_restart_pending) {
+                            let msg = "✓ Channels configured — starting listener(s) now. \
+                                       `/channels` shows the current state."
+                                .to_string();
+                            let _ = self.context.append_system_message(&msg);
+                            self.scrollback_queue.push(("system".to_string(), msg));
+                            self.restart_channels();
+                        }
                     }
                     super::first_run_wizard::WizardPhase::RunningProvisioner { .. } => {
                         // Unreachable due to guard; kept for exhaustiveness.
@@ -2010,9 +2043,38 @@ impl TuiApp {
             None => None,
         };
         if let Some(Some(cfg)) = &saved_config {
+            // Compare BEFORE the swap. The swap itself is deliberate — the next
+            // provisioner's clone must see this provisioner's writes — and
+            // moving it reintroduces the bug it was added to fix.
+            let before = channels_fingerprint(&self.config);
+            let after = channels_fingerprint(cfg);
             // Save succeeded — swap in the new config NOW so the next
             // provisioner's clone sees this provisioner's writes.
             self.config = cfg.clone();
+
+            // Restart from here, not only from `reload_config`: the documented
+            // flow is `/setup channels` → picker → provisioner, and it used to
+            // leave the live runtime untouched for the rest of the session
+            // unless the operator happened to press Esc. Gated on an actual
+            // diff, because `restart_channels` re-binds every listener and
+            // firing it on a no-op save costs a Telegram 409 window.
+            //
+            // During the first-run wizard several channels are saved in
+            // sequence; the restart is deferred to the end of the wizard so the
+            // listeners are not flapped once per provisioner.
+            if channels_differ(before.as_ref(), after.as_ref()) {
+                if self.first_run_wizard.is_some() {
+                    self.channels_restart_pending = true;
+                } else {
+                    let msg = "✓ Channel settings saved — restarting listener(s) now. \
+                               `/channels` shows the current state."
+                        .to_string();
+                    let _ = self.context.append_system_message(&msg);
+                    self.scrollback_queue.push(("system".to_string(), msg));
+                    self.channels_restarted_for_save = true;
+                    self.restart_channels();
+                }
+            }
         }
         if saved_config.is_some() {
             // Either Ok or Err — the oneshot is consumed; drop the rx.
@@ -2103,7 +2165,7 @@ impl TuiApp {
     /// avoiding Telegram's single-consumer 409 window.
     fn restart_channels(&mut self) {
         let prev = self.channel_supervisor.take();
-        let configured = count_configured_channels(&self.config);
+        let configured = crate::channels::configured_channel_count(&self.config);
         self.context.channels_autostart_count = configured;
 
         if configured == 0 {
@@ -2115,6 +2177,11 @@ impl TuiApp {
                     let _ = tokio::time::timeout(Duration::from_secs(10), prev.handle).await;
                 });
             }
+            // Both early returns used to leave the auto-start state at whatever
+            // it last was — typically `Starting`, which renders as "running"
+            // after five seconds. `/channels` then said "polling" for a runtime
+            // that had been torn down.
+            crate::channels::auto_start_state::mark_terminated();
             return;
         }
 
@@ -2133,6 +2200,7 @@ impl TuiApp {
                     let _ = tokio::time::timeout(Duration::from_secs(10), prev.handle).await;
                 });
             }
+            crate::channels::auto_start_state::mark_terminated();
             return;
         }
 
@@ -2140,27 +2208,39 @@ impl TuiApp {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let task_token = shutdown.clone();
         let handle = tokio::spawn(async move {
-            // Drain the previous runtime before starting the new one so the
-            // old and new listeners don't fight over the same backend
-            // (Telegram getUpdates returns 409 to a second concurrent
-            // poller). Cancel + bounded await guarantees the old long-poll
-            // has released first.
-            if let Some(prev) = prev {
-                prev.shutdown.cancel();
-                let _ = tokio::time::timeout(Duration::from_secs(10), prev.handle).await;
-            }
-            crate::channels::auto_start_state::mark_starting();
-            match crate::channels::start_channels_with_cancellation(cfg, task_token).await {
-                Ok(()) => {
-                    crate::channels::auto_start_state::mark_terminated();
+            // A panic inside this task reached neither arm of the match below,
+            // so the state stayed `Starting` — which renders as "running"
+            // forever. Catching it here maps a panic to the same failed state
+            // an `Err` produces.
+            let body = std::panic::AssertUnwindSafe(async {
+                // Drain the previous runtime before starting the new one so the
+                // old and new listeners don't fight over the same backend
+                // (Telegram getUpdates returns 409 to a second concurrent
+                // poller). Cancel + bounded await guarantees the old long-poll
+                // has released first.
+                if let Some(prev) = prev {
+                    prev.shutdown.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(10), prev.handle).await;
                 }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    tracing::warn!(
+                crate::channels::auto_start_state::mark_starting();
+                match crate::channels::start_channels_with_cancellation(cfg, task_token).await {
+                    Ok(()) => {
+                        crate::channels::auto_start_state::mark_terminated();
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        tracing::warn!(
                         "channel runtime (re)start failed (TUI continues; channels will not respond until fixed): {msg}"
                     );
-                    crate::channels::auto_start_state::mark_failed(msg);
+                        crate::channels::auto_start_state::mark_failed(msg);
+                    }
                 }
+            });
+            let outcome = futures::FutureExt::catch_unwind(body).await;
+            if outcome.is_err() {
+                crate::channels::auto_start_state::mark_failed(
+                    "the channel runtime panicked; channels are not running".to_string(),
+                );
             }
         });
         self.channel_supervisor = Some(ChannelSupervisor { shutdown, handle });
@@ -2278,13 +2358,20 @@ impl TuiApp {
         self.context.workspace_dir = Some(config.workspace_dir.clone());
         // Refresh the channels snapshot so /channels and /platforms reflect
         // any wizard-driven add/remove since launch.
-        let prev_channels_count = count_configured_channels(&self.config);
+        // Captured from the CURRENT config, before the swap below. The save
+        // handler swaps `self.config` in as soon as the save completes (so the
+        // next provisioner's clone sees this provisioner's writes), so reading
+        // "previous" from `self.config` here read the already-swapped value:
+        // previous always equalled new, and the restart never fired.
+        let prev_channels = channels_fingerprint(&self.config);
+        let prev_channels_count = crate::channels::configured_channel_count(&self.config);
         self.context.provider_key_ok = provider_key_status(&config);
-        self.context.channels_summary = channel_status_summary(&config)
+        self.context.channels_summary = crate::channels::channel_status_roster(&config)
             .into_iter()
             .map(|(name, configured)| (name.to_string(), configured))
             .collect();
-        let new_channels_count = count_configured_channels(&config);
+        let new_channels = channels_fingerprint(&config);
+        let new_channels_count = crate::channels::configured_channel_count(&config);
         self.context.channels_autostart_count = new_channels_count;
         // When the configured channel set changes mid-session (e.g.
         // `/setup telegram`), restart the background channel runtime in
@@ -2292,19 +2379,30 @@ impl TuiApp {
         // stop — without closing the TUI. The restart itself runs after
         // `self.config` is updated below (it reads `self.config`); surface a
         // short status line so the user knows it's taking effect live.
-        let channels_changed = new_channels_count != prev_channels_count;
+        // By content, not by count: a token rotation and a one-for-one channel
+        // swap are both count-neutral. Suppressed when the save-complete branch
+        // already restarted for this exact configuration — `reload_config` runs
+        // on Esc right after, and restarting twice costs the 409 window twice.
+        // One-shot: consumed here so a later reload still restarts.
+        let already_restarted = std::mem::take(&mut self.channels_restarted_for_save);
+        let channels_changed =
+            channels_differ(prev_channels.as_ref(), new_channels.as_ref()) && !already_restarted;
         if channels_changed {
-            let msg = if new_channels_count > prev_channels_count {
-                format!(
+            let msg = match new_channels_count.cmp(&prev_channels_count) {
+                // Count-neutral: a token rotation, or a one-for-one swap. The
+                // old detector could not see this case at all.
+                std::cmp::Ordering::Equal => "✓ Channel settings changed — restarting listener(s) \
+                     now. `/channels` shows the current state."
+                    .to_string(),
+                std::cmp::Ordering::Greater => format!(
                     "✓ {} new channel(s) configured — starting listener(s) now. \
                      `/channels` shows the current state.",
                     new_channels_count - prev_channels_count
-                )
-            } else {
-                format!(
+                ),
+                std::cmp::Ordering::Less => format!(
                     "✓ {} channel(s) removed — stopping their listener(s) now.",
                     prev_channels_count - new_channels_count
-                )
+                ),
             };
             let _ = self.context.append_system_message(&msg);
             self.scrollback_queue.push(("system".to_string(), msg));
@@ -2318,6 +2416,7 @@ impl TuiApp {
         // were the missing surface.
         self.refresh_available_skills();
         if channels_changed {
+            self.channels_restart_pending = false;
             self.restart_channels();
         }
         // Push the new config to the agent actor so the next turn uses
@@ -7351,61 +7450,32 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
 /// whether to spawn `start_channels` and by `/channels` + `/platforms`
 /// to render the active set. The CLI surface is implicit (always on)
 /// and is not counted here.
-pub(crate) fn count_configured_channels(c: &crate::config::Config) -> usize {
-    let mut n = 0;
-    let cc = &c.channels_config;
-    if cc.telegram.is_some() {
-        n += 1;
+/// A comparable fingerprint of the channel configuration.
+///
+/// The change detector used to compare channel **counts**, which misses every
+/// count-neutral edit: rotating a leaked bot token, or swapping one channel for
+/// another. A stale token is the security-relevant case — the listener keeps
+/// polling with the credential the operator just revoked, and nothing is even
+/// printed.
+///
+/// Serialised rather than `PartialEq`-derived because the config types are a
+/// public contract and adding derives across them is a wider change than this
+/// needs. A serialisation failure yields `None`, and the caller treats
+/// `None != None` as "cannot prove it is unchanged", which errs toward
+/// restarting.
+pub(crate) fn channels_fingerprint(c: &crate::config::Config) -> Option<String> {
+    serde_json::to_string(&c.channels_config).ok()
+}
+
+/// Whether the channel configuration differs between two fingerprints.
+///
+/// Unprovable equality counts as a difference: a restart costs a brief
+/// reconnect, a missed restart costs the whole session.
+pub(crate) fn channels_differ(before: Option<&String>, after: Option<&String>) -> bool {
+    match (before, after) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
     }
-    if cc.discord.is_some() {
-        n += 1;
-    }
-    if cc.slack.is_some() {
-        n += 1;
-    }
-    if cc.mattermost.is_some() {
-        n += 1;
-    }
-    if cc.webhook.is_some() {
-        n += 1;
-    }
-    if cc.imessage.is_some() {
-        n += 1;
-    }
-    if cc.signal.is_some() {
-        n += 1;
-    }
-    if cc.whatsapp.is_some() {
-        n += 1;
-    }
-    if cc.linq.is_some() {
-        n += 1;
-    }
-    if cc.nextcloud_talk.is_some() {
-        n += 1;
-    }
-    if cc.email.is_some() {
-        n += 1;
-    }
-    if cc.irc.is_some() {
-        n += 1;
-    }
-    if cc.dingtalk.is_some() {
-        n += 1;
-    }
-    #[cfg(feature = "channel-matrix")]
-    {
-        if cc.matrix.is_some() {
-            n += 1;
-        }
-    }
-    #[cfg(feature = "channel-lark")]
-    {
-        if cc.lark.is_some() {
-            n += 1;
-        }
-    }
-    n
 }
 
 /// Whether the active provider can actually send a message: it has a key
@@ -7422,124 +7492,6 @@ pub(crate) fn provider_key_status(c: &crate::config::Config) -> Option<bool> {
         crate::providers::provider_is_local(provider)
             || c.resolve_key_for_provider(provider).is_some(),
     )
-}
-
-/// Per-channel state for the `/channels` and `/platforms` commands.
-/// `(name, configured, transport-hint)`. `configured=true` means the
-/// channel has a config block in `config.toml`; whether it's actually
-/// polling depends on whether `channels_autostart_count > 0` was true
-/// at TUI startup.
-///
-/// "Configured" is credential-presence, not section-presence: a block with an
-/// empty `bot_token` (a hand-edit, or an aborted `/setup`) used to render
-/// "✓ configured". Each channel carries its own notion of a credential:
-///
-/// - token-bearing channels: the required credential string is non-blank;
-/// - iMessage / Webhook: presence *is* configuration — iMessage drives the
-///   local Messages app and has no credential, Webhook is an inbound receiver
-///   keyed by a port;
-/// - WhatsApp: cloud (`access_token`) OR web (`session_path`), mirroring
-///   `doctor::checks::channels::inspect_channels`;
-/// - DingTalk: `client_id` + `client_secret` — the pair the channel actually
-///   sends to authenticate (dingtalk.rs). Its `app_id`/`app_secret` struct
-///   fields are unused by the channel (test-only), so they are not checked.
-/// - Email: `imap_host` + `smtp_host` + `username` + `password` — all required
-///   `String`s; the channel needs IMAP to receive, SMTP to send, and the pair
-///   to authenticate (channels::email_channel).
-pub(crate) fn channel_status_summary(c: &crate::config::Config) -> Vec<(&'static str, bool)> {
-    let cc = &c.channels_config;
-    let non_blank = |s: &str| !s.trim().is_empty();
-
-    #[allow(unused_mut)]
-    let mut rows: Vec<(&'static str, bool)> = vec![
-        (
-            "Telegram",
-            cc.telegram
-                .as_ref()
-                .is_some_and(|t| non_blank(&t.bot_token)),
-        ),
-        (
-            "Discord",
-            cc.discord.as_ref().is_some_and(|d| non_blank(&d.bot_token)),
-        ),
-        (
-            "Slack",
-            cc.slack.as_ref().is_some_and(|s| non_blank(&s.bot_token)),
-        ),
-        (
-            "WhatsApp",
-            cc.whatsapp.as_ref().is_some_and(|w| {
-                w.access_token.as_deref().is_some_and(non_blank)
-                    || w.session_path.as_deref().is_some_and(non_blank)
-            }),
-        ),
-        (
-            "Mattermost",
-            cc.mattermost
-                .as_ref()
-                .is_some_and(|m| non_blank(&m.url) && non_blank(&m.bot_token)),
-        ),
-        (
-            "Signal",
-            cc.signal
-                .as_ref()
-                .is_some_and(|s| non_blank(&s.http_url) && non_blank(&s.account)),
-        ),
-        (
-            "Email",
-            cc.email.as_ref().is_some_and(|e| {
-                non_blank(&e.imap_host)
-                    && non_blank(&e.smtp_host)
-                    && non_blank(&e.username)
-                    && non_blank(&e.password)
-            }),
-        ),
-        (
-            "IRC",
-            cc.irc
-                .as_ref()
-                .is_some_and(|i| non_blank(&i.server) && non_blank(&i.nickname)),
-        ),
-        (
-            "DingTalk",
-            cc.dingtalk
-                .as_ref()
-                .is_some_and(|d| non_blank(&d.client_id) && non_blank(&d.client_secret)),
-        ),
-        // Webhook: an inbound receiver; presence is configuration.
-        ("Webhook", cc.webhook.is_some()),
-        (
-            "Linq",
-            cc.linq.as_ref().is_some_and(|l| non_blank(&l.api_token)),
-        ),
-        (
-            "Nextcloud Talk",
-            cc.nextcloud_talk
-                .as_ref()
-                .is_some_and(|n| non_blank(&n.base_url) && non_blank(&n.app_token)),
-        ),
-        // iMessage: local Messages app, no credential; presence is configuration.
-        ("iMessage", cc.imessage.is_some()),
-    ];
-    #[cfg(feature = "channel-matrix")]
-    {
-        rows.push((
-            "Matrix",
-            cc.matrix
-                .as_ref()
-                .is_some_and(|m| non_blank(&m.homeserver) && non_blank(&m.access_token)),
-        ));
-    }
-    #[cfg(feature = "channel-lark")]
-    {
-        rows.push((
-            "Lark / Feishu",
-            cc.lark
-                .as_ref()
-                .is_some_and(|l| non_blank(&l.app_id) && non_blank(&l.app_secret)),
-        ));
-    }
-    rows
 }
 
 pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
@@ -7759,9 +7711,9 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // If start_channels errors (bad token, network, missing creds), the
     // user can still chat locally; the failure is logged + surfaced via
     // /channels.
-    let configured_channels = count_configured_channels(&app_config);
+    let configured_channels = crate::channels::configured_channel_count(&app_config);
     app.context.provider_key_ok = provider_key_status(&app_config);
-    app.context.channels_summary = channel_status_summary(&app_config)
+    app.context.channels_summary = crate::channels::channel_status_roster(&app_config)
         .into_iter()
         .map(|(name, configured)| (name.to_string(), configured))
         .collect();
@@ -8147,6 +8099,90 @@ mod tests {
         assert_eq!(slug, "weather");
     }
 
+    /// THE plan's primary test. The save handler swaps the new config into
+    /// `self.config` immediately (so the next provisioner's clone sees this
+    /// provisioner's writes), and the detector then read "previous" from that
+    /// already-swapped value — previous always equalled new, so the restart
+    /// never fired and `/setup channels` left the runtime untouched for the
+    /// rest of the session.
+    #[test]
+    fn a_saved_channel_change_is_detected_before_the_swap() {
+        let before = channels_fingerprint(&crate::config::Config::default());
+        let after = channels_fingerprint(&cfg_with_telegram("123:XYZ"));
+        assert!(
+            channels_differ(before.as_ref(), after.as_ref()),
+            "adding a channel must be detected"
+        );
+
+        // The bug's shape: comparing the swapped config against itself.
+        assert!(
+            !channels_differ(after.as_ref(), after.as_ref()),
+            "the same config must not look changed"
+        );
+    }
+
+    /// Count comparison missed this entirely: rotating a leaked token is
+    /// count-neutral, so the listener kept polling with the credential the
+    /// operator had just revoked — and nothing was printed.
+    #[test]
+    fn token_rotation_is_detected() {
+        let before = channels_fingerprint(&cfg_with_telegram("123:OLD"));
+        let after = channels_fingerprint(&cfg_with_telegram("123:NEW"));
+        assert!(channels_differ(before.as_ref(), after.as_ref()));
+        assert_eq!(
+            crate::channels::configured_channel_count(&cfg_with_telegram("123:OLD")),
+            crate::channels::configured_channel_count(&cfg_with_telegram("123:NEW")),
+            "precondition: the counts are equal, which is why counting missed it"
+        );
+    }
+
+    #[test]
+    fn no_change_is_not_detected_as_a_change() {
+        let cfg = cfg_with_telegram("123:XYZ");
+        let a = channels_fingerprint(&cfg);
+        let b = channels_fingerprint(&cfg);
+        assert!(
+            !channels_differ(a.as_ref(), b.as_ref()),
+            "restart_channels re-binds every listener; firing it on a no-op save \
+             costs a Telegram 409 window"
+        );
+    }
+
+    /// QQ appeared nowhere in this file: configuring it left the count at zero,
+    /// the restart returned early, and `/channels` listed it in neither
+    /// section.
+    #[test]
+    fn roster_includes_qq_and_matches_the_shared_catalog() {
+        let rows = crate::channels::channel_status_roster(&crate::config::Config::default());
+        assert!(
+            rows.iter().any(|(name, _)| *name == "QQ"),
+            "QQ must appear in the roster: {rows:?}"
+        );
+        assert_eq!(
+            rows.len(),
+            crate::channels::channel_roster(&crate::config::Config::default()).len(),
+            "the status roster and the configured roster are derived from one catalog"
+        );
+    }
+
+    /// The two former TUI copies gated Matrix and Lark on build features while
+    /// the provisioner registry offered them unconditionally, so a channel
+    /// could be offered and then never displayed. One list cannot disagree
+    /// with itself.
+    #[test]
+    fn roster_labels_match_the_configured_roster_labels() {
+        let cfg = crate::config::Config::default();
+        let status: Vec<&str> = crate::channels::channel_status_roster(&cfg)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        let configured: Vec<&str> = crate::channels::channel_roster(&cfg)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(status, configured);
+    }
+
     fn cfg_with_telegram(token: &str) -> crate::config::Config {
         let mut c = crate::config::Config::default();
         c.channels_config.telegram = Some(
@@ -8171,9 +8207,9 @@ mod tests {
     /// the check was `.is_some()`.
     #[test]
     fn empty_bot_token_reads_as_not_configured() {
-        let rows = channel_status_summary(&cfg_with_telegram(""));
+        let rows = crate::channels::channel_status_roster(&cfg_with_telegram(""));
         assert!(!is_configured(&rows, "Telegram"));
-        let rows = channel_status_summary(&cfg_with_telegram("   "));
+        let rows = crate::channels::channel_status_roster(&cfg_with_telegram("   "));
         assert!(
             !is_configured(&rows, "Telegram"),
             "whitespace is not a token"
@@ -8182,7 +8218,7 @@ mod tests {
 
     #[test]
     fn a_real_bot_token_reads_as_configured() {
-        let rows = channel_status_summary(&cfg_with_telegram("123:XYZ"));
+        let rows = crate::channels::channel_status_roster(&cfg_with_telegram("123:XYZ"));
         assert!(is_configured(&rows, "Telegram"));
     }
 
@@ -8203,7 +8239,7 @@ mod tests {
                 }))
                 .unwrap(),
             );
-            channel_status_summary(&c)
+            crate::channels::channel_status_roster(&c)
         };
         assert!(is_configured(&with("cid", "sec"), "DingTalk"));
         assert!(!is_configured(&with("", "sec"), "DingTalk"), "no client_id");
@@ -8227,7 +8263,7 @@ mod tests {
                 }))
                 .unwrap(),
             );
-            channel_status_summary(&c)
+            crate::channels::channel_status_roster(&c)
         };
         assert!(is_configured(&cfg("imap.x", "smtp.x", "u", "p"), "Email"));
         assert!(
@@ -8250,7 +8286,7 @@ mod tests {
 
     #[test]
     fn an_absent_channel_reads_as_not_configured() {
-        let rows = channel_status_summary(&crate::config::Config::default());
+        let rows = crate::channels::channel_status_roster(&crate::config::Config::default());
         assert!(!is_configured(&rows, "Telegram"));
         assert!(!is_configured(&rows, "Discord"));
     }
@@ -8263,7 +8299,7 @@ mod tests {
         let mut c = crate::config::Config::default();
         c.channels_config.imessage =
             Some(serde_json::from_value(serde_json::json!({ "allowed_contacts": [] })).unwrap());
-        let rows = channel_status_summary(&c);
+        let rows = crate::channels::channel_status_roster(&c);
         assert!(is_configured(&rows, "iMessage"));
     }
 
@@ -8336,6 +8372,8 @@ mod tests {
             setup_overlay: None,
             setup_event_rx: None,
             setup_save_complete_rx: None,
+            channels_restart_pending: false,
+            channels_restarted_for_save: false,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
@@ -8440,6 +8478,8 @@ mod submit_tests {
             setup_overlay: None,
             setup_event_rx: None,
             setup_save_complete_rx: None,
+            channels_restart_pending: false,
+            channels_restarted_for_save: false,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
@@ -8806,6 +8846,8 @@ mod ctrl_c_tests {
             setup_overlay: None,
             setup_event_rx: None,
             setup_save_complete_rx: None,
+            channels_restart_pending: false,
+            channels_restarted_for_save: false,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
@@ -8991,6 +9033,8 @@ mod drain_tests {
             setup_overlay: None,
             setup_event_rx: None,
             setup_save_complete_rx: None,
+            channels_restart_pending: false,
+            channels_restarted_for_save: false,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,
@@ -9334,6 +9378,8 @@ mod retry_tests {
             setup_overlay: None,
             setup_event_rx: None,
             setup_save_complete_rx: None,
+            channels_restart_pending: false,
+            channels_restarted_for_save: false,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
             list_picker: None,

@@ -3120,6 +3120,103 @@ pub(crate) fn channel_is_configured(key: &str, config: &Config) -> bool {
     }
 }
 
+/// Whether `key`'s config block carries the credential it needs to run.
+///
+/// Stronger than [`channel_is_configured`], which only asks whether the section
+/// exists: a block with an empty `bot_token` — a hand-edit, or an aborted
+/// `/setup` — is present but cannot start. Each channel carries its own notion
+/// of a credential; iMessage and Webhook have none (iMessage drives the local
+/// Messages app, Webhook is an inbound receiver), so presence *is*
+/// configuration for those two.
+///
+/// This lived as a private copy inside `src/tui/app.rs` alongside a second
+/// copy that used the weaker predicate — two lists that could and did disagree
+/// with each other and with this module. It belongs here, beside the catalog
+/// they are both derived from.
+pub(crate) fn channel_has_credentials(key: &str, config: &Config) -> bool {
+    let c = &config.channels_config;
+    let filled = |s: &str| !s.trim().is_empty();
+    match key {
+        "telegram" => c.telegram.as_ref().is_some_and(|t| filled(&t.bot_token)),
+        "discord" => c.discord.as_ref().is_some_and(|d| filled(&d.bot_token)),
+        "slack" => c.slack.as_ref().is_some_and(|s| filled(&s.bot_token)),
+        "mattermost" => c
+            .mattermost
+            .as_ref()
+            .is_some_and(|m| filled(&m.url) && filled(&m.bot_token)),
+        // Presence is configuration: the webhook is served by the gateway and
+        // authenticates per-request, not per-channel.
+        "webhook" => c.webhook.is_some(),
+        // Presence is configuration: iMessage drives the local Messages app.
+        "imessage" => c.imessage.is_some(),
+        "matrix" => {
+            cfg!(feature = "channel-matrix")
+                && c.matrix
+                    .as_ref()
+                    .is_some_and(|m| filled(&m.homeserver) && filled(&m.access_token))
+        }
+        "signal" => c
+            .signal
+            .as_ref()
+            .is_some_and(|s| filled(&s.http_url) && filled(&s.account)),
+        // Either transport counts: the Cloud API uses an access token, the
+        // web client a linked session.
+        "whatsapp" => c.whatsapp.as_ref().is_some_and(|w| {
+            w.access_token.as_deref().is_some_and(filled)
+                || w.session_path.as_deref().is_some_and(filled)
+        }),
+        "linq" => c.linq.as_ref().is_some_and(|l| filled(&l.api_token)),
+        "nextcloud_talk" => c
+            .nextcloud_talk
+            .as_ref()
+            .is_some_and(|n| filled(&n.base_url) && filled(&n.app_token)),
+        "email" => c.email.as_ref().is_some_and(|e| {
+            filled(&e.imap_host)
+                && filled(&e.smtp_host)
+                && filled(&e.username)
+                && filled(&e.password)
+        }),
+        "irc" => c
+            .irc
+            .as_ref()
+            .is_some_and(|i| filled(&i.server) && filled(&i.nickname)),
+        "lark" => {
+            cfg!(feature = "channel-lark")
+                && c.lark
+                    .as_ref()
+                    .is_some_and(|l| filled(&l.app_id) && filled(&l.app_secret))
+        }
+        "dingtalk" => c
+            .dingtalk
+            .as_ref()
+            .is_some_and(|d| filled(&d.client_id) && filled(&d.client_secret)),
+        "qq" => {
+            c.qq.as_ref()
+                .is_some_and(|q| filled(&q.app_id) && filled(&q.app_secret))
+        }
+        _ => false,
+    }
+}
+
+/// Roster keyed on credential presence rather than section presence.
+///
+/// The `(display label, ready?)` shape the TUI status panel needs, derived from
+/// the same [`CHANNEL_CATALOG`] as [`channel_roster`] so the two cannot drift.
+pub(crate) fn channel_status_roster(config: &Config) -> Vec<(&'static str, bool)> {
+    CHANNEL_CATALOG
+        .iter()
+        .map(|(key, display)| (*display, channel_has_credentials(key, config)))
+        .collect()
+}
+
+/// How many channels are configured well enough to start.
+pub(crate) fn configured_channel_count(config: &Config) -> usize {
+    CHANNEL_CATALOG
+        .iter()
+        .filter(|(key, _)| channel_has_credentials(key, config))
+        .count()
+}
+
 /// Canonical channel roster: `(display label, configured?)` for every channel
 /// type in a stable order, derived from [`CHANNEL_CATALOG`] rather than
 /// maintained beside it.
