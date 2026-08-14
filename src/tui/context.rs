@@ -119,6 +119,14 @@ pub struct TuiContext {
     /// `/channels` and `/platforms` to render the table without needing
     /// live access to the on-disk config. Refreshed by `reload_config`.
     pub channels_summary: Vec<(String, bool)>,
+    /// The approval boundary a channel message meets: `(approval owner count,
+    /// autonomous_tools)`. Precomputed like `channels_summary` so the panel
+    /// does not carry `Config`.
+    ///
+    /// `autonomous_tools` voids the owner list entirely and appeared on no TUI
+    /// surface, so an operator could read "0 owners" and conclude channel
+    /// senders cannot trigger tools while every message ran them unprompted.
+    pub approval_boundary: (usize, bool),
     /// Whether the active provider has a usable API key (or is a local provider
     /// that needs none). Precomputed where `Config` is available — same pattern
     /// as `channels_summary` — so `/doctor` can report the truth without the
@@ -219,6 +227,7 @@ impl TuiContext {
             available_commands: Vec::new(),
             channels_autostart_count: 0,
             channels_summary: Vec::new(),
+            approval_boundary: (0, false),
             provider_key_ok: None,
             input_history: Vec::new(),
             input_history_pos: None,

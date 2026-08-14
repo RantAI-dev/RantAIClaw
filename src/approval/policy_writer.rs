@@ -89,6 +89,22 @@ impl PolicyPreset {
     /// Cycle order for the Shift+Tab keybinding and `rantaiclaw autonomy`
     /// CLI: Manual → Smart → Strict → Off → Manual. Picked so a casual
     /// tap walks from paranoid → default → CI → autonomous and back.
+    /// The next rung the Shift+Tab cycle should land on.
+    ///
+    /// `Off` — "no prompts" — is deliberately NOT reachable by cycling: the
+    /// keybinding is one keypress with no confirmation, and removing the
+    /// approval gate entirely should be an explicit act. `/autonomy off` still
+    /// selects it, and `next()` still walks all four for anything that wants
+    /// the canonical order.
+    pub fn next_cycled(self) -> Self {
+        match self {
+            Self::Manual => Self::Smart,
+            Self::Smart => Self::Strict,
+            // Skips `Off`.
+            Self::Strict | Self::Off => Self::Manual,
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::Manual => Self::Smart,
@@ -673,7 +689,34 @@ mod tests {
         );
     }
 
+    /// `Off` is "no prompts". The Shift+Tab cycle is one keypress with no
+    /// confirmation, and it used to walk straight into it.
     #[test]
+    fn cycle_never_reaches_off() {
+        let mut seen = vec![];
+        let mut p = PolicyPreset::Manual;
+        for _ in 0..8 {
+            p = p.next_cycled();
+            seen.push(p);
+        }
+        assert!(
+            !seen.contains(&PolicyPreset::Off),
+            "cycling must not reach Off: {seen:?}"
+        );
+        // And it still visits the other three.
+        for rung in [
+            PolicyPreset::Manual,
+            PolicyPreset::Smart,
+            PolicyPreset::Strict,
+        ] {
+            assert!(seen.contains(&rung), "{rung:?} unreachable by cycling");
+        }
+        // Starting FROM Off still escapes it.
+        assert_eq!(PolicyPreset::Off.next_cycled(), PolicyPreset::Manual);
+        // `next()` keeps the canonical four-rung order for /autonomy.
+        assert_eq!(PolicyPreset::Strict.next(), PolicyPreset::Off);
+    }
+
     fn next_cycles_in_canonical_order() {
         assert_eq!(PolicyPreset::Manual.next(), PolicyPreset::Smart);
         assert_eq!(PolicyPreset::Smart.next(), PolicyPreset::Strict);

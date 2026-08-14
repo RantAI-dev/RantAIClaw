@@ -601,8 +601,14 @@ impl TuiApp {
         use crate::approval::policy_writer::{self, PolicyPreset};
         let dir = self.profile.policy_dir();
         let current = policy_writer::read_active_preset(&dir).unwrap_or(PolicyPreset::Smart);
-        let next = current.next();
-        let warning = match policy_writer::write_policy_files(&self.profile, next, true) {
+        // `next_cycled`, not `next`: the cycle skips `Off` ("no prompts").
+        // Removing the approval gate entirely is an explicit act — `/autonomy
+        // off` — not something one unconfirmed keypress can do.
+        let next = current.next_cycled();
+        // `force = false`: this path is a keybinding. Forcing rewrote the
+        // policy files wholesale, clobbering hand-edited allowlists on an
+        // accidental press — the function's own doc said so.
+        let warning = match policy_writer::write_policy_files(&self.profile, next, false) {
             Ok(w) => w,
             Err(e) => {
                 let _ = self
@@ -618,13 +624,20 @@ impl TuiApp {
         // config.toml synchronously via block_in_place and asks the
         // actor to rebuild the agent with the new policy.
         if let Err(e) = self.apply_preset_to_config_and_reload(next) {
-            let _ = self
-                .context
-                .append_system_message(&format!("⚠ Preset written, but live reload failed: {e}"));
+            // Do NOT record or report the new level. It used to update
+            // `autonomy_preset` and announce the new rung even when the live
+            // reload failed, so the status bar asserted a level that was not in
+            // force — the most dangerous direction for this particular lie.
+            let _ = self.context.append_system_message(&format!(
+                "✗ Autonomy unchanged — the policy files were written but the live reload failed: {e}. \
+                 Still running as {}.",
+                current.label()
+            ));
+            return;
         }
         self.context.autonomy_preset = Some(next);
         let _ = self.context.append_system_message(&format!(
-            "⚙ Autonomy mode → {} ({}). Shift+Tab to cycle · /autonomy to pick.",
+            "⚙ Autonomy mode → {} ({}). Shift+Tab cycles Manual→Smart→Strict · `/autonomy off` to disable prompts.",
             next.label(),
             preset_blurb(next),
         ));
@@ -697,11 +710,22 @@ impl TuiApp {
         // Persist / Session decisions also add the basename to the
         // runtime allowlist so the same command doesn't prompt twice
         // in this session. Mirrors what /allow does.
+        // Resolve by ID, and grant only after it resolves.
+        //
+        // This used to widen the allowlist FIRST and then resolve by basename —
+        // which returns nothing when two requests share one. The agent loop runs
+        // tool calls in parallel (this file says so), so two pending `curl`
+        // calls are ordinary: pressing `A` permanently allowlisted `curl`,
+        // cleared the prompt, resolved neither call, and hung the turn.
+        let resolved = pending.resolve(req.id, decision);
+
         let persist_flag = matches!(decision, crate::security::Decision::Persist);
-        if matches!(
-            decision,
-            crate::security::Decision::Session | crate::security::Decision::Persist
-        ) {
+        if resolved
+            && matches!(
+                decision,
+                crate::security::Decision::Session | crate::security::Decision::Persist
+            )
+        {
             if let Err(e) = security.add_runtime_command(&basename, persist_flag) {
                 tracing::warn!(
                     target: "tui",
@@ -711,7 +735,6 @@ impl TuiApp {
                 );
             }
         }
-        let resolved = pending.resolve_by_basename(&basename, decision).is_some();
 
         // Deny → cancel the entire turn. Without this, the shell tool
         // returns the error to the LLM which typically reacts by
@@ -744,27 +767,34 @@ impl TuiApp {
             crate::security::Decision::Deny => {
                 format!("✗ Denied `{basename}` — turn cancelled.")
             }
-            _ => {
-                format!("⚠ `{basename}` was no longer pending (timed out or already resolved).")
-            }
+            // Was "no longer pending (timed out or already resolved)", which
+            // was false in the case that actually produced it: the request WAS
+            // pending, the basename lookup just could not tell two of them
+            // apart. Nothing was granted either, since the grant now follows
+            // the resolve.
+            _ => format!(
+                "⚠ Could not resolve the approval for `{basename}` — it is no longer registered. \
+                 Nothing was added to the allowlist."
+            ),
         };
         let _ = self.context.append_system_message(&msg);
         self.scrollback_queue.push(("system".into(), msg));
 
         // Concurrent blocked calls: an approve keeps the turn running, so pull
         // the next still-queued request into the box instead of leaving it
-        // stranded off-screen. Skip the basename we just resolved — its
+        // stranded off-screen. Skip the request we just resolved BY ID — its
         // snapshot entry is cleared asynchronously (when its awaiting future
-        // unwinds), so `list()` can still report it for a tick. A Deny cancels
-        // the whole turn (dropping the other blocked calls), so don't resurface
-        // anything there.
-        if resolved
-            && matches!(
-                decision,
-                crate::security::Decision::Session | crate::security::Decision::Persist
-            )
-        {
-            self.pending_approval = pending.list().into_iter().find(|r| r.basename != basename);
+        // unwinds), so `list()` can still report it for a tick. Skipping by
+        // basename also dropped a *different* pending call that happened to
+        // share one, which is the same conflation the resolve had. A Deny
+        // cancels the whole turn, so don't resurface anything there.
+        if matches!(
+            decision,
+            crate::security::Decision::Session | crate::security::Decision::Persist
+        ) {
+            // Requeued whether or not this one resolved: if it did not, the
+            // box would otherwise be left empty with calls still blocked.
+            self.pending_approval = pending.list().into_iter().find(|r| r.id != req.id);
         }
     }
 
@@ -1217,7 +1247,17 @@ impl TuiApp {
             // their own arms further down. Cycling autonomy from inside
             // the setup wizard is a silent state change that the user
             // didn't ask for.
-            KeyCode::BackTab if self.setup_overlay.is_none() && self.first_run_wizard.is_none() => {
+            // Also gated on there being no approval on screen and no turn in
+            // flight. The approval handler requires unmodified keys and
+            // `BackTab` carries SHIFT, so this arm used to fire from INSIDE an
+            // open approval prompt: the operator is looking at a gate while
+            // removing it, and one of the rungs is "no prompts".
+            KeyCode::BackTab
+                if self.setup_overlay.is_none()
+                    && self.first_run_wizard.is_none()
+                    && self.pending_approval.is_none()
+                    && !matches!(self.state, AppState::Streaming { .. }) =>
+            {
                 self.cycle_autonomy_preset();
                 return Ok(EventResult::Continue);
             }
@@ -1958,14 +1998,17 @@ impl TuiApp {
             loop {
                 match rx.try_recv() {
                     Ok(req) => {
-                        // Short audit-trail line for scrollback — the
-                        // real prompt UI is the boxed widget that takes
-                        // over the input row. The full command was
-                        // already echoed in the assistant's tool block
-                        // line, so this is just the gate fingerprint.
+                        // The FULL command goes here. The pane below
+                        // truncates its preview at 200 characters and
+                        // justifies that by saying the whole thing was
+                        // shown in scrollback — which was not true: this
+                        // line printed only the basename, so a long
+                        // command was approved without ever being shown
+                        // in full anywhere.
                         let line = format!(
-                            "🔒 awaiting decision on `{}` (press Y/A/N or Esc)",
-                            req.basename
+                            "🔒 awaiting decision on `{}` (press Y/A/N or Esc)\n    {}",
+                            req.basename,
+                            req.full_command.replace('\n', "\n    ")
                         );
                         let _ = self.context.append_system_message(&line);
                         self.scrollback_queue.push(("system".into(), line));
@@ -2366,6 +2409,10 @@ impl TuiApp {
         let prev_channels = channels_fingerprint(&self.config);
         let prev_channels_count = crate::channels::configured_channel_count(&self.config);
         self.context.provider_key_ok = provider_key_status(&config);
+        self.context.approval_boundary = (
+            config.channels_config.approval_owners.len(),
+            config.channels_config.autonomous_tools,
+        );
         self.context.channels_summary = crate::channels::channel_status_roster(&config)
             .into_iter()
             .map(|(name, configured)| (name.to_string(), configured))
@@ -2863,6 +2910,12 @@ impl TuiApp {
                 // reserved for errors only.
                 let _ = self.context.append_system_message(&msg);
                 self.scrollback_queue.push(("system".to_string(), msg));
+            }
+            CmdResult::SensitiveMessage { display, persisted } => {
+                // The redacted form goes to the session store; the real one
+                // only ever reaches the terminal.
+                let _ = self.context.append_system_message(&persisted);
+                self.scrollback_queue.push(("system".to_string(), display));
             }
             CmdResult::Overlay(content) => {
                 // Inline-mode: render the overlay's body straight into
@@ -5349,7 +5402,10 @@ fn render_approval_pane(
 
     let mut chip_spans: Vec<Span<'static>> = Vec::new();
     chip_spans.extend(chip("Y", "yes (session)", key_bg, key_fg, muted));
-    chip_spans.extend(chip("A", "always (persist)", key_bg, key_fg, muted));
+    // Says what it grants. "always (persist)" reads as "this command";
+    // allowlisting one long `curl` invocation permits EVERY future `curl`.
+    let always_label = format!("always: any `{}`", req.basename);
+    chip_spans.extend(chip("A", &always_label, key_bg, key_fg, muted));
     chip_spans.extend(chip("N", "no", key_bg, key_fg, muted));
     chip_spans.extend(chip("Esc", "deny", key_bg, key_fg, muted));
 
@@ -5374,7 +5430,12 @@ fn render_approval_pane(
                 .fg(Color::Rgb(255, 255, 255))
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
+        // Where it came from. An approval arriving from a chat channel was
+        // indistinguishable from one the operator triggered locally.
+        Span::styled(
+            format!(" · from {} ", req.channel),
+            Style::default().fg(muted),
+        ),
     ]);
 
     let para = Paragraph::new(body)
@@ -7713,6 +7774,10 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     // /channels.
     let configured_channels = crate::channels::configured_channel_count(&app_config);
     app.context.provider_key_ok = provider_key_status(&app_config);
+    app.context.approval_boundary = (
+        app_config.channels_config.approval_owners.len(),
+        app_config.channels_config.autonomous_tools,
+    );
     app.context.channels_summary = crate::channels::channel_status_roster(&app_config)
         .into_iter()
         .map(|(name, configured)| (name.to_string(), configured))

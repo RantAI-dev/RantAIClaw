@@ -28,6 +28,7 @@ const DEFAULT_TTL_MINUTES: i64 = 15;
 pub struct PairCommand;
 
 /// Parsed `/pair` arguments.
+#[derive(Debug)]
 struct PairArgs {
     channel: String,
     ttl_minutes: i64,
@@ -39,11 +40,16 @@ struct PairArgs {
 fn parse_args(args: &str) -> std::result::Result<PairArgs, String> {
     let mut channel: Option<String> = None;
     let mut ttl_minutes = DEFAULT_TTL_MINUTES;
-    let mut grant_owner = true;
+    // Owner-granting is opt-IN. It used to default to true, so the plain
+    // `/pair telegram` minted a code whose holder becomes an approval owner.
+    let mut grant_owner = false;
 
     let mut it = args.split_whitespace();
     while let Some(tok) = it.next() {
         match tok {
+            "--owner" => grant_owner = true,
+            // Kept so an existing muscle-memory invocation is not an error;
+            // it is now the default.
             "--no-owner" => grant_owner = false,
             "--ttl" => {
                 let Some(val) = it.next() else {
@@ -62,23 +68,47 @@ fn parse_args(args: &str) -> std::result::Result<PairArgs, String> {
             }
             other if other.starts_with("--") => {
                 return Err(format!(
-                    "Unknown flag `{other}`. Usage: /pair [channel] [--ttl N] [--no-owner]"
+                    "Unknown flag `{other}`. Usage: /pair [channel] [--ttl N] [--owner]"
                 ));
             }
             other if channel.is_none() => channel = Some(other.to_string()),
             other => {
                 return Err(format!(
-                    "Unexpected argument `{other}`. Usage: /pair [channel] [--ttl N] [--no-owner]"
+                    "Unexpected argument `{other}`. Usage: /pair [channel] [--ttl N] [--owner]"
                 ));
             }
         }
     }
 
+    let channel = channel.unwrap_or_else(|| DEFAULT_CHANNEL.to_string());
+    // The channel argument used to be accepted verbatim, so `/pair telgram`
+    // minted a code under a surface no listener ever reads — it simply never
+    // worked, with no error. Validated against the shared catalog rather than
+    // a list invented here.
+    if !valid_pair_surface(&channel) {
+        return Err(format!(
+            "Unknown channel `{channel}`. Valid surfaces: {}.",
+            valid_pair_surfaces().join(", ")
+        ));
+    }
+
     Ok(PairArgs {
-        channel: channel.unwrap_or_else(|| DEFAULT_CHANNEL.to_string()),
+        channel,
         ttl_minutes,
         grant_owner,
     })
+}
+
+/// Surfaces a pairing code can be minted for: every channel in the shared
+/// catalog, plus the gateway.
+fn valid_pair_surfaces() -> Vec<&'static str> {
+    let mut surfaces: Vec<&'static str> = crate::channels::channel_catalog_keys();
+    surfaces.push("gateway");
+    surfaces
+}
+
+fn valid_pair_surface(candidate: &str) -> bool {
+    valid_pair_surfaces().contains(&candidate)
 }
 
 /// Current unix time in seconds (the clock the store windows codes against).
@@ -91,19 +121,24 @@ fn now_unix() -> i64 {
 
 /// Mint a code into the shared store under the active profile root and render
 /// the success message.
-fn mint_and_render(args: &PairArgs) -> Result<String> {
+///
+/// Returns `(displayed, persisted)`: the second is what reaches `sessions.db`,
+/// with the code redacted.
+fn mint_and_render(args: &PairArgs) -> Result<(String, String)> {
     let root = crate::profile::ProfileManager::active()?.root;
     let code = pairing_store::mint(
         &root,
         &args.channel,
         args.ttl_minutes.saturating_mul(60),
-        None,
+        // One use, matching what the gateway path already mints. `None` meant
+        // unlimited: a code that leaked stayed claimable for its whole window.
+        Some(1),
         args.grant_owner,
         now_unix(),
     )?;
 
     let mut msg = format!(
-        "🔐 Pairing code for {}: {}   (valid {} min, multi-use)",
+        "🔐 Pairing code for {}: {}   (valid {} min, single use)",
         args.channel, code, args.ttl_minutes
     );
     if args.grant_owner {
@@ -118,7 +153,17 @@ fn mint_and_render(args: &PairArgs) -> Result<String> {
         );
     }
     msg.push_str("\n   No daemon restart needed — a running channel picks this up automatically.");
-    Ok(msg)
+
+    // What the session store sees. `sessions.db` is full-text indexed and long
+    // outlives the code's window, so the plaintext must not reach it.
+    let persisted = format!(
+        "🔐 Pairing code minted for {} (valid {} min, single use{}). \
+         The code itself was shown on screen only and is not recorded here.",
+        args.channel,
+        args.ttl_minutes,
+        if args.grant_owner { ", owner" } else { "" }
+    );
+    Ok((msg, persisted))
 }
 
 impl CommandHandler for PairCommand {
@@ -131,7 +176,7 @@ impl CommandHandler for PairCommand {
     }
 
     fn usage(&self) -> &str {
-        "/pair [channel] [--ttl N] [--no-owner]"
+        "/pair [channel] [--ttl N] [--owner]"
     }
 
     fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
@@ -140,7 +185,7 @@ impl CommandHandler for PairCommand {
             Err(msg) => return Ok(CommandResult::Message(format!("✗ {msg}"))),
         };
         match mint_and_render(&parsed) {
-            Ok(msg) => Ok(CommandResult::Message(msg)),
+            Ok((display, persisted)) => Ok(CommandResult::SensitiveMessage { display, persisted }),
             Err(e) => Ok(CommandResult::Message(format!(
                 "✗ Could not mint pairing code: {e}"
             ))),
@@ -175,16 +220,59 @@ mod tests {
         let mut ctx = test_context();
 
         match PairCommand.execute("", &mut ctx).unwrap() {
-            CommandResult::Message(m) => {
-                assert!(m.contains('-'), "should carry a dash-grouped code: {m}");
-                assert!(m.contains("telegram"), "{m}");
-                assert!(m.contains("/claim"), "{m}");
-                assert!(m.contains("/bind"), "{m}");
+            CommandResult::SensitiveMessage { display, persisted } => {
+                assert!(
+                    display.contains('-'),
+                    "should carry a dash-grouped code: {display}"
+                );
+                assert!(display.contains("telegram"), "{display}");
+                // Owner-granting is opt-in now, so the bare `/pair` mints a
+                // chat-only code: `/bind`, no `/claim`.
+                assert!(display.contains("/bind"), "{display}");
+                assert!(
+                    !display.contains("/claim"),
+                    "the default must not grant owner: {display}"
+                );
+                // THE point of the variant: the code never reaches the store.
+                assert!(
+                    !persisted.contains('-') || !persisted.contains("Pairing code for"),
+                    "the persisted form must not carry the code: {persisted}"
+                );
+                assert!(persisted.contains("not recorded here"), "{persisted}");
             }
-            other => panic!("expected Message, got {other:?}"),
+            other => panic!("expected SensitiveMessage, got {other:?}"),
         }
 
         restore_home(prev_home);
+    }
+
+    /// The channel argument was accepted verbatim, so a typo minted a code
+    /// under a surface no listener reads — it simply never worked, silently.
+    #[test]
+    fn pair_rejects_an_unknown_channel() {
+        let err = parse_args("telgram").expect_err("a typo must be refused");
+        assert!(err.contains("Unknown channel"), "{err}");
+        assert!(
+            err.contains("telegram"),
+            "the valid list must be shown: {err}"
+        );
+
+        // Every catalog channel is accepted, plus the gateway.
+        for good in ["telegram", "qq", "irc", "gateway"] {
+            assert!(parse_args(good).is_ok(), "{good} must be valid");
+        }
+    }
+
+    /// The default used to be owner-granting and unlimited-use: the plain
+    /// `/pair telegram` minted a code whose holder becomes an approval owner,
+    /// claimable as many times as it leaked.
+    #[test]
+    fn pair_defaults_to_non_owner() {
+        let args = parse_args("telegram").expect("valid");
+        assert!(!args.grant_owner, "owner must be opt-in");
+
+        let args = parse_args("telegram --owner").expect("valid");
+        assert!(args.grant_owner, "--owner opts in");
     }
 
     #[test]
@@ -199,9 +287,9 @@ mod tests {
             .execute("whatsapp --no-owner", &mut ctx)
             .unwrap()
         {
-            CommandResult::Message(m) => {
-                assert!(m.contains("whatsapp"), "{m}");
-                assert!(m.contains("does not grant owner"), "{m}");
+            CommandResult::SensitiveMessage { display, .. } => {
+                assert!(display.contains("whatsapp"), "{display}");
+                assert!(display.contains("does not grant owner"), "{display}");
             }
             other => panic!("expected Message, got {other:?}"),
         }

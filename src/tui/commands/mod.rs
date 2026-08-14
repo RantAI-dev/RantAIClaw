@@ -36,6 +36,17 @@ pub(crate) fn normalise_skill_name(s: &str) -> String {
 pub enum CommandResult {
     Continue,
     Message(String),
+    /// A message whose on-screen form carries a secret and whose persisted
+    /// form must not.
+    ///
+    /// `/pair` mints an owner-granting code and used to return it as a plain
+    /// `Message`, which is written into `sessions.db` — full-text indexed, and
+    /// long outliving the code's fifteen-minute window. `display` is rendered;
+    /// `persisted` is what the session store sees.
+    SensitiveMessage {
+        display: String,
+        persisted: String,
+    },
     /// Open a modal overlay (Claude-Code-style). The renderer pins it
     /// above the chat until the user presses `Esc`. Use for content too
     /// big or too structured for an inline `Message` — `/help`, full

@@ -180,6 +180,19 @@ pub fn render(config: &Config, safe_tools: &[String]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{}", crate::cli_style::heading("permissions"));
 
+    // `autonomous_tools` first, because when it is true everything printed
+    // below it is irrelevant: the approval gate is skipped entirely, so an
+    // operator reading "Owners (none)" would otherwise conclude channel senders
+    // cannot trigger tools while every channel message executes them
+    // unprompted. It appeared on no TUI or CLI surface at all.
+    if cc.autonomous_tools {
+        let _ = writeln!(
+            out,
+            "⚠ autonomous_tools = true — the approval gate is OFF. Every sender below runs tools\n               without prompting, and the owner and guest lists that follow do not restrain it."
+        );
+        out.push('\n');
+    }
+
     // Owners.
     out.push_str("Owners (full toolset, may approve):\n");
     if cc.approval_owners.is_empty() {
@@ -257,6 +270,34 @@ pub fn render(config: &Config, safe_tools: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `autonomous_tools` makes every list below it irrelevant — the approval
+    /// gate is skipped entirely — and it appeared on no surface at all, so an
+    /// operator could read "Owners (none)" and reasonably conclude channel
+    /// senders could not trigger tools.
+    #[test]
+    fn permissions_render_shows_autonomous_tools() {
+        let mut c = cfg();
+        c.channels_config.approval_owners = vec!["1360247715".to_string()];
+
+        let out = render(&c, &[]);
+        assert!(
+            !out.contains("autonomous_tools"),
+            "silent when the flag is off: {out}"
+        );
+
+        c.channels_config.autonomous_tools = true;
+        let out = render(&c, &[]);
+        assert!(out.contains("autonomous_tools = true"), "{out}");
+        assert!(
+            out.contains("approval gate is OFF"),
+            "it must say what the flag does: {out}"
+        );
+        // First, because everything after it is void.
+        let flag_at = out.find("autonomous_tools").expect("present");
+        let owners_at = out.find("Owners").expect("present");
+        assert!(flag_at < owners_at, "the flag must precede the owner list");
+    }
 
     /// A Telegram `@username` can be released and re-registered, so an owner
     /// entry recorded under one is transferable to whoever claims it next.
