@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 20;
+pub const CURRENT_VERSION: u32 = 21;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -285,6 +285,17 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
     // fingerprint is accepted with intent.
     if from < 20 {
         // (no transformation; additive field, refusal is the new default)
+    }
+
+    // v20 → v21: `[channels_config.webhook] port` was REMOVED. Nothing ever
+    // read it — the gateway binds its own listener — so an operator who set it
+    // was told to open a firewall port nothing listens on, and the callback
+    // never arrived. A leftover `port` in an existing config is ignored by
+    // serde rather than rejected, so there is nothing to transform; the key can
+    // be deleted by hand at leisure. This arm burns a version slot so the
+    // schema_drift fingerprint is accepted with intent.
+    if from < 21 {
+        // (no transformation; a removed key that no code read)
     }
 
     // Future migrations (v21, v22, …) inserted here in order.
@@ -835,6 +846,36 @@ backend = \"markdown\"
             irc.get("allow_insecure_tls_with_password").is_none(),
             "the migration must not grant the opt-in on the operator's behalf"
         );
+    }
+
+    #[test]
+    fn v21_webhook_config_keeps_loading_with_the_removed_port_key() {
+        // The key is gone from the schema, so the only thing that matters is
+        // that a config still carrying it loads instead of being rejected.
+        let _guard = V18EnvGuard::scrubbed();
+        let mut v = parse(
+            "schema_version = 20\n[channels_config.webhook]\nport = 8080\nsecret = \"shared\"\n",
+        );
+        migrate(&mut v).unwrap();
+        assert_eq!(version_of(&v), Some(i64::from(CURRENT_VERSION)));
+        let webhook = v
+            .get("channels_config")
+            .and_then(|c| c.get("webhook"))
+            .and_then(Value::as_table)
+            .expect("webhook table survives");
+        assert_eq!(
+            webhook.get("secret").and_then(Value::as_str),
+            Some("shared"),
+            "the key that IS read must survive"
+        );
+        // The dead key is left in place rather than rewritten out: a migration
+        // that edits a file to remove something inert is churn, and serde
+        // ignores it.
+        assert!(webhook.get("port").is_some());
+        let parsed: crate::config::schema::WebhookConfig =
+            toml::from_str("port = 8080\nsecret = \"shared\"\n")
+                .expect("a section still carrying `port` must load, not error");
+        assert_eq!(parsed.secret.as_deref(), Some("shared"));
     }
 
     #[test]

@@ -90,24 +90,9 @@ impl TuiProvisioner for SlackProvisioner {
             return Ok(ProvisionOutcome::Aborted("Bot token is required.".into()));
         }
 
-        // Optional app-level token
-        send(
-            &events,
-            ProvisionEvent::Prompt {
-                id: "app_token".into(),
-                label: "App-level token for Socket Mode (xapp-..., Enter to skip)".into(),
-                default: None,
-                secret: true,
-            },
-        )
-        .await?;
-
-        let app_token = recv_text(&mut responses).await?;
-        let app_token = if app_token.trim().is_empty() {
-            None
-        } else {
-            Some(app_token.trim().to_string())
-        };
+        // No app-token prompt: Socket Mode is not implemented, so the token
+        // is a real credential collected for nothing.
+        let app_token: Option<String> = None;
 
         // Validate bot token
         send(

@@ -573,8 +573,7 @@ mod slack {
                 // prefix, and this repo's fixtures have been rejected at push
                 // time for looking real. The provisioner does not check shape.
                 ProvisionResponse::Text("placeholder-slack-bot-token".into()), // bot token
-                ProvisionResponse::Text(String::new()), // app token (optional)
-                ProvisionResponse::Selection(vec![0]),  // probe inconclusive -> save anyway
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
                 ProvisionResponse::Text(String::new()), // default channel (optional)
                 ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
             ],
@@ -934,7 +933,6 @@ mod lark {
                 ProvisionResponse::Text("placeholder-app-secret".into()), // app secret
                 ProvisionResponse::Selection(vec![1]),                // region: Lark International
                 ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
-                ProvisionResponse::Text(String::new()), // encrypt key (optional)
                 ProvisionResponse::Text(String::new()), // verification token (optional)
                 ProvisionResponse::Selection(vec![0]), // receive mode: websocket
                 ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
