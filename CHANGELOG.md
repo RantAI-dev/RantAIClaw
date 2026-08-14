@@ -98,6 +98,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Configuring a channel in the TUI now starts it.** `/setup channels` wrote
+  the config, printed "✓ configured", and left the live runtime untouched for
+  the rest of the session — the change detector compared against a config that
+  had already been swapped in, so it never saw a change. It now compares before
+  the swap, by content rather than by count (rotating a leaked token is
+  count-neutral and used to leave the listener polling with the old
+  credential), and restarts as soon as the save completes instead of waiting
+  for you to press Esc.
+
+- **QQ appears in `/channels`.** It was missing from both of the TUI's private
+  channel lists, so configuring it left the count at zero and it showed up in
+  neither the configured nor the not-configured section. Both lists are gone;
+  the TUI reads the same 16-entry catalog the rest of the runtime does, which
+  also fixes Matrix and Lark being offered by setup but never displayed.
+
+- **`/channels` stops claiming a dead runtime is polling.** The status panel
+  read the runtime state three times while building one panel (so its rows could
+  contradict each other), two teardown paths left the state at "starting" —
+  which renders as "running" — and a panic in the channels task left it there
+  forever. Per-channel rows are also labelled "runtime …" now, because the state
+  they report is process-wide and never was per-channel.
+
 - **Image links no longer vanish from outbound messages.** The renderer's AST
   builder matched neither the image tag nor its close, so the URL was discarded
   on all eighteen channels: an image written in markdown arrived as the bare
