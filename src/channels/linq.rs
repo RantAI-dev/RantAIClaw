@@ -486,7 +486,13 @@ impl Channel for LinqChannel {
 /// Linq signs webhooks with HMAC-SHA256 over `"{timestamp}.{body}"`.
 /// The signature is sent in `X-Webhook-Signature` (hex-encoded) and the
 /// timestamp in `X-Webhook-Timestamp`. Reject timestamps older than 300s.
-pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signature: &str) -> bool {
+/// `body` is the RAW request body.
+///
+/// It used to be a `&str` the caller produced with `from_utf8_lossy`, while the
+/// handler parsed the raw bytes — so the string that was verified was a
+/// many-to-one projection of the body that was acted on. Every invalid sequence
+/// collapses to `U+FFFD`, so distinct bodies verify identically.
+pub fn verify_linq_signature(secret: &str, body: &[u8], timestamp: &str, signature: &str) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
@@ -502,12 +508,12 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
         return false;
     }
 
-    // Compute HMAC-SHA256 over "{timestamp}.{body}"
-    let message = format!("{timestamp}.{body}");
+    // HMAC-SHA256 over "{timestamp}." followed by the raw body bytes.
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
         return false;
     };
-    mac.update(message.as_bytes());
+    mac.update(format!("{timestamp}.").as_bytes());
+    mac.update(body);
     let signature_hex = signature
         .trim()
         .strip_prefix("sha256=")
@@ -779,7 +785,48 @@ mod tests {
         mac.update(message.as_bytes());
         let signature = hex::encode(mac.finalize().into_bytes());
 
-        assert!(verify_linq_signature(secret, body, &now, &signature));
+        assert!(verify_linq_signature(
+            secret,
+            body.as_bytes(),
+            &now,
+            &signature
+        ));
+    }
+
+    /// The verifier used to receive a `from_utf8_lossy` copy while the handler
+    /// parsed the raw bytes, so two different bodies could verify identically:
+    /// every invalid sequence collapses to the same U+FFFD.
+    #[test]
+    fn linq_signature_verifies_over_raw_bytes() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let secret = TEST_WEBHOOK_SECRET;
+        let now = chrono::Utc::now().timestamp().to_string();
+
+        // Two distinct bodies that `from_utf8_lossy` maps to the same string.
+        let body_a: Vec<u8> = [br#"{"a":""#.as_ref(), &[0xC3], br#""}"#.as_ref()].concat();
+        let body_b: Vec<u8> = [br#"{"a":""#.as_ref(), &[0xC2], br#""}"#.as_ref()].concat();
+        assert_ne!(body_a, body_b, "the bodies must differ");
+        assert_eq!(
+            String::from_utf8_lossy(&body_a),
+            String::from_utf8_lossy(&body_b),
+            "precondition: lossy decoding erases the difference"
+        );
+
+        let sign = |body: &[u8]| {
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+            mac.update(format!("{now}.").as_bytes());
+            mac.update(body);
+            hex::encode(mac.finalize().into_bytes())
+        };
+
+        let sig_a = sign(&body_a);
+        assert!(verify_linq_signature(secret, &body_a, &now, &sig_a));
+        assert!(
+            !verify_linq_signature(secret, &body_b, &now, &sig_a),
+            "a signature for one body must not verify the other"
+        );
     }
 
     #[test]
@@ -790,7 +837,7 @@ mod tests {
 
         assert!(!verify_linq_signature(
             secret,
-            body,
+            body.as_bytes(),
             &now,
             "deadbeefdeadbeefdeadbeef"
         ));
@@ -812,7 +859,7 @@ mod tests {
         let signature = hex::encode(mac.finalize().into_bytes());
 
         assert!(
-            !verify_linq_signature(secret, body, &stale_ts, &signature),
+            !verify_linq_signature(secret, body.as_bytes(), &stale_ts, &signature),
             "Stale timestamps (>300s) should be rejected"
         );
     }
@@ -830,7 +877,12 @@ mod tests {
         mac.update(message.as_bytes());
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
 
-        assert!(verify_linq_signature(secret, body, &now, &signature));
+        assert!(verify_linq_signature(
+            secret,
+            body.as_bytes(),
+            &now,
+            &signature
+        ));
     }
 
     #[test]
@@ -846,7 +898,12 @@ mod tests {
         mac.update(message.as_bytes());
         let signature = hex::encode(mac.finalize().into_bytes()).to_ascii_uppercase();
 
-        assert!(verify_linq_signature(secret, body, &now, &signature));
+        assert!(verify_linq_signature(
+            secret,
+            body.as_bytes(),
+            &now,
+            &signature
+        ));
     }
 
     #[test]

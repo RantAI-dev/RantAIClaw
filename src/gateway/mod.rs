@@ -1875,6 +1875,45 @@ pub struct WhatsAppVerifyQuery {
 }
 
 /// GET /whatsapp — Meta webhook verification
+/// Whether this inbound platform message should be processed now.
+///
+/// The three public channel webhooks had no idempotency at all, while
+/// `/webhook` in the same file has had it since it was written. A redelivery —
+/// which Meta and Nextcloud both perform when an ACK is slow, no attacker
+/// required — ran the full LLM turn again: a duplicate reply and duplicate
+/// token spend. A captured signed POST was likewise replayable indefinitely.
+///
+/// Returns `false` when the message has already been handled (or is in flight),
+/// in which case the caller must skip it. The caller owns `mark_done`/`abort`
+/// via [`finish_inbound`].
+fn begin_inbound(state: &AppState, channel: &str, platform_id: &str) -> bool {
+    let key = format!("{channel}:{platform_id}");
+    match state.idempotency_store.begin(&key) {
+        BeginOutcome::Started => true,
+        BeginOutcome::Done => {
+            tracing::info!("{channel}: ignoring a redelivered message ({platform_id})");
+            false
+        }
+        BeginOutcome::InProgress => {
+            tracing::info!("{channel}: message already in flight ({platform_id})");
+            false
+        }
+    }
+}
+
+/// Release or retire the idempotency entry opened by [`begin_inbound`].
+///
+/// A failed turn must `abort` so the platform's own retry can be processed —
+/// otherwise one transient LLM error silently drops the message forever.
+fn finish_inbound(state: &AppState, channel: &str, platform_id: &str, succeeded: bool) {
+    let key = format!("{channel}:{platform_id}");
+    if succeeded {
+        state.idempotency_store.mark_done(&key);
+    } else {
+        state.idempotency_store.abort(&key);
+    }
+}
+
 async fn handle_whatsapp_verify(
     State(state): State<AppState>,
     Query(params): Query<WhatsAppVerifyQuery>,
@@ -1930,9 +1969,25 @@ pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header
 /// POST /whatsapp — incoming message webhook
 async fn handle_whatsapp_message(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Rate-limited like `/webhook`: this endpoint is publicly reachable and
+    // every request costs a signature verification at minimum.
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("{} rate limit exceeded", "/whatsapp");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many webhook requests. Please retry later.",
+                "retry_after": RATE_LIMIT_WINDOW_SECS,
+            })),
+        );
+    }
+
     let Some(ref wa) = state.whatsapp else {
         return (
             StatusCode::NOT_FOUND,
@@ -1996,55 +2051,75 @@ async fn handle_whatsapp_message(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    // Process each message
+    // ACK first, then run the turns. The webhook used to await the full LLM
+    // turn before returning 200, so a slow turn blew past Meta's ACK deadline,
+    // Meta retried, and the same message was processed again — a duplicate
+    // reply and duplicate token spend on the ordinary path. The idempotency
+    // entries opened in the spawned task still release on failure, so a
+    // genuine retry is not lost.
     let provider_label = state
         .config
         .lock()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    for msg in &messages {
-        tracing::info!(
-            "WhatsApp message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        // Auto-save to memory
-        if state.auto_save {
-            let key = whatsapp_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        match process_channel_chat(
-            &state,
-            &provider_label,
-            "whatsapp",
-            &msg.sender,
-            &msg.content,
-        )
-        .await
-        {
-            Ok(reply) => {
-                // Send reply via WhatsApp
-                if let Err(e) = wa.send(&SendMessage::new(reply, &msg.reply_target)).await {
-                    tracing::error!("Failed to send WhatsApp reply: {e}");
-                }
+    let state_bg = state.clone();
+    let wa_bg = Arc::clone(wa);
+    tokio::spawn(async move {
+        let state = state_bg;
+        let wa = wa_bg;
+        for msg in &messages {
+            // The platform id, so a redelivery is skipped rather than answered
+            // twice. WhatsApp's signature scheme carries no timestamp or nonce,
+            // so this is the only replay control available here.
+            if !begin_inbound(&state, "whatsapp", &msg.id) {
+                continue;
             }
-            Err(e) => {
-                tracing::error!("LLM error for WhatsApp message: {e:#}");
-                let _ = wa
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+
+            tracing::info!(
+                "WhatsApp message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
+
+            if state.auto_save {
+                let key = whatsapp_memory_key(msg);
+                let _ = state
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
             }
+
+            match process_channel_chat(
+                &state,
+                &provider_label,
+                "whatsapp",
+                &msg.sender,
+                &msg.content,
+            )
+            .await
+            {
+                Ok(reply) => {
+                    if let Err(e) = wa.send(&SendMessage::new(reply, &msg.reply_target)).await {
+                        tracing::error!("Failed to send WhatsApp reply: {e}");
+                    }
+                    finish_inbound(&state, "whatsapp", &msg.id, true);
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for WhatsApp message: {e:#}");
+                    let _ = wa
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                    // Released, not retired: the platform's own retry must be
+                    // able to reach the agent after a transient failure.
+                    finish_inbound(&state, "whatsapp", &msg.id, false);
+                }
+            }
         }
-    }
+    });
 
     // Acknowledge the webhook
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
@@ -2053,17 +2128,31 @@ async fn handle_whatsapp_message(
 /// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
 async fn handle_linq_webhook(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Rate-limited like `/webhook`: this endpoint is publicly reachable and
+    // every request costs a signature verification at minimum.
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("{} rate limit exceeded", "/linq");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many webhook requests. Please retry later.",
+                "retry_after": RATE_LIMIT_WINDOW_SECS,
+            })),
+        );
+    }
+
     let Some(ref linq) = state.linq else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Linq not configured"})),
         );
     };
-
-    let body_str = String::from_utf8_lossy(&body);
 
     // ── Security: the X-Webhook-Signature is the ONLY authentication for this
     // public webhook (the Linq server cannot pair). Without the shared signing
@@ -2089,12 +2178,11 @@ async fn handle_linq_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !crate::channels::linq::verify_linq_signature(
-        signing_secret,
-        &body_str,
-        timestamp,
-        signature,
-    ) {
+    // `&body`, not a lossily-decoded copy: the handler parses these exact
+    // bytes below, and `from_utf8_lossy` collapses every invalid sequence to
+    // U+FFFD — so the string that was verified was a many-to-one projection of
+    // the body that was acted on.
+    if !crate::channels::linq::verify_linq_signature(signing_secret, &body, timestamp, signature) {
         tracing::warn!(
             "Linq webhook signature verification failed (signature: {})",
             if signature.is_empty() {
@@ -2154,49 +2242,61 @@ async fn handle_linq_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    // Process each message
+    // ACK first, then run the turns — see the WhatsApp handler for why.
     let provider_label = state
         .config
         .lock()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    for msg in &messages {
-        tracing::info!(
-            "Linq message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        // Auto-save to memory
-        if state.auto_save {
-            let key = linq_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        // Call the LLM
-        match process_channel_chat(&state, &provider_label, "linq", &msg.sender, &msg.content).await
-        {
-            Ok(reply) => {
-                // Send reply via Linq
-                if let Err(e) = linq.send(&SendMessage::new(reply, &msg.reply_target)).await {
-                    tracing::error!("Failed to send Linq reply: {e}");
-                }
+    let state_bg = state.clone();
+    let linq_bg = Arc::clone(linq);
+    tokio::spawn(async move {
+        let state = state_bg;
+        let linq = linq_bg;
+        for msg in &messages {
+            // Linq's signature enforces a 300-second window but no nonce, so a
+            // captured POST is replayable inside it; this closes that too.
+            if !begin_inbound(&state, "linq", &msg.id) {
+                continue;
             }
-            Err(e) => {
-                tracing::error!("LLM error for Linq message: {e:#}");
-                let _ = linq
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+
+            tracing::info!(
+                "Linq message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
+
+            if state.auto_save {
+                let key = linq_memory_key(msg);
+                let _ = state
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
             }
+
+            match process_channel_chat(&state, &provider_label, "linq", &msg.sender, &msg.content)
+                .await
+            {
+                Ok(reply) => {
+                    if let Err(e) = linq.send(&SendMessage::new(reply, &msg.reply_target)).await {
+                        tracing::error!("Failed to send Linq reply: {e}");
+                    }
+                    finish_inbound(&state, "linq", &msg.id, true);
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for Linq message: {e:#}");
+                    let _ = linq
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                    finish_inbound(&state, "linq", &msg.id, false);
+                }
+            }
         }
-    }
+    });
 
     // Acknowledge the webhook
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
@@ -2205,17 +2305,31 @@ async fn handle_linq_webhook(
 /// POST /nextcloud-talk — incoming message webhook (Nextcloud Talk bot API)
 async fn handle_nextcloud_talk_webhook(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Rate-limited like `/webhook`: this endpoint is publicly reachable and
+    // every request costs a signature verification at minimum.
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("{} rate limit exceeded", "/nextcloud-talk");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many webhook requests. Please retry later.",
+                "retry_after": RATE_LIMIT_WINDOW_SECS,
+            })),
+        );
+    }
+
     let Some(ref nextcloud_talk) = state.nextcloud_talk else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Nextcloud Talk not configured"})),
         );
     };
-
-    let body_str = String::from_utf8_lossy(&body);
 
     // ── Security: the HMAC signature is the ONLY authentication for this public
     // webhook (the Nextcloud server cannot pair). Without the shared secret the
@@ -2241,10 +2355,11 @@ async fn handle_nextcloud_talk_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // `&body`, not a lossily-decoded copy — see the Linq handler above.
     if !crate::channels::nextcloud_talk::verify_nextcloud_talk_signature(
         webhook_secret,
         random,
-        &body_str,
+        &body,
         signature,
     ) {
         tracing::warn!(
@@ -2260,6 +2375,17 @@ async fn handle_nextcloud_talk_webhook(
             Json(serde_json::json!({"error": "Invalid signature"})),
         );
     }
+
+    // Record the nonce: the scheme signs `random || body`, so a captured
+    // request replays forever unless the nonce is remembered. `Done` here means
+    // this exact request was already accepted.
+    if !begin_inbound(&state, "nextcloud_talk_nonce", random) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "duplicate"})),
+        );
+    }
+    finish_inbound(&state, "nextcloud_talk_nonce", random, true);
 
     // Parse JSON body
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
@@ -2283,56 +2409,68 @@ async fn handle_nextcloud_talk_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
+    // ACK first, then run the turns — see the WhatsApp handler for why.
     let provider_label = state
         .config
         .lock()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-
-    for msg in &messages {
-        tracing::info!(
-            "Nextcloud Talk message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        if state.auto_save {
-            let key = nextcloud_talk_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        match process_channel_chat(
-            &state,
-            &provider_label,
-            "nextcloud_talk",
-            &msg.sender,
-            &msg.content,
-        )
-        .await
-        {
-            Ok(reply) => {
-                if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(reply, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
-                }
+    let state_bg = state.clone();
+    let talk_bg = Arc::clone(nextcloud_talk);
+    tokio::spawn(async move {
+        let state = state_bg;
+        let nextcloud_talk = talk_bg;
+        for msg in &messages {
+            if !begin_inbound(&state, "nextcloud_talk", &msg.id) {
+                continue;
             }
-            Err(e) => {
-                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                let _ = nextcloud_talk
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+
+            tracing::info!(
+                "Nextcloud Talk message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
+
+            if state.auto_save {
+                let key = nextcloud_talk_memory_key(msg);
+                let _ = state
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
             }
+
+            match process_channel_chat(
+                &state,
+                &provider_label,
+                "nextcloud_talk",
+                &msg.sender,
+                &msg.content,
+            )
+            .await
+            {
+                Ok(reply) => {
+                    if let Err(e) = nextcloud_talk
+                        .send(&SendMessage::new(reply, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                    }
+                    finish_inbound(&state, "nextcloud_talk", &msg.id, true);
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                    let _ = nextcloud_talk
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                    finish_inbound(&state, "nextcloud_talk", &msg.id, false);
+                }
+            }
         }
-    }
+    });
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
@@ -2451,6 +2589,148 @@ async fn handle_trigger_webhook(
 
 #[cfg(test)]
 mod tests {
+    /// The three channel webhooks had no idempotency at all, while `/webhook`
+    /// in the same file has had it since it was written. A redelivery — which
+    /// Meta and Nextcloud both perform when an ACK is slow, no attacker
+    /// required — ran the full LLM turn again.
+    #[test]
+    fn idempotency_suppresses_a_redelivered_message_id() {
+        let store = IdempotencyStore::new(Duration::from_mins(5), 1000);
+
+        assert_eq!(store.begin("whatsapp:wamid.A"), BeginOutcome::Started);
+        // A second delivery while the first is running is not reprocessed.
+        assert_eq!(store.begin("whatsapp:wamid.A"), BeginOutcome::InProgress);
+
+        store.mark_done("whatsapp:wamid.A");
+        assert_eq!(store.begin("whatsapp:wamid.A"), BeginOutcome::Done);
+
+        // A different id is unaffected, and so is the same id on another
+        // channel — the key is namespaced.
+        assert_eq!(store.begin("whatsapp:wamid.B"), BeginOutcome::Started);
+        assert_eq!(store.begin("linq:wamid.A"), BeginOutcome::Started);
+    }
+
+    /// A failed turn must release its entry, or one transient LLM error drops
+    /// the message forever: the platform's retry would be answered with
+    /// "already done" and the user never hears back.
+    #[test]
+    fn a_failed_turn_releases_its_idempotency_entry() {
+        let store = IdempotencyStore::new(Duration::from_mins(5), 1000);
+        assert_eq!(store.begin("linq:msg-1"), BeginOutcome::Started);
+        store.abort("linq:msg-1");
+        assert_eq!(
+            store.begin("linq:msg-1"),
+            BeginOutcome::Started,
+            "a retry must be processed, not rejected as a duplicate"
+        );
+    }
+
+    /// The three channel webhooks are publicly reachable and request costs a
+    /// signature verification at minimum; `/webhook` has been rate-limited all
+    /// along.
+    #[test]
+    fn rate_limiter_rejects_a_burst() {
+        let limiter = GatewayRateLimiter::new(3, 3, 3, 3);
+        let key = "127.0.0.1";
+        assert!(limiter.allow_webhook(key));
+        assert!(limiter.allow_webhook(key));
+        assert!(limiter.allow_webhook(key));
+        assert!(
+            !limiter.allow_webhook(key),
+            "the fourth request in the window must be refused"
+        );
+        assert!(
+            limiter.allow_webhook("10.0.0.9"),
+            "another client is unaffected"
+        );
+    }
+
+    /// Each handler used to await the full LLM turn before returning 200, so a
+    /// slow turn blew past the platform's ACK deadline, the platform retried,
+    /// and the same message was processed again — no attacker required.
+    #[test]
+    fn every_public_webhook_handler_acks_before_processing() {
+        let src = include_str!("mod.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+
+        for handler in [
+            "async fn handle_whatsapp_message(",
+            "async fn handle_linq_webhook(",
+            "async fn handle_nextcloud_talk_webhook(",
+        ] {
+            let body = production
+                .split(handler)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{handler} exists"));
+            let end = body.find("\nasync fn ").unwrap_or(body.len());
+            let body = &body[..end];
+
+            let spawn_at = body
+                .find("tokio::spawn(")
+                .unwrap_or_else(|| panic!("{handler} must move the turn off the ACK path"));
+            let turn_at = body
+                .find("process_channel_chat(")
+                .unwrap_or_else(|| panic!("{handler} runs a turn"));
+            assert!(
+                spawn_at < turn_at,
+                "{handler} must spawn before running the turn, not await it inline"
+            );
+            // And the entry still releases on failure, or one transient error
+            // drops the message forever.
+            assert!(
+                body.contains(", false);"),
+                "{handler} must abort its idempotency entry on a failed turn"
+            );
+        }
+    }
+
+    /// The store tests above prove the store; a handler that never calls it
+    /// passes them anyway. Handler-level tests are plan 140's deliverable, so
+    /// until they land the wiring is pinned by source — otherwise this plan
+    /// ships an unpinned change.
+    #[test]
+    fn every_public_webhook_handler_is_rate_limited_and_deduplicated() {
+        let src = include_str!("mod.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+
+        for (handler, channel) in [
+            ("async fn handle_whatsapp_message(", "whatsapp"),
+            ("async fn handle_linq_webhook(", "linq"),
+            ("async fn handle_nextcloud_talk_webhook(", "nextcloud_talk"),
+        ] {
+            let body = production
+                .split(handler)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{handler} exists"));
+            let end = body.find("\nasync fn ").unwrap_or(body.len());
+            let body = &body[..end];
+
+            assert!(
+                body.contains("state.rate_limiter.allow_webhook("),
+                "{handler} must rate-limit; it is publicly reachable"
+            );
+            assert!(
+                body.contains(&format!("begin_inbound(&state, \"{channel}\"")),
+                "{handler} must run the platform id through the idempotency store"
+            );
+            assert!(
+                body.contains(&format!("finish_inbound(&state, \"{channel}\"")),
+                "{handler} must retire or release the entry it opened"
+            );
+            assert!(
+                !body.contains("String::from_utf8_lossy("),
+                "{handler} must verify the bytes it parses"
+            );
+        }
+    }
+
+    /// A loopback peer for handlers that now take `ConnectInfo`. The rate
+    /// limiter keys on it; tests share one address deliberately, so a test that
+    /// bursts would see the limit exactly as a real client does.
+    fn test_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 45_678)))
+    }
+
     use super::*;
     use crate::channels::traits::ChannelMessage;
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
@@ -3432,6 +3712,7 @@ mod tests {
 
         let response = handle_nextcloud_talk_webhook(
             State(state),
+            test_peer(),
             HeaderMap::new(),
             Bytes::from_static(br#"{"type":"message"}"#),
         )
@@ -3495,9 +3776,10 @@ mod tests {
             HeaderValue::from_str(invalid_signature).unwrap(),
         );
 
-        let response = handle_nextcloud_talk_webhook(State(state), headers, Bytes::from(body))
-            .await
-            .into_response();
+        let response =
+            handle_nextcloud_talk_webhook(State(state), test_peer(), headers, Bytes::from(body))
+                .await
+                .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
@@ -3545,10 +3827,14 @@ mod tests {
 
         let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
 
-        let response =
-            handle_nextcloud_talk_webhook(State(state), HeaderMap::new(), Bytes::from(body))
-                .await
-                .into_response();
+        let response = handle_nextcloud_talk_webhook(
+            State(state),
+            test_peer(),
+            HeaderMap::new(),
+            Bytes::from(body),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
