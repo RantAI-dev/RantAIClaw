@@ -632,6 +632,26 @@ fn ambiguous_pending_message(pending: &[PendingRequest], verb: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Wait until `pending` has registered at least `n` requests.
+    ///
+    /// Replaces `sleep(20ms)` after spawning the producer. A fixed sleep is a
+    /// race: it passes because 20 ms is usually enough on an unloaded runner,
+    /// and the suite survives only because CI forces `--test-threads=1`. This
+    /// polls the registry the test actually depends on, so it is correct at any
+    /// scheduling speed and fails loudly instead of flakily.
+    async fn await_pending(pending: &Arc<PendingApprovals>, n: usize) {
+        for _ in 0..500 {
+            if pending.list().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!(
+            "timed out waiting for {n} pending request(s); registry has {}",
+            pending.list().len()
+        );
+    }
+
     use super::*;
     use std::time::Duration;
 
@@ -711,7 +731,7 @@ mod tests {
                 .request_decision("brew", "brew --version", "telegram")
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&pending, 1).await;
 
         // Reply comes from an authorized owner.
         let owners = vec!["owner1".to_string()];
@@ -746,7 +766,7 @@ mod tests {
                 .request_decision("brew", "brew --version", "telegram")
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&pending, 1).await;
 
         // A non-owner replies `/allow` — recognised as an approval attempt
         // (so it's consumed, not routed to the agent) but NOT honored: the
@@ -792,7 +812,7 @@ mod tests {
                 .request_decision("brew", "brew --version", "telegram")
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&pending, 1).await;
 
         // Deny is honored regardless of sender/owner — stopping a pending
         // action is always safe.
@@ -880,7 +900,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&relay, 1).await;
 
         let owners = vec!["owner1".to_string()];
         let ack = try_handle_tool_reply(
@@ -910,7 +930,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&relay, 1).await;
 
         let owners = vec!["owner1".to_string()];
         // Stranger names the real pending tool → consumed (it WAS an approval
@@ -961,7 +981,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&relay, 1).await;
 
         let owners = vec!["owner1".to_string()];
         assert!(
@@ -992,7 +1012,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&relay, 1).await;
 
         let owners = vec!["owner1".to_string()];
         assert!(
@@ -1019,7 +1039,7 @@ mod tests {
             r2.request_decision_in(id_b, "shell", "ls /b", "telegram", "chat-b")
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&relay, 1).await;
 
         let owners = vec!["owner1".to_string()];
         let handle = PendingApprovals::handle_for(id_b);
@@ -1085,7 +1105,7 @@ mod tests {
         let (p1, p2) = (pending.clone(), pending.clone());
         let t1 = tokio::spawn(async move { p1.request_decision("curl", "curl a", "t").await });
         let t2 = tokio::spawn(async move { p2.request_decision("curl", "curl b", "t").await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&pending, 1).await;
         assert_eq!(pending.list().len(), 2, "both queued under one basename");
 
         let owners = vec!["owner1".to_string()];
@@ -1195,7 +1215,7 @@ mod tests {
                 )
                 .await
             });
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            await_pending(&relay, 1).await;
 
             let owners = vec!["owner1".to_string()];
             let ack = try_handle_tool_reply(verb, &relay, "owner1", &owners, "telegram", "chat-1")
@@ -1241,7 +1261,7 @@ mod tests {
             r2.request_decision_in(uuid::Uuid::new_v4(), "shell", "ls", "telegram", "chat-1")
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&relay, 1).await;
 
         let owners = vec!["owner1".to_string()];
         let ack = try_handle_tool_reply("approve", &relay, "owner1", &owners, "telegram", "chat-1")
@@ -1274,7 +1294,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&relay, 1).await;
 
         let owners = vec!["owner1".to_string()];
         let ack = try_handle_tool_reply(
@@ -1304,7 +1324,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&relay, 1).await;
 
         let owners = vec!["owner1".to_string()];
         let ack =
@@ -1334,7 +1354,7 @@ mod tests {
                 tokio::spawn(
                     async move { p2.request_decision("brew", "brew --version", "t").await },
                 );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            await_pending(&pending, 1).await;
 
             let owners = vec!["owner1".to_string()];
             let ack = try_handle_reply(verb, &security, "owner1", &owners, "telegram", "chat-1")
@@ -1361,7 +1381,7 @@ mod tests {
         let p2 = pending.clone();
         let task =
             tokio::spawn(async move { p2.request_decision("brew", "brew --version", "t").await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&pending, 1).await;
 
         let owners = vec!["owner1".to_string()];
         assert!(
@@ -1403,7 +1423,7 @@ mod tests {
         let p2 = pending.clone();
         let task =
             tokio::spawn(async move { p2.request_decision("brew", "brew --version", "t").await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&pending, 1).await;
 
         let ack = try_handle_reply("no", &security, "anyone", &[], "telegram", "chat-1")
             .expect("recognised");
@@ -1429,7 +1449,7 @@ mod tests {
             p2.request_decision_in(uuid::Uuid::new_v4(), "npm", "npm i", "telegram", "chat-1")
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&pending, 1).await;
 
         let owners = vec!["owner1".to_string()];
         let ack = try_handle_reply("allow", &security, "owner1", &owners, "telegram", "chat-1")
@@ -1458,7 +1478,7 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        await_pending(&relay, 1).await;
 
         // Deny needs no owner authority — stopping an action is always safe.
         let ack = try_handle_tool_reply("/deny shell", &relay, "anyone", &[], "telegram", "chat-1")

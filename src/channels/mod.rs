@@ -8676,8 +8676,14 @@ This is an example JSON object for profile settings."#;
     #[tokio::test]
     async fn supervised_listener_marks_error_and_restarts_on_failures() {
         let calls = Arc::new(AtomicUsize::new(0));
+        // UUID-suffixed like its two neighbours. `crate::health` is a process-wide
+        // registry, so a fixed component name collides with any other test that
+        // registers the same one — and the collision surfaces as a confusing
+        // assertion on somebody else's restart count, not as a name clash.
+        let name: &'static str =
+            Box::leak(format!("test-supervised-fail-{}", uuid::Uuid::new_v4()).into_boxed_str());
         let channel: Arc<dyn Channel> = Arc::new(AlwaysFailChannel {
-            name: "test-supervised-fail",
+            name,
             calls: Arc::clone(&calls),
         });
 
@@ -8690,7 +8696,7 @@ This is an example JSON object for profile settings."#;
         let _ = handle.await;
 
         let snapshot = crate::health::snapshot_json();
-        let component = &snapshot["components"]["channel:test-supervised-fail"];
+        let component = &snapshot["components"][format!("channel:{name}")];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
         assert!(component["last_error"]
