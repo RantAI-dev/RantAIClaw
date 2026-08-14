@@ -200,7 +200,7 @@ impl Channel for DiscordChannel {
         // Render per-platform, then split without cutting a code fence — replaces
         // the naive char-count splitter that could cut a fenced block in half.
         let blocks = crate::channels::format::render(&message.content, &self.render_target());
-        let chunks = crate::channels::format::split(&blocks, DISCORD_MAX_MESSAGE_LENGTH);
+        let chunks = crate::channels::format::split_non_empty(&blocks, DISCORD_MAX_MESSAGE_LENGTH);
 
         for (i, chunk) in chunks.iter().enumerate() {
             let url = format!(

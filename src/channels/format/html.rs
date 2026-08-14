@@ -61,6 +61,17 @@ fn inlines_html(inlines: &[Inline], dialect: Dialect) -> String {
                 out.push_str(&inlines_html(text, dialect));
                 out.push_str("</a>");
             }
+            // An `<a href>`, not an `<img>`: Telegram's HTML mode does not
+            // render inline images, and Matrix requires an `mxc://` URI it
+            // cannot mint here. A link is the honest representation, and it
+            // reuses the same escaping path.
+            Inline::Image { alt, url } => {
+                out.push_str("<a href=\"");
+                out.push_str(&escape_html(url));
+                out.push_str("\">");
+                out.push_str(&inlines_html(alt, dialect));
+                out.push_str("</a>");
+            }
             // Correct for BOTH dialects, for opposite reasons: a soft break means
             // "join with a space", and `\n` collapses to exactly one space in
             // Matrix's real HTML while Telegram's HTML mode keeps it as the

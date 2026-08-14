@@ -279,6 +279,19 @@ fn push_inlines(out: &mut String, inlines: &[Inline], ctx: Ctx) {
                 }
                 out.push(')');
             }
+            // The image form survives here: this target IS markdown, so a
+            // client that renders images gets one. Same cell-escaping rule as
+            // the link above.
+            Inline::Image { alt, url } => {
+                out.push_str("![");
+                push_inlines(out, alt, ctx);
+                out.push_str("](");
+                match ctx {
+                    Ctx::Cell => out.push_str(&url.replace('|', "\\|")),
+                    Ctx::Prose => out.push_str(url),
+                }
+                out.push(')');
+            }
             Inline::SoftBreak => out.push('\n'),
             Inline::HardBreak => out.push_str("  \n"),
         }

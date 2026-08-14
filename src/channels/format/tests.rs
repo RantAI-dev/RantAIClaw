@@ -1,7 +1,10 @@
 //! End-to-end checks: the canonical tutorial (headings + table + code) renders
 //! cleanly for every target, and split never orphans a fence or exceeds a limit.
 
-use super::{render, render_pair, render_to_string, split, split_paired, LinkStyle, RenderTarget};
+use super::{
+    render, render_pair, render_to_string, split, split_non_empty, split_paired, LinkStyle,
+    RenderTarget,
+};
 
 const FENCE: &str = "```";
 
@@ -296,5 +299,116 @@ fn text_targets_agree_on_the_rule_glyph() {
             }
         ),
         "---"
+    );
+}
+
+// ── Plan 131: image URLs, and nothing-to-send ────────────────────────
+
+/// Neither `Tag::Image` nor `TagEnd::Image` was matched, so both fell into the
+/// catch-all: `![chart](https://…/chart.png)` reached the user as the bare word
+/// `chart`, on all eighteen channels.
+#[test]
+fn image_url_survives_to_every_render_target() {
+    const SRC: &str = "![chart](https://example.test/c.png)";
+    const URL: &str = "https://example.test/c.png";
+
+    let html = render_to_string(SRC, &RenderTarget::TelegramHtml);
+    assert!(html.contains(URL), "TelegramHtml lost the URL: {html}");
+    assert!(html.contains("chart"), "TelegramHtml lost the alt: {html}");
+
+    let md = render_to_string(
+        SRC,
+        &RenderTarget::StdMarkdown {
+            tables_native: true,
+        },
+    );
+    assert!(md.contains(&format!("![chart]({URL})")), "got: {md}");
+
+    let light = render_to_string(
+        SRC,
+        &RenderTarget::LightMarkup {
+            links: LinkStyle::Raw,
+        },
+    );
+    assert!(light.contains(&format!("chart ({URL})")), "got: {light}");
+
+    let slack = render_to_string(
+        SRC,
+        &RenderTarget::LightMarkup {
+            links: LinkStyle::Slack,
+        },
+    );
+    assert!(slack.contains(URL), "Slack lost the URL: {slack}");
+
+    let plain = render_to_string(SRC, &RenderTarget::Plain);
+    assert!(plain.contains(&format!("chart ({URL})")), "got: {plain}");
+}
+
+/// `![](x.png)` used to yield `Block::Paragraph([])` — an empty message.
+#[test]
+fn image_without_alt_text_still_carries_the_url() {
+    for target in [
+        RenderTarget::Plain,
+        RenderTarget::TelegramHtml,
+        RenderTarget::StdMarkdown {
+            tables_native: true,
+        },
+    ] {
+        let out = render_to_string("![](https://example.test/x.png)", &target);
+        assert!(
+            out.contains("https://example.test/x.png"),
+            "{target:?} lost the URL of an alt-less image: {out}"
+        );
+    }
+}
+
+/// The nesting paths are where the `Link` handling is subtlest.
+#[test]
+fn image_inside_a_list_item_and_a_blockquote_renders() {
+    let nested = "- see ![chart](https://example.test/c.png)
+
+> quoted ![q](https://example.test/q.png)
+";
+    let out = render_to_string(nested, &RenderTarget::Plain);
+    assert!(out.contains("https://example.test/c.png"), "list: {out}");
+    assert!(out.contains("https://example.test/q.png"), "quote: {out}");
+}
+
+/// `split` returns one empty chunk when there is nothing to emit, and callers
+/// posted it: Discord answers "cannot send an empty message" and the dispatch
+/// loop records a delivery failure for a turn that had nothing to deliver.
+#[test]
+fn empty_content_yields_no_sendable_chunk() {
+    for source in ["", "   ", "\n\n\t\n"] {
+        let blocks = render(source, &RenderTarget::Plain);
+        assert!(
+            split_non_empty(&blocks, 4096).is_empty(),
+            "whitespace-only input must yield nothing to send: {source:?}"
+        );
+    }
+}
+
+/// The Telegram-shaped case: a reply that is entirely a tool-call block is
+/// stripped to nothing before it reaches the splitter.
+#[test]
+fn tool_call_only_reply_yields_no_sendable_chunk() {
+    let stripped = "";
+    let blocks = render(stripped, &RenderTarget::Plain);
+    assert!(split_non_empty(&blocks, 4096).is_empty());
+
+    // And a reply with real content still produces chunks.
+    let blocks = render("hello", &RenderTarget::Plain);
+    assert_eq!(split_non_empty(&blocks, 4096), vec!["hello".to_string()]);
+}
+
+/// `split`'s own guarantee is deliberate and its tests pin it; the fix belongs
+/// at the call sites, so the contract must NOT have moved.
+#[test]
+fn existing_split_contract_is_unchanged() {
+    let blocks = render("   ", &RenderTarget::Plain);
+    assert_eq!(
+        split(&blocks, 4096),
+        vec![String::new()],
+        "split still guarantees at least one chunk"
     );
 }

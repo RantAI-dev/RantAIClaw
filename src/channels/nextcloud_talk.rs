@@ -336,7 +336,8 @@ impl Channel for NextcloudTalkChannel {
             &message.content,
             &crate::channels::format::RenderTarget::Plain,
         );
-        let chunks = crate::channels::format::split(&blocks, NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH);
+        let chunks =
+            crate::channels::format::split_non_empty(&blocks, NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH);
 
         for (index, chunk) in chunks.iter().enumerate() {
             self.send_to_room(&message.recipient, chunk).await?;
@@ -437,8 +438,8 @@ mod tests {
             .nth(1)
             .expect("send exists");
         let split_at = send_body
-            .find("format::split(")
-            .expect("send must route through format::split");
+            .find("format::split_non_empty(")
+            .expect("send must route through format::split_non_empty");
         let next_fn = send_body.find("\n    async fn ").unwrap_or(send_body.len());
         assert!(
             split_at < next_fn,

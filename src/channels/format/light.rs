@@ -54,6 +54,26 @@ fn inlines_light(inlines: &[Inline], links: LinkStyle) -> String {
                     }
                 }
             }
+            // Flattened the same way a link is: these targets render no inline
+            // image, so the URL has to survive as text or it is lost.
+            Inline::Image { alt, url } => {
+                let label = inlines_light(alt, links);
+                match links {
+                    LinkStyle::Slack => {
+                        out.push('<');
+                        out.push_str(&escape_slack(url));
+                        out.push('|');
+                        out.push_str(&label);
+                        out.push('>');
+                    }
+                    LinkStyle::Raw => {
+                        out.push_str(&label);
+                        out.push_str(" (");
+                        out.push_str(url);
+                        out.push(')');
+                    }
+                }
+            }
             Inline::SoftBreak | Inline::HardBreak => out.push('\n'),
         }
     }

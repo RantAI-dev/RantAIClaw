@@ -23,6 +23,13 @@ fn inline_text(inlines: &[Inline]) -> String {
                 out.push_str(url);
                 out.push(')');
             }
+            // Plain text has no image; the URL survives as text or it is lost.
+            Inline::Image { alt, url } => {
+                out.push_str(&inline_text(alt));
+                out.push_str(" (");
+                out.push_str(url);
+                out.push(')');
+            }
             Inline::SoftBreak | Inline::HardBreak => out.push(' '),
         }
     }

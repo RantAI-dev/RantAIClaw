@@ -176,4 +176,4 @@ pub fn render_to_string(md: &str, target: &RenderTarget) -> String {
 // `src/channels/*.rs` — both reach this via the re-export below, not via
 // `split`'s own (deliberately private) module path.
 #[allow(unused_imports)]
-pub use split::{split, split_paired};
+pub use split::{split, split_non_empty, split_paired};

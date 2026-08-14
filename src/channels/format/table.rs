@@ -26,7 +26,12 @@ pub(crate) fn inline_plain(inlines: &[Inline]) -> String {
             Inline::Strong(c) | Inline::Emphasis(c) | Inline::Strikethrough(c) => {
                 out.push_str(&inline_plain(c));
             }
-            Inline::Link { text, .. } => out.push_str(&inline_plain(text)),
+            // An ASCII table cell drops the destination on purpose — the
+            // column is measured in characters, and a URL would blow the
+            // width out. Images follow the link rule for the same reason.
+            Inline::Link { text: inner, .. } | Inline::Image { alt: inner, .. } => {
+                out.push_str(&inline_plain(inner));
+            }
             Inline::SoftBreak | Inline::HardBreak => out.push(' '),
         }
     }
