@@ -2595,7 +2595,7 @@ mod tests {
     /// required — ran the full LLM turn again.
     #[test]
     fn idempotency_suppresses_a_redelivered_message_id() {
-        let store = IdempotencyStore::new(Duration::from_secs(300), 1000);
+        let store = IdempotencyStore::new(Duration::from_mins(5), 1000);
 
         assert_eq!(store.begin("whatsapp:wamid.A"), BeginOutcome::Started);
         // A second delivery while the first is running is not reprocessed.
@@ -2615,7 +2615,7 @@ mod tests {
     /// "already done" and the user never hears back.
     #[test]
     fn a_failed_turn_releases_its_idempotency_entry() {
-        let store = IdempotencyStore::new(Duration::from_secs(300), 1000);
+        let store = IdempotencyStore::new(Duration::from_mins(5), 1000);
         assert_eq!(store.begin("linq:msg-1"), BeginOutcome::Started);
         store.abort("linq:msg-1");
         assert_eq!(
