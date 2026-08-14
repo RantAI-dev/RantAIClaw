@@ -43,7 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session DB looked identical to "no session", so the wizard paired a fresh
   device over existing key material.
 
-
 - **Telegram reports the numeric user id as the sender, not the `@username`.**
   A Telegram handle can be released and re-registered, and pairing writes
   whichever form the channel reports into `approval_owners` — so whoever took a
@@ -229,8 +228,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derived `Debug` over the plaintext credential, so one `debug!(?config)` wrote
   it to the log stream. **Rotate any mailbox password that may already sit in
   retained logs** — the fix stops new leaks, it cannot recall old ones.
-
-### Fixed
 
 - **Email stopped losing mail and stopped refetching it forever.** Unparseable
   messages were filed `\Seen` alongside good ones and vanished; a batch where
