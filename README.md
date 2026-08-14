@@ -129,25 +129,31 @@ Steady-state daemon memory depends on which channels, providers, and MCP servers
 
 Connect your agent to any combination of channels simultaneously. Each channel renders the model's Markdown into whatever the target platform actually understands, so replies do not leak raw CommonMark:
 
-| Channel | Build gate | Reply rendering |
-|---------|-----------|-----------------|
-| Telegram | built in | HTML |
-| Discord | built in | Markdown (fenced-code aware splitting) |
-| Slack | built in | mrkdwn (single-char markup + Slack links) |
-| Mattermost | built in | Markdown (native tables) |
-| DingTalk | built in | Markdown |
-| WhatsApp Cloud | built in | single-char markup |
-| WhatsApp Web | `whatsapp-web` *(default on)* | single-char markup |
-| Signal | built in | plain text |
-| Email (IMAP/SMTP) | built in | plain text |
-| IRC | built in | plain text |
-| QQ | built in | plain text |
-| Linq | built in | plain text |
-| Nextcloud Talk | built in | plain text |
-| iMessage | built in | plain text |
-| Lark/Feishu | `channel-lark` | plain text |
-| Matrix (E2EE) | `channel-matrix` | Markdown via matrix-sdk *(not yet on the shared renderer)* |
-| CLI | built in | plain text |
+| Channel | Build gate | Ships in a release binary? | Reply rendering | Verified |
+|---------|-----------|---|-----------------|---|
+| Telegram | built in | yes | HTML | **live-verified** (2026-07, bot account, markdown-renderer effort) |
+| Discord | built in | yes | Markdown (fenced-code aware splitting) | built and unit-tested |
+| Slack | built in | yes | mrkdwn (single-char markup + Slack links) | built and unit-tested |
+| Mattermost | built in | yes | Markdown (native tables) | built and unit-tested |
+| DingTalk | built in | yes | Markdown | built and unit-tested |
+| WhatsApp Cloud | built in | yes | single-char markup | built and unit-tested |
+| WhatsApp Web | `whatsapp-web` *(default on)* | yes | single-char markup | built and unit-tested |
+| Signal | built in | yes | plain text | built and unit-tested |
+| Email (IMAP/SMTP) | built in | yes | plain text | built and unit-tested |
+| IRC | built in | yes | plain text | built and unit-tested |
+| QQ | built in | yes | plain text | built and unit-tested |
+| Linq | built in | yes | plain text | built and unit-tested |
+| Nextcloud Talk | built in | yes | plain text | built and unit-tested |
+| iMessage | built in | yes | plain text | built and unit-tested |
+| Lark/Feishu | `channel-lark` | **no** | plain text | built and unit-tested (own CI job) |
+| Matrix (E2EE) | `channel-matrix` | **no** | Markdown via matrix-sdk *(not on the shared renderer)* | **unbuildable** — `matrix-sdk` 0.16 does not type-check here |
+| CLI | built in | yes | plain text | built and unit-tested |
+
+**Release binaries are built with default features only**, so Lark and Matrix
+ship in **no** release binary — building from source with the flag is the only
+way to get them, and Matrix does not currently compile at all. See
+[channel verification status](docs/reference/channels.md#0-verification-status)
+for what each value means.
 
 Each channel runs independently with its own lifecycle — add, remove, or update channels at runtime without restarting. Per-platform setup: [`docs/reference/channels.md`](docs/reference/channels.md).
 

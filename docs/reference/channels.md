@@ -26,6 +26,76 @@ This is the most common symptom (same class as issue #499). Check these in order
 
 ---
 
+## 0. Verification Status
+
+Seventeen channels are wired. **One has been driven against a real platform.**
+That is not a defect in itself, but it is the difference between "it compiles
+and has tests" and "someone watched a message arrive", and an operator choosing a
+channel deserves to know which they are getting.
+
+The vocabulary is borrowed from
+[`kb-providers.md`](kb-providers.md), which already publishes this distinction.
+
+| Value | Means |
+|---|---|
+| **live-verified** | A scripted round trip — send a message, receive it, assert the echo — was run against a real account. The row records **when** and **what kind of account** |
+| **built and unit-tested** | Compiles, has unit tests, and is exercised by CI. Never driven against the live platform |
+| **built, not tested by CI** | Compiles only under a feature flag no CI job builds |
+| **unbuildable** | Does not compile at all today |
+
+A row may **not** be marked live-verified on the strength of a unit test. That
+conflation is the thing this table exists to prevent.
+
+| Channel | Status | Evidence |
+|---|---|---|
+| Telegram | **live-verified** — 2026-07, bot account | driven during the markdown-renderer effort; the reply rendering was read on a real client |
+| Discord | built and unit-tested | default feature; `cargo test --lib channels::discord` runs in CI |
+| Slack | built and unit-tested | default feature; CI |
+| Mattermost | built and unit-tested | default feature; CI |
+| DingTalk | built and unit-tested | default feature; CI |
+| WhatsApp Cloud | built and unit-tested | default feature; CI |
+| WhatsApp Web | built and unit-tested | `whatsapp-web` is in `default`; CI |
+| Signal | built and unit-tested | default feature; CI |
+| Email (IMAP/SMTP) | built and unit-tested | default feature; CI |
+| IRC | built and unit-tested | default feature; CI |
+| QQ | built and unit-tested | default feature; CI |
+| Linq | built and unit-tested | default feature; CI |
+| Nextcloud Talk | built and unit-tested | default feature; CI |
+| iMessage | built and unit-tested | default feature; CI. Note it needs macOS to run at all |
+| Webhook (generic) | built and unit-tested | gateway endpoint; handler-level auth tests |
+| Lark/Feishu | built and unit-tested | `channel-lark` is not a default feature, but it has its own CI job that builds **and tests** it |
+| Matrix (E2EE) | **unbuildable** | `matrix-sdk` 0.16 exceeds the type-check recursion budget; no CI job compiles it and its 1,168-line module is checked by nothing. Options are costed in [the dependency write-up](../project/2026-08-14-dependency-decisions.md) |
+
+### What ships in a release binary
+
+Release binaries are built with **default features only**
+(`.github/workflows/pub-release.yml`). So:
+
+- every "built in" channel above ships;
+- **Lark ships in no release binary** — it needs a source build with
+  `--features channel-lark`;
+- **Matrix ships in no release binary** and cannot currently be built from
+  source either.
+
+The README's channel table carries the same columns; the two are meant to agree.
+
+### How a row becomes live-verified
+
+Run a scripted round trip against a real account — send a message through the
+channel, receive it back, assert the echo — then record the **date** and the
+**account type** in the row. Anything less specific is decoration: without a
+definition, "verified" becomes whatever the last person to edit the row thought
+it meant.
+
+A `channel verify <name>` subcommand extending the shape `channel doctor`
+already establishes is the obvious way to make that repeatable. It is
+**deliberately not built here** — it needs real platform accounts, and a per-PR
+job depending on seventeen third-party services would be red more often than
+green, at which point it gets ignored. If it is ever built it belongs in a
+manually-dispatched workflow.
+
+---
+
 ## 1. Configuration Namespace
 
 All channel settings live under `channels_config` in `~/.rantaiclaw/config.toml`.
@@ -157,7 +227,7 @@ cutting a code fence.
 | Slack | LightMarkup (`<url\|text>`) | `**bold**` → `*bold*`, links → `<url\|text>`, tables → ASCII fence, `&`/`<`/`>` escaped per Slack's text field |
 | WhatsApp (Cloud + Web) | LightMarkup (`text (url)`) | `**bold**` → `*bold*`, links → `text (url)`, tables → ASCII fence |
 | Signal, QQ, Linq, IRC, iMessage, Nextcloud Talk, Lark, Email, CLI | Plain | all markup stripped to readable text: headings uppercased, emphasis removed, links → `text (url)`, tables → aligned ASCII |
-| Matrix | *(not wired)* | Matrix renders GFM natively today via matrix-sdk, so nothing leaks; a dedicated render target is deferred until `matrix-sdk` builds under `--all-features` again |
+| Matrix | *(not wired)* | The renderer itself shipped; what is missing is the four-line `render_target()` wiring in `matrix.rs`, which is blocked because the module does not compile ([§0](#0-verification-status)). Matrix renders GFM natively, so nothing leaks in the meantime |
 
 Notes:
 
