@@ -90,6 +90,19 @@ pub trait Channel: Send + Sync {
         crate::channels::format::RenderTarget::Plain
     }
 
+    /// Extra system-prompt text telling the model how to send attachments on
+    /// this channel.
+    ///
+    /// Defaults to `None`: a channel that cannot deliver media must not tell
+    /// the model it can, or the model emits markers that reach the user as
+    /// literal text. Telegram overrides it with its marker syntax.
+    ///
+    /// Was a central `match` on the channel name in `mod.rs`, which meant a new
+    /// channel's media support was declared in a file its author never opened.
+    fn delivery_instructions(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Replace this channel's runtime sender allowlist.
     ///
     /// Called by the channels runtime when `config.toml` changes, so an allowlist

@@ -536,15 +536,6 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
 
-fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
-    match channel_name {
-        "telegram" => Some(
-            "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
-        ),
-        _ => None,
-    }
-}
-
 /// Appended to a channel system prompt when the sender is an approval owner
 /// (`can_approve` is true for them). Without it, a cautious model self-refuses
 /// owner-only tools (e.g. `manage_permissions`, `issue_pairing_code`) because
@@ -591,8 +582,9 @@ fn build_channel_system_prompt(
     channel_name: &str,
     reply_target: &str,
     is_owner: bool,
+    delivery_instructions: Option<&str>,
 ) -> String {
-    let mut prompt = if let Some(instructions) = channel_delivery_instructions(channel_name) {
+    let mut prompt = if let Some(instructions) = delivery_instructions {
         if base_prompt.is_empty() {
             instructions.to_string()
         } else {
@@ -2191,6 +2183,12 @@ async fn process_channel_message(
         &msg.channel,
         &msg.reply_target,
         sender_is_owner,
+        // The channel declares its own media support. A channel that cannot
+        // deliver an attachment must not be told it can, or the model emits
+        // markers that reach the user as literal text.
+        ctx.channels_by_name
+            .get(&msg.channel)
+            .and_then(|channel| channel.delivery_instructions()),
     );
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
@@ -4170,6 +4168,40 @@ pub async fn start_channels_with_cancellation(
 
 #[cfg(test)]
 mod tests {
+    /// The seam moved from a central `match` on the channel name to a trait
+    /// method. The default must stay `None`: telling a channel that cannot
+    /// deliver an attachment that it can makes the model emit markers the user
+    /// sees as literal text.
+    #[test]
+    fn delivery_instructions_default_is_none() {
+        use crate::channels::traits::Channel;
+
+        let slack = crate::channels::slack::SlackChannel::new(
+            "xoxb-placeholder".into(),
+            None,
+            vec!["*".into()],
+        );
+        assert!(
+            slack.delivery_instructions().is_none(),
+            "a channel that cannot deliver media must not claim it can"
+        );
+
+        let telegram =
+            crate::channels::telegram::TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let instructions = telegram
+            .delivery_instructions()
+            .expect("Telegram is the channel that can deliver media");
+        assert!(instructions.contains("[IMAGE:"));
+
+        // Behaviour-preserving: the prompt is assembled exactly as the central
+        // `match` assembled it.
+        let with = build_channel_system_prompt("BASE", "telegram", "1", false, Some(instructions));
+        assert!(with.starts_with("BASE\n\n"));
+        assert!(with.contains("[DOCUMENT:"));
+        let without = build_channel_system_prompt("BASE", "irc", "#room", false, None);
+        assert!(!without.contains("[DOCUMENT:"));
+    }
+
     /// Threading moves WHERE replies appear, so the switch has to work — and it
     /// is enforced in one place, from a map built here.
     #[test]
@@ -4400,8 +4432,8 @@ mod tests {
     /// not. The base prompt is preserved either way.
     #[test]
     fn channel_system_prompt_marks_owner_turns_only() {
-        let owner = build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", true);
-        let guest = build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", false);
+        let owner = build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", true, None);
+        let guest = build_channel_system_prompt("BASE-PROMPT", "telegram", "12345", false, None);
 
         assert!(
             owner.to_lowercase().contains("verified owner"),
@@ -4416,7 +4448,7 @@ mod tests {
 
     #[test]
     fn cron_delivery_instruction_present_for_announce_channels() {
-        let p = build_channel_system_prompt("BASE", "telegram", "123456789", false);
+        let p = build_channel_system_prompt("BASE", "telegram", "123456789", false, None);
         assert!(p.contains("BASE"));
         assert!(
             p.contains("cron_add"),
@@ -4432,7 +4464,7 @@ mod tests {
     #[test]
     fn no_cron_delivery_instruction_for_unsupported_channel() {
         // A channel the scheduler can't deliver to must NOT promise delivery.
-        let p = build_channel_system_prompt("BASE", "irc", "#room", false);
+        let p = build_channel_system_prompt("BASE", "irc", "#room", false, None);
         assert!(
             !p.contains("route the output back"),
             "irc has no announce delivery"
@@ -4825,6 +4857,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
+        // Mirrors the real channel: the instructions come from the channel
+        // impl now, not from a `match` on its name, so a stub that claims the
+        // name must also claim the capability.
+        fn delivery_instructions(&self) -> Option<&'static str> {
+            Some(crate::channels::telegram::TELEGRAM_DELIVERY_INSTRUCTIONS)
+        }
+
         fn name(&self) -> &str {
             "telegram"
         }
