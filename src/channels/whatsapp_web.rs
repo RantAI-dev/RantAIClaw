@@ -998,10 +998,16 @@ pub struct PairOptions {
     pub timeout: std::time::Duration,
 }
 
-impl Default for PairOptions {
-    fn default() -> Self {
+impl PairOptions {
+    /// Build options for a session file the caller has already resolved.
+    ///
+    /// There is deliberately no `Default`: it used to default `session_path` to
+    /// the relative `wa.db`, so key material landed wherever the process
+    /// happened to be running.
+    #[must_use]
+    pub fn new(session_path: std::path::PathBuf) -> Self {
         Self {
-            session_path: std::path::PathBuf::from("wa.db"),
+            session_path,
             pair_phone: None,
             timeout: std::time::Duration::from_secs(60),
         }
@@ -1032,7 +1038,17 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
     let (tx, rx) = mpsc::channel::<PairEvent>(32);
 
     std::thread::spawn(move || {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        // A panicking runtime start here dropped `tx`, so the operator saw
+        // "Pairing failed: channel closed" with the real cause nowhere.
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.blocking_send(PairEvent::Failed(format!(
+                    "could not start the pairing runtime: {e}"
+                )));
+                return;
+            }
+        };
         runtime.block_on(async {
             tracing::info!(
                 "pair_once: thread started, opening storage at {}",
@@ -1050,11 +1066,40 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
             tracing::info!("pair_once: storage opened, building bot");
             let backend = std::sync::Arc::new(storage);
             let mut device = Device::new(backend.clone());
-            if let Ok(exists) = backend.exists().await {
-                if exists {
-                    if let Ok(Some(core_device)) = backend.load().await {
-                        device.load_from_serializable(core_device);
+            // Both results are matched. They used to be ignored, so a corrupt
+            // or unreadable session DB looked identical to "no session" and the
+            // wizard paired a fresh device OVER existing key material.
+            match backend.exists().await {
+                Ok(true) => match backend.load().await {
+                    Ok(Some(core_device)) => device.load_from_serializable(core_device),
+                    Ok(None) => {
+                        let _ = tx
+                            .send(PairEvent::Failed(
+                                "the session database reports a device but could not load it; \
+                                 refusing to pair over existing key material"
+                                    .into(),
+                            ))
+                            .await;
+                        return;
                     }
+                    Err(e) => {
+                        let _ = tx
+                            .send(PairEvent::Failed(format!(
+                                "existing session could not be read ({e}); refusing to pair over \
+                                 it — move or delete the session file to start fresh"
+                            )))
+                            .await;
+                        return;
+                    }
+                },
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = tx
+                        .send(PairEvent::Failed(format!(
+                            "could not check for an existing session: {e}"
+                        )))
+                        .await;
+                    return;
                 }
             }
             let mut transport_factory = TokioWebSocketTransportFactory::new();
@@ -1123,11 +1168,22 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
                 }
             };
             tracing::info!("pair_once: event loop spawned, awaiting JoinHandle");
-            if let Err(e) = join_handle.await {
-                tracing::error!("pair_once: bot task join failed: {e}");
-                let _ = tx
-                    .send(PairEvent::Failed(format!("bot task panicked: {e}")))
-                    .await;
+            // Bounded by `opts.timeout`, which the struct has always declared
+            // and nothing ever read — `PairEvent::Timeout` had exactly one
+            // occurrence in the repo, the arm that handles it. The bot
+            // auto-reconnects, so an unbounded await never returns.
+            match tokio::time::timeout(opts.timeout, join_handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!("pair_once: bot task join failed: {e}");
+                    let _ = tx
+                        .send(PairEvent::Failed(format!("bot task panicked: {e}")))
+                        .await;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!("pair_once: timed out after {:?}", opts.timeout);
+                    let _ = tx.send(PairEvent::Timeout).await;
+                }
             }
             tracing::info!("pair_once: thread exiting");
         });
@@ -1332,6 +1388,68 @@ mod tests {
         ch.apply_allowed_senders(&["+19998887777".to_string()]);
         assert!(ch.is_number_allowed("+19998887777"));
         assert!(!ch.is_number_allowed("+15551234567"));
+    }
+
+    /// `PairOptions` used to default `session_path` to a relative `wa.db`, so
+    /// the account's key material landed wherever the process ran.
+    #[test]
+    fn pair_options_have_no_relative_default() {
+        let opts = PairOptions::new(std::path::PathBuf::from("/tmp/rantaiclaw/wa.db"));
+        assert!(opts.session_path.is_absolute());
+        assert!(opts.timeout > std::time::Duration::ZERO);
+
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        assert!(
+            !production.contains("impl Default for PairOptions"),
+            "a Default impl reintroduces the relative session path"
+        );
+    }
+
+    /// `opts.timeout` was declared and never read, so pairing never ended: the
+    /// bot auto-reconnects, and the awaited handle only resolves when the event
+    /// loop dies.
+    #[test]
+    fn pair_once_honours_its_timeout() {
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let body = production
+            .split("pub fn pair_once(")
+            .nth(1)
+            .expect("pair_once exists");
+        assert!(
+            body.contains("tokio::time::timeout(opts.timeout"),
+            "the pairing wait must be bounded by the declared timeout"
+        );
+        assert!(
+            body.contains("PairEvent::Timeout"),
+            "the timeout must be reported to the caller"
+        );
+        assert!(
+            !body.contains("expect(\"runtime\")"),
+            "a panicking runtime start drops the sender and hides the cause"
+        );
+    }
+
+    /// A corrupt or unreadable session DB used to look identical to "no
+    /// session", so the wizard paired a fresh device over existing key
+    /// material.
+    #[test]
+    fn pair_once_refuses_to_pair_over_an_unreadable_session() {
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let body = production
+            .split("pub fn pair_once(")
+            .nth(1)
+            .expect("pair_once exists");
+        assert!(
+            !body.contains("if let Ok(exists) = backend.exists()"),
+            "both session-load results must be matched, not silently ignored"
+        );
+        assert!(
+            body.contains("refusing to pair over"),
+            "the refusal must say why"
+        );
     }
 
     /// The table test above exercises `allow_recipient` directly, and a
