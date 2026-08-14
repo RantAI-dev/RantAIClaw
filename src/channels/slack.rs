@@ -16,7 +16,75 @@ pub struct SlackChannel {
 /// <https://docs.slack.dev/changelog/2018-truncating-really-long-messages/>
 const SLACK_MAX_MESSAGE_LENGTH: usize = 4000;
 
+/// What the poll loop should do with one inbound Slack message.
+///
+/// Extracted so the allowlist gate is reachable from a test. It used to sit
+/// inside `listen()`'s socket loop, which no test enters — deleting the gate
+/// line left every test in this file passing. This is a **move**: the ordering
+/// of the checks and their conditions are unchanged.
+#[derive(Debug)]
+pub(crate) enum SlackInbound {
+    /// The bot's own message.
+    Own,
+    /// Not in the allowlist. The caller runs the pairing path, which needs the
+    /// network, then drops the message.
+    Unauthorized {
+        user: String,
+        text: String,
+        ts: String,
+    },
+    /// Empty text, or older than the cursor.
+    EmptyOrSeen,
+    Deliver(ChannelMessage),
+}
+
 impl SlackChannel {
+    /// Classify one message from a `conversations.history` page.
+    pub(crate) fn classify_inbound(
+        &self,
+        msg: &serde_json::Value,
+        bot_user_id: &str,
+        last_ts: &str,
+        channel_id: &str,
+    ) -> SlackInbound {
+        let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+        let user = msg
+            .get("user")
+            .and_then(|u| u.as_str())
+            .unwrap_or("unknown");
+        let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+
+        if user == bot_user_id {
+            return SlackInbound::Own;
+        }
+
+        if !self.is_user_allowed(user) {
+            return SlackInbound::Unauthorized {
+                user: user.to_string(),
+                text: text.to_string(),
+                ts: ts.to_string(),
+            };
+        }
+
+        if text.is_empty() || ts <= last_ts {
+            return SlackInbound::EmptyOrSeen;
+        }
+
+        SlackInbound::Deliver(ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: format!("slack_{channel_id}_{ts}"),
+            sender: user.to_string(),
+            reply_target: channel_id.to_string(),
+            content: text.to_string(),
+            channel: "slack".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: Self::inbound_thread_ts(msg, ts),
+        })
+    }
+
     /// POST one already-split chunk.
     async fn post_chunk(&self, message: &SendMessage, chunk: &str) -> anyhow::Result<()> {
         let mut body = serde_json::json!({
@@ -220,20 +288,34 @@ impl Channel for SlackChannel {
             if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                 // Messages come newest-first, reverse to process oldest first
                 for msg in messages.iter().rev() {
-                    let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-                    let user = msg
-                        .get("user")
-                        .and_then(|u| u.as_str())
-                        .unwrap_or("unknown");
-                    let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    // The decision — including the allowlist gate — lives in
+                    // `classify_inbound` so a test can reach it. Everything the
+                    // arms below do needs the network, which is why it stays
+                    // here.
+                    let (user, text, ts) = match self.classify_inbound(
+                        msg,
+                        &bot_user_id,
+                        last_ts.as_str(),
+                        &channel_id,
+                    ) {
+                        SlackInbound::Own | SlackInbound::EmptyOrSeen => continue,
+                        SlackInbound::Deliver(channel_msg) => {
+                            last_ts = channel_msg
+                                .id
+                                .rsplit('_')
+                                .next()
+                                .unwrap_or_default()
+                                .to_string();
+                            if tx.send(channel_msg).await.is_err() {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        SlackInbound::Unauthorized { user, text, ts } => (user, text, ts),
+                    };
+                    let (user, text, ts) = (user.as_str(), text.as_str(), ts.as_str());
 
-                    // Skip bot's own messages
-                    if user == bot_user_id {
-                        continue;
-                    }
-
-                    // Sender validation
-                    if !self.is_user_allowed(user) {
+                    {
                         // Before rejecting, let a not-yet-allowed user self-onboard
                         // with a `/bind`/`/claim <code>` minted via
                         // `rantaiclaw channels pair`. On success the sender lands in
@@ -263,32 +345,6 @@ impl Channel for SlackChannel {
                             }
                         }
                         tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
-                        continue;
-                    }
-
-                    // Skip empty or already-seen
-                    if text.is_empty() || ts <= last_ts.as_str() {
-                        continue;
-                    }
-
-                    last_ts = ts.to_string();
-
-                    let channel_msg = ChannelMessage {
-                        sender_aliases: Vec::new(),
-                        id: format!("slack_{channel_id}_{ts}"),
-                        sender: user.to_string(),
-                        reply_target: channel_id.clone(),
-                        content: text.to_string(),
-                        channel: "slack".to_string(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        thread_ts: Self::inbound_thread_ts(msg, ts),
-                    };
-
-                    if tx.send(channel_msg).await.is_err() {
-                        return Ok(());
                     }
                 }
             }
@@ -321,6 +377,67 @@ impl Channel for SlackChannel {
 
 #[cfg(test)]
 mod tests {
+    /// The allowlist gate lived inside `listen()`'s poll loop, which no test
+    /// enters — deleting the gate line left every test in this file passing.
+    #[test]
+    fn an_unlisted_user_is_rejected() {
+        let listed = SlackChannel::new("xoxb-placeholder".into(), None, vec!["U_ALLOWED".into()]);
+        let msg = serde_json::json!({
+            "ts": "1700000001.000100",
+            "user": "U_OTHER",
+            "text": "status please"
+        });
+
+        assert!(
+            matches!(
+                listed.classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
+                SlackInbound::Unauthorized { .. }
+            ),
+            "a user outside allowed_users must not be delivered"
+        );
+
+        // Control: the same message from the allowlisted user IS delivered, so
+        // this cannot pass because the fixture was malformed.
+        let mut allowed = msg.clone();
+        allowed["user"] = serde_json::json!("U_ALLOWED");
+        match listed.classify_inbound(&allowed, "U_BOT", "", "C_CHAN") {
+            SlackInbound::Deliver(m) => {
+                assert_eq!(m.sender, "U_ALLOWED");
+                assert_eq!(m.reply_target, "C_CHAN");
+                assert_eq!(m.content, "status please");
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_bots_own_message_and_stale_cursors_are_skipped() {
+        let ch = SlackChannel::new("xoxb-placeholder".into(), None, vec!["*".into()]);
+        let msg = serde_json::json!({
+            "ts": "1700000001.000100",
+            "user": "U_BOT",
+            "text": "my own reply"
+        });
+        assert!(matches!(
+            ch.classify_inbound(&msg, "U_BOT", "", "C_CHAN"),
+            SlackInbound::Own
+        ));
+
+        // Older than the cursor, and empty text.
+        let mut old = msg.clone();
+        old["user"] = serde_json::json!("U_SOMEONE");
+        assert!(matches!(
+            ch.classify_inbound(&old, "U_BOT", "1700000009.000100", "C_CHAN"),
+            SlackInbound::EmptyOrSeen
+        ));
+        let mut empty = old.clone();
+        empty["text"] = serde_json::json!("");
+        assert!(matches!(
+            ch.classify_inbound(&empty, "U_BOT", "", "C_CHAN"),
+            SlackInbound::EmptyOrSeen
+        ));
+    }
+
     /// The splitter test above proves the constant and the splitter behave; a
     /// `send()` that never calls the splitter passes it anyway. This asserts
     /// the wiring, since `send()` needs a live API to drive.

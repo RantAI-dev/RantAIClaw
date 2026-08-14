@@ -327,7 +327,14 @@ pub struct TelegramChannel {
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
+    /// Bot API root. Only the tests override it — nine of them used to send
+    /// real requests to `api.telegram.org` with a fake token and assert
+    /// `is_err()`, which passes whether or not the request was well formed.
+    api_base: String,
 }
+
+/// The public Bot API. Not a config key: overriding it is a test seam.
+const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 
 /// Validate a Telegram bot token by calling `getMe` directly, returning the
 /// bot's username on success. Deliberately does NOT build a [`TelegramChannel`]
@@ -336,7 +343,7 @@ pub struct TelegramChannel {
 /// a token works before persisting it. The caller distinguishes "invalid token"
 /// from "Telegram unreachable" only by the message; both are connect failures.
 pub async fn validate_bot_token(bot_token: &str) -> anyhow::Result<String> {
-    let url = format!("https://api.telegram.org/bot{bot_token}/getMe");
+    let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/getMe");
     let resp = reqwest::Client::new()
         .get(&url)
         .timeout(Duration::from_secs(10))
@@ -382,7 +389,16 @@ impl TelegramChannel {
             typing_handles: Mutex::new(std::collections::HashMap::new()),
             mention_only,
             bot_username: Mutex::new(None),
+            api_base: TELEGRAM_API_BASE.to_string(),
         }
+    }
+
+    /// Point this channel at a local server so a test can assert what was
+    /// actually sent.
+    #[cfg(test)]
+    fn with_api_base(mut self, api_base: impl Into<String>) -> Self {
+        self.api_base = api_base.into();
+        self
     }
 
     /// Configure streaming mode for progressive draft updates.
@@ -557,7 +573,7 @@ impl TelegramChannel {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{method}", self.bot_token)
+        format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
@@ -1213,10 +1229,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .to_string();
 
         // Step 2: download the actual file
-        let download_url = format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            self.bot_token, file_path
-        );
+        let download_url = format!("{}/file/bot{}/{}", self.api_base, self.bot_token, file_path);
         let img_resp = self.http_client().get(&download_url).send().await?;
         // Reject an oversized download before buffering it. Telegram caps bot
         // file downloads at ~20MB; a body claiming more is malformed/hostile.
@@ -2694,7 +2707,7 @@ mod tests {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
         assert_eq!(
             ch.api_url("getMe"),
-            "https://api.telegram.org/bot123:ABC/getMe"
+            format!("{TELEGRAM_API_BASE}/bot123:ABC/getMe")
         );
     }
 
@@ -2935,6 +2948,36 @@ mod tests {
         );
     }
 
+    /// `is_any_user_allowed` was tested on its own, never through the function
+    /// `listen()` actually calls. Deleting the gate from `parse_update_message`
+    /// left the suite green.
+    #[test]
+    fn parse_update_message_drops_an_unlisted_sender() {
+        let ch = TelegramChannel::new("token".into(), vec!["555".into()], false);
+        let update = |id: i64| {
+            serde_json::json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 33,
+                    "text": "status please",
+                    "from": { "id": id },
+                    "chat": { "id": id }
+                }
+            })
+        };
+
+        assert!(
+            ch.parse_update_message(&update(999)).is_none(),
+            "a sender outside allowed_users must not produce a message"
+        );
+        // Control on the same fixture: the allowlisted id does.
+        let (msg, _) = ch
+            .parse_update_message(&update(555))
+            .expect("the allowlisted sender parses");
+        assert_eq!(msg.sender, "555");
+        assert_eq!(msg.content, "status please");
+    }
+
     #[test]
     fn parse_update_message_uses_chat_id_as_reply_target() {
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
@@ -3076,7 +3119,7 @@ mod tests {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
         assert_eq!(
             ch.api_url("sendDocument"),
-            "https://api.telegram.org/bot123:ABC/sendDocument"
+            format!("{TELEGRAM_API_BASE}/bot123:ABC/sendDocument")
         );
     }
 
@@ -3085,7 +3128,7 @@ mod tests {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
         assert_eq!(
             ch.api_url("sendPhoto"),
-            "https://api.telegram.org/bot123:ABC/sendPhoto"
+            format!("{TELEGRAM_API_BASE}/bot123:ABC/sendPhoto")
         );
     }
 
@@ -3094,7 +3137,7 @@ mod tests {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
         assert_eq!(
             ch.api_url("sendVideo"),
-            "https://api.telegram.org/bot123:ABC/sendVideo"
+            format!("{TELEGRAM_API_BASE}/bot123:ABC/sendVideo")
         );
     }
 
@@ -3103,7 +3146,7 @@ mod tests {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
         assert_eq!(
             ch.api_url("sendAudio"),
-            "https://api.telegram.org/bot123:ABC/sendAudio"
+            format!("{TELEGRAM_API_BASE}/bot123:ABC/sendAudio")
         );
     }
 
@@ -3112,72 +3155,200 @@ mod tests {
         let ch = TelegramChannel::new("123:ABC".into(), vec![], false);
         assert_eq!(
             ch.api_url("sendVoice"),
-            "https://api.telegram.org/bot123:ABC/sendVoice"
+            format!("{TELEGRAM_API_BASE}/bot123:ABC/sendVoice")
         );
     }
 
     // ── File sending integration tests (with mock server) ──────────
 
+    /// A local stand-in for the Bot API. The tests below used to POST to
+    /// `api.telegram.org` with a fake token and assert only `is_err()` — which
+    /// is what a malformed request, an empty body and an unplugged network all
+    /// produce, so they asserted nothing about what was sent.
+    async fn spawn_bot_api() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
+        use axum::body::Bytes;
+        use axum::extract::State;
+        use axum::http::Uri;
+
+        type Captured = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+        let captured: Captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        async fn record(State(captured): State<Captured>, uri: Uri, body: Bytes) -> &'static str {
+            captured.lock().expect("capture lock").push((
+                uri.path().to_string(),
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
+            r#"{"ok":true,"result":{}}"#
+        }
+
+        let app = axum::Router::new()
+            .fallback(axum::routing::post(record))
+            .with_state(std::sync::Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}"), captured)
+    }
+
+    fn only_request(captured: &std::sync::Mutex<Vec<(String, String)>>) -> (String, String) {
+        let requests = captured.lock().expect("capture lock");
+        assert_eq!(requests.len(), 1, "expected exactly one request");
+        requests[0].clone()
+    }
+
     #[tokio::test]
-    async fn telegram_send_document_bytes_builds_correct_form() {
-        // This test verifies the method doesn't panic and handles bytes correctly
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
-        let file_bytes = b"Hello, this is a test file content".to_vec();
+    async fn telegram_send_document_bytes_posts_the_multipart_form() {
+        let (base, captured) = spawn_bot_api().await;
+        let ch =
+            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
 
-        // The actual API call will fail (no real server), but we verify the method exists
-        // and handles the input correctly up to the network call
-        let result = ch
-            .send_document_bytes("123456", None, file_bytes, "test.txt", Some("Test caption"))
-            .await;
+        ch.send_document_bytes(
+            "123456",
+            Some("77"),
+            b"file content".to_vec(),
+            "report.txt",
+            Some("Test caption"),
+        )
+        .await
+        .expect("the local Bot API accepts it");
 
-        // Should fail with network error, not a panic or type error
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        // Error should be network-related, not a code bug
+        let (path, body) = only_request(&captured);
+        assert_eq!(path, "/bot123:ABC/sendDocument");
+        for expected in [
+            "name=\"chat_id\"",
+            "123456",
+            "name=\"document\"",
+            "filename=\"report.txt\"",
+            "file content",
+            "name=\"caption\"",
+            "Test caption",
+            "name=\"message_thread_id\"",
+        ] {
+            assert!(body.contains(expected), "multipart body missing {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_send_document_bytes_omits_an_absent_caption() {
+        let (base, captured) = spawn_bot_api().await;
+        let ch =
+            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
+
+        ch.send_document_bytes("123456", None, b"x".to_vec(), "a.txt", None)
+            .await
+            .expect("the local Bot API accepts it");
+
+        let (_, body) = only_request(&captured);
         assert!(
-            err.contains("error") || err.contains("failed") || err.contains("connect"),
-            "Expected network error, got: {err}"
+            !body.contains("name=\"caption\""),
+            "no caption was supplied, so none may be sent"
         );
+        assert!(!body.contains("name=\"message_thread_id\""));
     }
 
     #[tokio::test]
-    async fn telegram_send_photo_bytes_builds_correct_form() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
-        // Minimal valid PNG header bytes
-        let file_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    async fn telegram_send_photo_bytes_posts_to_send_photo() {
+        let (base, captured) = spawn_bot_api().await;
+        let ch =
+            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
 
-        let result = ch
-            .send_photo_bytes("123456", None, file_bytes, "test.png", None)
-            .await;
+        ch.send_photo_bytes(
+            "123456",
+            None,
+            vec![0x89, 0x50, 0x4E, 0x47],
+            "shot.png",
+            Some("Photo caption"),
+        )
+        .await
+        .expect("the local Bot API accepts it");
 
-        assert!(result.is_err());
+        let (path, body) = only_request(&captured);
+        assert_eq!(path, "/bot123:ABC/sendPhoto");
+        assert!(body.contains("name=\"photo\""), "the field is `photo`");
+        assert!(body.contains("filename=\"shot.png\""));
+        assert!(body.contains("Photo caption"));
     }
 
     #[tokio::test]
-    async fn telegram_send_document_by_url_builds_correct_json() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
+    async fn telegram_send_document_by_url_posts_json_not_multipart() {
+        let (base, captured) = spawn_bot_api().await;
+        let ch =
+            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
 
-        let result = ch
-            .send_document_by_url(
-                "123456",
-                None,
-                "https://example.com/file.pdf",
-                Some("PDF doc"),
+        ch.send_document_by_url(
+            "123456",
+            None,
+            "https://example.com/file.pdf",
+            Some("PDF doc"),
+        )
+        .await
+        .expect("the local Bot API accepts it");
+
+        let (path, body) = only_request(&captured);
+        assert_eq!(path, "/bot123:ABC/sendDocument");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(json["chat_id"], "123456");
+        assert_eq!(json["document"], "https://example.com/file.pdf");
+        assert_eq!(json["caption"], "PDF doc");
+        assert!(json.get("message_thread_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn telegram_send_photo_by_url_posts_json_to_send_photo() {
+        let (base, captured) = spawn_bot_api().await;
+        let ch =
+            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
+
+        ch.send_photo_by_url("123456", Some("9"), "https://example.com/image.jpg", None)
+            .await
+            .expect("the local Bot API accepts it");
+
+        let (path, body) = only_request(&captured);
+        assert_eq!(path, "/bot123:ABC/sendPhoto");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(json["photo"], "https://example.com/image.jpg");
+        assert_eq!(json["message_thread_id"], "9");
+        assert!(json.get("caption").is_none());
+    }
+
+    /// Telegram rejects an empty `chat_id`; the channel must surface that as an
+    /// error rather than logging a success. The old test asserted `is_err()`
+    /// against an unreachable host, which proved nothing about this path.
+    #[tokio::test]
+    async fn telegram_send_document_bytes_reports_an_api_rejection() {
+        async fn reject() -> (axum::http::StatusCode, &'static str) {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                r#"{"ok":false,"description":"Bad Request: chat_id is empty"}"#,
             )
-            .await;
+        }
+        let app = axum::Router::new().fallback(axum::routing::post(reject));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn telegram_send_photo_by_url_builds_correct_json() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
-
-        let result = ch
-            .send_photo_by_url("123456", None, "https://example.com/image.jpg", None)
-            .await;
-
-        assert!(result.is_err());
+        let ch = TelegramChannel::new("123:ABC".into(), vec!["*".into()], false)
+            .with_api_base(format!("http://{addr}"));
+        let err = ch
+            .send_document_bytes("", None, b"content".to_vec(), "test.txt", None)
+            .await
+            .expect_err("an HTTP 400 from the Bot API is an error");
+        assert!(
+            err.to_string().contains("chat_id is empty"),
+            "the API's reason must survive: {err}"
+        );
     }
 
     // ── File path handling tests ────────────────────────────────────
@@ -3242,94 +3413,7 @@ mod tests {
 
     // ── Caption handling tests ──────────────────────────────────────
 
-    #[tokio::test]
-    async fn telegram_send_document_bytes_with_caption() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
-        let file_bytes = b"test content".to_vec();
-
-        // With caption
-        let result = ch
-            .send_document_bytes(
-                "123456",
-                None,
-                file_bytes.clone(),
-                "test.txt",
-                Some("My caption"),
-            )
-            .await;
-        assert!(result.is_err()); // Network error expected
-
-        // Without caption
-        let result = ch
-            .send_document_bytes("123456", None, file_bytes, "test.txt", None)
-            .await;
-        assert!(result.is_err()); // Network error expected
-    }
-
-    #[tokio::test]
-    async fn telegram_send_photo_bytes_with_caption() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
-        let file_bytes = vec![0x89, 0x50, 0x4E, 0x47];
-
-        // With caption
-        let result = ch
-            .send_photo_bytes(
-                "123456",
-                None,
-                file_bytes.clone(),
-                "test.png",
-                Some("Photo caption"),
-            )
-            .await;
-        assert!(result.is_err());
-
-        // Without caption
-        let result = ch
-            .send_photo_bytes("123456", None, file_bytes, "test.png", None)
-            .await;
-        assert!(result.is_err());
-    }
-
     // ── Empty/edge case tests ───────────────────────────────────────
-
-    #[tokio::test]
-    async fn telegram_send_document_bytes_empty_file() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
-        let file_bytes: Vec<u8> = vec![];
-
-        let result = ch
-            .send_document_bytes("123456", None, file_bytes, "empty.txt", None)
-            .await;
-
-        // Should not panic, will fail at API level
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn telegram_send_document_bytes_empty_filename() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
-        let file_bytes = b"content".to_vec();
-
-        let result = ch
-            .send_document_bytes("123456", None, file_bytes, "", None)
-            .await;
-
-        // Should not panic
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn telegram_send_document_bytes_empty_chat_id() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false);
-        let file_bytes = b"content".to_vec();
-
-        let result = ch
-            .send_document_bytes("", None, file_bytes, "test.txt", None)
-            .await;
-
-        // Should not panic
-        assert!(result.is_err());
-    }
 
     // ── Message ID edge cases ─────────────────────────────────────
 

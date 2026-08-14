@@ -120,6 +120,25 @@ pub fn profile_root(channel: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// The allowlist field a channel's identities belong in.
+///
+/// `apply_pairing` used to take an `AllowlistField` and consume it with
+/// a discard binding, so passing the wrong one for a channel was undetectable by
+/// construction — the parameter gave the appearance of a check that did not
+/// exist. It is now resolved from the channel here, and `apply_pairing`
+/// verifies the caller's argument against it.
+pub fn expected_field_for(channel: &str) -> Option<AllowlistField> {
+    Some(match channel {
+        "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "irc" | "lark"
+        | "dingtalk" | "qq" | "nextcloud_talk" => AllowlistField::AllowedUsers,
+        "signal" => AllowlistField::AllowedFrom,
+        "whatsapp" => AllowlistField::AllowedNumbers,
+        "linq" => AllowlistField::AllowedSenders,
+        "imessage" => AllowlistField::AllowedContacts,
+        _ => return None,
+    })
+}
+
 pub fn apply_pairing(
     cc: &mut ChannelsConfig,
     channel: &str,
@@ -127,8 +146,26 @@ pub fn apply_pairing(
     identities: &[String],
     make_owner: bool,
 ) {
-    // Resolve the target allowlist Vec for the (channel, field) pair. The field
-    // is informational/asserting; `channel` selects the config section.
+    // The field is now checked rather than ignored. A mismatch means the caller
+    // and this function disagree about which list a channel's identities go in,
+    // which is a programming error worth surfacing loudly — but not worth
+    // writing the wrong list over, so it returns.
+    match expected_field_for(channel) {
+        Some(expected) if expected == field => {}
+        Some(expected) => {
+            tracing::error!(
+                "pairing: {channel} expects {expected:?} but the caller passed {field:?}; \
+                 refusing to write the wrong allowlist"
+            );
+            return;
+        }
+        None => {
+            tracing::warn!("pairing: unknown channel {channel}; nothing to append to");
+            return;
+        }
+    }
+
+    // Resolve the target allowlist Vec. `channel` selects the config section.
     let target: Option<&mut Vec<String>> = match channel {
         "telegram" => cc.telegram.as_mut().map(|c| &mut c.allowed_users),
         "discord" => cc.discord.as_mut().map(|c| &mut c.allowed_users),
@@ -149,7 +186,6 @@ pub fn apply_pairing(
 
     let Some(list) = target else {
         // Channel section not configured — nothing to append to.
-        let _ = field;
         return;
     };
 
@@ -332,6 +368,84 @@ mod tests {
             telegram: Some(telegram_config()),
             ..Default::default()
         }
+    }
+
+    /// All fourteen arms, and the field each one expects. Every existing
+    /// `apply_pairing` test used `"telegram"`, so thirteen arms had no coverage
+    /// at all and a typo in any of them was invisible.
+    #[test]
+    fn every_channel_arm_resolves_its_own_allowlist() {
+        use AllowlistField::{
+            AllowedContacts, AllowedFrom, AllowedNumbers, AllowedSenders, AllowedUsers,
+        };
+
+        let table: [(&str, AllowlistField); 14] = [
+            ("telegram", AllowedUsers),
+            ("discord", AllowedUsers),
+            ("slack", AllowedUsers),
+            ("mattermost", AllowedUsers),
+            ("matrix", AllowedUsers),
+            ("irc", AllowedUsers),
+            ("lark", AllowedUsers),
+            ("dingtalk", AllowedUsers),
+            ("qq", AllowedUsers),
+            ("nextcloud_talk", AllowedUsers),
+            ("signal", AllowedFrom),
+            ("whatsapp", AllowedNumbers),
+            ("linq", AllowedSenders),
+            ("imessage", AllowedContacts),
+        ];
+
+        for (channel, field) in table {
+            assert_eq!(
+                expected_field_for(channel),
+                Some(field),
+                "{channel} must resolve to {field:?}"
+            );
+        }
+
+        // An unknown channel resolves to nothing, rather than defaulting into
+        // somebody else's list.
+        assert_eq!(expected_field_for("telgram"), None);
+        assert_eq!(expected_field_for(""), None);
+    }
+
+    /// The wrong field for a channel used to be accepted silently — the
+    /// parameter was discarded unread. It must not write.
+    #[test]
+    fn a_mismatched_field_writes_nothing() {
+        let mut cc = channels_with_telegram();
+        apply_pairing(
+            &mut cc,
+            "telegram",
+            // Telegram's list is `allowed_users`; this is Signal's field.
+            AllowlistField::AllowedFrom,
+            &["rantaiclaw_user".to_string()],
+            false,
+        );
+        assert!(
+            cc.telegram
+                .as_ref()
+                .expect("telegram section")
+                .allowed_users
+                .is_empty(),
+            "a mismatched field must not append to the resolved list"
+        );
+
+        // The matching field does write — otherwise this test would pass for a
+        // channel that appends nothing at all.
+        apply_pairing(
+            &mut cc,
+            "telegram",
+            AllowlistField::AllowedUsers,
+            &["rantaiclaw_user".to_string()],
+            false,
+        );
+        assert_eq!(
+            cc.telegram.as_ref().expect("telegram").allowed_users,
+            vec!["rantaiclaw_user".to_string()],
+            "control: the matching field appends"
+        );
     }
 
     #[test]

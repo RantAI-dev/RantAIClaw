@@ -488,6 +488,45 @@ mod tests {
 
     use super::*;
 
+    /// The plan for this work claimed there was no negative case here at all.
+    /// That had drifted — `nextcloud_talk_parse_skips_unauthorized_sender`
+    /// exists and does fail without the gate. What was missing is the
+    /// **control**: a negative test alone passes just as well when the fixture
+    /// is malformed and nothing would have parsed anyway. This asserts both
+    /// halves against one payload.
+    #[test]
+    fn an_unlisted_actor_is_rejected() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "type": "message",
+            "object": { "token": "room_rantaiclaw_0001" },
+            "message": {
+                "actorType": "users",
+                "actorId": "somebody_else",
+                "messageType": "comment",
+                "message": "status please",
+                "token": "room_rantaiclaw_0001",
+                "id": 4242,
+                "timestamp": 1_700_000_000
+            }
+        });
+
+        assert!(
+            ch.parse_webhook_payload(&payload).is_empty(),
+            "an actor outside allowed_users must not reach the agent"
+        );
+
+        // The same payload from the allowlisted actor DOES arrive — otherwise
+        // this test would pass for the wrong reason (a malformed fixture).
+        let mut allowed = payload.clone();
+        allowed["message"]["actorId"] = serde_json::json!("user_a");
+        assert_eq!(
+            ch.parse_webhook_payload(&allowed).len(),
+            1,
+            "control: the fixture itself parses"
+        );
+    }
+
     fn make_channel() -> NextcloudTalkChannel {
         NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),

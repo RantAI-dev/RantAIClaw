@@ -4110,6 +4110,177 @@ pub async fn start_channels_with_cancellation(
 
 #[cfg(test)]
 mod tests {
+    /// Every channel keeps its allowlist gate inside the polling loop that
+    /// `listen()` runs, and no test enters that loop — the gate line can be
+    /// deleted with the whole suite still green. Only Slack's is extracted into
+    /// a callable function (`classify_inbound`, tested in slack.rs); the rest
+    /// cannot be reached without a fake transport per channel, so this asserts
+    /// the wiring by source position instead: the gate call must be present in
+    /// the function that receives messages, and `listen()` must reach that
+    /// function. It is deliberately weaker than a behavioural test — it proves
+    /// the call exists, not that it decides anything. The per-channel
+    /// `is_*_allowed` unit tests cover the decision.
+    #[test]
+    fn every_channel_listen_path_calls_its_allowlist_gate() {
+        // (channel, source, fn that receives messages, gate call in it,
+        //  fn `listen()` must delegate to — empty when the gate is in listen)
+        let wiring: &[(&str, &str, &str, &str, &str)] = &[
+            (
+                "dingtalk",
+                include_str!("dingtalk.rs"),
+                "fn listen(",
+                "self.is_user_allowed(",
+                "",
+            ),
+            (
+                "discord",
+                include_str!("discord.rs"),
+                "fn listen(",
+                "self.is_user_allowed(",
+                "",
+            ),
+            (
+                "imessage",
+                include_str!("imessage.rs"),
+                "fn listen(",
+                "self.is_contact_allowed(",
+                "",
+            ),
+            (
+                "irc",
+                include_str!("irc.rs"),
+                "fn run_session(",
+                "self.is_user_allowed(",
+                "self.run_session(",
+            ),
+            (
+                "lark (websocket)",
+                include_str!("lark.rs"),
+                "fn listen_ws(",
+                "self.is_user_allowed(",
+                "self.listen_ws(",
+            ),
+            (
+                // The webhook half gates inside `parse_event_payload`, which the
+                // axum handler calls; `listen_http` only mounts the router.
+                "lark (webhook)",
+                include_str!("lark.rs"),
+                "fn parse_event_payload(",
+                "self.is_user_allowed(",
+                "",
+            ),
+            (
+                "matrix",
+                include_str!("matrix.rs"),
+                "fn listen(",
+                "MatrixChannel::is_sender_allowed(",
+                "",
+            ),
+            (
+                "mattermost",
+                include_str!("mattermost.rs"),
+                "fn listen(",
+                "self.is_user_allowed(",
+                "",
+            ),
+            // QQ gates twice — once per message shape — so both are named.
+            (
+                "qq (c2c)",
+                include_str!("qq.rs"),
+                "fn listen(",
+                "self.is_user_allowed(user_openid)",
+                "",
+            ),
+            (
+                "qq (group)",
+                include_str!("qq.rs"),
+                "fn listen(",
+                "self.is_user_allowed(author_id)",
+                "",
+            ),
+            (
+                "signal",
+                include_str!("signal.rs"),
+                "fn process_envelope(",
+                "self.is_sender_allowed(",
+                "self.process_envelope(",
+            ),
+            (
+                "slack",
+                include_str!("slack.rs"),
+                "fn classify_inbound(",
+                "self.is_user_allowed(",
+                "self.classify_inbound(",
+            ),
+            (
+                "telegram",
+                include_str!("telegram.rs"),
+                "fn parse_update_message(",
+                "self.is_any_user_allowed(",
+                "self.parse_update_message(",
+            ),
+            (
+                "whatsapp_web",
+                include_str!("whatsapp_web.rs"),
+                "fn listen(",
+                "Self::allow_inbound(",
+                "",
+            ),
+        ];
+
+        for (channel, src, receiver, gate, delegate) in wiring {
+            let production = production_half(src);
+            let body = fn_body(production, receiver)
+                .unwrap_or_else(|| panic!("{channel}: `{receiver}` not found in production code"));
+            assert!(
+                body.contains(gate),
+                "{channel}: `{receiver}` no longer calls `{gate}` — an inbound \
+                 message can reach the agent without passing the allowlist"
+            );
+            if !delegate.is_empty() {
+                let listen = fn_body(production, "fn listen(")
+                    .unwrap_or_else(|| panic!("{channel}: no `listen` in production code"));
+                assert!(
+                    listen.contains(delegate),
+                    "{channel}: `listen()` no longer reaches `{delegate}`, so the \
+                     gate asserted above is on a dead path"
+                );
+            }
+        }
+    }
+
+    /// Everything before the test module. Cutting at the first `#[cfg(test)]`
+    /// would be wrong twice over: telegram has a `#[cfg(test)]` helper among
+    /// its production methods, and whatsapp_web gates its test module on a
+    /// feature as well.
+    fn production_half(src: &str) -> &str {
+        let cut = ["\n#[cfg(test)]\nmod ", "\n#[cfg(all(test"]
+            .iter()
+            .filter_map(|marker| src.find(marker))
+            .min()
+            .unwrap_or(src.len());
+        &src[..cut]
+    }
+
+    /// Body of the first function whose signature starts with `header`, ending
+    /// at the next method declared at the same indentation.
+    fn fn_body<'a>(production: &'a str, header: &str) -> Option<&'a str> {
+        let after = production.split(header).nth(1)?;
+        let end = [
+            "\n    fn ",
+            "\n    async fn ",
+            "\n    pub fn ",
+            "\n    pub async fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub(crate) async fn ",
+        ]
+        .iter()
+        .filter_map(|marker| after.find(marker))
+        .min()
+        .unwrap_or(after.len());
+        Some(&after[..end])
+    }
+
     use super::*;
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
@@ -4352,6 +4523,97 @@ mod tests {
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
+    }
+
+    /// Durable history, end to end. Every `ChannelRuntimeContext` in this test
+    /// module set `history_store: None`, so making the write-through a no-op
+    /// failed nothing — and history silently stopping surviving restarts is the
+    /// bug this module exists to fix.
+    #[test]
+    fn durable_history_writes_through_and_reloads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store =
+            crate::channels::history_store::ChannelHistoryStore::open(dir.path()).expect("open");
+        let histories = HashMap::new();
+        let sender = "telegram_u1".to_string();
+
+        let ctx = ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            history_store: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        };
+
+        let ctx = ChannelRuntimeContext {
+            history_store: Some(Arc::new(store)),
+            ..ctx
+        };
+
+        // Enough turns to cross the cap, so eviction is exercised too.
+        for idx in 0..(MAX_CHANNEL_HISTORY + 5) {
+            append_sender_turn(&ctx, &sender, ChatMessage::user(format!("msg-{idx}")));
+        }
+
+        // The live map is capped, oldest-first.
+        {
+            let live = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let turns = live.get(&sender).expect("live history");
+            assert_eq!(turns.len(), MAX_CHANNEL_HISTORY);
+            assert_eq!(turns[0].content, "msg-5", "oldest turns are evicted first");
+            assert_eq!(
+                turns[MAX_CHANNEL_HISTORY - 1].content,
+                format!("msg-{}", MAX_CHANNEL_HISTORY + 4)
+            );
+        }
+
+        // And a fresh reader reproduces it from disk — the whole point.
+        let reopened =
+            crate::channels::history_store::ChannelHistoryStore::open(dir.path()).expect("reopen");
+        let loaded = reopened.load_all().expect("load_all");
+        let persisted = loaded.get(&sender).expect("persisted history");
+        assert_eq!(
+            persisted.len(),
+            MAX_CHANNEL_HISTORY,
+            "the persisted history must match the live cap"
+        );
+        assert_eq!(persisted[0].content, "msg-5");
+        assert_eq!(
+            persisted[MAX_CHANNEL_HISTORY - 1].content,
+            format!("msg-{}", MAX_CHANNEL_HISTORY + 4)
+        );
     }
 
     #[test]
@@ -8676,8 +8938,14 @@ This is an example JSON object for profile settings."#;
     #[tokio::test]
     async fn supervised_listener_marks_error_and_restarts_on_failures() {
         let calls = Arc::new(AtomicUsize::new(0));
+        // UUID-suffixed like its two neighbours. `crate::health` is a process-wide
+        // registry, so a fixed component name collides with any other test that
+        // registers the same one — and the collision surfaces as a confusing
+        // assertion on somebody else's restart count, not as a name clash.
+        let name: &'static str =
+            Box::leak(format!("test-supervised-fail-{}", uuid::Uuid::new_v4()).into_boxed_str());
         let channel: Arc<dyn Channel> = Arc::new(AlwaysFailChannel {
-            name: "test-supervised-fail",
+            name,
             calls: Arc::clone(&calls),
         });
 
@@ -8690,7 +8958,7 @@ This is an example JSON object for profile settings."#;
         let _ = handle.await;
 
         let snapshot = crate::health::snapshot_json();
-        let component = &snapshot["components"]["channel:test-supervised-fail"];
+        let component = &snapshot["components"][format!("channel:{name}")];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
         assert!(component["last_error"]
