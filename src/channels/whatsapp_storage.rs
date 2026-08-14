@@ -1527,7 +1527,7 @@ mod tests {
         );
 
         store
-            .delete_mutation_macs("regular", &[index_mac.clone()])
+            .delete_mutation_macs("regular", std::slice::from_ref(&index_mac))
             .await
             .expect("delete");
         assert_eq!(
