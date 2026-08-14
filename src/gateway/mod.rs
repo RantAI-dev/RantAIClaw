@@ -2051,66 +2051,75 @@ async fn handle_whatsapp_message(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    // Process each message
+    // ACK first, then run the turns. The webhook used to await the full LLM
+    // turn before returning 200, so a slow turn blew past Meta's ACK deadline,
+    // Meta retried, and the same message was processed again — a duplicate
+    // reply and duplicate token spend on the ordinary path. The idempotency
+    // entries opened in the spawned task still release on failure, so a
+    // genuine retry is not lost.
     let provider_label = state
         .config
         .lock()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    for msg in &messages {
-        // The platform id, so a redelivery is skipped rather than answered
-        // twice. WhatsApp's signature scheme carries no timestamp or nonce, so
-        // this is the only replay control available here.
-        if !begin_inbound(&state, "whatsapp", &msg.id) {
-            continue;
-        }
-
-        tracing::info!(
-            "WhatsApp message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        // Auto-save to memory
-        if state.auto_save {
-            let key = whatsapp_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        match process_channel_chat(
-            &state,
-            &provider_label,
-            "whatsapp",
-            &msg.sender,
-            &msg.content,
-        )
-        .await
-        {
-            Ok(reply) => {
-                // Send reply via WhatsApp
-                if let Err(e) = wa.send(&SendMessage::new(reply, &msg.reply_target)).await {
-                    tracing::error!("Failed to send WhatsApp reply: {e}");
-                }
-                finish_inbound(&state, "whatsapp", &msg.id, true);
+    let state_bg = state.clone();
+    let wa_bg = Arc::clone(wa);
+    tokio::spawn(async move {
+        let state = state_bg;
+        let wa = wa_bg;
+        for msg in &messages {
+            // The platform id, so a redelivery is skipped rather than answered
+            // twice. WhatsApp's signature scheme carries no timestamp or nonce,
+            // so this is the only replay control available here.
+            if !begin_inbound(&state, "whatsapp", &msg.id) {
+                continue;
             }
-            Err(e) => {
-                tracing::error!("LLM error for WhatsApp message: {e:#}");
-                let _ = wa
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+
+            tracing::info!(
+                "WhatsApp message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
+
+            if state.auto_save {
+                let key = whatsapp_memory_key(msg);
+                let _ = state
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
-                // Released, not retired: the platform's own retry must be able
-                // to reach the agent after a transient failure.
-                finish_inbound(&state, "whatsapp", &msg.id, false);
+            }
+
+            match process_channel_chat(
+                &state,
+                &provider_label,
+                "whatsapp",
+                &msg.sender,
+                &msg.content,
+            )
+            .await
+            {
+                Ok(reply) => {
+                    if let Err(e) = wa.send(&SendMessage::new(reply, &msg.reply_target)).await {
+                        tracing::error!("Failed to send WhatsApp reply: {e}");
+                    }
+                    finish_inbound(&state, "whatsapp", &msg.id, true);
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for WhatsApp message: {e:#}");
+                    let _ = wa
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                    // Released, not retired: the platform's own retry must be
+                    // able to reach the agent after a transient failure.
+                    finish_inbound(&state, "whatsapp", &msg.id, false);
+                }
             }
         }
-    }
+    });
 
     // Acknowledge the webhook
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
@@ -2233,58 +2242,61 @@ async fn handle_linq_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    // Process each message
+    // ACK first, then run the turns — see the WhatsApp handler for why.
     let provider_label = state
         .config
         .lock()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    for msg in &messages {
-        // The platform id, so a redelivery is skipped rather than answered
-        // twice. Linq's signature enforces a 300-second window but no nonce, so
-        // a captured POST is replayable inside it; this closes that too.
-        if !begin_inbound(&state, "linq", &msg.id) {
-            continue;
-        }
-
-        tracing::info!(
-            "Linq message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        // Auto-save to memory
-        if state.auto_save {
-            let key = linq_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        // Call the LLM
-        match process_channel_chat(&state, &provider_label, "linq", &msg.sender, &msg.content).await
-        {
-            Ok(reply) => {
-                // Send reply via Linq
-                if let Err(e) = linq.send(&SendMessage::new(reply, &msg.reply_target)).await {
-                    tracing::error!("Failed to send Linq reply: {e}");
-                }
-                finish_inbound(&state, "linq", &msg.id, true);
+    let state_bg = state.clone();
+    let linq_bg = Arc::clone(linq);
+    tokio::spawn(async move {
+        let state = state_bg;
+        let linq = linq_bg;
+        for msg in &messages {
+            // Linq's signature enforces a 300-second window but no nonce, so a
+            // captured POST is replayable inside it; this closes that too.
+            if !begin_inbound(&state, "linq", &msg.id) {
+                continue;
             }
-            Err(e) => {
-                tracing::error!("LLM error for Linq message: {e:#}");
-                let _ = linq
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+
+            tracing::info!(
+                "Linq message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
+
+            if state.auto_save {
+                let key = linq_memory_key(msg);
+                let _ = state
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
-                finish_inbound(&state, "linq", &msg.id, false);
+            }
+
+            match process_channel_chat(&state, &provider_label, "linq", &msg.sender, &msg.content)
+                .await
+            {
+                Ok(reply) => {
+                    if let Err(e) = linq.send(&SendMessage::new(reply, &msg.reply_target)).await {
+                        tracing::error!("Failed to send Linq reply: {e}");
+                    }
+                    finish_inbound(&state, "linq", &msg.id, true);
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for Linq message: {e:#}");
+                    let _ = linq
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                    finish_inbound(&state, "linq", &msg.id, false);
+                }
             }
         }
-    }
+    });
 
     // Acknowledge the webhook
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
@@ -2397,62 +2409,68 @@ async fn handle_nextcloud_talk_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
+    // ACK first, then run the turns — see the WhatsApp handler for why.
     let provider_label = state
         .config
         .lock()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-
-    for msg in &messages {
-        tracing::info!(
-            "Nextcloud Talk message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-
-        if !begin_inbound(&state, "nextcloud_talk", &msg.id) {
-            continue;
-        }
-
-        if state.auto_save {
-            let key = nextcloud_talk_memory_key(msg);
-            let _ = state
-                .mem
-                .store(&key, &msg.content, MemoryCategory::Conversation, None)
-                .await;
-        }
-
-        match process_channel_chat(
-            &state,
-            &provider_label,
-            "nextcloud_talk",
-            &msg.sender,
-            &msg.content,
-        )
-        .await
-        {
-            Ok(reply) => {
-                if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(reply, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
-                }
-                finish_inbound(&state, "nextcloud_talk", &msg.id, true);
+    let state_bg = state.clone();
+    let talk_bg = Arc::clone(nextcloud_talk);
+    tokio::spawn(async move {
+        let state = state_bg;
+        let nextcloud_talk = talk_bg;
+        for msg in &messages {
+            if !begin_inbound(&state, "nextcloud_talk", &msg.id) {
+                continue;
             }
-            Err(e) => {
-                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                let _ = nextcloud_talk
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+
+            tracing::info!(
+                "Nextcloud Talk message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
+
+            if state.auto_save {
+                let key = nextcloud_talk_memory_key(msg);
+                let _ = state
+                    .mem
+                    .store(&key, &msg.content, MemoryCategory::Conversation, None)
                     .await;
-                finish_inbound(&state, "nextcloud_talk", &msg.id, false);
+            }
+
+            match process_channel_chat(
+                &state,
+                &provider_label,
+                "nextcloud_talk",
+                &msg.sender,
+                &msg.content,
+            )
+            .await
+            {
+                Ok(reply) => {
+                    if let Err(e) = nextcloud_talk
+                        .send(&SendMessage::new(reply, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                    }
+                    finish_inbound(&state, "nextcloud_talk", &msg.id, true);
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                    let _ = nextcloud_talk
+                        .send(&SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ))
+                        .await;
+                    finish_inbound(&state, "nextcloud_talk", &msg.id, false);
+                }
             }
         }
-    }
+    });
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
@@ -2625,6 +2643,45 @@ mod tests {
             limiter.allow_webhook("10.0.0.9"),
             "another client is unaffected"
         );
+    }
+
+    /// Each handler used to await the full LLM turn before returning 200, so a
+    /// slow turn blew past the platform's ACK deadline, the platform retried,
+    /// and the same message was processed again — no attacker required.
+    #[test]
+    fn every_public_webhook_handler_acks_before_processing() {
+        let src = include_str!("mod.rs");
+        let production = src.split("#[cfg(test)]").next().expect("source");
+
+        for handler in [
+            "async fn handle_whatsapp_message(",
+            "async fn handle_linq_webhook(",
+            "async fn handle_nextcloud_talk_webhook(",
+        ] {
+            let body = production
+                .split(handler)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{handler} exists"));
+            let end = body.find("\nasync fn ").unwrap_or(body.len());
+            let body = &body[..end];
+
+            let spawn_at = body
+                .find("tokio::spawn(")
+                .unwrap_or_else(|| panic!("{handler} must move the turn off the ACK path"));
+            let turn_at = body
+                .find("process_channel_chat(")
+                .unwrap_or_else(|| panic!("{handler} runs a turn"));
+            assert!(
+                spawn_at < turn_at,
+                "{handler} must spawn before running the turn, not await it inline"
+            );
+            // And the entry still releases on failure, or one transient error
+            // drops the message forever.
+            assert!(
+                body.contains(", false);"),
+                "{handler} must abort its idempotency entry on a failed turn"
+            );
+        }
     }
 
     /// The store tests above prove the store; a handler that never calls it
