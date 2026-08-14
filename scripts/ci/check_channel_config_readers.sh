@@ -6,17 +6,20 @@
 # Why this exists
 # ---------------
 # A config key that nothing reads is not harmless. Two of the three found at
-# f189422 make an operator hand over a REAL CREDENTIAL for zero function:
+# f189422 made an operator hand over a REAL CREDENTIAL for zero function:
 #
 #   SlackConfig.app_token  — prompted, documented, redacted as a secret, never read.
 #                            Slack polls; Socket Mode is never established.
 #   LarkConfig.encrypt_key — prompted by the TUI provisioner, documented, never read.
 #   WebhookConfig.port     — documented as `port = 8080`; the gateway binds its own
-#                            port. This one tells operators to open a firewall port
-#                            nothing listens on, then the webhook never arrives.
+#                            port. This one told operators to open a firewall port
+#                            nothing listens on, then the webhook never arrived.
 #
 # Three no-op keys in one config section means the schema and the runtime drifted
-# apart with nothing checking. This is the check.
+# apart with nothing checking. This is the check. All three were resolved by plan
+# 146 (port deleted; encrypt_key and app_token now refuse/warn at startup and are
+# no longer collected), so KNOWN_UNREAD is empty — which is the state to keep it
+# in. A new entry needs a plan number and a removal date, not a shrug.
 #
 # How it works
 # ------------
@@ -33,7 +36,6 @@ SCHEMA="src/config/schema.rs"
 
 # field<TAB>struct<TAB>reason — each MUST name the plan that resolves it.
 KNOWN_UNREAD=$(cat <<'EOF'
-app_token	SlackConfig	plan 146 — build Socket Mode or delete the key
 EOF
 )
 

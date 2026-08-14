@@ -324,6 +324,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Setup no longer collects two credentials that nothing uses.** Slack's
+  `app_token` (for a Socket Mode path this build does not implement) and Lark's
+  `encrypt_key` (which the channel now refuses to start with, since it cannot
+  decrypt event bodies) were both prompted as secrets. Neither prompt remains.
+  A Slack config that still carries `app_token` logs a startup warning saying it
+  is ignored, rather than accepting it in silence.
+
 - **`[channels_config.webhook].port` was removed (schema v21).** Nothing read
   it: the webhook arrives on the gateway's own listener (`[gateway].port`), so
   the key told operators to open a firewall port nothing binds and then the

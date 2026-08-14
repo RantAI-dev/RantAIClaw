@@ -237,7 +237,7 @@ mention_only = false
 ```toml
 [channels_config.slack]
 bot_token = "xoxb-..."
-app_token = "xapp-..."             # accepted, NOT read by any code path
+app_token = "xapp-..."             # accepted, ignored — setup no longer asks
 channel_id = "C1234567890"         # optional
 allowed_users = ["*"]
 ```
@@ -248,9 +248,10 @@ Slack notes:
   (`src/channels/slack.rs:257`, `:267`); it is not an Events API subscriber and
   needs no public inbound port. Expect up to a few seconds of reply latency, and
   budget the poll against Slack's Web API rate limits when several channels run.
-- `app_token` exists in the config schema (`src/config/schema.rs:2863`) for a
-  Socket Mode implementation that does not exist yet. Setting it changes
-  nothing today.
+- `app_token` exists in the config schema for a Socket Mode implementation that
+  does not exist yet. Setting it changes nothing; the channel now logs
+  `Slack: \`app_token\` is set but ignored` at startup so it is not a silent
+  no-op, and neither setup path asks for it any more.
 
 ### 4.4 Mattermost
 

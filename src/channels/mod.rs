@@ -3424,6 +3424,21 @@ pub(crate) fn build_configured_channels(
     }
 
     if let Some(ref sl) = config.channels_config.slack {
+        // Socket Mode is not implemented — the channel polls
+        // `conversations.history`. Say so rather than accepting an app-level
+        // token in silence: an operator who supplied one is entitled to know
+        // it changes nothing, and a silent no-op is how this key went
+        // unnoticed for as long as it did.
+        if sl
+            .app_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+        {
+            tracing::warn!(
+                "Slack: `app_token` is set but ignored — this build polls conversations.history \
+                 and does not implement Socket Mode. Remove the key, or leave it for when it does."
+            );
+        }
         channels.push((
             "slack",
             "Slack",

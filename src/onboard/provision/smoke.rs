@@ -573,8 +573,7 @@ mod slack {
                 // prefix, and this repo's fixtures have been rejected at push
                 // time for looking real. The provisioner does not check shape.
                 ProvisionResponse::Text("placeholder-slack-bot-token".into()), // bot token
-                ProvisionResponse::Text(String::new()), // app token (optional)
-                ProvisionResponse::Selection(vec![0]),  // probe inconclusive -> save anyway
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
                 ProvisionResponse::Text(String::new()), // default channel (optional)
                 ProvisionResponse::Text("rantaiclaw_user".into()), // allowed users
             ],

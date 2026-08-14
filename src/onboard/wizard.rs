@@ -3812,10 +3812,9 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     }
                 }
 
-                let app_token: String = Password::new()
-                    .with_prompt("  App token (xapp-..., optional, Enter to skip)")
-                    .allow_empty_password(true)
-                    .interact()?;
+                // No app-token prompt: Socket Mode is not implemented, so the
+                // token would be a real credential collected for nothing.
+                let app_token = String::new();
 
                 let channel: String = Input::new()
                     .with_prompt("  Default channel ID (optional, Enter to skip)")
