@@ -74,7 +74,10 @@ Operational notes:
 
 Matrix and Lark support are controlled at compile time.
 
-- Default builds are lean (`default = []`) and do not include Matrix/Lark.
+- Default builds do **not** include Matrix or Lark. They do include WhatsApp Web:
+  `default = ["tui", "whatsapp-web", "remote-install", "kb"]` (`Cargo.toml:253`).
+  WhatsApp Web mode therefore ships **enabled** — read the
+  [security warning](#47-whatsapp) before configuring it.
 - Typical local check with only hardware support:
 
 ```bash
@@ -99,24 +102,34 @@ If `[channels_config.matrix]` or `[channels_config.lark]` is present but the cor
 
 ## 2. Delivery Modes at a Glance
 
-| Channel | Receive mode | Public inbound port required? |
-|---|---|---|
-| CLI | local stdin/stdout | No |
-| Telegram | polling | No |
-| Discord | gateway/websocket | No |
-| Slack | events API | No (token-based channel flow) |
-| Mattermost | polling | No |
-| Matrix | sync API (supports E2EE) | No |
-| Signal | signal-cli HTTP bridge | No (local bridge endpoint) |
-| WhatsApp | webhook (Cloud API) or websocket (Web mode) | Cloud API: Yes (public HTTPS callback), Web mode: No |
-| Nextcloud Talk | webhook (`/nextcloud-talk`) | Yes (public HTTPS callback) |
-| Webhook | gateway endpoint (`/webhook`) | Usually yes |
-| Email | IMAP polling + SMTP send | No |
-| IRC | IRC socket | No |
-| Lark/Feishu | websocket (default) or webhook | Webhook mode only |
-| DingTalk | stream mode | No |
-| QQ | bot gateway | No |
-| iMessage | local integration | No |
+| Channel | Receive mode | Public inbound port required? | Inbound authenticity |
+|---|---|---|---|
+| CLI | local stdin/stdout | No | n/a — local |
+| Telegram | polling | No | n/a — the agent calls out |
+| Discord | gateway/websocket | No | n/a — the agent calls out |
+| Slack | polling (`conversations.history`) | No | n/a — the agent calls out |
+| Mattermost | polling | No | n/a — the agent calls out |
+| Matrix | sync API (supports E2EE) | No | n/a — the agent calls out |
+| Signal | signal-cli HTTP bridge | No (local bridge endpoint) | n/a — local bridge |
+| WhatsApp (Cloud API) | webhook (`POST /whatsapp`) | Yes (public HTTPS callback) | **HMAC-verified** — `X-Hub-Signature-256`, required |
+| WhatsApp (Web mode) | websocket | No | n/a — the agent calls out |
+| Linq | webhook (`POST /linq`) | Yes (public HTTPS callback) | **HMAC-verified** — `X-Webhook-Signature` + `X-Webhook-Timestamp` (300s window), required |
+| Nextcloud Talk | webhook (`POST /nextcloud-talk`) | Yes (public HTTPS callback) | **HMAC-verified** — `X-Nextcloud-Talk-Signature`, required |
+| Webhook | gateway endpoint (`/webhook`) | Usually yes | Shared secret — pairing bearer token or `X-Webhook-Secret` |
+| Email | IMAP polling + SMTP send | No | n/a — the agent calls out (see §4.9 on `From:` spoofing) |
+| IRC | IRC socket | No | n/a — the agent calls out |
+| Lark/Feishu (websocket) | websocket | No | n/a — the agent calls out |
+| Lark/Feishu (webhook) | webhook (`POST /lark`, its own port) | Yes | Shared secret — `verification_token` in the body; **no signature check** |
+| DingTalk | stream mode | No | n/a — the agent calls out |
+| QQ | bot gateway | No | n/a — the agent calls out |
+| iMessage | local integration | No | n/a — local |
+
+"Inbound authenticity" is what proves a request actually came from the platform.
+The three HMAC-verified endpoints refuse to serve at all without their secret —
+see each channel's subsection. "n/a — the agent calls out" means there is no
+inbound port: the process opens the connection, so there is nothing for an
+attacker to POST to.
+
 
 ---
 
@@ -166,8 +179,26 @@ Field names differ by channel:
 - `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ/Nextcloud Talk)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp)
-- `allowed_senders` (Email)
+- `allowed_senders` (Email, Linq)
 - `allowed_contacts` (iMessage)
+
+### 3.1 Per-channel matching rules
+
+Matching is **exact and case-sensitive** unless listed below. An allowlist that
+matches more than you expect is a security-boundary problem, so these are worth
+reading before you tighten one:
+
+| Channel | Rule | Source |
+|---|---|---|
+| Email | An entry containing `@` is a full address (case-insensitive). An entry starting with `@` matches a **domain suffix** (`@example.com` allows everyone at that domain). A bare entry with no `@` is also a domain (`example.com` ≡ `@example.com`). | `src/channels/email_channel.rs:215-238` |
+| Matrix | Case-**insensitive** full-string match on the sender MXID. | `src/channels/matrix.rs:191-197` |
+| Telegram | Entries are normalised on the way in — trimmed, and a leading `@` stripped — so `@user` and `user` are the same entry. A numeric user ID and a username are both accepted; the numeric ID is the stable one. | `src/channels/telegram.rs:428-430` |
+| WhatsApp | Numbers are compared in normalised `+E.164` form. | `src/channels/whatsapp_web.rs` |
+| Everything else | Exact, case-sensitive. | per-channel `is_*_allowed` |
+
+Email's domain matching is the one to watch: `allowed_senders = ["example.com"]`
+admits **every** sender at that domain, and `From:` is trivially forged unless
+the sender-authentication gate is on (§4.9).
 
 ---
 
@@ -206,10 +237,20 @@ mention_only = false
 ```toml
 [channels_config.slack]
 bot_token = "xoxb-..."
-app_token = "xapp-..."             # optional
+app_token = "xapp-..."             # accepted, NOT read by any code path
 channel_id = "C1234567890"         # optional
 allowed_users = ["*"]
 ```
+
+Slack notes:
+
+- The channel **polls** `conversations.history` every 3 seconds
+  (`src/channels/slack.rs:257`, `:267`); it is not an Events API subscriber and
+  needs no public inbound port. Expect up to a few seconds of reply latency, and
+  budget the poll against Slack's Web API rate limits when several channels run.
+- `app_token` exists in the config schema (`src/config/schema.rs:2863`) for a
+  Socket Mode implementation that does not exist yet. Setting it changes
+  nothing today.
 
 ### 4.4 Mattermost
 
@@ -261,9 +302,24 @@ Cloud API mode:
 access_token = "EAAB..."
 phone_number_id = "123456789012345"
 verify_token = "your-verify-token"
-app_secret = "your-app-secret"     # optional but recommended
+app_secret = "your-app-secret"     # REQUIRED — see below
 allowed_numbers = ["*"]
 ```
+
+> **`app_secret` is required in Cloud API mode.** The gateway refuses the
+> webhook outright when it is absent — `POST /whatsapp` returns **401
+> Unauthorized** before the body is parsed, because the `X-Hub-Signature-256`
+> HMAC is the only thing that can prove a request came from Meta
+> (`src/gateway/mod.rs:2003-2011`). The channel still connects and still passes
+> `rantaiclaw channel doctor`, so the symptom is a channel that looks healthy
+> and answers nothing. Grep the log for:
+>
+> ```text
+> WhatsApp webhook rejected: no app secret configured. Set RANTAICLAW_WHATSAPP_APP_SECRET to authenticate this endpoint.
+> ```
+>
+> Set it in `[channels_config.whatsapp].app_secret` or as
+> `RANTAICLAW_WHATSAPP_APP_SECRET` (`src/gateway/mod.rs:621`).
 
 WhatsApp Web mode:
 
@@ -299,6 +355,37 @@ Notes:
 - Keep `session_path` on persistent storage to avoid relinking after restart.
 - Reply routing uses the originating chat JID, so direct and group replies work correctly.
 
+### 4.7a Linq
+
+```toml
+[channels_config.linq]
+api_token = "linq-partner-api-token"   # Bearer auth for the Partner API
+from_phone = "+15551234567"            # E.164 sending number
+signing_secret = "webhook-signing-secret"   # REQUIRED — see below
+allowed_senders = ["*"]                # phone numbers, or "*"
+```
+
+Linq notes:
+
+- Inbound endpoint: `POST /linq` on the gateway. Requires a reachable HTTPS
+  callback.
+- **`signing_secret` is required.** Without it the gateway returns **401** before
+  parsing, the same fail-closed rule WhatsApp and Nextcloud Talk follow
+  (`src/gateway/mod.rs:2160-2168`). Log line to grep:
+
+  ```text
+  Linq webhook rejected: no signing secret configured. Set RANTAICLAW_LINQ_SIGNING_SECRET to authenticate this endpoint.
+  ```
+
+- Verification is HMAC-SHA256 over `"{timestamp}."` followed by the raw body,
+  read from `X-Webhook-Signature` and `X-Webhook-Timestamp`; timestamps older
+  than 300 seconds are rejected (`src/channels/linq.rs:495-516`).
+- `RANTAICLAW_LINQ_SIGNING_SECRET` overrides the config value
+  (`src/gateway/mod.rs:649`).
+- Inbound `media` parts with an `image/*` MIME type are converted to the image
+  marker format described in §1, so Linq is the one webhook channel that carries
+  images into the agent.
+
 ### 4.8 Webhook Channel Config (Gateway)
 
 `channels_config.webhook` enables webhook-specific gateway behavior.
@@ -326,7 +413,21 @@ password = "email-password"
 from_address = "bot@example.com"
 poll_interval_secs = 60
 allowed_senders = ["*"]
+require_authenticated_sender = false   # optional; see below
 ```
+
+Email notes — `From:` is forgeable:
+
+- `require_authenticated_sender = true` drops mail whose `From:` domain is not
+  backed by `dmarc=pass`, or by an aligned `spf=pass`/`dkim=pass`, in the
+  `Authentication-Results` header your own MTA wrote
+  (`src/channels/email_channel.rs:254`). It is **off by default** because a relay
+  that strips that header would otherwise silence a working mailbox.
+- The **owner path does not depend on that flag**: mail claiming to come from an
+  address in `approval_owners` is dropped when unauthenticated, always
+  (`src/channels/email_channel.rs:315-324`). Otherwise anyone could grant
+  themselves approval authority by typing a `From:` line.
+- Turn the flag on for any mailbox that is reachable from the public internet.
 
 ### 4.10 IRC
 
@@ -350,8 +451,8 @@ verify_tls = true
 [channels_config.lark]
 app_id = "cli_xxx"
 app_secret = "xxx"
-encrypt_key = ""                    # optional
-verification_token = ""             # optional
+encrypt_key = ""                    # must stay empty — see below
+verification_token = ""             # REQUIRED in webhook mode
 allowed_users = ["*"]
 use_feishu = false
 receive_mode = "websocket"          # or "webhook"
@@ -369,7 +470,27 @@ The wizard now includes a dedicated **Lark/Feishu** step with:
 - region selection (`Feishu (CN)` vs `Lark (International)`)
 - credential verification against official Open Platform auth endpoint
 - receive mode selection (`websocket` or `webhook`)
-- optional webhook verification token prompt (recommended for stronger callback authenticity checks)
+- webhook verification token prompt — **required** when `receive_mode = "webhook"`
+
+Webhook-mode authenticity (accurate as of plan 124, merged):
+
+- The event endpoint authenticates with the **`token` field in the callback
+  body**, compared in constant time against `verification_token`
+  (`src/channels/lark.rs:1434-1448`). An absent token is a rejection.
+- `receive_mode = "webhook"` **refuses to start** without `verification_token`
+  (`src/channels/lark.rs:1299-1307`) — an endpoint that authenticates nothing
+  would let anyone who can reach the port drive the agent.
+- **`X-Lark-Signature` is not checked.** Its digest construction could not be
+  confirmed against a live tenant, and a subtly wrong implementation rejects
+  every legitimate callback while presenting as a working gate
+  (`src/channels/lark.rs:1427-1433`). A shared body token is weaker than an
+  HMAC: it is replayable and it is in the request body rather than bound to it.
+  If the endpoint is internet-facing, front it with an authenticating reverse
+  proxy.
+- `encrypt_key` is **rejected at startup** if set (`src/channels/lark.rs:1312-1323`):
+  this build does not decrypt event bodies, so enabling encryption in the
+  developer console makes every callback unreadable. Leave it empty, or use
+  `receive_mode = "websocket"`, which needs no inbound endpoint at all.
 
 Runtime token behavior:
 
@@ -401,7 +522,7 @@ allowed_users = ["*"]
 [channels_config.nextcloud_talk]
 base_url = "https://cloud.example.com"
 app_token = "nextcloud-talk-app-token"
-webhook_secret = "optional-webhook-secret"  # optional but recommended
+webhook_secret = "webhook-secret"           # REQUIRED — 401 without it
 allowed_users = ["*"]
 ```
 
@@ -409,7 +530,9 @@ Notes:
 
 - Inbound webhook endpoint: `POST /nextcloud-talk`.
 - Signature verification uses `X-Nextcloud-Talk-Random` and `X-Nextcloud-Talk-Signature`.
-- If `webhook_secret` is set, invalid signatures are rejected with `401`.
+- The secret is **required**: with none configured the endpoint returns `401`
+  before parsing (`src/gateway/mod.rs:2338-2346`), and invalid signatures are
+  rejected with `401` as well.
 - `RANTAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
 - See [nextcloud-talk-setup.md](nextcloud-talk-setup.md) for a full runbook.
 
@@ -419,6 +542,37 @@ Notes:
 [channels_config.imessage]
 allowed_contacts = ["*"]
 ```
+
+---
+
+## 4b. Approval and Roles
+
+Every channel shares one authorization model, and its **secure default surprises
+people**: with no owners configured, nobody can approve anything, so
+approval-required tools auto-deny and the agent looks broken.
+
+```toml
+[channels_config]
+approval_owners = ["rantaiclaw_user"]   # who may approve privileged tool calls
+guest_allowed_tools = []                # capability ceiling for everyone else
+guest_allowed_commands = []             # shell globs guests may run (hard ceiling)
+autonomous_tools = false                # true = skip the approval gate entirely
+```
+
+- **Owners** approve privileged tool calls and always get the full toolset.
+  `approval_owners = []` (the default) means **nobody** can approve —
+  privileged tools stay auto-denied. `"*"` lets any allowed sender approve;
+  it is accepted, insecure, and opt-in only (`src/config/schema.rs:2739-2743`).
+- **Guests** are senders on the channel allowlist who are not owners. They get
+  read-only file and memory tools plus skills; `guest_allowed_tools` widens
+  that, and `guest_allowed_commands` is a hard ceiling on shell — a command
+  outside it is denied outright, never escalated to an owner.
+- **If privileged tools are being denied, add an owner.** Do **not** reach for
+  `autonomous_tools = true`: that skips the approval gate for everyone on the
+  channel, which is a different and much larger decision.
+
+Full model, including the enforcement point:
+[Per-role channel permissions](../security/per-role-permissions.md).
 
 ---
 
@@ -445,6 +599,13 @@ If a channel appears connected but does not respond:
 1. Confirm the sender identity is allowed by the correct allowlist field.
 2. Confirm bot account membership/permissions in target room/channel.
 3. Confirm tokens/secrets are valid (and not expired/revoked).
+3a. For the three webhook channels, confirm the **inbound secret is set at all**:
+   WhatsApp Cloud API `app_secret`, Linq `signing_secret`, Nextcloud Talk
+   `webhook_secret`. Each returns `401` before parsing when it is missing, so the
+   channel connects, passes `channel doctor`, and answers nothing. Lark in
+   webhook mode refuses to start without `verification_token`.
+3b. If tool calls are being denied rather than the channel being silent, this is
+   the approval model, not the transport — see [§4b](#4b-approval-and-roles).
 4. Confirm transport mode assumptions:
    - polling/websocket channels do not need public inbound HTTP
    - webhook channels do need reachable HTTPS callback
@@ -481,14 +642,15 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | Mattermost | `Mattermost channel listening on` | `Mattermost: ignoring message from unauthorized user:` | `Mattermost poll error:` / `Mattermost parse error:` |
 | Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` | `Matrix sync error: ... retrying...` |
 | Signal | `Signal channel listening via SSE on` | (allowlist checks are enforced by `allowed_from`) | `Signal SSE returned ...` / `Signal SSE connect error:` |
-| WhatsApp (channel) | `WhatsApp channel active (webhook mode).` / `WhatsApp Web connected successfully` | `WhatsApp: ignoring message from unauthorized number:` / `WhatsApp Web: message from ... not in allowed list` | `WhatsApp send failed:` / `WhatsApp Web stream error:` |
+| WhatsApp (channel) | `WhatsApp channel active (webhook mode).` / `WhatsApp Web connected successfully` | `WhatsApp webhook rejected: no app secret configured.` (401, endpoint disabled) / `WhatsApp webhook signature verification failed` / `WhatsApp: ignoring message from unauthorized number:` / `WhatsApp Web: message from ... not in allowed list` | `WhatsApp send failed:` / `WhatsApp Web stream error:` |
+| Linq (gateway) | `POST /linq` | `Linq webhook rejected: no signing secret configured.` (401, endpoint disabled) / `Linq webhook signature verification failed` / `Linq: rejecting stale webhook timestamp` | `Linq send failed:` |
 | Webhook / WhatsApp (gateway) | `WhatsApp webhook verified successfully` | `Webhook: rejected — not paired / invalid bearer token` / `Webhook: rejected request — invalid or missing X-Webhook-Secret` / `WhatsApp webhook verification failed — token mismatch` | `Webhook JSON parse error:` |
 | Email | `Email polling every ...` / `Email sent to ...` | `Blocked email from ...` | `Email poll failed:` / `Email poll task panicked:` |
 | IRC | `IRC channel connecting to ...` / `IRC registered as ...` | (allowlist checks are enforced by `allowed_users`) | `IRC SASL authentication failed (...)` / `IRC server does not support SASL...` / `IRC nickname ... is in use, trying ...` |
 | Lark / Feishu | `Lark: WS connected` / `Lark event callback server listening on` | `Lark WS: ignoring ... (not in allowed_users)` / `Lark: ignoring message from unauthorized user:` | `Lark: ping failed, reconnecting` / `Lark: heartbeat timeout, reconnecting` / `Lark: WS read error:` |
 | DingTalk | `DingTalk: connected and listening for messages...` | `DingTalk: ignoring message from unauthorized user:` | `DingTalk WebSocket error:` / `DingTalk: message channel closed` |
 | QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
-| Nextcloud Talk (gateway) | `POST /nextcloud-talk — Nextcloud Talk bot webhook` | `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
+| Nextcloud Talk (gateway) | `POST /nextcloud-talk — Nextcloud Talk bot webhook` | `Nextcloud Talk webhook rejected: no webhook secret configured.` (401, endpoint disabled) / `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
 | iMessage | `iMessage channel listening (AppleScript bridge)...` | (contact allowlist enforced by `allowed_contacts`) | `iMessage poll error:` |
 
 ### 7.3 Runtime supervisor keywords
