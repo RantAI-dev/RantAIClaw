@@ -85,14 +85,24 @@ impl CommandHandler for AllowCommand {
             }
         }
 
-        let scope = if persist { "persistent" } else { "session" };
         let suffix = if resolved {
             " — pending approval resolved, the agent's tool call will resume"
         } else {
             ""
         };
+        // The scope is qualified because this mutates the TUI agent's
+        // `SecurityPolicy`, a different instance from the one the channel
+        // runtime builds. "persistent allowlist" read as fleet-wide and was
+        // not: a listener already running keeps its own copy until it restarts.
+        let scope = if persist {
+            "persistent allowlist (written to disk; running channel listeners pick it up on their \
+             next restart)"
+        } else {
+            "session allowlist (this TUI only; not written to disk, and not shared with running \
+             channel listeners)"
+        };
         Ok(CommandResult::Message(format!(
-            "Added `{basename}` to the {scope} allowlist{suffix}."
+            "Added `{basename}` to the {scope}{suffix}."
         )))
     }
 }

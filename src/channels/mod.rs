@@ -3120,6 +3120,12 @@ pub(crate) fn channel_is_configured(key: &str, config: &Config) -> bool {
     }
 }
 
+/// Every channel key in [`CHANNEL_CATALOG`], for callers that need to validate
+/// a user-supplied surface name against the one canonical list.
+pub(crate) fn channel_catalog_keys() -> Vec<&'static str> {
+    CHANNEL_CATALOG.iter().map(|(key, _)| *key).collect()
+}
+
 /// Whether `key`'s config block carries the credential it needs to run.
 ///
 /// Stronger than [`channel_is_configured`], which only asks whether the section

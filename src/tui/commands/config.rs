@@ -405,6 +405,33 @@ fn build_channels_panel(ctx: &TuiContext) -> InfoPanel {
     panel =
         panel.section(InfoSection::new("Runtime").status_with(auto_kind, auto_label, auto_detail));
 
+    // What a message arriving on any of these channels is allowed to do.
+    // `autonomous_tools` voids the owner list entirely and appeared on no TUI
+    // surface, so an operator could read "0 owners" and reasonably conclude
+    // channel senders cannot trigger tools.
+    let (owners, autonomous) = ctx.approval_boundary;
+    let boundary = if autonomous {
+        (
+            StatusKind::Fail,
+            "autonomous_tools = true — channel messages run tools WITHOUT approval".to_string(),
+        )
+    } else if owners == 0 {
+        (
+            StatusKind::Warn,
+            "no approval owners — anything needing approval is auto-denied".to_string(),
+        )
+    } else {
+        (
+            StatusKind::Ok,
+            format!("{owners} approval owner(s) — others are gated"),
+        )
+    };
+    panel = panel.section(InfoSection::new("Approval boundary").status_with(
+        boundary.0,
+        "Tool approval",
+        boundary.1,
+    ));
+
     // Configured channels — detailed per-row state.
     if configured_count > 0 {
         let mut sec = InfoSection::new("Configured");
