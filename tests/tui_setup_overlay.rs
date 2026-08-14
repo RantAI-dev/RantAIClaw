@@ -1,32 +1,13 @@
-//! Integration tests for SetupOverlay state machine and /setup command.
+//! The SetupOverlay state machine, driven by real `ProvisionEvent`s.
+//!
+//! Two tests were removed rather than kept: they built a
+//! `CommandResult::OpenSetupOverlay { .. }` and asserted the field they had
+//! just written. They exercised no production code and could not fail.
+//! What remains drives `SetupOverlayState::handle_event`, which is production
+//! code and is what the overlay's behaviour actually depends on.
 
 use rantaiclaw::onboard::provision::{ProvisionEvent, Severity};
-use rantaiclaw::tui::CommandResult;
 use rantaiclaw::tui::SetupOverlayState;
-
-#[test]
-fn command_result_open_setup_overlay_none_passes() {
-    let result = CommandResult::OpenSetupOverlay { provisioner: None };
-    match result {
-        CommandResult::OpenSetupOverlay { provisioner } => {
-            assert!(provisioner.is_none());
-        }
-        _ => panic!("expected OpenSetupOverlay(None), got {result:?}"),
-    }
-}
-
-#[test]
-fn command_result_open_setup_overlay_some_passes() {
-    let result = CommandResult::OpenSetupOverlay {
-        provisioner: Some("whatsapp-web".to_string()),
-    };
-    match result {
-        CommandResult::OpenSetupOverlay { provisioner } => {
-            assert_eq!(provisioner.as_deref(), Some("whatsapp-web"));
-        }
-        _ => panic!("expected OpenSetupOverlay(Some), got {result:?}"),
-    }
-}
 
 #[test]
 fn overlay_appends_message_events_to_log() {

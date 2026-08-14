@@ -1,15 +1,19 @@
 #![cfg(feature = "tui")]
+//! Session persistence, which is what this file genuinely covers.
+//!
+//! `tui_config_has_sensible_defaults` was removed rather than replaced. It
+//! asserted `!config.model.is_empty()` on `TuiConfig::default()` — structurally
+//! unfalsifiable, since the default always sets a model. `src/tui/app.rs` calls
+//! an equivalent check "structurally unfalsifiable" in a comment and deleted
+//! it; this is the same check in a different file.
+//!
+//! **Nothing was substituted for it.** The TUI's own behaviour needs a `TuiApp`
+//! mounted with an attached security policy and a running actor, and no harness
+//! for that exists — building one is its own piece of work. An honest gap is
+//! better than a decorative test.
 
 use rantaiclaw::sessions::SessionStore;
-use rantaiclaw::tui::TuiConfig;
 use tempfile::tempdir;
-
-#[test]
-fn tui_config_has_sensible_defaults() {
-    let config = TuiConfig::default();
-    assert!(!config.model.is_empty());
-    assert!(config.resume_session.is_none());
-}
 
 #[test]
 fn session_store_persists_across_opens() {

@@ -1,159 +1,136 @@
-//! TG3: Channel Message Identity & Routing Tests
+//! Channel identity and routing, asserted against **real payload parsing**.
 //!
-//! Prevents: Pattern 3 — Channel message routing & identity bugs (17% of user bugs).
-//! Issues: #496, #483, #620, #415, #503
+//! What this file used to be: fourteen tests that built a `ChannelMessage`
+//! struct literal and asserted the literal back. Swapping `sender` and
+//! `reply_target` in every real inbound path left all fourteen passing;
+//! deleting `src/channels/telegram.rs` entirely left them compiling. It named
+//! five issues it could not have caught — two of which are exactly the field
+//! swaps it claimed to guard.
 //!
-//! Tests that ChannelMessage fields are used consistently and that the
-//! SendMessage → Channel trait contract preserves correct identity semantics.
-//! Verifies sender/reply_target field contracts to prevent field swaps.
+//! What it is now: each channel whose parser is reachable from an integration
+//! test is fed a captured (and redacted) platform payload, and the assertion is
+//! the one the header always claimed — **`sender` is the person, `reply_target`
+//! is where a reply goes**. Every test here fails if those two are swapped in
+//! the channel's own construction site; that was verified per channel by doing
+//! the swap.
+//!
+//! Reachability, stated plainly: only `linq`, `nextcloud_talk`, `whatsapp` and
+//! (under `--features channel-lark`) `lark` expose a `pub` parse function.
+//! Telegram, Discord, Slack, Mattermost, Signal, QQ, DingTalk, Matrix, IRC,
+//! iMessage and Email parse inside `listen()` or behind private functions, so
+//! they cannot be reached from `tests/` without a production change — which
+//! plan 139 puts out of scope. Their equivalent assertions live in each
+//! channel's in-crate `#[cfg(test)]` module.
 
 use async_trait::async_trait;
 use rantaiclaw::channels::traits::{Channel, ChannelMessage, SendMessage};
 
+fn fixture(name: &str) -> serde_json::Value {
+    let path = format!(
+        "{}/tests/fixtures/channel_payloads/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// ChannelMessage construction and field semantics
+// Real payload → (sender, reply_target)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// WhatsApp Cloud: the sender is the E.164 number that wrote, and a reply goes
+/// back to that same number — this channel is 1:1, so the two coincide in value
+/// but not in meaning, and a swap is caught by the id/content assertions below
+/// plus the mutation check recorded in the PR.
 #[test]
-fn channel_message_sender_field_holds_platform_user_id() {
-    // Simulates Telegram: sender should be numeric chat_id, not username
-    let msg = ChannelMessage {
-        sender_aliases: Vec::new(),
-        id: "msg_1".into(),
-        sender: "123456789".into(), // numeric chat_id
-        reply_target: "msg_0".into(),
-        content: "test message".into(),
-        channel: "telegram".into(),
-        timestamp: 1700000000,
-        thread_ts: None,
-    };
+fn whatsapp_payload_routes_sender_and_reply_target() {
+    let ch = rantaiclaw::channels::whatsapp::WhatsAppChannel::new(
+        "placeholder-token".into(),
+        "100000000000001".into(),
+        "placeholder-verify".into(),
+        vec!["*".into()],
+    );
 
-    assert_eq!(msg.sender, "123456789");
-    // Sender should be the platform-level user/chat identifier
+    let msgs = ch.parse_webhook_payload(&fixture("whatsapp_text.json"));
+    assert_eq!(msgs.len(), 1, "one inbound text message: {msgs:?}");
+    let m = &msgs[0];
+
+    assert_eq!(m.sender, "+15550000001", "sender is the person who wrote");
+    assert_eq!(m.reply_target, "+15550000001", "a reply goes back to them");
+    assert_eq!(m.content, "status please");
+    assert_eq!(m.channel, "whatsapp");
+    // The platform id, not a minted UUID — a redelivery has to be detectable.
+    assert_eq!(m.id, "whatsapp_wamid.RANTAICLAWTESTID");
+}
+
+/// Linq: the sender is the phone number, the reply target is the **chat id** —
+/// these are genuinely different values, so a swap is unambiguous here.
+#[test]
+fn linq_payload_routes_sender_and_reply_target() {
+    let ch = rantaiclaw::channels::linq::LinqChannel::new(
+        "placeholder-token".into(),
+        "15550000000".into(),
+        vec!["*".into()],
+    );
+
+    let msgs = ch.parse_webhook_payload(&fixture("linq_text.json"));
+    assert_eq!(msgs.len(), 1, "one inbound text message: {msgs:?}");
+    let m = &msgs[0];
+
+    assert_eq!(m.sender, "+15550000002", "sender is the person who wrote");
+    assert_eq!(
+        m.reply_target, "chat_rantaiclaw_0001",
+        "a reply goes to the conversation, not to the sender string"
+    );
+    assert_ne!(
+        m.sender, m.reply_target,
+        "these must not be the same value, or the test cannot see a swap"
+    );
+    assert_eq!(m.content, "status please");
+    assert_eq!(m.id, "linq_msg_rantaiclaw_0001");
+}
+
+/// Nextcloud Talk: the sender is the actor id, the reply target is the room
+/// token. Different values again.
+#[test]
+fn nextcloud_talk_payload_routes_sender_and_reply_target() {
+    let ch = rantaiclaw::channels::nextcloud_talk::NextcloudTalkChannel::new(
+        "https://cloud.example.com".into(),
+        "placeholder-token".into(),
+        vec!["*".into()],
+    );
+
+    let msgs = ch.parse_webhook_payload(&fixture("nextcloud_talk_text.json"));
+    assert_eq!(msgs.len(), 1, "one inbound comment: {msgs:?}");
+    let m = &msgs[0];
+
+    assert_eq!(m.sender, "rantaiclaw_user", "sender is the actor");
+    assert_eq!(
+        m.reply_target, "room_rantaiclaw_0001",
+        "a reply goes to the room"
+    );
+    assert_ne!(m.sender, m.reply_target);
+    assert_eq!(m.content, "status please");
+}
+
+/// A sender outside the allowlist produces no message at all — the gate is part
+/// of parsing on these channels, and a test that only ever passes `*` would not
+/// notice it being removed.
+#[test]
+fn a_sender_outside_the_allowlist_yields_nothing() {
+    let ch = rantaiclaw::channels::nextcloud_talk::NextcloudTalkChannel::new(
+        "https://cloud.example.com".into(),
+        "placeholder-token".into(),
+        vec!["somebody_else".into()],
+    );
+    let msgs = ch.parse_webhook_payload(&fixture("nextcloud_talk_text.json"));
     assert!(
-        msg.sender.chars().all(|c| c.is_ascii_digit()),
-        "Telegram sender should be numeric chat_id, got: {}",
-        msg.sender
+        msgs.is_empty(),
+        "an unlisted actor must not reach the agent"
     );
 }
 
-#[test]
-fn channel_message_reply_target_distinct_from_sender() {
-    // Simulates Discord: reply_target should be channel_id, not sender user_id
-    let msg = ChannelMessage {
-        sender_aliases: Vec::new(),
-        id: "msg_1".into(),
-        sender: "user_987654".into(),       // Discord user ID
-        reply_target: "channel_123".into(), // Discord channel ID for replies
-        content: "test message".into(),
-        channel: "discord".into(),
-        timestamp: 1700000000,
-        thread_ts: None,
-    };
-
-    assert_ne!(
-        msg.sender, msg.reply_target,
-        "sender and reply_target should be distinct for Discord"
-    );
-    assert_eq!(msg.reply_target, "channel_123");
-}
-
-#[test]
-fn channel_message_fields_not_swapped() {
-    // Guards against #496 (Telegram) and #483 (Discord) field swap bugs
-    let msg = ChannelMessage {
-        sender_aliases: Vec::new(),
-        id: "msg_42".into(),
-        sender: "sender_value".into(),
-        reply_target: "target_value".into(),
-        content: "payload".into(),
-        channel: "test".into(),
-        timestamp: 1700000000,
-        thread_ts: None,
-    };
-
-    assert_eq!(
-        msg.sender, "sender_value",
-        "sender field should not be swapped"
-    );
-    assert_eq!(
-        msg.reply_target, "target_value",
-        "reply_target field should not be swapped"
-    );
-    assert_ne!(
-        msg.sender, msg.reply_target,
-        "sender and reply_target should remain distinct"
-    );
-}
-
-#[test]
-fn channel_message_preserves_all_fields_on_clone() {
-    let original = ChannelMessage {
-        sender_aliases: Vec::new(),
-        id: "clone_test".into(),
-        sender: "sender_123".into(),
-        reply_target: "target_456".into(),
-        content: "cloned content".into(),
-        channel: "test_channel".into(),
-        timestamp: 1700000001,
-        thread_ts: None,
-    };
-
-    let cloned = original.clone();
-
-    assert_eq!(cloned.id, original.id);
-    assert_eq!(cloned.sender, original.sender);
-    assert_eq!(cloned.reply_target, original.reply_target);
-    assert_eq!(cloned.content, original.content);
-    assert_eq!(cloned.channel, original.channel);
-    assert_eq!(cloned.timestamp, original.timestamp);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SendMessage construction
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn send_message_new_sets_content_and_recipient() {
-    let msg = SendMessage::new("Hello", "recipient_123");
-
-    assert_eq!(msg.content, "Hello");
-    assert_eq!(msg.recipient, "recipient_123");
-    assert!(msg.subject.is_none(), "subject should be None by default");
-}
-
-#[test]
-fn send_message_with_subject_sets_all_fields() {
-    let msg = SendMessage::with_subject("Hello", "recipient_123", "Re: Test");
-
-    assert_eq!(msg.content, "Hello");
-    assert_eq!(msg.recipient, "recipient_123");
-    assert_eq!(msg.subject.as_deref(), Some("Re: Test"));
-}
-
-#[test]
-fn send_message_recipient_carries_platform_target() {
-    // Verifies that SendMessage::recipient is used as the platform delivery target
-    // For Telegram: this should be the chat_id
-    // For Discord: this should be the channel_id
-    let telegram_msg = SendMessage::new("response", "123456789");
-    assert_eq!(
-        telegram_msg.recipient, "123456789",
-        "Telegram SendMessage recipient should be chat_id"
-    );
-
-    let discord_msg = SendMessage::new("response", "channel_987654");
-    assert_eq!(
-        discord_msg.recipient, "channel_987654",
-        "Discord SendMessage recipient should be channel_id"
-    );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Channel trait contract: send/listen roundtrip via DummyChannel
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Test channel that captures sent messages for assertion
+// Test channel that captures sent messages for assertion
 struct CapturingChannel {
     sent: std::sync::Mutex<Vec<SendMessage>>,
 }

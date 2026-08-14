@@ -1,0 +1,30 @@
+{
+  "type": "message",
+  "actor": {
+    "type": "Person",
+    "id": "users/rantaiclaw_user",
+    "name": "rantaiclaw_user"
+  },
+  "object": {
+    "type": "Note",
+    "id": "4242",
+    "name": "message",
+    "token": "room_rantaiclaw_0001",
+    "content": "{\"message\":\"status please\"}",
+    "mediaType": "text/markdown"
+  },
+  "target": {
+    "type": "Collection",
+    "id": "room_rantaiclaw_0001",
+    "name": "ops"
+  },
+  "message": {
+    "actorType": "users",
+    "actorId": "rantaiclaw_user",
+    "messageType": "comment",
+    "message": "status please",
+    "token": "room_rantaiclaw_0001",
+    "id": 4242,
+    "timestamp": 1700000000
+  }
+}
