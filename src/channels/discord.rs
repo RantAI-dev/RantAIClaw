@@ -17,6 +17,9 @@ pub struct DiscordChannel {
     allowed_users: Arc<RwLock<Vec<String>>>,
     listen_to_bots: bool,
     mention_only: bool,
+    /// Size/type limits for inbound images. Defaults to the shipped
+    /// `[multimodal]` defaults; the factory overrides it with the operator's.
+    multimodal: crate::config::MultimodalConfig,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
@@ -34,6 +37,7 @@ impl DiscordChannel {
             allowed_users: Arc::new(RwLock::new(allowed_users)),
             listen_to_bots,
             mention_only,
+            multimodal: crate::config::MultimodalConfig::default(),
             typing_handles: Mutex::new(HashMap::new()),
         }
     }
@@ -64,6 +68,41 @@ impl DiscordChannel {
             }
         }
         body
+    }
+
+    /// Apply the operator's `[multimodal]` limits to inbound images.
+    #[must_use]
+    pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {
+        self.multimodal = multimodal;
+        self
+    }
+
+    /// Turn a message's `attachments` into markers, per
+    /// `docs/security/inbound-media-policy.md`: images become `[IMAGE:data:…]`,
+    /// everything else becomes a visible note. Never silent — a user who sent a
+    /// screenshot and got no answer cannot tell a policy rejection from a bug.
+    async fn attachment_markers(&self, message: &serde_json::Value) -> Vec<String> {
+        let Some(attachments) = message.get("attachments").and_then(|a| a.as_array()) else {
+            return Vec::new();
+        };
+        let (max_images, _) = self.multimodal.effective_limits();
+        let cap = crate::channels::media::max_bytes(&self.multimodal);
+        let client = self.http_client();
+
+        let mut markers = Vec::new();
+        for attachment in attachments.iter().take(max_images) {
+            let Some(url) = attachment.get("url").and_then(|u| u.as_str()) else {
+                continue;
+            };
+            let claimed = attachment.get("content_type").and_then(|c| c.as_str());
+            // Discord CDN links are pre-authorized; the bot token is not sent,
+            // which keeps the credential out of a request whose host is chosen
+            // by the payload.
+            let outcome =
+                crate::channels::media::fetch_image(&client, url, None, claimed, cap).await;
+            markers.push(outcome.to_marker());
+        }
+        markers
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
@@ -472,6 +511,16 @@ impl Channel for DiscordChannel {
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
+                    // Inbound images become markers the multimodal path
+                    // already understands; a rejection becomes a visible note.
+                    let mut clean_content = clean_content;
+                    for marker in self.attachment_markers(d).await {
+                        if !clean_content.is_empty() {
+                            clean_content.push('\n');
+                        }
+                        clean_content.push_str(&marker);
+                    }
+
                     let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
                         id: if message_id.is_empty() {
                             Uuid::new_v4().to_string()
@@ -565,6 +614,70 @@ mod tests {
     /// enters — setting `thread_ts: None` there passed every test in this file.
     /// This is a source-position assertion and says so: it proves the anchor is
     /// read from the payload, not that the loop runs.
+    /// A screenshot on Discord was dropped without acknowledgement. The fetch
+    /// lives inside `listen()`'s socket loop, so this drives the piece that can
+    /// be reached — the per-attachment decision — through the shared policy.
+    #[tokio::test]
+    async fn discord_inbound_image_becomes_an_image_marker() {
+        async fn png() -> (axum::http::HeaderMap, axum::body::Bytes) {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("content-type", "image/png".parse().expect("header"));
+            let mut body = b"\x89PNG\r\n\x1a\n".to_vec();
+            body.extend(std::iter::repeat_n(0u8, 32));
+            (headers, axum::body::Bytes::from(body))
+        }
+        async fn pdf() -> (axum::http::HeaderMap, axum::body::Bytes) {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("content-type", "image/png".parse().expect("header"));
+            (
+                headers,
+                axum::body::Bytes::from_static(b"%PDF-1.7 not a png"),
+            )
+        }
+
+        let app = axum::Router::new()
+            .route("/shot.png", axum::routing::get(png))
+            .route("/liar.png", axum::routing::get(pdf));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, false);
+        let message = serde_json::json!({
+            "attachments": [
+                { "url": format!("http://{addr}/shot.png"), "content_type": "image/png" },
+                { "url": format!("http://{addr}/liar.png"), "content_type": "image/png" },
+                { "url": format!("http://{addr}/shot.png"), "content_type": "application/pdf" }
+            ]
+        });
+
+        let markers = ch.attachment_markers(&message).await;
+        assert_eq!(markers.len(), 3);
+        assert!(
+            markers[0].starts_with("[IMAGE:data:image/png;base64,"),
+            "{}",
+            markers[0]
+        );
+        // Bytes that are not an image are rejected even when the platform
+        // claims otherwise, and the user is told.
+        assert!(markers[1].contains("unsupported type"), "{}", markers[1]);
+        // A non-image claim is filtered before the download happens at all.
+        assert!(markers[2].contains("unsupported type"), "{}", markers[2]);
+    }
+
+    #[tokio::test]
+    async fn discord_message_without_attachments_adds_nothing() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, false);
+        assert!(ch
+            .attachment_markers(&serde_json::json!({ "content": "hi" }))
+            .await
+            .is_empty());
+    }
+
     #[test]
     fn discord_inbound_thread_id_is_captured() {
         let src = include_str!("discord.rs");

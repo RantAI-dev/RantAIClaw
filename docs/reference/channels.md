@@ -67,6 +67,12 @@ Operational notes:
 - Marker parsing applies to user-role messages before provider calls.
 - Provider capability is enforced at runtime: if the selected provider does not support vision, the request fails with a structured capability error (`capability=vision`).
 - Linq webhook `media` parts with `image/*` MIME type are automatically converted to this marker format.
+- **Discord and WhatsApp Cloud accept inbound images.** An attachment is fetched,
+  its type is sniffed from the bytes (the sender's claimed MIME is only an early
+  filter), and it is embedded as a `data:` URI — nothing is written to disk. Over
+  the `[multimodal].max_image_size_mb` cap, an unsupported type, or a failed
+  fetch produces a **visible note** in the message rather than silence. Full
+  rules: [inbound media policy](../security/inbound-media-policy.md).
 
 ## Channel Matrix
 

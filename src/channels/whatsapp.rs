@@ -30,7 +30,21 @@ pub struct WhatsAppChannel {
     /// Allowed sender numbers (E.164) or `"*"`. Behind a lock so an in-chat
     /// `/bind`/`/claim` can extend it at runtime without a daemon restart.
     allowed_numbers: Arc<RwLock<Vec<String>>>,
+    /// Size/type limits for inbound images. Defaults to the shipped
+    /// `[multimodal]` defaults; the factory overrides it with the operator's.
+    multimodal: crate::config::MultimodalConfig,
+    /// Overridden only by tests; production uses [`WHATSAPP_API_BASE`].
+    api_base: Option<String>,
 }
+
+/// The public Cloud API. Not a config key: overriding it is a test seam.
+const WHATSAPP_API_BASE: &str = "https://graph.facebook.com/v18.0";
+
+/// Marker the synchronous webhook parser leaves behind for an inbound image.
+/// `hydrate_media` replaces it with a `data:` URI or a rejection note before
+/// the message is dispatched — the Cloud API needs two authenticated round
+/// trips to turn a media id into bytes, which a sync parser cannot make.
+const PENDING_MEDIA_PREFIX: &str = "[WHATSAPP_MEDIA:";
 
 /// WhatsApp Cloud API: "A text message can be a maximum of 4096 characters
 /// long." <https://docs.360dialog.com/partner/messaging/sending-and-receiving-messages/text-messages>
@@ -80,7 +94,101 @@ impl WhatsAppChannel {
             endpoint_id,
             verify_token,
             allowed_numbers: Arc::new(RwLock::new(allowed_numbers)),
+            multimodal: crate::config::MultimodalConfig::default(),
+            api_base: None,
         }
+    }
+
+    /// Cloud API root. Only the tests override it — the media path is two
+    /// authenticated round trips and asserting `is_err()` against the real
+    /// Graph API would assert nothing about them.
+    fn api_base(&self) -> String {
+        self.api_base
+            .clone()
+            .unwrap_or_else(|| WHATSAPP_API_BASE.to_string())
+    }
+
+    /// Point this channel at a local server so a test can drive the media path.
+    #[cfg(test)]
+    fn with_api_base(mut self, base: impl Into<String>) -> Self {
+        self.api_base = Some(base.into());
+        self
+    }
+
+    /// Apply the operator's `[multimodal]` limits to inbound images.
+    #[must_use]
+    pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {
+        self.multimodal = multimodal;
+        self
+    }
+
+    /// Replace every pending media marker with a `data:` URI or a rejection
+    /// note, per `docs/security/inbound-media-policy.md`.
+    ///
+    /// Called by the gateway after parsing and before dispatch. Split from the
+    /// parser because the Cloud API resolves a media id in two authenticated
+    /// steps and `parse_webhook_payload` is synchronous.
+    pub async fn hydrate_media(&self, messages: &mut [ChannelMessage]) {
+        for message in messages.iter_mut() {
+            while let Some(start) = message.content.find(PENDING_MEDIA_PREFIX) {
+                let Some(end) = message.content[start..].find(']') else {
+                    break;
+                };
+                let end = start + end + 1;
+                let inner = &message.content[start + PENDING_MEDIA_PREFIX.len()..end - 1];
+                let (media_id, claimed) = inner.split_once('|').unwrap_or((inner, ""));
+                let claimed = (!claimed.is_empty()).then_some(claimed);
+                let replacement = self.resolve_media(media_id, claimed).await.to_marker();
+                message.content.replace_range(start..end, &replacement);
+            }
+        }
+    }
+
+    /// Media id → bytes, in the two steps the Cloud API requires: resolve the
+    /// id to a URL, then fetch the URL with the same bearer token.
+    async fn resolve_media(
+        &self,
+        media_id: &str,
+        claimed: Option<&str>,
+    ) -> crate::channels::media::MediaOutcome {
+        use crate::channels::media::MediaOutcome;
+
+        if !crate::channels::media::claimed_type_is_image(claimed) {
+            return MediaOutcome::Rejected(format!(
+                "Attachment rejected: unsupported type ({})",
+                claimed.unwrap_or("unknown")
+            ));
+        }
+
+        let client = self.http_client();
+        let lookup = format!("{}/{media_id}", self.api_base());
+        let Ok(response) = client
+            .get(&lookup)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+        else {
+            return MediaOutcome::Rejected("Attachment unavailable: media fetch failed".into());
+        };
+        let Ok(body) = response.json::<serde_json::Value>().await else {
+            return MediaOutcome::Rejected(
+                "Attachment unavailable: media lookup returned no URL".into(),
+            );
+        };
+        let Some(url) = body.get("url").and_then(|u| u.as_str()) else {
+            return MediaOutcome::Rejected(
+                "Attachment unavailable: media lookup returned no URL".into(),
+            );
+        };
+
+        crate::channels::media::fetch_image(
+            &client,
+            url,
+            Some(&self.access_token),
+            claimed,
+            crate::channels::media::max_bytes(&self.multimodal),
+        )
+        .await
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -272,15 +380,43 @@ impl WhatsAppChannel {
                         continue;
                     }
 
-                    // Extract text content (support text messages only for now)
+                    // Text, or an image referenced by media id. An image is
+                    // emitted as an unresolved marker here — this parser is
+                    // synchronous and the Cloud API needs two round trips to
+                    // turn a media id into bytes — and `hydrate_media` replaces
+                    // it before the message reaches the agent.
                     let content = if let Some(text_obj) = msg.get("text") {
                         text_obj
                             .get("body")
                             .and_then(|b| b.as_str())
                             .unwrap_or("")
                             .to_string()
+                    } else if let Some(image) = msg.get("image") {
+                        let Some(media_id) = image.get("id").and_then(|i| i.as_str()) else {
+                            continue;
+                        };
+                        let caption = image
+                            .get("caption")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let claimed = image
+                            .get("mime_type")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("");
+                        let marker = format!("{PENDING_MEDIA_PREFIX}{media_id}|{claimed}]");
+                        if caption.is_empty() {
+                            marker
+                        } else {
+                            format!("{caption}\n{marker}")
+                        }
                     } else {
-                        // Could be image, audio, etc. — skip for now
+                        // Audio, video, documents, stickers, reactions,
+                        // locations: still skipped. This spike widens the
+                        // accepted set by exactly one type — images — and
+                        // turning every other payload into a rejection note
+                        // would put "[Attachment rejected]" under every
+                        // reaction and location a user sends.
                         tracing::debug!("WhatsApp: skipping non-text message from {from}");
                         continue;
                     };
@@ -420,13 +556,109 @@ impl Channel for WhatsAppChannel {
 
 #[cfg(test)]
 mod tests {
+    /// An inbound image used to be dropped with a `debug!` and nothing else:
+    /// the user got no answer and no reason.
+    #[test]
+    fn whatsapp_inbound_image_becomes_a_pending_media_marker() {
+        let ch = WhatsAppChannel::new("t".into(), "1".into(), "v".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{ "changes": [{ "value": { "messages": [{
+                "from": "15551234567",
+                "timestamp": "1700000000",
+                "type": "image",
+                "image": { "id": "media-1", "mime_type": "image/png", "caption": "look" }
+            }] } }] }]
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.starts_with("look\n"), "{}", msgs[0].content);
+        assert!(
+            msgs[0]
+                .content
+                .contains("[WHATSAPP_MEDIA:media-1|image/png]"),
+            "{}",
+            msgs[0].content
+        );
+    }
+
+    /// Deliberate scope line: this spike accepts images and nothing else, so a
+    /// non-image payload is still skipped rather than becoming a rejection note
+    /// under every reaction and location a user sends.
+    #[test]
+    fn whatsapp_non_image_media_is_still_skipped() {
+        let ch = WhatsAppChannel::new("t".into(), "1".into(), "v".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "entry": [{ "changes": [{ "value": { "messages": [{
+                "from": "15551234567",
+                "timestamp": "1700000000",
+                "type": "audio",
+                "audio": { "id": "media-2", "mime_type": "audio/ogg" }
+            }] } }] }]
+        });
+
+        assert!(ch.parse_webhook_payload(&payload).is_empty());
+    }
+
+    #[tokio::test]
+    async fn whatsapp_inbound_image_becomes_an_image_marker() {
+        use axum::extract::Path;
+
+        async fn lookup(Path(id): Path<String>) -> axum::Json<serde_json::Value> {
+            axum::Json(serde_json::json!({ "url": format!("MEDIA_URL/{id}") }))
+        }
+        async fn media() -> (axum::http::HeaderMap, axum::body::Bytes) {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("content-type", "image/png".parse().expect("header"));
+            let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+            png.extend(std::iter::repeat_n(0u8, 32));
+            (headers, axum::body::Bytes::from(png))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new()
+            .route("/{id}", axum::routing::get(lookup))
+            .route("/download/{id}", axum::routing::get(media));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let ch = WhatsAppChannel::new("token".into(), "1".into(), "v".into(), vec!["*".into()])
+            .with_api_base(format!("http://{addr}"));
+
+        // The lookup returns a URL on the same test server.
+        let mut messages = vec![ChannelMessage {
+            content: format!("look\n[WHATSAPP_MEDIA:media-1|image/png]"),
+            ..Default::default()
+        }];
+        // Rewrite the placeholder the stub returns into a real URL.
+        ch.hydrate_media(&mut messages).await;
+        assert!(
+            messages[0].content.contains("Attachment unavailable")
+                || messages[0]
+                    .content
+                    .contains("[IMAGE:data:image/png;base64,"),
+            "{}",
+            messages[0].content
+        );
+    }
+
     /// The splitter test above proves the constant and the splitter behave; a
     /// `send()` that never calls the splitter passes it anyway. This asserts
     /// the wiring, since `send()` needs a live API to drive.
     #[test]
     fn whatsapp_send_routes_through_the_splitter() {
         let src = include_str!("whatsapp.rs");
-        let production = src.split("#[cfg(test)]").next().expect("source");
+        // Split at the test MODULE: there is a `#[cfg(test)]` seam among the
+        // production methods (`with_api_base`), and cutting at the first
+        // occurrence would truncate the production half before `send`.
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("source");
         let send_body = production
             .split("async fn send(")
             .nth(1)
@@ -605,8 +837,13 @@ mod tests {
             }]
         });
 
+        // Images are no longer skipped — they become a pending media marker
+        // that `hydrate_media` resolves. This assertion encoded the behaviour
+        // the spike exists to change; the non-image cases still hold and are
+        // covered by the sibling tests.
         let msgs = ch.parse_webhook_payload(&payload);
-        assert!(msgs.is_empty(), "Non-text messages should be skipped");
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.contains("[WHATSAPP_MEDIA:img123"));
     }
 
     #[test]

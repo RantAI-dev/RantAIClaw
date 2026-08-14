@@ -31,6 +31,7 @@ pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod media;
 pub mod nextcloud_talk;
 pub mod pairing;
 pub mod qq;
@@ -3456,13 +3457,18 @@ pub(crate) fn build_configured_channels(
         channels.push((
             "discord",
             "Discord",
-            Arc::new(DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            )),
+            Arc::new(
+                DiscordChannel::new(
+                    dc.bot_token.clone(),
+                    dc.guild_id.clone(),
+                    dc.allowed_users.clone(),
+                    dc.listen_to_bots,
+                    dc.mention_only,
+                )
+                // Inbound images obey the operator's size cap, not a default
+                // the channel invented for itself.
+                .with_multimodal(config.multimodal.clone()),
+            ),
         ));
     }
 
@@ -3568,12 +3574,15 @@ pub(crate) fn build_configured_channels(
                     channels.push((
                         "whatsapp",
                         "WhatsApp",
-                        Arc::new(WhatsAppChannel::new(
-                            wa.access_token.clone().unwrap_or_default(),
-                            wa.phone_number_id.clone().unwrap_or_default(),
-                            wa.verify_token.clone().unwrap_or_default(),
-                            wa.allowed_numbers.clone(),
-                        )),
+                        Arc::new(
+                            WhatsAppChannel::new(
+                                wa.access_token.clone().unwrap_or_default(),
+                                wa.phone_number_id.clone().unwrap_or_default(),
+                                wa.verify_token.clone().unwrap_or_default(),
+                                wa.allowed_numbers.clone(),
+                            )
+                            .with_multimodal(config.multimodal.clone()),
+                        ),
                     ));
                 } else {
                     tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");

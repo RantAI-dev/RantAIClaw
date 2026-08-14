@@ -324,6 +324,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Discord and WhatsApp Cloud accept inbound images.** A screenshot sent to the
+  bot on either platform was dropped without acknowledgement; the agent could
+  already reason about images, it just could not receive them anywhere people
+  send them. Both channels now fetch the attachment, sniff its real type from
+  the bytes, and hand it to the multimodal path as a `data:` URI. Rejections —
+  too large, wrong type, fetch failed — appear as a note in the message instead
+  of silence. The rules are written down once in
+  `docs/security/inbound-media-policy.md`, not per channel.
+
 - **Replies thread on Discord, Telegram and Mattermost.** The threading seam
   existed and was plumbed through every dispatch site, but exactly one channel
   (Slack) filled it — so in every busy group the bot's replies landed flat.

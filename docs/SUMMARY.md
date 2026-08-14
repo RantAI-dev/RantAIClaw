@@ -84,6 +84,7 @@
 ## 8) Project — conventions + archived snapshots
 
 - [project/README.md](project/README.md)
+- [project/2026-08-14-attachments-cost-estimate.md](project/2026-08-14-attachments-cost-estimate.md) — inbound media: what shipped, and what each remaining channel costs
 - [project/2026-08-14-threading-design.md](project/2026-08-14-threading-design.md) — which threading mechanism won, and what each remaining channel costs
 - [project/2026-08-14-dependency-decisions.md](project/2026-08-14-dependency-decisions.md) — measured costs of matrix-sdk, `whatsapp-web`-in-default, and the duplicate transport stacks; awaiting a maintainer decision
 - [project/operating-conventions.md](project/operating-conventions.md) — how alpha cuts ship (build target, validation, ship sequence, anti-patterns)
