@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **WhatsApp Web stopped logging message bodies — including pairing codes.**
+  Every inbound body was logged at INFO, and the `/claim` codes that promote
+  their holder to owner were logged *before* the pairing handler ran. The
+  surviving line is DEBUG and carries a character count. **Expire any
+  outstanding pairing codes** (`rantaiclaw channels pair whatsapp` mints fresh
+  ones) rather than trusting log cleanup — codes already emitted are burned.
+
+- **The WhatsApp Web pair code and QR are no longer written to a non-TTY.** A
+  managed daemon's stderr is captured by the journal, so linking credentials
+  were landing in a log nobody chose to hold. They render only for an
+  interactive terminal now.
+
+- **The WhatsApp Web allowlist now applies to replies.** It ran only for
+  non-JID recipients, and the reply target is always a JID — so every
+  agent-driven send bypassed it entirely and the allowlist provided zero
+  outbound containment. Groups and broadcasts stay exempt, deliberately and
+  documented. A blocked send is now an error instead of a silent success the
+  agent recorded as delivered.
+
+- **An unmapped WhatsApp LID no longer passes on a non-empty allowlist.** The
+  check read `has "*" || !is_empty()`, so configuring *any* entry admitted every
+  unmapped-LID sender. It now needs an explicit `*` or an explicit `lid:<id>`
+  entry, and such a sender is reported as `lid:<id>` so it can never be mistaken
+  for a phone number in logs or in `approval_owners`.
+
+- **The WhatsApp Web session database is 0600 (parent 0700).** It holds the
+  account's long-term Signal keys and was created at the process umask, while
+  every other credential store in this repo is 0600. **If the file was
+  previously world-readable, re-link the device.**
+
+- **WhatsApp Web pairing refuses to run over an unreadable session.** A corrupt
+  session DB looked identical to "no session", so the wizard paired a fresh
+  device over existing key material.
+
 - **Telegram reports the numeric user id as the sender, not the `@username`.**
   A Telegram handle can be released and re-registered, and pairing writes
   whichever form the channel reports into `approval_owners` — so whoever took a
@@ -48,6 +82,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration deliberately does not grant the opt-in on an operator's behalf.
 
 ### Fixed
+
+- **WhatsApp Web survives a restart.** Every listener restart leaked a live
+  client, a sync worker and a device-saver onto the same SQLite session file —
+  N restarts, N concurrent writers on one Signal store. The listener now aborts
+  and awaits any previous handle first, drops the stray `ctrl_c` arm that
+  reported a clean exit independently of the shutdown token, classifies terminal
+  events instead of swallowing them in `_ => {}`, and clears the client so
+  `health_check` can report false on a dead session.
+
+- **WhatsApp Web pairing terminates.** The declared `timeout` was never read, so
+  `PairEvent::Timeout` had exactly one occurrence in the repo — the arm that
+  handles it.
+
+- **WhatsApp Web snapshots are readable.** `snapshot_db` copied a WAL database
+  without its sidecar, which is what produced the malformed key blobs the
+  connect path then panicked on. It uses `VACUUM INTO` now, and a malformed blob
+  is an error rather than a panic inside the SQLite row callback.
+
+- **The WhatsApp Web mutation-MAC cache round trips.** `value_mac` was stored
+  JSON-encoded and read back raw. The table is derived state, so it is cleared
+  once on upgrade and the app-state sync repopulates it.
 
 - **Long replies are no longer lost on Slack, Mattermost, WhatsApp and
   Nextcloud Talk.** Only three of eighteen channels split; the rest posted the
@@ -173,8 +228,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derived `Debug` over the plaintext credential, so one `debug!(?config)` wrote
   it to the log stream. **Rotate any mailbox password that may already sit in
   retained logs** — the fix stops new leaks, it cannot recall old ones.
-
-### Fixed
 
 - **Email stopped losing mail and stopped refetching it forever.** Unparseable
   messages were filed `\Seen` alongside good ones and vanished; a batch where

@@ -232,6 +232,143 @@ impl WhatsAppWebChannel {
         recipient.trim().contains('@')
     }
 
+    /// Whether an outbound recipient is permitted by the allowlist.
+    ///
+    /// The gate used to run only when the recipient was NOT a JID — and
+    /// `resolve_reply_target` always produces a JID, which comes back as
+    /// `SendMessage.recipient`, so every agent-driven reply took the bypass and
+    /// the allowlist provided zero outbound containment.
+    ///
+    /// Groups (`@g.us`) and broadcast lists are a **documented exemption**: the
+    /// allowlist holds phone numbers, a group JID is not one, and gating on it
+    /// would break every group reply. Containment for groups is the inbound
+    /// gate — the agent only replies where it was addressed.
+    #[cfg(feature = "whatsapp-web")]
+    fn allow_recipient(recipient: &str, allowed: &Arc<RwLock<Vec<String>>>) -> RecipientDecision {
+        let trimmed = recipient.trim();
+        if trimmed.is_empty() {
+            return RecipientDecision::Deny("recipient is empty".to_string());
+        }
+
+        let (user, server) = match trimmed.split_once('@') {
+            Some((user, server)) => (user, server),
+            // Bare number: normalise and gate.
+            None => {
+                let normalized = Self::normalize_e164(trimmed);
+                return if Self::number_allowed_in(allowed, &normalized) {
+                    RecipientDecision::Allow
+                } else {
+                    RecipientDecision::Deny(format!("{normalized} is not in allowed_numbers"))
+                };
+            }
+        };
+
+        match server {
+            // Groups and broadcasts: exempt, deliberately. See above.
+            "g.us" | "broadcast" | "status" => RecipientDecision::Allow,
+            // A LID is not a phone number, so it can only match an explicit
+            // `lid:` entry or the wildcard — never a numeric entry.
+            "lid" => {
+                let entry = format!("lid:{user}");
+                if Self::number_allowed_in(allowed, &entry) {
+                    RecipientDecision::Allow
+                } else {
+                    RecipientDecision::Deny(format!(
+                        "{entry} is not in allowed_numbers (an unmapped LID is not a phone number)"
+                    ))
+                }
+            }
+            // Everything else is a user JID whose user part is the number.
+            _ => {
+                let normalized = Self::normalize_e164(user);
+                if Self::number_allowed_in(allowed, &normalized) {
+                    RecipientDecision::Allow
+                } else {
+                    RecipientDecision::Deny(format!("{normalized} is not in allowed_numbers"))
+                }
+            }
+        }
+    }
+
+    /// `+`-prefixed form of a bare user part.
+    #[cfg(feature = "whatsapp-web")]
+    fn normalize_e164(user: &str) -> String {
+        let user = user.trim();
+        if user.starts_with('+') {
+            user.to_string()
+        } else {
+            format!("+{user}")
+        }
+    }
+
+    /// Classify a terminal wa-rs event by name.
+    ///
+    /// Keyed on the variant name rather than the type so this stays testable
+    /// without constructing wa-rs payloads, and so a variant added upstream
+    /// falls into the explicit unknown arm instead of being silently ignored.
+    #[cfg(feature = "whatsapp-web")]
+    fn classify_terminal_event(variant: &str) -> TerminalAction {
+        match variant {
+            // Re-pairing required: restarting cannot fix either of these, and
+            // restarting into a ban makes it worse.
+            "LoggedOut" => TerminalAction::Stop("the device was logged out; re-pair to continue"),
+            "TemporaryBan" => {
+                TerminalAction::Stop("the account is temporarily banned; do not reconnect")
+            }
+            // Recoverable by a fresh connection.
+            "StreamError" | "StreamReplaced" | "Disconnected" | "ConnectFailure"
+            | "ClientOutdated" | "PairError" => TerminalAction::Restart("the stream ended"),
+            _ => TerminalAction::Continue,
+        }
+    }
+
+    /// The `ChannelMessage.id` for an inbound message.
+    ///
+    /// A UUID minted per message made a redelivery undetectable, so the agent
+    /// ran again on a message it had already answered.
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_message_id(platform_id: &str) -> String {
+        let trimmed = platform_id.trim();
+        if trimmed.is_empty() {
+            return uuid::Uuid::new_v4().to_string();
+        }
+        format!("whatsapp_{trimmed}")
+    }
+
+    /// The message's own timestamp as unix seconds, checked.
+    ///
+    /// `Utc::now()` stamped the moment the loop happened to process it, and an
+    /// `as u64` cast turns a negative (pre-epoch, or a malformed payload) into
+    /// an enormous positive.
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_timestamp(message_ts: i64) -> u64 {
+        u64::try_from(message_ts).unwrap_or_else(|_| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        })
+    }
+
+    /// Whether an inbound sender may reach the agent.
+    ///
+    /// An unmapped LID used to be admitted whenever the allowlist was
+    /// *non-empty* — `!a.is_empty()` subsumes the wildcard test, so configuring
+    /// any entry at all admitted every unmapped-LID sender.
+    #[cfg(feature = "whatsapp-web")]
+    fn allow_inbound(
+        allowed: &Arc<RwLock<Vec<String>>>,
+        is_lid: bool,
+        resolved_pn: Option<&str>,
+        sender_user: &str,
+    ) -> bool {
+        if is_lid && resolved_pn.is_none() {
+            // Only an explicit wildcard or an explicit `lid:` entry.
+            return Self::number_allowed_in(allowed, &format!("lid:{sender_user}"));
+        }
+        Self::number_allowed_in(allowed, &Self::normalize_sender(resolved_pn, sender_user))
+    }
+
     /// Convert a recipient to a wa-rs JID.
     ///
     /// Supports:
@@ -295,6 +432,45 @@ impl WhatsAppWebChannel {
             None => format!("+{sender_user}"),
         }
     }
+
+    /// The identity to report for an inbound sender.
+    ///
+    /// An unmapped LID is NOT a phone number, and reporting it as `+digits`
+    /// made it indistinguishable from one in logs and in `approval_owners`. It
+    /// now carries a `lid:` prefix so the two can never be confused.
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_identity(is_lid: bool, resolved_pn: Option<&str>, sender_user: &str) -> String {
+        if is_lid && resolved_pn.is_none() {
+            return format!("lid:{sender_user}");
+        }
+        Self::normalize_sender(resolved_pn, sender_user)
+    }
+}
+
+/// What the event loop should do about a terminal wa-rs event.
+///
+/// The match used to end in `_ => {}`, which swallowed every terminal variant:
+/// `Disconnected`, `ConnectFailure`, `StreamReplaced`, `TemporaryBan`,
+/// `ClientOutdated`, `PairError` and `UndecryptableMessage` all read as
+/// "nothing happened", so a dead channel kept reporting healthy.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalAction {
+    /// Keep running; nothing is wrong.
+    Continue,
+    /// The session is gone. Mark unhealthy and let the supervisor restart.
+    Restart(&'static str),
+    /// Re-pairing is required; a restart cannot fix it.
+    Stop(&'static str),
+}
+
+/// Outcome of the outbound allowlist gate.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecipientDecision {
+    Allow,
+    /// Carries the reason, so the refusal the agent sees names the number.
+    Deny(String),
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -319,16 +495,18 @@ impl Channel for WhatsAppWebChannel {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
 
-        // Validate recipient allowlist only for direct phone-number targets.
-        if !Self::is_jid(&message.recipient) {
-            let normalized = self.normalize_phone(&message.recipient);
-            if !self.is_number_allowed(&normalized) {
-                tracing::warn!(
-                    "WhatsApp Web: recipient {} not in allowed list",
-                    message.recipient
-                );
-                return Ok(());
-            }
+        // Gate EVERY recipient form. This used to run only for non-JID
+        // recipients, and `resolve_reply_target` always yields a JID — so every
+        // agent-driven reply bypassed the allowlist entirely.
+        if let RecipientDecision::Deny(reason) =
+            Self::allow_recipient(&message.recipient, &self.allowed_numbers)
+        {
+            // Was `return Ok(())`: the agent recorded a delivered reply that
+            // was never transmitted.
+            anyhow::bail!(
+                "WhatsApp Web refused to send to {}: {reason}",
+                message.recipient
+            );
         }
 
         let to = self.recipient_to_jid(&message.recipient)?;
@@ -354,6 +532,21 @@ impl Channel for WhatsAppWebChannel {
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
+        // Re-entry guard: every restart used to build a new client while the
+        // old one was still running, leaving N live clients, N sync workers and
+        // N device-savers writing to one SQLite session file.
+        // The guard is dropped before the await below — holding a parking_lot
+        // lock across an await point is not allowed here.
+        let previous = self.bot_handle.lock().take();
+        if let Some(previous) = previous {
+            tracing::warn!("WhatsApp Web: a previous listener is still live; aborting it first");
+            previous.abort();
+            // Awaiting the abort is the point: without it the old socket is
+            // still draining when the new one dials.
+            let _ = previous.await;
+        }
+        *self.client.lock() = None;
+
         // Store the sender channel for incoming messages
         *self.tx.lock() = Some(tx.clone());
 
@@ -403,6 +596,16 @@ impl Channel for WhatsAppWebChannel {
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
 
+        // A terminal event inside the wa-rs event loop has to reach `listen()`,
+        // which is parked in the `select!` below. The token wakes it; the slot
+        // carries why.
+        let session_ended = tokio_util::sync::CancellationToken::new();
+        let session_end_reason: Arc<Mutex<Option<TerminalAction>>> = Arc::new(Mutex::new(None));
+        // The closure below takes ownership of its clones; these two stay here
+        // for the `select!` and the return path.
+        let session_ended_outer = session_ended.clone();
+        let session_end_outer = Arc::clone(&session_end_reason);
+
         let mut builder = Bot::builder()
             .with_backend(backend)
             .with_transport_factory(transport_factory)
@@ -410,6 +613,8 @@ impl Channel for WhatsAppWebChannel {
             .on_event(move |event, client| {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
+                let session_ended_inner = session_ended.clone();
+                let session_end_inner = Arc::clone(&session_end_reason);
                 async move {
                     match event {
                         Event::Message(msg, info) => {
@@ -420,11 +625,15 @@ impl Channel for WhatsAppWebChannel {
                             let chat_jid = info.source.chat.clone();
                             let chat = chat_jid.to_string();
 
-                            tracing::info!(
-                                "WhatsApp Web message from {} in {}: {}",
+                            // Message bodies are NOT logged. They used to be
+                            // logged at INFO — including `/claim` pairing codes,
+                            // which promote their holder to owner, and which were
+                            // logged BEFORE the pairing handler ran.
+                            tracing::debug!(
+                                "WhatsApp Web message from {} in {} ({} chars)",
                                 sender,
                                 chat,
-                                text
+                                text.chars().count()
                             );
 
                             // Detect LID (Linked Identity) senders — WhatsApp often
@@ -443,10 +652,11 @@ impl Channel for WhatsAppWebChannel {
                                 None
                             };
 
-                            // Sender in E.164 `+` form (resolved phone number when
-                            // available, else the raw user part).
+                            // Sender identity: a resolved phone number in E.164
+                            // form, or a `lid:`-prefixed LID that can never be
+                            // mistaken for one.
                             let normalized =
-                                Self::normalize_sender(resolved_pn.as_deref(), &sender);
+                                Self::inbound_identity(is_lid, resolved_pn.as_deref(), &sender);
 
                             // Intercept on-demand store-minted pairing codes
                             // (`/bind`/`/claim`) BEFORE the allowlist gate so an
@@ -465,16 +675,17 @@ impl Channel for WhatsAppWebChannel {
                                 return;
                             }
 
-                            // A LID resolved to a phone number is matched like any
-                            // number. An *unmapped* LID is unverifiable, so allow it
-                            // through when the list is non-empty / has "*" (the user
-                            // configured filtering intent). Wildcard "*" always passes.
-                            let is_allowed = if is_lid && resolved_pn.is_none() {
-                                let allowed = allowed_numbers.read().ok();
-                                allowed.is_some_and(|a| a.iter().any(|n| n == "*") || !a.is_empty())
-                            } else {
-                                Self::number_allowed_in(&allowed_numbers, &normalized)
-                            };
+                            // An unmapped LID is unverifiable, so it needs an
+                            // explicit `"*"` or an explicit `lid:` entry. It used
+                            // to be admitted whenever the allowlist was merely
+                            // NON-EMPTY, which let any configured list admit every
+                            // unmapped-LID sender.
+                            let is_allowed = Self::allow_inbound(
+                                &allowed_numbers,
+                                is_lid,
+                                resolved_pn.as_deref(),
+                                &sender,
+                            );
 
                             if is_allowed {
                                 let trimmed = text.trim();
@@ -493,22 +704,40 @@ impl Channel for WhatsAppWebChannel {
                                 // this target, so it follows the reply.
                                 let reply_target =
                                     Self::resolve_reply_target(&client, &chat_jid).await;
-                                if let Err(e) = tx_inner
-                                    .send(ChannelMessage { sender_aliases: Vec::new(),
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        channel: "whatsapp".to_string(),
-                                        sender: normalized.clone(),
-                                        reply_target,
-                                        content: trimmed.to_string(),
-                                        timestamp: chrono::Utc::now().timestamp() as u64,
-                                        thread_ts: None,
-                                    })
-                                    .await
-                                {
-                                    tracing::error!("Failed to send message to channel: {}", e);
+                                let inbound = ChannelMessage {
+                                    sender_aliases: Vec::new(),
+                                    // The platform id, not a fresh UUID: a
+                                    // redelivery has to be recognisable.
+                                    id: Self::inbound_message_id(&info.id),
+                                    channel: "whatsapp".to_string(),
+                                    sender: normalized.clone(),
+                                    reply_target,
+                                    content: trimmed.to_string(),
+                                    // The message's own timestamp, checked —
+                                    // `Utc::now()` stamped the moment we
+                                    // happened to process it.
+                                    timestamp: Self::inbound_timestamp(
+                                        info.timestamp.timestamp(),
+                                    ),
+                                    thread_ts: None,
+                                };
+                                // `try_send`, not `send`: a busy agent must not
+                                // park the wa-rs protocol loop, which also
+                                // carries acks and retries.
+                                if let Err(e) = tx_inner.try_send(inbound) {
+                                    tracing::warn!(
+                                        "WhatsApp Web: dropping an inbound message, the agent \
+                                         queue is not accepting it: {e}"
+                                    );
                                 }
                             } else {
-                                tracing::warn!("WhatsApp Web: message from {} not in allowed list", normalized);
+                                // Name the identity so an operator can allowlist
+                                // it — including the `lid:` form, which is the
+                                // only thing that admits an unmapped LID.
+                                tracing::warn!(
+                                    "WhatsApp Web: message from {normalized} not in allowed_numbers; \
+                                     add that exact value to allow it"
+                                );
                             }
                         }
                         Event::Connected(_) => {
@@ -516,9 +745,15 @@ impl Channel for WhatsAppWebChannel {
                         }
                         Event::LoggedOut(_) => {
                             tracing::warn!("WhatsApp Web was logged out");
+                            *session_end_inner.lock() =
+                                Some(Self::classify_terminal_event("LoggedOut"));
+                            session_ended_inner.cancel();
                         }
                         Event::StreamError(stream_error) => {
                             tracing::error!("WhatsApp Web stream error: {:?}", stream_error);
+                            *session_end_inner.lock() =
+                                Some(Self::classify_terminal_event("StreamError"));
+                            session_ended_inner.cancel();
                         }
                         Event::PairingCode { code, .. } => {
                             crate::channels::qr_terminal::render_pair_code(&code);
@@ -535,7 +770,30 @@ impl Channel for WhatsAppWebChannel {
                                 "WhatsApp Web — scan with WhatsApp > Linked Devices > Link a Device",
                             );
                         }
-                        _ => {}
+                        // Every other variant used to land in `_ => {}`, which
+                        // swallowed Disconnected, ConnectFailure, StreamReplaced,
+                        // TemporaryBan, ClientOutdated, PairError and
+                        // UndecryptableMessage alike — a dead channel kept
+                        // reporting healthy. Classify by variant name so an
+                        // upstream addition surfaces instead of vanishing.
+                        other => {
+                            let variant = format!("{other:?}");
+                            let name = variant
+                                .split(['(', ' ', '{'])
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
+                            match Self::classify_terminal_event(&name) {
+                                TerminalAction::Continue => {
+                                    tracing::debug!("WhatsApp Web: unhandled event {name}");
+                                }
+                                action => {
+                                    tracing::warn!("WhatsApp Web: terminal event {name}");
+                                    *session_end_inner.lock() = Some(action);
+                                    session_ended_inner.cancel();
+                                }
+                            }
+                        }
                     }
                 }
             })
@@ -564,27 +822,58 @@ impl Channel for WhatsAppWebChannel {
         // Store the bot handle for later shutdown
         *self.bot_handle.lock() = Some(bot_handle);
 
-        // Wait for cancellation or shutdown signal
+        // Wait for cancellation or a terminal event.
+        //
+        // The `tokio::signal::ctrl_c()` arm that used to sit here returned
+        // `Ok(())` independently of the app's shutdown token, which the
+        // supervisor read as an unexpected exit and restarted — the passed
+        // token already covers shutdown.
         select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 tracing::info!("WhatsApp Web channel shutting down");
             }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("WhatsApp Web channel received Ctrl+C");
+            () = session_ended_outer.cancelled() => {
+                tracing::warn!("WhatsApp Web session ended");
             }
         }
 
+        // Clear both before returning, so `health_check` can report false and a
+        // restart does not find a stale client.
         *self.client.lock() = None;
-        if let Some(handle) = self.bot_handle.lock().take() {
+        let handle = self.bot_handle.lock().take();
+        if let Some(handle) = handle {
             handle.abort();
+            let _ = handle.await;
         }
 
-        Ok(())
+        // `Err` on a fault, per the trait contract: the supervisor escalates its
+        // backoff instead of reconnecting at a fixed rate. Note the limit — the
+        // supervisor restarts on `Stop` too; it backs off further, which is the
+        // most this side can do about a ban without a supervisor change.
+        let reason = session_end_outer.lock().take();
+        match reason {
+            Some(TerminalAction::Stop(why)) => {
+                anyhow::bail!("WhatsApp Web stopped: {why}");
+            }
+            Some(TerminalAction::Restart(why)) => {
+                anyhow::bail!("WhatsApp Web session fault: {why}");
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Healthy means a live client, not merely a handle that was once set.
+    ///
+    /// The handle used to be left in place on `LoggedOut` and `StreamError`, so
+    /// a dead channel reported healthy for the rest of the process's life.
+    fn apply_allowed_senders(&self, allowed: &[String]) {
+        if let Ok(mut numbers) = self.allowed_numbers.write() {
+            *numbers = allowed.to_vec();
+        }
     }
 
     async fn health_check(&self) -> bool {
-        let bot_handle_guard = self.bot_handle.lock();
-        bot_handle_guard.is_some()
+        self.client.lock().is_some() && self.bot_handle.lock().is_some()
     }
 
     async fn start_typing(&self, recipient: &str) -> Result<()> {
@@ -593,15 +882,13 @@ impl Channel for WhatsAppWebChannel {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
 
-        if !Self::is_jid(recipient) {
-            let normalized = self.normalize_phone(recipient);
-            if !self.is_number_allowed(&normalized) {
-                tracing::warn!(
-                    "WhatsApp Web: typing target {} not in allowed list",
-                    recipient
-                );
-                return Ok(());
-            }
+        if let RecipientDecision::Deny(reason) =
+            Self::allow_recipient(recipient, &self.allowed_numbers)
+        {
+            // Cosmetic surface: refusing quietly is right, `send` reports the
+            // same target with a full error.
+            tracing::debug!("WhatsApp Web: not typing at {recipient}: {reason}");
+            return Ok(());
         }
 
         let to = self.recipient_to_jid(recipient)?;
@@ -621,15 +908,13 @@ impl Channel for WhatsAppWebChannel {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
 
-        if !Self::is_jid(recipient) {
-            let normalized = self.normalize_phone(recipient);
-            if !self.is_number_allowed(&normalized) {
-                tracing::warn!(
-                    "WhatsApp Web: typing target {} not in allowed list",
-                    recipient
-                );
-                return Ok(());
-            }
+        if let RecipientDecision::Deny(reason) =
+            Self::allow_recipient(recipient, &self.allowed_numbers)
+        {
+            // Cosmetic surface: refusing quietly is right, `send` reports the
+            // same target with a full error.
+            tracing::debug!("WhatsApp Web: not typing at {recipient}: {reason}");
+            return Ok(());
         }
 
         let to = self.recipient_to_jid(recipient)?;
@@ -713,10 +998,16 @@ pub struct PairOptions {
     pub timeout: std::time::Duration,
 }
 
-impl Default for PairOptions {
-    fn default() -> Self {
+impl PairOptions {
+    /// Build options for a session file the caller has already resolved.
+    ///
+    /// There is deliberately no `Default`: it used to default `session_path` to
+    /// the relative `wa.db`, so key material landed wherever the process
+    /// happened to be running.
+    #[must_use]
+    pub fn new(session_path: std::path::PathBuf) -> Self {
         Self {
-            session_path: std::path::PathBuf::from("wa.db"),
+            session_path,
             pair_phone: None,
             timeout: std::time::Duration::from_secs(60),
         }
@@ -747,7 +1038,17 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
     let (tx, rx) = mpsc::channel::<PairEvent>(32);
 
     std::thread::spawn(move || {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        // A panicking runtime start here dropped `tx`, so the operator saw
+        // "Pairing failed: channel closed" with the real cause nowhere.
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.blocking_send(PairEvent::Failed(format!(
+                    "could not start the pairing runtime: {e}"
+                )));
+                return;
+            }
+        };
         runtime.block_on(async {
             tracing::info!(
                 "pair_once: thread started, opening storage at {}",
@@ -765,11 +1066,40 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
             tracing::info!("pair_once: storage opened, building bot");
             let backend = std::sync::Arc::new(storage);
             let mut device = Device::new(backend.clone());
-            if let Ok(exists) = backend.exists().await {
-                if exists {
-                    if let Ok(Some(core_device)) = backend.load().await {
-                        device.load_from_serializable(core_device);
+            // Both results are matched. They used to be ignored, so a corrupt
+            // or unreadable session DB looked identical to "no session" and the
+            // wizard paired a fresh device OVER existing key material.
+            match backend.exists().await {
+                Ok(true) => match backend.load().await {
+                    Ok(Some(core_device)) => device.load_from_serializable(core_device),
+                    Ok(None) => {
+                        let _ = tx
+                            .send(PairEvent::Failed(
+                                "the session database reports a device but could not load it; \
+                                 refusing to pair over existing key material"
+                                    .into(),
+                            ))
+                            .await;
+                        return;
                     }
+                    Err(e) => {
+                        let _ = tx
+                            .send(PairEvent::Failed(format!(
+                                "existing session could not be read ({e}); refusing to pair over \
+                                 it — move or delete the session file to start fresh"
+                            )))
+                            .await;
+                        return;
+                    }
+                },
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = tx
+                        .send(PairEvent::Failed(format!(
+                            "could not check for an existing session: {e}"
+                        )))
+                        .await;
+                    return;
                 }
             }
             let mut transport_factory = TokioWebSocketTransportFactory::new();
@@ -838,11 +1168,22 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
                 }
             };
             tracing::info!("pair_once: event loop spawned, awaiting JoinHandle");
-            if let Err(e) = join_handle.await {
-                tracing::error!("pair_once: bot task join failed: {e}");
-                let _ = tx
-                    .send(PairEvent::Failed(format!("bot task panicked: {e}")))
-                    .await;
+            // Bounded by `opts.timeout`, which the struct has always declared
+            // and nothing ever read — `PairEvent::Timeout` had exactly one
+            // occurrence in the repo, the arm that handles it. The bot
+            // auto-reconnects, so an unbounded await never returns.
+            match tokio::time::timeout(opts.timeout, join_handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!("pair_once: bot task join failed: {e}");
+                    let _ = tx
+                        .send(PairEvent::Failed(format!("bot task panicked: {e}")))
+                        .await;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!("pair_once: timed out after {:?}", opts.timeout);
+                    let _ = tx.send(PairEvent::Timeout).await;
+                }
             }
             tracing::info!("pair_once: thread exiting");
         });
@@ -860,6 +1201,319 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
 #[cfg(all(test, feature = "whatsapp-web"))]
 mod tests {
     use super::*;
+
+    fn allowlist(entries: &[&str]) -> Arc<RwLock<Vec<String>>> {
+        Arc::new(RwLock::new(
+            entries.iter().map(|e| (*e).to_string()).collect(),
+        ))
+    }
+
+    /// The outbound gate used to run only when the recipient was NOT a JID —
+    /// and `resolve_reply_target` always produces a JID, which comes back as
+    /// `SendMessage.recipient`. So every agent-driven reply bypassed it.
+    #[test]
+    fn allow_recipient_applies_to_jid_form() {
+        let empty = allowlist(&[]);
+        let specific = allowlist(&["+15551234567"]);
+        let wildcard = allowlist(&["*"]);
+
+        for form in [
+            "+15551234567",
+            "15551234567@s.whatsapp.net",
+            "+15551234567@s.whatsapp.net",
+        ] {
+            assert_eq!(
+                WhatsAppWebChannel::allow_recipient(form, &empty),
+                RecipientDecision::Deny("+15551234567 is not in allowed_numbers".to_string()),
+                "empty allowlist must deny {form}"
+            );
+            assert_eq!(
+                WhatsAppWebChannel::allow_recipient(form, &specific),
+                RecipientDecision::Allow,
+                "a listed number must be allowed via {form}"
+            );
+            assert_eq!(
+                WhatsAppWebChannel::allow_recipient(form, &wildcard),
+                RecipientDecision::Allow
+            );
+        }
+
+        // A different number is denied in every form.
+        assert!(matches!(
+            WhatsAppWebChannel::allow_recipient("19998887777@s.whatsapp.net", &specific),
+            RecipientDecision::Deny(_)
+        ));
+
+        // Groups and broadcasts are a documented exemption.
+        for group in ["1234-5678@g.us", "status@broadcast"] {
+            assert_eq!(
+                WhatsAppWebChannel::allow_recipient(group, &empty),
+                RecipientDecision::Allow,
+                "{group} must stay exempt or every group reply breaks"
+            );
+        }
+
+        assert!(matches!(
+            WhatsAppWebChannel::allow_recipient("   ", &wildcard),
+            RecipientDecision::Deny(_)
+        ));
+    }
+
+    /// A LID is not a phone number: it must match `lid:<id>` or the wildcard,
+    /// never a numeric entry.
+    #[test]
+    fn allow_recipient_treats_a_lid_as_its_own_form() {
+        let numeric = allowlist(&["+15551234567"]);
+        assert!(matches!(
+            WhatsAppWebChannel::allow_recipient("15551234567@lid", &numeric),
+            RecipientDecision::Deny(_)
+        ));
+        assert_eq!(
+            WhatsAppWebChannel::allow_recipient(
+                "15551234567@lid",
+                &allowlist(&["lid:15551234567"])
+            ),
+            RecipientDecision::Allow
+        );
+        assert_eq!(
+            WhatsAppWebChannel::allow_recipient("15551234567@lid", &allowlist(&["*"])),
+            RecipientDecision::Allow
+        );
+    }
+
+    /// `!a.is_empty()` subsumed the wildcard test, so configuring ANY entry
+    /// admitted every unmapped-LID sender.
+    #[test]
+    fn unmapped_lid_is_rejected_when_the_allowlist_is_non_empty() {
+        let configured = allowlist(&["+15551234567"]);
+        assert!(
+            !WhatsAppWebChannel::allow_inbound(&configured, true, None, "99887766"),
+            "a non-empty allowlist must not admit an unmapped LID"
+        );
+        assert!(
+            WhatsAppWebChannel::allow_inbound(&allowlist(&["*"]), true, None, "99887766"),
+            "an explicit wildcard still admits it"
+        );
+        assert!(
+            WhatsAppWebChannel::allow_inbound(
+                &allowlist(&["lid:99887766"]),
+                true,
+                None,
+                "99887766"
+            ),
+            "an explicit lid entry admits it"
+        );
+        // A LID that resolved to a phone number is matched as that number.
+        assert!(WhatsAppWebChannel::allow_inbound(
+            &configured,
+            true,
+            Some("15551234567"),
+            "99887766"
+        ));
+    }
+
+    /// An unmapped LID reported as `+digits` was indistinguishable from a phone
+    /// number in logs and in `approval_owners`.
+    #[test]
+    fn an_unmapped_lid_is_visibly_not_a_phone_number() {
+        assert_eq!(
+            WhatsAppWebChannel::inbound_identity(true, None, "99887766"),
+            "lid:99887766"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::inbound_identity(true, Some("15551234567"), "99887766"),
+            "+15551234567"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::inbound_identity(false, None, "15551234567"),
+            "+15551234567"
+        );
+    }
+
+    #[test]
+    fn classify_marks_terminal_events() {
+        use TerminalAction::{Continue, Restart, Stop};
+        assert!(matches!(
+            WhatsAppWebChannel::classify_terminal_event("LoggedOut"),
+            Stop(_)
+        ));
+        assert!(matches!(
+            WhatsAppWebChannel::classify_terminal_event("TemporaryBan"),
+            Stop(_)
+        ));
+        for recoverable in [
+            "StreamError",
+            "StreamReplaced",
+            "Disconnected",
+            "ConnectFailure",
+            "ClientOutdated",
+            "PairError",
+        ] {
+            assert!(
+                matches!(
+                    WhatsAppWebChannel::classify_terminal_event(recoverable),
+                    Restart(_)
+                ),
+                "{recoverable} must end the session"
+            );
+        }
+        assert_eq!(
+            WhatsAppWebChannel::classify_terminal_event("Receipt"),
+            Continue
+        );
+    }
+
+    #[test]
+    fn map_inbound_carries_the_platform_id_and_timestamp() {
+        assert_eq!(
+            WhatsAppWebChannel::inbound_message_id("3EB0ABC123"),
+            "whatsapp_3EB0ABC123"
+        );
+        // Absent id falls back to a UUID rather than an empty string.
+        assert_ne!(WhatsAppWebChannel::inbound_message_id("  "), "whatsapp_");
+
+        assert_eq!(
+            WhatsAppWebChannel::inbound_timestamp(1_700_000_000),
+            1_700_000_000
+        );
+        // A negative timestamp used to become an enormous positive via `as u64`.
+        let fallback = WhatsAppWebChannel::inbound_timestamp(-1);
+        assert!(fallback < 100_000_000_000, "got {fallback}");
+    }
+
+    #[test]
+    fn allowlist_edit_reaches_the_channel() {
+        let ch = make_channel(vec!["*".to_string()]);
+        assert!(ch.is_number_allowed("+15551234567"));
+        ch.apply_allowed_senders(&["+19998887777".to_string()]);
+        assert!(ch.is_number_allowed("+19998887777"));
+        assert!(!ch.is_number_allowed("+15551234567"));
+    }
+
+    /// `PairOptions` used to default `session_path` to a relative `wa.db`, so
+    /// the account's key material landed wherever the process ran.
+    #[test]
+    fn pair_options_have_no_relative_default() {
+        let opts = PairOptions::new(std::path::PathBuf::from("/tmp/rantaiclaw/wa.db"));
+        assert!(opts.session_path.is_absolute());
+        assert!(opts.timeout > std::time::Duration::ZERO);
+
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        assert!(
+            !production.contains("impl Default for PairOptions"),
+            "a Default impl reintroduces the relative session path"
+        );
+    }
+
+    /// `opts.timeout` was declared and never read, so pairing never ended: the
+    /// bot auto-reconnects, and the awaited handle only resolves when the event
+    /// loop dies.
+    #[test]
+    fn pair_once_honours_its_timeout() {
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let body = production
+            .split("pub fn pair_once(")
+            .nth(1)
+            .expect("pair_once exists");
+        assert!(
+            body.contains("tokio::time::timeout(opts.timeout"),
+            "the pairing wait must be bounded by the declared timeout"
+        );
+        assert!(
+            body.contains("PairEvent::Timeout"),
+            "the timeout must be reported to the caller"
+        );
+        assert!(
+            !body.contains("expect(\"runtime\")"),
+            "a panicking runtime start drops the sender and hides the cause"
+        );
+    }
+
+    /// A corrupt or unreadable session DB used to look identical to "no
+    /// session", so the wizard paired a fresh device over existing key
+    /// material.
+    #[test]
+    fn pair_once_refuses_to_pair_over_an_unreadable_session() {
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let body = production
+            .split("pub fn pair_once(")
+            .nth(1)
+            .expect("pair_once exists");
+        assert!(
+            !body.contains("if let Ok(exists) = backend.exists()"),
+            "both session-load results must be matched, not silently ignored"
+        );
+        assert!(
+            body.contains("refusing to pair over"),
+            "the refusal must say why"
+        );
+    }
+
+    /// The table test above exercises `allow_recipient` directly, and a
+    /// `send()` that re-adds the `is_jid` bypass passes it anyway — that bypass
+    /// IS the defect. `send()` needs a live client to drive, so the wiring is
+    /// asserted by source.
+    #[test]
+    fn send_gates_every_recipient_form() {
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        let send_body = production
+            .split("async fn send(&self, message: &SendMessage)")
+            .nth(1)
+            .expect("send exists");
+        let next_fn = send_body.find("\n    async fn ").unwrap_or(send_body.len());
+        let send_body = &send_body[..next_fn];
+        assert!(
+            send_body.contains("Self::allow_recipient("),
+            "send() must run the allowlist gate"
+        );
+        assert!(
+            !send_body.contains("is_jid("),
+            "the gate must not be conditioned on the recipient being a bare number"
+        );
+        assert!(
+            send_body.contains("anyhow::bail!"),
+            "a blocked send must be an error, not a silent Ok(())"
+        );
+    }
+
+    /// Message bodies must never reach INFO — they used to, including `/claim`
+    /// pairing codes, and BEFORE the pairing handler ran.
+    #[test]
+    fn no_message_body_is_logged_at_info() {
+        let src = include_str!("whatsapp_web.rs");
+        let production = src.split("#[cfg(all(test").next().expect("source");
+        assert!(
+            !production.contains("WhatsApp Web message from {} in {}: {}"),
+            "the body-logging INFO line is back"
+        );
+        let handler = production
+            .split("Event::Message(msg, info)")
+            .nth(1)
+            .expect("the message arm exists");
+        let pairing_at = handler
+            .find("try_reply_pairing")
+            .expect("the pairing interception is in the message arm");
+        let log_at = handler
+            .find("tracing::debug!")
+            .expect("the message arm logs at debug");
+        assert!(
+            log_at < pairing_at,
+            "the surviving log line must not carry the body; it logs only a length"
+        );
+        let logged = &handler[log_at..pairing_at];
+        assert!(
+            logged.contains("chars()"),
+            "the log must carry a length, not the text: {logged}"
+        );
+        assert!(
+            !logged.contains(", text\n") && !logged.contains("text\n"),
+            "the body must not be an argument: {logged}"
+        );
+    }
 
     fn make_channel(allowed: Vec<String>) -> WhatsAppWebChannel {
         WhatsAppWebChannel::new("/tmp/wa-test.db".into(), None, None, allowed)
