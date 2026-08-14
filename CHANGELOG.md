@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Shift+Tab can no longer change the autonomy level from inside an approval
+  prompt.** The approval handler ignores modified keys and Shift+Tab carries
+  Shift, so the binding fired while a gate was on screen — and one of its rungs
+  is "no prompts". It is now inert while an approval is pending or a turn is in
+  flight, the cycle skips "off" entirely (use `/autonomy off`), an accidental
+  press no longer force-rewrites hand-edited policy files, and a failed reload
+  leaves the previous level in place instead of announcing one that is not in
+  force.
+
+- **Approving a tool call no longer widens the allowlist for a call it did not
+  resolve.** The grant ran before resolution, and resolution matched by command
+  basename — which fails when two calls share one. Since the agent runs tool
+  calls in parallel, two pending `curl` calls were ordinary: pressing `A`
+  permanently allowlisted `curl`, resolved neither call, and hung the turn
+  behind a message claiming the request was no longer pending. It resolves by
+  request id now, and grants only after that succeeds.
+
+- **`/pair` no longer writes the pairing code into `sessions.db`.** The store is
+  full-text indexed and long outlives the code's window. The code is shown on
+  screen and recorded redacted. The channel name is validated (a typo used to
+  mint a code under a surface nothing reads), owner-granting is now opt-in
+  (`--owner`), and codes are single-use. **Treat any code previously minted
+  through `/pair` as recorded and supersede it.**
+
+- **`autonomous_tools` is visible.** The flag that skips the approval gate
+  entirely appeared on no TUI or CLI surface, so `permissions show` could read
+  "Owners (none)" while every channel message ran tools unprompted. It now heads
+  `permissions show`, and `/channels` carries an approval-boundary row.
+
 - **The public channel webhooks verify the bytes they parse.** Linq and
   Nextcloud Talk authenticated a `from_utf8_lossy` copy of the request while
   acting on the raw body — every invalid sequence collapses to `U+FFFD`, so the
