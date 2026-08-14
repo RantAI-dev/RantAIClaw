@@ -100,7 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Image links no longer vanish from outbound messages.** The renderer's AST
   builder matched neither the image tag nor its close, so the URL was discarded
-  on all eighteen channels: `![chart](https://…/chart.png)` arrived as the bare
+  on all eighteen channels: an image written in markdown arrived as the bare
   word `chart`, and an alt-less image produced an empty paragraph. Each target
   now spells it its own way — a link on Telegram and Matrix (neither renders an
   inline image from markdown), `![alt](url)` on markdown targets, `alt (url)` on
