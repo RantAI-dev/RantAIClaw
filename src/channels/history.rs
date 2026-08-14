@@ -4,9 +4,8 @@
 //! Moved out of `mod.rs` verbatim (plan 121, row 4). No behaviour change.
 
 use super::{
-    normalize_cached_channel_turns, truncate_with_ellipsis, ChannelRuntimeContext,
-    CHANNEL_HISTORY_COMPACT_CONTENT_CHARS, CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES,
-    MAX_CHANNEL_HISTORY,
+    truncate_with_ellipsis, ChannelRuntimeContext, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS,
+    CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES, MAX_CHANNEL_HISTORY,
 };
 use crate::providers::ChatMessage;
 
@@ -41,7 +40,8 @@ pub(crate) fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &s
     let keep_from = turns
         .len()
         .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
+    let mut compacted =
+        super::dispatch::normalize_cached_channel_turns(turns[keep_from..].to_vec());
 
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {

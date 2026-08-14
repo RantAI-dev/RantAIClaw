@@ -5,9 +5,7 @@
 //! `pub(crate)`.
 
 use super::traits::{self, Channel, SendMessage};
-use super::{
-    conversation_history_key, history, routing, ChannelRouteSelection, ChannelRuntimeContext,
-};
+use super::{history, routing, ChannelRouteSelection, ChannelRuntimeContext};
 use crate::providers;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -139,7 +137,7 @@ pub(crate) async fn handle_runtime_command_if_needed(
         return true;
     };
 
-    let sender_key = conversation_history_key(msg);
+    let sender_key = super::dispatch::conversation_history_key(msg);
     let mut current = routing::get_route_selection(ctx, &sender_key);
 
     let response = match command {
