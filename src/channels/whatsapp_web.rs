@@ -1553,8 +1553,8 @@ mod tests {
         // A LID sender resolved to its phone number matches owner/allowlist on
         // the real number, not the opaque LID.
         assert_eq!(
-            WhatsAppWebChannel::normalize_sender(Some("6285228485826"), "207550217756908"),
-            "+6285228485826"
+            WhatsAppWebChannel::normalize_sender(Some("628123456789"), "200000000000001"),
+            "+628123456789"
         );
     }
 
