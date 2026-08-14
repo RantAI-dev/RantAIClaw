@@ -18,6 +18,47 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 #[cfg(feature = "whatsapp-web")]
 use std::path::Path;
+
+/// Restrict a file to 0600, best-effort.
+///
+/// This store holds the account's long-term Signal keys; every other
+/// credential store in this repo is 0600 (`security/pairing_store.rs`,
+/// `security/secrets.rs`, the config file). Best-effort because a failure here
+/// must not stop the channel from starting — it is logged instead.
+fn restrict_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                "WhatsApp Web: could not restrict {} to 0600: {e}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Restrict a directory to 0700, best-effort. Same reasoning as above.
+fn restrict_dir_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(
+                "WhatsApp Web: could not restrict {} to 0700: {e}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
 #[cfg(feature = "whatsapp-web")]
 use std::sync::Arc;
 
@@ -82,14 +123,23 @@ impl RusqliteStore {
         // Create parent directory if needed
         if let Some(parent) = Path::new(&db_path).parent() {
             std::fs::create_dir_all(parent)?;
+            restrict_dir_permissions(parent);
         }
 
         let conn = Connection::open(&db_path)?;
 
-        // Enable WAL mode for better concurrency
+        // This file holds the account's long-term Signal keys. Every other
+        // credential store in this repo is 0600; this one was created at the
+        // process umask.
+        restrict_file_permissions(Path::new(&db_path));
+
+        // Enable WAL mode for better concurrency. `busy_timeout` matches
+        // `history_store.rs`: without it a concurrent writer fails immediately
+        // with SQLITE_BUSY instead of waiting.
         to_store_err!(conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;",
         ))?;
 
         let store = Self {
@@ -196,6 +246,12 @@ impl RusqliteStore {
                 PRIMARY KEY (name, index_mac, device_id)
             );
 
+            -- Store-level markers (encoding migrations and similar).
+            CREATE TABLE IF NOT EXISTS store_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             -- LID to phone number mapping
             CREATE TABLE IF NOT EXISTS lid_pn_mapping (
                 lid TEXT NOT NULL,
@@ -255,8 +311,36 @@ impl RusqliteStore {
                 device_id INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (jid, device_id)
-            );",
+            );
+
+            -- The reverse LID lookup filters on phone_number and runs once per
+            -- inbound message; without this it is a full scan of the mapping.
+            CREATE INDEX IF NOT EXISTS idx_lid_pn_by_number
+                ON lid_pn_mapping (phone_number, device_id, updated_at DESC);",
         ))?;
+
+        // `value_mac` used to be stored JSON-encoded and read back raw, so
+        // every row written before this fix is unreadable. The table is derived
+        // state — the app-state sync repopulates it — so clearing it once is
+        // the whole migration.
+        let encoding: Option<String> = conn
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'mutation_mac_encoding'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if encoding.as_deref() != Some("raw") {
+            to_store_err!(conn.execute("DELETE FROM app_state_mutation_macs", []))?;
+            to_store_err!(conn.execute(
+                "INSERT OR REPLACE INTO store_meta (key, value) VALUES ('mutation_mac_encoding', 'raw')",
+                [],
+            ))?;
+            tracing::debug!(
+                "WhatsApp Web: cleared the mutation-MAC cache once for the raw encoding"
+            );
+        }
+
         Ok(())
     }
 }
@@ -542,13 +626,23 @@ impl AppSyncStore for RusqliteStore {
 
     async fn get_version(&self, name: &str) -> wa_rs_core::store::error::Result<HashState> {
         let conn = self.conn.lock();
-        let state_data: Vec<u8> = to_store_err!(conn.query_row(
+        // A missing row is "no version yet", not a database error. Thirteen
+        // sibling readers in this file map `QueryReturnedNoRows` explicitly;
+        // this one surfaced it as a failure, which reads as a broken store.
+        let state_data: Option<Vec<u8>> = match conn.query_row(
             "SELECT state_data FROM app_state_versions WHERE name = ?1 AND device_id = ?2",
             params![name, self.device_id],
             |row| row.get(0),
-        ))?;
+        ) {
+            Ok(data) => Some(data),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(to_store_err!(Err::<(), _>(e)).unwrap_err()),
+        };
 
-        to_store_err!(serde_json::from_slice(&state_data))
+        match state_data {
+            Some(data) => to_store_err!(serde_json::from_slice(&data)),
+            None => Ok(HashState::default()),
+        }
     }
 
     async fn set_version(
@@ -574,17 +668,29 @@ impl AppSyncStore for RusqliteStore {
     ) -> wa_rs_core::store::error::Result<()> {
         let conn = self.conn.lock();
 
-        for mutation in mutations {
-            let index_mac = to_store_err!(serde_json::to_vec(&mutation.index_mac))?;
-            let value_mac = to_store_err!(serde_json::to_vec(&mutation.value_mac))?;
-
-            to_store_err!(execute: conn.execute(
+        // Both MACs are stored RAW. `value_mac` used to be written through
+        // `serde_json::to_vec` and read back raw, so every lookup returned
+        // JSON bytes rather than the MAC — an asymmetry `index_mac` did not
+        // share. One transaction and one prepared statement, rather than one
+        // implicit transaction per row.
+        let tx = to_store_err!(conn.unchecked_transaction())?;
+        {
+            let mut stmt = to_store_err!(tx.prepare(
                 "INSERT OR REPLACE INTO app_state_mutation_macs
                  (name, version, index_mac, value_mac, device_id)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![name, i64::try_from(version).unwrap_or(i64::MAX), index_mac, value_mac, self.device_id],
             ))?;
+            for mutation in mutations {
+                to_store_err!(execute: stmt.execute(params![
+                    name,
+                    i64::try_from(version).unwrap_or(i64::MAX),
+                    mutation.index_mac,
+                    mutation.value_mac,
+                    self.device_id
+                ]))?;
+            }
         }
+        to_store_err!(tx.commit())?;
 
         Ok(())
     }
@@ -595,12 +701,10 @@ impl AppSyncStore for RusqliteStore {
         index_mac: &[u8],
     ) -> wa_rs_core::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
-        let index_mac_json = to_store_err!(serde_json::to_vec(index_mac))?;
-
         let result = conn.query_row(
             "SELECT value_mac FROM app_state_mutation_macs
              WHERE name = ?1 AND index_mac = ?2 AND device_id = ?3",
-            params![name, index_mac_json, self.device_id],
+            params![name, index_mac, self.device_id],
             |row| row.get::<_, Vec<u8>>(0),
         );
 
@@ -620,15 +724,17 @@ impl AppSyncStore for RusqliteStore {
     ) -> wa_rs_core::store::error::Result<()> {
         let conn = self.conn.lock();
 
-        for index_mac in index_macs {
-            let index_mac_json = to_store_err!(serde_json::to_vec(index_mac))?;
-
-            to_store_err!(execute: conn.execute(
+        let tx = to_store_err!(conn.unchecked_transaction())?;
+        {
+            let mut stmt = to_store_err!(tx.prepare(
                 "DELETE FROM app_state_mutation_macs
                  WHERE name = ?1 AND index_mac = ?2 AND device_id = ?3",
-                params![name, index_mac_json, self.device_id],
             ))?;
+            for index_mac in index_macs {
+                to_store_err!(execute: stmt.execute(params![name, index_mac, self.device_id]))?;
+            }
         }
+        to_store_err!(tx.commit())?;
 
         Ok(())
     }
@@ -1177,10 +1283,23 @@ impl DeviceStoreTrait for RusqliteStore {
                 let adv_secret_bytes: Vec<u8> = row.get("adv_secret_key")?;
                 let account_bytes: Option<Vec<u8>> = row.get("account")?;
 
-                let mut signature = [0u8; 64];
-                let mut adv_secret = [0u8; 32];
-                signature.copy_from_slice(&signature_bytes);
-                adv_secret.copy_from_slice(&adv_secret_bytes);
+                // Checked, like the three blobs above. `copy_from_slice`
+                // panics on a length mismatch, and it panics *inside* the
+                // rusqlite row callback on the connect path — a malformed row
+                // took the process down instead of reporting a bad session.
+                let signature: [u8; 64] = signature_bytes.as_slice().try_into().map_err(|_| {
+                    rusqlite::Error::InvalidParameterName(format!(
+                        "signed_pre_key_signature must be 64 bytes, found {}",
+                        signature_bytes.len()
+                    ))
+                })?;
+                let adv_secret: [u8; 32] =
+                    adv_secret_bytes.as_slice().try_into().map_err(|_| {
+                        rusqlite::Error::InvalidParameterName(format!(
+                            "adv_secret_key must be 32 bytes, found {}",
+                            adv_secret_bytes.len()
+                        ))
+                    })?;
 
                 let account = if let Some(bytes) = account_bytes {
                     Some(
@@ -1244,15 +1363,26 @@ impl DeviceStoreTrait for RusqliteStore {
         name: &str,
         extra_content: Option<&[u8]>,
     ) -> wa_rs_core::store::error::Result<()> {
-        // Create a snapshot by copying the database file
         let snapshot_path = format!("{}.snapshot.{}", self.db_path, name);
 
-        to_store_err!(std::fs::copy(&self.db_path, &snapshot_path))?;
+        // `VACUUM INTO` against the live connection, not `fs::copy`. The store
+        // runs in WAL mode, so copying the main file alone left every
+        // transaction since the last checkpoint behind in the `-wal` sidecar —
+        // producing exactly the truncated key blobs the connect path used to
+        // panic on.
+        {
+            let conn = self.conn.lock();
+            // VACUUM INTO refuses to overwrite; clear a previous snapshot.
+            let _ = std::fs::remove_file(&snapshot_path);
+            to_store_err!(conn.execute("VACUUM INTO ?1", params![snapshot_path]))?;
+        }
+        restrict_file_permissions(Path::new(&snapshot_path));
 
         // If extra_content is provided, save it alongside
         if let Some(content) = extra_content {
             let content_path = format!("{}.extra", snapshot_path);
             to_store_err!(std::fs::write(&content_path, content))?;
+            restrict_file_permissions(Path::new(&content_path));
         }
 
         Ok(())
@@ -1264,6 +1394,164 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wa_rs_core::store::traits::{LidPnMappingEntry, ProtocolStore, TcTokenEntry};
+
+    /// This file holds the account's long-term Signal keys. Every other
+    /// credential store in this repo is 0600; this one was created at the
+    /// process umask.
+    #[cfg(all(unix, feature = "whatsapp-web"))]
+    #[test]
+    fn session_db_is_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("nested").join("wa.db");
+        let _store = RusqliteStore::new(&db).expect("store opens");
+
+        let mode = std::fs::metadata(&db)
+            .expect("db exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "session db mode was {mode:o}");
+
+        let parent_mode = std::fs::metadata(db.parent().expect("parent"))
+            .expect("parent exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(parent_mode, 0o700, "parent mode was {parent_mode:o}");
+    }
+
+    /// `copy_from_slice` panics on a length mismatch, and it panicked INSIDE
+    /// the rusqlite row callback on the connect path — a malformed row took the
+    /// process down rather than reporting a bad session.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn malformed_key_blob_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("wa.db");
+        let store = RusqliteStore::new(&db).expect("store opens");
+
+        // A device row whose blobs are all the wrong length.
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "INSERT INTO device (
+                     id, registration_id, noise_key, identity_key, signed_pre_key,
+                     signed_pre_key_id, signed_pre_key_signature, adv_secret_key,
+                     push_name, app_version_primary, app_version_secondary,
+                     app_version_tertiary, app_version_last_fetched_ms
+                 ) VALUES (1, 1, ?1, ?2, ?3, 1, ?4, ?5, 'rantaiclaw_node', 0, 0, 0, 0)",
+                params![
+                    vec![0_u8; 64],
+                    vec![0_u8; 64],
+                    vec![0_u8; 64],
+                    // Truncated: the real blobs are 64 and 32 bytes.
+                    vec![0_u8; 7],
+                    vec![0_u8; 3]
+                ],
+            )
+            .expect("insert malformed row");
+        }
+
+        // `load` must report, not unwind. A panic here would abort the test.
+        let result = store.load().await;
+        assert!(
+            result.is_err(),
+            "a malformed key blob must be reported, not panic the connect path"
+        );
+    }
+
+    /// The store runs in WAL mode, so copying the main file alone left every
+    /// transaction since the last checkpoint behind in the `-wal` sidecar —
+    /// producing exactly the truncated blobs the connect path panicked on.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn snapshot_is_readable_after_a_write() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("wa.db");
+        let store = RusqliteStore::new(&db).expect("store opens");
+
+        store
+            .put_identity("rantaiclaw_peer.1", [7_u8; 32])
+            .await
+            .expect("write an identity");
+
+        store
+            .snapshot_db("test", None)
+            .await
+            .expect("snapshot succeeds");
+
+        let snapshot = format!("{}.snapshot.test", db.to_string_lossy());
+        let snap = Connection::open(&snapshot).expect("snapshot opens");
+        let count: i64 = snap
+            .query_row("SELECT COUNT(*) FROM identities", [], |row| row.get(0))
+            .expect("identities table is present in the snapshot");
+        assert_eq!(
+            count, 1,
+            "the write must be inside the snapshot, not the WAL"
+        );
+    }
+
+    /// `value_mac` was written JSON-encoded and read back raw, so every lookup
+    /// returned JSON bytes instead of the MAC.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn mutation_mac_round_trips_symmetrically() {
+        use wa_rs_core::appstate::processor::AppStateMutationMAC;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RusqliteStore::new(dir.path().join("wa.db")).expect("store opens");
+
+        let index_mac = vec![1_u8, 2, 3, 4];
+        let value_mac = vec![9_u8, 8, 7, 6];
+        store
+            .put_mutation_macs(
+                "regular",
+                1,
+                &[AppStateMutationMAC {
+                    index_mac: index_mac.clone(),
+                    value_mac: value_mac.clone(),
+                }],
+            )
+            .await
+            .expect("put");
+
+        let got = store
+            .get_mutation_mac("regular", &index_mac)
+            .await
+            .expect("get");
+        assert_eq!(
+            got,
+            Some(value_mac),
+            "what goes in must come back out, unencoded"
+        );
+
+        store
+            .delete_mutation_macs("regular", &[index_mac.clone()])
+            .await
+            .expect("delete");
+        assert_eq!(
+            store
+                .get_mutation_mac("regular", &index_mac)
+                .await
+                .expect("get"),
+            None
+        );
+    }
+
+    /// A missing row is "no version yet", not a database error — thirteen
+    /// sibling readers in this file already map it that way.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn get_version_defaults_when_absent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = RusqliteStore::new(dir.path().join("wa.db")).expect("store opens");
+        let state = store.get_version("never-written").await;
+        assert!(
+            state.is_ok(),
+            "absent version must not be an error: {state:?}"
+        );
+    }
 
     #[cfg(feature = "whatsapp-web")]
     #[test]
