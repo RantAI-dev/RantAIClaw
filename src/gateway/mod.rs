@@ -3840,6 +3840,342 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════
+    // Handler-level authentication — the boundary itself, not the
+    // signature function.
+    //
+    // `tests/whatsapp_webhook_security.rs` asserted the signature helper eight
+    // ways and never invoked a handler: deleting the fail-closed 401 and the
+    // signature check left every one of those tests passing while the endpoint
+    // became unauthenticated. These call the handlers.
+    //
+    // Every rejection case asserts the provider was **not** called. A handler
+    // that returns 401 *after* processing would pass a status-only test.
+    // ══════════════════════════════════════════════════════════
+
+    /// Which endpoint a table row exercises.
+    #[derive(Clone, Copy, Debug)]
+    enum Endpoint {
+        WhatsApp,
+        Linq,
+        NextcloudTalk,
+    }
+
+    /// An `AppState` with exactly one channel configured, and its webhook
+    /// secret present or absent.
+    fn auth_test_state(
+        endpoint: Endpoint,
+        secret: Option<&str>,
+        provider_impl: &Arc<MockProvider>,
+    ) -> AppState {
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
+            whatsapp: matches!(endpoint, Endpoint::WhatsApp).then(|| {
+                Arc::new(crate::channels::whatsapp::WhatsAppChannel::new(
+                    "placeholder-token".into(),
+                    "100000000000001".into(),
+                    "placeholder-verify".into(),
+                    vec!["*".into()],
+                ))
+            }),
+            whatsapp_app_secret: matches!(endpoint, Endpoint::WhatsApp)
+                .then(|| secret.map(Arc::<str>::from))
+                .flatten(),
+            linq: matches!(endpoint, Endpoint::Linq).then(|| {
+                Arc::new(crate::channels::linq::LinqChannel::new(
+                    "placeholder-token".into(),
+                    "15550000000".into(),
+                    vec!["*".into()],
+                ))
+            }),
+            linq_signing_secret: matches!(endpoint, Endpoint::Linq)
+                .then(|| secret.map(Arc::<str>::from))
+                .flatten(),
+            nextcloud_talk: matches!(endpoint, Endpoint::NextcloudTalk).then(|| {
+                Arc::new(NextcloudTalkChannel::new(
+                    "https://cloud.example.com".into(),
+                    "placeholder-token".into(),
+                    vec!["*".into()],
+                ))
+            }),
+            nextcloud_talk_webhook_secret: matches!(endpoint, Endpoint::NextcloudTalk)
+                .then(|| secret.map(Arc::<str>::from))
+                .flatten(),
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+        }
+    }
+
+    /// A body each endpoint's parser accepts, so a rejection can only come from
+    /// the auth boundary and not from the payload being unparseable.
+    fn auth_test_body(endpoint: Endpoint) -> &'static str {
+        match endpoint {
+            Endpoint::WhatsApp => {
+                r#"{"object":"whatsapp_business_account","entry":[{"id":"1","changes":[{"field":"messages","value":{"messages":[{"from":"15550000001","id":"wamid.TEST","timestamp":"1700000000","type":"text","text":{"body":"hi"}}]}}]}]}"#
+            }
+            Endpoint::Linq => {
+                r#"{"event_type":"message.received","data":{"message_id":"m1","chat_id":"c1","from":"15550000002","message":{"parts":[{"type":"text","value":"hi"}]}}}"#
+            }
+            Endpoint::NextcloudTalk => {
+                r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hi"}}"#
+            }
+        }
+    }
+
+    /// The headers a correctly-signed request would carry.
+    fn auth_test_headers(endpoint: Endpoint, secret: &str, body: &str) -> HeaderMap {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let mut headers = HeaderMap::new();
+        match endpoint {
+            Endpoint::WhatsApp => {
+                let sig = compute_whatsapp_signature_hex(secret, body.as_bytes());
+                headers.insert(
+                    "X-Hub-Signature-256",
+                    format!("sha256={sig}").parse().unwrap(),
+                );
+            }
+            Endpoint::Linq => {
+                let ts = chrono::Utc::now().timestamp().to_string();
+                let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+                mac.update(format!("{ts}.").as_bytes());
+                mac.update(body.as_bytes());
+                headers.insert("X-Webhook-Timestamp", ts.parse().unwrap());
+                headers.insert(
+                    "X-Webhook-Signature",
+                    hex::encode(mac.finalize().into_bytes()).parse().unwrap(),
+                );
+            }
+            Endpoint::NextcloudTalk => {
+                let random = "nonce-rantaiclaw-0001";
+                let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+                mac.update(random.as_bytes());
+                mac.update(body.as_bytes());
+                headers.insert("X-Nextcloud-Talk-Random", random.parse().unwrap());
+                headers.insert(
+                    "X-Nextcloud-Talk-Signature",
+                    hex::encode(mac.finalize().into_bytes()).parse().unwrap(),
+                );
+            }
+        }
+        headers
+    }
+
+    async fn call_webhook(
+        endpoint: Endpoint,
+        state: AppState,
+        headers: HeaderMap,
+        body: &str,
+    ) -> StatusCode {
+        let bytes = Bytes::from(body.to_string());
+        match endpoint {
+            Endpoint::WhatsApp => {
+                handle_whatsapp_message(State(state), test_peer(), headers, bytes)
+                    .await
+                    .into_response()
+                    .status()
+            }
+            Endpoint::Linq => handle_linq_webhook(State(state), test_peer(), headers, bytes)
+                .await
+                .into_response()
+                .status(),
+            Endpoint::NextcloudTalk => {
+                handle_nextcloud_talk_webhook(State(state), test_peer(), headers, bytes)
+                    .await
+                    .into_response()
+                    .status()
+            }
+        }
+    }
+
+    const AUTH_ENDPOINTS: [Endpoint; 3] =
+        [Endpoint::WhatsApp, Endpoint::Linq, Endpoint::NextcloudTalk];
+
+    /// No secret configured → 401, and nothing is processed. The signature is
+    /// the ONLY authentication these public endpoints have; with no secret the
+    /// sender cannot be verified at all.
+    #[tokio::test]
+    async fn webhook_without_a_configured_secret_is_refused() {
+        for endpoint in AUTH_ENDPOINTS {
+            let provider_impl = Arc::new(MockProvider::default());
+            let state = auth_test_state(endpoint, None, &provider_impl);
+            let body = auth_test_body(endpoint);
+            // Signed with the EMPTY secret — i.e. a request that a handler
+            // without the fail-closed branch would happily verify against
+            // `unwrap_or("")` and accept. An unsigned request would be refused
+            // by the signature check anyway, so it cannot tell the two apart;
+            // this can.
+            let headers = auth_test_headers(endpoint, "", body);
+            let status = call_webhook(endpoint, state, headers, body).await;
+
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{endpoint:?} must fail closed with no secret configured"
+            );
+            assert_eq!(
+                provider_impl.calls.load(Ordering::SeqCst),
+                0,
+                "{endpoint:?} must not process an unauthenticated request"
+            );
+        }
+    }
+
+    /// A missing signature header → 401, nothing processed.
+    #[tokio::test]
+    async fn webhook_without_a_signature_is_refused() {
+        for endpoint in AUTH_ENDPOINTS {
+            let provider_impl = Arc::new(MockProvider::default());
+            let state = auth_test_state(endpoint, Some("test-webhook-secret"), &provider_impl);
+            let body = auth_test_body(endpoint);
+            let status = call_webhook(endpoint, state, HeaderMap::new(), body).await;
+
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{endpoint:?} must refuse an unsigned request"
+            );
+            assert_eq!(
+                provider_impl.calls.load(Ordering::SeqCst),
+                0,
+                "{endpoint:?}"
+            );
+        }
+    }
+
+    /// A wrong signature → 401, nothing processed.
+    #[tokio::test]
+    async fn webhook_with_a_wrong_signature_is_refused() {
+        for endpoint in AUTH_ENDPOINTS {
+            let provider_impl = Arc::new(MockProvider::default());
+            let state = auth_test_state(endpoint, Some("test-webhook-secret"), &provider_impl);
+            let body = auth_test_body(endpoint);
+            // Signed with a DIFFERENT secret: the shape is right, the value is
+            // not, which is the case a header-presence check would miss.
+            let headers = auth_test_headers(endpoint, "a-different-secret", body);
+            let status = call_webhook(endpoint, state, headers, body).await;
+
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{endpoint:?} must refuse a signature computed with another key"
+            );
+            assert_eq!(
+                provider_impl.calls.load(Ordering::SeqCst),
+                0,
+                "{endpoint:?}"
+            );
+        }
+    }
+
+    /// A correct signature → 200. The turn itself runs in a spawned task since
+    /// #495 (ACK before processing), so the provider counter is deliberately
+    /// NOT asserted here — it would be a race, and the rejection cases above are
+    /// where the counter carries the meaning.
+    #[tokio::test]
+    async fn webhook_with_a_valid_signature_is_accepted() {
+        for endpoint in AUTH_ENDPOINTS {
+            let provider_impl = Arc::new(MockProvider::default());
+            let state = auth_test_state(endpoint, Some("test-webhook-secret"), &provider_impl);
+            let body = auth_test_body(endpoint);
+            let headers = auth_test_headers(endpoint, "test-webhook-secret", body);
+            let status = call_webhook(endpoint, state, headers, body).await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{endpoint:?} must accept a correctly-signed request"
+            );
+        }
+    }
+
+    /// A captured Nextcloud request replays forever unless the nonce it already
+    /// carries is remembered. #495 records it; this pins that.
+    #[tokio::test]
+    async fn nextcloud_talk_rejects_a_replayed_nonce() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let state = auth_test_state(
+            Endpoint::NextcloudTalk,
+            Some("test-webhook-secret"),
+            &provider_impl,
+        );
+        let body = auth_test_body(Endpoint::NextcloudTalk);
+        let headers = auth_test_headers(Endpoint::NextcloudTalk, "test-webhook-secret", body);
+
+        let first = call_webhook(
+            Endpoint::NextcloudTalk,
+            state.clone(),
+            headers.clone(),
+            body,
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK);
+
+        // Byte-identical replay — same nonce, same signature.
+        let second = call_webhook(Endpoint::NextcloudTalk, state, headers, body).await;
+        assert_eq!(
+            second,
+            StatusCode::OK,
+            "a replay is acknowledged, not errored — but it must not be reprocessed"
+        );
+    }
+
+    /// A burst past the limit is refused, on the same key `/webhook` uses.
+    #[tokio::test]
+    async fn webhook_burst_is_rate_limited() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let mut state = auth_test_state(
+            Endpoint::NextcloudTalk,
+            Some("test-webhook-secret"),
+            &provider_impl,
+        );
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(2, 2, 2, 2));
+        let body = auth_test_body(Endpoint::NextcloudTalk);
+
+        let mut sawlimit = false;
+        for _ in 0..5 {
+            let status = call_webhook(
+                Endpoint::NextcloudTalk,
+                state.clone(),
+                HeaderMap::new(),
+                body,
+            )
+            .await;
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                sawlimit = true;
+                break;
+            }
+        }
+        assert!(
+            sawlimit,
+            "a burst must eventually be refused with 429; these endpoints are public"
+        );
+    }
+
+    // TODO(plan 124 follow-up): Lark has no handler-level auth test here.
+    // Its webhook verifies a `verification_token` (#488), but `X-Lark-Signature`
+    // is still unimplemented — the construction is not derivable from this repo
+    // and a subtly wrong one rejects every legitimate callback. The channel is
+    // also behind the non-default `channel-lark` feature, so a test here would
+    // not run in the default CI matrix. Covered in-crate instead.
+
+    // ══════════════════════════════════════════════════════════
     // WhatsApp Signature Verification Tests (CWE-345 Prevention)
     // ══════════════════════════════════════════════════════════
 

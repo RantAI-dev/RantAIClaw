@@ -1,10 +1,22 @@
-//! Integration tests for WhatsApp webhook signature verification.
+//! The WhatsApp HMAC signature **function**, in isolation.
 //!
-//! These tests validate that:
-//! 1. Webhooks with valid signatures are accepted
-//! 2. Webhooks with invalid signatures are rejected
-//! 3. Webhooks with missing signatures are rejected
-//! 4. Webhooks are rejected even if JSON is valid but signature is bad
+//! These tests call `verify_whatsapp_signature` directly. They pin the
+//! implementation — constant-time comparison, the `sha256=` prefix, hex
+//! decoding, an empty or malformed signature — and that is worth having.
+//!
+//! They do **not** test the webhook endpoint, and the header used to claim they
+//! did ("webhooks with valid signatures are accepted, invalid rejected"). They
+//! could not: deleting both the fail-closed 401 and the signature check from
+//! `handle_whatsapp_message` left all eight passing while the endpoint became
+//! unauthenticated.
+//!
+//! The handler boundary is covered in `src/gateway/mod.rs`'s test module —
+//! `webhook_without_a_configured_secret_is_refused`,
+//! `webhook_without_a_signature_is_refused`,
+//! `webhook_with_a_wrong_signature_is_refused` and
+//! `webhook_with_a_valid_signature_is_accepted` — which invoke the handlers and
+//! assert the provider was never called on a rejection. The claim, not these
+//! tests, was the problem.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
