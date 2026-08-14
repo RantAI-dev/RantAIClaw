@@ -215,7 +215,8 @@ impl Channel for MattermostChannel {
         // whole reply used to go out in one request, so anything past
         // Mattermost's per-post limit failed the entire send.
         let blocks = crate::channels::format::render(&message.content, &self.render_target());
-        let chunks = crate::channels::format::split(&blocks, MATTERMOST_MAX_MESSAGE_LENGTH);
+        let chunks =
+            crate::channels::format::split_non_empty(&blocks, MATTERMOST_MAX_MESSAGE_LENGTH);
 
         for (index, chunk) in chunks.iter().enumerate() {
             self.post_chunk(channel_id, root_id, chunk).await?;
@@ -578,8 +579,8 @@ mod tests {
             .nth(1)
             .expect("send exists");
         let split_at = send_body
-            .find("format::split(")
-            .expect("send must route through format::split");
+            .find("format::split_non_empty(")
+            .expect("send must route through format::split_non_empty");
         let next_fn = send_body.find("\n    async fn ").unwrap_or(send_body.len());
         assert!(
             split_at < next_fn,

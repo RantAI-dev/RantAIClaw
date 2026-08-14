@@ -196,6 +196,27 @@ fn split_oversized(block: &RenderedBlock, limit: usize) -> Vec<String> {
     }
 }
 
+/// Chunks worth sending: [`split`]'s output with nothing-to-send removed.
+///
+/// [`split`] guarantees at least one chunk and returns an empty string when
+/// there is nothing to emit — a contract its tests pin deliberately. Callers
+/// then posted that empty string: Discord answers "cannot send an empty
+/// message", `send()` bails, and the dispatch loop records a delivery failure
+/// for a turn that had nothing to deliver. Reachable from whitespace-only
+/// content, an image-only paragraph, and a reply that is entirely a tool-call
+/// block.
+///
+/// **This is the convention for every channel send path.** Use it instead of
+/// filtering at each call site, so the fleet has one answer to
+/// nothing-to-send rather than eleven.
+#[must_use]
+pub fn split_non_empty(blocks: &[RenderedBlock], limit: usize) -> Vec<String> {
+    split(blocks, limit)
+        .into_iter()
+        .filter(|chunk| !chunk.trim().is_empty())
+        .collect()
+}
+
 pub fn split(blocks: &[RenderedBlock], limit: usize) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();

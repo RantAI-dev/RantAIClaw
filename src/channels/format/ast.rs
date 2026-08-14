@@ -17,7 +17,20 @@ pub enum Inline {
     Strong(Vec<Inline>),
     Emphasis(Vec<Inline>),
     Strikethrough(Vec<Inline>),
-    Link { text: Vec<Inline>, url: String },
+    Link {
+        text: Vec<Inline>,
+        url: String,
+    },
+    /// An image. `alt` is the bracketed text, `url` the destination.
+    ///
+    /// Neither `Tag::Image` nor `TagEnd::Image` was matched, so both fell into
+    /// the catch-all: the URL was discarded and the alt text leaked into the
+    /// enclosing run. `![chart](https://…/chart.png)` reached the user as the
+    /// bare word `chart`, on all eighteen channels.
+    Image {
+        alt: Vec<Inline>,
+        url: String,
+    },
     SoftBreak,
     HardBreak,
 }
@@ -320,7 +333,10 @@ impl Builder {
                     t.current_row = Vec::new();
                 }
             }
-            Tag::Link { dest_url, .. } => {
+            // One arm for both: an image is an inline with a destination and a
+            // bracketed run, exactly like a link, and it reuses the same URL
+            // stack. They diverge at `end`, where the node type is chosen.
+            Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
                 self.inline_stack.push(Vec::new());
                 self.link_urls.push(dest_url.to_string());
             }
@@ -425,6 +441,11 @@ impl Builder {
                 let text = self.inline_stack.pop().unwrap_or_default();
                 let url = self.link_urls.pop().unwrap_or_default();
                 self.push_inline(Inline::Link { text, url });
+            }
+            TagEnd::Image => {
+                let alt = self.inline_stack.pop().unwrap_or_default();
+                let url = self.link_urls.pop().unwrap_or_default();
+                self.push_inline(Inline::Image { alt, url });
             }
             _ => {}
         }

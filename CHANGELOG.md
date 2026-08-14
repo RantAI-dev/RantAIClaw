@@ -98,6 +98,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Image links no longer vanish from outbound messages.** The renderer's AST
+  builder matched neither the image tag nor its close, so the URL was discarded
+  on all eighteen channels: an image written in markdown arrived as the bare
+  word `chart`, and an alt-less image produced an empty paragraph. Each target
+  now spells it its own way — a link on Telegram and Matrix (neither renders an
+  inline image from markdown), `![alt](url)` on markdown targets, `alt (url)` on
+  the flat ones.
+
+- **A turn with nothing to say no longer records a delivery failure.** The
+  splitter guarantees at least one chunk and returns an empty string when there
+  is nothing to emit; the send paths posted it, Discord answered "cannot send an
+  empty message", and the dispatch loop logged a failed delivery. Reachable from
+  whitespace-only content, an image-only paragraph, and a reply that was
+  entirely a tool-call block.
+
 - **WhatsApp Web survives a restart.** Every listener restart leaked a live
   client, a sync worker and a device-saver onto the same SQLite session file —
   N restarts, N concurrent writers on one Signal store. The listener now aborts
