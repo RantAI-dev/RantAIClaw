@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The public channel webhooks verify the bytes they parse.** Linq and
+  Nextcloud Talk authenticated a `from_utf8_lossy` copy of the request while
+  acting on the raw body — every invalid sequence collapses to `U+FFFD`, so the
+  string that was verified was a many-to-one projection of the body that was
+  processed. The WhatsApp handler already did this correctly.
+
+- **WhatsApp, Linq and Nextcloud Talk webhooks are rate-limited and
+  deduplicated.** Neither existed on any of the three, while `/webhook` in the
+  same file has had both since it was written. A redelivery — which the
+  platforms perform when an ACK is slow, no attacker required — ran the full
+  LLM turn again, and a captured signed POST was replayable indefinitely.
+  Nextcloud Talk now also records the nonce it was already given, and each
+  handler acknowledges before running the turn so a slow turn no longer causes
+  the retry in the first place.
+
 - **WhatsApp Web stopped logging message bodies — including pairing codes.**
   Every inbound body was logged at INFO, and the `/claim` codes that promote
   their holder to owner were logged *before* the pairing handler ran. The
