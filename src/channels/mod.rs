@@ -22,6 +22,7 @@ pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
 pub mod format;
+pub mod history;
 mod history_store;
 pub mod imessage;
 pub mod irc;
@@ -169,7 +170,7 @@ fn channel_message_timeout_budget_secs(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ChannelRouteSelection {
+pub(crate) struct ChannelRouteSelection {
     provider: String,
     model: String,
 }
@@ -339,7 +340,7 @@ struct ConfigFileStamp {
 /// The latches live here rather than in a `static` so they cannot couple one
 /// test to another — which is the defect that removing the global store fixed.
 #[derive(Default)]
-struct RuntimeConfigSlot {
+pub(crate) struct RuntimeConfigSlot {
     state: Option<RuntimeConfigState>,
     /// Set once `runtime_defaults_snapshot` has reported taking its synthesised
     /// fallback. That fallback hands the model a *guessed* autonomy preset the
@@ -379,7 +380,7 @@ const OPENRC_STATUS_ARGS: [&str; 2] = ["rantaiclaw", "status"];
 const OPENRC_RESTART_ARGS: [&str; 2] = ["rantaiclaw", "restart"];
 
 #[derive(Clone)]
-struct ChannelRuntimeContext {
+pub(crate) struct ChannelRuntimeContext {
     /// Reloaded config state for *this* runtime's config file.
     ///
     /// Was a process-global `HashMap<PathBuf, _>` keyed by config path. Entries
@@ -388,40 +389,40 @@ struct ChannelRuntimeContext {
     /// touched it was order-dependent on every other. One context owns one
     /// state; `None` means nothing has been loaded yet, which is the same
     /// condition the old "no entry for this path" fallback keyed on.
-    runtime_config: Arc<Mutex<RuntimeConfigSlot>>,
-    channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
-    provider: Arc<dyn Provider>,
-    default_provider: Arc<String>,
-    memory: Arc<dyn Memory>,
-    tools_registry: Arc<Vec<Box<dyn Tool>>>,
-    observer: Arc<dyn Observer>,
-    system_prompt: Arc<String>,
-    model: Arc<String>,
-    temperature: f64,
-    auto_save_memory: bool,
-    max_tool_iterations: usize,
-    min_relevance_score: f64,
-    conversation_histories: ConversationHistoryMap,
+    pub(crate) runtime_config: Arc<Mutex<RuntimeConfigSlot>>,
+    pub(crate) channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+    pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) default_provider: Arc<String>,
+    pub(crate) memory: Arc<dyn Memory>,
+    pub(crate) tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    pub(crate) observer: Arc<dyn Observer>,
+    pub(crate) system_prompt: Arc<String>,
+    pub(crate) model: Arc<String>,
+    pub(crate) temperature: f64,
+    pub(crate) auto_save_memory: bool,
+    pub(crate) max_tool_iterations: usize,
+    pub(crate) min_relevance_score: f64,
+    pub(crate) conversation_histories: ConversationHistoryMap,
     /// Durable backing for `conversation_histories`. `Some` persists each
     /// in-memory mutation to `brain.db` (and seeds the map at startup) so
     /// conversation threads survive daemon restarts. `None` means persistence
     /// is disabled (non-sqlite memory backends, or an open failure) and history
     /// stays in-memory only, exactly as before.
-    history_store: Option<Arc<history_store::ChannelHistoryStore>>,
-    provider_cache: ProviderCacheMap,
-    route_overrides: RouteSelectionMap,
-    api_key: Option<String>,
-    api_url: Option<String>,
-    reliability: Arc<crate::config::ReliabilityConfig>,
-    provider_runtime_options: providers::ProviderRuntimeOptions,
-    workspace_dir: Arc<PathBuf>,
-    message_timeout_secs: u64,
-    interrupt_on_new_message: bool,
-    multimodal: crate::config::MultimodalConfig,
+    pub(crate) history_store: Option<Arc<history_store::ChannelHistoryStore>>,
+    pub(crate) provider_cache: ProviderCacheMap,
+    pub(crate) route_overrides: RouteSelectionMap,
+    pub(crate) api_key: Option<String>,
+    pub(crate) api_url: Option<String>,
+    pub(crate) reliability: Arc<crate::config::ReliabilityConfig>,
+    pub(crate) provider_runtime_options: providers::ProviderRuntimeOptions,
+    pub(crate) workspace_dir: Arc<PathBuf>,
+    pub(crate) message_timeout_secs: u64,
+    pub(crate) interrupt_on_new_message: bool,
+    pub(crate) multimodal: crate::config::MultimodalConfig,
     /// Shared security policy. Carries the runtime allowlist + bound
     /// `PendingApprovals` registry. Read by the approval-reply parser
     /// before each inbound message is routed to the agent.
-    security: Arc<crate::security::SecurityPolicy>,
+    pub(crate) security: Arc<crate::security::SecurityPolicy>,
     /// Per-tool approval gate for polling channels. `Some` (default) means
     /// tools that need approval at the current autonomy level are denied —
     /// polling channels do NOT run tools unattended. `None` only when
@@ -429,22 +430,22 @@ struct ChannelRuntimeContext {
     /// run-everything behaviour. The shared session-allowlist stays empty
     /// (channels never grant interactive approval), so it's safe to share
     /// one manager across senders.
-    channel_approval: Option<Arc<crate::approval::ApprovalManager>>,
+    pub(crate) channel_approval: Option<Arc<crate::approval::ApprovalManager>>,
     /// Senders authorized to APPROVE tool calls over a channel
     /// (`[channels_config] approval_owners`). Empty ⇒ nobody can approve, so the
     /// in-chat relay is never offered and approval-required tools auto-deny.
     /// Shared with the dispatch loop's reply parser.
-    approval_owners: Arc<Vec<String>>,
+    pub(crate) approval_owners: Arc<Vec<String>>,
     /// Dedicated registry for in-chat whole-tool approvals (Layer A). Separate
     /// from the shell allowlist `PendingApprovals` on `security`. The per-message
     /// [`ChatRelayApprovalBackend`] registers + awaits here; the dispatch loop's
     /// `try_handle_tool_reply` resolves it when an owner replies.
-    tool_approvals: Arc<crate::security::PendingApprovals>,
+    pub(crate) tool_approvals: Arc<crate::security::PendingApprovals>,
     /// Per-role capability ceiling applied to non-owner ("guest") senders. The
     /// ceiling is role-based (same for every guest), so it's built once from
     /// config; a turn uses it only when the sender isn't an owner. Owners get
     /// the full toolset.
-    guest_gate: Arc<crate::approval::GuestGate>,
+    pub(crate) guest_gate: Arc<crate::approval::GuestGate>,
 }
 
 #[derive(Clone)]
@@ -1178,88 +1179,6 @@ fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: Chan
     }
 }
 
-fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
-    ctx.conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(sender_key);
-
-    // Persistence must never break message handling: log and ignore errors.
-    if let Some(store) = ctx.history_store.as_ref() {
-        if let Err(e) = store.delete(sender_key) {
-            tracing::warn!("failed to delete persisted channel history for {sender_key}: {e}");
-        }
-    }
-}
-
-fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
-    let mut histories = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-
-    let Some(turns) = histories.get_mut(sender_key) else {
-        return false;
-    };
-
-    if turns.is_empty() {
-        return false;
-    }
-
-    let keep_from = turns
-        .len()
-        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
-
-    for turn in &mut compacted {
-        if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
-            turn.content =
-                truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
-        }
-    }
-
-    if compacted.is_empty() {
-        turns.clear();
-        // Persist the now-empty state (save with [] deletes the row).
-        let snapshot: Vec<ChatMessage> = Vec::new();
-        drop(histories);
-        persist_sender_turns(ctx, sender_key, &snapshot);
-        return false;
-    }
-
-    *turns = compacted;
-    let snapshot = turns.clone();
-    drop(histories);
-    persist_sender_turns(ctx, sender_key, &snapshot);
-    true
-}
-
-/// Write-through helper: persist the current turns for a sender to the durable
-/// store, if persistence is enabled. Errors are logged and ignored — durability
-/// must never break live message handling.
-fn persist_sender_turns(ctx: &ChannelRuntimeContext, sender_key: &str, turns: &[ChatMessage]) {
-    if let Some(store) = ctx.history_store.as_ref() {
-        if let Err(e) = store.save(sender_key, turns) {
-            tracing::warn!("failed to persist channel history for {sender_key}: {e}");
-        }
-    }
-}
-
-fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
-    let mut histories = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let turns = histories.entry(sender_key.to_string()).or_default();
-    turns.push(turn);
-    while turns.len() > MAX_CHANNEL_HISTORY {
-        turns.remove(0);
-    }
-    let snapshot = turns.clone();
-    drop(histories);
-    persist_sender_turns(ctx, sender_key, &snapshot);
-}
-
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
@@ -1438,7 +1357,7 @@ async fn handle_runtime_command_if_needed(
                         if provider_name != current.provider {
                             current.provider = provider_name.clone();
                             set_route_selection(ctx, &sender_key, current.clone());
-                            clear_sender_history(ctx, &sender_key);
+                            history::clear_sender_history(ctx, &sender_key);
                         }
 
                         format!(
@@ -1468,7 +1387,7 @@ async fn handle_runtime_command_if_needed(
             } else {
                 current.model = model.clone();
                 set_route_selection(ctx, &sender_key, current.clone());
-                clear_sender_history(ctx, &sender_key);
+                history::clear_sender_history(ctx, &sender_key);
 
                 format!(
                     "Model switched to `{model}` for provider `{}` in this sender session.",
@@ -1939,7 +1858,7 @@ async fn process_channel_message(
         .is_some_and(|turns| !turns.is_empty());
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+    history::append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -2255,7 +2174,7 @@ async fn process_channel_message(
                 true
             };
 
-            append_sender_turn(
+            history::append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 if delivered {
@@ -2284,7 +2203,7 @@ async fn process_channel_message(
             }
 
             if is_context_window_overflow_error(&e) {
-                let compacted = compact_sender_history(ctx.as_ref(), &history_key);
+                let compacted = history::compact_sender_history(ctx.as_ref(), &history_key);
                 let error_text = if compacted {
                     "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
                 } else {
@@ -2333,7 +2252,7 @@ async fn process_channel_message(
             // the operator can still see it.
             // Pair the user turn appended at the start of this turn, so the
             // next question is not merged onto the failed one.
-            append_sender_turn(
+            history::append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant(FAILED_TURN_MARKER),
@@ -2369,7 +2288,7 @@ async fn process_channel_message(
                 elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "{timeout_msg}"
             );
-            append_sender_turn(
+            history::append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant(TIMED_OUT_TURN_MARKER),
@@ -4543,7 +4462,7 @@ mod tests {
 
         // Enough turns to cross the cap, so eviction is exercised too.
         for idx in 0..(MAX_CHANNEL_HISTORY + 5) {
-            append_sender_turn(&ctx, &sender, ChatMessage::user(format!("msg-{idx}")));
+            history::append_sender_turn(&ctx, &sender, ChatMessage::user(format!("msg-{idx}")));
         }
 
         // The live map is capped, oldest-first.
@@ -4633,7 +4552,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         };
 
-        assert!(compact_sender_history(&ctx, &sender));
+        assert!(history::compact_sender_history(&ctx, &sender));
 
         let histories = ctx
             .conversation_histories
