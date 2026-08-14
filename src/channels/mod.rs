@@ -4354,6 +4354,97 @@ mod tests {
         assert!(normalized[1].content.contains("assistant part 2"));
     }
 
+    /// Durable history, end to end. Every `ChannelRuntimeContext` in this test
+    /// module set `history_store: None`, so making the write-through a no-op
+    /// failed nothing — and history silently stopping surviving restarts is the
+    /// bug this module exists to fix.
+    #[test]
+    fn durable_history_writes_through_and_reloads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store =
+            crate::channels::history_store::ChannelHistoryStore::open(dir.path()).expect("open");
+        let histories = HashMap::new();
+        let sender = "telegram_u1".to_string();
+
+        let ctx = ChannelRuntimeContext {
+            runtime_config: Arc::new(Mutex::new(RuntimeConfigSlot::default())),
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            history_store: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            channel_approval: None,
+            approval_owners: Arc::new(Vec::new()),
+            tool_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            guest_gate: Arc::new(crate::approval::GuestGate::new(
+                Vec::<String>::new(),
+                &[],
+                &[],
+            )),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        };
+
+        let ctx = ChannelRuntimeContext {
+            history_store: Some(Arc::new(store)),
+            ..ctx
+        };
+
+        // Enough turns to cross the cap, so eviction is exercised too.
+        for idx in 0..(MAX_CHANNEL_HISTORY + 5) {
+            append_sender_turn(&ctx, &sender, ChatMessage::user(format!("msg-{idx}")));
+        }
+
+        // The live map is capped, oldest-first.
+        {
+            let live = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let turns = live.get(&sender).expect("live history");
+            assert_eq!(turns.len(), MAX_CHANNEL_HISTORY);
+            assert_eq!(turns[0].content, "msg-5", "oldest turns are evicted first");
+            assert_eq!(
+                turns[MAX_CHANNEL_HISTORY - 1].content,
+                format!("msg-{}", MAX_CHANNEL_HISTORY + 4)
+            );
+        }
+
+        // And a fresh reader reproduces it from disk — the whole point.
+        let reopened =
+            crate::channels::history_store::ChannelHistoryStore::open(dir.path()).expect("reopen");
+        let loaded = reopened.load_all().expect("load_all");
+        let persisted = loaded.get(&sender).expect("persisted history");
+        assert_eq!(
+            persisted.len(),
+            MAX_CHANNEL_HISTORY,
+            "the persisted history must match the live cap"
+        );
+        assert_eq!(persisted[0].content, "msg-5");
+        assert_eq!(
+            persisted[MAX_CHANNEL_HISTORY - 1].content,
+            format!("msg-{}", MAX_CHANNEL_HISTORY + 4)
+        );
+    }
+
     #[test]
     fn compact_sender_history_keeps_recent_truncated_messages() {
         let mut histories = HashMap::new();
