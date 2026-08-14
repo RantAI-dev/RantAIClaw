@@ -312,6 +312,11 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
     (cleaned.trim().to_string(), attachments)
 }
 
+/// Media-marker syntax, appended to the system prompt on this channel only.
+/// Telegram is the one channel that can actually deliver an attachment; telling
+/// the model otherwise elsewhere leaks markers as literal text.
+pub(crate) const TELEGRAM_DELIVERY_INSTRUCTIONS: &str = "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.";
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -1885,6 +1890,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 impl Channel for TelegramChannel {
     fn name(&self) -> &str {
         "telegram"
+    }
+
+    fn delivery_instructions(&self) -> Option<&'static str> {
+        Some(TELEGRAM_DELIVERY_INSTRUCTIONS)
     }
 
     fn render_target(&self) -> crate::channels::format::RenderTarget {

@@ -2043,8 +2043,11 @@ async fn handle_whatsapp_message(
     // and never surface as agent messages (parse_webhook_payload drops them).
     wa.handle_inbound_pairing(&payload).await;
 
-    // Parse messages from the webhook payload
-    let messages = wa.parse_webhook_payload(&payload);
+    // Parse messages from the webhook payload, then resolve any inbound image:
+    // the parser is synchronous and the Cloud API needs two authenticated round
+    // trips to turn a media id into bytes.
+    let mut messages = wa.parse_webhook_payload(&payload);
+    wa.hydrate_media(&mut messages).await;
 
     if messages.is_empty() {
         // Acknowledge the webhook even if no messages (could be status updates)
