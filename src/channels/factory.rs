@@ -8,7 +8,7 @@ use super::traits::Channel;
 use super::{
     DingTalkChannel, DiscordChannel, EmailChannel, IMessageChannel, IrcChannel, LinqChannel,
     MattermostChannel, NextcloudTalkChannel, QQChannel, SignalChannel, SlackChannel,
-    TelegramChannel, WhatsAppChannel, WhatsAppWebChannel,
+    TelegramChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use std::sync::Arc;
@@ -190,7 +190,7 @@ pub(crate) fn build_configured_channels(
                     channels.push((
                         "whatsapp",
                         "WhatsApp",
-                        Arc::new(WhatsAppWebChannel::new(
+                        Arc::new(super::WhatsAppWebChannel::new(
                             wa.session_path.clone().unwrap_or_default(),
                             wa.pair_phone.clone(),
                             wa.pair_code.clone(),
