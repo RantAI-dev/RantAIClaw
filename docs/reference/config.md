@@ -574,6 +574,16 @@ Top-level channel options are configured under `channels_config`.
 | Key | Default | Purpose |
 |---|---|---|
 | `message_timeout_secs` | `600` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
+| `approval_owners` | `[]` | Senders who may approve privileged tool calls. Empty = **nobody** can approve, so approval-required tools auto-deny. `"*"` lets any allowed sender approve (insecure, opt-in) |
+| `guest_allowed_tools` | `[]` | Capability ceiling for allowed senders who are not owners. Empty = read-only file/memory tools and skills only |
+| `guest_allowed_commands` | `[]` | Shell globs a guest may run (needs `"shell"` in `guest_allowed_tools`). Hard ceiling — a non-matching command is denied, never escalated |
+| `autonomous_tools` | `false` | `true` skips the approval gate entirely for this channel, for every sender |
+
+These four are the channel authorization model; see
+[Per-role channel permissions](../security/per-role-permissions.md) for the
+enforcement point, and [Channels reference §4b](channels.md#4b-approval-and-roles)
+for the failure mode operators hit first (privileged tools denied because no
+owner is configured).
 
 Examples:
 

@@ -225,6 +225,31 @@ rantaiclaw channel doctor
 
 Then verify channel-specific credentials + allowlist fields in config.
 
+### Channel connects, `channel doctor` passes, but nothing arrives
+
+For the three HMAC-verified webhook channels, a **missing inbound secret
+disables the endpoint** — the gateway returns `401` before parsing the body, so
+the channel looks healthy from every other angle:
+
+| Channel | Required secret | Log line |
+|---|---|---|
+| WhatsApp (Cloud API) | `app_secret` / `RANTAICLAW_WHATSAPP_APP_SECRET` | `WhatsApp webhook rejected: no app secret configured.` |
+| Linq | `signing_secret` / `RANTAICLAW_LINQ_SIGNING_SECRET` | `Linq webhook rejected: no signing secret configured.` |
+| Nextcloud Talk | `webhook_secret` / `RANTAICLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` | `Nextcloud Talk webhook rejected: no webhook secret configured.` |
+
+See [Channels reference §2](../reference/channels.md#2-delivery-modes-at-a-glance)
+for which channels have an inbound endpoint at all.
+
+### The agent replies but refuses every privileged tool
+
+This is the approval model, not the transport. With no `approval_owners`
+configured, nobody can approve, so approval-required tools auto-deny. Add an
+owner — do not reach for `autonomous_tools = true`, which removes the gate for
+everyone on the channel.
+
+See [Per-role channel permissions](../security/per-role-permissions.md) and
+[Channels reference §4b](../reference/channels.md#4b-approval-and-roles).
+
 ## Service Mode
 
 ### Service installed but not running
