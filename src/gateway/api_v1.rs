@@ -1969,61 +1969,27 @@ async fn personality_set(
 // channels (read-only listing)
 // ────────────────────────────────────────────────────────────────────────────
 
+/// The configured channels this endpoint reports, in catalog order.
+///
+/// Derived from `CHANNEL_CATALOG` rather than a hand-written list of `if`s.
+/// The hand-written version is how this endpoint came to check 7 of 11
+/// channels — matrix, linq, irc and lark were simply never added — and the
+/// catalog's own doc comment already records that two surfaces claiming to be
+/// the single source of truth "disagreed anyway". Deriving it means a channel
+/// added to the catalog cannot be missed here.
+pub(crate) fn configured_channel_keys(config: &crate::config::Config) -> Vec<&'static str> {
+    crate::channels::channel_catalog_keys()
+        .into_iter()
+        .filter(|key| crate::channels::channel_is_configured(key, config))
+        .collect()
+}
+
 async fn channels_list(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
-    let cfg = state.config.lock();
-    let mut configured: Vec<&str> = Vec::new();
-    if cfg.channels_config.telegram.is_some() {
-        configured.push("telegram");
-    }
-    if cfg.channels_config.discord.is_some() {
-        configured.push("discord");
-    }
-    if cfg.channels_config.slack.is_some() {
-        configured.push("slack");
-    }
-    if cfg.channels_config.mattermost.is_some() {
-        configured.push("mattermost");
-    }
-    if cfg.channels_config.imessage.is_some() {
-        configured.push("imessage");
-    }
-    if cfg.channels_config.signal.is_some() {
-        configured.push("signal");
-    }
-    if cfg.channels_config.whatsapp.is_some() {
-        configured.push("whatsapp");
-    }
-    if cfg.channels_config.webhook.is_some() {
-        configured.push("webhook");
-    }
-    if cfg!(feature = "channel-matrix") && cfg.channels_config.matrix.is_some() {
-        configured.push("matrix");
-    }
-    if cfg.channels_config.linq.is_some() {
-        configured.push("linq");
-    }
-    if cfg.channels_config.nextcloud_talk.is_some() {
-        configured.push("nextcloud_talk");
-    }
-    if cfg.channels_config.email.is_some() {
-        configured.push("email");
-    }
-    if cfg.channels_config.irc.is_some() {
-        configured.push("irc");
-    }
-    if cfg!(feature = "channel-lark") && cfg.channels_config.lark.is_some() {
-        configured.push("lark");
-    }
-    if cfg.channels_config.dingtalk.is_some() {
-        configured.push("dingtalk");
-    }
-    if cfg.channels_config.qq.is_some() {
-        configured.push("qq");
-    }
+    let configured = configured_channel_keys(&state.config.lock());
     Ok(Json(serde_json::json!({
         "configured": configured,
         "count": configured.len(),

@@ -3192,6 +3192,45 @@ fn roster_covers_exactly_the_catalog() {
     }
 }
 
+/// `GET /api/v1/channels` hand-rolled its own list of `if`s and checked 7 of
+/// the 11 channels that existed at the time — matrix, linq, irc and lark were
+/// never added, so an operator polling the API was told those channels were
+/// not configured when they were. The endpoint derives from the catalog now;
+/// this is what fails if it ever goes back to a hand-written list.
+///
+/// The catalog is the oracle, not a second copy of the implementation's own
+/// filter expression — comparing the endpoint against a re-derivation of
+/// itself would pass no matter which channels either one missed.
+#[test]
+fn the_api_channel_list_covers_every_catalog_channel() {
+    let config = config_with_every_channel();
+    let api = crate::gateway::api_v1::configured_channel_keys(&config);
+
+    for (key, display) in CHANNEL_CATALOG {
+        // Feature-gated channels are absent from a build that cannot run them.
+        if !channel_is_configured(key, &config) {
+            continue;
+        }
+        assert!(
+            api.contains(&key),
+            "{display} is configured but `/api/v1/channels` omits it — this is \
+             the drift that left the endpoint reporting 7 of 11 channels"
+        );
+    }
+}
+
+/// The completeness test above is satisfied by an endpoint that returns the
+/// whole catalog unconditionally. This is the half that makes it mean
+/// something: nothing configured, nothing reported.
+#[test]
+fn the_api_channel_list_reports_nothing_when_nothing_is_configured() {
+    let api = crate::gateway::api_v1::configured_channel_keys(&Config::default());
+    assert!(
+        api.is_empty(),
+        "an unconfigured install must report no channels, got: {api:?}"
+    );
+}
+
 /// Feature-gated channels must be reported as unconfigured in a build that
 /// cannot run them, never silently dropped.
 #[test]
