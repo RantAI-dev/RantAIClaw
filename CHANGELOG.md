@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A shell approval raised from a chat can now be answered with a bare `ok`
+  there — and only there.** `ShellTool` is a `Tool`, and the trait carries no
+  originating message, so its approvals registered with no chat attached.
+  Unscoped requests are deliberately not resolvable by a bare `ok`/`y`, so the
+  only way to answer one from a chat was to name the command (`allow brew`)
+  while every other approval took a bare yes. The turn's chat now reaches the
+  tool, so a shell approval names where it came from.
+
+  This **widens** what a bare verb can resolve, deliberately. Three things bound
+  it: a bare `ok` from a *different* chat is still refused, the owner gate is
+  unchanged, and resolution still refuses when more than one pending request
+  matches — so two parallel `curl` calls cannot be answered by a guess. Direct
+  TUI and CLI runs have no chat and stay unscoped exactly as before.
+
 - **Shift+Tab can no longer change the autonomy level from inside an approval
   prompt.** The approval handler ignores modified keys and Shift+Tab carries
   Shift, so the binding fired while a gate was on screen — and one of its rungs
@@ -407,9 +421,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Past the budget an attachment becomes a note naming the wait, like every other
   rejection. Both numbers are constants in `src/channels/media.rs`, not config
   keys — there is no schema change and nothing to set. Telegram and WhatsApp
-  Cloud each make one authenticated lookup before the fetch, so the budget saves
-  them the download but not that lookup; this is stated in
-  `docs/security/inbound-media-policy.md` §6 rather than left implicit.
+  Cloud each make one authenticated lookup before the fetch; both check the
+  budget before that call too, so an exhausted sender cannot make it either.
 
 - **Replies thread on Discord, Telegram and Mattermost.** The threading seam
   existed and was plumbed through every dispatch site, but exactly one channel
