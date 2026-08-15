@@ -226,12 +226,6 @@ impl WhatsAppWebChannel {
         }
     }
 
-    /// Whether the recipient string is a WhatsApp JID (contains a domain suffix).
-    #[cfg(feature = "whatsapp-web")]
-    fn is_jid(recipient: &str) -> bool {
-        recipient.trim().contains('@')
-    }
-
     /// Whether an outbound recipient is permitted by the allowlist.
     ///
     /// The gate used to run only when the recipient was NOT a JID — and
@@ -862,16 +856,22 @@ impl Channel for WhatsAppWebChannel {
         }
     }
 
-    /// Healthy means a live client, not merely a handle that was once set.
-    ///
-    /// The handle used to be left in place on `LoggedOut` and `StreamError`, so
-    /// a dead channel reported healthy for the rest of the process's life.
     fn apply_allowed_senders(&self, allowed: &[String]) {
         if let Ok(mut numbers) = self.allowed_numbers.write() {
             *numbers = allowed.to_vec();
         }
     }
 
+    /// Healthy means a live client, not merely a handle that was once set.
+    ///
+    /// The handle used to be left in place on `LoggedOut` and `StreamError`, so
+    /// a dead channel reported healthy for the rest of the process's life.
+    ///
+    /// This probe reads **local state only** — no network round trip, unlike the
+    /// sixteen channels that call their platform. It fails for the condition it
+    /// exists to catch (the event loop clears `client` on every terminal event),
+    /// but it cannot notice a platform that stops answering while the client
+    /// object is still around. The supervisor now runs this on its heartbeat.
     async fn health_check(&self) -> bool {
         self.client.lock().is_some() && self.bot_handle.lock().is_some()
     }
@@ -1453,9 +1453,12 @@ mod tests {
     }
 
     /// The table test above exercises `allow_recipient` directly, and a
-    /// `send()` that re-adds the `is_jid` bypass passes it anyway — that bypass
+    /// `send()` that re-adds the old JID bypass passes it anyway — that bypass
     /// IS the defect. `send()` needs a live client to drive, so the wiring is
     /// asserted by source.
+    ///
+    /// `is_jid` itself was deleted as dead code; the string check below stays as
+    /// a guard against the pattern being reintroduced under the same name.
     #[test]
     fn send_gates_every_recipient_form() {
         let src = include_str!("whatsapp_web.rs");
