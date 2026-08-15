@@ -4168,9 +4168,27 @@ pub(crate) fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
+                // The default used to be the literal `rantaiclaw-whatsapp-verify`,
+                // published in this file — so every install that pressed Enter
+                // shared a verify token anyone reading the source could look up.
+                // A verify token is an arbitrary shared secret; there is no
+                // reason for a human to invent one, so generate it.
+                //
+                // Deliberately NOT masked, unlike the provisioner's version of
+                // this prompt: there the operator types a token they already
+                // hold, here they must read this one off the screen to paste it
+                // into Meta's dashboard.
+                let generated: String = {
+                    let bytes: [u8; 16] = rand::random();
+                    bytes.iter().fold(String::new(), |mut acc, b| {
+                        use std::fmt::Write as _;
+                        let _ = write!(acc, "{b:02x}");
+                        acc
+                    })
+                };
                 let verify_token: String = Input::new()
-                    .with_prompt("  Webhook verify token (create your own)")
-                    .default("rantaiclaw-whatsapp-verify".into())
+                    .with_prompt("  Webhook verify token (paste this into Meta's dashboard)")
+                    .default(generated)
                     .interact_text()?;
 
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)

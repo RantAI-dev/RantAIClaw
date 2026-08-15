@@ -864,6 +864,63 @@ mod whatsapp_cloud {
         assert_configured(&outcome, written, "whatsapp-cloud", &events);
     }
 
+    /// Plan 132 masked twenty-seven credential prompts and left this one
+    /// echoing. Nothing pinned the flag, so it could be flipped back with the
+    /// whole suite green — the same shape as the finding itself.
+    #[tokio::test]
+    async fn whatsapp_cloud_masks_every_credential_it_collects() {
+        use super::ProvisionEvent;
+
+        let (_outcome, events, _written) = run_and_capture(
+            "whatsapp-cloud",
+            vec![
+                ProvisionResponse::Text("placeholder-access-token".into()), // access token
+                ProvisionResponse::Text("000000000000000".into()),          // phone number id
+                ProvisionResponse::Selection(vec![0]), // probe inconclusive -> save anyway
+                ProvisionResponse::Text("placeholder-verify-token".into()), // verify token
+                ProvisionResponse::Text(String::new()), // app secret (optional)
+                ProvisionResponse::Text("+15550002222".into()), // allowed numbers
+            ],
+            wrote,
+        )
+        .await;
+
+        // Every prompt this provisioner emits, and whether it must be masked.
+        // `phone_number_id` and `allowed_numbers` are not credentials.
+        let expected_secret = [
+            ("access_token", true),
+            ("verify_token", true),
+            ("app_secret", true),
+            ("phone_number_id", false),
+        ];
+
+        for (id, must_be_secret) in expected_secret {
+            let Some(secret) = events.iter().find_map(|e| match e {
+                ProvisionEvent::Prompt {
+                    id: got, secret, ..
+                } if got == id => Some(*secret),
+                _ => None,
+            }) else {
+                continue;
+            };
+            assert_eq!(
+                secret, must_be_secret,
+                "prompt `{id}` masking changed — a credential echoed into the \
+                 terminal is what plan 132 exists to stop"
+            );
+        }
+
+        // Not vacuous: the loop above skips ids it cannot find, so prove the
+        // one this test was written for is actually in the stream.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProvisionEvent::Prompt { id, .. } if id == "verify_token"
+            )),
+            "the verify-token prompt was never emitted"
+        );
+    }
+
     #[tokio::test]
     async fn whatsapp_cloud_aborts_on_a_missing_required_field() {
         let (outcome, events, written) = run_and_capture(
