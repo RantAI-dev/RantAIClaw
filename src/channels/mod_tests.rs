@@ -4924,6 +4924,91 @@ impl Channel for BlockUntilClosedChannel {
     }
 }
 
+/// A channel whose listener stays healthy forever while the platform behind it
+/// does not answer — an expired bot token, a revoked webhook, a workspace the
+/// bot was removed from. This is the shape the heartbeat used to report as OK.
+struct LiveListenerDeadPlatformChannel {
+    name: String,
+    probes: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Channel for LiveListenerDeadPlatformChannel {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        tx.closed().await;
+        Ok(())
+    }
+
+    async fn health_check(&self) -> bool {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+}
+
+/// The defect: the heartbeat called `mark_component_ok` unconditionally, so a
+/// channel whose listener task was alive reported healthy no matter what the
+/// platform said. `health_check` existed on sixteen channels and had exactly
+/// one caller — a one-shot CLI command.
+#[tokio::test]
+async fn a_channel_whose_platform_stops_answering_is_reported_unhealthy() {
+    let probes = Arc::new(AtomicUsize::new(0));
+    let channel_name = format!("test-supervised-deadplatform-{}", uuid::Uuid::new_v4());
+    let component = format!("channel:{channel_name}");
+    let channel: Arc<dyn Channel> = Arc::new(LiveListenerDeadPlatformChannel {
+        name: channel_name,
+        probes: Arc::clone(&probes),
+    });
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+    let shutdown = CancellationToken::new();
+    let handle = supervisor::spawn_supervised_listener_with_health_interval(
+        channel,
+        tx,
+        1,
+        1,
+        Duration::from_millis(20),
+        shutdown.clone(),
+    );
+
+    // The threshold is deliberate: one failed probe must NOT flip the status.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        crate::health::snapshot_json()["components"][&component]["status"],
+        "ok",
+        "a single failed probe must not flap the status"
+    );
+
+    // Past the threshold it must.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        probes.load(Ordering::SeqCst) >= usize::try_from(CHANNEL_HEALTH_FAILURE_THRESHOLD).unwrap(),
+        "the supervisor must actually call health_check, got {} probes",
+        probes.load(Ordering::SeqCst)
+    );
+    let snapshot = crate::health::snapshot_json();
+    assert_ne!(
+        snapshot["components"][&component]["status"], "ok",
+        "a channel whose platform stops answering must stop reporting healthy: {}",
+        snapshot["components"][&component]
+    );
+
+    shutdown.cancel();
+    drop(rx);
+    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
 #[tokio::test]
 async fn supervised_listener_marks_error_and_restarts_on_failures() {
     let calls = Arc::new(AtomicUsize::new(0));

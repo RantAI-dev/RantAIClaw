@@ -143,13 +143,13 @@ pub trait Channel: Send + Sync {
 
     /// Check if the channel is healthy.
     ///
-    /// **Diagnostic-only.** The one production caller is `doctor channels`,
-    /// which runs it under a 10-second timeout. The supervisor's own health
-    /// tick does NOT consult it — it marks every running channel OK — so do
-    /// not read a green `doctor` as evidence the daemon is watching this.
-    /// Wiring it into the tick needs the same timeout plus a
-    /// consecutive-failure threshold; until that lands, treat this as a probe
-    /// an operator runs, not a monitor.
+    /// Called by `doctor channels` on demand, and by the supervisor on its
+    /// heartbeat — so this **is** what the daemon reports, not just what an
+    /// operator can ask for. Both run it under a 10-second timeout; the
+    /// supervisor additionally requires three consecutive failures before it
+    /// reports the channel unhealthy, so a single blip does not flap the
+    /// status. The probe runs in its own task, so a slow one cannot stall
+    /// message delivery.
     ///
     /// An implementation MUST be able to fail for the condition it exists to
     /// catch. A probe that only checks the HTTP status of an API that reports
