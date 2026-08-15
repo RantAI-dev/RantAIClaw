@@ -164,6 +164,15 @@ impl WhatsAppChannel {
             ));
         }
 
+        // Budget first: resolving a media id to a URL is an authenticated round
+        // trip, and the charge inside the fetch below happens a request too late
+        // to spare an exhausted sender that one. Placed after the claimed-type
+        // filter so a declared non-image still costs nothing, matching
+        // `fetch_image_bytes`'s own order.
+        if let Err(note) = crate::channels::media::peek(&format!("whatsapp:{sender}")) {
+            return MediaOutcome::Rejected(note);
+        }
+
         let client = self.http_client();
         let lookup = format!("{}/{media_id}", self.api_base());
         let Ok(response) = client
@@ -615,7 +624,11 @@ mod tests {
         // The lookup answers with a loopback port nothing listens on, so a
         // budget note rather than a fetch failure proves the refusal lands
         // before the download.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static LOOKUP_HITS: AtomicUsize = AtomicUsize::new(0);
+
         async fn lookup(Path(_id): Path<String>) -> axum::Json<serde_json::Value> {
+            LOOKUP_HITS.fetch_add(1, Ordering::SeqCst);
             axum::Json(serde_json::json!({ "url": "http://127.0.0.1:1/x.png" }))
         }
 
@@ -640,12 +653,39 @@ mod tests {
             content: "[WHATSAPP_MEDIA:media-1|image/png]".to_string(),
             ..Default::default()
         }];
+        // Control first: a sender with budget left DOES reach the lookup, so the
+        // count below cannot come from an unreachable server.
+        let mut control = vec![ChannelMessage {
+            sender: "+15550001111".to_string(),
+            content: "[WHATSAPP_MEDIA:media-1|image/png]".to_string(),
+            ..Default::default()
+        }];
+        ch.hydrate_media(&mut control).await;
+        assert!(
+            !control[0].content.contains("media budget spent"),
+            "{}",
+            control[0].content
+        );
+        assert_eq!(
+            LOOKUP_HITS.load(Ordering::SeqCst),
+            1,
+            "the control must reach the media lookup"
+        );
+
         ch.hydrate_media(&mut messages).await;
 
         assert!(
             messages[0].content.contains("media budget spent"),
             "{}",
             messages[0].content
+        );
+        // The point of this change: resolving a media id is an authenticated
+        // round trip, and an exhausted sender must not be able to make it.
+        assert_eq!(
+            LOOKUP_HITS.load(Ordering::SeqCst),
+            1,
+            "the refused attachment still called the media lookup — the budget is \
+             being checked after it instead of before"
         );
     }
 
