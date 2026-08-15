@@ -2655,6 +2655,13 @@ mod tests {
     /// Each handler used to await the full LLM turn before returning 200, so a
     /// slow turn blew past the platform's ACK deadline, the platform retried,
     /// and the same message was processed again — no attacker required.
+    ///
+    /// Nextcloud Talk is now covered behaviourally by
+    /// `nextcloud_talk_webhook_acks_while_the_turn_is_still_running`, which
+    /// parks the provider and asserts the ACK still returns. This source check
+    /// remains for WhatsApp and Linq, whose handlers no test constructs — and it
+    /// is weaker than it looks: it finds a `tokio::spawn(` before the turn, which
+    /// an implementation that spawns and then immediately awaits would satisfy.
     #[test]
     fn every_public_webhook_handler_acks_before_processing() {
         let src = include_str!("mod.rs");
@@ -2692,9 +2699,21 @@ mod tests {
     }
 
     /// The store tests above prove the store; a handler that never calls it
-    /// passes them anyway. Handler-level tests are plan 140's deliverable, so
-    /// until they land the wiring is pinned by source — otherwise this plan
-    /// ships an unpinned change.
+    /// passes them anyway.
+    ///
+    /// Plan 140 landed (#500) but covered **authentication**, not these three
+    /// properties, so this still does a job. Nextcloud Talk's rate limiting is
+    /// now asserted behaviourally by `nextcloud_talk_webhook_rate_limits_a_burst`;
+    /// WhatsApp's and Linq's are not, because neither handler has a test that
+    /// constructs its `AppState`.
+    ///
+    /// Idempotency is **not** behaviourally covered on any handler. A test was
+    /// written and withdrawn: with the turn spawned, the provider-call count is
+    /// not a sound oracle — a control sending two *distinct* message ids also
+    /// produced one call, so the test would have passed with the dedup guard
+    /// removed. Whatever bounds it is upstream of the provider and was not
+    /// identified. Recorded rather than shipped as a test that passes for the
+    /// wrong reason.
     #[test]
     fn every_public_webhook_handler_is_rate_limited_and_deduplicated() {
         let src = include_str!("mod.rs");
@@ -3684,6 +3703,177 @@ mod tests {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(payload.as_bytes());
         hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// A provider that parks until released, so a test can observe what the
+    /// handler does *while* a turn is still running.
+    struct ParkedProvider {
+        calls: AtomicUsize,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for ParkedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            Ok("parked reply".to_string())
+        }
+    }
+
+    /// The `AppState` the three behavioural tests below share, so each test
+    /// varies only the thing it is about.
+    fn nextcloud_state(
+        provider: Arc<dyn Provider>,
+        secret: &str,
+        rate_limiter: GatewayRateLimiter,
+        idempotency: IdempotencyStore,
+    ) -> AppState {
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            config_fingerprint: Arc::new(Mutex::new("test".to_string())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(rate_limiter),
+            idempotency_store: Arc::new(idempotency),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: Some(Arc::new(NextcloudTalkChannel::new(
+                "https://cloud.example.com".into(),
+                "app-token".into(),
+                vec!["*".into()],
+            ))),
+            nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
+            observer: Arc::new(crate::observability::NoopObserver),
+            webhook_routes: Arc::new(Vec::new()),
+            channel_approvals: Arc::new(channel_approval::ChannelApprovalStore::default()),
+            web_approvals: Arc::new(crate::security::PendingApprovals::default()),
+            tools_factory: Arc::new(|_: &crate::config::Config| Vec::new()),
+        }
+    }
+
+    /// A signed Nextcloud Talk message body with the given platform id.
+    fn signed_nextcloud(secret: &str, id: &str) -> (HeaderMap, Bytes) {
+        let body = format!(
+            r#"{{"type":"message","object":{{"token":"room-token"}},"message":{{"id":"{id}","actorType":"users","actorId":"user_a","message":"hello"}}}}"#
+        );
+        let random = "seed-value";
+        let signature = compute_nextcloud_signature_hex(secret, random, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(&signature).unwrap(),
+        );
+        (headers, Bytes::from(body))
+    }
+
+    /// Wait for `calls` to reach `want`, or give up. The turn runs on a spawned
+    /// task, so its effect is not visible the instant the handler returns.
+    async fn wait_for_calls(calls: &AtomicUsize, want: usize) -> usize {
+        for _ in 0..200 {
+            if calls.load(Ordering::SeqCst) >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        calls.load(Ordering::SeqCst)
+    }
+
+    /// The defect: every handler awaited the full LLM turn before returning
+    /// 200, so a slow turn blew past the platform's ACK deadline, the platform
+    /// retried, and the same message was processed again — no attacker needed.
+    ///
+    /// This replaces a source-position assertion that read the handler's text
+    /// looking for `tokio::spawn(` before `process_channel_chat(`. That check
+    /// passes against any spawn, including one that is awaited immediately.
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_acks_while_the_turn_is_still_running() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider_impl = Arc::new(ParkedProvider {
+            calls: AtomicUsize::new(0),
+            release: Arc::clone(&release),
+        });
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let secret = "nextcloud-test-secret";
+        let state = nextcloud_state(
+            provider,
+            secret,
+            GatewayRateLimiter::new(100, 100, 100, 100),
+            IdempotencyStore::new(Duration::from_mins(5), 1000),
+        );
+        let (headers, body) = signed_nextcloud(secret, "msg-1");
+
+        // The ACK must not wait on the turn. Generous bound: the point is that
+        // it does not block on a provider that never answers, not that it is fast.
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle_nextcloud_talk_webhook(State(state), test_peer(), headers, body),
+        )
+        .await
+        .expect("the handler must ACK without awaiting the turn")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // And the turn really was in flight, still parked, when that ACK went out.
+        assert_eq!(
+            wait_for_calls(&provider_impl.calls, 1).await,
+            1,
+            "the turn should have started"
+        );
+        release.notify_waiters();
+    }
+
+    /// This endpoint is publicly reachable, so an unauthenticated burst must be
+    /// bounded before it reaches the provider.
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rate_limits_a_burst() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let secret = "nextcloud-test-secret";
+        // One webhook per window, from the shared loopback peer `test_peer` keys on.
+        let state = nextcloud_state(
+            provider,
+            secret,
+            GatewayRateLimiter::new(100, 1, 100, 100),
+            IdempotencyStore::new(Duration::from_mins(5), 1000),
+        );
+
+        let (headers, body) = signed_nextcloud(secret, "burst-1");
+        let first = handle_nextcloud_talk_webhook(State(state.clone()), test_peer(), headers, body)
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let (headers, body) = signed_nextcloud(secret, "burst-2");
+        let second = handle_nextcloud_talk_webhook(State(state), test_peer(), headers, body)
+            .await
+            .into_response();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a second request in the same window must be refused"
+        );
     }
 
     #[tokio::test]
