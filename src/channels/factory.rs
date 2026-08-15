@@ -245,7 +245,8 @@ pub(crate) fn build_configured_channels(
             "Email",
             Arc::new(
                 EmailChannel::new(email_cfg.clone())
-                    .with_approval_owners(config.channels_config.approval_owners.clone()),
+                    .with_approval_owners(config.channels_config.approval_owners.clone())
+                    .with_multimodal(config.multimodal.clone()),
             ),
         ));
     }
