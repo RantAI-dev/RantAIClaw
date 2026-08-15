@@ -166,6 +166,21 @@ const IN_FLIGHT_COMPLETION_WAIT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(IN_FLIGHT_COMPLETION_WAIT_TIMEOUT_SECS);
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 
+/// How long one `health_check()` may take before the probe counts as failed.
+///
+/// The probe is a network round trip on sixteen channels, so it needs a bound —
+/// a platform that accepts the connection and never answers would otherwise
+/// leave the channel's status frozen at whatever it last reported.
+const CHANNEL_HEALTH_PROBE_TIMEOUT_SECS: u64 = 10;
+
+/// Consecutive failed probes before a channel is reported unhealthy.
+///
+/// One failure is a blip — a dropped packet, a rate-limit, a platform's own
+/// hiccup — and flapping the status on those makes the health surface worth
+/// less than no surface at all. Three misses at the heartbeat interval is
+/// ninety seconds of a channel genuinely not answering.
+const CHANNEL_HEALTH_FAILURE_THRESHOLD: u32 = 3;
+
 /// How long an unanswered in-chat approval waits before auto-denying.
 ///
 /// Shared by the shell and tool registries so the two cannot drift, and read by

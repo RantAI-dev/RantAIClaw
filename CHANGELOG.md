@@ -127,6 +127,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The daemon's health surface stops reporting a dead channel as healthy.**
+  The supervisor's 30-second heartbeat marked every running channel OK
+  unconditionally — it never asked the channel anything. `health_check()` was
+  implemented with a real network probe by sixteen channels and had exactly one
+  caller: the one-shot `doctor channels` command. So an expired bot token, a
+  revoked webhook or a workspace the bot had been removed from left the
+  listener task alive and the status green, while the channel answered nothing.
+  The heartbeat now runs the probe. Two bounds keep that safe: a 10-second
+  timeout, so a platform that accepts the connection and never answers cannot
+  freeze the status, and **three consecutive failures** before the channel is
+  reported unhealthy, so one dropped packet does not flap it. The probe runs in
+  its own task, so a slow platform cannot stall message delivery.
+
 - **An image sent to a model that cannot see images no longer breaks the
   conversation.** The vision gate counted image markers across the **whole**
   history, so once a stored turn carried a picture every later message failed

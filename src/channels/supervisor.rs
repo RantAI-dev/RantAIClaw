@@ -8,8 +8,10 @@
 
 use super::traits::{self, Channel};
 use super::{
-    CHANNEL_HEALTH_HEARTBEAT_SECS, CHANNEL_MAX_IN_FLIGHT_MESSAGES, CHANNEL_MIN_IN_FLIGHT_MESSAGES,
-    CHANNEL_PARALLELISM_PER_CHANNEL, CHANNEL_TYPING_REFRESH_INTERVAL_SECS,
+    CHANNEL_HEALTH_FAILURE_THRESHOLD, CHANNEL_HEALTH_HEARTBEAT_SECS,
+    CHANNEL_HEALTH_PROBE_TIMEOUT_SECS, CHANNEL_MAX_IN_FLIGHT_MESSAGES,
+    CHANNEL_MIN_IN_FLIGHT_MESSAGES, CHANNEL_PARALLELISM_PER_CHANNEL,
+    CHANNEL_TYPING_REFRESH_INTERVAL_SECS,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -175,10 +177,20 @@ pub(crate) fn spawn_supervised_listener_with_health_interval(
         let mut backoff = initial_backoff_secs.max(1);
         let max_backoff = max_backoff_secs.max(backoff);
 
+        // The heartbeat runs in its own task, not as an arm of the select
+        // below. `tokio::select!` runs the chosen branch's body to completion
+        // before polling the others, so awaiting a network probe there would
+        // stall message delivery for as long as the probe took — up to the
+        // timeout, every heartbeat. A separate task keeps the listener hot.
+        let probe = tokio::spawn(probe_channel_health(
+            Arc::clone(&ch),
+            component.clone(),
+            health_interval,
+            shutdown.clone(),
+        ));
+
         'supervise: loop {
             crate::health::mark_component_ok(&component);
-            let mut health = tokio::time::interval(health_interval);
-            health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let result = {
                 // Pass the shared shutdown token so a well-behaved channel
                 // (e.g. Telegram) aborts its long-poll cleanly. The
@@ -191,9 +203,6 @@ pub(crate) fn spawn_supervised_listener_with_health_interval(
                 loop {
                     tokio::select! {
                         () = shutdown.cancelled() => break 'supervise,
-                        _ = health.tick() => {
-                            crate::health::mark_component_ok(&component);
-                        }
                         result = &mut listen_future => break result,
                     }
                 }
@@ -226,7 +235,67 @@ pub(crate) fn spawn_supervised_listener_with_health_interval(
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
+
+        // Every exit above lands here. The probe holds an `Arc<dyn Channel>`
+        // and would otherwise keep polling a platform this process has stopped
+        // listening to.
+        probe.abort();
     })
+}
+
+/// Ask the channel whether it is actually working, on `interval`.
+///
+/// The heartbeat used to call `mark_component_ok` unconditionally, so
+/// `channels doctor`, the gateway's health endpoint and the TUI's status panel
+/// all reported a channel healthy for as long as its listener task was alive —
+/// which it stays across an expired token, a revoked webhook, or a workspace
+/// the bot was removed from. `health_check` existed on sixteen channels with a
+/// real network probe and had exactly one caller: a one-shot CLI command.
+///
+/// Two bounds make it safe to run on a timer, and the plan that deferred this
+/// named both: a timeout, so a platform that accepts the connection and never
+/// answers cannot freeze the status; and a consecutive-failure threshold, so a
+/// single blip does not flap it.
+async fn probe_channel_health(
+    ch: Arc<dyn Channel>,
+    component: String,
+    interval: Duration,
+    shutdown: CancellationToken,
+) {
+    let timeout = Duration::from_secs(CHANNEL_HEALTH_PROBE_TIMEOUT_SECS);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval`'s first tick is immediate; the listener has only just started,
+    // so let one period pass before the first probe.
+    ticker.tick().await;
+
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+
+        // A timed-out probe counts as a failure, not as an unknown: the channel
+        // is not answering, which is the condition being reported.
+        let healthy = tokio::time::timeout(timeout, ch.health_check())
+            .await
+            .unwrap_or(false);
+
+        if healthy {
+            consecutive_failures = 0;
+            crate::health::mark_component_ok(&component);
+        } else {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            if consecutive_failures >= CHANNEL_HEALTH_FAILURE_THRESHOLD {
+                crate::health::mark_component_error(
+                    &component,
+                    format!("health probe failed {consecutive_failures} times in a row"),
+                );
+            }
+        }
+    }
 }
 
 pub(crate) fn compute_max_in_flight_messages(channel_count: usize) -> usize {
