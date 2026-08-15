@@ -357,6 +357,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of silence. The rules are written down once in
   `docs/security/inbound-media-policy.md`, not per channel.
 
+- **Email accepts inbound images.** An image attached to an email never reached
+  the agent. The only attachment handling sat in a fallback branch that runs
+  when a message has *neither* a text nor an HTML body — so a screenshot
+  attached to an ordinary email, which is nearly all of them, was dropped
+  without a word. Attachments now go through the same policy as every other
+  channel, and because the IMAP message already carries the decoded bytes there
+  is no fetch, no credential and no attacker-chosen host involved. Parts that
+  neither claim to be an image nor look like one — calendar invites, vCards,
+  delivery reports — are left alone rather than annotated, since an email's
+  attachment list carries protocol furniture a chat platform's does not.
+  Anything that is, or claims to be, an image still always produces a marker.
+  `require_authenticated_sender` is unchanged: attachments are read only after
+  the sender has been accepted.
+
+- **Inbound images are budgeted per sender: 20 images per 10 minutes.** The
+  media policy named this as its own known gap — inbound media was an unmetered
+  cost lever for anyone the allowlist admits, and on a group channel that is a
+  wider set than the operator pictures. The count is kept per
+  channel-qualified sender (`discord:<id>`, `email:<address>`), so one
+  identifier reused on two platforms does not share an allowance, and it is
+  charged **before the download**, so an exhausted sender costs no bandwidth.
+  Past the budget an attachment becomes a note naming the wait, like every other
+  rejection. Both numbers are constants in `src/channels/media.rs`, not config
+  keys — there is no schema change and nothing to set. Telegram and WhatsApp
+  Cloud each make one authenticated lookup before the fetch, so the budget saves
+  them the download but not that lookup; this is stated in
+  `docs/security/inbound-media-policy.md` §6 rather than left implicit.
+
 - **Replies thread on Discord, Telegram and Mattermost.** The threading seam
   existed and was plumbed through every dispatch site, but exactly one channel
   (Slack) filled it — so in every busy group the bot's replies landed flat.
