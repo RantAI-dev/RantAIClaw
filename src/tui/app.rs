@@ -9534,6 +9534,47 @@ mod autonomy_keybinding_tests {
         );
     }
 
+    /// The setup wizard owns the screen. Cycling autonomy underneath it is a
+    /// state change the operator did not ask for and cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shift_tab_cannot_change_autonomy_from_inside_the_setup_overlay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+
+        app.setup_overlay = Some(crate::tui::SetupOverlayState::new("Setup"));
+
+        press_shift_tab(&mut app).await;
+
+        assert_eq!(
+            preset_on_disk(dir.path()),
+            None,
+            "autonomy changed while the setup overlay owned the screen"
+        );
+    }
+
+    /// Same for the first-run wizard, which owns the screen before the operator
+    /// has an approval policy to speak of.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shift_tab_cannot_change_autonomy_from_inside_the_first_run_wizard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+
+        app.first_run_wizard = Some(crate::tui::FirstRunWizard::new(crate::profile::Profile {
+            name: "default".to_string(),
+            root: dir.path().to_path_buf(),
+        }));
+
+        press_shift_tab(&mut app).await;
+
+        assert_eq!(
+            preset_on_disk(dir.path()),
+            None,
+            "autonomy changed while the first-run wizard owned the screen"
+        );
+    }
+
     /// A turn in flight owns the screen; the policy must not move under it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shift_tab_cannot_change_autonomy_while_a_turn_is_streaming() {
