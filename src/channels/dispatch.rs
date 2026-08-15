@@ -51,6 +51,19 @@ pub(crate) fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
         .resolve()
 }
 
+/// The scope layered memory stores and recalls under.
+///
+/// Deliberately the **same** value as [`conversation_history_key`]: memory and
+/// history describe the same conversation, and keying them differently is what
+/// produced MEM-SCOPE-SENDER. This existed as an inline `ConversationKey::new`
+/// built from `msg.sender` while history used `msg.reply_target`, so a private
+/// DM, every group the bot shared with that person, and every forum topic
+/// collapsed into one memory scope — a detail recalled from a private chat
+/// could surface when they next spoke in a group. Named so a test can pin it.
+pub(crate) fn conversation_memory_scope(msg: &traits::ChannelMessage) -> String {
+    conversation_history_key(msg)
+}
+
 pub(crate) fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
@@ -314,13 +327,18 @@ pub(crate) async fn process_channel_message(
             return;
         }
     };
-    // Conversation scope for layered memory: one scope per chat/thread on this
-    // surface (channel:sender[:thread]), the same identity used for history
-    // keying. Stores and recalls are scoped to it so one chat's memory doesn't
-    // bleed into another's, while shared/global memory still backfills.
-    let conversation_scope = conversation::ConversationKey::new(&msg.channel, &msg.sender)
-        .in_thread(msg.thread_ts.as_deref())
-        .resolve();
+    // Conversation scope for layered memory: one scope per chat/thread, the same
+    // identity used for history keying — literally the same function, so the two
+    // cannot drift again.
+    //
+    // This used to build its own key from `msg.sender`, while history keyed on
+    // `msg.reply_target`. The comment claimed "one scope per chat" and the code
+    // gave one scope per *person*: a private DM, every group the bot shared with
+    // that person, and every forum topic collapsed into one memory scope, so a
+    // detail recalled from a private chat could surface when they next spoke in
+    // a group. Plan 118 fixed exactly this for conversation history and recorded
+    // that memory still had it.
+    let conversation_scope = conversation_memory_scope(&msg);
 
     if runtime_defaults.auto_save_memory
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
