@@ -586,17 +586,26 @@ impl TuiApp {
     }
 
     /// Advance the approval-policy preset for the active profile by one
-    /// step (`Manual → Smart → Strict → Off → Manual`) and persist it
-    /// to `<policy_dir>/{autonomy,command_allowlist,forbidden_paths}.toml`.
+    /// step (`Manual → Smart → Strict → Manual`, **skipping `Off`**) and
+    /// persist it to
+    /// `<policy_dir>/{autonomy,command_allowlist,forbidden_paths}.toml`.
     ///
     /// Wired to `KeyCode::BackTab` (Shift+Tab) and shared with the
     /// `/autonomy` slash command (which calls into the same write path).
-    /// The on-disk write goes through `policy_writer::write_policy_files`
-    /// with `force=true` — that's the same call `rantaiclaw setup
-    /// approvals --force` makes, so any hand-edits to
-    /// `command_allowlist.toml` / `forbidden_paths.toml` are clobbered.
-    /// `runtime_allowlist.toml` (the user's `/allow X --persist`
-    /// accretions) lives in a separate file and is preserved.
+    ///
+    /// Two writes, and both are needed:
+    ///
+    /// - `write_policy_files(.., force = false)` creates the bundle on a fresh
+    ///   profile and otherwise **preserves** hand-edited
+    ///   `command_allowlist.toml` / `forbidden_paths.toml` — a keybinding is one
+    ///   keypress with no confirmation, so it must not clobber them.
+    /// - `write_active_preset` then moves the active-preset marker, which lives
+    ///   inside `autonomy.toml` and is therefore left untouched by the
+    ///   `force = false` write above. Without it the cycle never advanced past
+    ///   one step on any profile that already had the file.
+    ///
+    /// `runtime_allowlist.toml` (the user's `/allow X --persist` accretions)
+    /// lives in a separate file and is untouched either way.
     fn cycle_autonomy_preset(&mut self) {
         use crate::approval::policy_writer::{self, PolicyPreset};
         let dir = self.profile.policy_dir();
@@ -617,6 +626,24 @@ impl TuiApp {
                 return;
             }
         };
+        // `write_policy_files` with `force = false` leaves an existing
+        // `autonomy.toml` alone — deliberately, so an accidental press cannot
+        // clobber hand-edited allowlists. But the active-preset marker lives in
+        // that same file, so on any profile that has one (every configured
+        // install) the write above moved nothing: `read_active_preset` returned
+        // the same rung on the next press and the cycle never advanced past one
+        // step, while `config.toml` drifted away from the marker.
+        //
+        // `write_active_preset` is the narrow write for exactly this — it
+        // updates the marker and leaves `command_allowlist.toml` /
+        // `forbidden_paths.toml` untouched. The gateway already calls it after
+        // an autonomy change for the same reason.
+        if let Err(e) = policy_writer::write_active_preset(&dir, next) {
+            let _ = self
+                .context
+                .append_system_message(&format!("✗ Failed to switch autonomy mode: {e}"));
+            return;
+        }
         // Propagate to config.toml + live agent. Without this step the
         // preset file changes but `SecurityPolicy.autonomy` keeps its
         // launch-time value (v0.6.49 bug — Off didn't actually disable
@@ -5450,6 +5477,83 @@ fn render_approval_pane(
     frame.render_widget(para, area);
 }
 
+/// Mounting a `TuiApp` for tests.
+///
+/// `TuiApp` has fifty-odd fields, so every test module that needed one wrote
+/// its own constructor — four byte-identical fifty-line copies. That is why
+/// behaviour reachable only through `handle_key` went untested: not because it
+/// was unreachable, but because reaching it meant maintaining a fifth copy.
+///
+/// **Point the profile at a temporary directory for anything that writes.**
+/// The copies this replaces all set `root` to the operator's real profile
+/// directory, so a test that reached `cycle_autonomy_preset` would have
+/// rewritten the machine's own `policy/` files. [`app_with_profile_root`] is
+/// the constructor to use whenever the code under test can touch disk.
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::{AppState, CommandRegistry, TuiApp, INLINE_VIEWPORT_LINES};
+    use crate::tui::context::TuiContext;
+    use std::path::PathBuf;
+
+    /// A `TuiApp` in `Ready` state whose profile lives under `profile_root`.
+    pub(crate) fn app_with_profile_root(ctx: TuiContext, profile_root: PathBuf) -> TuiApp {
+        TuiApp {
+            state: AppState::Ready,
+            context: ctx,
+            command_registry: CommandRegistry::new(),
+            config: crate::config::Config::default(),
+            profile: crate::profile::Profile {
+                name: "default".to_string(),
+                root: profile_root,
+            },
+            autocomplete: crate::tui::widgets::Autocomplete::new(),
+            overlay: None,
+            setup_overlay: None,
+            setup_event_rx: None,
+            setup_save_complete_rx: None,
+            channels_restart_pending: false,
+            channels_restarted_for_save: false,
+            setup_response_tx: None,
+            scrollback_queue: Vec::new(),
+            list_picker: None,
+            clawhub_install_last_query: String::new(),
+            clawhub_install_search_version: 0,
+            clawhub_install_results_rx: None,
+            clawhub_install_results_tx: None,
+            clawhub_install_in_progress: None,
+            clawhub_search_frame: None,
+            clawhub_install_completion_rx: None,
+            clawhub_install_completion_tx: None,
+            skill_deps_install_in_progress: None,
+            skill_deps_install_completion_rx: None,
+            skill_deps_install_completion_tx: None,
+            skill_deps_install_finished_at: None,
+            skills_watcher: None,
+            config_watcher: None,
+            channel_supervisor: None,
+            info_panel: None,
+            stream_committed_chars: 0,
+            stream_header_committed: false,
+            editor_request: false,
+            skill_editor_request: None,
+            clear_terminal_request: false,
+            composer_viewport_rows: INLINE_VIEWPORT_LINES,
+            first_run_wizard: None,
+            login_gate: None,
+            pending_approvals_rx: None,
+            shell_blocks_this_turn: 0,
+            autonomy_hint_shown_this_turn: false,
+            pending_approval: None,
+        }
+    }
+
+    /// The read-only form: profile points at the real `default` directory, as
+    /// the copies this replaces did. Safe only while nothing under test writes.
+    pub(crate) fn app_with_context(ctx: TuiContext) -> TuiApp {
+        app_with_profile_root(ctx, crate::profile::paths::profile_dir("default"))
+    }
+}
+
 #[cfg(test)]
 mod skill_body_validation_tests {
     use super::{validate_skill_body, SkillEditRequest};
@@ -8528,57 +8632,7 @@ mod submit_tests {
     use crate::tui::async_bridge::TurnRequest;
     use crate::tui::context::TuiContext;
 
-    fn make_app_with_context(ctx: TuiContext) -> TuiApp {
-        TuiApp {
-            state: AppState::Ready,
-            context: ctx,
-            command_registry: CommandRegistry::new(),
-            config: crate::config::Config::default(),
-            profile: crate::profile::Profile {
-                name: "default".to_string(),
-                root: crate::profile::paths::profile_dir("default"),
-            },
-            autocomplete: crate::tui::widgets::Autocomplete::new(),
-            overlay: None,
-            setup_overlay: None,
-            setup_event_rx: None,
-            setup_save_complete_rx: None,
-            channels_restart_pending: false,
-            channels_restarted_for_save: false,
-            setup_response_tx: None,
-            scrollback_queue: Vec::new(),
-            list_picker: None,
-            clawhub_install_last_query: String::new(),
-            clawhub_install_search_version: 0,
-            clawhub_install_results_rx: None,
-            clawhub_install_results_tx: None,
-            clawhub_install_in_progress: None,
-            clawhub_search_frame: None,
-            clawhub_install_completion_rx: None,
-            clawhub_install_completion_tx: None,
-            skill_deps_install_in_progress: None,
-            skill_deps_install_completion_rx: None,
-            skill_deps_install_completion_tx: None,
-            skill_deps_install_finished_at: None,
-            skills_watcher: None,
-            config_watcher: None,
-            channel_supervisor: None,
-            info_panel: None,
-            stream_committed_chars: 0,
-            stream_header_committed: false,
-            editor_request: false,
-            skill_editor_request: None,
-            clear_terminal_request: false,
-            composer_viewport_rows: INLINE_VIEWPORT_LINES,
-            first_run_wizard: None,
-            login_gate: None,
-            pending_approvals_rx: None,
-            shell_blocks_this_turn: 0,
-            autonomy_hint_shown_this_turn: false,
-            pending_approval: None,
-        }
-    }
-
+    use super::test_support::app_with_context as make_app_with_context;
     /// When several shell calls block at once (parallel tool execution),
     /// approving the one shown in the box must advance the box to the next
     /// still-queued request — not leave it blank, stranding the other blocked
@@ -8896,57 +8950,7 @@ mod ctrl_c_tests {
     use crate::tui::context::TuiContext;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    fn make_app_with_context(ctx: TuiContext) -> TuiApp {
-        TuiApp {
-            state: AppState::Ready,
-            context: ctx,
-            command_registry: CommandRegistry::new(),
-            config: crate::config::Config::default(),
-            profile: crate::profile::Profile {
-                name: "default".to_string(),
-                root: crate::profile::paths::profile_dir("default"),
-            },
-            autocomplete: crate::tui::widgets::Autocomplete::new(),
-            overlay: None,
-            setup_overlay: None,
-            setup_event_rx: None,
-            setup_save_complete_rx: None,
-            channels_restart_pending: false,
-            channels_restarted_for_save: false,
-            setup_response_tx: None,
-            scrollback_queue: Vec::new(),
-            list_picker: None,
-            clawhub_install_last_query: String::new(),
-            clawhub_install_search_version: 0,
-            clawhub_install_results_rx: None,
-            clawhub_install_results_tx: None,
-            clawhub_install_in_progress: None,
-            clawhub_search_frame: None,
-            clawhub_install_completion_rx: None,
-            clawhub_install_completion_tx: None,
-            skill_deps_install_in_progress: None,
-            skill_deps_install_completion_rx: None,
-            skill_deps_install_completion_tx: None,
-            skill_deps_install_finished_at: None,
-            skills_watcher: None,
-            config_watcher: None,
-            channel_supervisor: None,
-            info_panel: None,
-            stream_committed_chars: 0,
-            stream_header_committed: false,
-            editor_request: false,
-            skill_editor_request: None,
-            clear_terminal_request: false,
-            composer_viewport_rows: INLINE_VIEWPORT_LINES,
-            first_run_wizard: None,
-            login_gate: None,
-            pending_approvals_rx: None,
-            shell_blocks_this_turn: 0,
-            autonomy_hint_shown_this_turn: false,
-            pending_approval: None,
-        }
-    }
-
+    use super::test_support::app_with_context as make_app_with_context;
     /// The `KeyCode::Char(c)` insert arm gated only on "no overlay / no
     /// wizard" and never looked at `key.modifiers`, so every Ctrl chord the
     /// app does not explicitly handle fell through and typed its own letter.
@@ -9083,57 +9087,7 @@ mod drain_tests {
     use crate::agent::events::AgentEvent;
     use crate::tui::context::TuiContext;
 
-    fn make_app_with_context(ctx: TuiContext) -> TuiApp {
-        TuiApp {
-            state: AppState::Ready,
-            context: ctx,
-            command_registry: CommandRegistry::new(),
-            config: crate::config::Config::default(),
-            profile: crate::profile::Profile {
-                name: "default".to_string(),
-                root: crate::profile::paths::profile_dir("default"),
-            },
-            autocomplete: crate::tui::widgets::Autocomplete::new(),
-            overlay: None,
-            setup_overlay: None,
-            setup_event_rx: None,
-            setup_save_complete_rx: None,
-            channels_restart_pending: false,
-            channels_restarted_for_save: false,
-            setup_response_tx: None,
-            scrollback_queue: Vec::new(),
-            list_picker: None,
-            clawhub_install_last_query: String::new(),
-            clawhub_install_search_version: 0,
-            clawhub_install_results_rx: None,
-            clawhub_install_results_tx: None,
-            clawhub_install_in_progress: None,
-            clawhub_search_frame: None,
-            clawhub_install_completion_rx: None,
-            clawhub_install_completion_tx: None,
-            skill_deps_install_in_progress: None,
-            skill_deps_install_completion_rx: None,
-            skill_deps_install_completion_tx: None,
-            skill_deps_install_finished_at: None,
-            skills_watcher: None,
-            config_watcher: None,
-            channel_supervisor: None,
-            info_panel: None,
-            stream_committed_chars: 0,
-            stream_header_committed: false,
-            editor_request: false,
-            skill_editor_request: None,
-            clear_terminal_request: false,
-            composer_viewport_rows: INLINE_VIEWPORT_LINES,
-            first_run_wizard: None,
-            login_gate: None,
-            pending_approvals_rx: None,
-            shell_blocks_this_turn: 0,
-            autonomy_hint_shown_this_turn: false,
-            pending_approval: None,
-        }
-    }
-
+    use super::test_support::app_with_context as make_app_with_context;
     #[tokio::test]
     async fn drain_events_chunk_appends_to_partial() {
         let (ctx, _req_rx, events_tx) = TuiContext::test_context();
@@ -9428,57 +9382,7 @@ mod retry_tests {
     use crate::tui::async_bridge::TurnRequest;
     use crate::tui::context::TuiContext;
 
-    fn make_app_with_context(ctx: TuiContext) -> TuiApp {
-        TuiApp {
-            state: AppState::Ready,
-            context: ctx,
-            command_registry: CommandRegistry::new(),
-            config: crate::config::Config::default(),
-            profile: crate::profile::Profile {
-                name: "default".to_string(),
-                root: crate::profile::paths::profile_dir("default"),
-            },
-            autocomplete: crate::tui::widgets::Autocomplete::new(),
-            overlay: None,
-            setup_overlay: None,
-            setup_event_rx: None,
-            setup_save_complete_rx: None,
-            channels_restart_pending: false,
-            channels_restarted_for_save: false,
-            setup_response_tx: None,
-            scrollback_queue: Vec::new(),
-            list_picker: None,
-            clawhub_install_last_query: String::new(),
-            clawhub_install_search_version: 0,
-            clawhub_install_results_rx: None,
-            clawhub_install_results_tx: None,
-            clawhub_install_in_progress: None,
-            clawhub_search_frame: None,
-            clawhub_install_completion_rx: None,
-            clawhub_install_completion_tx: None,
-            skill_deps_install_in_progress: None,
-            skill_deps_install_completion_rx: None,
-            skill_deps_install_completion_tx: None,
-            skill_deps_install_finished_at: None,
-            skills_watcher: None,
-            config_watcher: None,
-            channel_supervisor: None,
-            info_panel: None,
-            stream_committed_chars: 0,
-            stream_header_committed: false,
-            editor_request: false,
-            skill_editor_request: None,
-            clear_terminal_request: false,
-            composer_viewport_rows: INLINE_VIEWPORT_LINES,
-            first_run_wizard: None,
-            login_gate: None,
-            pending_approvals_rx: None,
-            shell_blocks_this_turn: 0,
-            autonomy_hint_shown_this_turn: false,
-            pending_approval: None,
-        }
-    }
-
+    use super::test_support::app_with_context as make_app_with_context;
     #[tokio::test]
     async fn retry_in_ready_resubmits_last_user_message_and_streams() {
         let (ctx, mut req_rx, _events_tx) = TuiContext::test_context();
@@ -9546,6 +9450,158 @@ mod retry_tests {
             last_msg.content.contains("No previous response"),
             "got {:?}",
             last_msg.content
+        );
+    }
+}
+
+/// Shift+Tab cycles the autonomy preset, and one of that ladder's rungs is
+/// "no prompts". The guard on that keybinding is therefore a security control,
+/// and until this module existed nothing tested it: the arm lives in
+/// `handle_key`, and every test helper in this file pointed the profile at the
+/// operator's real directory, so driving the cycle would have rewritten the
+/// machine's own policy files.
+///
+/// The oracle throughout is the preset actually written to disk under a
+/// `TempDir`, not a flag or a mock — `cycle_autonomy_preset`'s whole effect is
+/// that write.
+#[cfg(test)]
+mod autonomy_keybinding_tests {
+    use super::test_support::app_with_profile_root;
+    use super::{AppState, EventResult};
+    use crate::approval::policy_writer::{self, PolicyPreset};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Shift+Tab as the terminal actually delivers it: `BackTab` already
+    /// carries SHIFT, which is what let this arm fire from inside an approval
+    /// prompt in the first place.
+    fn shift_tab() -> KeyEvent {
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+    }
+
+    fn preset_on_disk(root: &std::path::Path) -> Option<PolicyPreset> {
+        policy_writer::read_active_preset(&root.join("policy"))
+    }
+
+    /// A blocked press must leave the profile untouched — no `autonomy.toml`
+    /// at all, since nothing has written one yet.
+    async fn press_shift_tab(app: &mut super::TuiApp) {
+        let result = app.handle_key(shift_tab()).await.expect("handle_key");
+        assert!(matches!(result, EventResult::Continue));
+    }
+
+    /// The control. Without it, every assertion below passes against a
+    /// keybinding that never worked at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shift_tab_cycles_the_preset_when_nothing_is_on_screen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+
+        assert_eq!(preset_on_disk(dir.path()), None, "nothing written yet");
+        press_shift_tab(&mut app).await;
+
+        // No `autonomy.toml` reads as `Smart`, so one step lands on `Strict`.
+        assert_eq!(
+            preset_on_disk(dir.path()),
+            Some(PolicyPreset::Strict),
+            "the keybinding must actually cycle when unguarded"
+        );
+    }
+
+    /// The defect plan 136 fixed, and the one that had no test: the operator
+    /// is looking at an approval gate while the keypress removes gating.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shift_tab_cannot_change_autonomy_from_inside_an_approval_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+
+        app.pending_approval = Some(crate::security::PendingRequest {
+            id: uuid::Uuid::new_v4(),
+            basename: "curl".to_string(),
+            full_command: "curl https://example.com".to_string(),
+            channel: "tui".to_string(),
+            reply_target: String::new(),
+            created_at: 0,
+        });
+
+        press_shift_tab(&mut app).await;
+
+        assert_eq!(
+            preset_on_disk(dir.path()),
+            None,
+            "autonomy changed while an approval was on screen"
+        );
+    }
+
+    /// A turn in flight owns the screen; the policy must not move under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shift_tab_cannot_change_autonomy_while_a_turn_is_streaming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+
+        app.state = AppState::Streaming {
+            partial: String::new(),
+            tool_blocks: Vec::new(),
+            cancelling: false,
+            turn_started_at: std::time::Instant::now(),
+        };
+
+        press_shift_tab(&mut app).await;
+
+        assert_eq!(
+            preset_on_disk(dir.path()),
+            None,
+            "autonomy changed while a turn was streaming"
+        );
+    }
+
+    /// The contract the status bar advertises: "Shift+Tab cycles
+    /// Manual→Smart→Strict". Two presses must therefore land on two different
+    /// rungs — and the cycle must never land on `Off`, which disables the
+    /// approval gate and is reachable only through `/autonomy off`.
+    ///
+    /// This is what caught the marker bug: `write_policy_files(.., force=false)`
+    /// leaves an existing `autonomy.toml` alone, so on a configured profile the
+    /// preset never moved and the second press re-announced the first rung.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shift_tab_advances_the_preset_on_every_press_and_skips_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = crate::profile::Profile {
+            name: "default".to_string(),
+            root: dir.path().to_path_buf(),
+        };
+        // Seed a configured profile — the case that used to be stuck. A fresh
+        // profile with no `autonomy.toml` was the only one that ever cycled.
+        policy_writer::write_policy_files(&profile, PolicyPreset::Manual, false)
+            .expect("seed the profile at Manual");
+        assert_eq!(preset_on_disk(dir.path()), Some(PolicyPreset::Manual));
+
+        let (ctx, _req_rx, _events_tx) = crate::tui::context::TuiContext::test_context();
+        let mut app = app_with_profile_root(ctx, dir.path().to_path_buf());
+
+        press_shift_tab(&mut app).await;
+        assert_eq!(
+            preset_on_disk(dir.path()),
+            Some(PolicyPreset::Smart),
+            "first press must advance Manual -> Smart"
+        );
+
+        press_shift_tab(&mut app).await;
+        assert_eq!(
+            preset_on_disk(dir.path()),
+            Some(PolicyPreset::Strict),
+            "second press must advance again — a cycle that repeats one rung is stuck"
+        );
+
+        // Strict is the rung before `Off` in the canonical order. The keybinding
+        // wraps to Manual instead: removing the gate is an explicit act.
+        press_shift_tab(&mut app).await;
+        assert_eq!(
+            preset_on_disk(dir.path()),
+            Some(PolicyPreset::Manual),
+            "the keybinding cycle must skip Off — it disables the approval gate"
         );
     }
 }

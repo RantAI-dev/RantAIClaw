@@ -7,10 +7,12 @@
 //! an equivalent check "structurally unfalsifiable" in a comment and deleted
 //! it; this is the same check in a different file.
 //!
-//! **Nothing was substituted for it.** The TUI's own behaviour needs a `TuiApp`
-//! mounted with an attached security policy and a running actor, and no harness
-//! for that exists — building one is its own piece of work. An honest gap is
-//! better than a decorative test.
+//! **Nothing was substituted for it here.** The TUI's own behaviour needs a
+//! mounted `TuiApp`, which at the time had no harness. One exists now —
+//! `src/tui/app.rs::test_support` — and the behaviour that gap was hiding is
+//! covered in-crate by `autonomy_keybinding_tests`, which drives `handle_key`
+//! against a temporary profile. In-crate is the right home for it: the harness
+//! constructs `TuiApp` from private fields, which no `tests/` binary can reach.
 
 use rantaiclaw::sessions::SessionStore;
 use tempfile::tempdir;
