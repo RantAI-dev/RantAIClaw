@@ -94,20 +94,43 @@ The current Signal behaviour — detect an attachment, skip it, say nothing — 
 the thing being generalised away. A user who gets no answer about a screenshot
 they sent has no way to tell a policy rejection from a broken bot.
 
-### 6. Rate limiting — deferred, and here is why
+### 6. Rate limiting — a per-sender budget, charged before the download
 
-Inbound media is an unmetered cost lever for anyone allowed to chat, so a
-per-sender limit belongs here in principle.
+Inbound media is an unmetered cost lever for anyone the allowlist admits, and on
+a group channel that is a wider set than the operator pictures.
 
-It is **not implemented in this spike**, for one reason: the natural place for it
-is the existing per-sender in-flight tracking in the dispatch loop, not a
-per-channel counter, and putting it there is a change to the dispatch loop's
-concurrency model. Doing that inside a media spike would bury it.
+**Budget: 20 images per sender per 10 minutes.** Both numbers are constants in
+`src/channels/media.rs` (`BUDGET_IMAGES`, `BUDGET_WINDOW`), not config keys — a
+key means a schema version bump and a drift snapshot, which is not worth
+spending until an operator asks for a different number. Change them there.
 
-What bounds the exposure until then: `max_images` per message (default 4), the
-size cap per image, and the fact that a sender must already be on the channel
-allowlist. **A follow-up plan should add a per-sender media budget** — it is
-recorded here rather than left as an unstated gap.
+The counter lives in `media::` and is keyed by a **channel-qualified** sender
+key (`discord:<id>`, `email:<address>`), so one identifier reused on two
+platforms does not share an allowance. `media::charge` is consulted by
+`fetch_image`/`fetch_image_bytes` **before the request goes out**, so an
+exhausted sender costs no bandwidth. The alternative — metering in the dispatch
+loop's existing per-sender in-flight tracking — would have been cheaper to write
+but could only refuse markers whose bytes had already been downloaded.
+
+The window is fixed rather than sliding: a sender who exhausts it waits out the
+remainder, which is cheaper to reason about and errs toward the sender's benefit
+at the boundary. Entries are dropped once their window closes, so the map holds
+only senders active in the last 10 minutes.
+
+Refusal is a visible note like every other rejection, and it names the wait:
+`[Attachment rejected: media budget spent (20 images per 10 minutes); try again
+in 4 minute(s)]`.
+
+**Known gap.** Telegram (`getFile`) and WhatsApp Cloud (the media lookup) each
+make one authenticated API call *before* reaching the fetch, so the budget saves
+those channels the download but not that lookup. Bounding it would mean moving
+the charge into each channel's own two-step resolver, which trades one shared
+rule for five per-channel ones. The remaining exposure is one small API request
+per refused attachment.
+
+Still bounding this alongside the budget: `max_images` per message (default 4),
+the size cap per image, and the fact that a sender must already be on the
+channel allowlist.
 
 ---
 
@@ -139,6 +162,9 @@ picture, rather than answer confidently about one it never received.
 4. Convert to a `data:` URI and emit the `[IMAGE:…]` marker the multimodal path
    already understands (`docs/reference/channels.md` §1).
 5. On any rejection, append the note to the message content. Never drop silently.
+6. Pass a channel-qualified sender key (`"<channel>:<id>"`) so the per-sender
+   budget in rule 6 applies. A path that does not fetch charges
+   `media::charge` itself.
 
 Steps 1 and 2 assume a transport that hands over a URL. **Email does not**: the
 IMAP message already carries the decoded bytes, so it skips straight to step 3

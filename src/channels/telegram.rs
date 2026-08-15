@@ -1245,7 +1245,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// constant), reads the body **bounded**, and decides the type from the
     /// bytes. The caller used to drop any failure with `if let Ok(..)`, which
     /// is the silent-drop the policy forbids.
-    async fn resolve_photo_marker(&self, file_id: &str) -> crate::channels::media::MediaOutcome {
+    async fn resolve_photo_marker(
+        &self,
+        file_id: &str,
+        sender: &str,
+    ) -> crate::channels::media::MediaOutcome {
         use crate::channels::media::{ImageBytes, MediaOutcome};
         use base64::Engine as _;
 
@@ -1278,6 +1282,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             None,
             None,
             crate::channels::media::max_bytes(&self.multimodal),
+            &format!("telegram:{sender}"),
         )
         .await
         {
@@ -2373,7 +2378,10 @@ Ensure only one `rantaiclaw` process is using this bot token."
                     // Resolve the photo to a marker — or to a note saying why
                     // it did not resolve. A dropped image used to be silent.
                     if let Some(file_id) = photo_file_id {
-                        let marker = self.resolve_photo_marker(&file_id).await.to_marker();
+                        let marker = self
+                            .resolve_photo_marker(&file_id, &msg.sender)
+                            .await
+                            .to_marker();
                         if msg.content.is_empty() {
                             msg.content = marker;
                         } else {
@@ -3367,9 +3375,45 @@ mod tests {
 
         // The stub answers `getFile` with `{"ok":true,"result":{}}` — no
         // `file_path` — which is the shape a revoked/expired file id produces.
-        let marker = ch.resolve_photo_marker("file-1").await.to_marker();
+        let marker = ch
+            .resolve_photo_marker("file-1", "tg_user_a")
+            .await
+            .to_marker();
         assert!(marker.contains("Attachment unavailable"), "got: {marker}");
         assert!(!marker.starts_with("[IMAGE:"));
+    }
+
+    /// The budget key is channel-qualified, so a Telegram id cannot spend a
+    /// Discord id's allowance. Dropping the `telegram:` prefix fails this.
+    #[tokio::test]
+    async fn telegram_charges_the_media_budget_under_a_channel_qualified_key() {
+        use crate::channels::media;
+        use axum::response::IntoResponse;
+
+        async fn get_file() -> impl IntoResponse {
+            axum::Json(serde_json::json!({"ok": true, "result": {"file_path": "photos/x.jpg"}}))
+        }
+
+        let sender = "telegram_budget_user";
+        for _ in 0..media::BUDGET_IMAGES {
+            assert!(media::charge(&format!("telegram:{sender}")).is_ok());
+        }
+
+        // Only `getFile` is mounted: the download route is deliberately absent,
+        // so reaching it at all would be a 404 rather than the budget note.
+        let app = axum::Router::new().route("/bot123:ABC/getFile", axum::routing::get(get_file));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let ch = TelegramChannel::new("123:ABC".into(), vec!["*".into()], false)
+            .with_api_base(format!("http://{addr}"));
+        let marker = ch.resolve_photo_marker("file-1", sender).await.to_marker();
+        assert!(marker.contains("media budget spent"), "got: {marker}");
     }
 
     /// A photo whose bytes are not an image must reach the user as a note, not
@@ -3402,7 +3446,10 @@ mod tests {
 
         let ch = TelegramChannel::new("123:ABC".into(), vec!["*".into()], false)
             .with_api_base(format!("http://{addr}"));
-        let marker = ch.resolve_photo_marker("file-1").await.to_marker();
+        let marker = ch
+            .resolve_photo_marker("file-1", "tg_user_b")
+            .await
+            .to_marker();
         assert!(marker.contains("unsupported type"), "got: {marker}");
         assert!(!marker.starts_with("[IMAGE:"));
     }

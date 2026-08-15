@@ -138,7 +138,10 @@ impl WhatsAppChannel {
                 let inner = &message.content[start + PENDING_MEDIA_PREFIX.len()..end - 1];
                 let (media_id, claimed) = inner.split_once('|').unwrap_or((inner, ""));
                 let claimed = (!claimed.is_empty()).then_some(claimed);
-                let replacement = self.resolve_media(media_id, claimed).await.to_marker();
+                let replacement = self
+                    .resolve_media(media_id, claimed, &message.sender)
+                    .await
+                    .to_marker();
                 message.content.replace_range(start..end, &replacement);
             }
         }
@@ -150,6 +153,7 @@ impl WhatsAppChannel {
         &self,
         media_id: &str,
         claimed: Option<&str>,
+        sender: &str,
     ) -> crate::channels::media::MediaOutcome {
         use crate::channels::media::MediaOutcome;
 
@@ -187,6 +191,7 @@ impl WhatsAppChannel {
             Some(&self.access_token),
             claimed,
             crate::channels::media::max_bytes(&self.multimodal),
+            &format!("whatsapp:{sender}"),
         )
         .await
     }
@@ -598,6 +603,50 @@ mod tests {
         });
 
         assert!(ch.parse_webhook_payload(&payload).is_empty());
+    }
+
+    /// The budget key is channel-qualified, so a WhatsApp number cannot spend
+    /// another channel's allowance. Dropping the `whatsapp:` prefix fails this.
+    #[tokio::test]
+    async fn whatsapp_charges_the_media_budget_under_a_channel_qualified_key() {
+        use crate::channels::media;
+        use axum::extract::Path;
+
+        // The lookup answers with a loopback port nothing listens on, so a
+        // budget note rather than a fetch failure proves the refusal lands
+        // before the download.
+        async fn lookup(Path(_id): Path<String>) -> axum::Json<serde_json::Value> {
+            axum::Json(serde_json::json!({ "url": "http://127.0.0.1:1/x.png" }))
+        }
+
+        let sender = "+15558887777";
+        for _ in 0..media::BUDGET_IMAGES {
+            assert!(media::charge(&format!("whatsapp:{sender}")).is_ok());
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route("/{id}", axum::routing::get(lookup));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let ch = WhatsAppChannel::new("token".into(), "1".into(), "v".into(), vec!["*".into()])
+            .with_api_base(format!("http://{addr}"));
+        let mut messages = vec![ChannelMessage {
+            sender: sender.to_string(),
+            content: "[WHATSAPP_MEDIA:media-1|image/png]".to_string(),
+            ..Default::default()
+        }];
+        ch.hydrate_media(&mut messages).await;
+
+        assert!(
+            messages[0].content.contains("media budget spent"),
+            "{}",
+            messages[0].content
+        );
     }
 
     #[tokio::test]

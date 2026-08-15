@@ -204,6 +204,7 @@ impl LinqChannel {
         let cap = crate::channels::media::max_bytes(&self.multimodal);
         let client = self.http_client();
         for message in messages.iter_mut() {
+            let sender_key = format!("linq:{}", message.sender);
             while let Some(start) = message.content.find(PENDING_MEDIA_PREFIX) {
                 let Some(end) = message.content[start..].find(']') else {
                     break;
@@ -214,10 +215,16 @@ impl LinqChannel {
                 let claimed = (!claimed.is_empty()).then_some(claimed);
                 // No bearer: the host comes from the payload, so the channel's
                 // API token does not belong in this request.
-                let replacement =
-                    crate::channels::media::fetch_image(&client, url, None, claimed, cap)
-                        .await
-                        .to_marker();
+                let replacement = crate::channels::media::fetch_image(
+                    &client,
+                    url,
+                    None,
+                    claimed,
+                    cap,
+                    &sender_key,
+                )
+                .await
+                .to_marker();
                 message.content.replace_range(start..end, &replacement);
             }
         }
@@ -811,6 +818,34 @@ mod tests {
             "mime_type": "image/jpeg"
         });
         assert!(LinqChannel::media_part_to_image_marker(&clean).is_some());
+    }
+
+    /// The budget key is channel-qualified, so a Linq sender cannot spend
+    /// another channel's allowance. Dropping the `linq:` prefix fails this.
+    #[tokio::test]
+    async fn linq_charges_the_media_budget_under_a_channel_qualified_key() {
+        use crate::channels::media;
+
+        let sender = "+15559999999";
+        for _ in 0..media::BUDGET_IMAGES {
+            assert!(media::charge(&format!("linq:{sender}")).is_ok());
+        }
+
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        // Port 1 on loopback: nothing listens there, so a budget note rather
+        // than a fetch failure proves the refusal precedes the request.
+        let mut messages = vec![ChannelMessage {
+            sender: sender.to_string(),
+            content: "[LINQ_MEDIA:http://127.0.0.1:1/x.jpg|image/jpeg]".to_string(),
+            ..Default::default()
+        }];
+        ch.hydrate_media(&mut messages).await;
+
+        assert!(
+            messages[0].content.contains("media budget spent"),
+            "{}",
+            messages[0].content
+        );
     }
 
     #[tokio::test]

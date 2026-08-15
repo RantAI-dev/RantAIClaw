@@ -464,10 +464,10 @@ impl EmailChannel {
     /// Split out of `fetch_unseen` so it is reachable without an IMAP session.
     /// Assembling it inline there meant no test could see what the agent
     /// actually receives.
-    fn message_content(&self, parsed: &mail_parser::Message) -> String {
+    fn message_content(&self, parsed: &mail_parser::Message, sender: &str) -> String {
         let subject = parsed.subject().unwrap_or("(no subject)");
         let mut content = format!("Subject: {}\n\n{}", subject, Self::extract_text(parsed));
-        for marker in self.attachment_markers(parsed) {
+        for marker in self.attachment_markers(parsed, sender) {
             content.push('\n');
             content.push_str(&marker);
         }
@@ -493,11 +493,16 @@ impl EmailChannel {
     /// invites, delivery reports — and a "not an image" note on each of those
     /// would be noise on ordinary mail. Anything that *is* or *claims to be* an
     /// image still always produces a marker.
-    fn attachment_markers(&self, parsed: &mail_parser::Message) -> Vec<String> {
+    ///
+    /// The per-sender budget is charged here rather than inside a fetch, since
+    /// this path has none. The bytes arrived with the message either way, so
+    /// what the budget bounds on email is the agent's context — not bandwidth.
+    fn attachment_markers(&self, parsed: &mail_parser::Message, sender: &str) -> Vec<String> {
         use crate::channels::media;
 
         let (max_images, _) = self.multimodal.effective_limits();
         let cap = media::max_bytes(&self.multimodal);
+        let sender_key = format!("email:{sender}");
 
         parsed
             .attachments()
@@ -517,6 +522,9 @@ impl EmailChannel {
                     && media::sniff_image_mime(bytes).is_none()
                 {
                     return None;
+                }
+                if let Err(note) = media::charge(&sender_key) {
+                    return Some(media::MediaOutcome::Rejected(note).to_marker());
                 }
                 Some(media::accept_bytes(bytes, claimed.as_deref(), cap).to_marker())
             })
@@ -593,7 +601,7 @@ impl EmailChannel {
                 continue;
             };
             // Reached only once `sender_identity` above has accepted the sender.
-            let content = self.message_content(&parsed);
+            let content = self.message_content(&parsed, &sender);
             let msg_id = parsed
                 .message_id()
                 .map(|s| s.to_string())
@@ -1302,11 +1310,14 @@ mod tests {
         )
     }
 
-    fn content_for(ch: &EmailChannel, raw: &str) -> String {
+    /// `sender` is the per-sender media-budget key, so each test gets its own
+    /// allowance and the process-global counter cannot make one test's result
+    /// depend on another's.
+    fn content_for(ch: &EmailChannel, raw: &str, sender: &str) -> String {
         let parsed = MessageParser::default()
             .parse(raw.as_bytes())
             .expect("parse mail");
-        ch.message_content(&parsed)
+        ch.message_content(&parsed, sender)
     }
 
     fn png_bytes(padding: usize) -> Vec<u8> {
@@ -1333,6 +1344,7 @@ mod tests {
         let out = content_for(
             &media_channel(5),
             &mail_with_attachment("image/png", &png_bytes(32)),
+            "budget_ok@example.com",
         );
         assert!(
             out.contains("[IMAGE:data:image/png;base64,"),
@@ -1349,6 +1361,7 @@ mod tests {
         let out = content_for(
             &media_channel(5),
             &mail_with_attachment("image/png", b"%PDF-1.7 not a png"),
+            "budget_pdfbytes@example.com",
         );
         assert!(out.contains("unsupported type"), "{out}");
         assert!(!out.contains("[IMAGE:"), "{out}");
@@ -1361,6 +1374,7 @@ mod tests {
         let out = content_for(
             &media_channel(5),
             &mail_with_attachment("application/pdf", &png_bytes(32)),
+            "budget_mislabel@example.com",
         );
         assert!(out.contains("type mismatch"), "{out}");
         assert!(!out.contains("[IMAGE:"), "{out}");
@@ -1374,6 +1388,7 @@ mod tests {
         let out = content_for(
             &media_channel(1),
             &mail_with_attachment("image/png", &png_bytes(1024 * 1024 + 1)),
+            "budget_oversized@example.com",
         );
         // Truncated on purpose: the failing value here is a megabyte of base64,
         // and dumping it turns one CI failure into an unreadable log.
@@ -1392,10 +1407,35 @@ mod tests {
         let out = content_for(
             &media_channel(5),
             &mail_with_attachment("text/calendar", b"BEGIN:VCALENDAR\r\nEND:VCALENDAR"),
+            "budget_calendar@example.com",
         );
         assert!(!out.contains("[IMAGE:"), "{out}");
         assert!(!out.contains("Attachment rejected"), "{out}");
         assert!(out.contains("here is the shot"), "{out}");
+    }
+
+    /// Email has no fetch, so its budget bounds the agent's context rather than
+    /// bandwidth — but it is still charged, and under an `email:`-qualified key.
+    #[test]
+    fn a_sender_over_their_media_budget_gets_a_note_instead_of_the_image() {
+        use crate::channels::media;
+
+        let spent = "budget_spent@example.com";
+        for _ in 0..media::BUDGET_IMAGES {
+            assert!(media::charge(&format!("email:{spent}")).is_ok());
+        }
+
+        let ch = media_channel(5);
+        let mail = mail_with_attachment("image/png", &png_bytes(32));
+
+        let out = content_for(&ch, &mail, spent);
+        assert!(out.contains("media budget spent"), "{out}");
+        assert!(!out.contains("[IMAGE:"), "{out}");
+
+        // Control: an unrelated sender, same channel and same mail, still gets
+        // the image — so the assertion above cannot pass because markers broke.
+        let out = content_for(&ch, &mail, "budget_untouched@example.com");
+        assert!(out.contains("[IMAGE:data:image/png;base64,"), "{out}");
     }
 
     // Sender authentication
