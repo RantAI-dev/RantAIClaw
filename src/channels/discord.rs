@@ -198,13 +198,14 @@ impl DiscordChannel {
     /// `docs/security/inbound-media-policy.md`: images become `[IMAGE:data:…]`,
     /// everything else becomes a visible note. Never silent — a user who sent a
     /// screenshot and got no answer cannot tell a policy rejection from a bug.
-    async fn attachment_markers(&self, message: &serde_json::Value) -> Vec<String> {
+    async fn attachment_markers(&self, message: &serde_json::Value, sender: &str) -> Vec<String> {
         let Some(attachments) = message.get("attachments").and_then(|a| a.as_array()) else {
             return Vec::new();
         };
         let (max_images, _) = self.multimodal.effective_limits();
         let cap = crate::channels::media::max_bytes(&self.multimodal);
         let client = self.http_client();
+        let sender_key = format!("discord:{sender}");
 
         let mut markers = Vec::new();
         for attachment in attachments.iter().take(max_images) {
@@ -216,7 +217,8 @@ impl DiscordChannel {
             // which keeps the credential out of a request whose host is chosen
             // by the payload.
             let outcome =
-                crate::channels::media::fetch_image(&client, url, None, claimed, cap).await;
+                crate::channels::media::fetch_image(&client, url, None, claimed, cap, &sender_key)
+                    .await;
             markers.push(outcome.to_marker());
         }
         markers
@@ -598,7 +600,7 @@ impl Channel for DiscordChannel {
 
                     // Inbound images become markers the multimodal path
                     // already understands; a rejection becomes a visible note.
-                    for marker in self.attachment_markers(d).await {
+                    for marker in self.attachment_markers(d, &channel_msg.sender).await {
                         if !channel_msg.content.is_empty() {
                             channel_msg.content.push('\n');
                         }
@@ -709,7 +711,7 @@ mod tests {
             ]
         });
 
-        let markers = ch.attachment_markers(&message).await;
+        let markers = ch.attachment_markers(&message, "U_MEDIA").await;
         assert_eq!(markers.len(), 3);
         assert!(
             markers[0].starts_with("[IMAGE:data:image/png;base64,"),
@@ -723,11 +725,37 @@ mod tests {
         assert!(markers[2].contains("unsupported type"), "{}", markers[2]);
     }
 
+    /// The budget key is channel-qualified, so a Discord id cannot spend a
+    /// Telegram id's allowance. Dropping the `discord:` prefix fails this.
+    #[tokio::test]
+    async fn discord_charges_the_media_budget_under_a_channel_qualified_key() {
+        use crate::channels::media;
+
+        let sender = "discord_budget_user";
+        for _ in 0..media::BUDGET_IMAGES {
+            assert!(media::charge(&format!("discord:{sender}")).is_ok());
+        }
+
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, false);
+        // Port 1 on loopback: nothing listens there. Getting the budget note
+        // rather than a fetch failure is itself proof the refusal lands before
+        // the request goes out.
+        let message = serde_json::json!({
+            "attachments": [
+                { "url": "http://127.0.0.1:1/shot.png", "content_type": "image/png" }
+            ]
+        });
+
+        let markers = ch.attachment_markers(&message, sender).await;
+        assert_eq!(markers.len(), 1);
+        assert!(markers[0].contains("media budget spent"), "{}", markers[0]);
+    }
+
     #[tokio::test]
     async fn discord_message_without_attachments_adds_nothing() {
         let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, false);
         assert!(ch
-            .attachment_markers(&serde_json::json!({ "content": "hi" }))
+            .attachment_markers(&serde_json::json!({ "content": "hi" }), "U_NO_ATTACH")
             .await
             .is_empty());
     }

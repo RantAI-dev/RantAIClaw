@@ -144,6 +144,10 @@ Operational notes:
   type, or a failed fetch produces a **visible note** in the message rather than
   silence. Full rules:
   [inbound media policy](../security/inbound-media-policy.md).
+- **Inbound images are budgeted per sender**: 20 images per 10 minutes, counted
+  per channel-qualified sender and charged *before* the download. Past it, the
+  attachment becomes a note naming the wait. Not a config key — the constants
+  live in `src/channels/media.rs`.
 - Email needs no fetch — the IMAP message already carries the decoded bytes — so
   only the size and type rules apply. Attachments that neither claim to be an
   image nor look like one (calendar invites, vCards, delivery reports) are left

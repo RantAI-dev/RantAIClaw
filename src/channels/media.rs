@@ -7,6 +7,71 @@
 //! channel added later inherits them instead of inventing its own answers.
 
 use base64::Engine as _;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+/// Images one sender may have accepted per [`BUDGET_WINDOW`].
+///
+/// Deliberately a constant and not a config key: a key means a schema version
+/// bump and a drift snapshot, and there is no operator asking for a different
+/// number yet. Raise it here if one does.
+pub(crate) const BUDGET_IMAGES: u32 = 20;
+
+/// The window [`BUDGET_IMAGES`] is counted over. Fixed, not sliding — a sender
+/// who exhausts it waits out the remainder of the window, which is cheaper to
+/// reason about than a rolling count and errs toward the sender's benefit at
+/// the boundary.
+const BUDGET_WINDOW: Duration = Duration::from_mins(10);
+
+/// Window start and images charged in it, per sender key.
+///
+/// Process-global on purpose: the limit is per *sender*, and one sender can be
+/// talking to several channels at once. Entries whose window has closed are
+/// dropped on the next charge, so this holds only senders active in the last
+/// [`BUDGET_WINDOW`].
+static BUDGET: LazyLock<Mutex<HashMap<String, (Instant, u32)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Charge one inbound image to `sender_key`, or refuse with the note the user
+/// should see.
+///
+/// `sender_key` must be channel-qualified — `"discord:<id>"`, `"email:<addr>"`
+/// — so one identifier reused on two platforms does not share an allowance.
+///
+/// Called **before** the download, so an exhausted sender costs no bandwidth.
+/// Inbound media is otherwise an unmetered cost lever for anyone the allowlist
+/// admits, and on a group channel that is a wider set than the operator
+/// pictures.
+///
+/// # Errors
+///
+/// Returns the rejection note when the sender has spent the window's budget.
+pub fn charge(sender_key: &str) -> Result<(), String> {
+    let now = Instant::now();
+    let mut budget = match BUDGET.lock() {
+        Ok(budget) => budget,
+        // A poisoned lock means some other thread panicked mid-charge. Failing
+        // open here would hand an attacker an unmetered path by crashing one
+        // request, so the budget refuses instead.
+        Err(_) => return Err("Attachment rejected: media budget unavailable".into()),
+    };
+
+    budget.retain(|_, (started, _)| now.duration_since(*started) < BUDGET_WINDOW);
+
+    let entry = budget.entry(sender_key.to_string()).or_insert((now, 0));
+    if entry.1 >= BUDGET_IMAGES {
+        let left = BUDGET_WINDOW.saturating_sub(now.duration_since(entry.0));
+        return Err(format!(
+            "Attachment rejected: media budget spent ({BUDGET_IMAGES} images per {} minutes); \
+             try again in {} minute(s)",
+            BUDGET_WINDOW.as_secs() / 60,
+            left.as_secs().div_ceil(60)
+        ));
+    }
+    entry.1 += 1;
+    Ok(())
+}
 
 /// Image types the agent accepts. Anything else is rejected with a note.
 const ACCEPTED: &[(&[u8], &str)] = &[
@@ -144,8 +209,9 @@ pub async fn fetch_image(
     bearer: Option<&str>,
     claimed: Option<&str>,
     max_bytes: u64,
+    sender_key: &str,
 ) -> MediaOutcome {
-    match fetch_image_bytes(client, url, bearer, claimed, max_bytes).await {
+    match fetch_image_bytes(client, url, bearer, claimed, max_bytes, sender_key).await {
         ImageBytes::Ok { mime, bytes } => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             MediaOutcome::Image(format!("data:{mime};base64,{encoded}"))
@@ -162,12 +228,19 @@ pub async fn fetch_image_bytes(
     bearer: Option<&str>,
     claimed: Option<&str>,
     max_bytes: u64,
+    sender_key: &str,
 ) -> ImageBytes {
     if !claimed_type_is_image(claimed) {
         return ImageBytes::Rejected(format!(
             "Attachment rejected: unsupported type ({})",
             claimed.unwrap_or("unknown")
         ));
+    }
+
+    // After the type filter, before the request: the budget meters downloads
+    // actually performed, and a declared non-image costs none.
+    if let Err(note) = charge(sender_key) {
+        return ImageBytes::Rejected(note);
     }
 
     let mut request = client.get(url);
@@ -224,6 +297,105 @@ pub async fn fetch_image_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The budget is process-global, so every test that charges it uses a key
+    /// of its own. Sharing one would make a result depend on test ordering.
+    #[test]
+    fn a_sender_is_cut_off_after_spending_the_window_budget() {
+        let key = "test:budget_exhaustion";
+        for i in 0..BUDGET_IMAGES {
+            assert!(charge(key).is_ok(), "image {i} should be within budget");
+        }
+
+        let note = charge(key).expect_err("image past the budget must be refused");
+        assert!(note.contains("media budget spent"), "{note}");
+        // The note tells the user when they can try again, not just that they
+        // failed — a rejection the sender cannot act on is barely better than
+        // silence.
+        assert!(note.contains("try again in"), "{note}");
+    }
+
+    #[test]
+    fn one_sender_exhausting_the_budget_does_not_block_another() {
+        let loud = "test:budget_isolation_loud";
+        for _ in 0..BUDGET_IMAGES {
+            assert!(charge(loud).is_ok());
+        }
+        assert!(charge(loud).is_err());
+
+        // The whole point of keying by sender: a group channel's other members
+        // keep working while one member is over their allowance.
+        assert!(charge("test:budget_isolation_quiet").is_ok());
+    }
+
+    /// The keys callers build are channel-qualified, so the same identifier on
+    /// two platforms does not share one allowance.
+    #[test]
+    fn the_same_identifier_on_two_channels_gets_two_allowances() {
+        for _ in 0..BUDGET_IMAGES {
+            assert!(charge("discord:test_budget_shared_id").is_ok());
+        }
+        assert!(charge("discord:test_budget_shared_id").is_err());
+        assert!(charge("telegram:test_budget_shared_id").is_ok());
+    }
+
+    /// The reason the budget lives here and not in the dispatch loop: an
+    /// exhausted sender must cost no bandwidth, so the refusal has to land
+    /// before the request is sent.
+    #[tokio::test]
+    async fn an_exhausted_sender_never_reaches_the_server() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+
+        async fn counted() -> (axum::http::HeaderMap, axum::body::Bytes) {
+            HITS.fetch_add(1, Ordering::SeqCst);
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("content-type", "image/png".parse().expect("header"));
+            let mut body = b"\x89PNG\r\n\x1a\n".to_vec();
+            body.extend(std::iter::repeat_n(0u8, 32));
+            (headers, axum::body::Bytes::from(body))
+        }
+
+        let app = axum::Router::new().route("/media", axum::routing::get(counted));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/media");
+        let key = "test:budget_no_download";
+
+        // Control first: the same call succeeds and does reach the server, so
+        // the assertion below cannot pass because the server was unreachable.
+        let outcome = fetch_image(&client, &url, None, Some("image/png"), 65536, key).await;
+        assert!(matches!(outcome, MediaOutcome::Image(_)), "{outcome:?}");
+        let after_control = HITS.load(Ordering::SeqCst);
+        assert_eq!(
+            after_control, 1,
+            "the control request must reach the server"
+        );
+
+        for _ in 1..BUDGET_IMAGES {
+            assert!(charge(key).is_ok());
+        }
+
+        let outcome = fetch_image(&client, &url, None, Some("image/png"), 65536, key).await;
+        assert!(
+            matches!(outcome, MediaOutcome::Rejected(ref note) if note.contains("media budget spent")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            HITS.load(Ordering::SeqCst),
+            after_control,
+            "the refused fetch still hit the network — the budget is being \
+             charged after the download instead of before it"
+        );
+    }
 
     fn png(padding: usize) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -314,6 +486,7 @@ mod tests {
             None,
             Some("image/png"),
             1024,
+            "test:fetch_failure",
         )
         .await;
         let MediaOutcome::Rejected(note) = outcome else {
@@ -352,6 +525,7 @@ mod tests {
             None,
             Some("image/png"),
             1024,
+            "test:oversized",
         )
         .await;
         assert!(
@@ -367,6 +541,7 @@ mod tests {
             None,
             Some("image/png"),
             65536,
+            "test:oversized_control",
         )
         .await;
         assert!(
