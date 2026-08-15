@@ -127,6 +127,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A memory recalled from a private chat no longer surfaces in a group.** The
+  layered-memory scope was built from the *sender* while conversation history
+  was keyed on the *chat*, so one person's DM, every group the bot shared with
+  them, and every forum topic collapsed into a single memory scope — a detail
+  stored in private could be recalled into a public room by the same person's
+  next message there. Memory now uses the same key as history, by calling the
+  same function, so the two cannot drift apart again. Plan 118 fixed this for
+  history and recorded that memory still had it.
+
+  **Effect on existing installs**: memory stored under the old sender-keyed
+  scope is no longer recalled under the new chat-keyed one. Nothing is deleted,
+  and shared/global memory still backfills as before.
+
 - **The daemon's health surface stops reporting a dead channel as healthy.**
   The supervisor's 30-second heartbeat marked every running channel OK
   unconditionally — it never asked the channel anything. `health_check()` was

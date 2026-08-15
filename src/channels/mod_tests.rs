@@ -5208,3 +5208,44 @@ fn channels_module_public_surface_is_the_documented_ten() {
         );
     }
 }
+
+/// MEM-SCOPE-SENDER, surfaced by plan 118 when it fixed the same leak in
+/// conversation history and left this one recorded.
+///
+/// The memory scope was built from `msg.sender` while history used
+/// `msg.reply_target`, so one person's private DM and every group they share
+/// with the bot were one memory scope — a detail stored in private could be
+/// recalled into a public group.
+#[test]
+fn memory_scope_does_not_merge_a_dm_into_a_group() {
+    let dm = traits::ChannelMessage {
+        sender_aliases: Vec::new(),
+        id: "1".into(),
+        sender: "user_a".into(),
+        reply_target: "private-chat".into(),
+        content: "secret".into(),
+        channel: "telegram".into(),
+        timestamp: 1,
+        thread_ts: None,
+    };
+    let group = traits::ChannelMessage {
+        reply_target: "-1009999".into(),
+        id: "2".into(),
+        content: "public".into(),
+        ..dm.clone()
+    };
+
+    assert_ne!(
+        conversation_memory_scope(&dm),
+        conversation_memory_scope(&group),
+        "the same person's DM and a group they share with the bot are not one \
+         memory scope — a private detail must not be recalled into a group"
+    );
+
+    // And it is the *same* scope history uses: keying them differently is what
+    // produced this leak in the first place.
+    assert_eq!(
+        conversation_memory_scope(&dm),
+        conversation_history_key(&dm)
+    );
+}
