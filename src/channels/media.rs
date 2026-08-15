@@ -48,6 +48,31 @@ static BUDGET: LazyLock<Mutex<HashMap<String, (Instant, u32)>>> =
 ///
 /// Returns the rejection note when the sender has spent the window's budget.
 pub fn charge(sender_key: &str) -> Result<(), String> {
+    apply_budget(sender_key, true)
+}
+
+/// Whether [`charge`] would refuse `sender_key`, **without** consuming a slot.
+///
+/// For a channel whose media path costs a request *before* the download:
+/// Telegram resolves a `file_id` through `getFile`, WhatsApp Cloud resolves a
+/// media id to a URL, and both are authenticated round trips that an exhausted
+/// sender should not be able to make either. `charge` sits inside the fetch, so
+/// without this the budget saved those channels the download but not the
+/// lookup.
+///
+/// Peek-then-charge is deliberately not atomic: two attachments racing for the
+/// last slot means one wasted lookup, and the fetch still refuses. Making the
+/// pre-check consume would double-charge every image on these two channels,
+/// which is the worse error.
+///
+/// # Errors
+///
+/// Returns the same note [`charge`] would, when the sender has no budget left.
+pub fn peek(sender_key: &str) -> Result<(), String> {
+    apply_budget(sender_key, false)
+}
+
+fn apply_budget(sender_key: &str, consume: bool) -> Result<(), String> {
     let now = Instant::now();
     let mut budget = match BUDGET.lock() {
         Ok(budget) => budget,
@@ -69,7 +94,9 @@ pub fn charge(sender_key: &str) -> Result<(), String> {
             left.as_secs().div_ceil(60)
         ));
     }
-    entry.1 += 1;
+    if consume {
+        entry.1 += 1;
+    }
     Ok(())
 }
 

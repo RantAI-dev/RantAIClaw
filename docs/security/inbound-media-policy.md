@@ -121,12 +121,15 @@ Refusal is a visible note like every other rejection, and it names the wait:
 `[Attachment rejected: media budget spent (20 images per 10 minutes); try again
 in 4 minute(s)]`.
 
-**Known gap.** Telegram (`getFile`) and WhatsApp Cloud (the media lookup) each
-make one authenticated API call *before* reaching the fetch, so the budget saves
-those channels the download but not that lookup. Bounding it would mean moving
-the charge into each channel's own two-step resolver, which trades one shared
-rule for five per-channel ones. The remaining exposure is one small API request
-per refused attachment.
+**The two-step channels are covered too.** Telegram (`getFile`) and WhatsApp
+Cloud (the media lookup) each make one authenticated API call *before* reaching
+the fetch. Both now call `media::peek` — the same refusal, without consuming a
+slot — before that call, so an exhausted sender cannot make the lookup either.
+
+Peek-then-charge is deliberately not atomic. Two attachments racing for the last
+slot costs one wasted lookup, and the fetch still refuses; making the pre-check
+consume would double-charge every image on those two channels, which is the
+worse error.
 
 Still bounding this alongside the budget: `max_images` per message (default 4),
 the size cap per image, and the fact that a sender must already be on the

@@ -1253,6 +1253,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         use crate::channels::media::{ImageBytes, MediaOutcome};
         use base64::Engine as _;
 
+        // Budget first: `getFile` is an authenticated round trip, and the
+        // charge inside the fetch below happens a request too late to spare an
+        // exhausted sender that one.
+        if let Err(note) = crate::channels::media::peek(&format!("telegram:{sender}")) {
+            return MediaOutcome::Rejected(note);
+        }
+
         // Step 1: call getFile to get file_path
         let get_file_url = self.api_url(&format!("getFile?file_id={}", file_id));
         let Ok(resp) = self.http_client().get(&get_file_url).send().await else {
@@ -3390,7 +3397,11 @@ mod tests {
         use crate::channels::media;
         use axum::response::IntoResponse;
 
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static GET_FILE_HITS: AtomicUsize = AtomicUsize::new(0);
+
         async fn get_file() -> impl IntoResponse {
+            GET_FILE_HITS.fetch_add(1, Ordering::SeqCst);
             axum::Json(serde_json::json!({"ok": true, "result": {"file_path": "photos/x.jpg"}}))
         }
 
@@ -3412,8 +3423,29 @@ mod tests {
 
         let ch = TelegramChannel::new("123:ABC".into(), vec!["*".into()], false)
             .with_api_base(format!("http://{addr}"));
+        // Control first: an unrelated sender with budget left DOES reach getFile,
+        // so the zero below cannot come from an unreachable server.
+        let fresh = ch
+            .resolve_photo_marker("file-1", "telegram_budget_control")
+            .await
+            .to_marker();
+        assert!(!fresh.contains("media budget spent"), "got: {fresh}");
+        assert_eq!(
+            GET_FILE_HITS.load(Ordering::SeqCst),
+            1,
+            "the control must reach getFile"
+        );
+
         let marker = ch.resolve_photo_marker("file-1", sender).await.to_marker();
         assert!(marker.contains("media budget spent"), "got: {marker}");
+        // The point of this change: `getFile` is an authenticated round trip,
+        // and an exhausted sender must not be able to make it either.
+        assert_eq!(
+            GET_FILE_HITS.load(Ordering::SeqCst),
+            1,
+            "the refused attachment still called getFile — the budget is being \
+             checked after the lookup instead of before it"
+        );
     }
 
     /// A photo whose bytes are not an image must reach the user as a note, not
