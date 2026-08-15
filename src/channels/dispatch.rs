@@ -573,6 +573,12 @@ pub(crate) async fn process_channel_message(
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
+            // Carry this turn's chat into tool execution. `ShellTool` is a
+            // `Tool` and the trait has no originating message, so without this
+            // a shell approval registers unscoped and cannot be answered by a
+            // bare `ok` from the chat that triggered it.
+            crate::security::TURN_SCOPE.scope(
+            (msg.channel.clone(), msg.reply_target.clone()),
             run_tool_call_loop(
                 active_provider.as_ref(),
                 &mut history,
@@ -593,6 +599,7 @@ pub(crate) async fn process_channel_message(
                 Some(cancellation_token.clone()),
                 delta_tx,
                 None,
+            ),
             ),
         ) => LlmExecutionResult::Completed(result),
     };

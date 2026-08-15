@@ -134,10 +134,15 @@ pub fn try_handle_reply(
 /// Whether a bare `ok`/`y` arriving in `(channel, reply_target)` may answer this
 /// request.
 ///
-/// An unscoped request (empty `reply_target`) never qualifies. `ShellTool` is
-/// the live case: it is a `Tool`, and the trait carries no originating message,
-/// so a shell approval genuinely has no chat to be answered from. Those must be
-/// named explicitly rather than resolved by a guess.
+/// An unscoped request (empty `reply_target`) never qualifies — it has no chat
+/// to compare against, so it must be named explicitly rather than resolved by a
+/// guess.
+///
+/// `ShellTool` used to be the live case: it is a `Tool` and the trait carries no
+/// originating message, so its approvals registered unscoped. The turn's chat
+/// now reaches it through `security::TURN_SCOPE`, so a shell approval raised by
+/// a channel turn is answerable in that chat like any other. Direct TUI and CLI
+/// runs still have no chat and stay unscoped.
 fn request_is_answerable_here(r: &PendingRequest, channel: &str, reply_target: &str) -> bool {
     !r.reply_target.is_empty() && r.channel == channel && r.reply_target == reply_target
 }
@@ -1365,6 +1370,71 @@ mod tests {
                 .runtime_allowlist_snapshot()
                 .contains(&"brew".to_string()));
         }
+    }
+
+    /// A shell approval raised by a channel turn now names the chat it came
+    /// from, so the operator can answer it the way they answer every other
+    /// approval — with a bare `ok` in that chat.
+    ///
+    /// `ShellTool` is a `Tool` and the trait carries no originating message, so
+    /// it used to register with both fields empty and the only answer was to
+    /// name the command. The chat now reaches it through `TURN_SCOPE`, which the
+    /// channel dispatch sets around the tool loop.
+    #[tokio::test]
+    async fn a_scoped_shell_request_is_answerable_by_a_bare_verb_in_its_own_chat() {
+        let security = supervised_only_echo();
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        security.set_pending(pending.clone());
+        let p2 = pending.clone();
+        let task = tokio::spawn(async move {
+            p2.request_decision_in(
+                uuid::Uuid::new_v4(),
+                "brew",
+                "brew --version",
+                "telegram",
+                "chat-1",
+            )
+            .await
+        });
+        await_pending(&pending, 1).await;
+
+        let owners = vec!["owner1".to_string()];
+
+        // The control that keeps this from being a hole: the same bare verb from
+        // a DIFFERENT chat must still not answer it. Scoping the request must
+        // make it answerable *there*, not anywhere.
+        assert!(
+            try_handle_reply("ok", &security, "owner1", &owners, "telegram", "chat-2").is_none(),
+            "a bare verb from another chat must not answer this request"
+        );
+        assert_eq!(pending.list().len(), 1, "and it stays pending");
+
+        let ack = try_handle_reply("ok", &security, "owner1", &owners, "telegram", "chat-1")
+            .expect("a bare verb in the originating chat is recognised");
+        assert!(ack.contains("session"), "ack={ack}");
+        assert_eq!(task.await.unwrap(), Decision::Session);
+        assert!(security
+            .runtime_allowlist_snapshot()
+            .contains(&"brew".to_string()));
+    }
+
+    /// The mechanism the test above depends on: the dispatch loop sets the
+    /// chat, and everything outside a turn sees none — which is what keeps the
+    /// TUI and CLI paths unscoped.
+    #[tokio::test]
+    async fn the_turn_scope_is_present_inside_a_turn_and_absent_outside_one() {
+        assert_eq!(
+            crate::security::current_turn_scope(),
+            (String::new(), String::new()),
+            "no turn is in flight here"
+        );
+
+        let seen = crate::security::TURN_SCOPE
+            .scope(("telegram".to_string(), "chat-1".to_string()), async {
+                crate::security::current_turn_scope()
+            })
+            .await;
+        assert_eq!(seen, ("telegram".to_string(), "chat-1".to_string()));
     }
 
     /// The cross-chat hole, on the path that carried it.
