@@ -215,11 +215,14 @@ pub(crate) fn build_configured_channels(
         channels.push((
             "linq",
             "Linq",
-            Arc::new(LinqChannel::new(
-                lq.api_token.clone(),
-                lq.from_phone.clone(),
-                lq.allowed_senders.clone(),
-            )),
+            Arc::new(
+                LinqChannel::new(
+                    lq.api_token.clone(),
+                    lq.from_phone.clone(),
+                    lq.allowed_senders.clone(),
+                )
+                .with_multimodal(config.multimodal.clone()),
+            ),
         ));
     }
 

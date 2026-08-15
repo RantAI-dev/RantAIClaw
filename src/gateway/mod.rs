@@ -2238,7 +2238,11 @@ async fn handle_linq_webhook(
     }
 
     // Parse messages from the webhook payload
-    let messages = linq.parse_webhook_payload(&payload);
+    let mut messages = linq.parse_webhook_payload(&payload);
+    // Inbound images are fetched, sniffed and size-capped here rather than
+    // handed to the agent as a remote URL — see
+    // `docs/security/inbound-media-policy.md`.
+    linq.hydrate_media(&mut messages).await;
 
     if messages.is_empty() {
         // Acknowledge the webhook even if no messages (could be status/delivery events)
