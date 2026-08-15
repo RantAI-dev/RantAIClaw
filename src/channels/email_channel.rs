@@ -172,6 +172,9 @@ pub struct EmailChannel {
     /// Bounded: an unbounded `HashSet` grew for the lifetime of the process,
     /// one entry per message ever seen.
     seen_messages: Arc<Mutex<(std::collections::VecDeque<String>, HashSet<String>)>>,
+    /// Size/type limits for inbound images. Defaults to the shipped
+    /// `[multimodal]` defaults; the factory overrides it with the operator's.
+    multimodal: crate::config::MultimodalConfig,
 }
 
 impl EmailChannel {
@@ -184,7 +187,15 @@ impl EmailChannel {
                 std::collections::VecDeque::new(),
                 HashSet::new(),
             ))),
+            multimodal: crate::config::MultimodalConfig::default(),
         }
+    }
+
+    /// Apply the operator's `[multimodal]` limits to inbound images.
+    #[must_use]
+    pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {
+        self.multimodal = multimodal;
+        self
     }
 
     /// Remember a message id, evicting the oldest once the window is full.
@@ -447,6 +458,72 @@ impl EmailChannel {
         "(no readable content)".to_string()
     }
 
+    /// The text one email contributes to the agent's context: subject, body,
+    /// then a marker per image attachment.
+    ///
+    /// Split out of `fetch_unseen` so it is reachable without an IMAP session.
+    /// Assembling it inline there meant no test could see what the agent
+    /// actually receives.
+    fn message_content(&self, parsed: &mail_parser::Message) -> String {
+        let subject = parsed.subject().unwrap_or("(no subject)");
+        let mut content = format!("Subject: {}\n\n{}", subject, Self::extract_text(parsed));
+        for marker in self.attachment_markers(parsed) {
+            content.push('\n');
+            content.push_str(&marker);
+        }
+        content
+    }
+
+    /// Turn an email's image attachments into markers, per
+    /// `docs/security/inbound-media-policy.md`: images become `[IMAGE:data:…]`,
+    /// a rejection becomes a visible note.
+    ///
+    /// Email is the one channel that needs no fetch — `mail_parser` has already
+    /// decoded the bytes — so no credential and no attacker-chosen host are
+    /// involved, and only the size/type half of the policy applies.
+    ///
+    /// Runs on the whole message, not on `extract_text`'s attachment loop:
+    /// that loop is a *fallback* reached only when the mail has neither a text
+    /// nor an HTML body, so a screenshot attached to an ordinary email never
+    /// reached it at all.
+    ///
+    /// Parts that neither claim to be an image nor look like one are left
+    /// alone. Every channel's attachments are things a human deliberately
+    /// attached; an email's also include protocol furniture — vCards, calendar
+    /// invites, delivery reports — and a "not an image" note on each of those
+    /// would be noise on ordinary mail. Anything that *is* or *claims to be* an
+    /// image still always produces a marker.
+    fn attachment_markers(&self, parsed: &mail_parser::Message) -> Vec<String> {
+        use crate::channels::media;
+
+        let (max_images, _) = self.multimodal.effective_limits();
+        let cap = media::max_bytes(&self.multimodal);
+
+        parsed
+            .attachments()
+            .filter_map(|part| {
+                let bytes = part.contents();
+                let claimed = MimeHeaders::content_type(part)
+                    .map(|ct| match ct.subtype() {
+                        Some(sub) => format!("{}/{}", ct.ctype(), sub),
+                        None => ct.ctype().to_string(),
+                    })
+                    .unwrap_or_default();
+                let claimed = (!claimed.is_empty()).then_some(claimed);
+                // Either half is enough: the claim catches an oversized JPEG
+                // whose bytes we would otherwise skip, and the sniff catches a
+                // real PNG mislabelled `application/pdf`.
+                if !media::claimed_type_is_image(claimed.as_deref())
+                    && media::sniff_image_mime(bytes).is_none()
+                {
+                    return None;
+                }
+                Some(media::accept_bytes(bytes, claimed.as_deref(), cap).to_marker())
+            })
+            .take(max_images)
+            .collect()
+    }
+
     /// Connect to IMAP server with TLS and authenticate
     async fn connect_imap(&self) -> Result<ImapSession> {
         let addr = format!("{}:{}", self.config.imap_host, self.config.imap_port);
@@ -515,9 +592,8 @@ impl EmailChannel {
                 self.remember_seen(uid.to_string()).await;
                 continue;
             };
-            let subject = parsed.subject().unwrap_or("(no subject)").to_string();
-            let body_text = Self::extract_text(&parsed);
-            let content = format!("Subject: {}\n\n{}", subject, body_text);
+            // Reached only once `sender_identity` above has accepted the sender.
+            let content = self.message_content(&parsed);
             let msg_id = parsed
                 .message_id()
                 .map(|s| s.to_string())
@@ -1193,6 +1269,133 @@ mod tests {
                 "port {port} should build"
             );
         }
+    }
+
+    // Inbound attachments
+
+    /// A multipart mail with a plain-text body and one attachment part.
+    ///
+    /// The body matters: `extract_text` returns at the first text or HTML body
+    /// and only falls through to the attachment loop when there is neither, so
+    /// a screenshot on an ordinary email is exactly the case that used to be
+    /// dropped.
+    fn mail_with_attachment(part_mime: &str, bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!(
+            "From: user_a@example.com\r\n\
+             Subject: look at this\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n\
+             \r\n\
+             --BOUND\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             here is the shot\r\n\
+             --BOUND\r\n\
+             Content-Type: {part_mime}\r\n\
+             Content-Disposition: attachment; filename=\"part.bin\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             \r\n\
+             {encoded}\r\n\
+             --BOUND--\r\n"
+        )
+    }
+
+    fn content_for(ch: &EmailChannel, raw: &str) -> String {
+        let parsed = MessageParser::default()
+            .parse(raw.as_bytes())
+            .expect("parse mail");
+        ch.message_content(&parsed)
+    }
+
+    fn png_bytes(padding: usize) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, padding));
+        bytes
+    }
+
+    fn media_channel(max_image_size_mb: usize) -> EmailChannel {
+        EmailChannel::new(EmailConfig {
+            allowed_senders: vec!["*".to_string()],
+            ..Default::default()
+        })
+        .with_multimodal(crate::config::MultimodalConfig {
+            max_image_size_mb,
+            ..Default::default()
+        })
+    }
+
+    /// The defect: an attached screenshot never reached the agent, because the
+    /// only attachment handling sat in `extract_text`'s no-body fallback.
+    #[test]
+    fn an_attached_image_reaches_the_agent_alongside_the_body() {
+        let out = content_for(
+            &media_channel(5),
+            &mail_with_attachment("image/png", &png_bytes(32)),
+        );
+        assert!(
+            out.contains("[IMAGE:data:image/png;base64,"),
+            "no image marker: {out}"
+        );
+        // The body is still there — the marker is appended, not substituted.
+        assert!(out.contains("here is the shot"), "{out}");
+        assert!(out.starts_with("Subject: look at this"), "{out}");
+    }
+
+    /// The bytes decide, not the sender's `Content-Type`.
+    #[test]
+    fn bytes_that_are_not_an_image_are_rejected_even_when_claimed_as_one() {
+        let out = content_for(
+            &media_channel(5),
+            &mail_with_attachment("image/png", b"%PDF-1.7 not a png"),
+        );
+        assert!(out.contains("unsupported type"), "{out}");
+        assert!(!out.contains("[IMAGE:"), "{out}");
+    }
+
+    /// An honest PNG mislabelled `application/pdf` must still be caught and
+    /// reported, not skipped as "not media".
+    #[test]
+    fn an_image_mislabelled_as_a_document_is_reported_not_dropped() {
+        let out = content_for(
+            &media_channel(5),
+            &mail_with_attachment("application/pdf", &png_bytes(32)),
+        );
+        assert!(out.contains("type mismatch"), "{out}");
+        assert!(!out.contains("[IMAGE:"), "{out}");
+    }
+
+    /// The cap comes from `[multimodal].max_image_size_mb`, and going over it
+    /// is a visible note rather than a truncated image.
+    #[test]
+    fn an_oversized_image_becomes_a_visible_note() {
+        // `effective_limits` clamps to 1 MiB minimum, so the payload must beat that.
+        let out = content_for(
+            &media_channel(1),
+            &mail_with_attachment("image/png", &png_bytes(1024 * 1024 + 1)),
+        );
+        // Truncated on purpose: the failing value here is a megabyte of base64,
+        // and dumping it turns one CI failure into an unreadable log.
+        let head: String = out.chars().take(200).collect();
+        assert!(out.contains("too large"), "{head}");
+        assert!(
+            !out.contains("[IMAGE:"),
+            "accepted an oversized image: {head}"
+        );
+    }
+
+    /// Protocol furniture — a calendar invite, a vCard, a delivery report — is
+    /// not media and must not produce a "not an image" note on ordinary mail.
+    #[test]
+    fn a_non_media_attachment_produces_no_marker() {
+        let out = content_for(
+            &media_channel(5),
+            &mail_with_attachment("text/calendar", b"BEGIN:VCALENDAR\r\nEND:VCALENDAR"),
+        );
+        assert!(!out.contains("[IMAGE:"), "{out}");
+        assert!(!out.contains("Attachment rejected"), "{out}");
+        assert!(out.contains("here is the shot"), "{out}");
     }
 
     // Sender authentication

@@ -139,3 +139,13 @@ picture, rather than answer confidently about one it never received.
 4. Convert to a `data:` URI and emit the `[IMAGE:…]` marker the multimodal path
    already understands (`docs/reference/channels.md` §1).
 5. On any rejection, append the note to the message content. Never drop silently.
+
+Steps 1 and 2 assume a transport that hands over a URL. **Email does not**: the
+IMAP message already carries the decoded bytes, so it skips straight to step 3
+with `media::accept_bytes`. No credential and no attacker-chosen host are
+involved on that path — only the size and type rules apply.
+
+Email is also the one inbound surface where the attachment list is not entirely
+human intent: calendar invites, vCards and delivery reports arrive as parts.
+Those are skipped rather than annotated. Rule 5 still binds everything that *is*
+or *claims to be* an image, which is what a user who sent a screenshot needs.
