@@ -338,8 +338,19 @@ impl Tool for ShellTool {
                             error: Some(format!("{reason}{BLOCKED_COMMAND_REMEDIATION}")),
                         });
                     };
+                    // The chat this turn came from, when there is one. Empty on
+                    // the TUI and CLI paths, which keeps those unscoped exactly
+                    // as before — an unscoped request is still answerable only
+                    // by naming the command.
+                    let (channel, reply_target) = crate::security::current_turn_scope();
                     let decision = approvals
-                        .request_decision(basename.clone(), command.to_string(), "")
+                        .request_decision_in(
+                            uuid::Uuid::new_v4(),
+                            basename.clone(),
+                            command.to_string(),
+                            channel,
+                            reply_target,
+                        )
                         .await;
                     match decision {
                         Decision::Once | Decision::Session => {
@@ -607,7 +618,7 @@ mod tests {
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, PendingApprovals, SecurityPolicy};
 
-    fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
+    pub(super) fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(
             SecurityPolicy::default()
                 .with_autonomy(autonomy)
@@ -615,7 +626,7 @@ mod tests {
         )
     }
 
-    fn test_runtime() -> Arc<dyn RuntimeAdapter> {
+    pub(super) fn test_runtime() -> Arc<dyn RuntimeAdapter> {
         Arc::new(NativeRuntime::new())
     }
 
@@ -1305,5 +1316,86 @@ mod tests {
             !alive,
             "SIGTERM-ignoring leader pid {pid} must be SIGKILLed by the escalation"
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_scope_tests {
+    use super::tests::{test_runtime, test_security};
+    use super::*;
+    use crate::security::{AutonomyLevel, Decision, PendingApprovals, PendingRequest};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Wait for the shell tool to register its approval, then hand it back.
+    async fn first_pending(pending: &PendingApprovals) -> PendingRequest {
+        for _ in 0..200 {
+            if let Some(r) = pending.list().into_iter().next() {
+                return r;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the shell tool should have registered an approval");
+    }
+
+    /// The wiring, not the mechanism: `ShellTool` must actually put the current
+    /// turn's chat on the request it registers.
+    ///
+    /// A test that calls `request_decision_in` directly proves the relay can
+    /// answer a scoped request and passes whether or not `ShellTool` supplies
+    /// the scope — that gap is why this drives the tool itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shell_registers_its_approval_against_the_turns_chat() {
+        let security = test_security(AutonomyLevel::Supervised);
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(pending.clone());
+        let tool = ShellTool::new(Arc::clone(&security), test_runtime());
+
+        // A command Supervised does not pre-allow, so it blocks on approval.
+        let run = tokio::spawn(crate::security::TURN_SCOPE.scope(
+            ("telegram".to_string(), "chat-42".to_string()),
+            async move {
+                let _ = tool
+                    .execute(serde_json::json!({ "command": "brew --version" }))
+                    .await;
+            },
+        ));
+
+        let request = first_pending(&pending).await;
+        assert_eq!(
+            (request.channel.as_str(), request.reply_target.as_str()),
+            ("telegram", "chat-42"),
+            "the shell approval must name the chat the turn came from, or it \
+             cannot be answered by a bare `ok` there"
+        );
+
+        pending.resolve(request.id, Decision::Deny);
+        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    }
+
+    /// Outside a turn — the TUI and CLI paths — the request stays unscoped, so
+    /// `bare_verb_does_not_resolve_an_unscoped_shell_request` still applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shell_outside_a_turn_still_registers_unscoped() {
+        let security = test_security(AutonomyLevel::Supervised);
+        let pending = Arc::new(PendingApprovals::new(Some(Duration::from_secs(5))));
+        security.set_pending(pending.clone());
+        let tool = ShellTool::new(Arc::clone(&security), test_runtime());
+
+        let run = tokio::spawn(async move {
+            let _ = tool
+                .execute(serde_json::json!({ "command": "brew --version" }))
+                .await;
+        });
+
+        let request = first_pending(&pending).await;
+        assert!(
+            request.reply_target.is_empty(),
+            "with no turn in flight there is no chat to name, got {:?}",
+            request.reply_target
+        );
+
+        pending.resolve(request.id, Decision::Deny);
+        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
     }
 }

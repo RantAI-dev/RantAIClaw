@@ -43,7 +43,7 @@ pub use detect::create_sandbox;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
 #[allow(unused_imports)]
-pub use pending::{Decision, PendingApprovals, PendingRequest};
+pub use pending::{current_turn_scope, Decision, PendingApprovals, PendingRequest, TURN_SCOPE};
 pub use policy::{AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;

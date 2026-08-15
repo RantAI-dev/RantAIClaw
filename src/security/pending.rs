@@ -52,15 +52,50 @@ pub struct PendingRequest {
     pub channel: String,
     /// Chat/room the request can be answered from, alongside `channel`.
     ///
-    /// Empty means **unscoped**: the registering surface had no message
-    /// context to attach. `ShellTool` is the live case — it is a `Tool`, and the
-    /// trait carries no originating message, so a shell approval genuinely
-    /// cannot name a chat. An unscoped request is deliberately NOT resolvable by
-    /// a bare `ok`/`y`; it needs its request handle. See
+    /// Empty means **unscoped**: the registering surface had no message context
+    /// to attach — a direct TUI or CLI run. An unscoped request is deliberately
+    /// NOT resolvable by a bare `ok`/`y`; it needs its request handle. See
     /// `resolve_by_basename_in`.
+    ///
+    /// `ShellTool` used to be permanently in that state, because it is a `Tool`
+    /// and the trait carries no originating message. It now reads the turn's
+    /// chat from [`TURN_SCOPE`], so a shell approval raised by a channel turn
+    /// names the chat it came from.
     pub reply_target: String,
     /// Unix epoch seconds when the request was created.
     pub created_at: u64,
+}
+
+tokio::task_local! {
+    /// The chat the current turn came from: `(channel, reply_target)`.
+    ///
+    /// `ShellTool` is a `Tool`, and the trait carries no originating message —
+    /// so a shell approval used to register with both fields empty, which made
+    /// it **unscoped**: answerable only by naming the command (`allow brew`),
+    /// never by a bare `ok`. That was a real limitation, not a safety property
+    /// on its own: `resolve_by_basename_in` already refuses when more than one
+    /// request matches, so two parallel `curl` calls cannot be answered by a
+    /// guess either way.
+    ///
+    /// A task-local rather than a `Tool` trait parameter: the tool registry is
+    /// built **once** and shared across every channel and every turn, so a
+    /// constructor field would be wrong for all but one caller, and widening a
+    /// public trait for one tool's benefit is worse than ambient context that
+    /// the one tool reads. Set by the channel dispatch around the tool loop; the
+    /// loop does not spawn between there and `Tool::execute`, so it survives.
+    ///
+    /// Absent on the TUI and CLI paths, where there is no chat — those keep
+    /// today's unscoped behaviour.
+    pub static TURN_SCOPE: (String, String);
+}
+
+/// The current turn's `(channel, reply_target)`, or empty strings when there is
+/// none — a direct CLI or TUI run.
+#[must_use]
+pub fn current_turn_scope() -> (String, String) {
+    TURN_SCOPE
+        .try_with(|(channel, reply_target)| (channel.clone(), reply_target.clone()))
+        .unwrap_or_default()
 }
 
 impl PendingRequest {
