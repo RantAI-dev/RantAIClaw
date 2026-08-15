@@ -23,7 +23,124 @@ pub struct DiscordChannel {
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
+/// What the gateway loop should do with one `MESSAGE_CREATE` payload.
+///
+/// Extracted so the allowlist gate, the guild filter and the reply anchor are
+/// reachable from a test — they used to sit inside `listen()`'s socket loop,
+/// which no test enters, so deleting any of them left every test in this file
+/// passing. This is a **move**: the ordering of the checks and their
+/// conditions are unchanged.
+#[derive(Debug)]
+pub(crate) enum DiscordInbound {
+    /// The bot's own message, a bot author while `listen_to_bots` is off, a
+    /// message from a guild the filter excludes, or content that is empty or
+    /// not addressed to the bot under `mention_only`.
+    Ignore,
+    /// Not in the allowlist. The caller runs the pairing path, which needs the
+    /// network, then drops the message.
+    Unauthorized {
+        author_id: String,
+        raw_content: String,
+    },
+    /// Deliverable. Attachments are appended by the caller — that fetch needs
+    /// the network.
+    Deliver(ChannelMessage),
+}
+
 impl DiscordChannel {
+    /// Classify the `d` object of one `MESSAGE_CREATE` event.
+    pub(crate) fn classify_inbound(
+        &self,
+        d: &serde_json::Value,
+        bot_user_id: &str,
+    ) -> DiscordInbound {
+        // Skip messages from the bot itself
+        let author_id = d
+            .get("author")
+            .and_then(|a| a.get("id"))
+            .and_then(|i| i.as_str())
+            .unwrap_or("");
+        if author_id == bot_user_id {
+            return DiscordInbound::Ignore;
+        }
+
+        // Skip bot messages (unless listen_to_bots is enabled)
+        if !self.listen_to_bots
+            && d.get("author")
+                .and_then(|a| a.get("bot"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            return DiscordInbound::Ignore;
+        }
+
+        // Sender validation
+        if !self.is_user_allowed(author_id) {
+            // Carries the raw content (not the mention-stripped form) so the
+            // caller's pairing path still sees DMs and unmentioned messages.
+            return DiscordInbound::Unauthorized {
+                author_id: author_id.to_string(),
+                raw_content: d
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            };
+        }
+
+        // Guild filter
+        if let Some(ref gid) = self.guild_id {
+            let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
+            // DMs have no guild_id — let them through; for guild messages, enforce the filter
+            if let Some(g) = msg_guild {
+                if g != gid {
+                    return DiscordInbound::Ignore;
+                }
+            }
+        }
+
+        let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let Some(clean_content) =
+            normalize_incoming_content(content, self.mention_only, bot_user_id)
+        else {
+            return DiscordInbound::Ignore;
+        };
+
+        let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+
+        DiscordInbound::Deliver(ChannelMessage {
+            sender_aliases: Vec::new(),
+            id: if message_id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                format!("discord_{message_id}")
+            },
+            sender: author_id.to_string(),
+            reply_target: if channel_id.is_empty() {
+                author_id.to_string()
+            } else {
+                channel_id.to_string()
+            },
+            content: clean_content,
+            channel: "discord".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            // The prompting message, so the reply carries a
+            // `message_reference` back to it. Discord threads are
+            // channels, so `recipient` already routes into a thread;
+            // what was missing is the reply anchor that makes a busy
+            // channel readable.
+            thread_ts: if message_id.is_empty() {
+                None
+            } else {
+                Some(message_id.to_string())
+            },
+        })
+    }
+
     pub fn new(
         bot_token: String,
         guild_id: Option<String>,
@@ -371,8 +488,6 @@ impl Channel for DiscordChannel {
             }
         });
 
-        let guild_filter = self.guild_id.clone();
-
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
@@ -438,118 +553,57 @@ impl Channel for DiscordChannel {
                         continue;
                     };
 
-                    // Skip messages from the bot itself
-                    let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
-                    if author_id == bot_user_id {
-                        continue;
-                    }
-
-                    // Skip bot messages (unless listen_to_bots is enabled)
-                    if !self.listen_to_bots && d.get("author").and_then(|a| a.get("bot")).and_then(serde_json::Value::as_bool).unwrap_or(false) {
-                        continue;
-                    }
-
-                    // Sender validation
-                    if !self.is_user_allowed(author_id) {
-                        // Before rejecting, let a not-yet-allowed user self-onboard
-                        // with a `/bind`/`/claim <code>` minted via
-                        // `rantaiclaw channels pair`. Uses the raw content (not the
-                        // mention-stripped form) so DMs and unmentioned messages are
-                        // still seen. On success the sender lands in `allowed_users`
-                        // (and, for an owner-capable `/claim`, `approval_owners`).
-                        let raw_content = d
-                            .get("content")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("");
-                        if let Some(root) = crate::channels::pairing::profile_root("discord") {
-                            let identities = Self::extract_pairing_identities(d);
-                            if let Some(reply) = crate::channels::pairing::try_handle_pairing(
-                                raw_content,
-                                "discord",
-                                crate::channels::pairing::AllowlistField::AllowedUsers,
-                                &identities,
-                                &root,
-                            )
-                            .await
-                            {
-                                // Mirror into the runtime allowlist so access is
-                                // effective immediately (config is already saved).
-                                for id in &identities {
-                                    self.add_allowed_identity_runtime(id);
+                    // The decision — including the allowlist gate, the guild
+                    // filter and the reply anchor — lives in `classify_inbound`
+                    // so a test can reach it. Everything the arms below do
+                    // needs the network, which is why it stays here.
+                    let mut channel_msg = match self.classify_inbound(d, &bot_user_id) {
+                        DiscordInbound::Ignore => continue,
+                        DiscordInbound::Deliver(channel_msg) => channel_msg,
+                        DiscordInbound::Unauthorized { author_id, raw_content } => {
+                            // Before rejecting, let a not-yet-allowed user self-onboard
+                            // with a `/bind`/`/claim <code>` minted via
+                            // `rantaiclaw channels pair`. On success the sender lands in
+                            // `allowed_users` (and, for an owner-capable `/claim`,
+                            // `approval_owners`).
+                            if let Some(root) = crate::channels::pairing::profile_root("discord") {
+                                let identities = Self::extract_pairing_identities(d);
+                                if let Some(reply) = crate::channels::pairing::try_handle_pairing(
+                                    &raw_content,
+                                    "discord",
+                                    crate::channels::pairing::AllowlistField::AllowedUsers,
+                                    &identities,
+                                    &root,
+                                )
+                                .await
+                                {
+                                    // Mirror into the runtime allowlist so access is
+                                    // effective immediately (config is already saved).
+                                    for id in &identities {
+                                        self.add_allowed_identity_runtime(id);
+                                    }
+                                    let channel_id = d
+                                        .get("channel_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or(author_id.as_str());
+                                    let _ = self.send(&SendMessage::new(reply, channel_id)).await;
+                                    continue;
                                 }
-                                let channel_id = d
-                                    .get("channel_id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                    .unwrap_or(author_id);
-                                let _ = self.send(&SendMessage::new(reply, channel_id)).await;
-                                continue;
                             }
+                            tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
+                            continue;
                         }
-                        tracing::warn!("Discord: ignoring message from unauthorized user: {author_id}");
-                        continue;
-                    }
-
-                    // Guild filter
-                    if let Some(ref gid) = guild_filter {
-                        let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
-                        // DMs have no guild_id — let them through; for guild messages, enforce the filter
-                        if let Some(g) = msg_guild {
-                            if g != gid {
-                                continue;
-                            }
-                        }
-                    }
-
-                    let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let Some(clean_content) =
-                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
-                    else {
-                        continue;
                     };
-
-                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
                     // Inbound images become markers the multimodal path
                     // already understands; a rejection becomes a visible note.
-                    let mut clean_content = clean_content;
                     for marker in self.attachment_markers(d).await {
-                        if !clean_content.is_empty() {
-                            clean_content.push('\n');
+                        if !channel_msg.content.is_empty() {
+                            channel_msg.content.push('\n');
                         }
-                        clean_content.push_str(&marker);
+                        channel_msg.content.push_str(&marker);
                     }
-
-                    let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
-                        id: if message_id.is_empty() {
-                            Uuid::new_v4().to_string()
-                        } else {
-                            format!("discord_{message_id}")
-                        },
-                        sender: author_id.to_string(),
-                        reply_target: if channel_id.is_empty() {
-                            author_id.to_string()
-                        } else {
-                            channel_id.clone()
-                        },
-                        content: clean_content,
-                        channel: "discord".to_string(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        // The prompting message, so the reply carries a
-                        // `message_reference` back to it. Discord threads are
-                        // channels, so `recipient` already routes into a thread;
-                        // what was missing is the reply anchor that makes a busy
-                        // channel readable.
-                        thread_ts: if message_id.is_empty() {
-                            None
-                        } else {
-                            Some(message_id.to_string())
-                        },
-                    };
 
                     if tx.send(channel_msg).await.is_err() {
                         break;
@@ -678,22 +732,114 @@ mod tests {
             .is_empty());
     }
 
+    /// One `MESSAGE_CREATE` `d` object from `author_id`, in `guild_id`.
+    fn inbound(author_id: &str, content: &str, guild_id: Option<&str>) -> serde_json::Value {
+        let mut d = serde_json::json!({
+            "id": "MSG_1",
+            "channel_id": "C_CHAN",
+            "content": content,
+            "author": { "id": author_id, "username": "rantaiclaw_user" },
+        });
+        if let Some(guild_id) = guild_id {
+            d["guild_id"] = serde_json::json!(guild_id);
+        }
+        d
+    }
+
     #[test]
-    fn discord_inbound_thread_id_is_captured() {
-        let src = include_str!("discord.rs");
-        let production = src.split("#[cfg(test)]").next().expect("source");
-        let listen = production
-            .split("async fn listen(")
-            .nth(1)
-            .expect("listen exists");
-        let construct = listen
-            .find("thread_ts:")
-            .expect("the inbound message sets thread_ts");
-        let window = &listen[construct..construct + 200];
-        assert!(
-            window.contains("message_id"),
-            "the reply anchor must come from the inbound message id, got: {window}"
+    fn discord_allowlist_gate_decides_inbound() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["U_OK".into()], false, false);
+
+        match ch.classify_inbound(&inbound("U_BAD", "hi", None), "U_BOT") {
+            DiscordInbound::Unauthorized {
+                author_id,
+                raw_content,
+            } => {
+                assert_eq!(author_id, "U_BAD");
+                // The pairing path needs the raw, un-stripped content.
+                assert_eq!(raw_content, "hi");
+            }
+            other => panic!("an unlisted sender must not be delivered: {other:?}"),
+        }
+
+        match ch.classify_inbound(&inbound("U_OK", "hi", None), "U_BOT") {
+            DiscordInbound::Deliver(msg) => assert_eq!(msg.sender, "U_OK"),
+            other => panic!("a listed sender must be delivered: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discord_inbound_thread_anchor_is_the_prompting_message() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, false);
+        match ch.classify_inbound(&inbound("U_OK", "hi", None), "U_BOT") {
+            DiscordInbound::Deliver(msg) => {
+                // The reply anchor is the inbound message id, not the channel.
+                assert_eq!(msg.thread_ts.as_deref(), Some("MSG_1"));
+                assert_eq!(msg.id, "discord_MSG_1");
+                assert_eq!(msg.reply_target, "C_CHAN");
+            }
+            other => panic!("expected delivery: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discord_ignores_its_own_message_and_other_bots() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, false);
+        assert!(matches!(
+            ch.classify_inbound(&inbound("U_BOT", "hi", None), "U_BOT"),
+            DiscordInbound::Ignore
+        ));
+
+        let mut from_bot = inbound("U_OTHER_BOT", "hi", None);
+        from_bot["author"]["bot"] = serde_json::json!(true);
+        assert!(matches!(
+            ch.classify_inbound(&from_bot, "U_BOT"),
+            DiscordInbound::Ignore
+        ));
+
+        let listening = DiscordChannel::new("token".into(), None, vec!["*".into()], true, false);
+        assert!(matches!(
+            listening.classify_inbound(&from_bot, "U_BOT"),
+            DiscordInbound::Deliver(_)
+        ));
+    }
+
+    #[test]
+    fn discord_guild_filter_excludes_other_guilds_but_not_dms() {
+        let ch = DiscordChannel::new(
+            "token".into(),
+            Some("G_MINE".into()),
+            vec!["*".into()],
+            false,
+            false,
         );
+        assert!(matches!(
+            ch.classify_inbound(&inbound("U_OK", "hi", Some("G_OTHER")), "U_BOT"),
+            DiscordInbound::Ignore
+        ));
+        assert!(matches!(
+            ch.classify_inbound(&inbound("U_OK", "hi", Some("G_MINE")), "U_BOT"),
+            DiscordInbound::Deliver(_)
+        ));
+        // A DM carries no guild_id and must still get through.
+        assert!(matches!(
+            ch.classify_inbound(&inbound("U_OK", "hi", None), "U_BOT"),
+            DiscordInbound::Deliver(_)
+        ));
+    }
+
+    #[test]
+    fn discord_mention_only_drops_unmentioned_content() {
+        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, true);
+        assert!(matches!(
+            ch.classify_inbound(&inbound("U_OK", "hi", None), "U_BOT"),
+            DiscordInbound::Ignore
+        ));
+        match ch.classify_inbound(&inbound("U_OK", "<@U_BOT> hi", None), "U_BOT") {
+            // The mention tag is stripped from what the agent sees.
+            DiscordInbound::Deliver(msg) => assert_eq!(msg.content, "hi"),
+            other => panic!("a mentioned message must be delivered: {other:?}"),
+        }
     }
 
     #[test]
