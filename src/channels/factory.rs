@@ -43,7 +43,8 @@ pub(crate) fn build_configured_channels(
                     tg.allowed_users.clone(),
                     tg.mention_only,
                 )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_multimodal(config.multimodal.clone()),
             ),
         ));
     }
