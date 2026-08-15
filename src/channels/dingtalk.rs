@@ -807,6 +807,33 @@ client_secret = "secret"
         std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     }
 
+    /// The half `resolve_chat_id_handles_numeric_group_conversation_type` does
+    /// not reach: in a 1:1 DingTalk chat there is no `conversationId`, so the
+    /// reply target falls back to the sender. That fallback is the whole
+    /// sender-vs-reply-target decision on this channel, and nothing covered it.
+    #[test]
+    fn resolve_chat_id_replies_to_the_sender_in_a_private_chat() {
+        for conversation_type in [serde_json::json!("1"), serde_json::json!(1)] {
+            let data = serde_json::json!({ "conversationType": conversation_type });
+            assert_eq!(
+                DingTalkChannel::resolve_chat_id(&data, "staff-1"),
+                "staff-1",
+                "a 1:1 chat has no conversation id, so the reply goes back to the sender"
+            );
+        }
+
+        // A group conversation id must NOT be borrowed for a private chat.
+        let mislabelled = serde_json::json!({
+            "conversationType": "1",
+            "conversationId": "cid-group",
+        });
+        assert_eq!(
+            DingTalkChannel::resolve_chat_id(&mislabelled, "staff-1"),
+            "staff-1",
+            "conversationType decides, not the presence of a conversationId"
+        );
+    }
+
     #[test]
     fn resolve_chat_id_handles_numeric_group_conversation_type() {
         let data = serde_json::json!({

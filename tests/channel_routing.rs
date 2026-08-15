@@ -16,11 +16,26 @@
 //!
 //! Reachability, stated plainly: only `linq`, `nextcloud_talk`, `whatsapp` and
 //! (under `--features channel-lark`) `lark` expose a `pub` parse function.
-//! Telegram, Discord, Slack, Mattermost, Signal, QQ, DingTalk, Matrix, IRC,
-//! iMessage and Email parse inside `listen()` or behind private functions, so
-//! they cannot be reached from `tests/` without a production change — which
-//! plan 139 puts out of scope. Their equivalent assertions live in each
-//! channel's in-crate `#[cfg(test)]` module.
+//! The other eleven parse inside `listen()` or behind private functions, so
+//! they cannot be reached from `tests/` without widening the public API — which
+//! plan 139 puts out of scope, and which is a contract decision rather than a
+//! test one.
+//!
+//! The claim that "their equivalent assertions live in each channel's in-crate
+//! module" was too broad. Checked per channel:
+//!
+//! - **Telegram, Discord, Slack, Mattermost, Signal** — covered in-crate.
+//!   Discord's seam (`classify_inbound`) was extracted later, in #520.
+//! - **iMessage, Email** — `reply_target` *is* the sender: both are 1:1
+//!   surfaces, so a swap is a no-op and a test asserting it would pass either
+//!   way. Same reason plan 139 used a platform-id mutation for WhatsApp instead
+//!   of a field swap. Not a gap; nothing meaningful to assert.
+//! - **DingTalk** — `resolve_chat_id` is the whole decision and is covered both
+//!   ways: group conversation id, and the 1:1 fallback to the sender.
+//! - **QQ, IRC** — genuinely uncovered. Both build the message inside their
+//!   listen loop with no extracted seam, so closing this needs the same
+//!   extraction Discord got, not a test.
+//! - **Matrix** — unverifiable by anything: `matrix-sdk` compiles in no CI job.
 
 use async_trait::async_trait;
 use rantaiclaw::channels::traits::{Channel, ChannelMessage, SendMessage};
