@@ -170,7 +170,12 @@ impl TuiProvisioner for WhatsAppCloudProvisioner {
                 id: "verify_token".into(),
                 label: "Webhook verify token (your custom token, Meta will echo it back)".into(),
                 default: None,
-                secret: false,
+                // Masked like the `app_secret` prompt below it. This is a shared
+                // secret between the operator and Meta, and the operator is
+                // transcribing one they already hold — nothing here needs to be
+                // read back off the screen, so echoing it only put it in the
+                // terminal's scrollback.
+                secret: true,
             },
         )
         .await?;
