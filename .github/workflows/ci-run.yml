@@ -39,6 +39,23 @@ jobs:
                   BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
               run: ./scripts/ci/detect_change_scope.sh
 
+    identity:
+        # CLAUDE.md §9.1 is a merge gate, and identity strings can land in any
+        # file type — a fixture, a doc, a commit-message example. So this runs
+        # unconditionally: no `needs`, no scope `if`, no `ci:full` label. The
+        # script was added by #502 and then wired into no workflow at all, so
+        # the gate existed on disk and enforced nothing.
+        #
+        # Cheap by construction: a grep over tracked files, no toolchain, no
+        # build, no cache.
+        name: Identity Strings (CLAUDE.md 9.1)
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: No personal identity data
+              run: ./scripts/ci/check_identity_strings.sh --self-test
+
     lint:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
@@ -334,7 +351,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, features, e2e, bench-compile, build, docs-only, non-rust, docs-quality, lint-feedback]
+        needs: [changes, identity, lint, test, features, e2e, bench-compile, build, docs-only, non-rust, docs-quality, lint-feedback]
         runs-on: ubuntu-latest
         steps:
             - name: Enforce required status
@@ -346,6 +363,13 @@ jobs:
                   rust_changed="${{ needs.changes.outputs.rust_changed }}"
                   docs_changed="${{ needs.changes.outputs.docs_changed }}"
                   docs_result="${{ needs.docs-quality.result }}"
+
+                  # Checked before every fast path below: §9.1 applies to docs-only
+                  # and non-Rust changes too, so an early `exit 0` must not skip it.
+                  if [ "${{ needs.identity.result }}" != "success" ]; then
+                    echo "Identity-strings gate did not pass (CLAUDE.md 9.1)."
+                    exit 1
+                  fi
 
                   if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
                     if [ "$event_name" != "pull_request" ] && [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
