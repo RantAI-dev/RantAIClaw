@@ -18,7 +18,14 @@ pub struct LinqChannel {
     /// daemon restart (mirrors the persisted config update).
     allowed_senders: Arc<RwLock<Vec<String>>>,
     client: reqwest::Client,
+    /// Size/type limits for inbound images. Defaults to the shipped
+    /// `[multimodal]` defaults; the factory overrides it with the operator's.
+    multimodal: crate::config::MultimodalConfig,
 }
+
+/// Marker the synchronous webhook parser leaves behind for an inbound image;
+/// `hydrate_media` resolves it before dispatch.
+const PENDING_MEDIA_PREFIX: &str = "[LINQ_MEDIA:";
 
 /// Base URL every Linq request goes to.
 ///
@@ -47,7 +54,19 @@ impl LinqChannel {
             from_phone,
             allowed_senders: Arc::new(RwLock::new(allowed_senders)),
             client: reqwest::Client::new(),
+            multimodal: crate::config::MultimodalConfig::default(),
         }
+    }
+
+    /// Apply the operator's `[multimodal]` limits to inbound images.
+    #[must_use]
+    pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {
+        self.multimodal = multimodal;
+        self
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        self.client.clone()
     }
 
     /// Check if a sender phone number is allowed (E.164 format: +1234567890)
@@ -140,6 +159,16 @@ impl LinqChannel {
         &self.from_phone
     }
 
+    /// A media part becomes a **pending** marker, resolved by [`Self::hydrate_media`]
+    /// before dispatch.
+    ///
+    /// It used to emit `[IMAGE:<url>]` — the platform's URL, straight into the
+    /// agent's marker path. That was wrong twice over: the URL is fetched (if
+    /// at all) only when `[multimodal].allow_remote_fetch` is on, so under the
+    /// default config the image silently never loaded; and when it was on, an
+    /// attacker-supplied URL was fetched with no size cap and the type taken
+    /// from the payload. `docs/security/inbound-media-policy.md` exists to stop
+    /// exactly that.
     fn media_part_to_image_marker(part: &serde_json::Value) -> Option<String> {
         let source = part
             .get("url")
@@ -158,8 +187,40 @@ impl LinqChannel {
         if !mime_type.starts_with("image/") {
             return None;
         }
+        if source.contains(']') || source.contains('|') {
+            // The marker is delimited by `|` and `]`; a URL carrying either
+            // would let the payload forge a second marker.
+            tracing::warn!("Linq: skipping a media URL containing a marker delimiter");
+            return None;
+        }
 
-        Some(format!("[IMAGE:{source}]"))
+        Some(format!("{PENDING_MEDIA_PREFIX}{source}|{mime_type}]"))
+    }
+
+    /// Replace every pending media marker with a `data:` URI or a rejection
+    /// note, per `docs/security/inbound-media-policy.md`. Called by the gateway
+    /// after parsing and before dispatch, because the parser is synchronous.
+    pub async fn hydrate_media(&self, messages: &mut [ChannelMessage]) {
+        let cap = crate::channels::media::max_bytes(&self.multimodal);
+        let client = self.http_client();
+        for message in messages.iter_mut() {
+            while let Some(start) = message.content.find(PENDING_MEDIA_PREFIX) {
+                let Some(end) = message.content[start..].find(']') else {
+                    break;
+                };
+                let end = start + end + 1;
+                let inner = &message.content[start + PENDING_MEDIA_PREFIX.len()..end - 1];
+                let (url, claimed) = inner.rsplit_once('|').unwrap_or((inner, ""));
+                let claimed = (!claimed.is_empty()).then_some(claimed);
+                // No bearer: the host comes from the payload, so the channel's
+                // API token does not belong in this request.
+                let replacement =
+                    crate::channels::media::fetch_image(&client, url, None, claimed, cap)
+                        .await
+                        .to_marker();
+                message.content.replace_range(start..end, &replacement);
+            }
+        }
     }
 
     /// Parse an incoming webhook payload from Linq and extract messages.
@@ -715,9 +776,76 @@ mod tests {
             }
         });
 
+        // The parser leaves a PENDING marker: it is synchronous, and the
+        // policy (fetch bounded, sniff the bytes, embed as a data: URI) needs
+        // a request. `hydrate_media` resolves it before dispatch. This
+        // assertion used to expect `[IMAGE:<the platform's URL>]`, which is
+        // what handed an attacker-supplied URL to the agent's marker path.
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "[IMAGE:https://example.com/image.jpg]");
+        assert_eq!(
+            msgs[0].content,
+            "[LINQ_MEDIA:https://example.com/image.jpg|image/jpeg]"
+        );
+        assert!(
+            !msgs[0].content.starts_with("[IMAGE:"),
+            "a remote URL must not reach the agent as an image marker"
+        );
+    }
+
+    /// The marker is delimited by `|` and `]`, so a URL carrying either could
+    /// forge a second one. Such a part is dropped.
+    #[test]
+    fn linq_media_url_with_a_marker_delimiter_is_refused() {
+        let part = serde_json::json!({
+            "type": "media",
+            "url": "https://example.com/a]b.jpg",
+            "mime_type": "image/jpeg"
+        });
+        assert!(LinqChannel::media_part_to_image_marker(&part).is_none());
+
+        // Control: the same part without the delimiter is accepted.
+        let clean = serde_json::json!({
+            "type": "media",
+            "url": "https://example.com/ab.jpg",
+            "mime_type": "image/jpeg"
+        });
+        assert!(LinqChannel::media_part_to_image_marker(&clean).is_some());
+    }
+
+    #[tokio::test]
+    async fn linq_hydrate_media_applies_the_shared_policy() {
+        async fn pdf() -> (axum::http::HeaderMap, axum::body::Bytes) {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("content-type", "image/jpeg".parse().expect("header"));
+            (
+                headers,
+                axum::body::Bytes::from_static(b"%PDF-1.7 not an image"),
+            )
+        }
+        let app = axum::Router::new().route("/x.jpg", axum::routing::get(pdf));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let mut messages = vec![ChannelMessage {
+            content: format!("[LINQ_MEDIA:http://{addr}/x.jpg|image/jpeg]"),
+            ..Default::default()
+        }];
+        ch.hydrate_media(&mut messages).await;
+
+        // Bytes decide, not the claimed type — and the user is told.
+        assert!(
+            messages[0].content.contains("unsupported type"),
+            "{}",
+            messages[0].content
+        );
+        assert!(!messages[0].content.contains("LINQ_MEDIA"));
     }
 
     #[test]

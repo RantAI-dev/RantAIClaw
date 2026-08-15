@@ -35,7 +35,7 @@
 | Nextcloud Talk | the message references a file share; fetch via WebDAV with the app token | no | **Medium** | WebDAV is a different auth/path shape from the OCS API the channel already speaks |
 | Signal | `signal-cli` writes attachments to disk and reports the path | **no fetch at all** | **Cheap, but** | the bytes are already local — which collides head-on with the policy's "memory only" rule. Reading them is trivial; deciding whether a path outside our control counts as "landed on disk" is the actual work |
 | WhatsApp Web | `wa-rs` decrypts media itself | no HTTP | **Medium** | a different code path from Cloud entirely; belongs with plan 123's owner |
-| Linq | already converts `media` parts with an `image/*` MIME to markers | — | **Done, unpoliced** | it trusts the platform's claimed type and applies no size cap — it should move onto `media::` before it is called finished |
+| Linq | fetched, sniffed and size-capped through `media::` | — | **Done** | was emitting `[IMAGE:<platform URL>]` — unfetched, uncapped, type taken from the payload. Fixed after this write-up |
 | DingTalk | stream-mode frames carry a `downloadCode`, exchanged for a URL | no | **Medium** | one extra call, same shape as WhatsApp's two-step |
 | QQ | media URLs in the message payload | no | **Cheap** | |
 | Email | MIME parts are already in the message being parsed | **none** | **Cheapest** | `mail_parser` hands over the bytes; no network at all. This is the highest value-per-line remaining |
@@ -46,9 +46,10 @@
 
 1. **Email** — no fetch, no credential, bytes already in hand.
 2. **Slack, QQ** — plain authenticated fetch, the shape already implemented twice.
-3. **Move Telegram and Linq onto `media::`** — both predate the policy. Linq in
-   particular accepts a platform-claimed `image/*` with no size cap, which is
-   the exact combination the policy exists to prevent.
+3. **Move Telegram onto `media::`** — it predates the policy and keeps its own
+   25 MiB cap. (Linq is done: it was emitting the platform's URL unfetched, so
+   the image either never loaded under the default config or was fetched with
+   no cap and the type trusted.)
 4. **Lark, DingTalk, Nextcloud Talk** — one extra resolution step each.
 5. **Signal, iMessage** — only after the "bytes already on disk" question has an
    answer. Do not settle it channel by channel.
@@ -92,3 +93,5 @@ proves it; and Meta's media lookup response shape is version-dependent.
   sends; widening the accepted set is a separate decision per type.
 - **Telegram's own photo path still has its own 25 MiB cap** and does not use
   `media::`. It works; it is simply not yet under the shared policy.
+- **Linq moved onto `media::`** after this note was written; the row above
+  reflects the fix.

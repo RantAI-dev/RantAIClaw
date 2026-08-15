@@ -324,6 +324,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Linq images are fetched under the media policy instead of handed to the
+  agent as a URL.** The channel emitted `[IMAGE:<the platform's URL>]`, which
+  meant the image either silently never loaded (remote fetch is off by default)
+  or was fetched with no size cap and its type taken from the payload — the
+  exact combination `docs/security/inbound-media-policy.md` exists to prevent.
+  It now goes through the same bounded fetch, byte sniffing and visible
+  rejection as Discord and WhatsApp Cloud.
+
 - **Discord and WhatsApp Cloud accept inbound images.** A screenshot sent to the
   bot on either platform was dropped without acknowledgement; the agent could
   already reason about images, it just could not receive them anywhere people
