@@ -120,6 +120,15 @@ recorded here rather than left as an unstated gap.
 - **WhatsApp Web** (the reverse-engineered client), which decrypts its own media
   through `wa-rs` and does not use an HTTP fetch at all.
 
+## Providers that cannot see images
+
+The gate that refuses image input to a non-vision provider reads the whole
+conversation, so a stored image used to fail every later turn as well. Images
+in **history** are now replaced with an explicit note before that gate runs —
+only the turn the user just sent can be refused. The note is deliberately
+visible in the prompt: a model should be able to say it could not see the
+picture, rather than answer confidently about one it never received.
+
 ---
 
 ## Implementation checklist for a new channel

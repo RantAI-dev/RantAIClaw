@@ -127,6 +127,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An image sent to a model that cannot see images no longer breaks the
+  conversation.** The vision gate counted image markers across the **whole**
+  history, so once a stored turn carried a picture every later message failed
+  with `provider_capability_error` too — the chat stayed dead until someone
+  cleared its history out of band. Historic images are now replaced with an
+  explicit `[image omitted: this model cannot receive images]` note before the
+  gate runs; only the turn just sent can still be refused, and its message now
+  says the conversation is not stuck.
+
+- **Telegram photos obey the operator's `[multimodal]` limits.** That path
+  carried its own 25 MiB constant, checked only `Content-Length` (advisory),
+  never sniffed the bytes, and the caller dropped every failure with
+  `if let Ok(..)` — a photo that could not be fetched vanished with no reason
+  given. It now goes through the shared media policy like Discord, WhatsApp
+  Cloud and Linq, and a rejection reaches the user as a note.
+
 - **Configuring a channel in the TUI now starts it.** `/setup channels` wrote
   the config, printed "✓ configured", and left the live runtime untouched for
   the rest of the session — the change detector compared against a config that

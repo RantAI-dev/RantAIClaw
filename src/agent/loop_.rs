@@ -1502,13 +1502,27 @@ pub(crate) async fn run_structured_loop(
         // Flatten the structured history to provider messages for this turn.
         let provider_messages = dispatcher.to_provider_messages(history);
 
+        // A provider without vision must not be stuck forever on a conversation
+        // that once carried an image. The gate below counts markers across the
+        // WHOLE history, so a single stored image used to fail every later turn
+        // — the chat stayed broken until the history was cleared out of band.
+        // Historic images become a note; only the turn just sent can be refused.
+        let provider_messages = if provider.supports_vision() {
+            provider_messages
+        } else {
+            multimodal::redact_historic_image_markers(provider_messages)
+        };
+
         let image_marker_count = multimodal::count_image_markers(&provider_messages);
         if image_marker_count > 0 && !provider.supports_vision() {
             return Err(ProviderCapabilityError {
                 provider: provider_name.to_string(),
                 capability: "vision".to_string(),
                 message: format!(
-                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                    "received {image_marker_count} image marker(s), but this provider does not \
+                     support vision input. The image was not sent; switch to a vision-capable \
+                     model to describe it. Your next message goes through normally — the \
+                     conversation is not stuck."
                 ),
             }
             .into());
@@ -3027,6 +3041,62 @@ mod tests {
         assert!(err.to_string().contains("provider_capability_error"));
         assert!(err.to_string().contains("capability=vision"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The conversation used to stay broken forever: the gate counts markers
+    /// across the WHOLE history, so once a stored turn carried an image, every
+    /// later text-only message failed too and the operator had to clear the
+    /// history out of band to talk to the bot again.
+    #[tokio::test]
+    async fn a_stored_image_does_not_break_later_turns_on_a_blind_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        // The image is in HISTORY; the turn just sent is plain text.
+        let mut history = vec![
+            ChatMessage::user(
+                "look at this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            ),
+            ChatMessage::assistant("⚠️ Error: provider_capability_error".to_string()),
+            ChatMessage::user("never mind, what is 2 + 2?".to_string()),
+        ];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            None,
+            None,
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a text-only turn must go through: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the provider must actually have been called"
+        );
     }
 
     #[tokio::test]

@@ -332,6 +332,9 @@ pub struct TelegramChannel {
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
+    /// Size/type limits for inbound images. Defaults to the shipped
+    /// `[multimodal]` defaults; the factory overrides it with the operator's.
+    multimodal: crate::config::MultimodalConfig,
     /// Bot API root. Only the tests override it — nine of them used to send
     /// real requests to `api.telegram.org` with a fake token and assert
     /// `is_err()`, which passes whether or not the request was well formed.
@@ -394,8 +397,16 @@ impl TelegramChannel {
             typing_handles: Mutex::new(std::collections::HashMap::new()),
             mention_only,
             bot_username: Mutex::new(None),
+            multimodal: crate::config::MultimodalConfig::default(),
             api_base: TELEGRAM_API_BASE.to_string(),
         }
+    }
+
+    /// Apply the operator's `[multimodal]` limits to inbound photos.
+    #[must_use]
+    pub fn with_multimodal(mut self, multimodal: crate::config::MultimodalConfig) -> Self {
+        self.multimodal = multimodal;
+        self
     }
 
     /// Point this channel at a local server so a test can assert what was
@@ -1226,39 +1237,60 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     /// Download a Telegram photo by file_id, resize to fit within 1024px, and return as base64 data URI.
-    async fn resolve_photo_data_uri(&self, file_id: &str) -> anyhow::Result<String> {
+    /// Resolve a photo `file_id` to an `[IMAGE:…]` marker, or to the note the
+    /// user should see.
+    ///
+    /// The fetch goes through `channels::media`, so it obeys the operator's
+    /// `[multimodal].max_image_size_mb` (this path used to carry its own 25 MiB
+    /// constant), reads the body **bounded**, and decides the type from the
+    /// bytes. The caller used to drop any failure with `if let Ok(..)`, which
+    /// is the silent-drop the policy forbids.
+    async fn resolve_photo_marker(&self, file_id: &str) -> crate::channels::media::MediaOutcome {
+        use crate::channels::media::{ImageBytes, MediaOutcome};
         use base64::Engine as _;
 
         // Step 1: call getFile to get file_path
         let get_file_url = self.api_url(&format!("getFile?file_id={}", file_id));
-        let resp = self.http_client().get(&get_file_url).send().await?;
-        let json: serde_json::Value = resp.json().await?;
-        let file_path = json
+        let Ok(resp) = self.http_client().get(&get_file_url).send().await else {
+            return MediaOutcome::Rejected("Attachment unavailable: media fetch failed".into());
+        };
+        let Ok(json) = resp.json::<serde_json::Value>().await else {
+            return MediaOutcome::Rejected(
+                "Attachment unavailable: getFile returned no file path".into(),
+            );
+        };
+        let Some(file_path) = json
             .get("result")
             .and_then(|r| r.get("file_path"))
             .and_then(|p| p.as_str())
-            .ok_or_else(|| anyhow::anyhow!("getFile: no file_path in response"))?
-            .to_string();
+            .map(str::to_string)
+        else {
+            return MediaOutcome::Rejected(
+                "Attachment unavailable: getFile returned no file path".into(),
+            );
+        };
 
-        // Step 2: download the actual file
+        // Step 2: download under the shared policy.
         let download_url = format!("{}/file/bot{}/{}", self.api_base, self.bot_token, file_path);
-        let img_resp = self.http_client().get(&download_url).send().await?;
-        // Reject an oversized download before buffering it. Telegram caps bot
-        // file downloads at ~20MB; a body claiming more is malformed/hostile.
-        const MAX_PHOTO_BYTES: u64 = 25 * 1024 * 1024;
-        if let Some(len) = img_resp.content_length() {
-            if len > MAX_PHOTO_BYTES {
-                anyhow::bail!("telegram photo too large to process: {len} bytes");
-            }
-        }
-        let bytes = img_resp.bytes().await?;
+        let bytes = match crate::channels::media::fetch_image_bytes(
+            &self.http_client(),
+            &download_url,
+            None,
+            None,
+            crate::channels::media::max_bytes(&self.multimodal),
+        )
+        .await
+        {
+            ImageBytes::Ok { bytes, .. } => bytes,
+            ImageBytes::Rejected(note) => return MediaOutcome::Rejected(note),
+        };
 
         // Step 3: resize to max 512px on longest side to fit within model context.
-        let resized_bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+        let resize = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
             // Bound the decode: a small, heavily-compressed image can declare huge
             // dimensions and force a multi-GB pixel allocation (decompression
             // bomb) before the thumbnail step. Cap dimensions + total allocation.
-            let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes.as_ref()))
+            let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
                 .with_guessed_format()
                 .map_err(|e| anyhow::anyhow!("failed to read image header: {e}"))?;
             let mut limits = image::Limits::default();
@@ -1281,10 +1313,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             )?;
             Ok(buf)
         })
-        .await??;
+        .await;
+
+        let resized_bytes = match resize {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                tracing::warn!("Telegram: could not decode an inbound photo: {error}");
+                return MediaOutcome::Rejected(
+                    "Attachment rejected: the image could not be decoded".into(),
+                );
+            }
+            Err(error) => {
+                tracing::warn!("Telegram: photo resize task failed: {error}");
+                return MediaOutcome::Rejected(
+                    "Attachment unavailable: the image could not be processed".into(),
+                );
+            }
+        };
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(&resized_bytes);
-        Ok(format!("data:image/jpeg;base64,{}", b64))
+        MediaOutcome::Image(format!("data:image/jpeg;base64,{b64}"))
     }
 
     async fn send_text_chunks(
@@ -2322,15 +2370,14 @@ Ensure only one `rantaiclaw` process is using this bot token."
                         continue;
                     };
 
-                    // Resolve photo file_id to data URI and inject as IMAGE marker
+                    // Resolve the photo to a marker — or to a note saying why
+                    // it did not resolve. A dropped image used to be silent.
                     if let Some(file_id) = photo_file_id {
-                        if let Ok(data_uri) = self.resolve_photo_data_uri(&file_id).await {
-                            let image_marker = format!("[IMAGE:{}]", data_uri);
-                            if msg.content.is_empty() {
-                                msg.content = image_marker;
-                            } else {
-                                msg.content = format!("{}\n{}", msg.content, image_marker);
-                            }
+                        let marker = self.resolve_photo_marker(&file_id).await.to_marker();
+                        if msg.content.is_empty() {
+                            msg.content = marker;
+                        } else {
+                            msg.content = format!("{}\n{}", msg.content, marker);
                         }
                     }
 
@@ -3307,6 +3354,80 @@ mod tests {
         assert!(
             json.get("reply_parameters").is_none(),
             "a non-threaded inbound must not produce a threaded reply"
+        );
+    }
+
+    /// A photo that cannot be resolved used to vanish: the caller dropped every
+    /// error with `if let Ok(..)`, so the user got no answer and no reason.
+    #[tokio::test]
+    async fn telegram_photo_failure_becomes_a_visible_note() {
+        let (base, _captured) = spawn_bot_api().await;
+        let ch =
+            TelegramChannel::new("123:ABC".into(), vec!["*".into()], false).with_api_base(base);
+
+        // The stub answers `getFile` with `{"ok":true,"result":{}}` — no
+        // `file_path` — which is the shape a revoked/expired file id produces.
+        let marker = ch.resolve_photo_marker("file-1").await.to_marker();
+        assert!(marker.contains("Attachment unavailable"), "got: {marker}");
+        assert!(!marker.starts_with("[IMAGE:"));
+    }
+
+    /// A photo whose bytes are not an image must reach the user as a note, not
+    /// as silence and not as a broken `[IMAGE:]` marker.
+    #[tokio::test]
+    async fn telegram_photo_rejected_by_the_policy_becomes_a_note() {
+        use axum::response::IntoResponse;
+
+        async fn get_file() -> impl IntoResponse {
+            axum::Json(serde_json::json!({"ok": true, "result": {"file_path": "photos/x.jpg"}}))
+        }
+        async fn download() -> impl IntoResponse {
+            // Claims nothing; the bytes are not an image.
+            axum::body::Bytes::from_static(b"%PDF-1.7 not an image")
+        }
+
+        let app = axum::Router::new()
+            .route("/bot123:ABC/getFile", axum::routing::get(get_file))
+            .route(
+                "/file/bot123:ABC/photos/x.jpg",
+                axum::routing::get(download),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let ch = TelegramChannel::new("123:ABC".into(), vec!["*".into()], false)
+            .with_api_base(format!("http://{addr}"));
+        let marker = ch.resolve_photo_marker("file-1").await.to_marker();
+        assert!(marker.contains("unsupported type"), "got: {marker}");
+        assert!(!marker.starts_with("[IMAGE:"));
+    }
+
+    /// The 25 MiB constant this path used to carry is gone: the cap is the
+    /// operator's `[multimodal].max_image_size_mb`, applied by `media::`.
+    #[test]
+    fn telegram_photo_cap_comes_from_multimodal_config() {
+        let src = include_str!("telegram.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("source");
+        assert!(
+            !production.contains("MAX_PHOTO_BYTES"),
+            "the channel-local photo cap must be gone"
+        );
+        let resolver = production
+            .split("async fn resolve_photo_marker(")
+            .nth(1)
+            .expect("resolve_photo_marker exists");
+        assert!(
+            resolver.contains("media::fetch_image_bytes")
+                && resolver.contains("media::max_bytes(&self.multimodal)"),
+            "the fetch must go through the shared policy with the operator's cap"
         );
     }
 

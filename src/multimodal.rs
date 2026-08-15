@@ -118,6 +118,50 @@ pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
+/// Replace image markers in every message **except the last** with a plain-text
+/// note.
+///
+/// A provider without vision must not be permanently stuck: the gate that
+/// refuses image input counts markers across the whole conversation, so one
+/// stored image used to fail every later turn too — the chat stayed broken
+/// until someone cleared the history out of band. Historic images are dropped
+/// to a note (so the model can say it cannot see one) and only the turn the
+/// user just sent can still be refused.
+#[must_use]
+pub fn redact_historic_image_markers(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let last = messages.len().saturating_sub(1);
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut message)| {
+            if index == last || message.role != "user" {
+                return message;
+            }
+            let (cleaned, refs) = parse_image_markers(&message.content);
+            if refs.is_empty() {
+                return message;
+            }
+            let note = if refs.len() == 1 {
+                IMAGE_OMITTED_NOTE.to_string()
+            } else {
+                format!("{IMAGE_OMITTED_NOTE} (x{})", refs.len())
+            };
+            let cleaned = cleaned.trim();
+            message.content = if cleaned.is_empty() {
+                note
+            } else {
+                format!("{cleaned}\n{note}")
+            };
+            message
+        })
+        .collect()
+}
+
+/// What a historic image becomes for a provider that cannot see it. Explicit on
+/// purpose: the model should know an image was there and say so, rather than
+/// answer confidently about something it never received.
+pub const IMAGE_OMITTED_NOTE: &str = "[image omitted: this model cannot receive images]";
+
 pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
@@ -501,6 +545,45 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    /// Historic images become a note so a blind provider is not permanently
+    /// stuck; the turn the user just sent keeps its marker so the gate can
+    /// still refuse it once, with a clear reason.
+    #[test]
+    fn redaction_keeps_the_current_turn_and_notes_the_old_ones() {
+        let messages = vec![
+            ChatMessage::user("old [IMAGE:data:image/png;base64,AAA]".to_string()),
+            ChatMessage::assistant("I could not see it".to_string()),
+            ChatMessage::user("new [IMAGE:data:image/png;base64,BBB]".to_string()),
+        ];
+
+        let redacted = redact_historic_image_markers(messages);
+
+        assert_eq!(redacted[0].content, format!("old\n{IMAGE_OMITTED_NOTE}"));
+        assert_eq!(
+            redacted[1].content, "I could not see it",
+            "assistant untouched"
+        );
+        assert_eq!(
+            redacted[2].content, "new [IMAGE:data:image/png;base64,BBB]",
+            "the turn just sent keeps its marker"
+        );
+        assert_eq!(count_image_markers(&redacted), 1);
+    }
+
+    #[test]
+    fn redaction_counts_multiple_images_and_survives_an_image_only_turn() {
+        let messages = vec![
+            ChatMessage::user(
+                "[IMAGE:data:image/png;base64,AAA] [IMAGE:data:image/png;base64,BBB]".to_string(),
+            ),
+            ChatMessage::user("what did I send?".to_string()),
+        ];
+
+        let redacted = redact_historic_image_markers(messages);
+        assert_eq!(redacted[0].content, format!("{IMAGE_OMITTED_NOTE} (x2)"));
+        assert_eq!(count_image_markers(&redacted), 0);
+    }
+
     use super::*;
 
     #[test]

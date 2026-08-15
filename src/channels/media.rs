@@ -70,6 +70,16 @@ pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Accepted bytes with the type the **bytes** say they are, or the note the
+/// user should see. Callers that need the raw image (Telegram resizes before
+/// embedding) take this; callers that just want a marker take
+/// [`accept_bytes`].
+#[derive(Debug)]
+pub enum ImageBytes {
+    Ok { mime: &'static str, bytes: Vec<u8> },
+    Rejected(String),
+}
+
 /// Apply the policy to bytes that have already been read.
 ///
 /// Split from the fetch so the rules are testable without a network: the
@@ -77,16 +87,26 @@ pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
 /// extra byte is how an oversized body is detected after a bounded read.
 #[must_use]
 pub fn accept_bytes(bytes: &[u8], claimed: Option<&str>, max_bytes: u64) -> MediaOutcome {
+    match accept_image_bytes(bytes, claimed, max_bytes) {
+        ImageBytes::Ok { mime, bytes } => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            MediaOutcome::Image(format!("data:{mime};base64,{encoded}"))
+        }
+        ImageBytes::Rejected(note) => MediaOutcome::Rejected(note),
+    }
+}
+
+/// The policy itself. [`accept_bytes`] is this plus base64.
+#[must_use]
+pub fn accept_image_bytes(bytes: &[u8], claimed: Option<&str>, max_bytes: u64) -> ImageBytes {
     if bytes.len() as u64 > max_bytes {
-        return MediaOutcome::Rejected(format!(
+        return ImageBytes::Rejected(format!(
             "Attachment rejected: image too large (over {} MiB limit)",
             max_bytes / (1024 * 1024)
         ));
     }
     if bytes.is_empty() {
-        return MediaOutcome::Rejected(
-            "Attachment unavailable: media fetch returned no data".into(),
-        );
+        return ImageBytes::Rejected("Attachment unavailable: media fetch returned no data".into());
     }
 
     match sniff_image_mime(bytes) {
@@ -96,15 +116,17 @@ pub fn accept_bytes(bytes: &[u8], claimed: Option<&str>, max_bytes: u64) -> Medi
             if let Some(claimed) = claimed {
                 let claimed = claimed.trim().to_ascii_lowercase();
                 if !claimed.is_empty() && !claimed.starts_with("image/") {
-                    return MediaOutcome::Rejected(format!(
+                    return ImageBytes::Rejected(format!(
                         "Attachment rejected: type mismatch (sender claimed {claimed}, bytes are {mime})"
                     ));
                 }
             }
-            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            MediaOutcome::Image(format!("data:{mime};base64,{encoded}"))
+            ImageBytes::Ok {
+                mime,
+                bytes: bytes.to_vec(),
+            }
         }
-        None => MediaOutcome::Rejected(
+        None => ImageBytes::Rejected(
             "Attachment rejected: unsupported type (not a PNG, JPEG, GIF or WebP)".into(),
         ),
     }
@@ -123,8 +145,26 @@ pub async fn fetch_image(
     claimed: Option<&str>,
     max_bytes: u64,
 ) -> MediaOutcome {
+    match fetch_image_bytes(client, url, bearer, claimed, max_bytes).await {
+        ImageBytes::Ok { mime, bytes } => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            MediaOutcome::Image(format!("data:{mime};base64,{encoded}"))
+        }
+        ImageBytes::Rejected(note) => MediaOutcome::Rejected(note),
+    }
+}
+
+/// [`fetch_image`] without the base64 step, for callers that transform the
+/// image first (Telegram thumbnails it to fit the model's context).
+pub async fn fetch_image_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    bearer: Option<&str>,
+    claimed: Option<&str>,
+    max_bytes: u64,
+) -> ImageBytes {
     if !claimed_type_is_image(claimed) {
-        return MediaOutcome::Rejected(format!(
+        return ImageBytes::Rejected(format!(
             "Attachment rejected: unsupported type ({})",
             claimed.unwrap_or("unknown")
         ));
@@ -135,17 +175,17 @@ pub async fn fetch_image(
         request = request.bearer_auth(token);
     }
     let Ok(response) = request.send().await else {
-        return MediaOutcome::Rejected("Attachment unavailable: media fetch failed".into());
+        return ImageBytes::Rejected("Attachment unavailable: media fetch failed".into());
     };
     if !response.status().is_success() {
-        return MediaOutcome::Rejected(format!(
+        return ImageBytes::Rejected(format!(
             "Attachment unavailable: media fetch failed (HTTP {})",
             response.status().as_u16()
         ));
     }
     if let Some(len) = response.content_length() {
         if len > max_bytes {
-            return MediaOutcome::Rejected(format!(
+            return ImageBytes::Rejected(format!(
                 "Attachment rejected: image too large ({:.1} MiB, limit {} MiB)",
                 len as f64 / (1024.0 * 1024.0),
                 max_bytes / (1024 * 1024)
@@ -171,14 +211,14 @@ pub async fn fetch_image(
             }
             Ok(None) => break,
             Err(_) => {
-                return MediaOutcome::Rejected(
+                return ImageBytes::Rejected(
                     "Attachment unavailable: media fetch failed mid-download".into(),
                 )
             }
         }
     }
 
-    accept_bytes(&collected, claimed, max_bytes)
+    accept_image_bytes(&collected, claimed, max_bytes)
 }
 
 #[cfg(test)]
