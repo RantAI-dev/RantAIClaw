@@ -85,8 +85,9 @@ fn thread_replies_opt_out_disables_threading() {
 
 /// Every channel keeps its allowlist gate inside the polling loop that
 /// `listen()` runs, and no test enters that loop — the gate line can be
-/// deleted with the whole suite still green. Only Slack's is extracted into
-/// a callable function (`classify_inbound`, tested in slack.rs); the rest
+/// deleted with the whole suite still green. Slack's and Discord's are
+/// extracted into a callable function (`classify_inbound`, behaviourally
+/// tested in each channel's own file); the rest
 /// cannot be reached without a fake transport per channel, so this asserts
 /// the wiring by source position instead: the gate call must be present in
 /// the function that receives messages, and `listen()` must reach that
@@ -108,9 +109,9 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
         (
             "discord",
             include_str!("discord.rs"),
-            "fn listen(",
+            "fn classify_inbound(",
             "self.is_user_allowed(",
-            "",
+            "self.classify_inbound(",
         ),
         (
             "imessage",
