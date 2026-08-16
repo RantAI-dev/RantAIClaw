@@ -1599,16 +1599,44 @@ impl ProxyConfig {
         builder
     }
 
+    /// Publish this configuration to the process environment.
+    ///
+    /// **`NO_PROXY` first, deliberately.** These are process-global and read by
+    /// every HTTP client in the process, including ones already constructed and
+    /// ones other threads build while this runs. Setting the proxies first left
+    /// a window in which traffic that should bypass them did not — briefly, but
+    /// on a live process that window is real requests. The exemption list has to
+    /// be in place before the thing it exempts from.
+    ///
+    /// The same ordering makes it safe to call repeatedly: a config that widens
+    /// `no_proxy` never has a moment where the old, narrower list is paired with
+    /// the new proxies.
     pub fn apply_to_process_env(&self) {
-        set_proxy_env_pair("HTTP_PROXY", self.http_proxy.as_deref());
-        set_proxy_env_pair("HTTPS_PROXY", self.https_proxy.as_deref());
-        set_proxy_env_pair("ALL_PROXY", self.all_proxy.as_deref());
+        for (key, value) in self.process_env_assignments() {
+            set_proxy_env_pair(key, value.as_deref());
+        }
+    }
 
+    /// The variables [`apply_to_process_env`](Self::apply_to_process_env) writes,
+    /// **in the order it writes them**.
+    ///
+    /// Returned rather than applied inline so the ordering is a value a test can
+    /// assert. It is a temporal property otherwise — observable only by racing
+    /// another thread against it, which is the kind of test that flakes instead
+    /// of failing.
+    fn process_env_assignments(&self) -> Vec<(&'static str, Option<String>)> {
         let no_proxy_joined = {
             let list = self.normalized_no_proxy();
             (!list.is_empty()).then(|| list.join(","))
         };
-        set_proxy_env_pair("NO_PROXY", no_proxy_joined.as_deref());
+
+        vec![
+            // First, always. See the doc comment above.
+            ("NO_PROXY", no_proxy_joined),
+            ("HTTP_PROXY", self.http_proxy.clone()),
+            ("HTTPS_PROXY", self.https_proxy.clone()),
+            ("ALL_PROXY", self.all_proxy.clone()),
+        ]
     }
 
     pub fn clear_process_env() {
@@ -7064,6 +7092,51 @@ default_model = "legacy-model"
         assert!(!config.proxy.should_apply_to_service("provider.anthropic"));
 
         clear_proxy_env_test_vars();
+    }
+
+    /// `NO_PROXY` must be published before the proxies it exempts from.
+    ///
+    /// These variables are process-global and read by every HTTP client in the
+    /// process — including ones already built, and ones other threads build
+    /// while this runs. Setting the proxies first left a window where traffic
+    /// that should bypass them did not. Brief, but on a live process a window is
+    /// real requests.
+    ///
+    /// Asserted on the assignment order rather than by racing a thread against
+    /// the write, which would flake rather than fail.
+    #[test]
+    async fn no_proxy_is_published_before_the_proxies_it_exempts_from() {
+        let config = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            https_proxy: Some("http://127.0.0.1:7891".into()),
+            all_proxy: Some("socks5://127.0.0.1:7892".into()),
+            no_proxy: vec!["localhost".into(), "127.0.0.1".into()],
+            ..Default::default()
+        };
+
+        let keys: Vec<&str> = config
+            .process_env_assignments()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+
+        assert_eq!(
+            keys.first(),
+            Some(&"NO_PROXY"),
+            "the exemption list must be in place before the proxies, got {keys:?}"
+        );
+        for proxy_key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            assert!(keys.contains(&proxy_key), "{proxy_key} must still be set");
+        }
+
+        // And the values still round-trip, so ordering did not cost correctness.
+        let assignments = config.process_env_assignments();
+        let no_proxy = &assignments[0].1;
+        assert!(
+            no_proxy.as_deref().is_some_and(|v| v.contains("localhost")),
+            "got {no_proxy:?}"
+        );
     }
 
     #[test]
