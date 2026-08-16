@@ -65,6 +65,23 @@ pub struct TuiContext {
     /// Inner height (rows) of the chat pane at the last render, so PgUp/PgDn can
     /// page by a screenful. Updated every chat render; defaults to a sane 10.
     pub last_chat_rows: usize,
+    /// Chat pane rect at the last render (with borders), so mouse hit-testing
+    /// maps clicks against exactly the frame the user sees. `None` before the
+    /// first frame and in unit tests that never render.
+    pub last_chat_area: Option<ratatui::layout::Rect>,
+    /// Global index of the first visible display line at the last render —
+    /// the renderer's window `start`. Paired with `last_chat_area` for
+    /// mouse-row → display-line mapping.
+    pub last_window_start: usize,
+    /// Per-display-line provenance from the last render: `Some((msg_idx,
+    /// rendered_line_idx))` for lines wrapped out of a message's rendered
+    /// lines, `None` for separators/spinner/streaming tail/splash. Same
+    /// length as the full (unwindowed) display-line buffer.
+    pub last_chat_provenance: Vec<Option<super::selection::LineAnchor>>,
+    /// Active drag-selection over the chat transcript, anchored to rendered
+    /// lines. Cleared on click, Esc, copy, and any history replacement
+    /// (`/compress`, `/clear`) — anchors don't survive those.
+    pub selection: Option<super::selection::Selection>,
     pub token_usage: TokenUsage,
     /// Total context window of the active model, in tokens. Used by the
     /// status bar to display a `used/window  pct%` meter. `None` when the
@@ -74,6 +91,9 @@ pub struct TuiContext {
     /// compact `1h2m` / `34m` / `12s` age label.
     pub started_at: std::time::Instant,
     pub last_error: Option<String>,
+    /// Transient neutral status-line notice (e.g. "⧉ copied 4 lines").
+    /// Rendered when no error is pending; cleared on the next submit.
+    pub status_notice: Option<String>,
     pub debug_mode: bool,
     /// Outbound channel to the `TuiAgentActor` for submitting turn requests.
     pub req_tx: mpsc::Sender<TurnRequest>,
@@ -212,10 +232,15 @@ impl TuiContext {
             scroll_offset: 0,
             last_composer_width: 80,
             last_chat_rows: 10,
+            last_chat_area: None,
+            last_window_start: 0,
+            last_chat_provenance: Vec::new(),
+            selection: None,
             token_usage: TokenUsage::default(),
             context_window: None,
             started_at: std::time::Instant::now(),
             last_error: None,
+            status_notice: None,
             debug_mode: false,
             req_tx,
             events_rx,
@@ -652,6 +677,8 @@ impl TuiContext {
             Some(sid) => self.messages = self.session_store.get_messages(sid)?,
             None => self.messages.clear(),
         }
+        // History replaced wholesale — selection anchors are stale.
+        self.selection = None;
         Ok(())
     }
 
@@ -670,6 +697,8 @@ impl TuiContext {
         self.scroll_offset = 0;
         self.token_usage = TokenUsage::default();
         self.last_error = None;
+        // `/new` empties the transcript — selection anchors are stale.
+        self.selection = None;
         Ok(())
     }
 }

@@ -210,6 +210,13 @@ pub struct TuiApp {
     pub state: AppState,
     pub context: TuiContext,
     pub command_registry: CommandRegistry,
+    /// Anchor of an in-progress mouse drag over the chat pane — set on
+    /// left-button Down, promoted into `context.selection` on the first Drag.
+    /// `None` when no gesture is active.
+    pub selection_drag_anchor: Option<super::selection::LineAnchor>,
+    /// True once the active gesture has actually dragged (moved while held).
+    /// A Down+Up with no drag is a plain click, which clears the selection.
+    pub selection_dragged: bool,
     /// Active config, cloned for provisioner use.
     pub config: crate::config::Config,
     /// Active profile, cloned for provisioner use.
@@ -539,6 +546,8 @@ impl TuiApp {
             channels_restarted_for_save: false,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
+            selection_drag_anchor: None,
+            selection_dragged: false,
             list_picker: None,
             clawhub_install_last_query: String::new(),
             clawhub_install_search_version: 0,
@@ -896,7 +905,9 @@ impl TuiApp {
             }
             // Mouse wheel scrolls the chat pane (same `scroll_offset` as
             // PgUp/PgDn: up counts lines back from the newest, 0 sticks to the
-            // bottom; render clamps to the top). Only when the chat composer
+            // bottom; render clamps to the top). Left-button Down/Drag/Up is
+            // the selection gesture: drag highlights display lines, Ctrl+C
+            // copies, a plain click clears. Only when the chat composer
             // owns the screen — a modal/overlay/approval keeps its own view.
             Event::Mouse(me)
                 if !self.modal_active()
@@ -909,6 +920,30 @@ impl TuiApp {
                     }
                     MouseEventKind::ScrollDown => {
                         self.context.scroll_offset = self.context.scroll_offset.saturating_sub(3);
+                    }
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        self.selection_dragged = false;
+                        self.selection_drag_anchor = self.chat_anchor_at(me.column, me.row);
+                    }
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                        if let Some(anchor) = self.selection_drag_anchor {
+                            // Clamp the drag row into the pane so dragging
+                            // past the border keeps extending the selection.
+                            if let Some(head) = self.chat_anchor_at_clamped(me.column, me.row) {
+                                self.selection_dragged = true;
+                                self.context.selection =
+                                    Some(super::selection::Selection { anchor, head });
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                        // Down+Up with no drag in between = a plain click:
+                        // clear any existing highlight (the Windows model).
+                        if !self.selection_dragged {
+                            self.context.selection = None;
+                        }
+                        self.selection_drag_anchor = None;
+                        self.selection_dragged = false;
                     }
                     _ => {}
                 }
@@ -997,8 +1032,19 @@ impl TuiApp {
                 self.state = AppState::Quitting;
                 return Ok(EventResult::Quit);
             }
-            // Ctrl+C → cancel streaming turn if active; otherwise quit
+            // Ctrl+C → copy the active selection if one exists (the Windows
+            // Terminal mental model: Ctrl+C with a highlight copies, without
+            // one it keeps its control meaning). Selection FIRST — an
+            // operator with a highlight active must never cancel their
+            // running turn by copying. No selection → cancel streaming turn
+            // if active; otherwise quit — both arms unchanged.
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(sel) = self.context.selection.take() {
+                    self.selection_drag_anchor = None;
+                    self.selection_dragged = false;
+                    self.copy_selection(sel);
+                    return Ok(EventResult::Continue);
+                }
                 match &mut self.state {
                     AppState::Streaming { cancelling, .. } => {
                         *cancelling = true;
@@ -1642,6 +1688,17 @@ impl TuiApp {
             }
             // Esc — cancel the in-flight streaming turn. Mirrors Ctrl+C's
             // streaming branch but only acts during Streaming, never as a
+            // Esc with an active text selection clears the highlight and
+            // stops — deliberately BEFORE the streaming-cancel arm below, so
+            // the first Esc drops the selection and a second Esc cancels the
+            // turn. Still after every modal handler: closing a picker /
+            // overlay / wizard always wins over both.
+            KeyCode::Esc if self.context.selection.is_some() => {
+                self.context.selection = None;
+                self.selection_drag_anchor = None;
+                self.selection_dragged = false;
+                return Ok(EventResult::Continue);
+            }
             // quit (Ctrl+C still handles quit). This arm sits AFTER every
             // modal-specific Esc handler above so closing a picker /
             // overlay / wizard always wins over cancel; Esc only reaches
@@ -1940,6 +1997,8 @@ impl TuiApp {
     pub async fn submit_input(&mut self) -> Result<()> {
         let raw = std::mem::take(&mut self.context.input_buffer);
         self.context.cursor_pos = 0;
+        // A new submission supersedes any transient notice (copy feedback).
+        self.context.status_notice = None;
         // Swap any `[Pasted text #N +M lines]` placeholders back for their real
         // content before the message is read or sent. Must precede the
         // empty-check: a buffer holding only a placeholder is not empty once
@@ -2739,6 +2798,11 @@ impl TuiApp {
                 self.context.messages.clear();
                 self.context.messages.push(summary_msg);
                 self.context.messages.extend(kept_tail);
+                // History replaced — selection anchors (msg_idx, line_idx)
+                // now point at different text; drop them.
+                self.context.selection = None;
+                self.selection_drag_anchor = None;
+                self.selection_dragged = false;
 
                 // Persist the new shape so it survives restart (only when a
                 // session is bound — compaction always runs on an active one).
@@ -3135,6 +3199,10 @@ impl TuiApp {
                 self.context.session_id = Some(session.id.clone());
                 self.context.model = session.model.clone();
                 self.context.messages.clear();
+                // History replaced (resume) — selection anchors are stale.
+                self.context.selection = None;
+                self.selection_drag_anchor = None;
+                self.selection_dragged = false;
                 if let Err(e) = self.context.load_session_messages() {
                     self.context.last_error = Some(format!("load_session failed: {e}"));
                     return;
@@ -4368,6 +4436,72 @@ impl TuiApp {
             || self.first_run_wizard.is_some()
     }
 
+    /// Resolve a mouse position to a selection anchor, using the chat-pane
+    /// geometry and provenance stashed by the last render. `None` when the
+    /// point is outside the pane's inner text area or nothing anchored is
+    /// near the hit line.
+    fn chat_anchor_at(&self, col: u16, row: u16) -> Option<super::selection::LineAnchor> {
+        let area = self.context.last_chat_area?;
+        if !super::selection::point_in_chat_inner(col, row, area) {
+            return None;
+        }
+        let gidx = super::selection::global_line_at(row, area, self.context.last_window_start)?;
+        super::selection::anchor_at(&self.context.last_chat_provenance, gidx)
+    }
+
+    /// Like [`Self::chat_anchor_at`] but clamps the row into the pane's inner
+    /// rows first, so a drag that overshoots the border keeps extending the
+    /// selection instead of freezing at the edge. The column is ignored —
+    /// selection is whole-line.
+    fn chat_anchor_at_clamped(&self, _col: u16, row: u16) -> Option<super::selection::LineAnchor> {
+        let area = self.context.last_chat_area?;
+        if area.height < 3 {
+            return None;
+        }
+        let y0 = area.y + 1;
+        let y1 = area.y + area.height - 2;
+        let row = row.clamp(y0, y1);
+        let gidx = super::selection::global_line_at(row, area, self.context.last_window_start)?;
+        super::selection::anchor_at(&self.context.last_chat_provenance, gidx)
+    }
+
+    /// Copy the selected transcript text to the system clipboard via OSC 52
+    /// and report the outcome on the status line. Honest about the limits:
+    /// OSC 52 delivery cannot be confirmed from inside the app, and some
+    /// terminals (GNOME Terminal/VTE) don't implement it — the notice says
+    /// where to look instead of overclaiming success.
+    fn copy_selection(&mut self, sel: super::selection::Selection) {
+        let theme = super::render::RenderTheme::default();
+        let messages = &self.context.messages;
+        let text = super::selection::extract_text(messages.len(), sel.range(), |i| {
+            rendered_message_lines(&messages[i], &theme)
+        });
+        if text.is_empty() {
+            self.context.status_notice = Some("nothing to copy".to_string());
+            return;
+        }
+        let n_lines = text.lines().count();
+        match super::selection::osc52_sequence(&text) {
+            Some(seq) => {
+                use std::io::Write as _;
+                let mut out = io::stdout();
+                let _ = out.write_all(&seq);
+                let _ = out.flush();
+                self.context.status_notice = Some(format!(
+                    "⧉ copied {n_lines} line{} (OSC 52 — clipboard empty? your terminal may \
+                     not support it; Shift+drag selects natively)",
+                    if n_lines == 1 { "" } else { "s" }
+                ));
+            }
+            None => {
+                self.context.status_notice = Some(format!(
+                    "selection too large to copy ({} KiB) — select a smaller range",
+                    text.len() / 1024
+                ));
+            }
+        }
+    }
+
     /// Commit a finalized message to the terminal's scrollback (above the
     /// inline viewport). This is the inline-mode equivalent of "append to
     /// chat history" — once committed the line is permanent and scrolls
@@ -5111,6 +5245,163 @@ fn horizontal_rule_line(width: usize) -> Line<'static> {
     ))
 }
 
+/// Selection highlight background — the same blue family as the pane chrome,
+/// dark enough that every theme foreground stays readable on it.
+const SELECTION_BG: Color = Color::Rgb(40, 70, 140);
+
+/// Rendered (pre-wrap) lines for one transcript message. The SINGLE source
+/// both the chat pane and selection-copy extraction use — line indices from
+/// one are valid in the other by construction, so a copy can never grab
+/// different text than the highlight showed.
+fn rendered_message_lines(
+    msg: &crate::sessions::Message,
+    theme: &super::render::RenderTheme,
+) -> Vec<Line<'static>> {
+    let persisted = msg
+        .tool_calls
+        .as_deref()
+        .map(super::render::parse_persisted_tool_calls)
+        .unwrap_or_default();
+    super::render::render_message_lines(&msg.role, &msg.content, &persisted, &[], theme)
+}
+
+/// Build the full display-line buffer for a non-empty transcript, plus the
+/// per-display-line provenance the selection feature depends on. A rendered
+/// line that wraps into N display lines yields N identical anchors; turn
+/// separators, the spinner, and the volatile streaming tail carry `None`.
+fn build_transcript_lines(
+    messages: &[crate::sessions::Message],
+    state: &AppState,
+    inner_w: usize,
+    theme: &super::render::RenderTheme,
+) -> (
+    Vec<Line<'static>>,
+    Vec<Option<super::selection::LineAnchor>>,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut prov: Vec<Option<super::selection::LineAnchor>> = Vec::new();
+
+    for (i, msg) in messages.iter().enumerate() {
+        // A blank line between turns so a "You:" and the reply above it don't
+        // run together — one separator, never a trailing one.
+        if i > 0 {
+            lines.push(Line::from(""));
+            prov.push(None);
+        }
+        let raw = rendered_message_lines(msg, theme);
+        for (raw_idx, rline) in raw.iter().enumerate() {
+            let before = lines.len();
+            extend_wrapped(&mut lines, std::slice::from_ref(rline), inner_w);
+            prov.extend(std::iter::repeat_n(
+                Some((i, raw_idx)),
+                lines.len() - before,
+            ));
+        }
+    }
+
+    if let AppState::Streaming {
+        partial,
+        tool_blocks,
+        ..
+    } = state
+    {
+        if !messages.is_empty() {
+            lines.push(Line::from(""));
+            prov.push(None);
+        }
+        let frame_idx = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as usize / 100)
+            .unwrap_or(0))
+            % SPINNER_FRAMES.len();
+        let spinner = SPINNER_FRAMES[frame_idx];
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{spinner} "),
+                Style::default()
+                    .fg(Color::Rgb(94, 184, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("thinking…", Style::default().fg(Color::Rgb(107, 114, 128))),
+        ]));
+        prov.push(None);
+        let raw =
+            super::render::render_message_lines("assistant", partial, &[], tool_blocks, theme);
+        let before = lines.len();
+        extend_wrapped(&mut lines, &raw, inner_w);
+        prov.extend(std::iter::repeat_n(None, lines.len() - before));
+    }
+
+    (lines, prov)
+}
+
+#[cfg(test)]
+mod transcript_provenance_tests {
+    use super::*;
+    use crate::sessions::Message;
+
+    fn theme() -> super::super::render::RenderTheme {
+        super::super::render::RenderTheme::default()
+    }
+
+    #[test]
+    fn provenance_length_matches_lines_for_mixed_transcript() {
+        let msgs = vec![
+            Message::user("s", "hello"),
+            Message::assistant("s", "line one\nline two"),
+        ];
+        let (lines, prov) = build_transcript_lines(&msgs, &AppState::Ready, 40, &theme());
+        assert_eq!(lines.len(), prov.len());
+        // 2 rendered lines (label+first, none extra) for msg 0? label line only.
+        // Exact counts: msg0 = 1 line, separator = 1, msg1 = 2 lines.
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn separator_rows_carry_no_anchor() {
+        let msgs = vec![Message::user("s", "a"), Message::assistant("s", "b")];
+        let (_, prov) = build_transcript_lines(&msgs, &AppState::Ready, 40, &theme());
+        assert_eq!(prov[0], Some((0, 0)));
+        assert_eq!(prov[1], None, "turn separator must not be selectable");
+        assert_eq!(prov[2], Some((1, 0)));
+    }
+
+    #[test]
+    fn a_wrapped_rendered_line_yields_identical_consecutive_anchors() {
+        // Narrow pane: one long rendered line wraps into several display lines,
+        // every one of which must anchor back to the SAME rendered line.
+        let msgs = vec![Message::user(
+            "s",
+            "alpha beta gamma delta epsilon zeta eta theta",
+        )];
+        let (lines, prov) = build_transcript_lines(&msgs, &AppState::Ready, 12, &theme());
+        assert!(lines.len() > 2, "expected the line to wrap, got {lines:?}");
+        for p in &prov {
+            assert_eq!(*p, Some((0, 0)), "all wraps anchor to rendered line 0");
+        }
+    }
+
+    #[test]
+    fn streaming_tail_and_spinner_carry_no_anchor() {
+        let msgs = vec![Message::user("s", "q")];
+        let state = AppState::Streaming {
+            partial: "partial reply".into(),
+            tool_blocks: Vec::new(),
+            cancelling: false,
+            turn_started_at: std::time::Instant::now(),
+        };
+        let (lines, prov) = build_transcript_lines(&msgs, &state, 40, &theme());
+        assert_eq!(lines.len(), prov.len());
+        // Everything after the committed message (separator, spinner, partial)
+        // must be None — the tail is volatile mid-stream.
+        assert_eq!(prov[0], Some((0, 0)));
+        assert!(
+            prov[1..].iter().all(Option::is_none),
+            "streaming tail must be unselectable, got {prov:?}"
+        );
+    }
+}
+
 /// Append the wrapped form of each rendered message line to `out`, drawing a
 /// Markdown horizontal rule (`---`/`***`/`___`) as a full-width rule instead of
 /// wrapping its literal characters.
@@ -5135,69 +5426,40 @@ fn render_chat_pane(
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
     let inner_h = (area.height.saturating_sub(2).max(1)) as usize;
     ctx.last_chat_rows = inner_h;
+    // Stash the pane rect so mouse hit-testing maps clicks against exactly
+    // the frame the user sees (selection::point_in_chat_inner).
+    ctx.last_chat_area = Some(area);
 
     // Flatten every message into individual, pre-wrapped display lines. A plain
     // `List` renders NOTHING when a single item (one long message) is taller
     // than the pane, so we can't hand it multi-line items; instead we build one
     // flat line buffer, word-wrap it to the pane width (so long replies reflow
     // instead of being clipped off the right edge), and window the bottom
-    // `inner_h` lines ourselves.
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    // `inner_h` lines ourselves. `provenance` tracks, per display line, which
+    // message's rendered line it wraps out of — the anchor space selection
+    // lives in (None = separator / spinner / streaming tail / splash).
     let streaming = matches!(state, AppState::Streaming { .. });
-
-    if ctx.messages.is_empty() && !streaming {
+    let (mut lines, provenance) = if ctx.messages.is_empty() && !streaming {
         // The splash is ASCII art already sized to the pane width; don't
         // re-wrap it (that would mangle the logo).
-        lines.extend(render_splash_lines(ctx, area.width, area.height));
+        let splash = render_splash_lines(ctx, area.width, area.height);
+        let prov = vec![None; splash.len()];
+        (splash, prov)
     } else {
-        for (i, msg) in ctx.messages.iter().enumerate() {
-            // A blank line between turns so a "You:" and the reply above it don't
-            // run together — one separator, never a trailing one.
-            if i > 0 {
-                lines.push(Line::from(""));
-            }
-            let persisted = msg
-                .tool_calls
-                .as_deref()
-                .map(super::render::parse_persisted_tool_calls)
-                .unwrap_or_default();
-            let raw = super::render::render_message_lines(
-                &msg.role,
-                &msg.content,
-                &persisted,
-                &[],
-                &theme,
-            );
-            extend_wrapped(&mut lines, &raw, inner_w);
-        }
+        build_transcript_lines(&ctx.messages, state, inner_w, &theme)
+    };
 
-        if let AppState::Streaming {
-            partial,
-            tool_blocks,
-            ..
-        } = state
-        {
-            if !ctx.messages.is_empty() {
-                lines.push(Line::from(""));
+    // Paint the active selection as a whole-line background over every
+    // display line whose provenance falls inside the range.
+    if let Some(sel) = ctx.selection {
+        for (idx, p) in provenance.iter().enumerate() {
+            if p.is_some_and(|a| sel.contains(a)) {
+                if let Some(line) = lines.get_mut(idx) {
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(SELECTION_BG);
+                    }
+                }
             }
-            let frame_idx = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as usize / 100)
-                .unwrap_or(0))
-                % SPINNER_FRAMES.len();
-            let spinner = SPINNER_FRAMES[frame_idx];
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{spinner} "),
-                    Style::default()
-                        .fg(Color::Rgb(94, 184, 255))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("thinking…", Style::default().fg(Color::Rgb(107, 114, 128))),
-            ]));
-            let raw =
-                super::render::render_message_lines("assistant", partial, &[], tool_blocks, &theme);
-            extend_wrapped(&mut lines, &raw, inner_w);
         }
     }
 
@@ -5212,6 +5474,11 @@ fn render_chat_pane(
     let end = total.saturating_sub(ctx.scroll_offset);
     let start = end.saturating_sub(inner_h);
     let visible: Vec<Line<'static>> = lines[start..end].to_vec();
+
+    // Stash the window start + provenance so the mouse handler resolves a
+    // clicked row to the same display line this frame drew there.
+    ctx.last_window_start = start;
+    ctx.last_chat_provenance = provenance;
 
     let para = Paragraph::new(visible).block(
         Block::default()
@@ -5515,6 +5782,8 @@ pub(super) mod test_support {
             channels_restarted_for_save: false,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
+            selection_drag_anchor: None,
+            selection_dragged: false,
             list_picker: None,
             clawhub_install_last_query: String::new(),
             clawhub_install_search_version: 0,
@@ -6436,6 +6705,13 @@ fn render_status_pane(ctx: &TuiContext, state: &AppState, frame: &mut ratatui::F
         Line::from(vec![
             Span::styled(" ✗ ", coral),
             Span::styled(err.clone(), Style::default().fg(Color::Rgb(255, 123, 123))),
+        ])
+    } else if let Some(ref notice) = ctx.status_notice {
+        // Transient neutral notice (e.g. selection-copy feedback). Errors win
+        // the line; the notice clears on the next submit.
+        Line::from(vec![
+            Span::styled(" · ", sky),
+            Span::styled(notice.clone(), muted),
         ])
     } else {
         let used = ctx.token_usage.total_tokens;
@@ -8587,6 +8863,8 @@ mod tests {
             channels_restarted_for_save: false,
             setup_response_tx: None,
             scrollback_queue: Vec::new(),
+            selection_drag_anchor: None,
+            selection_dragged: false,
             list_picker: None,
             clawhub_install_last_query: String::new(),
             clawhub_install_search_version: 0,
@@ -8847,6 +9125,239 @@ mod submit_tests {
         assert_eq!(
             app.context.input_buffer, "",
             "the wheel must not touch the composer"
+        );
+    }
+
+    /// The Windows-copy flow, restored: drag highlights, Ctrl+C with a
+    /// selection copies (and must NOT quit or cancel anything).
+    #[tokio::test]
+    async fn drag_then_ctrl_c_copies_and_does_not_quit() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut ctx, _r, _e) = TuiContext::test_context();
+        ctx.append_user_message("question one").unwrap();
+        ctx.append_assistant_message("answer line").unwrap();
+        // Render once so the mouse handler has the pane rect, window start
+        // and provenance the real event loop would have stashed.
+        let _ = chat_pane_rows(&mut ctx, 60, 12);
+        let mut app = make_app_with_context(ctx);
+        let m = |kind, row| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        // Row 1 = first display line ("You: question one"), row 3 = the reply.
+        app.handle_event(m(MouseEventKind::Down(MouseButton::Left), 1))
+            .await
+            .unwrap();
+        app.handle_event(m(MouseEventKind::Drag(MouseButton::Left), 3))
+            .await
+            .unwrap();
+        assert!(
+            app.context.selection.is_some(),
+            "drag must arm a selection over the transcript"
+        );
+
+        let res = app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            EventResult::Continue,
+            "Ctrl+C with a selection copies — it must not quit"
+        );
+        assert!(
+            app.context.selection.is_none(),
+            "the copy consumes the selection"
+        );
+        let notice = app.context.status_notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("copied"),
+            "the status line must confirm the copy, got: {notice}"
+        );
+    }
+
+    /// Pin BOTH legacy Ctrl+C arms: quit while Ready, cancel while Streaming
+    /// (the second is also pinned by the older cancel test) — the selection
+    /// branch must not disturb either.
+    #[tokio::test]
+    async fn ctrl_c_without_selection_in_ready_still_quits() {
+        let (ctx, _r, _e) = TuiContext::test_context();
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Ready;
+        let res = app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            EventResult::Quit,
+            "no selection + Ready must still quit"
+        );
+    }
+
+    /// An operator with a highlight active must never cancel their running
+    /// turn by copying — the Hermes Ctrl+C-conflict lesson.
+    #[tokio::test]
+    async fn ctrl_c_with_selection_while_streaming_copies_not_cancels() {
+        let (mut ctx, mut req_rx, _e) = TuiContext::test_context();
+        ctx.append_user_message("q").unwrap();
+        ctx.selection = Some(crate::tui::selection::Selection {
+            anchor: (0, 0),
+            head: (0, 0),
+        });
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Streaming {
+            partial: String::new(),
+            tool_blocks: Vec::new(),
+            cancelling: false,
+            turn_started_at: std::time::Instant::now(),
+        };
+
+        let res = app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(res, EventResult::Continue);
+        assert!(app.context.selection.is_none());
+        assert!(
+            req_rx.try_recv().is_err(),
+            "copy must not send a Cancel to the agent"
+        );
+        if let AppState::Streaming { cancelling, .. } = &app.state {
+            assert!(!cancelling, "the turn must keep running untouched");
+        } else {
+            panic!("state must remain Streaming");
+        }
+    }
+
+    /// Esc ordering: the first Esc drops the highlight, the second cancels
+    /// the running turn — selection sits above streaming-cancel, below every
+    /// modal.
+    #[tokio::test]
+    async fn esc_clears_selection_before_cancelling_the_turn() {
+        let (mut ctx, mut req_rx, _e) = TuiContext::test_context();
+        ctx.append_user_message("q").unwrap();
+        ctx.selection = Some(crate::tui::selection::Selection {
+            anchor: (0, 0),
+            head: (0, 0),
+        });
+        let mut app = make_app_with_context(ctx);
+        app.state = AppState::Streaming {
+            partial: String::new(),
+            tool_blocks: Vec::new(),
+            cancelling: false,
+            turn_started_at: std::time::Instant::now(),
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(
+            app.context.selection.is_none(),
+            "first Esc clears the highlight"
+        );
+        assert!(
+            req_rx.try_recv().is_err(),
+            "first Esc must not cancel the turn"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(
+            matches!(req_rx.try_recv(), Ok(TurnRequest::Cancel)),
+            "second Esc cancels the turn as before"
+        );
+    }
+
+    /// A plain click (Down+Up, no drag) clears the highlight — the Windows
+    /// model again.
+    #[tokio::test]
+    async fn plain_click_clears_selection() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut ctx, _r, _e) = TuiContext::test_context();
+        ctx.append_user_message("hello").unwrap();
+        let _ = chat_pane_rows(&mut ctx, 60, 12);
+        ctx.selection = Some(crate::tui::selection::Selection {
+            anchor: (0, 0),
+            head: (0, 0),
+        });
+        let mut app = make_app_with_context(ctx);
+        let m = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 5,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.handle_event(m(MouseEventKind::Down(MouseButton::Left)))
+            .await
+            .unwrap();
+        app.handle_event(m(MouseEventKind::Up(MouseButton::Left)))
+            .await
+            .unwrap();
+        assert!(app.context.selection.is_none(), "a click deselects");
+    }
+
+    /// Compaction replaces the transcript wholesale — anchors into the old
+    /// history must not survive it.
+    #[tokio::test]
+    async fn compaction_clears_the_selection() {
+        let (mut ctx, _r, _e) = TuiContext::test_context();
+        ctx.append_user_message("old question").unwrap();
+        ctx.append_assistant_message("old answer").unwrap();
+        ctx.selection = Some(crate::tui::selection::Selection {
+            anchor: (0, 0),
+            head: (1, 0),
+        });
+        let mut app = make_app_with_context(ctx);
+        app.handle_agent_event(AgentEvent::CompactionComplete {
+            summary: "a summary".into(),
+            original_count: 2,
+            kept_count: 0,
+            keep_last: 0,
+        });
+        assert!(
+            app.context.selection.is_none(),
+            "history replacement must drop the selection"
+        );
+    }
+
+    /// The highlight actually paints: the selected row gets the selection
+    /// background, an unselected row does not.
+    #[test]
+    fn selection_paints_background_on_selected_rows_only() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let (mut ctx, _r, _e) = TuiContext::test_context();
+        ctx.append_user_message("picked").unwrap();
+        ctx.append_assistant_message("not picked").unwrap();
+        ctx.selection = Some(crate::tui::selection::Selection {
+            anchor: (0, 0),
+            head: (0, 0),
+        });
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_chat_pane(&AppState::Ready, &mut ctx, f, area);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        // Row 1 = "You: picked" (selected); row 3 = the reply (not selected).
+        assert_eq!(
+            buf[(2u16, 1u16)].style().bg,
+            Some(SELECTION_BG),
+            "selected row must carry the selection background"
+        );
+        assert_ne!(
+            buf[(2u16, 3u16)].style().bg,
+            Some(SELECTION_BG),
+            "unselected row must not"
         );
     }
 
