@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0-alpha] — 2026-08-16
+
+The channels release: a full-subsystem deepscan (plans 115–149) plus
+twenty-six follow-ups, covering all sixteen transports. Sixteen security
+fixes, forty-one behaviour fixes, six additions, five changes. Every guard
+mutation-tested; the TUI, the web console and the Telegram runtime driven
+live before this cut.
+
+Minor, not patch: the config schema moves **v18 → v22** and the gateway's
+Telegram replies gain a field. **The schema migration is one-way** — once any
+command of this release touches `config.toml`, older binaries refuse to start,
+and the migrator writes no backup. Take your own copy of `config.toml` first
+if you may want to roll back.
+
+Console pin moves to claw-ui **v0.3.18** (Shift+Tab no longer changes autonomy
+from a button, honest channel status, a reload banner that matches what the
+gateway actually did).
+
+### Operators: read before upgrading
+
+- **Back up `config.toml` before first run.** v18 → v22 is one-way and
+  unbacked. This is the single most likely thing to cost you time: a binary
+  from v0.19.0-alpha or earlier will refuse a config this release has touched,
+  and there is no downgrade path.
+- **Six channel allowlists that defaulted to "allow anyone" no longer do.** If
+  you configured Discord, Slack, Mattermost, Signal, IRC or QQ through setup
+  and never typed an allowlist, that channel answered anyone who messaged it.
+  It now denies by default — **re-run setup and enter your ids**, or the
+  channel will stop responding to you too.
+- **`[channels_config.webhook].port` was removed (schema v21).** Nothing read
+  it; the migration drops it silently. No action needed unless you scripted
+  against it.
+- **Inbound images are budgeted at 20 per sender per 10 minutes.** A sender
+  over budget gets a note instead of an image. Not configurable in this
+  release, by design.
+- **Telegram now reports the numeric user id as the sender, not `@username`.**
+  If you keyed anything off the old value — an allowlist entry, a memory scope,
+  an external script — it will not match. Numeric ids in `allowed_users` have
+  always worked and are unaffected.
+- **IRC resolves identity from the services account, not the nick.** On a
+  network without account-tag capability, owner authority cannot be granted;
+  the channel says so rather than trusting a nick anyone can take.
+- **Replies now thread on Discord, Telegram and Mattermost.** Set
+  `[channels_config] thread_replies = false` if you preferred flat replies.
+
+
 ### Security
 
 - **A shell approval raised from a chat can now be answered with a bare `ok`
@@ -149,6 +195,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   produces one apology rather than one per message. The notice goes out through
   WhatsApp directly, not the agent queue, and is not sent when the runtime is
   shutting down — there is nothing to try again with.
+
+- **`NO_PROXY` is published before the proxies it exempts from.** The four
+  proxy variables were written to the process environment in declaration
+  order, so for the length of that loop a subprocess could read a proxy with
+  no exemption list beside it. The ordering is data now — one list, `NO_PROXY`
+  first.
 
 - **WhatsApp Web traffic now honours `[proxy]`.** Its HTTP transport
   (`wa-rs-ureq-http`) built a client with no proxy configuration at all, so an
@@ -440,6 +492,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys — there is no schema change and nothing to set. Telegram and WhatsApp
   Cloud each make one authenticated lookup before the fetch; both check the
   budget before that call too, so an exhausted sender cannot make it either.
+
+- **The gateway reports whether a channel save restarts the runtime.** The
+  Telegram connect/allowlist and disconnect replies gain `restarts_runtime`,
+  the same decision the human-readable `note` already carried. A console
+  cannot branch on prose, so it guessed — and the web console's own hint said
+  every save reloads the runtime while this reply said it does not, both on
+  screen about the same click. The note is now derived from the flag, so the
+  two cannot drift.
 
 - **Replies thread on Discord, Telegram and Mattermost.** The threading seam
   existed and was plumbed through every dispatch site, but exactly one channel
