@@ -383,6 +383,25 @@ Fix:
 
 - Do not bypass this check. Confirm you're pulling the intended `--ref` (release tag) and that no proxy/mirror is altering the download. If `cosign` itself isn't installed locally, `ui install` only warns and continues with SHA-only verification — install cosign (<https://docs.sigstore.dev/system_config/installation/>) for the full guarantee.
 
+### Every panel says `Gateway unreachable … — unexpected_host`
+
+Symptom:
+
+- The console loads, but chat and every panel show `Gateway unreachable. Start the agent gateway, then retry — unexpected_host.` Restarting the gateway changes nothing. Typically appears right after a UI upgrade, when the console is opened via a LAN address or a DNS name instead of `localhost`.
+
+Why this happens:
+
+- The 403 comes from the console's own request proxy, not from the gateway. claw-ui v0.3.18 added a `Host`-header allowlist to block DNS-rebinding attacks, and its default only covered `localhost`/loopback — so a console opened at `http://<lan-ip>:3939` was silently locked out.
+
+Fix:
+
+- Upgrade the console to claw-ui **v0.3.19** or later (`rantaiclaw ui update`): IP-literal hosts (LAN addresses included) are always served, no configuration needed. An IP in the `Host` header cannot be a DNS-rebinding vector — the attack requires a DNS name.
+- Only if you reach the console by a **DNS name** (a tunnel domain, `console.lan`): list it explicitly, then restart the console:
+
+```bash
+RANTAICLAW_UI_ALLOWED_HOSTS=console.lan rantaiclaw ui start
+```
+
 ## Legacy Installer Compatibility
 
 Both still work:
