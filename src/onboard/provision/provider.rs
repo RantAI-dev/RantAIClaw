@@ -312,9 +312,64 @@ impl TuiProvisioner for ProviderProvisioner {
                 api_key = recv_text(&mut responses).await?;
 
                 if api_key.trim().is_empty() {
-                    // Empty key: don't validate, just move on. Some flows
-                    // (gemini with CLI auth, dev mode) expect this.
-                    break;
+                    // Empty key: skip validation only when this provider can
+                    // actually construct without one. The factory is the same
+                    // oracle boot uses — including the per-provider env-var
+                    // fallback (OPENAI_API_KEY etc.) — so what passes here is
+                    // exactly what will start later. Keyless-capable flows
+                    // (ollama, gemini CLI auth, exported env key) sail
+                    // through; a provider that cannot build without a key
+                    // (openai/anthropic/gemini route through rig and fail at
+                    // construction) must not be saved silently: that config
+                    // used to abort every later launch — including
+                    // `rantaiclaw setup`, the repair path — before the TUI
+                    // existed.
+                    if crate::providers::create_provider(provider_name, None).is_ok() {
+                        break;
+                    }
+                    send(
+                        &events,
+                        ProvisionEvent::Message {
+                            severity: Severity::Warn,
+                            text: format!(
+                                "{provider_name} cannot start without an API key — \
+                                 saving it keyless would break the next launch."
+                            ),
+                        },
+                    )
+                    .await?;
+                    send(
+                        &events,
+                        ProvisionEvent::Choose {
+                            id: "empty_key_retry".into(),
+                            label: "What would you like to do?".into(),
+                            options: vec![
+                                "Re-enter the API key".into(),
+                                "Abort setup (nothing will be saved)".into(),
+                            ],
+                            multi: false,
+                        },
+                    )
+                    .await?;
+                    let choice = recv_selection(&mut responses).await?;
+                    match choice.first().copied() {
+                        Some(0) => continue, // re-prompt for the key
+                        Some(1) | None => {
+                            send(
+                                &events,
+                                ProvisionEvent::Failed {
+                                    error: format!(
+                                        "{provider_name} requires an API key; setup aborted."
+                                    ),
+                                },
+                            )
+                            .await?;
+                            return Ok(ProvisionOutcome::Aborted(format!(
+                                "{provider_name} requires an API key."
+                            )));
+                        }
+                        Some(_) => continue, // unknown index — safest is to re-prompt
+                    }
                 }
 
                 send(
@@ -550,5 +605,191 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3".to_string(),
         "llamacpp" => "llama3".to_string(),
         _ => "default".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::onboard::provision::test_support::{drive, scratch_profile, Answer};
+
+    /// Save an env var's previous value and restore it on drop, so a
+    /// panicking assert doesn't leak state into the next test. Only
+    /// meaningful while `test_env::ENV_LOCK` is held.
+    struct VarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl VarGuard {
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for VarGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    // Tier 0 picker indices (see the `providers` table in `run`):
+    // 0 = openrouter, 3 = openai.
+    const PICK_TIER_RECOMMENDED: usize = 0;
+    const PICK_OPENROUTER: usize = 0;
+    const PICK_OPENAI: usize = 3;
+
+    /// The lockout producer. An empty key for a provider that cannot
+    /// construct without one (`openai` routes through rig, which fails at
+    /// construction) used to be saved silently — and every later launch,
+    /// including `rantaiclaw setup`, then died with
+    /// "openai: OPENAI_API_KEY required" before any UI existed.
+    #[tokio::test]
+    async fn empty_key_for_key_required_provider_prompts_and_aborts() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _key = VarGuard::unset("OPENAI_API_KEY");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(PICK_OPENAI),
+                Answer::Text(""),
+                Answer::Pick(1), // Abort setup
+            ],
+        )
+        .await;
+
+        assert!(
+            t.aborted(),
+            "an empty key for openai must abort, got {:?}",
+            t.outcome
+        );
+        assert!(
+            t.events.iter().any(|e| matches!(
+                e,
+                super::ProvisionEvent::Choose { id, .. } if id == "empty_key_retry"
+            )),
+            "the operator must be offered the re-enter/abort choice"
+        );
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some("openrouter"),
+            "an aborted provisioner must not overwrite default_provider"
+        );
+        assert!(config.api_key.is_none(), "no key must be written");
+    }
+
+    /// "Re-enter the API key" loops back to the prompt instead of aborting.
+    #[tokio::test]
+    async fn empty_key_reenter_choice_prompts_again() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _key = VarGuard::unset("OPENAI_API_KEY");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(PICK_OPENAI),
+                Answer::Text(""),
+                Answer::Pick(0), // Re-enter the API key
+                Answer::Text(""),
+                Answer::Pick(1), // Abort setup
+            ],
+        )
+        .await;
+
+        let key_prompts = t.prompts().iter().filter(|l| l.contains("API key")).count();
+        assert_eq!(key_prompts, 2, "re-enter must re-open the key prompt");
+        assert!(t.aborted(), "second abort must still abort");
+    }
+
+    /// The capability split: openrouter constructs keyless
+    /// (`factory_openrouter` pins it), so an empty key sails through
+    /// exactly as before the gate.
+    #[tokio::test]
+    async fn empty_key_for_keyless_capable_provider_saves() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(PICK_OPENROUTER),
+                Answer::Text(""),
+                Answer::Pick(0), // default model
+            ],
+        )
+        .await;
+
+        assert!(
+            t.configured(),
+            "openrouter with an empty key must configure, got {:?}",
+            t.outcome
+        );
+        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+        assert!(config.api_key.is_none());
+    }
+
+    /// The gate consults the same oracle boot uses — including the
+    /// per-provider env-var fallback. An exported OPENAI_API_KEY means an
+    /// empty config key is a working setup, so no prompt appears.
+    #[tokio::test]
+    async fn exported_env_key_lets_empty_config_key_through() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let _key = VarGuard::set("OPENAI_API_KEY", "sk-test-env-key");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(PICK_OPENAI),
+                Answer::Text(""),
+                Answer::Pick(0), // default model
+            ],
+        )
+        .await;
+
+        assert!(
+            t.configured(),
+            "an exported env key must let the empty config key through, got {:?}",
+            t.outcome
+        );
+        assert_eq!(config.default_provider.as_deref(), Some("openai"));
+        assert!(config.api_key.is_none());
     }
 }

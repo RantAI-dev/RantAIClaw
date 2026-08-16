@@ -70,7 +70,7 @@ async fn end_to_end_turn_emits_chunks_and_done() {
 
     let (req_tx, req_rx) = mpsc::channel(4);
     let (events_tx, mut events_rx) = mpsc::channel(64);
-    let actor = TuiAgentActor::new(agent, req_rx, events_tx);
+    let actor = TuiAgentActor::new(Some(agent), req_rx, events_tx);
     let handle = tokio::spawn(actor.run());
 
     req_tx.send(TurnRequest::Submit("hi".into())).await.unwrap();

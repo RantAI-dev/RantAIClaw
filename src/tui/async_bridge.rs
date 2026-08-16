@@ -29,7 +29,12 @@ pub enum TurnRequest {
 }
 
 pub struct TuiAgentActor {
-    agent: Agent,
+    /// `None` when the initial `Agent::from_config` failed at boot (e.g. a
+    /// provider that cannot construct without an API key). The TUI still
+    /// runs so the operator can repair the config via `/setup provider`;
+    /// a successful `Reload` sets this to `Some` and heals the session
+    /// in place. Turn requests while `None` get an actionable error event.
+    agent: Option<Agent>,
     req_rx: mpsc::Receiver<TurnRequest>,
     events_tx: AgentEventSender,
     queue: VecDeque<String>,
@@ -39,9 +44,15 @@ pub struct TuiAgentActor {
     pending_reload: Option<Box<crate::config::Config>>,
 }
 
+/// Error event sent for a turn request that arrives while no working
+/// agent exists (initial provider construction failed at boot).
+const NO_AGENT_ERROR: &str =
+    "No working provider — the agent failed to start with the current config. \
+     Fix it via /setup provider (or edit config.toml), then retry.";
+
 impl TuiAgentActor {
     pub fn new(
-        agent: Agent,
+        agent: Option<Agent>,
         req_rx: mpsc::Receiver<TurnRequest>,
         events_tx: AgentEventSender,
     ) -> Self {
@@ -78,7 +89,7 @@ impl TuiAgentActor {
                                 let mcp_servers_configured: Vec<String> =
                                     config.mcp_servers.keys().cloned().collect();
                                 let security = new_agent.security();
-                                self.agent = new_agent;
+                                self.agent = Some(new_agent);
                                 tracing::info!("agent reloaded with new config");
                                 let _ = self
                                     .events_tx
@@ -101,8 +112,16 @@ impl TuiAgentActor {
                         // just await the future. Errors surface as
                         // `AgentEvent::Error` (also emitted by the
                         // agent) so the TUI can render them.
-                        if let Err(e) = self
-                            .agent
+                        let Some(agent) = self.agent.as_mut() else {
+                            let _ = self
+                                .events_tx
+                                .send(crate::agent::events::AgentEvent::Error(
+                                    NO_AGENT_ERROR.into(),
+                                ))
+                                .await;
+                            continue;
+                        };
+                        if let Err(e) = agent
                             .compact_streaming(keep_last, Some(self.events_tx.clone()))
                             .await
                         {
@@ -120,6 +139,18 @@ impl TuiAgentActor {
             // Start the next queued turn if idle.
             if self.current.is_none() {
                 if let Some(text) = self.queue.pop_front() {
+                    // No agent (boot-time provider failure): answer the turn
+                    // with an actionable error and keep draining the queue —
+                    // a later Reload restores normal service.
+                    let Some(agent) = self.agent.as_mut() else {
+                        let _ = self
+                            .events_tx
+                            .send(crate::agent::events::AgentEvent::Error(
+                                NO_AGENT_ERROR.into(),
+                            ))
+                            .await;
+                        continue;
+                    };
                     let token = CancellationToken::new();
                     self.current = Some(token.clone());
                     let events = self.events_tx.clone();
@@ -133,7 +164,7 @@ impl TuiAgentActor {
                         // future borrows self.agent exclusively for its
                         // lifetime — confined to this inner block so
                         // self.agent is free for post-turn reload.
-                        let mut turn_fut = Box::pin(self.agent.turn_streaming(
+                        let mut turn_fut = Box::pin(agent.turn_streaming(
                             &text,
                             Some(events),
                             Some(token.clone()),
@@ -191,7 +222,7 @@ impl TuiAgentActor {
                                 let mcp_servers_configured: Vec<String> =
                                     config.mcp_servers.keys().cloned().collect();
                                 let security = new_agent.security();
-                                self.agent = new_agent;
+                                self.agent = Some(new_agent);
                                 tracing::info!("agent reloaded with new config (post-turn)");
                                 // Same ReloadComplete shape as the idle
                                 // path so the TUI re-subscribes to the
@@ -292,7 +323,7 @@ mod tests {
     async fn actor_processes_single_submit_and_emits_done() {
         let (req_tx, req_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(32);
-        let actor = TuiAgentActor::new(build_test_agent("reply"), req_rx, events_tx);
+        let actor = TuiAgentActor::new(Some(build_test_agent("reply")), req_rx, events_tx);
         let handle = tokio::spawn(actor.run());
 
         req_tx.send(TurnRequest::Submit("hi".into())).await.unwrap();
@@ -319,7 +350,7 @@ mod tests {
     async fn actor_processes_queued_submit_after_first_completes() {
         let (req_tx, req_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(32);
-        let actor = TuiAgentActor::new(build_test_agent("r"), req_rx, events_tx);
+        let actor = TuiAgentActor::new(Some(build_test_agent("r")), req_rx, events_tx);
         let handle = tokio::spawn(actor.run());
 
         req_tx
@@ -349,7 +380,7 @@ mod tests {
     async fn actor_cancel_while_idle_is_a_noop() {
         let (req_tx, req_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(32);
-        let actor = TuiAgentActor::new(build_test_agent("x"), req_rx, events_tx);
+        let actor = TuiAgentActor::new(Some(build_test_agent("x")), req_rx, events_tx);
         let handle = tokio::spawn(actor.run());
 
         req_tx.send(TurnRequest::Cancel).await.unwrap();
@@ -394,7 +425,7 @@ mod tests {
         let agent = build_test_agent_with_provider(Box::new(SlowProvider));
         let (req_tx, req_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(32);
-        let actor = TuiAgentActor::new(agent, req_rx, events_tx);
+        let actor = TuiAgentActor::new(Some(agent), req_rx, events_tx);
         let handle = tokio::spawn(actor.run());
 
         req_tx
@@ -415,6 +446,80 @@ mod tests {
             }
         }
         assert!(cancelled_done, "expected Done {{ cancelled: true }}");
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+    }
+
+    #[tokio::test]
+    async fn actor_without_agent_answers_submit_with_error_event() {
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let actor = TuiAgentActor::new(None, req_rx, events_tx);
+        let handle = tokio::spawn(actor.run());
+
+        req_tx.send(TurnRequest::Submit("hi".into())).await.unwrap();
+
+        let ev = timeout(Duration::from_secs(2), events_rx.recv())
+            .await
+            .expect("event within timeout")
+            .expect("channel open");
+        match ev {
+            AgentEvent::Error(msg) => {
+                assert!(
+                    msg.contains("/setup provider"),
+                    "error must point at the repair path, got: {msg}"
+                );
+            }
+            other => panic!("expected Error event, got {other:?}"),
+        }
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+    }
+
+    #[tokio::test]
+    async fn actor_without_agent_drains_every_queued_submit() {
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let actor = TuiAgentActor::new(None, req_rx, events_tx);
+        let handle = tokio::spawn(actor.run());
+
+        req_tx.send(TurnRequest::Submit("a".into())).await.unwrap();
+        req_tx.send(TurnRequest::Submit("b".into())).await.unwrap();
+
+        let mut errors = 0;
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(2), events_rx.recv()).await {
+            if matches!(ev, AgentEvent::Error(_)) {
+                errors += 1;
+                if errors == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(errors, 2, "each queued submit gets its own error event");
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+    }
+
+    #[tokio::test]
+    async fn actor_without_agent_answers_compact_with_error_event() {
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let actor = TuiAgentActor::new(None, req_rx, events_tx);
+        let handle = tokio::spawn(actor.run());
+
+        req_tx
+            .send(TurnRequest::Compact { keep_last: 10 })
+            .await
+            .unwrap();
+
+        let ev = timeout(Duration::from_secs(2), events_rx.recv())
+            .await
+            .expect("event within timeout")
+            .expect("channel open");
+        assert!(
+            matches!(ev, AgentEvent::Error(_)),
+            "expected Error event for /compress without an agent"
+        );
         drop(req_tx);
         let _ = timeout(Duration::from_secs(1), handle).await;
     }
