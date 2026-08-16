@@ -141,6 +141,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **WhatsApp Web traffic now honours `[proxy]`.** Its HTTP transport
+  (`wa-rs-ureq-http`) built a client with no proxy configuration at all, so an
+  operator who routed the agent through a proxy had this one channel quietly
+  going direct — including its media downloads. It is replaced by a
+  reqwest-backed transport that takes its proxies from the same configuration
+  every other channel uses. `ureq` and `ureq-proto` leave the dependency graph
+  as a side effect, not as the point.
+
 - **A memory recalled from a private chat no longer surfaces in a group.** The
   layered-memory scope was built from the *sender* while conversation history
   was keyed on the *chat*, so one person's DM, every group the bot shared with

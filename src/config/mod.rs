@@ -6,14 +6,15 @@ pub mod watcher;
 
 #[allow(unused_imports)]
 pub use schema::{
-    apply_runtime_proxy_to_builder, build_runtime_proxy_client,
-    build_runtime_proxy_client_no_redirect, build_runtime_proxy_client_with_timeouts,
-    runtime_proxy_config, set_runtime_proxy_config, AgentConfig, AuditConfig, AutonomyConfig,
-    BrowserComputerUseConfig, BrowserConfig, ChannelsConfig, ClassificationRule, ComposioConfig,
-    Config, CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig,
-    EmbeddingRouteConfig, GatewayAgentConfig, GatewayConfig, GatewayLoginConfig, HardwareConfig,
-    HardwareTransport, HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,
-    KnowledgeConfig, LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig,
+    apply_runtime_proxy_to_blocking_builder, apply_runtime_proxy_to_builder,
+    build_runtime_proxy_client, build_runtime_proxy_client_no_redirect,
+    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
+    AgentConfig, AuditConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig,
+    ChannelsConfig, ClassificationRule, ComposioConfig, Config, CostConfig, CronConfig,
+    DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EmbeddingRouteConfig,
+    GatewayAgentConfig, GatewayConfig, GatewayLoginConfig, HardwareConfig, HardwareTransport,
+    HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityConfig, KnowledgeConfig,
+    LarkConfig, MatrixConfig, MemoryConfig, ModelRouteConfig, MultimodalConfig,
     NextcloudTalkConfig, ObservabilityConfig, PeripheralBoardConfig, PeripheralsConfig,
     ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig,
     RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,

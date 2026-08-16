@@ -1523,62 +1523,79 @@ impl ProxyConfig {
         }
     }
 
+    /// Every proxy this configuration wants applied for `service_key`.
+    ///
+    /// Extracted so the async and blocking client builders below cannot drift:
+    /// `reqwest::Proxy` is the same type for both, so the decision — which URLs,
+    /// which `no_proxy` — is made once here and only the `.proxy()` call differs.
+    /// WhatsApp Web needs a blocking client for its streaming media download,
+    /// and a second hand-rolled copy of this logic is how that channel would
+    /// quietly stop honouring `[proxy]` again.
+    fn proxies_for(&self, service_key: &str) -> Vec<reqwest::Proxy> {
+        if !self.should_apply_to_service(service_key) {
+            return Vec::new();
+        }
+
+        let no_proxy = self.no_proxy_value();
+        let mut proxies = Vec::new();
+
+        for (raw, kind, build) in [
+            (
+                self.all_proxy.as_deref(),
+                "all_proxy",
+                (|u: &str| reqwest::Proxy::all(u)) as fn(&str) -> reqwest::Result<reqwest::Proxy>,
+            ),
+            (
+                self.http_proxy.as_deref(),
+                "http_proxy",
+                (|u: &str| reqwest::Proxy::http(u)) as fn(&str) -> reqwest::Result<reqwest::Proxy>,
+            ),
+            (
+                self.https_proxy.as_deref(),
+                "https_proxy",
+                (|u: &str| reqwest::Proxy::https(u)) as fn(&str) -> reqwest::Result<reqwest::Proxy>,
+            ),
+        ] {
+            let Some(url) = normalize_proxy_url_option(raw) else {
+                continue;
+            };
+            match build(&url) {
+                Ok(proxy) => proxies.push(apply_no_proxy(proxy, no_proxy.clone())),
+                Err(error) => tracing::warn!(
+                    proxy_url = %url,
+                    service_key,
+                    "Ignoring invalid {kind} URL: {error}"
+                ),
+            }
+        }
+
+        proxies
+    }
+
     pub fn apply_to_reqwest_builder(
         &self,
         mut builder: reqwest::ClientBuilder,
         service_key: &str,
     ) -> reqwest::ClientBuilder {
-        if !self.should_apply_to_service(service_key) {
-            return builder;
+        for proxy in self.proxies_for(service_key) {
+            builder = builder.proxy(proxy);
         }
+        builder
+    }
 
-        let no_proxy = self.no_proxy_value();
-
-        if let Some(url) = normalize_proxy_url_option(self.all_proxy.as_deref()) {
-            match reqwest::Proxy::all(&url) {
-                Ok(proxy) => {
-                    builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        proxy_url = %url,
-                        service_key,
-                        "Ignoring invalid all_proxy URL: {error}"
-                    );
-                }
-            }
+    /// The blocking counterpart, for a caller that needs a synchronous reader
+    /// over the response body. WhatsApp Web's media download is the live case:
+    /// `wa-rs` streams the encrypted body straight into a writer from inside
+    /// `spawn_blocking`, so buffering it to satisfy an async client would trade
+    /// the proxy fix for a memory regression on large media.
+    pub fn apply_to_blocking_reqwest_builder(
+        &self,
+        mut builder: reqwest::blocking::ClientBuilder,
+        service_key: &str,
+    ) -> reqwest::blocking::ClientBuilder {
+        for proxy in self.proxies_for(service_key) {
+            builder = builder.proxy(proxy);
         }
-
-        if let Some(url) = normalize_proxy_url_option(self.http_proxy.as_deref()) {
-            match reqwest::Proxy::http(&url) {
-                Ok(proxy) => {
-                    builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        proxy_url = %url,
-                        service_key,
-                        "Ignoring invalid http_proxy URL: {error}"
-                    );
-                }
-            }
-        }
-
-        if let Some(url) = normalize_proxy_url_option(self.https_proxy.as_deref()) {
-            match reqwest::Proxy::https(&url) {
-                Ok(proxy) => {
-                    builder = builder.proxy(apply_no_proxy(proxy, no_proxy));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        proxy_url = %url,
-                        service_key,
-                        "Ignoring invalid https_proxy URL: {error}"
-                    );
-                }
-            }
-        }
-
         builder
     }
 
@@ -1792,6 +1809,13 @@ pub fn apply_runtime_proxy_to_builder(
     service_key: &str,
 ) -> reqwest::ClientBuilder {
     runtime_proxy_config().apply_to_reqwest_builder(builder, service_key)
+}
+
+pub fn apply_runtime_proxy_to_blocking_builder(
+    builder: reqwest::blocking::ClientBuilder,
+    service_key: &str,
+) -> reqwest::blocking::ClientBuilder {
+    runtime_proxy_config().apply_to_blocking_reqwest_builder(builder, service_key)
 }
 
 pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {

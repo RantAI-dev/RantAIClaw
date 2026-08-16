@@ -245,7 +245,7 @@ because of crate count alone.
 its own header already labels it aspirational, and the reachable thresholds
 (35 MB error / 30 MB advisory) have been kept current.
 
-### 5.3 `wa-rs-ureq-http` → reqwest: **do it, as its own plan**
+### 5.3 `wa-rs-ureq-http` → reqwest: **done**
 
 Accepted in principle — it removes `ureq` and `ureq-proto` and brings WhatsApp
 Web traffic under `[proxy]`, which it currently bypasses. That second half is a
@@ -259,7 +259,10 @@ replicated, on a path that handles attacker-influenced bytes. `AGENTS.md` §7.5
 asks for threat notes and a rollback strategy on exactly that kind of change,
 and §12 says not to ship and hope on it.
 
-Shape for whoever picks it up:
+**Implemented 2026-08-16** in `src/channels/whatsapp_http.rs`. `ureq` and
+`ureq-proto` are out of the dependency graph (`cargo tree -i ureq` finds
+nothing), and both halves of the transport are proxied. The shape below is what
+was built:
 
 1. Implement `wa_rs_core::net::HttpClient` for a reqwest-backed type — `execute`
    maps `HttpRequest{url,method,headers,body}` onto the async client from
@@ -272,6 +275,13 @@ Shape for whoever picks it up:
 4. Prove the proxy is honoured: point `[proxy]` at a local recorder and assert
    the media fetch arrives there. That assertion is the deliverable — the crate
    removal is incidental.
+
+The drift risk in step 2 was closed rather than accepted. `ProxyConfig` now has
+one `proxies_for`, and both `apply_to_reqwest_builder` and the new
+`apply_to_blocking_reqwest_builder` consume it — `reqwest::Proxy` is the same
+type for async and blocking clients, so only the `.proxy()` call differs. A
+second hand-rolled copy of the proxy decision is exactly how this channel would
+have quietly gone direct again.
 
 The `rig-core` reqwest 0.13 duplicate stays unforced, per §4.
 
