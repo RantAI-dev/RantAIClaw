@@ -229,6 +229,21 @@ which unzip
 rantaiclaw skills inspect <slug>
 ```
 
+### TUI says "copied N lines" but the clipboard is empty
+
+The TUI copies drag-selected chat text with Ctrl+C using OSC 52, a terminal
+escape sequence — the app cannot confirm delivery, so an unsupporting terminal
+fails silently.
+
+Terminal support in one line: Windows Terminal, iTerm2, kitty, alacritty,
+WezTerm, and tmux ≥ 3.3 (`set -g set-clipboard on`) implement OSC 52;
+GNOME Terminal and other VTE-based terminals do not.
+
+On an unsupporting terminal, use native selection instead: hold **Shift**
+while dragging (Option on iTerm2) — the terminal bypasses the TUI's mouse
+capture and its normal copy shortcut works. Native selection copies the
+screen as-is, so the pane border `│` and wrapped line breaks come along.
+
 ## Channel Issues
 
 ### Telegram conflict: `terminated by other getUpdates request`
