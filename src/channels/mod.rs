@@ -73,6 +73,8 @@ pub mod telegram;
 pub mod traits;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
+pub mod whatsapp_http;
+#[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;

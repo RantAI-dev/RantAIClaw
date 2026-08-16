@@ -544,6 +544,7 @@ impl Channel for WhatsAppWebChannel {
         // Store the sender channel for incoming messages
         *self.tx.lock() = Some(tx.clone());
 
+        use super::whatsapp_http::ReqwestHttpClient;
         use wa_rs::bot::Bot;
         use wa_rs::pair_code::PairCodeOptions;
         use wa_rs::store::{Device, DeviceStore};
@@ -551,7 +552,6 @@ impl Channel for WhatsAppWebChannel {
         use wa_rs_core::proto_helpers::MessageExt;
         use wa_rs_core::types::events::Event;
         use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
-        use wa_rs_ureq_http::UreqHttpClient;
 
         tracing::info!(
             "WhatsApp Web channel starting (session: {})",
@@ -584,7 +584,7 @@ impl Channel for WhatsAppWebChannel {
         }
 
         // Create HTTP client for media operations
-        let http_client = UreqHttpClient::new();
+        let http_client = ReqwestHttpClient::new();
 
         // Build the bot
         let tx_clone = tx.clone();
@@ -1025,6 +1025,7 @@ pub enum PairEvent {
 
 #[cfg(feature = "whatsapp-web")]
 pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + Send {
+    use super::whatsapp_http::ReqwestHttpClient;
     use async_stream::stream;
     use tokio::sync::mpsc;
     use wa_rs::bot::Bot;
@@ -1032,7 +1033,6 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
     use wa_rs::store::{Device, DeviceStore};
     use wa_rs_core::types::events::Event;
     use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
-    use wa_rs_ureq_http::UreqHttpClient;
 
     let opts = std::sync::Arc::new(opts);
     let (tx, rx) = mpsc::channel::<PairEvent>(32);
@@ -1110,7 +1110,7 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
             let builder = Bot::builder()
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
-                .with_http_client(UreqHttpClient::new())
+                .with_http_client(ReqwestHttpClient::new())
                 .with_pair_code(PairCodeOptions {
                     phone_number: opts.pair_phone.clone().unwrap_or_default(),
                     ..Default::default()

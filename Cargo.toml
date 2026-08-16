@@ -213,7 +213,6 @@ wa-rs = { version = "0.2", optional = true, default-features = false }
 wa-rs-core = { version = "0.2", optional = true, default-features = false }
 wa-rs-binary = { version = "0.2", optional = true, default-features = false }
 wa-rs-proto = { version = "0.2", optional = true, default-features = false }
-wa-rs-ureq-http = { version = "0.2", optional = true }
 wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
 
 # Knowledge Base storage backend — sqlite-vec extension for vector search.
@@ -285,7 +284,7 @@ probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
-whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost"]
+whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost"]
 # kb = Knowledge Base subsystem (sqlite-vec + PDF extraction)
 kb = ["dep:sqlite-vec", "dep:lopdf", "rag-pdf"]
 # kb-office = Office-document ingestion for the KB (docx/xlsx/pptx)
