@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1-alpha] — 2026-08-16
+
+A single-fix patch. No config schema change — this release carries no
+migration and rolls back freely to v0.20.0-alpha.
+
 ### Fixed
 
 - **Setup no longer saves a provider it cannot start, and a broken provider
