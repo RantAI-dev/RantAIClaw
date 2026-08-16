@@ -7689,21 +7689,35 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         }
     }
 
-    let mut agent = Agent::from_config(&app_config).await?;
+    // A provider that cannot construct (e.g. `openai` saved with no API key)
+    // used to abort right here — which also killed `rantaiclaw setup`, the
+    // documented repair path, leaving no way back in short of hand-editing
+    // config.toml. Degrade instead: boot without an agent, surface the error,
+    // open the provider setup overlay, and let TurnRequest::Reload heal the
+    // session in place once a working config is saved.
+    let (mut agent, agent_boot_error) = match Agent::from_config(&app_config).await {
+        Ok(agent) => (Some(agent), None),
+        Err(e) => {
+            tracing::error!("agent failed to start: {e:#}");
+            (None, Some(format!("{e:#}")))
+        }
+    };
 
     // `/resume`: re-feed the resumed session's prior turns so the model
     // actually remembers the earlier conversation (not just the scrollback).
     if let Some(resume_id) = tui_config.resume_session.as_deref() {
-        match crate::sessions::cli::open_store().and_then(|s| s.get_messages(resume_id)) {
-            Ok(msgs) => {
-                let prior = crate::sessions::messages_to_turns(&msgs);
-                if !prior.is_empty() {
-                    if let Err(e) = agent.restore_history(&prior) {
-                        tracing::warn!("failed to restore resumed history: {e}");
+        if let Some(agent) = agent.as_mut() {
+            match crate::sessions::cli::open_store().and_then(|s| s.get_messages(resume_id)) {
+                Ok(msgs) => {
+                    let prior = crate::sessions::messages_to_turns(&msgs);
+                    if !prior.is_empty() {
+                        if let Err(e) = agent.restore_history(&prior) {
+                            tracing::warn!("failed to restore resumed history: {e}");
+                        }
                     }
                 }
+                Err(e) => tracing::warn!("could not load resumed session {resume_id}: {e}"),
             }
-            Err(e) => tracing::warn!("could not load resumed session {resume_id}: {e}"),
         }
     }
 
@@ -7719,9 +7733,12 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<TurnRequest>(16);
     let (events_tx, events_rx): (AgentEventSender, mpsc::Receiver<AgentEvent>) = mpsc::channel(128);
 
-    let security_handle = agent.security();
-    let memory_handle = agent.memory_handle();
-    let mcp_tools_by_server = agent.mcp_tools_by_server();
+    let security_handle = agent.as_ref().and_then(|a| a.security());
+    let memory_handle = agent.as_ref().map(|a| a.memory_handle());
+    let mcp_tools_by_server = agent
+        .as_ref()
+        .map(|a| a.mcp_tools_by_server())
+        .unwrap_or_default();
     let actor = TuiAgentActor::new(agent, req_rx, events_tx);
     let actor_handle = tokio::spawn(actor.run());
 
@@ -7757,7 +7774,7 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         }
     }
     app.context.security = security_handle;
-    app.context.memory = Some(memory_handle);
+    app.context.memory = memory_handle;
     app.context.autonomy_preset =
         crate::approval::policy_writer::read_active_preset(&profile.policy_dir());
 
@@ -7789,6 +7806,19 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
         let _ = entry; // suppress unused warning when args check skipped
     }
 
+    // Boot-time provider failure: tell the operator what broke and how the
+    // session heals. The overlay itself opens below — an explicit
+    // `setup <topic>` still wins; otherwise we route to the provider
+    // provisioner, the one that repairs this state.
+    if let Some(err) = agent_boot_error.as_deref() {
+        let msg = format!(
+            "⚠ provider failed to start: {err}. Opening setup — enter an API key or \
+             switch provider; the session heals in place once saved."
+        );
+        let _ = app.context.append_system_message(&msg);
+        app.scrollback_queue.push(("system".to_string(), msg));
+    }
+
     if let Some(topic) = tui_config.setup_provisioner.take() {
         // `rantaiclaw setup` (no topic) and `rantaiclaw setup full` both
         // boot the first-run wizard — the canonical "set everything up"
@@ -7813,6 +7843,18 @@ pub async fn run_tui(tui_config: TuiConfig) -> Result<()> {
             app.open_category_sub_picker(crate::tui::commands::setup::category_key(cat));
         } else if let Err(e) = app.open_setup_overlay(topic) {
             let msg = format!("Failed to open setup: {}", e);
+            let _ = app.context.append_system_message(&msg);
+            app.scrollback_queue.push(("system".to_string(), msg));
+        }
+    } else if agent_boot_error.is_some() {
+        // No explicit setup topic and the agent failed to build: open the
+        // provider provisioner directly — it owns exactly the keys
+        // (default_provider / api_key / default_model) whose current values
+        // broke the boot. The first-run-wizard branch below can't catch
+        // this: its condition requires `default_provider` to be unset, and
+        // a failed boot means it IS set (to something unusable).
+        if let Err(e) = app.open_setup_overlay("provider".to_string()) {
+            let msg = format!("Failed to open provider setup: {e}");
             let _ = app.context.append_system_message(&msg);
             app.scrollback_queue.push(("system".to_string(), msg));
         }

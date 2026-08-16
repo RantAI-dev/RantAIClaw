@@ -142,6 +142,33 @@ Persist in your shell profile if needed.
 
 ## Runtime / Gateway
 
+### Startup fails with `openai: OPENAI_API_KEY required` (or anthropic / gemini)
+
+Cause: the config names a provider that cannot start without an API key, and
+no key is stored or exported. The usual producer was setup on **v0.20.0-alpha
+or earlier**: choosing such a provider and leaving the key prompt empty saved
+the pair anyway.
+
+On binaries **after v0.20.0-alpha** this state no longer aborts: the TUI opens,
+reports the failure, and drops you into provider setup — enter a key or switch
+provider and the session heals in place. Setup also refuses to save the broken
+combination in the first place.
+
+On **v0.20.0-alpha and earlier** the same config kills every launch, including
+`rantaiclaw setup`. Two manual escapes:
+
+1. Export the provider's key for the session, then repair via setup:
+
+```bash
+OPENAI_API_KEY=sk-... rantaiclaw setup provider
+```
+
+(PowerShell: `$env:OPENAI_API_KEY="sk-..."; rantaiclaw setup provider`)
+
+2. Or edit `~/.rantaiclaw/profiles/<name>/config.toml` directly: set
+   `default_provider` to a provider that runs keyless (for example
+   `"openrouter"` or `"ollama"`), save, and relaunch.
+
 ### Gateway unreachable
 
 Checks:

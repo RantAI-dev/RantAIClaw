@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Setup no longer saves a provider it cannot start, and a broken provider
+  config no longer locks you out.** Choosing a key-required provider (openai,
+  anthropic, gemini without CLI auth) and leaving the API key empty used to
+  save silently — and every later launch, including `rantaiclaw setup`, then
+  died with `openai: OPENAI_API_KEY required` before any UI existed; the only
+  escapes were hand-editing `config.toml` or exporting the env var. Two
+  halves: setup now checks whether the chosen provider can actually construct
+  keyless (the same check boot performs, so an exported `OPENAI_API_KEY` or
+  gemini CLI auth still sails through) and offers re-enter/abort instead of
+  saving a broken pair; and the TUI now boots without an agent when the
+  provider fails to build — it reports what broke, opens provider setup, and
+  the session heals in place once a working config is saved, no restart
+  needed. Keyless-capable providers (ollama, openrouter, …) are untouched.
+
 ## [0.20.0-alpha] — 2026-08-16
 
 The channels release: a full-subsystem deepscan (plans 115–149) plus
