@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **TUI: drag-select chat text and copy it with Ctrl+C.** Native terminal
+  selection died silently in v0.10.0-alpha when mouse capture was enabled for
+  wheel scrolling (capture is all-or-nothing — the protocol has no
+  "wheel-only" mode). Selection now lives in the app: drag highlights whole
+  transcript lines, Ctrl+C with a highlight copies via OSC 52, Ctrl+C without
+  one keeps its cancel/quit meaning, Esc clears the highlight first and
+  cancels the turn second, a plain click deselects. The copied text is the
+  message text itself — no `│` borders, no wrap-injected line breaks, code
+  fences verbatim — which is better than the pre-v0.10 native copy ever was.
+  Honest limits: OSC 52 delivery can't be confirmed from inside the app and
+  GNOME Terminal/VTE don't implement it — the status notice says so, and
+  Shift+drag native selection remains the universal fallback. Wheel
+  scrolling is untouched.
+
 ## [0.20.1-alpha] — 2026-08-16
 
 A single-fix patch. No config schema change — this release carries no
