@@ -187,11 +187,114 @@ later.
 
 ---
 
-## 5. What this document does not do
+## 5. Decisions — recorded 2026-08-15
 
-No manifest was changed. Per the plan, implementation waits on a recorded
-decision — a PR that implements an option and describes it as obvious is the
-failure mode the plan exists to prevent.
+Taken by the maintainer's delegation. Each is re-grounded in a measurement made
+today, not in the section above, because two of that section's claims had gone
+stale in the meantime (noted inline).
+
+### 5.1 matrix-sdk → **option 1, with a review trigger**
+
+Verified today at rustc 1.97, on `main`:
+
+- `cargo check --lib --features channel-matrix` still fails with
+  `queries overflow the depth limit!` — unchanged since `1a015d0`.
+- **`recursion_limit` on *our* crate root does not help.** Probed directly: the
+  limit must sit on `matrix_sdk`'s own crate root, which is what makes option 2
+  a fork rather than a one-line manifest edit. This had been assumed; it is now
+  measured.
+
+Option 2 remains the technically best answer and is **not** taken here, for a
+reason that is not technical: it requires hosting a fork of a security-critical
+E2EE SDK, plus a `deny.toml` `unknown-git` exception. That is a maintenance
+commitment for the project to make deliberately, not a side effect of a
+dependency clean-up. Option 4 (drop the channel) is likewise a product call that
+the section above rightly warns must not happen by inaction.
+
+So: **wait — but stop waiting silently.** The two RUSTSEC suppressions that
+exist *only* for matrix-sdk now carry an explicit review date. When it passes,
+the choice is re-made rather than re-deferred.
+
+**Stale claim corrected**: §2 says `README.md:149` reads as "flip a flag and it
+works". It no longer does — plan 149's status matrix (#508) already marks Matrix
+**unbuildable** in both `README.md` and `docs/reference/channels.md` §0, with
+the reason. No documentation change was needed.
+
+**Removed as dead weight**: `#![recursion_limit = "512"]` in `src/lib.rs`, whose
+comment claimed it addressed exactly this problem. It does not, and no buildable
+configuration needs it — verified across `--no-default-features`, `hardware`,
+`browser-native`, `channel-lark`, default, `--tests` and `--bins`. If Matrix is
+ever unblocked and our own monomorphizations need it, the compiler says so
+immediately and it comes back with a comment that is true.
+
+### 5.2 `whatsapp-web` stays in `default`
+
+The v0.6.49 reasoning holds. `AGENTS.md` §3.6 is explicit that *local
+capability* ships enabled so a fresh install is useful without hand-editing
+config, and a channel is capability, not exposure. Moving it out is a
+user-visible packaging regression — anyone building from source silently loses
+the channel — traded for 4.5 MiB on a 32 MiB binary.
+
+What the measurement changes is not the default, but what is said about it: the
+account-suspension warning in `docs/reference/channels.md` §4.7 and the
+reverse-engineered Signal stack are properties of a channel every user links,
+and they are already documented there. Revisit if the binary target moves, not
+because of crate count alone.
+
+`scripts/ci/check_binary_size.sh`'s "5 MB target" was checked and **left alone**:
+its own header already labels it aspirational, and the reachable thresholds
+(35 MB error / 30 MB advisory) have been kept current.
+
+### 5.3 `wa-rs-ureq-http` → reqwest: **do it, as its own plan**
+
+Accepted in principle — it removes `ureq` and `ureq-proto` and brings WhatsApp
+Web traffic under `[proxy]`, which it currently bypasses. That second half is a
+behaviour fix, not a size one, and is the reason to do it.
+
+It is **not** implemented in this change, for a reason found while scoping it:
+`wa-rs-core`'s `HttpClient` has a second method, `execute_streaming`, and
+`wa-rs/src/download.rs:238` calls it — the media download path. A reqwest
+implementation therefore needs a blocking client with the proxy configuration
+replicated, on a path that handles attacker-influenced bytes. `AGENTS.md` §7.5
+asks for threat notes and a rollback strategy on exactly that kind of change,
+and §12 says not to ship and hope on it.
+
+Shape for whoever picks it up:
+
+1. Implement `wa_rs_core::net::HttpClient` for a reqwest-backed type — `execute`
+   maps `HttpRequest{url,method,headers,body}` onto the async client from
+   `config::build_runtime_proxy_client("channel.whatsapp_web")`.
+2. `execute_streaming` is sync and returns `Box<dyn Read + Send>`; it must keep
+   working or WhatsApp Web media downloads break. A blocking reqwest client
+   needs the same proxy settings — do not let the two drift.
+3. Swap both `UreqHttpClient::new()` call sites in `src/channels/whatsapp_web.rs`
+   and drop `wa-rs-ureq-http` from `Cargo.toml`.
+4. Prove the proxy is honoured: point `[proxy]` at a local recorder and assert
+   the media fetch arrives there. That assertion is the deliverable — the crate
+   removal is incidental.
+
+The `rig-core` reqwest 0.13 duplicate stays unforced, per §4.
+
+### 5.4 Plan 149's `channel verify` harness → **not built**
+
+Recorded here because it turns on the same reasoning. A per-PR job driving 17
+third-party services contradicts `AGENTS.md` §3.7, which requires deterministic
+CI and no unguarded network dependence: it would be red more often than green,
+and a gate that is usually red trains people to ignore it.
+
+What replaces it is what plan 149 already shipped: the per-channel verification
+status matrix in `docs/reference/channels.md` §0, kept current by hand. A
+manually-dispatched verification workflow remains available later if someone
+wants one — the objection is to it being per-PR and required, not to it
+existing.
+
+---
+
+## 6. What this document does not do
+
+No manifest was changed by the write-up itself. Per the plan, implementation
+waited on a recorded decision — a PR that implements an option and describes it
+as obvious is the failure mode the plan exists to prevent. §5 is that record.
 
 One follow-up applies **whichever** matrix option wins: add a `channel-matrix`
 entry to the CI features matrix so the module is at minimum type-checked, and

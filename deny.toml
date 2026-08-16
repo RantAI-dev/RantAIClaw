@@ -15,6 +15,13 @@ ignore = [
     # crate is declared unmaintained (notice only, no vulnerability). It
     # implements fixed-size bitmap ops with no I/O and no untrusted-input
     # surface in our usage. Unblocks when matrix-sdk moves off imbl.
+    #
+    # REVIEW BY 2026-11-15. Reached only through `channel-matrix`, which has not
+    # compiled since 0.16 and ships in no release binary — so this suppresses an
+    # advisory for code no user runs. The decision to keep waiting is recorded in
+    # docs/project/2026-08-14-dependency-decisions.md §5.1; waiting without a date
+    # is what made it invisible for months. On that date, re-make the choice
+    # (fork / pin / drop) rather than re-defer it.
     "RUSTSEC-2026-0247",
     # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete.
     "RUSTSEC-2025-0141",
@@ -45,6 +52,9 @@ ignore = [
     "RUSTSEC-2026-0159",
     # proc-macro-error2 v2.0.1 via matrix-sdk → aquamarine (doc-comment macro) —
     # build-time only, no runtime surface, no safe upgrade published upstream.
+    #
+    # REVIEW BY 2026-11-15, with RUSTSEC-2026-0247 above — same root, same
+    # decision. See docs/project/2026-08-14-dependency-decisions.md §5.1.
     "RUSTSEC-2026-0173",
     # ttf-parser v0.25 via lopdf 0.42 → pdf-extract (KB PDF text extraction) —
     # font parser flagged unmaintained; parse-only path over operator-supplied
