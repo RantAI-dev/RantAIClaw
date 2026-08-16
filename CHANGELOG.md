@@ -52,7 +52,6 @@ gateway actually did).
 - **Replies now thread on Discord, Telegram and Mattermost.** Set
   `[channels_config] thread_replies = false` if you preferred flat replies.
 
-
 ### Security
 
 - **A shell approval raised from a chat can now be answered with a bare `ok`
