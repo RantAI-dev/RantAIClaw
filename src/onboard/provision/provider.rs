@@ -353,7 +353,6 @@ impl TuiProvisioner for ProviderProvisioner {
                     .await?;
                     let choice = recv_selection(&mut responses).await?;
                     match choice.first().copied() {
-                        Some(0) => continue, // re-prompt for the key
                         Some(1) | None => {
                             send(
                                 &events,
@@ -368,7 +367,9 @@ impl TuiProvisioner for ProviderProvisioner {
                                 "{provider_name} requires an API key."
                             )));
                         }
-                        Some(_) => continue, // unknown index — safest is to re-prompt
+                        // Some(0) = re-enter; an unknown index re-prompts
+                        // too, the safest reading of a malformed selection.
+                        _ => continue,
                     }
                 }
 

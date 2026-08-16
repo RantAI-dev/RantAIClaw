@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<TurnRequest>(16);
     let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(128);
 
-    let actor = TuiAgentActor::new(agent, req_rx, events_tx);
+    let actor = TuiAgentActor::new(Some(agent), req_rx, events_tx);
     let actor_handle = tokio::spawn(actor.run());
 
     let start = Instant::now();
