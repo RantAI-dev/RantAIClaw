@@ -12,9 +12,44 @@
 //! `RANTAICLAW_CONFIG_DIR` env var, because the config-api handlers persist
 //! via `Config::load_or_init()` / `cfg.save()` — resolved from that env var,
 //! not from `state.config` (see `lock_and_load`/`persist_and_swap` in
-//! `src/gateway/config_api.rs`). Run this binary single-threaded:
-//! `cargo test --test config_api -- --test-threads=1` (env var is
-//! process-global; concurrent test threads would race on it).
+//! `src/gateway/config_api.rs`).
+//!
+//! That race is now **enforced, not requested**. This header used to ask for
+//! `--test-threads=1`; CI runs plain `cargo test`, so the instruction was
+//! documentation that nothing applied, and
+//! `knowledge_accepted_key_activates_and_deactivate_keeps_it` failed
+//! intermittently when a sibling replaced `RANTAICLAW_CONFIG_DIR` mid-test.
+//! Every test that touches those variables takes [`EnvGuard`], which also
+//! clears them on drop so a panicking test cannot leak an override into the
+//! next one. `crate::test_env::ENV_LOCK` is not reachable from an integration
+//! binary, and does not need to be: the race here is between siblings in this
+//! process.
+
+/// Serialises the tests that set process-global config-resolution env vars,
+/// and clears them on drop — including on unwind.
+static CONFIG_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+
+impl EnvGuard {
+    async fn acquire() -> Self {
+        let guard = CONFIG_ENV_LOCK.lock().await;
+        // Start from a known state: a previous panicking test may have leaked.
+        clear_config_env();
+        Self(guard)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        clear_config_env();
+    }
+}
+
+fn clear_config_env() {
+    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
+    std::env::remove_var("KB_EMBEDDING_BASE_URL");
+}
 
 use rantaiclaw::config::Config;
 use rantaiclaw::gateway::build_gateway_router;
@@ -138,6 +173,7 @@ async fn put_model_with_auth_returns_200() {
     // module doc comment above). Point it at a scratch dir so this test
     // never touches a real config.toml. This binary MUST run
     // single-threaded (`--test-threads=1`): the env var is process-global.
+    let _env = EnvGuard::acquire().await;
     std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
 
     let base_url = spawn_test_gateway(test_config(workspace.path())).await;
@@ -151,7 +187,6 @@ async fn put_model_with_auth_returns_200() {
         .expect("request should complete");
     let status = resp.status();
 
-    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     assert_eq!(status, reqwest::StatusCode::OK);
 }
 
@@ -200,6 +235,7 @@ async fn get_channels_returns_200() {
 async fn knowledge_activate_without_key_returns_400() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let config_dir = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::acquire().await;
     std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
     let base_url = spawn_test_gateway(test_config(workspace.path())).await;
 
@@ -222,7 +258,6 @@ async fn knowledge_activate_without_key_returns_400() {
         .json()
         .await
         .expect("json");
-    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(got["enabled"], false, "{got}");
 }
@@ -240,6 +275,7 @@ async fn knowledge_rejected_key_is_never_persisted() {
 
     let workspace = tempfile::tempdir().expect("tempdir");
     let config_dir = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::acquire().await;
     std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
     std::env::set_var("KB_EMBEDDING_BASE_URL", embed.uri());
     let base_url = spawn_test_gateway(test_config(workspace.path())).await;
@@ -266,8 +302,6 @@ async fn knowledge_rejected_key_is_never_persisted() {
         .json()
         .await
         .expect("json");
-    std::env::remove_var("KB_EMBEDDING_BASE_URL");
-    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
 
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
     let detail = body["detail"].as_str().unwrap_or_default();
@@ -298,6 +332,7 @@ async fn knowledge_accepted_key_activates_and_deactivate_keeps_it() {
 
     let workspace = tempfile::tempdir().expect("tempdir");
     let config_dir = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::acquire().await;
     std::env::set_var("RANTAICLAW_CONFIG_DIR", config_dir.path());
     std::env::set_var("KB_EMBEDDING_BASE_URL", embed.uri());
     let base_url = spawn_test_gateway(test_config(workspace.path())).await;
@@ -346,8 +381,6 @@ async fn knowledge_accepted_key_activates_and_deactivate_keeps_it() {
         .json()
         .await
         .expect("json");
-    std::env::remove_var("KB_EMBEDDING_BASE_URL");
-    std::env::remove_var("RANTAICLAW_CONFIG_DIR");
     assert_eq!(got["enabled"], false, "{got}");
     assert_eq!(got["embedding_configured"], true, "{got}");
 }

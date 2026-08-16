@@ -72,8 +72,26 @@ pub async fn probe_post(url: &str, headers: &[(&str, &str)], body: &str) -> Resu
 mod tests {
     use super::*;
 
+    /// These probes build a plain `reqwest` client, and reqwest reads
+    /// `HTTP_PROXY`/`HTTPS_PROXY` from the process environment by default. A
+    /// sibling test — `config::schema::tests::env_override_proxy_scope_environment_applies_process_env`
+    /// — sets those to a dead loopback port while asserting
+    /// `apply_to_process_env`, so a probe running concurrently dialled the dead
+    /// proxy and failed with `Connection refused`.
+    ///
+    /// `test_env`'s contract says a test that *sets* those variables must hold
+    /// the shared lock. A test whose result *depends* on them has to hold it
+    /// too, or the serialization only covers half the race.
+    ///
+    /// Reproduced deterministically: with `HTTP_PROXY=http://127.0.0.1:7890`
+    /// these fail exactly as they did intermittently; without it they pass.
+    async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::test_env::ENV_LOCK.lock().await
+    }
+
     #[tokio::test]
     async fn probe_get_returns_status() {
+        let _env_guard = env_lock().await;
         let mut mock = mockito::Server::new_async().await;
         let m = mock
             .mock("GET", "/test")
@@ -88,6 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_post_returns_status() {
+        let _env_guard = env_lock().await;
         let mut mock = mockito::Server::new_async().await;
         let m = mock
             .mock("POST", "/test")
@@ -102,6 +121,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_get_invalid_url() {
+        let _env_guard = env_lock().await;
         let r = probe_get("http://localhost:99999", &[]).await;
         assert!(r.is_err());
     }
@@ -128,6 +148,7 @@ mod tests {
     /// which the TUI appends to its overlay log and the headless driver prints.
     #[tokio::test]
     async fn probe_error_context_excludes_the_url() {
+        let _env_guard = env_lock().await;
         // Port 1 is reserved and closed: connection refused, no DNS lookup.
         let url = "http://127.0.0.1:1/botPLACEHOLDER-TOKEN/getMe?appsecret=PLACEHOLDER-SECRET";
         let err = probe_get(url, &[])
@@ -156,6 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_post_error_context_excludes_the_url() {
+        let _env_guard = env_lock().await;
         let url = "http://127.0.0.1:1/v1/token?appsecret=PLACEHOLDER-SECRET";
         let err = probe_post(url, &[], "{}")
             .await
