@@ -13,9 +13,19 @@ Config path resolution at startup:
 
 `RANTAICLAW_CONFIG_DIR` moves **config and workspace only**. The profile root —
 `~/.rantaiclaw/profiles/<name>/`, which holds `policy/`, session and KB
-databases, and the persona — is keyed on `$HOME` and is deliberately unaffected.
+databases, the persona, and the `.daemon_active` sentinel — is keyed on `$HOME`
+and is deliberately unaffected. So are the logs, at `~/.rantaiclaw/logs/`.
 Setting only `RANTAICLAW_CONFIG_DIR` therefore gives you a split state: config
 from the custom directory, approval policy and profile data from the real home.
+
+The sentinel is the one that surprises people. It records which process owns the
+channels for a profile, and it is keyed on the profile *name*, not on the config
+in use — so a TUI started with `RANTAICLAW_CONFIG_DIR` pointing somewhere else
+will still see a daemon running under `$HOME`, defer to it, and start no
+channels at all. The status panel says `Auto-start stopped (dispatch loop
+exited)` and nothing explains why. That is working as intended (two processes
+polling one bot token cause `409 Conflict` flapping on Telegram and duplicate
+replies on WhatsApp), but it means a split state cannot run channels.
 
 To isolate a run completely — a scratch test, a throwaway profile — set `HOME`
 instead. That moves both halves together.
