@@ -69,7 +69,43 @@ pub struct WhatsAppWebChannel {
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
 }
 
+/// How long before the same chat may be told again that a message was dropped.
+///
+/// The queue saturates in bursts, so without this a user who sent five messages
+/// during a busy turn would get five identical apologies. They need to know
+/// once that they were not heard, not once per message.
+#[cfg(feature = "whatsapp-web")]
+const DROP_NOTICE_COOLDOWN: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// What the sender is told when their message could not be queued.
+#[cfg(feature = "whatsapp-web")]
+const DROP_NOTICE: &str =
+    "I could not take that message just now — I am still working through the previous one. \
+     Please send it again in a moment.";
+
 impl WhatsAppWebChannel {
+    /// Whether `chat` may be told about a drop now, recording the notice if so.
+    ///
+    /// Split out so the cooldown is testable without a live client: the whole
+    /// decision is here, and the event loop only performs the send.
+    #[cfg(feature = "whatsapp-web")]
+    fn claim_drop_notice(
+        seen: &Mutex<std::collections::HashMap<String, std::time::Instant>>,
+        chat: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        let mut seen = seen.lock();
+        // Bound the map: without this it grows one entry per chat, forever.
+        seen.retain(|_, last| now.duration_since(*last) < DROP_NOTICE_COOLDOWN);
+        match seen.get(chat) {
+            Some(last) if now.duration_since(*last) < DROP_NOTICE_COOLDOWN => false,
+            _ => {
+                seen.insert(chat.to_string(), now);
+                true
+            }
+        }
+    }
+
     /// Create a new WhatsApp Web channel
     ///
     /// # Arguments
@@ -589,6 +625,10 @@ impl Channel for WhatsAppWebChannel {
         // Build the bot
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
+        // Last time each chat was told a message was dropped, so a saturated
+        // queue produces one apology per chat rather than one per message.
+        let drop_notices: Arc<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         // A terminal event inside the wa-rs event loop has to reach `listen()`,
         // which is parked in the `select!` below. The token wakes it; the slot
@@ -607,6 +647,7 @@ impl Channel for WhatsAppWebChannel {
             .on_event(move |event, client| {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
+                let drop_notices = Arc::clone(&drop_notices);
                 let session_ended_inner = session_ended.clone();
                 let session_end_inner = Arc::clone(&session_end_reason);
                 async move {
@@ -723,6 +764,39 @@ impl Channel for WhatsAppWebChannel {
                                         "WhatsApp Web: dropping an inbound message, the agent \
                                          queue is not accepting it: {e}"
                                     );
+                                    // Tell the sender. A dropped message was
+                                    // silent to them: no reply, no reason, and
+                                    // nothing to distinguish a busy agent from
+                                    // a broken bot. The notice goes out through
+                                    // wa-rs, not the agent queue, so it cannot
+                                    // re-enter this path.
+                                    //
+                                    // Only on `Full`. `Closed` means the runtime
+                                    // is shutting down — there is nothing to try
+                                    // again with, and the send would race the
+                                    // teardown.
+                                    let chat = chat_jid.to_string();
+                                    if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_))
+                                        && Self::claim_drop_notice(
+                                            &drop_notices,
+                                            &chat,
+                                            std::time::Instant::now(),
+                                        )
+                                    {
+                                        let notice = wa_rs_proto::whatsapp::Message {
+                                            conversation: Some(DROP_NOTICE.to_string()),
+                                            ..Default::default()
+                                        };
+                                        if let Err(e) =
+                                            Box::pin(client.send_message(chat_jid.clone(), notice))
+                                                .await
+                                        {
+                                            tracing::warn!(
+                                                "WhatsApp Web: could not tell {chat} its message \
+                                                 was dropped: {e}"
+                                            );
+                                        }
+                                    }
                                 }
                             } else {
                                 // Name the identity so an operator can allowlist
@@ -1201,6 +1275,65 @@ pub fn pair_once(opts: PairOptions) -> impl futures::Stream<Item = PairEvent> + 
 #[cfg(all(test, feature = "whatsapp-web"))]
 mod tests {
     use super::*;
+
+    /// A dropped inbound message used to be silent to the sender: the log said
+    /// so, they got no reply and no reason, and a busy agent looked exactly like
+    /// a broken bot. The notice closes that — but a saturated queue drops in
+    /// bursts, so it must not turn one busy turn into five apologies.
+    #[test]
+    fn a_chat_is_told_about_a_drop_once_per_cooldown() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let seen = Mutex::new(HashMap::new());
+        let t0 = Instant::now();
+
+        assert!(
+            WhatsAppWebChannel::claim_drop_notice(&seen, "chat-a", t0),
+            "the first drop in a chat must be reported"
+        );
+        assert!(
+            !WhatsAppWebChannel::claim_drop_notice(&seen, "chat-a", t0),
+            "a second drop in the same burst must not repeat the apology"
+        );
+
+        // A different chat is a different person waiting on a reply.
+        assert!(
+            WhatsAppWebChannel::claim_drop_notice(&seen, "chat-b", t0),
+            "another chat must still be told"
+        );
+
+        // Once the window has passed, they are told again — the alternative is
+        // going quiet on someone whose second attempt also failed.
+        let later = t0 + DROP_NOTICE_COOLDOWN + std::time::Duration::from_secs(1);
+        assert!(WhatsAppWebChannel::claim_drop_notice(
+            &seen, "chat-a", later
+        ));
+    }
+
+    /// The map is keyed per chat and would otherwise grow for the lifetime of
+    /// the process — the same unbounded-set shape `seen_messages` was fixed for.
+    #[test]
+    fn the_drop_notice_map_does_not_grow_without_bound() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let seen = Mutex::new(HashMap::new());
+        let t0 = Instant::now();
+        for i in 0..50 {
+            WhatsAppWebChannel::claim_drop_notice(&seen, &format!("chat-{i}"), t0);
+        }
+        assert_eq!(seen.lock().len(), 50);
+
+        // One call after the window drops every stale entry.
+        let later = t0 + DROP_NOTICE_COOLDOWN + std::time::Duration::from_secs(1);
+        WhatsAppWebChannel::claim_drop_notice(&seen, "chat-fresh", later);
+        assert_eq!(
+            seen.lock().len(),
+            1,
+            "entries older than the cooldown must be evicted"
+        );
+    }
 
     fn allowlist(entries: &[&str]) -> Arc<RwLock<Vec<String>>> {
         Arc::new(RwLock::new(
