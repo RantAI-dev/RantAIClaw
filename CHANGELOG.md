@@ -141,6 +141,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A WhatsApp Web message the agent was too busy to take now says so.** When
+  the dispatch queue is saturated the inbound message is dropped rather than
+  parking the wa-rs protocol loop — the right trade, but it was silent to the
+  sender: no reply, no reason, and nothing to distinguish a busy agent from a
+  broken bot. The chat is now told, at most once per minute per chat so a burst
+  produces one apology rather than one per message. The notice goes out through
+  WhatsApp directly, not the agent queue, and is not sent when the runtime is
+  shutting down — there is nothing to try again with.
+
 - **WhatsApp Web traffic now honours `[proxy]`.** Its HTTP transport
   (`wa-rs-ureq-http`) built a client with no proxy configuration at all, so an
   operator who routed the agent through a proxy had this one channel quietly
