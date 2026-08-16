@@ -3768,11 +3768,22 @@ mod tests {
     }
 
     /// A signed Nextcloud Talk message body with the given platform id.
+    ///
+    /// The nonce defaults to the platform id, so distinct ids are also distinct
+    /// requests. That matters: the handler runs an anti-replay nonce gate
+    /// *before* it looks at the message id, so a fixture that reuses one nonce
+    /// makes every request after the first a replay, whatever id it carries.
     fn signed_nextcloud(secret: &str, id: &str) -> (HeaderMap, Bytes) {
+        signed_nextcloud_with_nonce(secret, id, id)
+    }
+
+    /// As [`signed_nextcloud`], with the anti-replay nonce chosen separately —
+    /// for tests that need to vary the message id and the nonce independently.
+    fn signed_nextcloud_with_nonce(secret: &str, id: &str, nonce: &str) -> (HeaderMap, Bytes) {
         let body = format!(
             r#"{{"type":"message","object":{{"token":"room-token"}},"message":{{"id":"{id}","actorType":"users","actorId":"user_a","message":"hello"}}}}"#
         );
-        let random = "seed-value";
+        let random = nonce;
         let signature = compute_nextcloud_signature_hex(secret, random, &body);
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -3841,6 +3852,73 @@ mod tests {
             "the turn should have started"
         );
         release.notify_waiters();
+    }
+
+    /// A platform that never sees an ACK redelivers the same message. That
+    /// redelivery must not run the turn a second time — the user would get two
+    /// answers and pay for two.
+    ///
+    /// The control is the load-bearing half. "One provider call" is also what a
+    /// harness returns when nothing reaches the provider at all, or when some
+    /// gate ahead of the dedup — the anti-replay nonce, the rate limiter —
+    /// swallows the second request. So the same harness, the same wait budget,
+    /// first has to show two distinct messages arriving as two calls.
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_runs_a_redelivered_message_once() {
+        let secret = "nextcloud-test-secret";
+
+        async fn post(state: &AppState, headers: HeaderMap, body: Bytes) -> StatusCode {
+            handle_nextcloud_talk_webhook(State(state.clone()), test_peer(), headers, body)
+                .await
+                .into_response()
+                .status()
+        }
+
+        // Control: two different messages, two different nonces => two turns.
+        let control_provider = Arc::new(MockProvider::default());
+        let control = nextcloud_state(
+            control_provider.clone(),
+            secret,
+            GatewayRateLimiter::new(100, 100, 100, 100),
+            IdempotencyStore::new(Duration::from_mins(5), 1000),
+        );
+        for id in ["control-1", "control-2"] {
+            let (headers, body) = signed_nextcloud(secret, id);
+            assert_eq!(post(&control, headers, body).await, StatusCode::OK);
+        }
+        assert_eq!(
+            wait_for_calls(&control_provider.calls, 2).await,
+            2,
+            "two distinct messages must reach the provider twice — \
+             without this the dedup assertion below proves nothing"
+        );
+
+        // The real case: one message, delivered twice under distinct nonces, so
+        // the anti-replay gate lets both through and the message-id dedup is
+        // what decides.
+        let provider = Arc::new(MockProvider::default());
+        let state = nextcloud_state(
+            provider.clone(),
+            secret,
+            GatewayRateLimiter::new(100, 100, 100, 100),
+            IdempotencyStore::new(Duration::from_mins(5), 1000),
+        );
+        for nonce in ["nonce-a", "nonce-b"] {
+            let (headers, body) = signed_nextcloud_with_nonce(secret, "redelivered", nonce);
+            assert_eq!(
+                post(&state, headers, body).await,
+                StatusCode::OK,
+                "a redelivery is ACKed, not refused — the platform must stop retrying"
+            );
+        }
+
+        // Wait for the second call the same way the control did, so a pass here
+        // is a real absence and not a race we outran.
+        assert_eq!(
+            wait_for_calls(&provider.calls, 2).await,
+            1,
+            "the redelivered message must run exactly one turn"
+        );
     }
 
     /// This endpoint is publicly reachable, so an unauthenticated burst must be
