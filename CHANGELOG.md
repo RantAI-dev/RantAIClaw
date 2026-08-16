@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0-alpha] — 2026-08-16
+
+No config schema change — this release carries no migration and rolls back
+freely to v0.20.1-alpha.
+
 ### Added
 
 - **TUI: drag-select chat text and copy it with Ctrl+C.** Native terminal
@@ -22,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GNOME Terminal/VTE don't implement it — the status notice says so, and
   Shift+drag native selection remains the universal fallback. Wheel
   scrolling is untouched.
+
+### Changed
+
+- Web console pin rolls to **claw-ui v0.3.19**; the `unexpected_host`
+  console lockout is now documented in the troubleshooting guide.
 
 ## [0.20.1-alpha] — 2026-08-16
 
