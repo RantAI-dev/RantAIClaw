@@ -586,6 +586,20 @@ fn needs_runtime_restart(token_changed: bool) -> bool {
     token_changed
 }
 
+/// The operator-facing note for a save, derived from the same flag the response
+/// reports as `restarts_runtime`.
+///
+/// One function so the two cannot drift. They already had: the console printed
+/// its own hint saying every save reloads the runtime, directly above this
+/// reply saying it does not — both on screen at once, about the same click.
+fn runtime_restart_note(restarts_runtime: bool) -> &'static str {
+    if restarts_runtime {
+        "Saved. Reloading the runtime to apply the new token — automatic if RantaiClaw runs as a managed service, otherwise restart `rantaiclaw daemon`."
+    } else {
+        "Saved. The running channel picks this up on its next message — no restart."
+    }
+}
+
 /// Connect a Telegram channel from the console: validate the token against
 /// Telegram, then persist it into `channels_config.telegram`. The token is a
 /// secret and is never echoed back in responses. NOTE: channel tokens are
@@ -671,11 +685,12 @@ async fn connect_telegram(
         "bot_username": bot_username,
         "allowed_users": body.allowed_users.len(),
         "warning": warning,
-        "note": if restarts_runtime {
-            "Saved. Reloading the runtime to apply the new token — automatic if RantaiClaw runs as a managed service, otherwise restart `rantaiclaw daemon`."
-        } else {
-            "Saved. The running channel picks this up on its next message — no restart."
-        },
+        // The same decision as `note`, as data. A console cannot reliably tell
+        // "the runtime is restarting" from prose, and it needs to: showing a
+        // reload banner for a save that does not restart leaves the operator
+        // watching for something that never happens.
+        "restarts_runtime": restarts_runtime,
+        "note": runtime_restart_note(restarts_runtime),
     })))
 }
 
@@ -711,9 +726,14 @@ async fn disconnect_telegram(
         schedule_daemon_reload();
     }
 
-    Ok(Json(
-        json!({ "disconnected": was_configured, "channel": "telegram" }),
-    ))
+    // Same field name as the connect/allowlist responses, so a client has one
+    // thing to read rather than having to know that `disconnected` implies a
+    // bounce here but `allowed_users` does not there.
+    Ok(Json(json!({
+        "disconnected": was_configured,
+        "channel": "telegram",
+        "restarts_runtime": was_configured,
+    })))
 }
 
 // ── GET/PUT /secrets ─────────────────────────────────────────────────────────
@@ -1325,6 +1345,27 @@ mod tests {
             !needs_runtime_restart(false),
             "an allowlist-only edit must not restart the channels runtime"
         );
+    }
+
+    /// The note and the `restarts_runtime` flag are one decision reported two
+    /// ways, and a client reads whichever it can. They must not describe
+    /// different worlds — the console shipped a hint saying every save reloads
+    /// the runtime, printed directly above this reply saying it does not.
+    #[test]
+    fn the_restart_note_agrees_with_the_flag_it_is_derived_from() {
+        let restarting = runtime_restart_note(true);
+        let live = runtime_restart_note(false);
+        assert!(
+            restarting.contains("Reloading the runtime"),
+            "a restarting save must say so: {restarting}"
+        );
+        assert!(
+            live.contains("no restart"),
+            "a live save must say so: {live}"
+        );
+        // Control: the two branches are actually different text, so the
+        // assertions above cannot both pass against one shared string.
+        assert_ne!(restarting, live);
     }
 
     #[test]
