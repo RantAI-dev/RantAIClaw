@@ -10,6 +10,7 @@ mod context;
 pub mod first_run_wizard;
 #[cfg(feature = "tui")]
 mod render;
+#[cfg(feature = "tui")]
 pub mod selection;
 #[cfg(feature = "tui")]
 mod widgets;
