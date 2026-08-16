@@ -429,6 +429,41 @@ impl IrcChannel {
         Some(nick.to_string())
     }
 
+    /// Decide where a reply to this PRIVMSG goes and how its text reaches the
+    /// agent — or that it is not ours to answer.
+    ///
+    /// Pure, and the reply anchor is computed once here rather than at each of
+    /// the two points that used to spell it out (the pairing reply and the
+    /// routed message): one contract, one implementation. The allowlist gate,
+    /// pairing, and identity resolution all need shared state, so they stay in
+    /// `listen`.
+    fn classify_privmsg(target: &str, text: &str, sender_nick: &str) -> IrcInbound {
+        // Services announce at us constantly; answering them is a loop.
+        if sender_nick.eq_ignore_ascii_case("NickServ")
+            || sender_nick.eq_ignore_ascii_case("ChanServ")
+        {
+            return IrcInbound::Ignore;
+        }
+
+        // Sent to a channel => reply to the channel. Sent to our own nick (a
+        // DM) => reply to the sender. Replying to a channel message in a DM
+        // strands the answer where nobody asked.
+        let is_channel = target.starts_with('#') || target.starts_with('&');
+        let (reply_target, content) = if is_channel {
+            (
+                target.to_string(),
+                format!("{IRC_STYLE_PREFIX}<{sender_nick}> {text}"),
+            )
+        } else {
+            (sender_nick.to_string(), format!("{IRC_STYLE_PREFIX}{text}"))
+        };
+
+        IrcInbound::Route(IrcRouted {
+            reply_target,
+            content,
+        })
+    }
+
     fn is_user_allowed(&self, nick: &str) -> bool {
         let Ok(users) = self.allowed_users.read() else {
             return false;
@@ -580,6 +615,25 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// What [`IrcChannel::classify_privmsg`] decided about one PRIVMSG.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IrcInbound {
+    /// Not ours to answer — currently a message from network services.
+    Ignore,
+    Route(IrcRouted),
+}
+
+/// A routable IRC message, before the allowlist gate and identity resolution.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct IrcRouted {
+    /// Where a reply goes: the channel for a channel message, the sender's
+    /// nick for a DM. The pairing reply uses the same anchor.
+    pub reply_target: String,
+    /// The text as the agent sees it; channel messages carry the speaker so a
+    /// room reads as a conversation.
+    pub content: String,
 }
 
 #[async_trait]
@@ -874,16 +928,13 @@ impl IrcChannel {
                     let sender_nick = msg.nick().unwrap_or("unknown");
                     let account = msg.account();
 
-                    // Skip messages from NickServ/ChanServ
-                    if sender_nick.eq_ignore_ascii_case("NickServ")
-                        || sender_nick.eq_ignore_ascii_case("ChanServ")
-                    {
+                    // Where a reply goes and how the text reads — the part of
+                    // this a test can reach without an IRC server.
+                    let IrcInbound::Route(routed) =
+                        Self::classify_privmsg(target, text, sender_nick)
+                    else {
                         continue;
-                    }
-
-                    // Determine reply target: if sent to a channel, reply to channel;
-                    // if DM (target == our nick), reply to sender
-                    let is_channel = target.starts_with('#') || target.starts_with('&');
+                    };
 
                     if !self.is_user_allowed(sender_nick) {
                         // Before rejecting, let a not-yet-allowed nick self-onboard
@@ -912,29 +963,14 @@ impl IrcChannel {
                             .await
                             {
                                 self.add_allowed_identity_runtime(sender_nick);
-                                let pair_reply_target = if is_channel {
-                                    target.to_string()
-                                } else {
-                                    sender_nick.to_string()
-                                };
-                                let _ =
-                                    self.send(&SendMessage::new(reply, pair_reply_target)).await;
+                                let _ = self
+                                    .send(&SendMessage::new(reply, routed.reply_target))
+                                    .await;
                                 continue;
                             }
                         }
                         continue;
                     }
-
-                    let reply_target = if is_channel {
-                        target.to_string()
-                    } else {
-                        sender_nick.to_string()
-                    };
-                    let content = if is_channel {
-                        format!("{IRC_STYLE_PREFIX}<{sender_nick}> {text}")
-                    } else {
-                        format!("{IRC_STYLE_PREFIX}{text}")
-                    };
 
                     let Some(sender) = self.resolve_identity(account, sender_nick) else {
                         // Refused above, with the reason logged.
@@ -945,8 +981,8 @@ impl IrcChannel {
                     let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
                         id: format!("irc_{}_{seq}", chrono::Utc::now().timestamp_millis()),
                         sender,
-                        reply_target,
-                        content,
+                        reply_target: routed.reply_target,
+                        content: routed.content,
                         channel: "irc".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -974,6 +1010,64 @@ impl IrcChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Inbound routing ──────────────────────────────────────
+
+    /// A channel message is answered in the channel, and carries the speaker so
+    /// a room full of people reads as a conversation rather than one voice.
+    #[test]
+    fn classify_privmsg_answers_a_channel_in_the_channel() {
+        assert_eq!(
+            IrcChannel::classify_privmsg("#room", "hello", "user_a"),
+            IrcInbound::Route(IrcRouted {
+                reply_target: "#room".into(),
+                content: format!("{IRC_STYLE_PREFIX}<user_a> hello"),
+            })
+        );
+    }
+
+    /// `&` is also a channel prefix (server-local channels). Missing it sends a
+    /// room's answer to whoever spoke, in private.
+    #[test]
+    fn classify_privmsg_treats_an_ampersand_target_as_a_channel() {
+        let IrcInbound::Route(routed) = IrcChannel::classify_privmsg("&local", "hi", "user_a")
+        else {
+            panic!("a channel message must route");
+        };
+        assert_eq!(routed.reply_target, "&local");
+    }
+
+    /// A DM is answered to the sender, with no speaker prefix — there is only
+    /// one other person in the conversation.
+    #[test]
+    fn classify_privmsg_answers_a_dm_to_the_sender() {
+        assert_eq!(
+            IrcChannel::classify_privmsg("rantaiclaw_bot", "hello", "user_a"),
+            IrcInbound::Route(IrcRouted {
+                reply_target: "user_a".into(),
+                content: format!("{IRC_STYLE_PREFIX}hello"),
+            })
+        );
+    }
+
+    /// Services message the bot on connect. Answering them talks to a robot
+    /// that answers back.
+    #[test]
+    fn classify_privmsg_ignores_network_services() {
+        for nick in ["NickServ", "chanserv"] {
+            assert_eq!(
+                IrcChannel::classify_privmsg("rantaiclaw_bot", "hello", nick),
+                IrcInbound::Ignore,
+                "{nick} is services, whatever its case"
+            );
+        }
+        // Control: the same DM from anyone else does route, so the two ignores
+        // above are the services filter and not an inert classifier.
+        assert!(matches!(
+            IrcChannel::classify_privmsg("rantaiclaw_bot", "hello", "nickserv_fan"),
+            IrcInbound::Route(_)
+        ));
+    }
 
     // ── IRC message parsing ──────────────────────────────────
 
