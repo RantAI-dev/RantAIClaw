@@ -158,19 +158,17 @@ fn every_channel_listen_path_calls_its_allowlist_gate() {
             "",
         ),
         // QQ gates twice — once per message shape — so both are named.
+        // One entry, not two: the C2C and group events used to be separate
+        // `listen` arms with a gate each, and this table pinned both by their
+        // argument name. They now share one path through `classify_inbound`,
+        // so there is one gate to pin. That both event types still reach it is
+        // covered by the `classify_inbound_*` unit tests in `qq.rs`.
         (
-            "qq (c2c)",
+            "qq",
             include_str!("qq.rs"),
             "fn listen(",
-            "self.is_user_allowed(user_openid)",
-            "",
-        ),
-        (
-            "qq (group)",
-            include_str!("qq.rs"),
-            "fn listen(",
-            "self.is_user_allowed(author_id)",
-            "",
+            "self.is_user_allowed(&routed.sender)",
+            "Self::classify_inbound(",
         ),
         (
             "signal",

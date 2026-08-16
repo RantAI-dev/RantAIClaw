@@ -238,6 +238,77 @@ impl QQChannel {
         }
         false
     }
+
+    /// Decide who sent a dispatch event, where a reply to it goes, and whether
+    /// it is worth routing at all.
+    ///
+    /// Pure, and deliberately so: the two message events differ only in where
+    /// the sender identity lives and how the reply anchor is spelled, and that
+    /// difference is the whole of what a test needs to reach. Everything the
+    /// caller does with the result — dedup, pairing, the allowlist gate — needs
+    /// the network or shared state, which is why it stays in `listen`.
+    fn classify_inbound(event_type: &str, d: &serde_json::Value) -> QqInbound {
+        let content = d
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if content.is_empty() {
+            return QqInbound::Ignore;
+        }
+        let author = |field: &str| {
+            d.get("author")
+                .and_then(|a| a.get(field))
+                .and_then(serde_json::Value::as_str)
+        };
+
+        let (kind, sender, chat_id) = match event_type {
+            "C2C_MESSAGE_CREATE" => {
+                // For QQ, user_openid is the identifier; `author.id` is the
+                // fallback the event carries when it is absent.
+                let author_id = author("id").unwrap_or("unknown");
+                let user_openid = author("user_openid").unwrap_or(author_id);
+                ("C2C", user_openid, format!("user:{user_openid}"))
+            }
+            "GROUP_AT_MESSAGE_CREATE" => {
+                let member_openid = author("member_openid").unwrap_or("unknown");
+                let group_openid = d
+                    .get("group_openid")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                ("group", member_openid, format!("group:{group_openid}"))
+            }
+            _ => return QqInbound::Ignore,
+        };
+
+        QqInbound::Route(QqRouted {
+            kind,
+            sender: sender.to_string(),
+            chat_id,
+            content: content.to_string(),
+        })
+    }
+}
+
+/// What [`QQChannel::classify_inbound`] decided about one dispatch event.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum QqInbound {
+    /// Not a message this channel routes: an event type we do not handle, or a
+    /// message with nothing in it.
+    Ignore,
+    Route(QqRouted),
+}
+
+/// A routable QQ message, before dedup, pairing, and the allowlist gate.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct QqRouted {
+    /// How to name this event in an operator-facing log line.
+    pub kind: &'static str,
+    /// The openid the allowlist and the agent both key on.
+    pub sender: String,
+    /// The reply anchor: `user:<openid>` for C2C, `group:<openid>` for a group.
+    pub chat_id: String,
+    pub content: String,
 }
 
 #[async_trait]
@@ -433,101 +504,53 @@ impl Channel for QQChannel {
                         None => continue,
                     };
 
-                    match event_type {
-                        "C2C_MESSAGE_CREATE" => {
-                            let msg_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                            if self.is_duplicate(msg_id).await {
-                                continue;
-                            }
+                    let msg_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    if self.is_duplicate(msg_id).await {
+                        continue;
+                    }
 
-                            let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
-                            if content.is_empty() {
-                                continue;
-                            }
+                    // Who sent it and where a reply goes — the only part of this
+                    // that a test can reach without a gateway socket.
+                    let QqInbound::Route(routed) = Self::classify_inbound(event_type, d) else {
+                        continue;
+                    };
 
-                            let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("unknown");
-                            // For QQ, user_openid is the identifier
-                            let user_openid = d.get("author").and_then(|a| a.get("user_openid")).and_then(|u| u.as_str()).unwrap_or(author_id);
+                    // Intercept on-demand store-minted `/bind`/`/claim`
+                    // pairing codes before the allowlist gate so unenrolled
+                    // users can self-onboard without a daemon restart.
+                    if self
+                        .try_handle_store_pairing(&routed.content, &routed.sender, &routed.chat_id)
+                        .await
+                    {
+                        continue;
+                    }
 
-                            let chat_id = format!("user:{user_openid}");
+                    if !self.is_user_allowed(&routed.sender) {
+                        tracing::warn!(
+                            "QQ: ignoring {} message from unauthorized user: {}",
+                            routed.kind,
+                            routed.sender
+                        );
+                        continue;
+                    }
 
-                            // Intercept on-demand store-minted `/bind`/`/claim`
-                            // pairing codes before the allowlist gate so unenrolled
-                            // users can self-onboard without a daemon restart.
-                            if self.try_handle_store_pairing(content, user_openid, &chat_id).await {
-                                continue;
-                            }
+                    let channel_msg = ChannelMessage {
+                        sender_aliases: Vec::new(),
+                        id: Uuid::new_v4().to_string(),
+                        sender: routed.sender,
+                        reply_target: routed.chat_id,
+                        content: routed.content,
+                        channel: "qq".to_string(),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        thread_ts: None,
+                    };
 
-                            if !self.is_user_allowed(user_openid) {
-                                tracing::warn!("QQ: ignoring C2C message from unauthorized user: {user_openid}");
-                                continue;
-                            }
-
-                            let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
-                                id: Uuid::new_v4().to_string(),
-                                sender: user_openid.to_string(),
-                                reply_target: chat_id,
-                                content: content.to_string(),
-                                channel: "qq".to_string(),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                thread_ts: None,
-                            };
-
-                            if tx.send(channel_msg).await.is_err() {
-                                tracing::warn!("QQ: message channel closed");
-                                break;
-                            }
-                        }
-                        "GROUP_AT_MESSAGE_CREATE" => {
-                            let msg_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                            if self.is_duplicate(msg_id).await {
-                                continue;
-                            }
-
-                            let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
-                            if content.is_empty() {
-                                continue;
-                            }
-
-                            let author_id = d.get("author").and_then(|a| a.get("member_openid")).and_then(|m| m.as_str()).unwrap_or("unknown");
-
-                            let group_openid = d.get("group_openid").and_then(|g| g.as_str()).unwrap_or("unknown");
-                            let chat_id = format!("group:{group_openid}");
-
-                            // Intercept on-demand store-minted `/bind`/`/claim`
-                            // pairing codes before the allowlist gate so unenrolled
-                            // users can self-onboard without a daemon restart.
-                            if self.try_handle_store_pairing(content, author_id, &chat_id).await {
-                                continue;
-                            }
-
-                            if !self.is_user_allowed(author_id) {
-                                tracing::warn!("QQ: ignoring group message from unauthorized user: {author_id}");
-                                continue;
-                            }
-
-                            let channel_msg = ChannelMessage { sender_aliases: Vec::new(),
-                                id: Uuid::new_v4().to_string(),
-                                sender: author_id.to_string(),
-                                reply_target: chat_id,
-                                content: content.to_string(),
-                                channel: "qq".to_string(),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                thread_ts: None,
-                            };
-
-                            if tx.send(channel_msg).await.is_err() {
-                                tracing::warn!("QQ: message channel closed");
-                                break;
-                            }
-                        }
-                        _ => {}
+                    if tx.send(channel_msg).await.is_err() {
+                        tracing::warn!("QQ: message channel closed");
+                        break;
                     }
                 }
             }
@@ -555,6 +578,80 @@ mod tests {
     fn test_name() {
         let ch = QQChannel::new("id".into(), "secret".into(), vec![]);
         assert_eq!(ch.name(), "qq");
+    }
+
+    /// A direct message is keyed on `user_openid`, not on `author.id`. Getting
+    /// this wrong points the allowlist and the conversation at an identity the
+    /// operator never enrolled, so an allowed user is silently refused.
+    #[test]
+    fn classify_inbound_keys_a_direct_message_on_the_user_openid() {
+        let d = serde_json::json!({
+            "content": " hello ",
+            "author": {"id": "author-id", "user_openid": "openid-1"},
+        });
+        assert_eq!(
+            QQChannel::classify_inbound("C2C_MESSAGE_CREATE", &d),
+            QqInbound::Route(QqRouted {
+                kind: "C2C",
+                sender: "openid-1".into(),
+                chat_id: "user:openid-1".into(),
+                content: "hello".into(),
+            })
+        );
+    }
+
+    /// `author.id` is the documented fallback when the event omits the openid.
+    #[test]
+    fn classify_inbound_falls_back_to_the_author_id_without_an_openid() {
+        let d = serde_json::json!({"content": "hi", "author": {"id": "author-id"}});
+        let QqInbound::Route(routed) = QQChannel::classify_inbound("C2C_MESSAGE_CREATE", &d) else {
+            panic!("a direct message with content must route");
+        };
+        assert_eq!(routed.sender, "author-id");
+        assert_eq!(routed.chat_id, "user:author-id");
+    }
+
+    /// A group message is keyed on `member_openid`, and its reply anchor is the
+    /// group — answering into `user:` would send a group reply to one member.
+    #[test]
+    fn classify_inbound_anchors_a_group_message_on_the_group() {
+        let d = serde_json::json!({
+            "content": "hello",
+            "author": {"id": "author-id", "member_openid": "member-1"},
+            "group_openid": "group-1",
+        });
+        assert_eq!(
+            QQChannel::classify_inbound("GROUP_AT_MESSAGE_CREATE", &d),
+            QqInbound::Route(QqRouted {
+                kind: "group",
+                sender: "member-1".into(),
+                chat_id: "group:group-1".into(),
+                content: "hello".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn classify_inbound_ignores_empty_content_and_unhandled_events() {
+        let empty = serde_json::json!({"content": "   ", "author": {"user_openid": "openid-1"}});
+        assert_eq!(
+            QQChannel::classify_inbound("C2C_MESSAGE_CREATE", &empty),
+            QqInbound::Ignore,
+            "a whitespace-only message has nothing to answer"
+        );
+
+        let full = serde_json::json!({"content": "hi", "author": {"user_openid": "openid-1"}});
+        assert_eq!(
+            QQChannel::classify_inbound("GUILD_MEMBER_ADD", &full),
+            QqInbound::Ignore,
+            "only the two message events route"
+        );
+        // Control: the same payload under a handled event type does route, so
+        // the two ignores above are the filter and not an inert classifier.
+        assert!(matches!(
+            QQChannel::classify_inbound("C2C_MESSAGE_CREATE", &full),
+            QqInbound::Route(_)
+        ));
     }
 
     #[test]
