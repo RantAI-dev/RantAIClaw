@@ -642,6 +642,7 @@ pub async fn start_channels_with_cancellation(
         &security,
         runtime,
         Arc::clone(&mem),
+        crate::tools::memory_recall::ConversationScope::default(),
         composio_key,
         composio_entity_id,
         &config.browser,

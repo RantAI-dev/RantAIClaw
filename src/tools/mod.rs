@@ -212,6 +212,7 @@ pub fn all_tools(
         security,
         Arc::new(NativeRuntime::new()),
         memory,
+        memory_recall::ConversationScope::default(),
         composio_key,
         composio_entity_id,
         browser_config,
@@ -230,6 +231,11 @@ pub fn all_tools_with_runtime(
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
+    // Conversation scope for `memory_recall`. Surfaces that serve one
+    // conversation per registry (the interactive Agent) pass their own handle
+    // and keep it updated; multi-conversation surfaces pass a fresh unset
+    // handle (= global recall, the prior behaviour).
+    memory_recall_scope: memory_recall::ConversationScope,
     composio_key: Option<&str>,
     composio_entity_id: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
@@ -260,7 +266,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
-        Arc::new(MemoryRecallTool::new(memory.clone())),
+        Arc::new(MemoryRecallTool::new(memory.clone(), memory_recall_scope)),
         Arc::new(MemoryForgetTool::new(
             memory,
             security.clone(),

@@ -448,6 +448,14 @@ memory only. Entries another conversation stored never surface in this one's
 prompt. Unscoped entries — what `memory_store` writes — are the shared tier and
 remain visible everywhere.
 
+The explicit `memory_recall` tool follows the same scope on interactive
+surfaces (TUI, `agent run`, the console API): it reads the active
+conversation's rows plus the shared tier, never another conversation's.
+Surfaces that serve many conversations through one tool registry (channels,
+the gateway webhook) keep the tool's read global — a single shared scope
+would race across concurrent turns — and guests cannot invoke it at all
+unless an operator adds `memory_recall` to `guest_allowed_tools`.
+
 ### Scores are absolute
 
 `MemoryEntry.score` is absolute relevance in `[0, 1]`: cosine similarity for the

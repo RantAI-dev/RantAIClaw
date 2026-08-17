@@ -529,6 +529,7 @@ fn build_tools_factory(
             &security,
             Arc::clone(&runtime),
             Arc::clone(&mem),
+            crate::tools::memory_recall::ConversationScope::default(),
             composio_key,
             composio_entity_id,
             &config.browser,
