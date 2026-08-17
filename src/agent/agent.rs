@@ -86,6 +86,11 @@ pub struct Agent {
     /// turn memory is stored under and recalled from this conversation id
     /// (via `recall_layered`), so distinct conversations don't bleed context.
     conversation_id: Option<String>,
+    /// Handle into the registry's `memory_recall` tool, written together with
+    /// `conversation_id` so the explicit recall tool follows the same scope
+    /// the injection path uses. Fresh (shared with nothing) on bare-builder
+    /// agents; `from_config` replaces it with the handle the registry holds.
+    memory_recall_scope: crate::tools::memory_recall::ConversationScope,
     /// Optional Layer-A tool-approval gate. `None` (default — TUI / `agent run`)
     /// means tools are not gated here (the shell tool's own `PendingApprovals`
     /// still applies). The console SSE surface sets this so non-read-only tools
@@ -313,6 +318,7 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             conversation_id: self.conversation_id,
+            memory_recall_scope: crate::tools::memory_recall::ConversationScope::default(),
             approval_manager: self.approval_manager,
             approval_backend: self.approval_backend,
         })
@@ -451,11 +457,13 @@ impl Agent {
             None
         };
 
+        let memory_recall_scope = crate::tools::memory_recall::ConversationScope::default();
         let mut tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
             memory.clone(),
+            memory_recall_scope.clone(),
             composio_key,
             composio_entity_id,
             &config.browser,
@@ -560,6 +568,7 @@ impl Agent {
                 agent.security = Some(security);
                 agent.mcp_health = mcp_health;
                 agent.mcp_tools_by_server = mcp_tools_by_server;
+                agent.memory_recall_scope = memory_recall_scope;
                 agent
             })
     }
@@ -586,6 +595,11 @@ impl Agent {
     /// one agent, or that only learn the identity after construction. `None`
     /// restores global behaviour.
     pub fn set_conversation_id(&mut self, conversation_id: Option<String>) {
+        // Keep the explicit recall tool on the same scope as the injection
+        // path — one conversation identity, two readers.
+        if let Ok(mut slot) = self.memory_recall_scope.lock() {
+            slot.clone_from(&conversation_id);
+        }
         self.conversation_id = conversation_id;
     }
 
@@ -1411,6 +1425,40 @@ mod tests {
         let mut agent = build_test_agent("delegated");
         let text = agent.turn("hi").await.unwrap();
         assert_eq!(text, "delegated");
+    }
+
+    /// One conversation identity, two readers: setting the id must reach the
+    /// registry's `memory_recall` tool through the shared scope handle.
+    #[test]
+    fn set_conversation_id_updates_the_recall_scope_handle() {
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed");
+
+        agent.set_conversation_id(Some("tui:s1".into()));
+        assert_eq!(
+            agent.memory_recall_scope.lock().unwrap().as_deref(),
+            Some("tui:s1")
+        );
+        agent.set_conversation_id(None);
+        assert_eq!(agent.memory_recall_scope.lock().unwrap().as_deref(), None);
     }
 
     #[tokio::test]
