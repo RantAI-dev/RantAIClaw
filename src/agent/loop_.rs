@@ -4058,7 +4058,7 @@ Done."#;
     }
 
     #[tokio::test]
-    async fn build_context_ignores_legacy_assistant_autosave_entries() {
+    async fn build_context_ignores_autosave_entries_but_keeps_curated_facts() {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
         mem.store(
@@ -4069,6 +4069,7 @@ Done."#;
         )
         .await
         .unwrap();
+        // Auto-saved user turn: retained for explicit recall, never injected.
         mem.store(
             "user_msg_real",
             "User asked for concise status updates",
@@ -4077,9 +4078,18 @@ Done."#;
         )
         .await
         .unwrap();
+        mem.store(
+            "status_pref",
+            "Prefers concise status updates",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
 
         let context = build_context(&mem, "status updates", 0.0).await;
-        assert!(context.contains("user_msg_real"));
+        assert!(context.contains("status_pref"));
+        assert!(!context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
     }

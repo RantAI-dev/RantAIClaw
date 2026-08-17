@@ -2833,7 +2833,7 @@ impl Memory for RecallMemory {
             id: "entry-1".to_string(),
             key: "memory_key_1".to_string(),
             content: "Age is 45".to_string(),
-            category: crate::memory::MemoryCategory::Conversation,
+            category: crate::memory::MemoryCategory::Core,
             timestamp: "2026-02-20T00:00:00Z".to_string(),
             session_id: None,
             score: Some(0.9),
@@ -4201,7 +4201,7 @@ async fn autosave_keys_preserve_multiple_conversation_facts() {
 async fn build_memory_context_includes_recalled_entries() {
     let tmp = TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
-    mem.store("age_fact", "Age is 45", MemoryCategory::Conversation, None)
+    mem.store("age_fact", "Age is 45", MemoryCategory::Core, None)
         .await
         .unwrap();
 
@@ -4214,12 +4214,13 @@ async fn build_memory_context_includes_recalled_entries() {
 async fn build_memory_context_surfaces_conversation_scoped_entry() {
     let tmp = TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
-    // Stored under a specific conversation scope (as the channel autosave
-    // now does), it must be recalled when that conversation asks.
+    // Stored under a specific conversation scope, it must be recalled when
+    // that conversation asks. Curated category: `conversation` entries are
+    // auto-save transcript rows and are excluded from injection outright.
     mem.store(
         "scoped_fact",
         "Project ships Friday",
-        MemoryCategory::Conversation,
+        MemoryCategory::Core,
         Some("telegram:u1"),
     )
     .await

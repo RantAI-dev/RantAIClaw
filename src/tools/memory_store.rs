@@ -89,7 +89,7 @@ impl Tool for MemoryStoreTool {
     }
 
     fn description(&self) -> &str {
-        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name. To correct an existing memory, pass 'replaces' with a distinctive phrase from the old one so it is superseded instead of piling up beside the correction."
+        "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context (kept for explicit recall only; never auto-injected into prompts), or a custom category name. To correct an existing memory, pass 'replaces' with a distinctive phrase from the old one so it is superseded instead of piling up beside the correction."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
