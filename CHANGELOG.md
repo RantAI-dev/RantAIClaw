@@ -53,7 +53,6 @@ reach prompts.
   nudged into durable memory) and to registries that actually carry
   `memory_store`. (#559)
 
-
 ## [0.21.0-alpha] — 2026-08-16
 
 No config schema change — this release carries no migration and rolls back
@@ -1343,7 +1342,7 @@ this release pins.
 
 - **The title heading was written blank.** Typing a name updated the
   frontmatter but not the `#` heading, so skills created through the console
-  landed on disk with a bare `# ` as their visible title. That heading is part
+  landed on disk with a bare `#` as their visible title. That heading is part
   of the body the model reads, so it was not only untidy.
 
 - **The pencil always opened the markdown view.** The editor's view was stored
@@ -1360,7 +1359,7 @@ never exercised; a second test asserted the buggy behaviour outright. The
 third lived in the ordering of an async fetch against a React effect, which no
 function-level test can observe.
 
-A skill created through v0.3.12 has a blank `# ` title on disk. Harmless, and
+A skill created through v0.3.12 has a blank `#` title on disk. Harmless, and
 editing and re-saving it now fixes it.
 
 ## [0.16.1-alpha] — 2026-07-31
@@ -2954,7 +2953,7 @@ scaffolds a ready-to-use skill for you.
 ### Changed
 
 - **Knowledge Base is now in the default build.** `kb` (sqlite-vec vector store
-  + PDF/markdown/image ingestion) moved into the default feature set, so a
+  - PDF/markdown/image ingestion) moved into the default feature set, so a
   classic install/build ships the `rantaiclaw kb` command (search / ingest /
   list / get / delete / drift / re-embed) without `--features kb`. Verified to
   cross-compile on all six release targets. Costs ~5MB of binary size (≈31MB);
@@ -3146,7 +3145,7 @@ Two TUI fixes from v0.6.6-alpha tester feedback. One UX gap deferred
   `tracing::error!` instead. Channel activity is now visible only in
   `~/.rantaiclaw/logs/tui-YYYY-MM-DD.log`. Daemon-mode operators who
   relied on stdout for live message tracing should now `RUST_LOG=info`
-  + tail the log file. (`src/channels/mod.rs` lines ~1324, ~1374,
+  - tail the log file. (`src/channels/mod.rs` lines ~1324, ~1374,
   ~1563, ~1589.)
 
 ### Added
@@ -3301,7 +3300,7 @@ deferred (back-button navigation needs wizard rework).
   installed** — v0.5.0 introduced a per-profile skills dir
   (`<profile>/skills/`) but the loader still looked at the v0.4.x
   workspace-level path (`<workspace>/skills/`). The bundled installer
-  + ClawHub both write to the new path; the picker was reading from
+  - ClawHub both write to the new path; the picker was reading from
   the old one. Loader now checks both, profile-level wins on conflict,
   deduped by name. Empty-state hint corrected to point at the actual
   v0.5.0+ path. (`src/skills/mod.rs` `load_workspace_skills`,
