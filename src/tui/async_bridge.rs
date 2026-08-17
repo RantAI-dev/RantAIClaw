@@ -9,7 +9,13 @@ use crate::agent::events::AgentEventSender;
 
 #[derive(Debug)]
 pub enum TurnRequest {
-    Submit(String),
+    Submit {
+        text: String,
+        /// Memory scope for this turn's reads and writes
+        /// (`tui:<session_id>`). `None` recalls and stores globally —
+        /// the pre-scoping behaviour, kept for unbound test agents.
+        conversation_id: Option<String>,
+    },
     Cancel,
     /// Replace the actor's `Agent` with one built from the supplied
     /// config. Used after the first-run wizard or `/setup` saves new
@@ -37,7 +43,7 @@ pub struct TuiAgentActor {
     agent: Option<Agent>,
     req_rx: mpsc::Receiver<TurnRequest>,
     events_tx: AgentEventSender,
-    queue: VecDeque<String>,
+    queue: VecDeque<(String, Option<String>)>,
     current: Option<CancellationToken>,
     /// Reload deferred until the in-flight turn completes — replacing
     /// `self.agent` mid-turn would invalidate the borrow.
@@ -80,7 +86,10 @@ impl TuiAgentActor {
             // Idle path: block on the next request.
             if self.current.is_none() && self.queue.is_empty() {
                 match self.req_rx.recv().await {
-                    Some(TurnRequest::Submit(text)) => self.queue.push_back(text),
+                    Some(TurnRequest::Submit {
+                        text,
+                        conversation_id,
+                    }) => self.queue.push_back((text, conversation_id)),
                     Some(TurnRequest::Cancel) => { /* no-op while idle */ }
                     Some(TurnRequest::Reload(config)) => {
                         match crate::agent::Agent::from_config(&config).await {
@@ -138,7 +147,7 @@ impl TuiAgentActor {
 
             // Start the next queued turn if idle.
             if self.current.is_none() {
-                if let Some(text) = self.queue.pop_front() {
+                if let Some((text, conversation_id)) = self.queue.pop_front() {
                     // No agent (boot-time provider failure): answer the turn
                     // with an actionable error and keep draining the queue —
                     // a later Reload restores normal service.
@@ -151,6 +160,11 @@ impl TuiAgentActor {
                             .await;
                         continue;
                     };
+                    // Scope this turn's memory to the conversation that
+                    // submitted it — per request, like the gateway, so a
+                    // session switch between queued turns takes effect on
+                    // the turn it belongs to.
+                    agent.set_conversation_id(conversation_id);
                     let token = CancellationToken::new();
                     self.current = Some(token.clone());
                     let events = self.events_tx.clone();
@@ -174,8 +188,11 @@ impl TuiAgentActor {
                                 biased;
                                 maybe_req = self.req_rx.recv(), if !senders_dropped => {
                                     match maybe_req {
-                                        Some(TurnRequest::Submit(more)) => {
-                                            self.queue.push_back(more);
+                                        Some(TurnRequest::Submit {
+                                            text: more,
+                                            conversation_id,
+                                        }) => {
+                                            self.queue.push_back((more, conversation_id));
                                         }
                                         Some(TurnRequest::Cancel) => token.cancel(),
                                         Some(TurnRequest::Reload(config)) => {
@@ -326,7 +343,13 @@ mod tests {
         let actor = TuiAgentActor::new(Some(build_test_agent("reply")), req_rx, events_tx);
         let handle = tokio::spawn(actor.run());
 
-        req_tx.send(TurnRequest::Submit("hi".into())).await.unwrap();
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "hi".into(),
+                conversation_id: None,
+            })
+            .await
+            .unwrap();
 
         let mut got_done = false;
         while let Ok(Some(ev)) = timeout(Duration::from_secs(2), events_rx.recv()).await {
@@ -354,11 +377,17 @@ mod tests {
         let handle = tokio::spawn(actor.run());
 
         req_tx
-            .send(TurnRequest::Submit("first".into()))
+            .send(TurnRequest::Submit {
+                text: "first".into(),
+                conversation_id: None,
+            })
             .await
             .unwrap();
         req_tx
-            .send(TurnRequest::Submit("second".into()))
+            .send(TurnRequest::Submit {
+                text: "second".into(),
+                conversation_id: None,
+            })
             .await
             .unwrap();
 
@@ -429,7 +458,10 @@ mod tests {
         let handle = tokio::spawn(actor.run());
 
         req_tx
-            .send(TurnRequest::Submit("start".into()))
+            .send(TurnRequest::Submit {
+                text: "start".into(),
+                conversation_id: None,
+            })
             .await
             .unwrap();
         sleep(Duration::from_millis(50)).await;
@@ -457,7 +489,13 @@ mod tests {
         let actor = TuiAgentActor::new(None, req_rx, events_tx);
         let handle = tokio::spawn(actor.run());
 
-        req_tx.send(TurnRequest::Submit("hi".into())).await.unwrap();
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "hi".into(),
+                conversation_id: None,
+            })
+            .await
+            .unwrap();
 
         let ev = timeout(Duration::from_secs(2), events_rx.recv())
             .await
@@ -483,8 +521,20 @@ mod tests {
         let actor = TuiAgentActor::new(None, req_rx, events_tx);
         let handle = tokio::spawn(actor.run());
 
-        req_tx.send(TurnRequest::Submit("a".into())).await.unwrap();
-        req_tx.send(TurnRequest::Submit("b".into())).await.unwrap();
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "a".into(),
+                conversation_id: None,
+            })
+            .await
+            .unwrap();
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "b".into(),
+                conversation_id: None,
+            })
+            .await
+            .unwrap();
 
         let mut errors = 0;
         while let Ok(Some(ev)) = timeout(Duration::from_secs(2), events_rx.recv()).await {
@@ -519,6 +569,111 @@ mod tests {
         assert!(
             matches!(ev, AgentEvent::Error(_)),
             "expected Error event for /compress without an agent"
+        );
+        drop(req_tx);
+        let _ = timeout(Duration::from_secs(1), handle).await;
+    }
+
+    /// Records the `session_id` every `store` receives, so a test can prove
+    /// which conversation scope a turn's memory writes ran under.
+    struct ScopeRecordingMemory {
+        scopes: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl Memory for ScopeRecordingMemory {
+        fn name(&self) -> &str {
+            "scope-recording"
+        }
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: crate::memory::MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.scopes
+                .lock()
+                .expect("scope mutex")
+                .push(session_id.map(str::to_string));
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _category: Option<&crate::memory::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// The seam this module owns: a `Submit` carrying a conversation id must
+    /// scope the agent's turn memory to it. Auto-save is the observable —
+    /// its `store` runs under the same scope `recall_layered` reads.
+    #[tokio::test]
+    async fn a_submitted_conversation_id_scopes_the_turns_memory_writes() {
+        let scopes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mem: Arc<dyn Memory> = Arc::new(ScopeRecordingMemory {
+            scopes: scopes.clone(),
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(Box::new(EchoProvider("reply")))
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .auto_save(true)
+            .build()
+            .expect("agent builder should succeed");
+
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let actor = TuiAgentActor::new(Some(agent), req_rx, events_tx);
+        let handle = tokio::spawn(actor.run());
+
+        req_tx
+            .send(TurnRequest::Submit {
+                text: "remember me".into(),
+                conversation_id: Some("tui:s1".into()),
+            })
+            .await
+            .unwrap();
+
+        let mut got_done = false;
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(2), events_rx.recv()).await {
+            if matches!(ev, AgentEvent::Done { .. }) {
+                got_done = true;
+                break;
+            }
+        }
+        assert!(got_done, "expected Done event");
+
+        let seen = scopes.lock().expect("scope mutex").clone();
+        assert!(
+            seen.contains(&Some("tui:s1".to_string())),
+            "auto-save must run under the submitted conversation scope, saw {seen:?}"
         );
         drop(req_tx);
         let _ = timeout(Duration::from_secs(1), handle).await;

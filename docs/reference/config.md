@@ -428,6 +428,14 @@ Notes:
 | `sqlite_open_timeout_secs` | unset | seconds to wait when opening `brain.db`. Unset waits indefinitely; capped at 300 |
 | `chunk_max_tokens` | `512` | **not used by memory** — see the note below |
 
+### Conversation scoping
+
+Memory reads and writes are scoped per conversation: each channel chat and each
+TUI session recalls its own rows first, then backfills from shared (unscoped)
+memory only. Entries another conversation stored never surface in this one's
+prompt. Unscoped entries — what `memory_store` writes — are the shared tier and
+remain visible everywhere.
+
 ### Scores are relative, not absolute
 
 `MemoryEntry.score` is relevance normalised to `[0, 1]` **within one result set**:

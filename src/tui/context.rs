@@ -600,6 +600,17 @@ impl TuiContext {
         Ok(session.id)
     }
 
+    /// Memory scope for the bound session (`tui:<session_id>`), or `None`
+    /// while unbound. Uses [`ConversationKey`] so the TUI's conversation ids
+    /// live in the same tested format as every channel's.
+    ///
+    /// [`ConversationKey`]: crate::channels::conversation::ConversationKey
+    pub fn conversation_scope(&self) -> Option<String> {
+        self.session_id
+            .as_ref()
+            .map(|sid| crate::channels::conversation::ConversationKey::new("tui", sid).resolve())
+    }
+
     /// Short session id for status displays; `"new"` while the session is
     /// still unbound (no message sent yet).
     pub fn session_id_short(&self) -> &str {
@@ -1028,10 +1039,13 @@ mod tests {
         // Peer ends are live: sending through the ctx reaches the test receiver,
         // and sending via the test sender reaches the ctx's events receiver.
         ctx.req_tx
-            .try_send(TurnRequest::Submit("ping".into()))
+            .try_send(TurnRequest::Submit {
+                text: "ping".into(),
+                conversation_id: None,
+            })
             .expect("req channel open");
         match req_rx.try_recv().expect("req received") {
-            TurnRequest::Submit(s) => assert_eq!(s, "ping"),
+            TurnRequest::Submit { text: s, .. } => assert_eq!(s, "ping"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
@@ -1039,5 +1053,18 @@ mod tests {
         events_tx
             .try_send(AgentEvent::Chunk("ok".into()))
             .expect("events channel open");
+    }
+
+    /// The scope is `None` while unbound (a fresh TUI never scopes to a
+    /// session that does not exist yet) and `tui:<session_id>` once bound —
+    /// the same `ConversationKey` format every channel uses.
+    #[test]
+    fn conversation_scope_follows_the_bound_session() {
+        let mut ctx = in_memory_context("test-model");
+        assert_eq!(ctx.conversation_scope(), None);
+
+        ctx.append_user_message("first message").expect("append");
+        let sid = ctx.session_id.clone().expect("session bound on append");
+        assert_eq!(ctx.conversation_scope(), Some(format!("tui:{sid}")));
     }
 }
