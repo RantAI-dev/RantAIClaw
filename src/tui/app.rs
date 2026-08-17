@@ -2038,7 +2038,15 @@ impl TuiApp {
         // Dispatch to the actor. If the bridge is closed (e.g. actor has
         // exited), surface a visible error but do not propagate — the TUI
         // should remain responsive so the user can /quit cleanly.
-        if let Err(e) = self.context.req_tx.send(TurnRequest::Submit(text)).await {
+        if let Err(e) = self
+            .context
+            .req_tx
+            .send(TurnRequest::Submit {
+                text,
+                conversation_id: self.context.conversation_scope(),
+            })
+            .await
+        {
             self.context.last_error = Some(format!("agent bridge closed: {e}"));
             self.context.scroll_offset = 0;
             return Ok(());
@@ -4254,7 +4262,15 @@ impl TuiApp {
                 );
             }
             AppState::Ready => {
-                if let Err(e) = self.context.req_tx.send(TurnRequest::Submit(text)).await {
+                if let Err(e) = self
+                    .context
+                    .req_tx
+                    .send(TurnRequest::Submit {
+                        text,
+                        conversation_id: self.context.conversation_scope(),
+                    })
+                    .await
+                {
                     self.context.last_error = Some(format!("agent bridge closed: {e}"));
                     return;
                 }
@@ -9415,7 +9431,21 @@ mod submit_tests {
         assert_eq!(app.context.input_buffer, "");
         let req = req_rx.recv().await.expect("request should have been sent");
         match req {
-            TurnRequest::Submit(text) => assert_eq!(text, "hello"),
+            TurnRequest::Submit {
+                text,
+                conversation_id,
+            } => {
+                assert_eq!(text, "hello");
+                // Submitting bound a session (persist-before-send), so the
+                // request must carry that session's memory scope — this is
+                // what keeps TUI recall out of other conversations' rows.
+                let sid = app
+                    .context
+                    .session_id
+                    .clone()
+                    .expect("submit binds a session");
+                assert_eq!(conversation_id, Some(format!("tui:{sid}")));
+            }
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
@@ -9472,7 +9502,7 @@ mod submit_tests {
         assert_eq!(app.context.queued_turns, 1);
         let req = req_rx.recv().await.expect("request should have been sent");
         match req {
-            TurnRequest::Submit(text) => assert_eq!(text, "queued"),
+            TurnRequest::Submit { text, .. } => assert_eq!(text, "queued"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
@@ -9952,7 +9982,7 @@ mod retry_tests {
         assert_eq!(app.context.messages[0].content, "previous prompt");
         let req = req_rx.recv().await.expect("resubmit should dispatch");
         match req {
-            TurnRequest::Submit(text) => assert_eq!(text, "previous prompt"),
+            TurnRequest::Submit { text, .. } => assert_eq!(text, "previous prompt"),
             TurnRequest::Cancel => panic!("expected Submit, got Cancel"),
             TurnRequest::Reload(_) => panic!("expected Submit, got Reload"),
             TurnRequest::Compact { .. } => panic!("expected Submit, got Compact"),
