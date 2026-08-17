@@ -428,6 +428,18 @@ Notes:
 | `sqlite_open_timeout_secs` | unset | seconds to wait when opening `brain.db`. Unset waits indefinitely; capped at 300 |
 | `chunk_max_tokens` | `512` | **not used by memory** — see the note below |
 
+### The curated tier
+
+Durable facts live in `core` (and `daily`) categories, written via the
+`memory_store` tool. Two mechanisms fill this tier: the interactive agent's
+system prompt nudges the model to save a durable fact the moment the user
+states it (interactive surfaces only — channel prompts serve guests, whose
+words are never nudged into durable memory), and a pre-compaction flush
+(`/compress` and TUI auto-compaction) gives the model one last bounded turn to
+save facts before the turns carrying them are folded into a summary. Auto-saved
+`conversation` rows are not part of this tier and are never injected into
+prompts.
+
 ### Conversation scoping
 
 Memory reads and writes are scoped per conversation: each channel chat and each
