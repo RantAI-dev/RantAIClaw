@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0-alpha] — 2026-08-17
+
+No config schema change — this release carries no migration and rolls back
+freely to v0.21.0-alpha. Memory *behaviour* changes substantially (that is the
+point of the release): recall is more selective and conversation echoes never
+reach prompts.
+
+### Fixed
+
+- **Memory: auto-saved conversation turns are never injected into prompts.**
+  Reproduced live twice: a TUI request for a story was answered with an old
+  Telegram request's Python tutorial, and a bare "hello" recalled four stale
+  turns and executed tools (`skills_list`, `glob_search`) nobody asked for.
+  Every auto-save path stores under the `conversation` category; the context
+  builder now excludes that category outright — rows stay stored, reachable
+  via `memory_recall`, and pruned by retention. Covers legacy rows on every
+  backend with no migration. (#555)
+- **TUI: each session's memory reads and writes are scoped to the
+  conversation.** The interactive agent ran unscoped: it recalled every
+  channel's rows and its auto-saves landed in the shared tier where every
+  surface could recall them. Each submit now carries `tui:<session_id>`
+  (the same `ConversationKey` format channels use), applied per turn like
+  the gateway. (#556)
+- **Memory: relevance scores are absolute, so the floor can reject a weak
+  set.** Scores used to be rescaled relative to the best hit — the top hit
+  always scored 1.0 and something was injected on nearly every turn. Scores
+  are now absolute in [0, 1]: cosine for the vector signal, query coverage
+  for the keyword paths (BM25 still orders hits; its corpus-dependent
+  magnitude — measured near 1e-6 on a small store — cannot be the score),
+  match-tier fraction on postgres. A query with no relevant memory injects
+  nothing. Keyword-only recall (`embedding_provider = "none"`) is exact-term
+  matching; configure an embedding provider for semantic recall. (#558)
+- **CI: the weekly Sec Audit cron can file its advisory issue** instead of
+  failing with "Resource not accessible by integration" on a zero-vuln
+  scan. (#557)
+
+### Added
+
+- **Agent: the interactive system prompt nudges the model to save durable
+  facts** (preference, standing decision, project fact, correction) via
+  `memory_store` with category `core` and a stable key, the moment the user
+  states them — complementing the existing pre-compaction flush. Gated to
+  interactive surfaces (channel prompts serve guests, whose words are never
+  nudged into durable memory) and to registries that actually carry
+  `memory_store`. (#559)
+
+
 ## [0.21.0-alpha] — 2026-08-16
 
 No config schema change — this release carries no migration and rolls back
