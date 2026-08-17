@@ -29,6 +29,11 @@ permissions:
     security-events: write
     actions: read
     checks: write
+    # audit-check reports informational advisories (unmaintained/unsound) on
+    # scheduled runs by opening an issue; without this the weekly cron fails
+    # with "Resource not accessible by integration" even when the audit
+    # itself finds zero vulnerabilities.
+    issues: write
 
 env:
     CARGO_TERM_COLOR: always
