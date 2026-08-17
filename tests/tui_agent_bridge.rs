@@ -73,7 +73,13 @@ async fn end_to_end_turn_emits_chunks_and_done() {
     let actor = TuiAgentActor::new(Some(agent), req_rx, events_tx);
     let handle = tokio::spawn(actor.run());
 
-    req_tx.send(TurnRequest::Submit("hi".into())).await.unwrap();
+    req_tx
+        .send(TurnRequest::Submit {
+            text: "hi".into(),
+            conversation_id: None,
+        })
+        .await
+        .unwrap();
 
     let mut chunks: Vec<String> = Vec::new();
     let mut saw_done = false;

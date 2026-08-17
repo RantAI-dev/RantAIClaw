@@ -21,9 +21,10 @@ async fn main() -> anyhow::Result<()> {
 
     let start = Instant::now();
     req_tx
-        .send(TurnRequest::Submit(
-            "write me a 3-sentence travel description of Bali".to_string(),
-        ))
+        .send(TurnRequest::Submit {
+            text: "write me a 3-sentence travel description of Bali".to_string(),
+            conversation_id: None,
+        })
         .await?;
 
     let mut chunks_seen = 0;
