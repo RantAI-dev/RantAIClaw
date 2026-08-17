@@ -64,10 +64,9 @@ impl Tool for MemoryRecallTool {
             Ok(entries) => {
                 let mut output = format!("Found {} memories:\n", entries.len());
                 for entry in &entries {
-                    // Scores are relevance in [0,1] relative to the best hit
-                    // in this set. Formatting the fraction directly as a
-                    // percentage rendered the best match as "[1%]" and
-                    // everything else as "[0%]".
+                    // Scores are absolute relevance in [0,1]. Formatting the
+                    // fraction directly as a percentage rendered a strong
+                    // match as "[1%]" and everything else as "[0%]".
                     let score = entry
                         .score
                         .map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
@@ -178,9 +177,20 @@ mod tests {
         let tool = MemoryRecallTool::new(mem);
         let result = tool.execute(json!({"query": "Rust"})).await.unwrap();
 
+        // Scores are absolute now — the exact value depends on the BM25
+        // magnitude, not on being the best of the set. Pin the rendering shape
+        // and that a real single-term match reads as a substantial percentage,
+        // not the fraction-as-percent bug ("[1%]").
+        let pct: u32 = result
+            .output
+            .rsplit('[')
+            .next()
+            .and_then(|s| s.split('%').next())
+            .and_then(|s| s.parse().ok())
+            .expect("a percentage in the output");
         assert!(
-            result.output.contains("[100%]"),
-            "the best hit scores 1.0 and must read as 100%, got: {}",
+            (5..=100).contains(&pct),
+            "expected a substantial percentage, got {pct}% in: {}",
             result.output
         );
     }

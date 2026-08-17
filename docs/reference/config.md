@@ -436,24 +436,31 @@ memory only. Entries another conversation stored never surface in this one's
 prompt. Unscoped entries — what `memory_store` writes — are the shared tier and
 remain visible everywhere.
 
-### Scores are relative, not absolute
+### Scores are absolute
 
-`MemoryEntry.score` is relevance normalised to `[0, 1]` **within one result set**:
-the best hit for a query scores `1.0` and weaker hits score proportionally lower.
-Scores are not comparable across queries.
+`MemoryEntry.score` is absolute relevance in `[0, 1]`: cosine similarity for the
+vector signal, query coverage (the fraction of the query's terms the row
+contains) for the keyword paths, and a match-tier fraction on postgres. BM25
+still orders keyword hits, but its corpus-dependent magnitude is not the score.
+Hybrid recall averages over the signals a document actually has.
 
-So `min_relevance_score` reads as _"keep hits at least this fraction as good as the
-best one"_, and it means the same thing on every backend. It is not a measure of
-absolute quality — a result set whose best hit is poor still contains a `1.0`.
+So `min_relevance_score` is a real floor: a result set where every hit is weak
+is rejected **whole**, and a query with no relevant memory injects nothing.
+(Scores used to be relative to the best hit in the set — the top hit was always
+rescaled to `1.0`, so the floor could trim the tail but never say "nothing here
+is relevant", and something was injected on nearly every turn.)
 
-One consequence is worth knowing about, because it used to bite: with
-`auto_save = true` the store holds a verbatim copy of the message being answered
-by the time recall runs. A verbatim copy is the best possible lexical match, so
-it took `1.0` and everything else was scored against it — which pushed genuinely
-relevant memories under the threshold and out of the prompt. The context builder
-now drops an entry that _is_ the message being answered and re-ranks what remains,
-so the scale is set by the best **usable** hit. An entry that merely mentions the
-same topic is unaffected; only a verbatim echo is dropped.
+One documented approximation: the `lucid` backend's *remote* results carry
+rank-derived scores — the service reports order, not relevance.
+
+Keyword-only recall (the default, `embedding_provider = "none"`) is exact-term
+matching: a query that shares no words with a stored fact returns nothing, and
+paraphrased or cross-language questions will miss. Configure an
+`embedding_provider` to add semantic (vector) recall on top.
+
+The context builder also drops an entry that _is_ the message being answered
+(auto-save stores a verbatim copy, which is worthless as context). An entry that
+merely mentions the same topic is unaffected; only a verbatim echo is dropped.
 
 ### Embedding dimensions must match the model
 

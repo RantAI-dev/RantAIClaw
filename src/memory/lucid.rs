@@ -348,11 +348,12 @@ impl Memory for LucidMemory {
         match self.recall_from_lucid(query).await {
             Ok(lucid_results) if !lucid_results.is_empty() => {
                 self.clear_failure();
-                let mut merged = Self::merge_results(local_results, lucid_results, limit);
-                // Two rankings meet here — the local backend's normalised scores
-                // and lucid's rank-derived ones. Rescale the union so the set
-                // still satisfies the trait's "best hit scores 1.0" contract.
-                super::vector::normalize_entry_scores(&mut merged);
+                let merged = Self::merge_results(local_results, lucid_results, limit);
+                // Two score kinds meet here: the local backend's absolute
+                // relevances and lucid's rank-derived approximations (the
+                // remote service reports order, not relevance — documented
+                // where they are assigned). No union rescale: rescaling would
+                // inflate a weak local set back over the relevance floor.
                 Ok(merged)
             }
             Ok(_) => {

@@ -403,18 +403,18 @@ impl SqliteMemory {
         // busy database a scoped recall came back empty while matching rows sat
         // in the table.
         let sql = if session_id.is_some() {
-            "SELECT m.id, bm25(memories_fts) as score
+            "SELECT m.id, m.key, m.content
              FROM memories_fts f
              JOIN memories m ON m.rowid = f.rowid
              WHERE memories_fts MATCH ?1 AND m.session_id = ?3
-             ORDER BY score
+             ORDER BY bm25(memories_fts)
              LIMIT ?2"
         } else {
-            "SELECT m.id, bm25(memories_fts) as score
+            "SELECT m.id, m.key, m.content
              FROM memories_fts f
              JOIN memories m ON m.rowid = f.rowid
              WHERE memories_fts MATCH ?1
-             ORDER BY score
+             ORDER BY bm25(memories_fts)
              LIMIT ?2"
         };
 
@@ -422,12 +422,18 @@ impl SqliteMemory {
         #[allow(clippy::cast_possible_wrap)]
         let limit_i64 = limit as i64;
 
+        // BM25 orders the hits (it is IDF-aware), but it cannot be the score:
+        // its magnitude is corpus-dependent and lands near zero on small
+        // stores, where most rows share the query's terms. Query coverage is
+        // the absolute [0, 1] relevance — the same measure the LIKE fallback
+        // and the markdown backend already use.
+        let terms = Self::coverage_terms(query);
         let map_row = |row: &rusqlite::Row| -> rusqlite::Result<(String, f32)> {
             let id: String = row.get(0)?;
-            let score: f64 = row.get(1)?;
-            // BM25 returns negative scores (lower = better), negate for ranking
+            let key: String = row.get(1)?;
+            let content: String = row.get(2)?;
             #[allow(clippy::cast_possible_truncation)]
-            Ok((id, (-score) as f32))
+            Ok((id, Self::query_coverage(&terms, &key, &content) as f32))
         };
 
         let mut results = Vec::new();
@@ -446,6 +452,33 @@ impl SqliteMemory {
             }
         }
         Ok(results)
+    }
+
+    /// Query terms used for coverage scoring — lowercased whitespace tokens,
+    /// capped like the LIKE fallback's keyword list.
+    fn coverage_terms(query: &str) -> Vec<String> {
+        const MAX_COVERAGE_TERMS: usize = 8;
+        query
+            .split_whitespace()
+            .take(MAX_COVERAGE_TERMS)
+            .map(str::to_lowercase)
+            .collect()
+    }
+
+    /// Fraction of the query's terms present in `key`/`content` — the absolute
+    /// keyword relevance shared by the FTS path and the LIKE fallback. `1.0`
+    /// means the row covers the whole query, not "best of its set".
+    #[allow(clippy::cast_precision_loss)]
+    fn query_coverage(terms: &[String], key: &str, content: &str) -> f64 {
+        if terms.is_empty() {
+            return 0.0;
+        }
+        let haystack = format!("{key} {content}").to_lowercase();
+        let matched = terms
+            .iter()
+            .filter(|term| haystack.contains(term.as_str()))
+            .count();
+        matched as f64 / terms.len() as f64
     }
 
     /// Build the FTS5 MATCH expression for a free-text query.
@@ -756,9 +789,8 @@ impl Memory for SqliteMemory {
 
             // Hybrid merge
             let merged = if vector_results.is_empty() {
-                // Raw BM25 magnitudes. They are unbounded, so they are not a
-                // relevance yet — the single rescale at the end of `recall`
-                // turns them into one. Ordering is unaffected either way.
+                // `fts5_search` already scored each hit by query coverage —
+                // absolute [0, 1], the same scale the hybrid path uses.
                 keyword_results
                     .iter()
                     .map(|(id, score)| vector::ScoredResult {
@@ -895,22 +927,10 @@ impl Memory for SqliteMemory {
                     let rows = stmt.query_map(params_ref.as_slice(), |row| {
                         let key: String = row.get(1)?;
                         let content: String = row.get(2)?;
-                        // A substring scan has no ranking of its own. Score it by
-                        // how much of the query it actually covers — claiming a
-                        // perfect 1.0 made the weakest retrieval path outrank
-                        // every BM25 and vector hit.
-                        let haystack = format!("{key} {content}").to_lowercase();
-                        #[allow(clippy::cast_precision_loss)]
-                        let matched = keyword_terms
-                            .iter()
-                            .filter(|term| haystack.contains(term.as_str()))
-                            .count() as f64;
-                        #[allow(clippy::cast_precision_loss)]
-                        let coverage = if keyword_terms.is_empty() {
-                            0.0
-                        } else {
-                            matched / keyword_terms.len() as f64
-                        };
+                        // A substring scan has no ranking of its own. Score it
+                        // by query coverage — the same absolute measure the
+                        // FTS path uses, so the two paths share one scale.
+                        let coverage = Self::query_coverage(&keyword_terms, &key, &content);
                         Ok(MemoryEntry {
                             id: row.get(0)?,
                             key,
@@ -933,12 +953,10 @@ impl Memory for SqliteMemory {
                 }
             }
 
-            // Every path out of `recall` — hybrid, keyword-only, LIKE fallback —
-            // lands here, so the returned set always satisfies the trait's
-            // "best hit scores 1.0" contract. Idempotent for the paths that
-            // already normalised, and it re-bases the set when session filtering
-            // has removed the top hit.
-            vector::normalize_entry_scores(&mut results);
+            // Every path out of `recall` now yields absolute [0, 1] scores —
+            // saturated BM25, cosine, query coverage — so there is nothing to
+            // rescale: a set of weak hits stays weak, which is what lets the
+            // relevance floor reject it whole.
             results.truncate(limit);
             Ok(results)
         })
@@ -2196,10 +2214,12 @@ mod tests {
 
     // ── Score contract ────────────────────────────────────────────
 
-    /// BM25 magnitudes are unbounded, so the keyword-only path used to hand back
-    /// a raw score that no `[0,1]` threshold could be compared against.
+    /// Keyword hits score by query coverage — absolute, corpus-independent.
+    /// A row covering the whole query scores 1.0 on its own merits (BM25's
+    /// magnitude is near zero on a small store and cannot be the score); a
+    /// row covering half the query scores 0.5 even when it is the best hit.
     #[tokio::test]
-    async fn keyword_only_top_hit_scores_one() {
+    async fn keyword_only_hits_score_by_absolute_query_coverage() {
         let (_tmp, mem) = temp_sqlite();
         for (k, c) in [
             ("a", "rust ownership and borrowing"),
@@ -2211,16 +2231,26 @@ mod tests {
 
         let hits = mem.recall("rust", 10, None).await.unwrap();
         assert!(!hits.is_empty(), "expected keyword hits");
-
         let best = hits.iter().filter_map(|e| e.score).fold(0.0_f64, f64::max);
         assert!(
             (best - 1.0).abs() < 1e-6,
-            "best hit must score 1.0, got {best}"
+            "full query coverage scores 1.0, got {best}"
         );
         for e in &hits {
             let s = e.score.unwrap();
             assert!((0.0..=1.0).contains(&s), "{} out of range: {s}", e.key);
         }
+
+        // Partial coverage stays partial — the best hit is NOT rescaled up.
+        let partial = mem.recall("rust gardening", 10, None).await.unwrap();
+        let best = partial
+            .iter()
+            .filter_map(|e| e.score)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            (best - 0.5).abs() < 1e-6,
+            "half coverage must score 0.5 even as the best hit, got {best}"
+        );
     }
 
     /// The LIKE fallback is an unranked substring scan. It used to claim a flat
