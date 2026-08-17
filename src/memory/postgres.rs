@@ -292,11 +292,15 @@ impl Memory for PostgresMemory {
                 .iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()?;
-            // The SQL expression above yields 0.0/1.0/2.0/3.0 — a raw signal, not
-            // a relevance. Rescale so the best hit is 1.0, matching the contract
-            // every other backend now satisfies. Left unscaled, any match scored
-            // at or above 1.0 and the relevance threshold never filtered here.
-            super::vector::normalize_entry_scores(&mut entries);
+            // The SQL expression above yields 0.0/1.0/2.0/3.0 — a match-tier
+            // signal. Map it onto the absolute [0, 1] scale every backend now
+            // shares (3.0 = key + content match) instead of rescaling relative
+            // to the best hit, so a weak set stays under the relevance floor.
+            for entry in &mut entries {
+                if let Some(score) = entry.score {
+                    entry.score = Some((score / 3.0).clamp(0.0, 1.0));
+                }
+            }
             Ok(entries)
         })
         .await?

@@ -295,8 +295,8 @@ impl Memory for MarkdownMemory {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        // Contract: the best hit in the returned set scores 1.0.
-        super::vector::normalize_entry_scores(&mut scored);
+        // Query coverage is already an absolute [0, 1] relevance — no
+        // best-hit rescale, so a set of weak hits stays under the floor.
         scored.truncate(limit);
         Ok(scored)
     }

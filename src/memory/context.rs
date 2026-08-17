@@ -151,15 +151,10 @@ pub async fn build_memory_context(
             }
         };
 
-    // Drop self-echoes *before* the score threshold, not after: by then the
-    // echo has already defined the ranking everything else is measured against.
-    let before = entries.len();
+    // Drop self-echoes: the stored copy of the question being answered is
+    // worthless as context. Scores are absolute, so removing one entry does
+    // not change what any other entry is worth — no re-ranking needed.
     entries.retain(|e| !is_echo_of_query(&e.content, user_message));
-    if entries.len() != before {
-        // Removing the top hit invalidates the scale it set, so re-rank what is
-        // left. "Relative to the best hit" now means the best *usable* hit.
-        super::vector::normalize_entry_scores(&mut entries);
-    }
 
     let mut context = String::new();
     let mut keys: Vec<String> = Vec::new();
@@ -491,11 +486,9 @@ mod tests {
     }
 
     /// The defect, reproduced: auto-save stores the question, the stored copy
-    /// is a perfect lexical match so it ranks 1.0, and every real fact is then
-    /// scored *relative to it* — under the threshold and out of the prompt.
-    ///
-    /// Scores here are what a backend produces before this function sees them:
-    /// the echo at 1.0, a genuinely relevant fact well below it.
+    /// is a perfect lexical match and takes the top rank; dropping it must
+    /// leave the genuinely relevant facts injectable. Scores are absolute, so
+    /// the facts stand on their own — nothing is re-ranked after the drop.
     #[tokio::test]
     async fn a_self_echo_does_not_bury_the_facts_beneath_it() {
         let question = "when is the deployment window?";
@@ -504,9 +497,9 @@ mod tests {
             entry(
                 "deploy_window",
                 "Deployments happen Friday afternoons",
-                0.30,
+                0.55,
             ),
-            entry("release_cadence", "Releases cut on the first Monday", 0.22),
+            entry("release_cadence", "Releases cut on the first Monday", 0.45),
         ]);
 
         let ctx =
@@ -524,13 +517,31 @@ mod tests {
         );
     }
 
+    /// The headline of the absolute-score contract: when the best hit is weak,
+    /// NOTHING is injected. Under the old relative contract this test was
+    /// unwritable — the top hit was always rescaled to 1.0 and always passed.
+    #[tokio::test]
+    async fn a_weak_best_hit_is_not_injected() {
+        let mem = memory_of(vec![entry("barely", "a marginal overlap", 0.25)]);
+        let ctx = build_memory_context(
+            &mem,
+            "unrelated question",
+            0.4,
+            None,
+            MemoryContextLimits::default(),
+        )
+        .await;
+        assert!(ctx.is_empty(), "weak best hit was injected: {ctx:?}");
+        assert!(ctx.keys.is_empty());
+    }
+
     /// Whitespace differences must not defeat the match — a stored copy may
     /// have been re-wrapped on the way in.
     #[tokio::test]
     async fn an_echo_is_recognised_across_whitespace() {
         let mem = memory_of(vec![
             entry("user_msg_a1b2", "when is  the\ndeployment window?", 1.0),
-            entry("deploy_window", "Friday afternoons", 0.3),
+            entry("deploy_window", "Friday afternoons", 0.55),
         ]);
         let ctx = build_memory_context(
             &mem,

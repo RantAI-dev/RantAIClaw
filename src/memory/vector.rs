@@ -1,37 +1,4 @@
-// Vector operations — cosine similarity, normalization, hybrid merge.
-
-use super::traits::MemoryEntry;
-
-/// Rescale `MemoryEntry::score` so the best hit in the set is exactly `1.0`.
-///
-/// The [`Memory`](super::traits::Memory) contract defines `score` as relevance
-/// *relative to the best hit in the same result set*. Backends compute whatever
-/// raw signal they have — BM25 magnitudes, keyword counts, SQL weights — and
-/// pass it through here, so one `min_relevance_score` threshold means the same
-/// thing on every backend.
-///
-/// Entries with no score are left alone. A set whose best score is zero or
-/// non-finite is left alone too: there is no meaningful ratio to take, and
-/// inventing one would be worse than leaving the raw signal visible.
-pub fn normalize_entry_scores(entries: &mut [MemoryEntry]) {
-    let best = entries
-        .iter()
-        .filter_map(|e| e.score)
-        .filter(|s| s.is_finite())
-        .fold(0.0_f64, f64::max);
-
-    if best <= 0.0 || !best.is_finite() {
-        return;
-    }
-
-    for entry in entries.iter_mut() {
-        if let Some(score) = entry.score {
-            if score.is_finite() {
-                entry.score = Some((score / best).clamp(0.0, 1.0));
-            }
-        }
-    }
-}
+// Vector operations — cosine similarity, keyword-score saturation, hybrid merge.
 
 /// Cosine similarity between two vectors. Returns 0.0–1.0.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -98,8 +65,16 @@ pub struct ScoredResult {
 
 /// Hybrid merge: combine vector and keyword results with weighted fusion.
 ///
-/// Normalizes each score set to [0, 1], then computes:
-///   `final_score` = `vector_weight` * `vector_score` + `keyword_weight` * `keyword_score`
+/// Every score is **absolute**: cosine similarity is `[0, 1]`, keyword scores
+/// arrive as query coverage in `[0, 1]` (see `SqliteMemory::query_coverage`),
+/// and `final_score` is the weighted average over the signals a document
+/// actually has. Two properties follow, both deliberate:
+///
+///   * a single-signal match is not diluted by the missing signal's weight —
+///     a keyword-only hit used to cap at `keyword_weight` (0.3 by default) and
+///     could never clear the 0.4 relevance floor however well it matched;
+///   * nothing is rescaled relative to the best hit, so a set where every hit
+///     is weak scores weak, and the floor can reject all of it.
 ///
 /// Deduplicates by id, keeping the best score from each source.
 pub fn hybrid_merge(
@@ -125,15 +100,9 @@ pub fn hybrid_merge(
             });
     }
 
-    // Normalize keyword scores (BM25 can be any positive number)
-    let max_kw = keyword_results
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(0.0_f32, f32::max);
-    let max_kw = if max_kw < f32::EPSILON { 1.0 } else { max_kw };
-
+    // Keyword scores arrive absolute (query coverage); clamp defensively.
     for (id, score) in keyword_results {
-        let normalized = score / max_kw;
+        let normalized = score.clamp(0.0, 1.0);
         map.entry(id.clone())
             .and_modify(|r| r.keyword_score = Some(normalized))
             .or_insert_with(|| ScoredResult {
@@ -144,34 +113,28 @@ pub fn hybrid_merge(
             });
     }
 
-    // Compute final scores
+    // Weighted average over the signals each document actually has.
     let mut results: Vec<ScoredResult> = map
         .into_values()
         .map(|mut r| {
-            let vs = r.vector_score.unwrap_or(0.0);
-            let ks = r.keyword_score.unwrap_or(0.0);
-            r.final_score = vector_weight * vs + keyword_weight * ks;
+            let mut weighted = 0.0_f32;
+            let mut weight = 0.0_f32;
+            if let Some(vs) = r.vector_score {
+                weighted += vector_weight * vs;
+                weight += vector_weight;
+            }
+            if let Some(ks) = r.keyword_score {
+                weighted += keyword_weight * ks;
+                weight += keyword_weight;
+            }
+            r.final_score = if weight > 0.0 {
+                (weighted / weight).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             r
         })
         .collect();
-
-    // Rescale so the best hit is exactly 1.0, whichever signal produced it.
-    // Without this a document found by only one signal is capped at that
-    // signal's weight: a keyword-only match could never exceed `keyword_weight`
-    // — 0.3 by default — which put it under the 0.4 relevance threshold no
-    // matter how well it matched.
-    let best = results
-        .iter()
-        .map(|r| r.final_score)
-        .filter(|s| s.is_finite())
-        .fold(0.0_f32, f32::max);
-    if best > 0.0 && best.is_finite() {
-        for r in &mut results {
-            if r.final_score.is_finite() {
-                r.final_score = (r.final_score / best).clamp(0.0, 1.0);
-            }
-        }
-    }
 
     results.sort_by(|a, b| {
         b.final_score
@@ -259,7 +222,7 @@ mod tests {
 
     #[test]
     fn hybrid_merge_keyword_only() {
-        let kw_results = vec![("x".into(), 10.0), ("y".into(), 5.0)];
+        let kw_results = vec![("x".into(), 1.0), ("y".into(), 0.5)];
         let merged = hybrid_merge(&[], &kw_results, 0.7, 0.3, 10);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, "x");
@@ -268,7 +231,7 @@ mod tests {
     #[test]
     fn hybrid_merge_deduplicates() {
         let vec_results = vec![("a".into(), 0.9)];
-        let kw_results = vec![("a".into(), 10.0)];
+        let kw_results = vec![("a".into(), 1.0)];
         let merged = hybrid_merge(&vec_results, &kw_results, 0.7, 0.3, 10);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "a");
@@ -406,7 +369,7 @@ mod tests {
     #[test]
     fn hybrid_merge_zero_weights() {
         let vec_results = vec![("a".into(), 0.9)];
-        let kw_results = vec![("b".into(), 10.0)];
+        let kw_results = vec![("b".into(), 1.0)];
         let merged = hybrid_merge(&vec_results, &kw_results, 0.0, 0.0, 10);
         // All final scores should be 0.0
         for r in &merged {
@@ -416,7 +379,7 @@ mod tests {
 
     #[test]
     fn hybrid_merge_negative_keyword_scores() {
-        // BM25 scores are negated in our code, but raw negatives shouldn't crash
+        // Coverage can't be negative, but defensive clamping shouldn't crash
         let kw_results = vec![("a".into(), -5.0), ("b".into(), -1.0)];
         let merged = hybrid_merge(&[], &kw_results, 0.7, 0.3, 10);
         assert_eq!(merged.len(), 2);
@@ -435,12 +398,12 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_merge_large_bm25_normalization() {
-        let kw_results = vec![("a".into(), 1000.0), ("b".into(), 500.0), ("c".into(), 1.0)];
+    fn hybrid_merge_clamps_out_of_range_keyword_scores() {
+        // Coverage is 0-1 by construction; anything else is clamped, never
+        // rescaled against the rest of the set.
+        let kw_results = vec![("a".into(), 3.0), ("b".into(), 0.5)];
         let merged = hybrid_merge(&[], &kw_results, 0.0, 1.0, 10);
-        // "a" should have normalized score of 1.0
         assert!((merged[0].keyword_score.unwrap() - 1.0).abs() < 0.001);
-        // "b" should have 0.5
         assert!((merged[1].keyword_score.unwrap() - 0.5).abs() < 0.001);
     }
 
@@ -451,23 +414,19 @@ mod tests {
         assert_eq!(merged[0].id, "only");
     }
 
-    // ── Score contract: best hit in the set scores 1.0 ───────────
+    // ── Score contract: absolute [0, 1], no best-hit rescale ──────
 
-    /// A document found only by keyword used to be capped at `keyword_weight`
-    /// — 0.3 by default — so however well it matched it stayed below the 0.4
-    /// relevance threshold and never reached the model.
+    /// Mixed-signal set: every score bounded, ordering by strength, and a
+    /// strong keyword-only hit outranks a mediocre vector-only hit even
+    /// though its signal carries the smaller weight — present-signal
+    /// averaging, not weight dilution.
     #[test]
-    fn hybrid_merge_rescales_to_best() {
+    fn hybrid_merge_scores_are_bounded_and_undiluted() {
         let vec_results = vec![("semantic".into(), 0.5)];
-        let kw_results = vec![("keyword".into(), 10.0)];
+        let kw_results = vec![("keyword".into(), 1.0)];
 
         let merged = hybrid_merge(&vec_results, &kw_results, 0.7, 0.3, 10);
 
-        let best = merged.iter().map(|r| r.final_score).fold(0.0_f32, f32::max);
-        assert!(
-            (best - 1.0).abs() < 1e-6,
-            "best hit must score 1.0, got {best}"
-        );
         for r in &merged {
             assert!(
                 (0.0..=1.0).contains(&r.final_score),
@@ -476,55 +435,39 @@ mod tests {
                 r.final_score
             );
         }
+        let kw = merged.iter().find(|r| r.id == "keyword").unwrap();
+        let sem = merged.iter().find(|r| r.id == "semantic").unwrap();
+        assert!(
+            kw.final_score > sem.final_score,
+            "strong keyword match ({}) must outrank mediocre vector match ({})",
+            kw.final_score,
+            sem.final_score
+        );
     }
 
+    /// The old defect this design must not reintroduce: a keyword-only match
+    /// used to be diluted by the absent vector signal's weight (capped at 0.3)
+    /// and could never clear the 0.4 floor. Present-signal averaging keeps a
+    /// strong keyword-only hit strong.
     #[test]
-    fn hybrid_merge_keyword_only_set_reaches_one() {
-        // No vector signal at all: the top keyword hit is still the best hit.
-        let merged = hybrid_merge(&[], &[("a".into(), 4.0), ("b".into(), 1.0)], 0.7, 0.3, 10);
+    fn a_keyword_only_match_is_not_diluted_by_the_missing_signal() {
+        let merged = hybrid_merge(&[], &[("a".into(), 0.9)], 0.7, 0.3, 10);
         assert!(
-            (merged[0].final_score - 1.0).abs() < 1e-6,
-            "got {}",
+            merged[0].final_score > 0.4,
+            "strong keyword-only match must clear the default floor, got {}",
             merged[0].final_score
         );
-        assert!(merged[1].final_score < merged[0].final_score);
     }
 
-    fn scored_entry(key: &str, score: Option<f64>) -> MemoryEntry {
-        MemoryEntry {
-            id: key.to_string(),
-            key: key.to_string(),
-            content: format!("content-{key}"),
-            category: super::super::traits::MemoryCategory::Core,
-            timestamp: "t".into(),
-            session_id: None,
-            score,
-        }
-    }
-
+    /// The defect this change fixes: a weak best hit must stay weak — nothing
+    /// rescales it to 1.0 just for winning its set.
     #[test]
-    fn normalize_entry_scores_rescales_to_best() {
-        let mut entries = vec![
-            scored_entry("a", Some(4.0)),
-            scored_entry("b", Some(1.0)),
-            scored_entry("c", Some(0.0)),
-        ];
-        normalize_entry_scores(&mut entries);
-        assert_eq!(entries[0].score, Some(1.0));
-        assert_eq!(entries[1].score, Some(0.25));
-        assert_eq!(entries[2].score, Some(0.0));
-    }
-
-    #[test]
-    fn normalize_entry_scores_leaves_unscored_and_degenerate_sets_alone() {
-        let mut none_scored = vec![scored_entry("a", None)];
-        normalize_entry_scores(&mut none_scored);
-        assert_eq!(none_scored[0].score, None);
-
-        // Nothing to divide by — leaving the raw signal visible beats inventing
-        // a ratio.
-        let mut all_zero = vec![scored_entry("a", Some(0.0))];
-        normalize_entry_scores(&mut all_zero);
-        assert_eq!(all_zero[0].score, Some(0.0));
+    fn a_weak_best_hit_keeps_its_weak_absolute_score() {
+        let merged = hybrid_merge(&[], &[("a".into(), 0.2)], 0.7, 0.3, 10);
+        assert!(
+            merged[0].final_score < 0.4,
+            "weak best hit must stay under the floor, got {}",
+            merged[0].final_score
+        );
     }
 }

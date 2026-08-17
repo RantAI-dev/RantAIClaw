@@ -12,17 +12,19 @@ pub struct MemoryEntry {
     pub session_id: Option<String>,
     /// Relevance, normalised to `[0, 1]` **within the returned result set**.
     ///
-    /// The best hit for a query scores `1.0`; weaker hits score proportionally
-    /// lower. Scores are *not* comparable across queries or across calls — a
-    /// `1.0` means "the best of what this query found", not "a good match in
-    /// absolute terms". Nothing here has a calibrated model, and pretending
-    /// otherwise would make `min_relevance_score` mean different things on
-    /// different backends, which is exactly what it used to.
+    /// Absolute relevance in `[0, 1]`: cosine similarity, query coverage
+    /// (fraction of the query's terms the row contains), or a match-tier
+    /// fraction, depending on the backend. Comparable against
+    /// `min_relevance_score` directly — a set where every hit is weak scores
+    /// weak, so the floor can reject all of it. It used to be relative to the
+    /// best hit in the set, which rescaled the top hit to `1.0` however weak
+    /// it was and made the floor unable to reject anything.
+    ///
+    /// One documented approximation: the lucid backend's *remote* results are
+    /// rank-derived (the service reports order, not relevance).
     ///
     /// `None` where the operation does not rank — [`Memory::get`] and
     /// [`Memory::list`] return entries, not search results.
-    ///
-    /// Backends normalise via `vector::normalize_entry_scores`.
     pub score: Option<f64>,
 }
 
