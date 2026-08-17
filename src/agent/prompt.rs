@@ -117,6 +117,7 @@ impl SystemPromptBuilder {
                 Box::new(TaskSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
+                Box::new(MemorySection),
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
@@ -176,6 +177,7 @@ pub struct IdentitySection;
 pub struct ToolsSection;
 pub struct SafetySection;
 pub struct SkillsSection;
+pub struct MemorySection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
@@ -536,6 +538,38 @@ impl PromptSection for SkillsSection {
     }
 }
 
+/// Standing nudge to curate durable facts as they appear, instead of letting
+/// them die with the session. The pre-compaction flush
+/// (`Agent::flush_durable_memory`) is the safety net for facts that were never
+/// saved mid-conversation; this section is the first line — the model saves a
+/// fact the moment the user states it.
+///
+/// Self-gating, twice:
+///   * only on [`PromptSurface::Agent`] — channel prompts serve guests too,
+///     and a guest's words must not be nudged into durable memory (the same
+///     taint boundary that keeps the flush off the channel auto-compaction
+///     path);
+///   * only when a `memory_store` tool is actually registered — nudging a
+///     model toward a tool it does not have manufactures failed calls.
+impl PromptSection for MemorySection {
+    fn name(&self) -> &str {
+        "memory"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if ctx.surface != PromptSurface::Agent {
+            return Ok(String::new());
+        }
+        if !ctx.tools.iter().any(|t| t.name() == "memory_store") {
+            return Ok(String::new());
+        }
+        Ok("## Memory
+            When the user states something durable — a preference, a standing             decision, a project fact, a correction — save it with `memory_store`             (category `core`, a descriptive snake_case key such as             `user_language`). Update the existing key, or pass `replaces` with a             phrase from the old entry, instead of piling up variants. Do not             save one-off conversational detail, secrets, or anything you are             unsure about — when in doubt, ask first.
+"
+            .to_string())
+    }
+}
+
 impl PromptSection for WorkspaceSection {
     fn name(&self) -> &str {
         "workspace"
@@ -828,6 +862,85 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    /// The nudge appears exactly when it can be acted on: Agent surface with a
+    /// registered `memory_store`. Each gate has its own control below.
+    #[test]
+    fn memory_nudge_renders_on_agent_surface_with_memory_store() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(DescriptorTool::new(
+            "memory_store",
+            "store a memory",
+        ))];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: None,
+            allowed_commands: &[],
+        };
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(prompt.contains("## Memory"), "nudge missing: {prompt}");
+        assert!(prompt.contains("memory_store"));
+    }
+
+    /// Channel prompts serve guests too — a guest's words must not be nudged
+    /// into durable memory. Same fixture, Channel surface, nudge gone.
+    #[test]
+    fn memory_nudge_is_absent_on_channel_surface() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(DescriptorTool::new(
+            "memory_store",
+            "store a memory",
+        ))];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Channel { native_tools: true },
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: None,
+            allowed_commands: &[],
+        };
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(
+            !prompt.contains("## Memory"),
+            "nudge must not render for channels: {prompt}"
+        );
+    }
+
+    /// Nudging a model toward a tool it does not have manufactures failed
+    /// calls. No `memory_store` in the registry, no nudge.
+    #[test]
+    fn memory_nudge_is_absent_without_the_memory_store_tool() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "m",
+            surface: PromptSurface::Agent,
+            bootstrap_max_chars: BOOTSTRAP_MAX_CHARS,
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            autonomy_preset: None,
+            allowed_commands: &[],
+        };
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(
+            !prompt.contains("## Memory"),
+            "nudge needs the tool: {prompt}"
+        );
     }
 
     #[test]
