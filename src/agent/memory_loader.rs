@@ -101,7 +101,9 @@ mod tests {
                 id: "1".into(),
                 key: "k".into(),
                 content: "v".into(),
-                category: MemoryCategory::Conversation,
+                // Curated category: `conversation` entries are auto-save
+                // transcript rows and are excluded from context injection.
+                category: MemoryCategory::Core,
                 timestamp: "now".into(),
                 session_id: None,
                 score: None,
@@ -217,7 +219,7 @@ mod tests {
                     id: "2".into(),
                     key: "user_fact".into(),
                     content: "User prefers concise answers".into(),
-                    category: MemoryCategory::Conversation,
+                    category: MemoryCategory::Core,
                     timestamp: "now".into(),
                     session_id: None,
                     score: Some(0.9),

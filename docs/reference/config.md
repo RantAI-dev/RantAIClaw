@@ -410,7 +410,7 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `postgres`, `none`. An unrecognised value is a startup error, not a fallback |
-| `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded) |
+| `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded). Auto-saved turns are stored under the `conversation` category: retained, searchable via `memory_recall`, but **never auto-injected into prompts** |
 | `min_relevance_score` | `0.4` | drop recalled entries scoring below this. See _Scores are relative_ below |
 | `embedding_provider` | `none` | `none`, `openai`, `openrouter`, `minimax`, or `custom:<base-url>` |
 | `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` to use an `[[embedding_routes]]` entry |

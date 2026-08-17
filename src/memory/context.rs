@@ -9,7 +9,7 @@
 //! rules to reason about — and one place to fix the next thing that is wrong
 //! with them.
 
-use super::{recall_layered, Memory};
+use super::{recall_layered, Memory, MemoryCategory, MemoryEntry};
 use crate::util::truncate_with_ellipsis;
 
 /// How much recalled memory may enter a prompt.
@@ -71,22 +71,33 @@ fn is_echo_of_query(content: &str, user_message: &str) -> bool {
 }
 
 /// Entries that must never reach the prompt, whatever they scored.
-fn should_skip(key: &str, content: &str, limits: &MemoryContextLimits) -> bool {
-    // Model-authored summaries from a legacy auto-save. Treated as untrusted
-    // context: re-injecting them lets an old fabrication harden into a fact.
-    if super::is_assistant_autosave_key(key) {
+fn should_skip(entry: &MemoryEntry, limits: &MemoryContextLimits) -> bool {
+    // Raw conversation turns. Every auto-save path stores under this category
+    // (channel dispatch and the interactive agent alike), whatever key scheme
+    // it uses — the key-shape checks below cannot keep up with new schemes,
+    // and a stale request injected as context has been observed answered (and
+    // its tools executed) in place of the live message. The rows stay stored:
+    // `memory_recall` reaches them explicitly, and retention prunes them.
+    if entry.category == MemoryCategory::Conversation {
         return true;
     }
 
-    // Serialised conversation history. It is not a fact about the user, and it
-    // duplicates what the transcript already carries.
-    if key.trim().to_ascii_lowercase().ends_with("_history") {
+    // Model-authored summaries from a legacy auto-save. Treated as untrusted
+    // context: re-injecting them lets an old fabrication harden into a fact.
+    if super::is_assistant_autosave_key(&entry.key) {
+        return true;
+    }
+
+    // Serialised conversation history stored under a non-conversation
+    // category. It is not a fact about the user, and it duplicates what the
+    // transcript already carries.
+    if entry.key.trim().to_ascii_lowercase().ends_with("_history") {
         return true;
     }
 
     // A single entry larger than the whole budget cannot be usefully truncated
     // into it.
-    content.chars().count() > limits.max_total_chars
+    entry.content.chars().count() > limits.max_total_chars
 }
 
 /// What a turn's recall produced: the block to inject, and which entries are
@@ -163,7 +174,7 @@ pub async fn build_memory_context(
         if included >= limits.max_entries {
             break;
         }
-        if should_skip(&entry.key, &entry.content, &limits) {
+        if should_skip(entry, &limits) {
             continue;
         }
 
@@ -254,11 +265,15 @@ mod tests {
     }
 
     fn entry(key: &str, content: &str, score: f64) -> MemoryEntry {
+        entry_in(key, content, score, MemoryCategory::Core)
+    }
+
+    fn entry_in(key: &str, content: &str, score: f64, category: MemoryCategory) -> MemoryEntry {
         MemoryEntry {
             id: key.into(),
             key: key.into(),
             content: content.into(),
-            category: MemoryCategory::Core,
+            category,
             timestamp: "t".into(),
             session_id: None,
             score: Some(score),
@@ -357,6 +372,67 @@ mod tests {
         assert!(out.contains("user_fact"));
         assert!(!out.contains("fabricated"));
         assert!(!out.contains("transcript"));
+    }
+
+    /// The live defect, pinned: auto-saved conversation turns carry innocuous
+    /// keys (`telegram_<sender>_<msg_id>`, `user_msg_<uuid>`) that no
+    /// key-shape rule catches, and a perfect score cannot save them — the
+    /// category alone must keep them out of the prompt.
+    #[tokio::test]
+    async fn a_conversation_category_entry_never_reaches_the_prompt() {
+        let mem = memory_of(vec![entry_in(
+            "telegram_chat_42",
+            "an old request from another surface",
+            1.0,
+            MemoryCategory::Conversation,
+        )]);
+        let ctx = build_memory_context(&mem, "q", 0.0, None, MemoryContextLimits::default()).await;
+        assert!(ctx.is_empty(), "conversation turn was injected: {ctx:?}");
+        assert!(ctx.keys.is_empty());
+    }
+
+    /// The control: the same content and score under a curated category must
+    /// survive, or the test above passes for the wrong reason.
+    #[tokio::test]
+    async fn the_same_entry_under_a_curated_category_survives() {
+        let mem = memory_of(vec![entry_in(
+            "telegram_chat_42",
+            "an old request from another surface",
+            1.0,
+            MemoryCategory::Core,
+        )]);
+        let ctx = build_memory_context(&mem, "q", 0.0, None, MemoryContextLimits::default()).await;
+        assert_eq!(ctx.keys, vec!["telegram_chat_42"]);
+    }
+
+    /// The repro shape: two auto-saved turns outrank a real fact. Only the
+    /// fact may be injected, and dropping the turns must not resurrect them
+    /// through the echo-removal re-rank.
+    #[tokio::test]
+    async fn conversation_turns_outranking_a_fact_do_not_displace_it() {
+        let mem = memory_of(vec![
+            entry_in(
+                "user_msg_a1b2",
+                "an earlier tui request",
+                1.0,
+                MemoryCategory::Conversation,
+            ),
+            entry_in(
+                "telegram_user_a_telegram_123_7",
+                "an earlier channel request",
+                0.9,
+                MemoryCategory::Conversation,
+            ),
+            entry_in(
+                "user_fact",
+                "prefers concise answers",
+                0.5,
+                MemoryCategory::Core,
+            ),
+        ]);
+        let ctx = build_memory_context(&mem, "q", 0.4, None, MemoryContextLimits::default()).await;
+        assert_eq!(ctx.keys, vec!["user_fact"]);
+        assert!(!ctx.block.contains("request"));
     }
 
     /// The keys are what a surface shows the operator, so they must name
