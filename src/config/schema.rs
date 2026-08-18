@@ -3728,6 +3728,88 @@ pub(crate) fn decrypt_optional_secret(
     Ok(())
 }
 
+/// Decrypt every at-rest-encrypted secret in `config`, in place.
+///
+/// The single authority on WHICH fields are encrypted. `Config::load_or_init`
+/// and the TUI's `reload_config` both call this; before it existed each kept
+/// a hand-copy of the list, and the copies drifted twice (KB keys, then
+/// `provider_api_keys` — the latter answered 401 on every provider call
+/// after a config-watcher reload until #565). Add new encrypted fields HERE
+/// and in `save()`'s encrypt side, nowhere else.
+pub(crate) fn decrypt_config_secrets(
+    store: &crate::security::SecretStore,
+    config: &mut Config,
+) -> Result<()> {
+    decrypt_optional_secret(store, &mut config.api_key, "config.api_key")?;
+    decrypt_optional_secret(
+        store,
+        &mut config.knowledge.embedding_api_key,
+        "config.knowledge.embedding_api_key",
+    )?;
+    decrypt_optional_secret(
+        store,
+        &mut config.knowledge.vision_api_key,
+        "config.knowledge.vision_api_key",
+    )?;
+    decrypt_optional_secret(
+        store,
+        &mut config.composio.api_key,
+        "config.composio.api_key",
+    )?;
+
+    decrypt_optional_secret(
+        store,
+        &mut config.browser.computer_use.api_key,
+        "config.browser.computer_use.api_key",
+    )?;
+
+    decrypt_optional_secret(
+        store,
+        &mut config.web_search.brave_api_key,
+        "config.web_search.brave_api_key",
+    )?;
+
+    decrypt_optional_secret(
+        store,
+        &mut config.storage.provider.config.db_url,
+        "config.storage.provider.config.db_url",
+    )?;
+
+    for agent in config.agents.values_mut() {
+        decrypt_optional_secret(store, &mut agent.api_key, "config.agents.*.api_key")?;
+    }
+    for key in config.provider_api_keys.values_mut() {
+        let mut wrapped = Some(std::mem::take(key));
+        decrypt_optional_secret(store, &mut wrapped, "config.provider_api_keys.*")?;
+        *key = wrapped.unwrap_or_default();
+    }
+    // Decrypt the Telegram bot token symmetrically with `save()` so the
+    // running channel receives the plaintext token.
+    if let Some(tg) = config.channels_config.telegram.as_mut() {
+        let mut wrapped = Some(std::mem::take(&mut tg.bot_token));
+        decrypt_optional_secret(
+            store,
+            &mut wrapped,
+            "config.channels_config.telegram.bot_token",
+        )?;
+        tg.bot_token = wrapped.unwrap_or_default();
+    }
+    // Decrypt skill literal API keys symmetrically with `save()` so
+    // `src/tools/mod.rs` still reads a plaintext value in memory.
+    for (name, entry) in &mut config.skills.entries {
+        if let Some(api_key) = entry.api_key.as_mut() {
+            if api_key.source == "literal" {
+                decrypt_optional_secret(
+                    store,
+                    &mut api_key.value,
+                    &format!("config.skills.entries.{name}.api_key.value"),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -3954,73 +4036,7 @@ impl Config {
             config.config_path = config_path.clone();
             config.workspace_dir = workspace_dir;
             let store = crate::security::SecretStore::new(&rantaiclaw_dir, config.secrets.encrypt);
-            decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
-            decrypt_optional_secret(
-                &store,
-                &mut config.knowledge.embedding_api_key,
-                "config.knowledge.embedding_api_key",
-            )?;
-            decrypt_optional_secret(
-                &store,
-                &mut config.knowledge.vision_api_key,
-                "config.knowledge.vision_api_key",
-            )?;
-            decrypt_optional_secret(
-                &store,
-                &mut config.composio.api_key,
-                "config.composio.api_key",
-            )?;
-
-            decrypt_optional_secret(
-                &store,
-                &mut config.browser.computer_use.api_key,
-                "config.browser.computer_use.api_key",
-            )?;
-
-            decrypt_optional_secret(
-                &store,
-                &mut config.web_search.brave_api_key,
-                "config.web_search.brave_api_key",
-            )?;
-
-            decrypt_optional_secret(
-                &store,
-                &mut config.storage.provider.config.db_url,
-                "config.storage.provider.config.db_url",
-            )?;
-
-            for agent in config.agents.values_mut() {
-                decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
-            }
-            for key in config.provider_api_keys.values_mut() {
-                let mut wrapped = Some(std::mem::take(key));
-                decrypt_optional_secret(&store, &mut wrapped, "config.provider_api_keys.*")?;
-                *key = wrapped.unwrap_or_default();
-            }
-            // Decrypt the Telegram bot token symmetrically with `save()` so the
-            // running channel receives the plaintext token.
-            if let Some(tg) = config.channels_config.telegram.as_mut() {
-                let mut wrapped = Some(std::mem::take(&mut tg.bot_token));
-                decrypt_optional_secret(
-                    &store,
-                    &mut wrapped,
-                    "config.channels_config.telegram.bot_token",
-                )?;
-                tg.bot_token = wrapped.unwrap_or_default();
-            }
-            // Decrypt skill literal API keys symmetrically with `save()` so
-            // `src/tools/mod.rs` still reads a plaintext value in memory.
-            for (name, entry) in &mut config.skills.entries {
-                if let Some(api_key) = entry.api_key.as_mut() {
-                    if api_key.source == "literal" {
-                        decrypt_optional_secret(
-                            &store,
-                            &mut api_key.value,
-                            &format!("config.skills.entries.{name}.api_key.value"),
-                        )?;
-                    }
-                }
-            }
+            decrypt_config_secrets(&store, &mut config)?;
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -5310,6 +5326,100 @@ tool_dispatcher = "xml"
         );
         // The allowlist is not a secret — it must stay readable.
         assert_eq!(tg.allowed_users, vec!["alice".to_string()]);
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    /// `decrypt_config_secrets` is the single decrypt authority shared by
+    /// `load_or_init` and the TUI's `reload_config`. Round-trip the three
+    /// fields whose decrypt coverage has historically drifted between those
+    /// two callers: a per-provider key, the Telegram bot token, and a
+    /// literal skill key. save() encrypts them; one shared call must bring
+    /// all three back to plaintext.
+    #[tokio::test]
+    async fn decrypt_config_secrets_round_trips_every_drift_prone_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "rantaiclaw_test_decrypt_pass_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.join("workspace");
+        config.config_path = dir.join("config.toml");
+        config.secrets.encrypt = true;
+        config
+            .provider_api_keys
+            .insert("openrouter".into(), "neutral-provider-key-value".into());
+        config.channels_config.telegram = Some(
+            serde_json::from_value(serde_json::json!({
+                "bot_token": "123456789:neutral-bot-token-value",
+                "allowed_users": ["rantaiclaw_user"],
+            }))
+            .unwrap(),
+        );
+        config.skills.entries.insert(
+            "x".into(),
+            SkillEntryConfig {
+                api_key: Some(SkillApiKey {
+                    source: "literal".into(),
+                    id: None,
+                    value: Some("neutral-skill-key-value".into()),
+                }),
+                ..Default::default()
+            },
+        );
+
+        config.save().await.unwrap();
+
+        // At rest: all three encrypted.
+        let contents = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        let mut stored: Config = toml::from_str(&contents).unwrap();
+        assert!(
+            crate::security::SecretStore::is_encrypted(&stored.provider_api_keys["openrouter"]),
+            "provider key must be encrypted at rest"
+        );
+        assert!(
+            crate::security::SecretStore::is_encrypted(
+                &stored.channels_config.telegram.as_ref().unwrap().bot_token
+            ),
+            "bot_token must be encrypted at rest"
+        );
+        assert!(
+            crate::security::SecretStore::is_encrypted(
+                stored.skills.entries["x"]
+                    .api_key
+                    .as_ref()
+                    .unwrap()
+                    .value
+                    .as_ref()
+                    .unwrap()
+            ),
+            "skill literal key must be encrypted at rest"
+        );
+
+        // One shared pass restores all three.
+        let store = crate::security::SecretStore::new(&dir, true);
+        decrypt_config_secrets(&store, &mut stored).unwrap();
+        assert_eq!(
+            stored.provider_api_keys["openrouter"],
+            "neutral-provider-key-value"
+        );
+        assert_eq!(
+            stored.channels_config.telegram.as_ref().unwrap().bot_token,
+            "123456789:neutral-bot-token-value"
+        );
+        assert_eq!(
+            stored.skills.entries["x"]
+                .api_key
+                .as_ref()
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("neutral-skill-key-value")
+        );
 
         let _ = fs::remove_dir_all(&dir).await;
     }
