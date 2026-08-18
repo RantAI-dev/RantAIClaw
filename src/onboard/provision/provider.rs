@@ -474,24 +474,41 @@ impl TuiProvisioner for ProviderProvisioner {
         )
         .await?;
 
-        // Use the curated model list shared with the legacy wizard so
-        // the names stay in sync across both setup paths. Returns
-        // `(model_id, description)` tuples; we render description as
-        // the Choose option, then map back to the id via `model_ids`.
+        // Read the same catalog every other surface uses (`/model` picker,
+        // gateway, channel routing): cached live models when `models
+        // refresh`/the wizard has written them, curated otherwise. This
+        // used to read the curated list alone — ~10 rows for openrouter
+        // while the same binary's /model picker offered 400 from the cache.
+        // Capped like the CLI wizard's Select: the setup Choose overlay has
+        // no filter box, and the full openrouter list is 400 rows.
+        let catalog =
+            crate::onboard::wizard::provider_model_catalog(&config.workspace_dir, provider_name);
+        let source = catalog.source;
         let curated = crate::onboard::wizard::curated_models_for_provider(provider_name);
-        let (model_ids, model_labels): (Vec<String>, Vec<String>) = if curated.is_empty() {
-            // Provider has no curated list — fall back to a single
+        let describe = |id: &str| {
+            curated
+                .iter()
+                .find(|(curated_id, _)| curated_id == id)
+                .map(|(_, description)| description.clone())
+        };
+        let (model_ids, model_labels): (Vec<String>, Vec<String>) = if catalog.models.is_empty() {
+            // No cache and no curated list — fall back to a single
             // "default" option so the user still has something to pick.
-            let fallback = default_model_for_provider(provider_name);
+            let fallback = crate::onboard::wizard::default_model_for_provider(provider_name);
             (
                 vec![fallback.clone()],
                 vec![format!("{fallback} (default)")],
             )
         } else {
-            curated
+            catalog
+                .models
                 .into_iter()
-                .map(|(id, desc)| {
-                    let label = format!("{id}  —  {desc}");
+                .take(crate::onboard::wizard::LIVE_MODEL_MAX_OPTIONS)
+                .map(|id| {
+                    let label = match describe(&id) {
+                        Some(desc) => format!("{id}  —  {desc}"),
+                        None => format!("{id}  ({source})"),
+                    };
                     (id, label)
                 })
                 .unzip()
@@ -513,7 +530,7 @@ impl TuiProvisioner for ProviderProvisioner {
         let model = model_ids
             .get(model_idx)
             .cloned()
-            .unwrap_or_else(|| default_model_for_provider(provider_name));
+            .unwrap_or_else(|| crate::onboard::wizard::default_model_for_provider(provider_name));
 
         // ── Write config ────────────────────────────────────────────
         config.default_provider = Some(provider_name.to_string());
@@ -542,38 +559,6 @@ impl TuiProvisioner for ProviderProvisioner {
         Ok(ProvisionOutcome::Configured)
     }
 }
-
-fn default_model_for_provider(provider: &str) -> String {
-    match provider {
-        "openrouter" => "anthropic/claude-sonnet-4-20250514".to_string(),
-        "anthropic" => "claude-sonnet-4-20250514".to_string(),
-        "openai" => "gpt-4o".to_string(),
-        "deepseek" => "deepseek-chat".to_string(),
-        "mistral" => "mistral-large-latest".to_string(),
-        "xai" => "grok-3".to_string(),
-        "perplexity" => "sonar".to_string(),
-        "gemini" => "gemini-2.0-flash".to_string(),
-        "groq" => "llama-3.3-70b-versatile".to_string(),
-        "fireworks" => "accounts/fireworks/models/llama-v3.3-70b-instruct".to_string(),
-        "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
-        "nvidia" => "deepseek-ai/DeepSeek-V3".to_string(),
-        "vercel" => "gpt-4o".to_string(),
-        "cloudflare" => "@cf/meta/llama-3.1-8b-instruct".to_string(),
-        "bedrock" => "anthropic.claude-sonnet-4-20250514".to_string(),
-        "moonshot" => "moonshot-v1-8k".to_string(),
-        "moonshot-intl" => "moonshot-v1-8k".to_string(),
-        "glm" => "glm-4".to_string(),
-        "minimax" => "abab6.5s-chat".to_string(),
-        "qwen" => "qwen-turbo".to_string(),
-        "qianfan" => "ernie-4.0-8k".to_string(),
-        "zai" => "glm-4".to_string(),
-        "cohere" => "command-r-plus".to_string(),
-        "ollama" => "llama3".to_string(),
-        "llamacpp" => "llama3".to_string(),
-        _ => "default".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +714,55 @@ mod tests {
         );
         assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
         assert!(config.api_key.is_none());
+    }
+
+    /// The model step must offer what `models refresh` cached — the
+    /// curated-only regression showed ~10 openrouter rows while /model
+    /// offered 400 from the same cache on the same box.
+    #[tokio::test]
+    async fn model_step_offers_cached_models_not_just_curated() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let profile = scratch_profile(tmp.path());
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+
+        let cache_only = "openrouter/some-model-only-the-live-catalog-has";
+        assert!(
+            !crate::onboard::wizard::curated_models_for_provider("openrouter")
+                .iter()
+                .any(|(id, _)| id == cache_only),
+            "fixture must not collide with the curated list"
+        );
+        crate::onboard::wizard::cache_live_models_for_provider(
+            tmp.path(),
+            "openrouter",
+            &[cache_only.to_string()],
+        )
+        .expect("write cache");
+
+        let t = drive(
+            &ProviderProvisioner::new(),
+            &mut config,
+            &profile,
+            vec![
+                Answer::Pick(PICK_TIER_RECOMMENDED),
+                Answer::Pick(pick_provider("openrouter")),
+                Answer::Text(""), // keyless — openrouter builds without a key
+                Answer::Pick(0),  // the only model row is the cached one
+            ],
+        )
+        .await;
+
+        assert!(
+            t.events.iter().any(|e| matches!(
+                e,
+                super::ProvisionEvent::Choose { id, options, .. }
+                    if id == "model" && options.iter().any(|o| o.contains(cache_only))
+            )),
+            "the model Choose must surface what `models refresh` wrote"
+        );
+        assert!(t.configured(), "flow must configure, got {:?}", t.outcome);
+        assert_eq!(config.default_model.as_deref(), Some(cache_only));
     }
 
     /// The gate consults the same oracle boot uses — including the
