@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.2-alpha] — 2026-08-18
+
+Three TUI/config bugfixes. No config schema change — this release carries no
+migration and rolls back freely to v0.22.1-alpha.
+
+### Fixed
+
+- **TUI: `/model` switches the agent's model, not just the status-bar label.**
+  Both the typed form and the picker reported "Model set to: X" while only the
+  label changed — every following turn silently ran (and billed) on the old
+  model, and neither the config on disk nor the next launch learned about the
+  switch. A model switch now persists `default_provider`/`default_model` and
+  hot-reloads the running agent through the same path the wizard uses; a wrong
+  model fails the next turn with the provider's own error instead of a false
+  success. Model ids containing `:` (ollama `llama3:8b`) survive the split.
+  (#565)
+- **TUI: the setup provider list matches the CLI wizard again.** The TUI kept
+  a hand-copied provider table that had drifted 11 providers behind — Kimi
+  Code, Qwen Code, OpenAI Codex, Astrai, GLM (CN), MiniMax (CN), Qwen
+  intl/US, Z.AI (CN), Synthetic, and OpenCode Zen were fully supported by the
+  provider factory but never offered in the TUI. Both surfaces now read one
+  shared table. (#566)
+- **Config: one decrypt pass shared by startup and the TUI reload.** Startup
+  (`load_or_init`) and the TUI's config reload each kept a hand-written list
+  of which at-rest-encrypted secrets to decrypt, and the lists drifted:
+  reloads rebuilt the agent with encrypted `provider_api_keys` blobs (every
+  provider call then answered 401 until restart), and a reloaded Telegram
+  channel polled with an encrypted token. Both callers now share a single
+  decrypt authority, closing the per-provider key, Telegram bot token, and
+  skill literal key gaps at once. (#565, #567)
+
 ## [0.22.1-alpha] — 2026-08-18
 
 A single-hardening patch. No config schema change — this release carries no
