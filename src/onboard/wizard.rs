@@ -2298,28 +2298,24 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
-#[allow(clippy::too_many_lines)]
-pub(crate) fn setup_provider(
-    workspace_dir: &Path,
-) -> Result<(String, String, String, Option<String>)> {
-    // ── Tier selection ──
-    let tiers = vec![
-        "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
-        "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
-        "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
-        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
-        "🏠 Local / private (Ollama, llama.cpp server — no API key needed)",
-        "🔧 Custom — bring your own OpenAI-compatible API",
-    ];
+/// One tier of the provider-setup catalog.
+///
+/// Shared verbatim by the CLI wizard (`setup_provider`) and the TUI
+/// provisioner (`onboard::provision::provider`). These were two
+/// hand-maintained copies and drifted 11 providers apart — the same
+/// defect shape as the endpoint table replaced in v0.16.1-alpha.
+/// `providers` empty marks the Custom/BYOP tier; both drivers already
+/// treat an empty list as "run the custom flow".
+pub(crate) struct ProviderTier {
+    pub label: &'static str,
+    /// `(factory_key, human_label)` pairs, in display order.
+    pub providers: &'static [(&'static str, &'static str)],
+}
 
-    let tier_idx = Select::new()
-        .with_prompt("  Select provider category")
-        .items(&tiers)
-        .default(0)
-        .interact()?;
-
-    let providers: Vec<(&str, &str)> = match tier_idx {
-        0 => vec![
+pub(crate) const PROVIDER_SETUP_TIERS: &[ProviderTier] = &[
+    ProviderTier {
+        label: "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
+        providers: &[
             (
                 "openrouter",
                 "OpenRouter — 200+ models, 1 API key (recommended)",
@@ -2340,13 +2336,19 @@ pub(crate) fn setup_provider(
                 "Google Gemini — Gemini 2.0 Flash & Pro (supports CLI auth)",
             ),
         ],
-        1 => vec![
+    },
+    ProviderTier {
+        label: "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
+        providers: &[
             ("groq", "Groq — ultra-fast LPU inference"),
             ("fireworks", "Fireworks AI — fast open-source inference"),
             ("together-ai", "Together AI — open-source model hosting"),
             ("nvidia", "NVIDIA NIM — DeepSeek, Llama, & more"),
         ],
-        2 => vec![
+    },
+    ProviderTier {
+        label: "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
+        providers: &[
             ("vercel", "Vercel AI Gateway"),
             ("cloudflare", "Cloudflare AI Gateway"),
             (
@@ -2355,7 +2357,10 @@ pub(crate) fn setup_provider(
             ),
             ("bedrock", "Amazon Bedrock — AWS managed models"),
         ],
-        3 => vec![
+    },
+    ProviderTier {
+        label: "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
+        providers: &[
             (
                 "kimi-code",
                 "Kimi Code — coding-optimized Kimi API (KimiCLI)",
@@ -2386,15 +2391,40 @@ pub(crate) fn setup_provider(
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
         ],
-        4 => vec![
+    },
+    ProviderTier {
+        label: "🏠 Local / private (Ollama, llama.cpp server — no API key needed)",
+        providers: &[
             ("ollama", "Ollama — local models (Llama, Mistral, Phi)"),
             (
                 "llamacpp",
                 "llama.cpp server — local OpenAI-compatible endpoint",
             ),
         ],
-        _ => vec![], // Custom — handled below
-    };
+    },
+    ProviderTier {
+        label: "🔧 Custom — bring your own OpenAI-compatible API",
+        providers: &[],
+    },
+];
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn setup_provider(
+    workspace_dir: &Path,
+) -> Result<(String, String, String, Option<String>)> {
+    // ── Tier selection ──
+    let tiers: Vec<&str> = PROVIDER_SETUP_TIERS.iter().map(|t| t.label).collect();
+
+    let tier_idx = Select::new()
+        .with_prompt("  Select provider category")
+        .items(&tiers)
+        .default(0)
+        .interact()?;
+
+    let providers: Vec<(&str, &str)> = PROVIDER_SETUP_TIERS
+        .get(tier_idx)
+        .map(|t| t.providers.to_vec())
+        .unwrap_or_default();
 
     // ── Custom / BYOP flow ──
     if providers.is_empty() {
@@ -5598,6 +5628,62 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    // ── Provider setup catalog (shared CLI wizard + TUI provisioner) ──
+
+    #[test]
+    fn provider_setup_tiers_have_no_duplicate_ids() {
+        let mut seen = std::collections::HashSet::new();
+        for tier in PROVIDER_SETUP_TIERS {
+            for (id, _) in tier.providers {
+                assert!(
+                    seen.insert(*id),
+                    "duplicate provider id in setup tiers: {id}"
+                );
+            }
+        }
+    }
+
+    /// Regression pin for the 2026-08-17 drift: the TUI copy of this table
+    /// was missing these 11 ids. Now both surfaces read one table; this
+    /// asserts the table itself never silently loses them again.
+    #[test]
+    fn provider_setup_tiers_offer_the_once_missing_providers() {
+        let all: Vec<&str> = PROVIDER_SETUP_TIERS
+            .iter()
+            .flat_map(|t| t.providers.iter().map(|(id, _)| *id))
+            .collect();
+        for id in [
+            "openai-codex",
+            "astrai",
+            "kimi-code",
+            "qwen-code",
+            "glm-cn",
+            "minimax-cn",
+            "qwen-intl",
+            "qwen-us",
+            "zai-cn",
+            "synthetic",
+            "opencode",
+        ] {
+            assert!(all.contains(&id), "provider {id} missing from setup tiers");
+        }
+    }
+
+    /// Both drivers treat an empty provider list as "run the custom flow".
+    /// Exactly one tier — the last — may be that sentinel.
+    #[test]
+    fn only_the_last_tier_is_the_custom_sentinel() {
+        let (last, rest) = PROVIDER_SETUP_TIERS.split_last().expect("tiers non-empty");
+        assert!(last.providers.is_empty(), "last tier must be Custom");
+        for tier in rest {
+            assert!(
+                !tier.providers.is_empty(),
+                "non-last tier {} is empty",
+                tier.label
+            );
+        }
+    }
 
     // ── ProjectContext defaults ──────────────────────────────────
 
