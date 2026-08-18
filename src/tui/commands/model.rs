@@ -54,6 +54,22 @@ fn model_entries_for_provider(
         .collect()
 }
 
+/// Split a `/model` target into `(provider, model)`.
+///
+/// Picker keys are always `provider:model` (`ModelEntry::target()`), but
+/// model ids may themselves contain `:` (ollama `llama3:8b`), so only the
+/// first segment is the provider. A bare string with no `:` (or an empty
+/// first segment) names a model only — the caller keeps the current
+/// provider.
+pub(crate) fn split_model_target(target: &str) -> (Option<&str>, &str) {
+    match target.split_once(':') {
+        Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+            (Some(provider), model)
+        }
+        _ => (None, target),
+    }
+}
+
 /// /model command — display, change, or interactively pick the active model.
 pub struct ModelCommand;
 
@@ -73,13 +89,7 @@ impl CommandHandler for ModelCommand {
     fn execute(&self, args: &str, ctx: &mut TuiContext) -> Result<CommandResult> {
         let model = args.trim();
         if !model.is_empty() {
-            ctx.model = model.to_string();
-            // The previous `last_error` (e.g. "model unavailable")
-            // may have been caused by the model we are leaving. Clear
-            // it on explicit user-driven model change; the next failed
-            // turn will set a fresh error if the new model also fails.
-            ctx.last_error = None;
-            return Ok(CommandResult::Message(format!("Model set to: {model}")));
+            return Ok(CommandResult::SetModel(model.to_string()));
         }
 
         // No args → open the interactive picker, restricted to providers
@@ -177,13 +187,43 @@ mod tests {
 
         let result = cmd.execute("openai:gpt-4o", &mut ctx).unwrap();
 
-        assert_eq!(ctx.model, "openai:gpt-4o");
+        // The handler no longer mutates the label itself: it hands the app a
+        // `SetModel` so the switch also persists the config and reloads the
+        // agent (`TuiApp::apply_model_selection`). Before that, `/model` set
+        // `ctx.model` and nothing else — the label changed, the agent didn't.
         match result {
-            CommandResult::Message(msg) => {
-                assert!(msg.contains("openai:gpt-4o"));
+            CommandResult::SetModel(target) => {
+                assert_eq!(target, "openai:gpt-4o");
             }
-            _ => panic!("Expected Message result"),
+            other => panic!("expected SetModel result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn split_target_with_provider() {
+        assert_eq!(
+            split_model_target("openrouter:meta/llama-4-scout"),
+            (Some("openrouter"), "meta/llama-4-scout")
+        );
+    }
+
+    #[test]
+    fn split_target_keeps_colons_inside_the_model_id() {
+        assert_eq!(
+            split_model_target("ollama:llama3:8b"),
+            (Some("ollama"), "llama3:8b")
+        );
+    }
+
+    #[test]
+    fn split_target_bare_model_names_no_provider() {
+        assert_eq!(split_model_target("gpt-5.3"), (None, "gpt-5.3"));
+    }
+
+    #[test]
+    fn split_target_degenerate_colon_forms_are_model_only() {
+        assert_eq!(split_model_target(":x"), (None, ":x"));
+        assert_eq!(split_model_target("x:"), (None, "x:"));
     }
 
     #[test]

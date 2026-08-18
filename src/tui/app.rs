@@ -2383,6 +2383,53 @@ impl TuiApp {
         self.channel_supervisor = Some(ChannelSupervisor { shutdown, handle });
     }
 
+    /// Apply a user-driven model switch from `/model` (arg or picker).
+    ///
+    /// Until v0.22.1-alpha this was label-only: `context.model` changed,
+    /// the agent kept its launch-time model (`Agent::from_config`), and
+    /// the config on disk never learned about the switch. Persist first,
+    /// then reload — the same ordering the wizard save path uses, so a
+    /// crash between the two leaves disk authoritative.
+    ///
+    /// Known double-fire, accepted: the save trips the config watcher, whose
+    /// debounced tick runs `reload_config` and pushes a second `Reload` with
+    /// the same config. One redundant agent rebuild per manual switch — a
+    /// human-frequency event, not worth another memo flag to suppress.
+    fn apply_model_selection(&mut self, target: &str) {
+        self.context.model = target.to_string();
+        // The previous `last_error` (e.g. "model unavailable") may have
+        // been caused by the model we are leaving.
+        self.context.last_error = None;
+        let msg = format!("Model set to: {target}");
+        let _ = self.context.append_system_message(&msg);
+        self.scrollback_queue.push(("system".to_string(), msg));
+
+        let (provider, model) = super::commands::split_model_target(target);
+        if let Some(provider) = provider {
+            self.config.default_provider = Some(provider.to_string());
+        }
+        self.config.default_model = Some(model.to_string());
+
+        // `self.config` is the decrypted in-memory config (the same one the
+        // provisioner save path clones), so the `Reload` hands the agent
+        // usable credentials — the invariant `reload_config`'s decrypt pass
+        // exists to protect. `save()` takes `&self` and encrypts into a
+        // clone, so it does not disturb that.
+        let config = self.config.clone();
+        let req_tx = self.context.req_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = config.save().await {
+                // The in-session switch below still applies; only the
+                // on-disk copy is stale. Next successful save (wizard,
+                // /setup) heals it.
+                tracing::warn!("failed to persist model change: {e:#}");
+            }
+            let _ = req_tx
+                .send(crate::tui::TurnRequest::Reload(Box::new(config)))
+                .await;
+        });
+    }
+
     fn reload_config(&mut self) -> anyhow::Result<()> {
         let path = self.profile.config_toml();
         let contents = std::fs::read_to_string(&path)
@@ -2445,6 +2492,21 @@ impl TuiApp {
                 &mut agent.api_key,
                 "config.agents.*.api_key",
             )?;
+        }
+        // Per-provider keys are encrypted at rest like `api_key`. This pass
+        // was missing while `Config::load_or_init` had it (schema.rs), so any
+        // watcher/Esc-close reload rebuilt the agent with `enc2:` blobs in
+        // `provider_api_keys` and every call answered 401 — surfaced by the
+        // `/model` live drive, whose save now triggers this reload each
+        // switch. Mirrors load_or_init's loop exactly.
+        for key in config.provider_api_keys.values_mut() {
+            let mut wrapped = Some(std::mem::take(key));
+            crate::config::schema::decrypt_optional_secret(
+                &store,
+                &mut wrapped,
+                "config.provider_api_keys.*",
+            )?;
+            *key = wrapped.unwrap_or_default();
         }
         // Knowledge Base keys are encrypted at rest like `api_key`; decrypt
         // them here too so a wizard/`/setup knowledge` run leaves the running
@@ -3046,6 +3108,9 @@ impl TuiApp {
             CmdResult::Resubmit(text) => {
                 self.dispatch_resubmit(text).await;
             }
+            CmdResult::SetModel(target) => {
+                self.apply_model_selection(&target);
+            }
             CmdResult::OpenListPicker(picker) => {
                 self.list_picker = Some(picker);
             }
@@ -3181,14 +3246,7 @@ impl TuiApp {
 
         match kind {
             ListPickerKind::Model => {
-                self.context.model = key.clone();
-                // See `commands/model.rs::execute` for the rationale —
-                // an explicit model switch supersedes any model-related
-                // last_error from the previous selection.
-                self.context.last_error = None;
-                let msg = format!("Model set to: {key}");
-                let _ = self.context.append_system_message(&msg);
-                self.scrollback_queue.push(("system".to_string(), msg));
+                self.apply_model_selection(&key);
             }
             ListPickerKind::Session => {
                 let session = match self.context.session_store.get_session(&key) {
@@ -8854,14 +8912,16 @@ mod tests {
     use crate::sessions::SessionStore;
     use crate::tui::context::TuiContext;
 
-    fn make_app_from_store(store: SessionStore, model: &str) -> TuiApp {
-        // Tests that hit this helper do not exercise the bridge; the request
-        // receiver and events sender are held locally so the TUI-side ends
-        // stay valid for the duration of the test.
-        let (req_tx, _req_rx) = tokio::sync::mpsc::channel(4);
+    /// Like `make_app_from_store`, but hands back the bridge's request
+    /// receiver so a test can observe what the app sends to the agent.
+    fn make_app_with_bridge_from_store(
+        store: SessionStore,
+        model: &str,
+    ) -> (TuiApp, tokio::sync::mpsc::Receiver<TurnRequest>) {
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
         let (_events_tx, events_rx) = tokio::sync::mpsc::channel(32);
         let ctx = TuiContext::new(store, model, None, req_tx, events_rx).expect("context");
-        TuiApp {
+        let app = TuiApp {
             state: AppState::Ready,
             context: ctx,
             command_registry: CommandRegistry::new(),
@@ -8910,7 +8970,80 @@ mod tests {
             shell_blocks_this_turn: 0,
             autonomy_hint_shown_this_turn: false,
             pending_approval: None,
-        }
+        };
+        (app, req_rx)
+    }
+
+    fn make_app_from_store(store: SessionStore, model: &str) -> TuiApp {
+        // Tests that hit this helper do not exercise the bridge; the request
+        // receiver is dropped with the returned tuple's tail, and the events
+        // sender is held inside the helper for the duration of the test.
+        make_app_with_bridge_from_store(store, model).0
+    }
+
+    // ── `/model` switches the agent, not just the label ──────────
+    //
+    // `/model` reported "Model set to: X" while `context.model` was the only
+    // thing that changed: the agent kept its launch-time provider/model and
+    // every subsequent turn silently ran on the old one.
+
+    #[tokio::test]
+    async fn model_selection_persists_config_and_reloads_the_agent() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "anthropic:old-model",
+        );
+        app.config.config_path = tmp.path().join("config.toml");
+        app.config.workspace_dir = tmp.path().to_path_buf();
+
+        app.apply_model_selection("openrouter:meta/llama-4-scout");
+
+        // Label updated synchronously.
+        assert_eq!(app.context.model, "openrouter:meta/llama-4-scout");
+
+        // The reload carries the new pair. Save happens before the send in
+        // the same task, so once this arrives the file must exist too.
+        let req = tokio::time::timeout(std::time::Duration::from_secs(5), req_rx.recv())
+            .await
+            .expect("reload sent within 5s")
+            .expect("bridge channel open");
+        let TurnRequest::Reload(config) = req else {
+            panic!("expected TurnRequest::Reload");
+        };
+        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+        assert_eq!(config.default_model.as_deref(), Some("meta/llama-4-scout"));
+
+        let raw = std::fs::read_to_string(tmp.path().join("config.toml"))
+            .expect("config persisted to disk");
+        assert!(
+            raw.contains("meta/llama-4-scout"),
+            "saved config names the new model"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_model_switch_keeps_the_current_provider() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let (mut app, mut req_rx) = make_app_with_bridge_from_store(
+            SessionStore::in_memory().expect("store"),
+            "anthropic:old-model",
+        );
+        app.config.config_path = tmp.path().join("config.toml");
+        app.config.workspace_dir = tmp.path().to_path_buf();
+        app.config.default_provider = Some("anthropic".to_string());
+
+        app.apply_model_selection("claude-opus-5");
+
+        let req = tokio::time::timeout(std::time::Duration::from_secs(5), req_rx.recv())
+            .await
+            .expect("reload sent within 5s")
+            .expect("bridge channel open");
+        let TurnRequest::Reload(config) = req else {
+            panic!("expected TurnRequest::Reload");
+        };
+        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.default_model.as_deref(), Some("claude-opus-5"));
     }
 
     #[test]

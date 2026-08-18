@@ -21,6 +21,8 @@ use std::collections::HashMap;
 
 use super::context::TuiContext;
 
+pub(crate) use model::split_model_target;
+
 /// Canonical skill-name key for command matching: lowercase, and treat `-`
 /// and `_` as equivalent. Used by `/skill <name>`, `/skills <name>`
 /// preselect, and the `/<skill>` direct-invoke fallback so all three accept
@@ -129,6 +131,12 @@ pub enum CommandResult {
     /// `/<skill-name>` direct-invoke fallback to pre-fill a "Use the
     /// <skill> skill: " prompt.
     SetInput(String),
+    /// Switch the active model: update the label, persist
+    /// `default_provider`/`default_model`, and rebuild the agent via
+    /// `TurnRequest::Reload`. Carried as a result rather than done in the
+    /// handler because the config and the agent bridge live on `TuiApp`,
+    /// not on `TuiContext`.
+    SetModel(String),
 }
 
 /// Pre-rendered content for the modal help overlay. Multiple "tabs" can

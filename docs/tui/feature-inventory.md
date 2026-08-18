@@ -108,7 +108,7 @@ All commands are dispatched by `src/tui/commands/mod.rs::CommandRegistry`. **Non
 
 | Command       | Aliases    | Description                                                | Output                         | Args |
 | ------------- | ---------- | ---------------------------------------------------------- | ------------------------------ | ---- |
-| `/model`      |            | Pick or change the active model.                           | **interactive picker** (no args) / scrollback msg (with args) | `[provider:model]` |
+| `/model`      |            | Pick or change the active model. Persists `default_provider`/`default_model` to config and hot-reloads the running agent — the next turn uses the new model. | **interactive picker** (no args) / scrollback msg (with args) | `[provider:model]` |
 | `/usage`      |            | Show token usage statistics.                               | scrollback                     | none |
 
 ### Other
