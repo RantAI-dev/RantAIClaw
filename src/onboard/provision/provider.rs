@@ -66,14 +66,14 @@ impl TuiProvisioner for ProviderProvisioner {
         .await?;
 
         // ── Tier selection ─────────────────────────────────────────
-        let tiers = vec![
-            "Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)".to_string(),
-            "Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)".to_string(),
-            "Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)".to_string(),
-            "Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Cohere)".to_string(),
-            "Local / private (Ollama, llama.cpp server — no API key needed)".to_string(),
-            "Custom — bring your own OpenAI-compatible API".to_string(),
-        ];
+        // One table shared with the CLI wizard. This used to be a
+        // hand-copy that drifted 11 providers behind (openai-codex,
+        // astrai, kimi-code, qwen-code, glm-cn, minimax-cn, qwen-intl,
+        // qwen-us, zai-cn, synthetic, opencode).
+        let tiers: Vec<String> = crate::onboard::wizard::PROVIDER_SETUP_TIERS
+            .iter()
+            .map(|t| t.label.to_string())
+            .collect();
 
         send(
             &events,
@@ -99,45 +99,10 @@ impl TuiProvisioner for ProviderProvisioner {
         let tier_idx = tier_sel.first().copied().unwrap_or(0);
 
         // ── Provider selection ─────────────────────────────────────
-        let providers: Vec<(&str, &str)> = match tier_idx {
-            0 => vec![
-                ("openrouter", "OpenRouter — 200+ models, 1 API key"),
-                ("venice", "Venice AI — privacy-first"),
-                ("anthropic", "Anthropic — Claude direct"),
-                ("openai", "OpenAI — GPT and Codex models"),
-                ("deepseek", "DeepSeek — chat & reasoning models"),
-                ("mistral", "Mistral — general & code models"),
-                ("xai", "xAI — Grok models"),
-                ("perplexity", "Perplexity — search-augmented AI"),
-                ("gemini", "Google Gemini — Pro & Flash tiers"),
-            ],
-            1 => vec![
-                ("groq", "Groq — ultra-fast LPU inference"),
-                ("fireworks", "Fireworks AI — fast open-source"),
-                ("together-ai", "Together AI — open-source hosting"),
-                ("nvidia", "NVIDIA NIM — Llama, Nemotron, & more"),
-            ],
-            2 => vec![
-                ("vercel", "Vercel AI Gateway"),
-                ("cloudflare", "Cloudflare AI Gateway"),
-                ("bedrock", "Amazon Bedrock — AWS managed models"),
-            ],
-            3 => vec![
-                ("moonshot", "Moonshot — Kimi API (China)"),
-                ("moonshot-intl", "Moonshot — Kimi API (international)"),
-                ("glm", "GLM — ChatGLM / Zhipu"),
-                ("minimax", "MiniMax — international"),
-                ("qwen", "Qwen — DashScope"),
-                ("qianfan", "Qianfan — Baidu AI"),
-                ("zai", "Z.AI — coding endpoint"),
-                ("cohere", "Cohere — Command models"),
-            ],
-            4 => vec![
-                ("ollama", "Ollama — local models"),
-                ("llamacpp", "llama.cpp server — local OpenAI-compatible"),
-            ],
-            _ => vec![],
-        };
+        let providers: Vec<(&str, &str)> = crate::onboard::wizard::PROVIDER_SETUP_TIERS
+            .get(tier_idx)
+            .map(|t| t.providers.to_vec())
+            .unwrap_or_default();
 
         if providers.is_empty() {
             // Custom provider
@@ -646,11 +611,17 @@ mod tests {
         }
     }
 
-    // Tier 0 picker indices (see the `providers` table in `run`):
-    // 0 = openrouter, 3 = openai.
+    // Tier 0 picker index, and provider rows derived from the shared table —
+    // a hardcoded row index silently repoints these tests at a different
+    // provider whenever the table gains or reorders an entry.
     const PICK_TIER_RECOMMENDED: usize = 0;
-    const PICK_OPENROUTER: usize = 0;
-    const PICK_OPENAI: usize = 3;
+    fn pick_provider(id: &str) -> usize {
+        crate::onboard::wizard::PROVIDER_SETUP_TIERS[PICK_TIER_RECOMMENDED]
+            .providers
+            .iter()
+            .position(|(pid, _)| *pid == id)
+            .unwrap_or_else(|| panic!("{id} missing from tier 0 of the shared table"))
+    }
 
     /// The lockout producer. An empty key for a provider that cannot
     /// construct without one (`openai` routes through rig, which fails at
@@ -672,7 +643,7 @@ mod tests {
             &profile,
             vec![
                 Answer::Pick(PICK_TIER_RECOMMENDED),
-                Answer::Pick(PICK_OPENAI),
+                Answer::Pick(pick_provider("openai")),
                 Answer::Text(""),
                 Answer::Pick(1), // Abort setup
             ],
@@ -715,7 +686,7 @@ mod tests {
             &profile,
             vec![
                 Answer::Pick(PICK_TIER_RECOMMENDED),
-                Answer::Pick(PICK_OPENAI),
+                Answer::Pick(pick_provider("openai")),
                 Answer::Text(""),
                 Answer::Pick(0), // Re-enter the API key
                 Answer::Text(""),
@@ -744,7 +715,7 @@ mod tests {
             &profile,
             vec![
                 Answer::Pick(PICK_TIER_RECOMMENDED),
-                Answer::Pick(PICK_OPENROUTER),
+                Answer::Pick(pick_provider("openrouter")),
                 Answer::Text(""),
                 Answer::Pick(0), // default model
             ],
@@ -778,7 +749,7 @@ mod tests {
             &profile,
             vec![
                 Answer::Pick(PICK_TIER_RECOMMENDED),
-                Answer::Pick(PICK_OPENAI),
+                Answer::Pick(pick_provider("openai")),
                 Answer::Text(""),
                 Answer::Pick(0), // default model
             ],
