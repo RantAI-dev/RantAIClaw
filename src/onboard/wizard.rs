@@ -56,7 +56,7 @@ const BANNER: &str = r"
     ⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡
 ";
 
-const LIVE_MODEL_MAX_OPTIONS: usize = 120;
+pub(crate) const LIVE_MODEL_MAX_OPTIONS: usize = 120;
 const MODEL_PREVIEW_LIMIT: usize = 20;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
@@ -811,7 +811,7 @@ fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
 /// for the same provider — `default_model_is_offered_by_its_own_provider`
 /// asserts it. Setup writes this value as `default_model`, so a default the
 /// picker never offers is one the operator cannot re-select after changing it.
-fn default_model_for_provider(provider: &str) -> String {
+pub(crate) fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-6".into(),
         "openai" => "gpt-5.5".into(),
