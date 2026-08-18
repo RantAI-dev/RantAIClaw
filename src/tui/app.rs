@@ -2452,76 +2452,20 @@ impl TuiApp {
         // Decrypt secrets before pushing to the agent. Without this the
         // agent receives encrypted blobs in `config.api_key` and friends
         // and every API call returns 401 "Missing Authentication header"
-        // because the request builder rejects the malformed header. This
-        // mirrors the decrypt pass that `Config::load_or_init` runs at
-        // startup; without it, `/setup provider` saves a fresh key and
-        // the running TUI immediately fails to use it.
+        // because the request builder rejects the malformed header.
+        //
+        // One shared pass with `Config::load_or_init` — this used to be a
+        // hand-copy of that list, and the copies drifted twice (KB keys,
+        // then `provider_api_keys`, which 401'd every provider call after
+        // a config-watcher reload until #565). The shared function also
+        // closes the two gaps the copy still had: the Telegram bot token
+        // (handed to `restart_channels` below) and skill literal keys.
         let rantaiclaw_dir = path
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let store = crate::security::SecretStore::new(&rantaiclaw_dir, config.secrets.encrypt);
-        crate::config::schema::decrypt_optional_secret(
-            &store,
-            &mut config.api_key,
-            "config.api_key",
-        )?;
-        crate::config::schema::decrypt_optional_secret(
-            &store,
-            &mut config.composio.api_key,
-            "config.composio.api_key",
-        )?;
-        crate::config::schema::decrypt_optional_secret(
-            &store,
-            &mut config.browser.computer_use.api_key,
-            "config.browser.computer_use.api_key",
-        )?;
-        crate::config::schema::decrypt_optional_secret(
-            &store,
-            &mut config.web_search.brave_api_key,
-            "config.web_search.brave_api_key",
-        )?;
-        crate::config::schema::decrypt_optional_secret(
-            &store,
-            &mut config.storage.provider.config.db_url,
-            "config.storage.provider.config.db_url",
-        )?;
-        for agent in config.agents.values_mut() {
-            crate::config::schema::decrypt_optional_secret(
-                &store,
-                &mut agent.api_key,
-                "config.agents.*.api_key",
-            )?;
-        }
-        // Per-provider keys are encrypted at rest like `api_key`. This pass
-        // was missing while `Config::load_or_init` had it (schema.rs), so any
-        // watcher/Esc-close reload rebuilt the agent with `enc2:` blobs in
-        // `provider_api_keys` and every call answered 401 — surfaced by the
-        // `/model` live drive, whose save now triggers this reload each
-        // switch. Mirrors load_or_init's loop exactly.
-        for key in config.provider_api_keys.values_mut() {
-            let mut wrapped = Some(std::mem::take(key));
-            crate::config::schema::decrypt_optional_secret(
-                &store,
-                &mut wrapped,
-                "config.provider_api_keys.*",
-            )?;
-            *key = wrapped.unwrap_or_default();
-        }
-        // Knowledge Base keys are encrypted at rest like `api_key`; decrypt
-        // them here too so a wizard/`/setup knowledge` run leaves the running
-        // agent with usable KB credentials instead of a raw `enc2:` blob
-        // (mirrors the decrypt pass in `Config::load_or_init`).
-        crate::config::schema::decrypt_optional_secret(
-            &store,
-            &mut config.knowledge.embedding_api_key,
-            "config.knowledge.embedding_api_key",
-        )?;
-        crate::config::schema::decrypt_optional_secret(
-            &store,
-            &mut config.knowledge.vision_api_key,
-            "config.knowledge.vision_api_key",
-        )?;
+        crate::config::schema::decrypt_config_secrets(&store, &mut config)?;
         config.apply_env_overrides();
         // Refresh the status-bar model label so the running TUI shows
         // the freshly-saved provider/model. Without this, a wizard run
