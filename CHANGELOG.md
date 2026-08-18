@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1-alpha] — 2026-08-18
+
+A single-hardening patch. No config schema change — this release carries no
+migration and rolls back freely to v0.22.0-alpha.
+
+### Added
+
+- **Memory: the `memory_recall` tool follows the active conversation on
+  interactive surfaces.** With a conversation set (TUI session, console API),
+  the explicit recall tool reads through the layered path — the
+  conversation's own rows first, the shared unscoped tier as backfill, other
+  conversations' rows filtered — matching the scope the injection path
+  already uses. Surfaces that serve many conversations through one registry
+  (channels, the gateway webhook) deliberately keep the global read: a
+  shared scope would race across concurrent turns, and guests cannot invoke
+  the tool unless an operator widens `guest_allowed_tools`. (#562)
+
 ## [0.22.0-alpha] — 2026-08-17
 
 No config schema change — this release carries no migration and rolls back
