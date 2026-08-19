@@ -723,6 +723,7 @@ mod tests {
             last_run: None,
             last_status: None,
             last_output: None,
+            created_by: None,
         }
     }
 
@@ -1191,6 +1192,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -1216,6 +1218,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -1280,6 +1283,7 @@ mod tests {
             Some("one-shot-shell".into()),
             crate::cron::Schedule::At { at },
             "echo hi",
+            None,
         )
         .unwrap();
         assert!(
@@ -1326,6 +1330,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         let started = Utc::now();

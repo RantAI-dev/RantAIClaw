@@ -24,7 +24,7 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
         expr: expression.to_string(),
         tz: None,
     };
-    add_shell_job(config, None, schedule, command)
+    add_shell_job(config, None, schedule, command, None)
 }
 
 pub fn add_shell_job(
@@ -32,6 +32,7 @@ pub fn add_shell_job(
     name: Option<String>,
     schedule: Schedule,
     command: &str,
+    created_by: Option<&str>,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -44,8 +45,8 @@ pub fn add_shell_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, 0, ?7, ?8)",
+                enabled, delivery, delete_after_run, created_at, next_run, created_by
+             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, 0, ?7, ?8, ?9)",
             params![
                 id,
                 expression,
@@ -55,6 +56,7 @@ pub fn add_shell_job(
                 serde_json::to_string(&DeliveryConfig::default())?,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                created_by,
             ],
         )
         .context("Failed to insert cron shell job")?;
@@ -74,6 +76,7 @@ pub fn add_agent_job(
     model: Option<String>,
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
+    created_by: Option<&str>,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -87,8 +90,8 @@ pub fn add_agent_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11)",
+                enabled, delivery, delete_after_run, created_at, next_run, created_by
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id,
                 expression,
@@ -101,6 +104,7 @@ pub fn add_agent_job(
                 if delete_after_run { 1 } else { 0 },
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
+                created_by,
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -114,7 +118,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -132,7 +136,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -165,7 +169,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC
@@ -196,7 +200,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         let mut job = {
             let mut stmt = tx.prepare(
                 "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                        enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                        enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, created_by, created_by
                  FROM cron_jobs WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![job_id])?;
@@ -502,6 +506,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         },
         last_status: row.get(15)?,
         last_output: row.get(16)?,
+        created_by: row.get(17)?,
     })
 }
 
@@ -594,7 +599,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             next_run         TEXT NOT NULL,
             last_run         TEXT,
             last_status      TEXT,
-            last_output      TEXT
+            last_output      TEXT,
+            created_by       TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
 
@@ -623,6 +629,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
     add_column_if_missing(&conn, "delivery", "TEXT")?;
     add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(&conn, "created_by", "TEXT")?;
 
     f(&conn)
 }
@@ -667,6 +674,44 @@ mod tests {
 
         remove_job(&config, &job.id).unwrap();
         assert!(list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn created_by_round_trips_and_defaults_none() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo hi",
+            Some("cli"),
+        )
+        .unwrap();
+        assert_eq!(job.created_by.as_deref(), Some("cli"));
+        // Survives the round-trip through get_job's row mapper.
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().created_by.as_deref(),
+            Some("cli")
+        );
+
+        // A job created without an origin loads as None (legacy rows are NULL).
+        let anon = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo anon",
+            None,
+        )
+        .unwrap();
+        assert_eq!(anon.created_by, None);
     }
 
     #[test]

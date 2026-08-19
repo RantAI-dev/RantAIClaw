@@ -142,9 +142,10 @@ fn add_text(config: &Config, args: &[&str]) -> String {
             model,
             None,
             false,
+            Some("tui"),
         )
     } else {
-        cron::add_shell_job(config, None, schedule, &payload)
+        cron::add_shell_job(config, None, schedule, &payload, Some("tui"))
     };
     match result {
         Ok(job) => format!(
