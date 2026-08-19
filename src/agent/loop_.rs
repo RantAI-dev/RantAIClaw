@@ -2017,6 +2017,7 @@ pub async fn run(
     model_override: Option<String>,
     temperature: f64,
     peripheral_overrides: Vec<String>,
+    surface: &str,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -2332,8 +2333,8 @@ pub async fn run(
             temperature,
             false,
             Some(&approval_manager),
-            "cli",
-            None, // CLI — no origin chat
+            surface,
+            None, // no origin chat on the CLI/scheduler surface
             None,
             None,
             &config.multimodal,

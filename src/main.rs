@@ -1843,9 +1843,17 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        }) => agent::run(config, message, provider, model, temperature, peripheral)
-            .await
-            .map(|_| ()),
+        }) => agent::run(
+            config,
+            message,
+            provider,
+            model,
+            temperature,
+            peripheral,
+            "cli",
+        )
+        .await
+        .map(|_| ()),
 
         Some(Commands::Gateway { port, host }) => {
             let port = port.unwrap_or(config.gateway.port);
@@ -2207,6 +2215,7 @@ async fn main() -> Result<()> {
                         model_override,
                         config.default_temperature,
                         Vec::new(),
+                        "cli",
                     )
                     .await?;
                     if !response.is_empty() {
