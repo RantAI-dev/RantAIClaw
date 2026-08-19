@@ -74,6 +74,13 @@ pub async fn run(config: Config) -> Result<()> {
     // (a bare tokio::spawn would detach them and leak across shutdown).
     let mut batches: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
+    // The tick works against `working`, refreshed from disk each cycle so an
+    // operator editing scheduler/cron/channel config (or rotating a delivery
+    // token) reaches scheduled jobs without a daemon restart — the same reload
+    // that already keeps `security` (autonomy) current. Only the poll interval
+    // stays fixed at its boot value.
+    let mut working = config;
+
     loop {
         interval.tick().await;
         // Keep scheduler liveness fresh even when there are no due jobs, and even
@@ -95,17 +102,20 @@ pub async fn run(config: Config) -> Result<()> {
         // exactly the surface where nobody is watching. Cost is one config read
         // per interval, floored at MIN_POLL_SECONDS.
         match Config::load_or_init().await {
-            Ok(cfg) => security.apply_config(&cfg.autonomy),
-            // Keep the previous fields. Never fall back to a permissive default
+            Ok(cfg) => {
+                security.apply_config(&cfg.autonomy);
+                working = cfg;
+            }
+            // Keep the previous config. Never fall back to a permissive default
             // because a config read failed.
             Err(e) => tracing::warn!(
                 target: "scheduler",
                 error = %e,
-                "config reload failed; keeping the previously applied autonomy settings"
+                "config reload failed; keeping the previously applied config for this tick"
             ),
         }
 
-        let jobs = match due_jobs(&config, Utc::now()) {
+        let jobs = match due_jobs(&working, Utc::now()) {
             Ok(jobs) => jobs,
             Err(e) => {
                 crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
@@ -120,8 +130,10 @@ pub async fn run(config: Config) -> Result<()> {
 
         // Spawn the batch so a slow/hung job can never stall the poll cadence.
         // The process-wide in-flight registry still prevents a job from a
-        // still-running earlier batch from being run again.
-        let config = config.clone();
+        // still-running earlier batch from being run again. The batch carries the
+        // freshly reloaded `working` config, so scheduler/cron/channel edits reach
+        // this cycle's jobs.
+        let config = working.clone();
         let security = Arc::clone(&security);
         batches.spawn(async move {
             process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
