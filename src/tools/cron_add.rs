@@ -239,6 +239,14 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     return Ok(blocked);
                 }
 
+                // Provenance audit trail. Never log the raw prompt — it may carry
+                // injected content or secrets; record its length only.
+                tracing::info!(
+                    prompt_len = prompt.len(),
+                    has_delivery = delivery.is_some(),
+                    "cron_add: creating a scheduled agent job"
+                );
+
                 cron::add_agent_job(
                     &self.config,
                     name,

@@ -1093,6 +1093,41 @@ fn maybe_inject_channel_delivery(
     })
 }
 
+/// For a GUEST turn, reject a `cron_add` whose explicit `delivery.to` is not the
+/// caller's own conversation (`reply_target` on the same channel). A guest must
+/// not install a scheduled job that announces to a chat they do not own — that
+/// would turn one injected turn into a persistent exfiltration channel. Owner
+/// turns (no guest gate) may route cross-channel and never reach this check.
+/// Returns `Some(reason)` when the call must be denied.
+fn reject_foreign_cron_delivery(
+    call: &ParsedToolCall,
+    channel_name: &str,
+    reply_target: Option<&str>,
+) -> Option<String> {
+    if call.name != "cron_add" {
+        return None;
+    }
+    let delivery = call.arguments.get("delivery")?;
+    let mode = delivery.get("mode").and_then(serde_json::Value::as_str)?;
+    if mode == "none" {
+        return None;
+    }
+    let to = delivery.get("to").and_then(serde_json::Value::as_str);
+    let channel = delivery.get("channel").and_then(serde_json::Value::as_str);
+    // The only target a guest may deliver to is their own reply target on the
+    // channel they are speaking from.
+    if to == reply_target && channel == Some(channel_name) {
+        None
+    } else {
+        Some(
+            "cron_add: a scheduled job may only deliver to your own conversation. \
+             Remove the `delivery` target (it defaults to this chat), or ask an \
+             operator to configure cross-channel delivery."
+                .to_string(),
+        )
+    }
+}
+
 /// Execute a single parsed tool call and return a structured result. Emits
 /// paired Start/End events, records observer events, and races the tool against
 /// `cancel` (returning `ToolLoopCancelled` if it fires mid-execution). `success`
@@ -1268,6 +1303,38 @@ pub(crate) async fn execute_tool_calls_collecting(
                             id,
                             ok: false,
                             output_preview: "[denied: guest capability ceiling]".into(),
+                        })
+                        .await;
+                }
+                results.push(ToolExecutionResult {
+                    name: call.name.clone(),
+                    output: reason,
+                    success: false,
+                    tool_call_id: call.tool_call_id.clone(),
+                });
+                continue;
+            }
+
+            // A guest may only schedule delivery to their own conversation — a
+            // foreign delivery target on a cron_add is a persistent exfiltration
+            // vector, so deny it outright (owner turns skip this whole block).
+            if let Some(reason) =
+                reject_foreign_cron_delivery(call, channel_name, channel_reply_target)
+            {
+                if let Some(tx) = events {
+                    let id = Uuid::new_v4().to_string();
+                    let _ = tx
+                        .send(AgentEvent::ToolCallStart {
+                            id: id.clone(),
+                            name: call.name.clone(),
+                            args: call.arguments.clone(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(AgentEvent::ToolCallEnd {
+                            id,
+                            ok: false,
+                            output_preview: "[denied: foreign cron delivery target]".into(),
                         })
                         .await;
                 }
@@ -2760,6 +2827,53 @@ mod tests {
         assert_eq!(d["to"], "12345");
         // The rest of the call is untouched.
         assert_eq!(out.arguments["prompt"], "morning pep talk");
+    }
+
+    #[test]
+    fn reject_foreign_cron_delivery_allows_own_conversation() {
+        let call = cron_add_call(serde_json::json!({
+            "schedule": {"kind": "cron", "expr": "0 7 * * *"},
+            "job_type": "agent",
+            "prompt": "x",
+            "delivery": {"mode": "announce", "channel": "telegram", "to": "12345"}
+        }));
+        assert!(reject_foreign_cron_delivery(&call, "telegram", Some("12345")).is_none());
+    }
+
+    #[test]
+    fn reject_foreign_cron_delivery_rejects_a_foreign_target() {
+        // Different chat id than the caller's reply target → denied.
+        let other_chat = cron_add_call(serde_json::json!({
+            "schedule": {"kind": "cron", "expr": "0 7 * * *"},
+            "job_type": "agent",
+            "prompt": "x",
+            "delivery": {"mode": "announce", "channel": "telegram", "to": "99999"}
+        }));
+        assert!(reject_foreign_cron_delivery(&other_chat, "telegram", Some("12345")).is_some());
+        // Different channel than the caller's → also denied.
+        let other_channel = cron_add_call(serde_json::json!({
+            "schedule": {"kind": "cron", "expr": "0 7 * * *"},
+            "job_type": "agent",
+            "prompt": "x",
+            "delivery": {"mode": "announce", "channel": "slack", "to": "12345"}
+        }));
+        assert!(reject_foreign_cron_delivery(&other_channel, "telegram", Some("12345")).is_some());
+    }
+
+    #[test]
+    fn reject_foreign_cron_delivery_ignores_bare_and_non_cron() {
+        // No explicit delivery (the injector supplies the safe default) → nothing
+        // to reject.
+        let bare =
+            cron_add_call(serde_json::json!({"schedule": {"kind": "cron", "expr": "0 7 * * *"}}));
+        assert!(reject_foreign_cron_delivery(&bare, "telegram", Some("12345")).is_none());
+        // A different tool is not this gate's concern.
+        let other = ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        };
+        assert!(reject_foreign_cron_delivery(&other, "telegram", Some("12345")).is_none());
     }
 
     #[test]
