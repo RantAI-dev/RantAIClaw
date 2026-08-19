@@ -148,6 +148,9 @@ pub struct CronRun {
     pub status: String,
     pub output: Option<String>,
     pub duration_ms: Option<i64>,
+    /// 1-based retry attempt this row records. A job with no retries writes a
+    /// single row with `attempt = 1`; a retried job writes one row per attempt.
+    pub attempt: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

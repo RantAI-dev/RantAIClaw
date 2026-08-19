@@ -1,8 +1,8 @@
 use crate::channels::SendMessage;
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    due_jobs, next_run_for_schedule, record_last_run, remove_job, reschedule_after_run, update_job,
+    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -156,7 +156,7 @@ pub async fn execute_job_now(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
-) -> (bool, String) {
+) -> (bool, String, Vec<AttemptOutcome>) {
     execute_job_with_retry(config, security, job).await
 }
 
@@ -177,42 +177,43 @@ pub async fn run_job_manual(
     let Some(_guard) = InFlightGuard::claim(&job.id) else {
         return (false, format!("cron job '{}' is already running", job.id));
     };
-    let started_at = Utc::now();
-    let (success, output) = execute_job_now(config, security, job).await;
-    let finished_at = Utc::now();
-    let duration_ms = (finished_at - started_at).num_milliseconds();
-    let status = if success { "ok" } else { "error" };
-    if let Err(e) = record_run(
-        config,
-        &job.id,
-        started_at,
-        finished_at,
-        status,
-        Some(&output),
-        duration_ms,
-    ) {
-        if crate::cron::get_job(config, &job.id).is_err() {
-            tracing::warn!(job_id = %job.id, "cron job deleted while running; run history not recorded");
-        } else {
-            tracing::warn!(job_id = %job.id, error = %e, "failed to record cron run history");
-        }
+    let (success, output, attempts) = execute_job_now(config, security, job).await;
+    // Record each attempt as its own row (a manual run does not deliver).
+    for a in &attempts {
+        record_attempt(config, &job.id, a).await;
     }
+    let finished_at = attempts.last().map_or_else(Utc::now, |a| a.finished_at);
     if let Err(e) = record_last_run(config, &job.id, finished_at, success, &output) {
         tracing::warn!(job_id = %job.id, error = %e, "failed to record cron last-run fields");
     }
     (success, output)
 }
 
+/// One execution attempt of a cron job, with its own timing and outcome. The
+/// scheduler records each as a separate run-history row so a retried job shows
+/// the real `error, error, ok` sequence and each `duration_ms` reflects only
+/// that attempt's execution — not the backoff sleeps between attempts. `pub`
+/// because it appears in the return type of the `pub` `execute_job_now`.
+pub struct AttemptOutcome {
+    attempt: u32,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    success: bool,
+    output: String,
+}
+
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
-) -> (bool, String) {
+) -> (bool, String, Vec<AttemptOutcome>) {
+    let mut attempts = Vec::new();
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
+        let started_at = Utc::now();
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
             JobType::Agent => {
@@ -223,15 +224,23 @@ async fn execute_job_with_retry(
                 .await
             }
         };
+        let finished_at = Utc::now();
+        attempts.push(AttemptOutcome {
+            attempt: attempt + 1,
+            started_at,
+            finished_at,
+            success,
+            output: output.clone(),
+        });
         last_output = output;
 
         if success {
-            return (true, last_output);
+            return (true, last_output, attempts);
         }
 
         if last_output.starts_with("blocked by security policy:") {
             // Deterministic policy violations are not retryable.
-            return (false, last_output);
+            return (false, last_output, attempts);
         }
 
         if attempt < retries {
@@ -241,7 +250,7 @@ async fn execute_job_with_retry(
         }
     }
 
-    (false, last_output)
+    (false, last_output, attempts)
 }
 
 async fn process_due_jobs(
@@ -291,10 +300,8 @@ async fn execute_and_persist_job(
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
-    let started_at = Utc::now();
-    let (success, output) = execute_job_with_retry(config, security, job).await;
-    let finished_at = Utc::now();
-    let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
+    let (success, output, attempts) = execute_job_with_retry(config, security, job).await;
+    let success = persist_job_result(config, job, success, &output, &attempts).await;
 
     (job.id.clone(), success)
 }
@@ -362,49 +369,62 @@ async fn run_agent_job(
     }
 }
 
+/// Record one execution attempt as its own run-history row, off the async
+/// worker (rusqlite is blocking). A history-write failure is logged, never
+/// propagated — the job's outcome must not depend on it; a mid-run deletion of
+/// the parent job row is called out distinctly.
+async fn record_attempt(config: &Config, job_id: &str, a: &AttemptOutcome) {
+    let cfg = config.clone();
+    let jid = job_id.to_string();
+    let status = if a.success { "ok" } else { "error" };
+    let out = a.output.clone();
+    let (started, finished, attempt) = (a.started_at, a.finished_at, a.attempt);
+    let duration_ms = (finished - started).num_milliseconds();
+    match tokio::task::spawn_blocking(move || {
+        crate::cron::record_run_attempt(
+            &cfg,
+            &jid,
+            started,
+            finished,
+            status,
+            Some(&out),
+            duration_ms,
+            attempt,
+        )
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if crate::cron::get_job(config, job_id).is_err() {
+                tracing::warn!(job_id = %job_id, "cron job deleted while running; run history not recorded");
+            } else {
+                tracing::warn!(job_id = %job_id, error = %e, "failed to record cron run history");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(job_id = %job_id, error = %e, "failed to join cron record_run task");
+        }
+    }
+}
+
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
     success: bool,
     output: &str,
-    started_at: DateTime<Utc>,
-    finished_at: DateTime<Utc>,
+    attempts: &[AttemptOutcome],
 ) -> bool {
-    let duration_ms = (finished_at - started_at).num_milliseconds();
+    // The final attempt's finish time stamps last_run / reschedule below.
+    let finished_at = attempts.last().map_or_else(Utc::now, |a| a.finished_at);
 
-    // Record the EXECUTION outcome first. `last_status` / the `cron_runs` row
-    // describe whether the JOB ran — delivery is a separate concern and must
-    // never flip this (a chat hiccup is not a job failure).
-    {
-        let cfg = config.clone();
-        let job_id = job.id.clone();
-        let status = if success { "ok" } else { "error" };
-        let out = output.to_string();
-        match tokio::task::spawn_blocking(move || {
-            record_run(
-                &cfg,
-                &job_id,
-                started_at,
-                finished_at,
-                status,
-                Some(&out),
-                duration_ms,
-            )
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                if crate::cron::get_job(config, &job.id).is_err() {
-                    tracing::warn!(job_id = %job.id, "cron job deleted while running; run history not recorded");
-                } else {
-                    tracing::warn!(job_id = %job.id, error = %e, "failed to record cron run history");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(job_id = %job.id, error = %e, "failed to join cron record_run task");
-            }
-        }
+    // Record each EXECUTION attempt as its own run-history row — a retried job
+    // now shows the real error,error,ok sequence and each duration_ms excludes
+    // the backoff sleeps between attempts. `last_status` / the rows describe
+    // whether the JOB ran — delivery is a separate concern and must never flip
+    // this (a chat hiccup is not a job failure).
+    for a in attempts {
+        record_attempt(config, &job.id, a).await;
     }
 
     // Deliver only a job that actually succeeded and whose output is not a
@@ -819,6 +839,23 @@ mod tests {
         format!("{prefix}-{}", uuid::Uuid::new_v4())
     }
 
+    /// A single-attempt outcome slice for driving `persist_job_result` in tests
+    /// that don't exercise retries.
+    fn one_attempt(
+        started: DateTime<Utc>,
+        finished: DateTime<Utc>,
+        success: bool,
+        output: &str,
+    ) -> Vec<AttemptOutcome> {
+        vec![AttemptOutcome {
+            attempt: 1,
+            started_at: started,
+            finished_at: finished,
+            success,
+            output: output.to_string(),
+        }]
+    }
+
     #[tokio::test]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
@@ -1014,7 +1051,7 @@ mod tests {
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
+        let (success, output, _attempts) = execute_job_with_retry(&config, &security, &job).await;
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -1029,9 +1066,68 @@ mod tests {
 
         let job = test_job("ls always_missing_for_retry_test");
 
-        let (success, output) = execute_job_with_retry(&config, &security, &job).await;
+        let (success, output, _attempts) = execute_job_with_retry(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
+    }
+
+    #[tokio::test]
+    async fn retried_job_records_one_row_per_attempt() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.cron.max_run_history = 20; // keep both attempt rows
+        let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
+
+        // A fail-then-succeed execution: two attempts, ~300ms apart (the backoff),
+        // each running ~5ms. The rows must show the real sequence and per-attempt
+        // durations, not one clean row with the whole-window duration.
+        let t0 = Utc::now();
+        let attempts = vec![
+            AttemptOutcome {
+                attempt: 1,
+                started_at: t0,
+                finished_at: t0 + ChronoDuration::milliseconds(5),
+                success: false,
+                output: "boom".into(),
+            },
+            AttemptOutcome {
+                attempt: 2,
+                started_at: t0 + ChronoDuration::milliseconds(300),
+                finished_at: t0 + ChronoDuration::milliseconds(305),
+                success: true,
+                output: "ok".into(),
+            },
+        ];
+        let success = persist_job_result(&config, &job, true, "ok", &attempts).await;
+        assert!(success);
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 2, "each attempt is its own run-history row");
+        // Newest-first (started_at DESC): attempt 2 (ok) then attempt 1 (error).
+        assert_eq!(runs[0].attempt, 2);
+        assert_eq!(runs[0].status, "ok");
+        assert_eq!(runs[1].attempt, 1);
+        assert_eq!(runs[1].status, "error");
+        // Each duration reflects only that attempt (~5ms), not the ~300ms gap.
+        assert!(runs[0].duration_ms.unwrap() < 100);
+        assert!(runs[1].duration_ms.unwrap() < 100);
+    }
+
+    #[tokio::test]
+    async fn single_attempt_success_records_one_row_with_attempt_one() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
+
+        let t0 = Utc::now();
+        let attempts = one_attempt(t0, t0 + ChronoDuration::milliseconds(5), true, "ok");
+        let success = persist_job_result(&config, &job, true, "ok", &attempts).await;
+        assert!(success);
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].attempt, 1);
+        assert_eq!(runs[0].status, "ok");
     }
 
     #[tokio::test]
@@ -1201,7 +1297,14 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            true,
+            "ok",
+            &one_attempt(started, finished, true, "ok"),
+        )
+        .await;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -1227,8 +1330,14 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success =
-            persist_job_result(&config, &job, true, "job ran fine", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            true,
+            "job ran fine",
+            &one_attempt(started, finished, true, "job ran fine"),
+        )
+        .await;
         assert!(success, "a delivery failure must not fail the job");
         assert_eq!(
             cron::get_job(&config, &job.id)
@@ -1263,8 +1372,12 @@ mod tests {
             &job,
             false,
             "blocked by security policy: command not allowed: example",
-            started,
-            finished,
+            &one_attempt(
+                started,
+                finished,
+                false,
+                "blocked by security policy: command not allowed: example",
+            ),
         )
         .await;
         assert!(!success);
@@ -1297,7 +1410,14 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            true,
+            "ok",
+            &one_attempt(started, finished, true, "ok"),
+        )
+        .await;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
@@ -1323,7 +1443,14 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            false,
+            "boom",
+            &one_attempt(started, finished, false, "boom"),
+        )
+        .await;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -1415,7 +1542,14 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            true,
+            "ok",
+            &one_attempt(started, finished, true, "ok"),
+        )
+        .await;
         assert!(success);
 
         // Must survive (user did NOT opt into auto-delete) …
@@ -1457,7 +1591,14 @@ mod tests {
 
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            true,
+            "ok",
+            &one_attempt(started, finished, true, "ok"),
+        )
+        .await;
         assert!(success);
 
         // It opted into auto-delete → the row must be gone.
@@ -1490,7 +1631,14 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            true,
+            "ok",
+            &one_attempt(started, finished, true, "ok"),
+        )
+        .await;
         assert!(success);
 
         let stored = cron::get_job(&config, &job.id).unwrap();
