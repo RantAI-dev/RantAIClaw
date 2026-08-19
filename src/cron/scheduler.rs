@@ -1110,6 +1110,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_job_result_keeps_run_history_for_undeleted_one_shot() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        // Agent one-shot with delete_after_run = false (the no-delivery default
+        // after the fix): must be kept+disabled, and its run row must survive
+        // the cron_runs FK cascade.
+        let job = cron::add_agent_job(
+            &config,
+            Some("one-shot".into()),
+            crate::cron::Schedule::At { at },
+            "Hello",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        let stored = cron::get_job(&config, &job.id).unwrap();
+        assert!(!stored.enabled, "kept one-shot must be disabled");
+        assert_eq!(
+            cron::list_runs(&config, &job.id, 10).unwrap().len(),
+            1,
+            "the run-history row must survive (no cascade delete)"
+        );
+    }
+
+    #[tokio::test]
     async fn deliver_if_configured_handles_none_and_invalid_channel() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
