@@ -140,7 +140,9 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             agent,
             model,
         } => {
-            let at = chrono::Utc::now() + parse_delay(&delay)?;
+            let at = chrono::Utc::now()
+                .checked_add_signed(parse_delay(&delay)?)
+                .ok_or_else(|| anyhow::anyhow!("delay too large: {delay}"))?;
             let job = add_scheduled(config, Schedule::At { at }, &command, agent, model, agent)?;
             print_added(&job);
             Ok(())
@@ -304,7 +306,11 @@ fn runs_report(config: &Config, id: &str, limit: usize) -> Result<String> {
 
 pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
-    let at = chrono::Utc::now() + duration;
+    // `now + duration` can still overflow the DateTime range even when the
+    // Duration itself is representable, so add with a checked op.
+    let at = chrono::Utc::now()
+        .checked_add_signed(duration)
+        .ok_or_else(|| anyhow::anyhow!("delay too large: {delay}"))?;
     add_once_at(config, at, command)
 }
 
@@ -350,13 +356,18 @@ fn parse_delay(input: &str) -> Result<chrono::Duration> {
     let (num, unit) = input.split_at(split);
     let amount: i64 = num.parse()?;
     let unit = if unit.is_empty() { "m" } else { unit };
+    // Non-panicking constructors: chrono's `Duration::minutes/hours/days` panic
+    // on values that overflow its internal millisecond range. `num.parse::<i64>()`
+    // above already errors on a string too large for i64; the `try_*` mapping
+    // handles the in-i64-but-out-of-Duration-range case.
     let duration = match unit {
-        "s" => chrono::Duration::seconds(amount),
-        "m" => chrono::Duration::minutes(amount),
-        "h" => chrono::Duration::hours(amount),
-        "d" => chrono::Duration::days(amount),
+        "s" => chrono::Duration::try_seconds(amount),
+        "m" => chrono::Duration::try_minutes(amount),
+        "h" => chrono::Duration::try_hours(amount),
+        "d" => chrono::Duration::try_days(amount),
         _ => anyhow::bail!("unsupported delay unit '{unit}', use s/m/h/d"),
-    };
+    }
+    .ok_or_else(|| anyhow::anyhow!("delay too large: {input}"))?;
     Ok(duration)
 }
 
@@ -652,5 +663,35 @@ mod tests {
         record_run(&config, &job.id, Utc::now(), Utc::now(), "ok", Some("x"), 3).unwrap();
         let text = runs_report(&config, &job.id, 10).unwrap();
         assert!(text.contains(&job.id) || text.contains("ok"), "{text}");
+    }
+
+    #[test]
+    fn parse_delay_rejects_oversized_amount_without_panicking() {
+        // A value that overflows chrono::Duration for the unit must be an Err,
+        // not a panic. (Days are the tightest bound.)
+        let err = parse_delay("999999999999d").unwrap_err();
+        assert!(
+            err.to_string().contains("delay too large")
+                || err.to_string().contains("number too large")
+                || err.to_string().contains("invalid digit"),
+            "expected a bounded error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_delay_accepts_reasonable_values() {
+        assert_eq!(parse_delay("30").unwrap(), chrono::Duration::minutes(30));
+        assert_eq!(parse_delay("2h").unwrap(), chrono::Duration::hours(2));
+        assert_eq!(parse_delay("45s").unwrap(), chrono::Duration::seconds(45));
+        assert_eq!(parse_delay("7d").unwrap(), chrono::Duration::days(7));
+    }
+
+    #[test]
+    fn add_once_errors_on_overflowing_delay_instead_of_panicking() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        // Large-but-parses-as-i64 value; must surface as Err, never panic/abort.
+        let result = add_once(&config, "9999999999d", "echo x");
+        assert!(result.is_err(), "oversized delay must return Err");
     }
 }
