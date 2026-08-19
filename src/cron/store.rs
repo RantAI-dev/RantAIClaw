@@ -183,68 +183,123 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
 }
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
-    let mut job = get_job(config, job_id)?;
-    let mut schedule_changed = false;
-
-    if let Some(schedule) = patch.schedule {
-        validate_schedule(&schedule, Utc::now())?;
-        job.schedule = schedule;
-        job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
-        schedule_changed = true;
-    }
-    if let Some(command) = patch.command {
-        job.command = command;
-    }
-    if let Some(prompt) = patch.prompt {
-        job.prompt = Some(prompt);
-    }
-    if let Some(name) = patch.name {
-        job.name = Some(name);
-    }
-    if let Some(enabled) = patch.enabled {
-        job.enabled = enabled;
-    }
-    if let Some(delivery) = patch.delivery {
-        job.delivery = delivery;
-    }
-    if let Some(model) = patch.model {
-        job.model = Some(model);
-    }
-    if let Some(target) = patch.session_target {
-        job.session_target = target;
-    }
-    if let Some(delete_after_run) = patch.delete_after_run {
-        job.delete_after_run = delete_after_run;
-    }
-
-    if schedule_changed {
-        job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
-    }
-
     with_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs
-             SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
-                 session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 next_run = ?12
-             WHERE id = ?13",
-            params![
-                job.expression,
-                job.command,
-                serde_json::to_string(&job.schedule)?,
-                <JobType as Into<&str>>::into(job.job_type).to_string(),
-                job.prompt,
-                job.name,
-                job.session_target.as_str(),
-                job.model,
-                if job.enabled { 1 } else { 0 },
-                serde_json::to_string(&job.delivery)?,
-                if job.delete_after_run { 1 } else { 0 },
-                job.next_run.to_rfc3339(),
-                job.id,
-            ],
-        )
-        .context("Failed to update cron job")?;
+        // IMMEDIATE takes the write lock up front so a concurrent
+        // reschedule_after_run cannot commit between our read and our write —
+        // that race is exactly how an operator edit used to clobber a
+        // scheduler-written next_run.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+
+        // Read the current row inside the write transaction. Scoped in a block so
+        // the prepared statement/cursor are dropped before we UPDATE.
+        let mut job = {
+            let mut stmt = tx.prepare(
+                "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                        enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                 FROM cron_jobs WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(params![job_id])?;
+            match rows.next()? {
+                Some(row) => map_cron_job_row(row).map_err(anyhow::Error::from)?,
+                None => anyhow::bail!("Cron job '{job_id}' not found"),
+            }
+        };
+
+        let mut schedule_changed = false;
+        if let Some(schedule) = patch.schedule {
+            validate_schedule(&schedule, Utc::now())?;
+            job.schedule = schedule;
+            job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
+            schedule_changed = true;
+        }
+        if let Some(command) = patch.command {
+            job.command = command;
+        }
+        if let Some(prompt) = patch.prompt {
+            job.prompt = Some(prompt);
+        }
+        if let Some(name) = patch.name {
+            job.name = Some(name);
+        }
+        if let Some(enabled) = patch.enabled {
+            job.enabled = enabled;
+        }
+        if let Some(delivery) = patch.delivery {
+            job.delivery = delivery;
+        }
+        if let Some(model) = patch.model {
+            job.model = Some(model);
+        }
+        if let Some(target) = patch.session_target {
+            job.session_target = target;
+        }
+        if let Some(delete_after_run) = patch.delete_after_run {
+            job.delete_after_run = delete_after_run;
+        }
+
+        if schedule_changed {
+            job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
+        }
+
+        let schedule_json = serde_json::to_string(&job.schedule)?;
+        let job_type_str = <JobType as Into<&str>>::into(job.job_type).to_string();
+        let delivery_json = serde_json::to_string(&job.delivery)?;
+        let enabled_int = if job.enabled { 1 } else { 0 };
+        let delete_after_int = if job.delete_after_run { 1 } else { 0 };
+
+        if schedule_changed {
+            // Only a schedule edit is allowed to move next_run.
+            tx.execute(
+                "UPDATE cron_jobs
+                 SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
+                     session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                     next_run = ?12
+                 WHERE id = ?13",
+                params![
+                    job.expression,
+                    job.command,
+                    schedule_json,
+                    job_type_str,
+                    job.prompt,
+                    job.name,
+                    job.session_target.as_str(),
+                    job.model,
+                    enabled_int,
+                    delivery_json,
+                    delete_after_int,
+                    job.next_run.to_rfc3339(),
+                    job.id,
+                ],
+            )
+            .context("Failed to update cron job")?;
+        } else {
+            // Leave next_run untouched so an operator edit can never clobber a
+            // next_run the scheduler wrote.
+            tx.execute(
+                "UPDATE cron_jobs
+                 SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
+                     session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11
+                 WHERE id = ?12",
+                params![
+                    job.expression,
+                    job.command,
+                    schedule_json,
+                    job_type_str,
+                    job.prompt,
+                    job.name,
+                    job.session_target.as_str(),
+                    job.model,
+                    enabled_int,
+                    delivery_json,
+                    delete_after_int,
+                    job.id,
+                ],
+            )
+            .context("Failed to update cron job")?;
+        }
+
+        tx.commit().context("Failed to commit cron update")?;
         Ok(())
     })?;
 
@@ -669,6 +724,72 @@ mod tests {
         assert_eq!(stored.last_status.as_deref(), Some("error"));
         assert!(stored.last_run.is_some());
         assert_eq!(stored.last_output.as_deref(), Some("failed output"));
+    }
+
+    // NOTE: the real defect is a two-connection RACE (an operator edit reads
+    // next_run on one connection while a reschedule writes it on another). A
+    // sequential unit test cannot reproduce that interleaving, so it does NOT
+    // fail on the pre-fix code. The primary proof of the fix is structural (the
+    // single IMMEDIATE transaction + next_run written only on a schedule change).
+    // These two are a sequential sanity check and an over-correction guard.
+    #[test]
+    fn update_job_without_schedule_change_preserves_next_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "*/5 * * * *", "echo hi").unwrap();
+
+        // Simulate a scheduler reschedule writing a fresh next_run.
+        reschedule_after_run(&config, &job, true, "ran").unwrap();
+        let after_reschedule = get_job(&config, &job.id).unwrap().next_run;
+
+        // An operator edit that does NOT touch the schedule (rename) must not
+        // move next_run back.
+        update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                name: Some("renamed".into()),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        let final_job = get_job(&config, &job.id).unwrap();
+        assert_eq!(
+            final_job.next_run, after_reschedule,
+            "a non-schedule edit must preserve the scheduler-written next_run"
+        );
+        assert_eq!(final_job.name.as_deref(), Some("renamed"));
+    }
+
+    #[test]
+    fn update_job_with_schedule_change_recomputes_next_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "*/5 * * * *", "echo hi").unwrap();
+        let original_next = job.next_run;
+
+        // A schedule change is the ONLY edit allowed to move next_run.
+        let updated = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                schedule: Some(Schedule::Cron {
+                    expr: "0 0 1 1 *".into(),
+                    tz: None,
+                }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        assert_ne!(
+            updated.next_run, original_next,
+            "a schedule change must recompute next_run"
+        );
+        assert_eq!(updated.expression, "0 0 1 1 *");
     }
 
     #[test]
