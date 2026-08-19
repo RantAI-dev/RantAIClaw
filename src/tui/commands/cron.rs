@@ -108,7 +108,10 @@ fn list_text(config: &Config) -> String {
                     "  {} [{}] {} · next {} · {}\n    {}\n",
                     crate::memory::sanitize::sanitize_for_terminal(&name),
                     if j.enabled { "on" } else { "paused" },
-                    crate::memory::sanitize::sanitize_for_terminal(&j.expression),
+                    // Render the structured schedule (Display) — the stored
+                    // `expression` is empty for at/every jobs — and keep the
+                    // terminal-escape sanitize from plan 178.
+                    crate::memory::sanitize::sanitize_for_terminal(&j.schedule.to_string()),
                     j.next_run.to_rfc3339(),
                     j.last_status.as_deref().unwrap_or("never run"),
                     crate::memory::sanitize::sanitize_for_terminal(&what),
@@ -151,7 +154,7 @@ fn add_text(config: &Config, args: &[&str]) -> String {
         Ok(job) => format!(
             "✅ Added cron job {}\n  Expr: {}\n  Next: {}",
             job.id,
-            job.expression,
+            job.schedule,
             job.next_run.to_rfc3339()
         ),
         Err(e) => format!("✗ Failed to add cron job: {e}"),
@@ -187,7 +190,7 @@ fn edit_text(config: &Config, args: &[&str]) -> String {
         Ok(job) => format!(
             "✅ Updated cron job {}\n  Expr: {}\n  Next: {}",
             job.id,
-            job.expression,
+            job.schedule,
             job.next_run.to_rfc3339()
         ),
         Err(e) => format!("✗ {e}"),
@@ -221,7 +224,7 @@ pub fn build_cron_picker(config: &Config) -> ListPicker {
                 primary: format!("{name} [{}]", if j.enabled { "on" } else { "paused" }),
                 secondary: format!(
                     "{} · next {} · {}",
-                    j.expression,
+                    j.schedule,
                     j.next_run.to_rfc3339(),
                     j.last_status.as_deref().unwrap_or("never run")
                 ),
