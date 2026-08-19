@@ -422,6 +422,7 @@ pub(crate) fn classify_health_result(
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
+    factory::warn_unused_channel_config(&config);
     let channels = factory::build_configured_channels(&config);
 
     if channels.is_empty() {

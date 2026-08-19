@@ -202,7 +202,11 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             );
             Ok(())
         }
-        crate::CronCommands::Remove { id } => remove_job(config, &id),
+        crate::CronCommands::Remove { id } => {
+            remove_job(config, &id)?;
+            println!("\u{2705} Removed cron job {id}");
+            Ok(())
+        }
         crate::CronCommands::Pause { id } => {
             pause_job(config, &id)?;
             println!("⏸️  Paused cron job {id}");
