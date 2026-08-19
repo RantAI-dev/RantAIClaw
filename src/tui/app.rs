@@ -3408,7 +3408,7 @@ impl TuiApp {
                 "State",
                 if job.enabled { "enabled" } else { "paused" },
             )
-            .status_with(StatusKind::Info, "Schedule", job.expression.clone())
+            .status_with(StatusKind::Info, "Schedule", job.schedule.to_string())
             .status_with(StatusKind::Info, "Next run", job.next_run.to_rfc3339())
             .status_with(
                 StatusKind::Info,

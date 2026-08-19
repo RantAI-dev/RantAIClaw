@@ -209,4 +209,19 @@ mod tests {
         let every = Schedule::Every { every_ms: 5000 };
         assert_eq!(every.to_string(), "every 5000ms");
     }
+
+    /// Pins the regression the TUI/web render fix addresses: at/every schedules
+    /// must render a non-empty string (the stored `expression` column is empty
+    /// for them, so the render sites must use this Display).
+    #[test]
+    fn schedule_display_is_non_empty_for_at_and_every() {
+        use super::Schedule;
+        use chrono::Utc;
+        let at = Schedule::At { at: Utc::now() };
+        let every = Schedule::Every { every_ms: 60_000 };
+        assert!(!at.to_string().is_empty());
+        assert!(!every.to_string().is_empty());
+        assert!(at.to_string().starts_with("at "));
+        assert!(every.to_string().starts_with("every "));
+    }
 }
