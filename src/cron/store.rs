@@ -369,7 +369,12 @@ pub fn record_run(
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
-    let bounded_output = output.map(truncate_cron_output);
+    // Scrub credential-shaped substrings (api_key=…, password:… etc.) BEFORE
+    // truncating and persisting — run history is a world-readable payload sink
+    // served back over the API, so a secret in a command's stdout/stderr must
+    // not land in cleartext. Reuses the agent path's shared scrubber (plan 175).
+    let bounded_output =
+        output.map(|o| truncate_cron_output(&crate::agent::loop_::scrub_credentials(o)));
     with_connection(config, |conn| {
         // Wrap INSERT + pruning DELETE in an explicit transaction so that
         // if the DELETE fails, the INSERT is rolled back and the run table
@@ -570,6 +575,33 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
     }
 }
 
+/// Best-effort 0600 on the cron DB and its WAL/SHM siblings. Run history can
+/// hold command output that passed a secret through a scheduled job's
+/// environment, so the file must not be left world-readable at the process
+/// umask (commonly 0644). Unix-only, logged-not-fatal — a chmod failure must
+/// never stop the scheduler from opening the DB. Mirrors the WhatsApp
+/// credential store's `restrict_file_permissions` (plan 175). Idempotent, so
+/// running it on every open picks up the WAL siblings once they appear.
+#[cfg(unix)]
+fn restrict_db_permissions(db_path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    for path in [
+        db_path.to_path_buf(),
+        db_path.with_extension("db-wal"),
+        db_path.with_extension("db-shm"),
+    ] {
+        if path.exists() {
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
+                tracing::warn!("cron: could not restrict {} to 0600: {e}", path.display());
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_db_permissions(_db_path: &std::path::Path) {}
+
 fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     let db_path = config.workspace_dir.join("cron").join("jobs.db");
     if let Some(parent) = db_path.parent() {
@@ -579,6 +611,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
 
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
+    restrict_db_permissions(&db_path);
 
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
@@ -998,5 +1031,61 @@ mod tests {
         let last_output = stored.last_output.as_deref().unwrap_or_default();
         assert!(last_output.ends_with(TRUNCATED_OUTPUT_MARKER));
         assert!(last_output.len() <= MAX_CRON_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn record_run_scrubs_credentials_from_output() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "*/5 * * * *", "echo secret").unwrap();
+        // Neutral placeholder shaped like a key=value secret the shared scrubber
+        // matches (value >= 8 chars). Never a real credential.
+        let dummy = "abcd1234efgh5678";
+        let output = format!("api_key={dummy}\nall good");
+
+        record_run(
+            &config,
+            &job.id,
+            Utc::now(),
+            Utc::now(),
+            "ok",
+            Some(&output),
+            1,
+        )
+        .unwrap();
+
+        let runs = list_runs(&config, &job.id, 1).unwrap();
+        let stored = runs[0].output.as_deref().unwrap_or_default();
+        assert!(
+            !stored.contains(dummy),
+            "raw secret value must not be persisted: {stored}"
+        );
+        assert!(
+            stored.contains("*[REDACTED]"),
+            "expected redaction marker in stored output: {stored}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jobs_db_is_restricted_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        record_run(
+            &config,
+            &job.id,
+            Utc::now(),
+            Utc::now(),
+            "ok",
+            Some("ok"),
+            1,
+        )
+        .unwrap();
+
+        let db_path = config.workspace_dir.join("cron").join("jobs.db");
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "jobs.db must be owner-only, got {mode:o}");
     }
 }
