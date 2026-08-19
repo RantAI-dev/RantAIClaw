@@ -145,7 +145,7 @@ fn add_text(config: &Config, args: &[&str]) -> String {
             Some("tui"),
         )
     } else {
-        cron::add_shell_job(config, None, schedule, &payload, Some("tui"))
+        cron::add_shell_job(config, None, schedule, &payload, None, false, Some("tui"))
     };
     match result {
         Ok(job) => format!(

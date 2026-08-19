@@ -169,11 +169,45 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     });
                 }
 
+                // The origin-chat safety net injects a `delivery` block into any
+                // cron_add from an announce-capable channel regardless of job
+                // type, so a shell job ("run this and message me") must honor it
+                // too — mirror the agent branch's parse + delete-after logic.
+                let delivery = match args.get("delivery") {
+                    Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
+                        Ok(cfg) => Some(cfg),
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("Invalid delivery config: {e}")),
+                            });
+                        }
+                    },
+                    None => None,
+                };
+                let delivered = delivery
+                    .as_ref()
+                    .is_some_and(|d| d.mode.eq_ignore_ascii_case("announce"));
+                let default_delete_after_run = matches!(schedule, Schedule::At { .. }) && delivered;
+                let delete_after_run = args
+                    .get("delete_after_run")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(default_delete_after_run);
+
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
                 }
 
-                cron::add_shell_job(&self.config, name, schedule, command, Some("agent-tool"))
+                cron::add_shell_job(
+                    &self.config,
+                    name,
+                    schedule,
+                    command,
+                    delivery,
+                    delete_after_run,
+                    Some("agent-tool"),
+                )
             }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {

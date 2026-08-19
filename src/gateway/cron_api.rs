@@ -330,9 +330,24 @@ async fn create_cron(
                     "command blocked by security policy: {command}"
                 )));
             }
-            let (name, schedule) = (body.name.clone(), body.schedule.clone());
+            let delete_after = body
+                .delete_after_run
+                .unwrap_or(matches!(body.schedule, Schedule::At { .. }));
+            let (name, delivery, schedule) = (
+                body.name.clone(),
+                body.delivery.clone(),
+                body.schedule.clone(),
+            );
             tokio::task::spawn_blocking(move || {
-                cron::add_shell_job(&cfg, name, schedule, &command, Some("gateway"))
+                cron::add_shell_job(
+                    &cfg,
+                    name,
+                    schedule,
+                    &command,
+                    delivery,
+                    delete_after,
+                    Some("gateway"),
+                )
             })
             .await
             .map_err(err_500)?
