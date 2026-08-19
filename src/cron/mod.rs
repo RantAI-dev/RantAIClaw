@@ -229,7 +229,8 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
 }
 
 /// Create a shell or agent job from a resolved schedule. `delete_after_run`
-/// applies to agent one-shots (`At`); shell jobs ignore it (store limitation).
+/// controls whether a one-shot (`At`) self-deletes on success; it is honored
+/// for both shell and agent jobs.
 fn add_scheduled(
     config: &Config,
     schedule: Schedule,
@@ -251,7 +252,15 @@ fn add_scheduled(
             Some("cli"),
         )
     } else {
-        add_shell_job(config, None, schedule, payload, Some("cli"))
+        add_shell_job(
+            config,
+            None,
+            schedule,
+            payload,
+            None,
+            delete_after_run,
+            Some("cli"),
+        )
     }
 }
 
@@ -320,7 +329,7 @@ pub fn add_once_at(
     command: &str,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job(config, None, schedule, command, Some("cli"))
+    add_shell_job(config, None, schedule, command, None, false, Some("cli"))
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {
@@ -396,6 +405,8 @@ mod tests {
                 tz: tz.map(Into::into),
             },
             cmd,
+            None,
+            false,
             None,
         )
         .unwrap()
@@ -520,6 +531,8 @@ mod tests {
             },
             "echo original",
             None,
+            false,
+            None,
         )
         .unwrap();
 
@@ -638,6 +651,8 @@ mod tests {
             },
             "echo cli-run",
             None,
+            false,
+            None,
         )
         .unwrap();
         let out = run_job_report(&config, &job.id).await.unwrap();
@@ -657,6 +672,8 @@ mod tests {
                 tz: None,
             },
             "echo x",
+            None,
+            false,
             None,
         )
         .unwrap();

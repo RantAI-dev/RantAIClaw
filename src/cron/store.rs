@@ -24,14 +24,17 @@ pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJ
         expr: expression.to_string(),
         tz: None,
     };
-    add_shell_job(config, None, schedule, command, None)
+    add_shell_job(config, None, schedule, command, None, false, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn add_shell_job(
     config: &Config,
     name: Option<String>,
     schedule: Schedule,
     command: &str,
+    delivery: Option<DeliveryConfig>,
+    delete_after_run: bool,
     created_by: Option<&str>,
 ) -> Result<CronJob> {
     let now = Utc::now();
@@ -40,20 +43,22 @@ pub fn add_shell_job(
     let id = Uuid::new_v4().to_string();
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
+    let delivery = delivery.unwrap_or_default();
 
     with_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, created_by
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, 0, ?7, ?8, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9, ?10)",
             params![
                 id,
                 expression,
                 command,
                 schedule_json,
                 name,
-                serde_json::to_string(&DeliveryConfig::default())?,
+                serde_json::to_string(&delivery)?,
+                if delete_after_run { 1 } else { 0 },
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
                 created_by,
@@ -768,6 +773,8 @@ mod tests {
                 tz: None,
             },
             "echo hi",
+            None,
+            false,
             Some("cli"),
         )
         .unwrap();
@@ -788,9 +795,41 @@ mod tests {
             },
             "echo anon",
             None,
+            false,
+            None,
         )
         .unwrap();
         assert_eq!(anon.created_by, None);
+    }
+
+    #[test]
+    fn add_shell_job_persists_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("telegram".into()),
+            to: Some("123".into()),
+            best_effort: true,
+        };
+        let job = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo hi",
+            Some(delivery),
+            false,
+            None,
+        )
+        .unwrap();
+        // A shell "run this and message me" job must persist its delivery
+        // instead of the old hardcoded DeliveryConfig::default() ("none").
+        assert_eq!(job.delivery.mode, "announce");
+        assert_eq!(job.delivery.channel.as_deref(), Some("telegram"));
+        assert_eq!(job.delivery.to.as_deref(), Some("123"));
     }
 
     #[test]

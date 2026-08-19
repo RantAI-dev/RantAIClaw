@@ -1404,6 +1404,8 @@ mod tests {
             crate::cron::Schedule::At { at },
             "echo hi",
             None,
+            false,
+            None,
         )
         .unwrap();
         assert!(
@@ -1430,6 +1432,38 @@ mod tests {
         assert!(
             due.iter().all(|j| j.id != job.id),
             "disabled one-shot must not be due"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_deletes_shell_one_shot_when_flagged() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_shell_job(
+            &config,
+            Some("one-shot-shell".into()),
+            crate::cron::Schedule::At { at },
+            "echo hi",
+            None,
+            true, // delete_after_run — now honored for shell jobs
+            None,
+        )
+        .unwrap();
+        assert!(
+            job.delete_after_run,
+            "shell one-shot must carry the flag now"
+        );
+
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        // It opted into auto-delete → the row must be gone.
+        assert!(
+            cron::get_job(&config, &job.id).is_err(),
+            "a flagged shell one-shot must self-delete after a successful run"
         );
     }
 
