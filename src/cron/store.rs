@@ -246,6 +246,23 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
         }
 
+        // A fired one-shot (`Schedule::At`) is disabled but keeps its now-past
+        // `at` as next_run. Re-enabling it (resume / PUT {enabled:true} / TUI `p`)
+        // would make it due on the next poll tick and silently re-run a job whose
+        // contract is "runs once". Refuse unless the same patch also supplies a
+        // fresh, future `at` (which reschedules via schedule_changed above).
+        if patch.enabled == Some(true) {
+            if let Schedule::At { at } = job.schedule {
+                if at <= Utc::now() {
+                    anyhow::bail!(
+                        "cannot re-enable one-shot cron job '{job_id}': its scheduled \
+                         time ({at}) is in the past. Supply a new future 'at' to \
+                         reschedule it, or create a new job."
+                    );
+                }
+            }
+        }
+
         let schedule_json = serde_json::to_string(&job.schedule)?;
         let job_type_str = <JobType as Into<&str>>::into(job.job_type).to_string();
         let delivery_json = serde_json::to_string(&job.delivery)?;
@@ -1116,5 +1133,63 @@ mod tests {
         let db_path = config.workspace_dir.join("cron").join("jobs.db");
         let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "jobs.db must be owner-only, got {mode:o}");
+    }
+
+    #[test]
+    fn update_job_refuses_reenabling_a_past_one_shot() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let past = Utc::now() - ChronoDuration::minutes(10);
+        let schedule = Schedule::At { at: past };
+        let schedule_json = serde_json::to_string(&schedule).unwrap();
+
+        // A fired one-shot that kept its row disabled with a now-past next_run.
+        // Written via raw SQL because validate_schedule rejects a past `at`.
+        with_connection(&config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, schedule, job_type,
+                    session_target, enabled, delivery, delete_after_run, created_at, next_run)
+                 VALUES (?1, '', 'echo once', ?2, 'shell', 'isolated', 0, ?3, 0, ?4, ?5)",
+                params![
+                    "past-oneshot",
+                    schedule_json,
+                    serde_json::to_string(&DeliveryConfig::default()).unwrap(),
+                    past.to_rfc3339(),
+                    past.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Re-enabling with no new schedule must be refused.
+        let err = update_job(
+            &config,
+            "past-oneshot",
+            CronJobPatch {
+                enabled: Some(true),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("in the past"),
+            "expected a past-one-shot refusal, got: {err}"
+        );
+
+        // Escape hatch: a fresh future `at` in the same patch reschedules and succeeds.
+        let future = Utc::now() + ChronoDuration::hours(1);
+        let ok = update_job(
+            &config,
+            "past-oneshot",
+            CronJobPatch {
+                enabled: Some(true),
+                schedule: Some(Schedule::At { at: future }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(ok.enabled);
+        assert!(ok.next_run > Utc::now());
     }
 }
