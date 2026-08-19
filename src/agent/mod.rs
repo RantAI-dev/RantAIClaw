@@ -16,4 +16,4 @@ pub use agent::{Agent, AgentBuilder};
 #[allow(unused_imports)]
 pub use events::{AgentEvent, AgentEventSender, TurnResult};
 #[allow(unused_imports)]
-pub use loop_::{process_message, run};
+pub use loop_::{process_message, run, run_with_scope};

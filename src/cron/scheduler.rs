@@ -338,12 +338,17 @@ async fn run_agent_job(
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            // Box the agent future: `crate::agent::run` is a ~27KB future and is
-            // awaited transitively across the whole cron execution chain
-            // (execute_job_with_retry → execute_job_now/run_job_manual/
+            // Box the agent future: `crate::agent::run_with_scope` is a ~27KB
+            // future and is awaited transitively across the whole cron execution
+            // chain (execute_job_with_retry → execute_job_now/run_job_manual/
             // execute_and_persist_job). Boxing it once here keeps every enclosing
             // future off the poll-loop stack (clippy::large_futures).
-            Box::pin(crate::agent::run(
+            //
+            // Scope memory to `cron:<job_id>` so this job's memory_recall returns
+            // its own rows plus the shared/global tier — not another
+            // conversation's scoped rows, which it could otherwise quote into the
+            // announced output (memory_recall is auto-approved).
+            Box::pin(crate::agent::run_with_scope(
                 config.clone(),
                 Some(prefixed_prompt),
                 None,
@@ -351,6 +356,7 @@ async fn run_agent_job(
                 config.default_temperature,
                 vec![],
                 "scheduler",
+                Some(format!("cron:{}", job.id)),
             ))
             .await
         }
