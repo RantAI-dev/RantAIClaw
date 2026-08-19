@@ -40,7 +40,7 @@ pub mod factory;
 
 // `src/cron/scheduler.rs` builds channels to resolve a delivery target, so the
 // construction table keeps its `crate::channels::` path.
-pub(crate) use factory::build_configured_channels;
+pub(crate) use factory::build_one;
 pub mod format;
 pub mod history;
 mod history_store;
@@ -757,6 +757,7 @@ pub async fn start_channels_with_cancellation(
     // One construction site: the doctor probes exactly what the runtime starts.
     // These were written out separately and had already drifted — the doctor was
     // missing Mattermost entirely.
+    factory::warn_unused_channel_config(&config);
     let channels: Vec<Arc<dyn Channel>> = factory::build_configured_channels(&config)
         .into_iter()
         .map(|(_key, _display, channel)| channel)

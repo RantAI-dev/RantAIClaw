@@ -69,21 +69,10 @@ pub(crate) fn build_configured_channels(
     }
 
     if let Some(ref sl) = config.channels_config.slack {
-        // Socket Mode is not implemented — the channel polls
-        // `conversations.history`. Say so rather than accepting an app-level
-        // token in silence: an operator who supplied one is entitled to know
-        // it changes nothing, and a silent no-op is how this key went
-        // unnoticed for as long as it did.
-        if sl
-            .app_token
-            .as_deref()
-            .is_some_and(|t| !t.trim().is_empty())
-        {
-            tracing::warn!(
-                "Slack: `app_token` is set but ignored — this build polls conversations.history \
-                 and does not implement Socket Mode. Remove the key, or leave it for when it does."
-            );
-        }
+        // The "`app_token` is set but ignored" note is an operator-facing,
+        // one-time warning — emitted from `warn_unused_channel_config` on the
+        // startup/doctor paths, NOT here, so the cron delivery path (which builds
+        // channels on every scheduled run) does not re-log it as a recurring fault.
         channels.push((
             "slack",
             "Slack",
@@ -313,4 +302,120 @@ pub(crate) fn build_configured_channels(
     }
 
     channels
+}
+
+/// Build exactly one channel by its lowercase `key`, for the cron delivery path
+/// (which needs a single target, not the whole fleet). Covers only the
+/// announce-capable channels — the set `channel_supports_announce_delivery`
+/// allows, which is the only set cron delivery selects on; returns `None` for any
+/// other key or when that channel is not configured. Unlike
+/// `build_configured_channels` this allocates one channel, not ~15, and emits no
+/// construction-time warnings. Keep this key set a superset of
+/// `channel_supports_announce_delivery`; if that gate widens, add the key here.
+/// Constructors are copied verbatim from `build_configured_channels` so the two
+/// cannot drift on fields.
+pub(crate) fn build_one(config: &Config, key: &str) -> Option<Arc<dyn Channel>> {
+    match key {
+        "telegram" => config.channels_config.telegram.as_ref().map(|tg| {
+            Arc::new(
+                TelegramChannel::new(
+                    tg.bot_token.clone(),
+                    tg.allowed_users.clone(),
+                    tg.mention_only,
+                )
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_multimodal(config.multimodal.clone()),
+            ) as Arc<dyn Channel>
+        }),
+        "discord" => config.channels_config.discord.as_ref().map(|dc| {
+            Arc::new(
+                DiscordChannel::new(
+                    dc.bot_token.clone(),
+                    dc.guild_id.clone(),
+                    dc.allowed_users.clone(),
+                    dc.listen_to_bots,
+                    dc.mention_only,
+                )
+                .with_multimodal(config.multimodal.clone()),
+            ) as Arc<dyn Channel>
+        }),
+        "slack" => config.channels_config.slack.as_ref().map(|sl| {
+            Arc::new(SlackChannel::new(
+                sl.bot_token.clone(),
+                sl.channel_id.clone(),
+                sl.allowed_users.clone(),
+            )) as Arc<dyn Channel>
+        }),
+        "mattermost" => config.channels_config.mattermost.as_ref().map(|mm| {
+            Arc::new(MattermostChannel::new(
+                mm.url.clone(),
+                mm.bot_token.clone(),
+                mm.channel_id.clone(),
+                mm.allowed_users.clone(),
+                mm.thread_replies.unwrap_or(true),
+                mm.mention_only.unwrap_or(false),
+            )) as Arc<dyn Channel>
+        }),
+        _ => None,
+    }
+}
+
+/// One-time, operator-facing warnings about channel config that is set but
+/// ignored. Call from the operator paths (channel-server startup, doctor) — NOT
+/// from cron delivery, which must not re-log on every scheduled run.
+pub(crate) fn warn_unused_channel_config(config: &Config) {
+    if let Some(ref sl) = config.channels_config.slack {
+        if sl
+            .app_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+        {
+            tracing::warn!(
+                "Slack: `app_token` is set but ignored — this build polls conversations.history \
+                 and does not implement Socket Mode. Remove the key, or leave it for when it does."
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_telegram() -> Config {
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::schema::TelegramConfig {
+            bot_token: "placeholder-token".to_string(),
+            allowed_users: vec![],
+            stream_mode: crate::config::schema::StreamMode::default(),
+            draft_update_interval_ms: 1_000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        config
+    }
+
+    #[test]
+    fn build_one_returns_the_configured_announce_channel() {
+        let config = config_with_telegram();
+        assert!(build_one(&config, "telegram").is_some());
+        // A configured-but-not-requested channel and unknown keys return None.
+        assert!(build_one(&config, "discord").is_none());
+        assert!(build_one(&config, "nope").is_none());
+    }
+
+    #[test]
+    fn build_one_covers_every_announce_gate_key() {
+        // build_one must recognize every key channel_supports_announce_delivery
+        // allows, else a valid delivery target would fail to construct. Not
+        // configured here, so each returns None — but the key is recognized.
+        let config = Config::default();
+        for key in ["telegram", "discord", "slack", "mattermost"] {
+            assert!(
+                crate::channels::channel_supports_announce_delivery(key),
+                "{key} must be an announce channel"
+            );
+            assert!(build_one(&config, key).is_none());
+        }
+    }
 }

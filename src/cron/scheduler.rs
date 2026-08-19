@@ -520,26 +520,33 @@ fn is_one_shot(job: &CronJob) -> bool {
     matches!(job.schedule, Schedule::At { .. })
 }
 
-fn warn_if_high_frequency_agent_job(job: &CronJob) {
+/// True when an *agent* job is scheduled more often than every 5 minutes. For
+/// `Cron`, compares the gap between two CONSECUTIVE occurrences (`next(a)` after
+/// `a`) — NOT `next(now)` vs `next(now + 1s)`, which return the same occurrence
+/// unless one happens to fall in that 1-second window. That old comparison gave
+/// a ~0 gap and warned on every cron agent job, including a daily `0 9 * * *`.
+fn is_high_frequency_agent_job(job: &CronJob) -> bool {
     if !matches!(job.job_type, JobType::Agent) {
-        return;
+        return false;
     }
-    let too_frequent = match &job.schedule {
+    match &job.schedule {
         Schedule::Every { every_ms } => *every_ms < 5 * 60 * 1000,
         Schedule::Cron { .. } => {
             let now = Utc::now();
-            match (
-                next_run_for_schedule(&job.schedule, now),
-                next_run_for_schedule(&job.schedule, now + chrono::Duration::seconds(1)),
-            ) {
-                (Ok(a), Ok(b)) => (b - a).num_minutes() < 5,
-                _ => false,
+            match next_run_for_schedule(&job.schedule, now) {
+                Ok(a) => match next_run_for_schedule(&job.schedule, a) {
+                    Ok(b) => (b - a).num_minutes() < 5,
+                    Err(_) => false,
+                },
+                Err(_) => false,
             }
         }
         Schedule::At { .. } => false,
-    };
+    }
+}
 
-    if too_frequent {
+fn warn_if_high_frequency_agent_job(job: &CronJob) {
+    if is_high_frequency_agent_job(job) {
         tracing::warn!(
             "Cron agent job '{}' is scheduled more frequently than every 5 minutes",
             job.id
@@ -590,8 +597,10 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         anyhow::bail!("unsupported delivery channel: {key}");
     }
 
-    let built = crate::channels::build_configured_channels(config);
-    let Some((_, _, channel_impl)) = built.into_iter().find(|(k, _, _)| *k == key) else {
+    // Build only the one channel this delivery needs — not the whole fleet of
+    // ~15 — and emit no construction-time warnings on this per-run path (the
+    // Slack app_token note lives on the startup/doctor paths instead).
+    let Some(channel_impl) = crate::channels::build_one(config, &key) else {
         anyhow::bail!("{key} channel not configured");
     };
     channel_impl.send(&SendMessage::new(output, target)).await?;
@@ -1209,6 +1218,45 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].attempt, 1);
         assert_eq!(runs[0].status, "ok");
+    }
+
+    fn agent_job_with_cron(expr: &str) -> CronJob {
+        let mut job = test_job("noop");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("hi".into());
+        job.schedule = crate::cron::Schedule::Cron {
+            expr: expr.into(),
+            tz: None,
+        };
+        job
+    }
+
+    #[test]
+    fn high_frequency_predicate_ignores_daily_agent_job() {
+        // The regression: `next(now)` vs `next(now+1s)` returned the same
+        // occurrence and warned on every cron agent job. A daily job must not.
+        assert!(!is_high_frequency_agent_job(&agent_job_with_cron(
+            "0 9 * * *"
+        )));
+    }
+
+    #[test]
+    fn high_frequency_predicate_flags_every_minute_agent_job() {
+        assert!(is_high_frequency_agent_job(&agent_job_with_cron(
+            "*/1 * * * *"
+        )));
+    }
+
+    #[test]
+    fn high_frequency_predicate_ignores_shell_job() {
+        // A shell job is never an agent job, so it is never warned about,
+        // regardless of frequency.
+        let mut job = test_job("echo hi");
+        job.schedule = crate::cron::Schedule::Cron {
+            expr: "*/1 * * * *".into(),
+            tz: None,
+        };
+        assert!(!is_high_frequency_agent_job(&job));
     }
 
     #[tokio::test]
