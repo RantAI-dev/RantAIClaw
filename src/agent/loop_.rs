@@ -235,25 +235,35 @@ async fn auto_compact_history(
     Ok(true)
 }
 
-/// Build context preamble by searching memory for relevant entries.
-/// Entries with a hybrid score below `min_relevance_score` are dropped to
-/// prevent unrelated memories from bleeding into the conversation.
-async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
+/// Build context preamble by searching memory for relevant entries, scoped to
+/// `conversation_id` when the caller has one. Entries with a hybrid score below
+/// `min_relevance_score` are dropped to prevent unrelated memories from bleeding
+/// into the conversation. With `None` this is a plain global recall (the prior
+/// behaviour); with `Some(id)` it returns that scope's rows plus the
+/// shared/global tier and excludes other conversations' scoped rows.
+async fn build_context_scoped(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    conversation_id: Option<&str>,
+) -> String {
     // One builder, shared with the agent's memory loader and the channel
     // dispatcher. This path used to render its own block with no cap on entry
     // count, entry size or total size.
-    //
-    // Scope stays `None` here: the CLI loop has no conversation identity to
-    // pass, and inventing one would change which memories surface.
     memory::build_memory_context(
         mem,
         user_msg,
         min_relevance_score,
-        None,
+        conversation_id,
         memory::MemoryContextLimits::default(),
     )
     .await
     .block
+}
+
+/// Global-scope convenience for callers with no conversation identity.
+async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f64) -> String {
+    build_context_scoped(mem, user_msg, min_relevance_score, None).await
 }
 
 /// Build hardware datasheet context from RAG when peripherals are enabled.
@@ -2078,7 +2088,8 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
 // and hard trimming to keep the context window bounded.
 
 #[allow(clippy::too_many_lines)]
-pub async fn run(
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_scope(
     config: Config,
     message: Option<String>,
     provider_override: Option<String>,
@@ -2086,6 +2097,7 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     surface: &str,
+    conversation_id: Option<String>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -2128,7 +2140,7 @@ pub async fn run(
         &security,
         runtime,
         mem.clone(),
-        crate::tools::memory_recall::ConversationScope::default(),
+        std::sync::Arc::new(std::sync::Mutex::new(conversation_id.clone())),
         composio_key,
         composio_entity_id,
         &config.browser,
@@ -2372,8 +2384,13 @@ pub async fn run(
         }
 
         // Inject memory + hardware RAG context into user message
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+        let mem_context = build_context_scoped(
+            mem.as_ref(),
+            &msg,
+            config.memory.min_relevance_score,
+            conversation_id.as_deref(),
+        )
+        .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -2523,8 +2540,13 @@ pub async fn run(
             }
 
             // Inject memory + hardware RAG context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+            let mem_context = build_context_scoped(
+                mem.as_ref(),
+                &user_input,
+                config.memory.min_relevance_score,
+                conversation_id.as_deref(),
+            )
+            .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
@@ -2607,6 +2629,31 @@ pub async fn run(
     });
 
     Ok(final_output)
+}
+
+/// Back-compat entry point: run with no conversation scope (global memory),
+/// exactly as before scoping was threaded through. The CLI/daemon callers have
+/// no conversation identity; only cron passes one (via `run_with_scope`).
+pub async fn run(
+    config: Config,
+    message: Option<String>,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: f64,
+    peripheral_overrides: Vec<String>,
+    surface: &str,
+) -> Result<String> {
+    run_with_scope(
+        config,
+        message,
+        provider_override,
+        model_override,
+        temperature,
+        peripheral_overrides,
+        surface,
+        None,
+    )
+    .await
 }
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
@@ -4210,6 +4257,81 @@ Done."#;
         assert!(!context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
+    }
+
+    /// Records the `session_id` of every `recall` — mirrors
+    /// memory_recall.rs's `RecallScopeProbe`.
+    struct RecallScopeProbe {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Memory for RecallScopeProbe {
+        fn name(&self) -> &str {
+            "recall-scope-probe"
+        }
+        async fn store(
+            &self,
+            _k: &str,
+            _c: &str,
+            _cat: MemoryCategory,
+            _s: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _q: &str,
+            _l: usize,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            self.calls
+                .lock()
+                .expect("probe mutex")
+                .push(session_id.map(str::to_string));
+            Ok(vec![])
+        }
+        async fn get(&self, _k: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _c: Option<&MemoryCategory>,
+            _s: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn build_context_scoped_forwards_conversation_id() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let mem = RecallScopeProbe {
+            calls: calls.clone(),
+        };
+
+        // Scoped: recall_layered(Some(cid)) reads the conversation first, then the
+        // shared backfill — proving the id reached build_memory_context.
+        let _ = build_context_scoped(&mem, "q", 0.0, Some("cron:job1")).await;
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec![Some("cron:job1".to_string()), None],
+        );
+
+        calls.lock().unwrap().clear();
+
+        // Unscoped: exactly one global read, as before.
+        let _ = build_context(&mem, "q", 0.0).await;
+        assert_eq!(calls.lock().unwrap().clone(), vec![None]);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
