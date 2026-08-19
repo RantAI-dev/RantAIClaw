@@ -378,8 +378,12 @@ pub fn record_run(
     with_connection(config, |conn| {
         // Wrap INSERT + pruning DELETE in an explicit transaction so that
         // if the DELETE fails, the INSERT is rolled back and the run table
-        // cannot grow unboundedly.
-        let tx = conn.unchecked_transaction()?;
+        // cannot grow unboundedly. IMMEDIATE (not the default DEFERRED): this
+        // reads then writes, and two concurrent DEFERRED read→write
+        // transactions deadlock with a SQLITE_BUSY that busy_timeout cannot
+        // resolve. See sessions/store.rs.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
 
         tx.execute(
             "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
@@ -614,7 +618,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     restrict_db_permissions(&db_path);
 
     conn.execute_batch(
-        "PRAGMA foreign_keys = ON;
+        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
          CREATE TABLE IF NOT EXISTS cron_jobs (
             id               TEXT PRIMARY KEY,
             expression       TEXT NOT NULL,
@@ -653,18 +657,43 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     )
     .context("Failed to initialize cron schema")?;
 
-    add_column_if_missing(&conn, "schedule", "TEXT")?;
-    add_column_if_missing(&conn, "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
-    add_column_if_missing(&conn, "prompt", "TEXT")?;
-    add_column_if_missing(&conn, "name", "TEXT")?;
-    add_column_if_missing(&conn, "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
-    add_column_if_missing(&conn, "model", "TEXT")?;
-    add_column_if_missing(&conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(&conn, "delivery", "TEXT")?;
-    add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(&conn, "created_by", "TEXT")?;
+    migrate_cron_columns_once(&conn, &db_path)?;
 
     f(&conn)
+}
+
+/// Tracks which cron DB paths this process has already migrated, so the
+/// `add_column_if_missing` PRAGMA scans run once per DB path — not on every
+/// store call (the scheduler calls `due_jobs` every poll tick). A freshly
+/// created DB is already fully-formed by the `CREATE TABLE` above; migration
+/// only matters for legacy on-disk DBs from an older binary.
+static MIGRATED_CRON_DBS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
+
+fn migrate_cron_columns_once(conn: &Connection, db_path: &std::path::Path) -> Result<()> {
+    let set =
+        MIGRATED_CRON_DBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    {
+        let guard = set.lock().expect("cron migration lock poisoned");
+        if guard.contains(db_path) {
+            return Ok(());
+        }
+    }
+    add_column_if_missing(conn, "schedule", "TEXT")?;
+    add_column_if_missing(conn, "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
+    add_column_if_missing(conn, "prompt", "TEXT")?;
+    add_column_if_missing(conn, "name", "TEXT")?;
+    add_column_if_missing(conn, "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
+    add_column_if_missing(conn, "model", "TEXT")?;
+    add_column_if_missing(conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "delivery", "TEXT")?;
+    add_column_if_missing(conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "created_by", "TEXT")?;
+    set.lock()
+        .expect("cron migration lock poisoned")
+        .insert(db_path.to_path_buf());
+    Ok(())
 }
 
 #[cfg(test)]

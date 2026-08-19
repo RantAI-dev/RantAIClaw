@@ -115,12 +115,23 @@ pub async fn run(config: Config) -> Result<()> {
             ),
         }
 
-        let jobs = match due_jobs(&working, Utc::now()) {
-            Ok(jobs) => jobs,
-            Err(e) => {
-                crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
-                tracing::warn!("Scheduler query failed: {e}");
-                continue;
+        // rusqlite is blocking file I/O; run the poll query off the async worker
+        // so a lock stall can't park a runtime thread shared with gateway/channel
+        // work. Clone `working` in — it is reused below to spawn the batch.
+        let jobs = {
+            let cfg = working.clone();
+            match tokio::task::spawn_blocking(move || due_jobs(&cfg, Utc::now())).await {
+                Ok(Ok(jobs)) => jobs,
+                Ok(Err(e)) => {
+                    crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
+                    tracing::warn!("Scheduler query failed: {e}");
+                    continue;
+                }
+                Err(e) => {
+                    crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
+                    tracing::warn!("Scheduler due_jobs task failed: {e}");
+                    continue;
+                }
             }
         };
 
@@ -171,7 +182,7 @@ pub async fn run_job_manual(
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let status = if success { "ok" } else { "error" };
-    let _ = record_run(
+    if let Err(e) = record_run(
         config,
         &job.id,
         started_at,
@@ -179,8 +190,16 @@ pub async fn run_job_manual(
         status,
         Some(&output),
         duration_ms,
-    );
-    let _ = record_last_run(config, &job.id, finished_at, success, &output);
+    ) {
+        if crate::cron::get_job(config, &job.id).is_err() {
+            tracing::warn!(job_id = %job.id, "cron job deleted while running; run history not recorded");
+        } else {
+            tracing::warn!(job_id = %job.id, error = %e, "failed to record cron run history");
+        }
+    }
+    if let Err(e) = record_last_run(config, &job.id, finished_at, success, &output) {
+        tracing::warn!(job_id = %job.id, error = %e, "failed to record cron last-run fields");
+    }
     (success, output)
 }
 
@@ -356,15 +375,37 @@ async fn persist_job_result(
     // Record the EXECUTION outcome first. `last_status` / the `cron_runs` row
     // describe whether the JOB ran — delivery is a separate concern and must
     // never flip this (a chat hiccup is not a job failure).
-    let _ = record_run(
-        config,
-        &job.id,
-        started_at,
-        finished_at,
-        if success { "ok" } else { "error" },
-        Some(output),
-        duration_ms,
-    );
+    {
+        let cfg = config.clone();
+        let job_id = job.id.clone();
+        let status = if success { "ok" } else { "error" };
+        let out = output.to_string();
+        match tokio::task::spawn_blocking(move || {
+            record_run(
+                &cfg,
+                &job_id,
+                started_at,
+                finished_at,
+                status,
+                Some(&out),
+                duration_ms,
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if crate::cron::get_job(config, &job.id).is_err() {
+                    tracing::warn!(job_id = %job.id, "cron job deleted while running; run history not recorded");
+                } else {
+                    tracing::warn!(job_id = %job.id, error = %e, "failed to record cron run history");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %job.id, error = %e, "failed to join cron record_run task");
+            }
+        }
+    }
 
     // Deliver only a job that actually succeeded and whose output is not a
     // security refusal. A refused job's output is the rejected command text +
@@ -395,29 +436,56 @@ async fn persist_job_result(
 
     if is_one_shot(job) {
         if job.delete_after_run && success {
-            if let Err(e) = remove_job(config, &job.id) {
-                tracing::warn!("Failed to remove one-shot cron job after success: {e}");
+            let cfg = config.clone();
+            let job_id = job.id.clone();
+            match tokio::task::spawn_blocking(move || remove_job(&cfg, &job_id)).await {
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to remove one-shot cron job after success: {e}");
+                }
+                Err(e) => tracing::warn!("Failed to join cron remove_job task: {e}"),
+                Ok(Ok(())) => {}
             }
         } else {
             // Not opted into auto-delete (or it failed): keep the row for history
             // but disable it so the poller can't re-fire this already-past `At`.
-            let _ = record_last_run(config, &job.id, finished_at, success, output);
-            if let Err(e) = update_job(
-                config,
-                &job.id,
-                CronJobPatch {
-                    enabled: Some(false),
-                    ..CronJobPatch::default()
-                },
-            ) {
-                tracing::warn!("Failed to disable one-shot cron job: {e}");
+            if let Err(e) = record_last_run(config, &job.id, finished_at, success, output) {
+                tracing::warn!(job_id = %job.id, error = %e, "failed to record cron last-run fields");
+            }
+            let cfg = config.clone();
+            let job_id = job.id.clone();
+            match tokio::task::spawn_blocking(move || {
+                update_job(
+                    &cfg,
+                    &job_id,
+                    CronJobPatch {
+                        enabled: Some(false),
+                        ..CronJobPatch::default()
+                    },
+                )
+            })
+            .await
+            {
+                Ok(Err(e)) => tracing::warn!("Failed to disable one-shot cron job: {e}"),
+                Err(e) => tracing::warn!("Failed to join cron update_job task: {e}"),
+                Ok(Ok(_)) => {}
             }
         }
         return success;
     }
 
-    if let Err(e) = reschedule_after_run(config, job, success, output) {
-        tracing::warn!("Failed to persist scheduler run result: {e}");
+    {
+        let cfg = config.clone();
+        let job_clone = job.clone();
+        let out = output.to_string();
+        match tokio::task::spawn_blocking(move || {
+            reschedule_after_run(&cfg, &job_clone, success, &out)
+        })
+        .await
+        {
+            Ok(Err(e)) => tracing::warn!("Failed to persist scheduler run result: {e}"),
+            Err(e) => tracing::warn!("Failed to join cron reschedule task: {e}"),
+            Ok(Ok(())) => {}
+        }
     }
 
     success
@@ -1280,6 +1348,27 @@ mod tests {
         );
         assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
         assert_eq!(after.last_status.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn run_job_manual_survives_missing_job_row() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        // A job value whose row was never inserted: recording its run fails the FK
+        // INSERT internally, but that must not fail the run or panic. (Logging is a
+        // side-effect this test does not assert; the branch choice is covered by
+        // the grep-based done criteria in the plan.) A unique id avoids colliding
+        // with another test's process-wide in-flight claim on the shared "test-job".
+        let mut job = test_job("echo ok");
+        job.id = "missing-row-probe".into();
+
+        let (ok, output) = run_job_manual(&config, &security, &job).await;
+        assert!(ok, "the command ran successfully");
+        assert!(output.contains("ok"));
+        // No run row exists because the parent job row is absent — the write
+        // failure was logged and swallowed here, not propagated.
+        assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
     }
 
     #[tokio::test]
