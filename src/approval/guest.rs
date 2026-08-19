@@ -50,6 +50,11 @@ impl GuestGate {
     ///         the sub-agent is allowed runs unconstrained — a full bypass;
     ///       - `ssh` / `pty` run arbitrary commands on a remote host / live tmux
     ///         session and don't carry a glob-checkable single command;
+    ///       - `cron_add` / `cron_update` persist an **agent** job whose later
+    ///         scheduled run calls `crate::agent::run(...)` with the full toolset
+    ///         and NO guest gate — the same deferred sub-loop bypass as
+    ///         `delegate`, just fired later; `cron_run` triggers that run
+    ///         immediately. Read-only `cron_list` / `cron_runs` stay allowed;
     ///   * it injects instructions into the system prompt for every later turn,
     ///     which this per-turn gate can't later constrain:
     ///       - `author_skill` / `skills_install` write a new skill (local
@@ -66,6 +71,9 @@ impl GuestGate {
         "author_skill",
         "skills_install",
         "skills_install_deps",
+        "cron_add",
+        "cron_update",
+        "cron_run",
     ];
 
     /// Whether a guest may invoke `tool` at all. Owner-only tools are always
@@ -265,6 +273,32 @@ mod tests {
             let reason = g.deny_reason(tool, &json!({})).unwrap();
             assert!(reason.contains("owner-only"), "{tool}: {reason}");
         }
+    }
+
+    #[test]
+    fn guest_denied_cron_mutation_tools_but_allowed_read_only() {
+        // Owner (mis)configured all five cron tools into guest_allowed_tools.
+        let g = GuestGate::new(
+            std::iter::empty::<String>(),
+            &[
+                "cron_add".to_string(),
+                "cron_update".to_string(),
+                "cron_run".to_string(),
+                "cron_list".to_string(),
+                "cron_runs".to_string(),
+            ],
+            &[],
+        );
+        // The three mutation/trigger tools stay owner-only even when allowlisted:
+        // each persists or fires an agent job whose scheduled run has no guest gate.
+        for tool in ["cron_add", "cron_update", "cron_run"] {
+            assert!(!g.tool_permitted(tool), "{tool} must stay owner-only");
+            let reason = g.deny_reason(tool, &json!({})).unwrap();
+            assert!(reason.contains("owner-only"), "{tool}: {reason}");
+        }
+        // Read-only cron tools must remain usable by guests when allowlisted.
+        assert!(g.tool_permitted("cron_list"));
+        assert!(g.tool_permitted("cron_runs"));
     }
 
     #[test]
