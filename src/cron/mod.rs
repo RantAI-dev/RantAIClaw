@@ -238,9 +238,10 @@ fn add_scheduled(
             model,
             None,
             delete_after_run,
+            Some("cli"),
         )
     } else {
-        add_shell_job(config, None, schedule, payload)
+        add_shell_job(config, None, schedule, payload, Some("cli"))
     }
 }
 
@@ -305,7 +306,7 @@ pub fn add_once_at(
     command: &str,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job(config, None, schedule, command)
+    add_shell_job(config, None, schedule, command, Some("cli"))
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {
@@ -376,6 +377,7 @@ mod tests {
                 tz: tz.map(Into::into),
             },
             cmd,
+            None,
         )
         .unwrap()
     }
@@ -498,6 +500,7 @@ mod tests {
                 tz: None,
             },
             "echo original",
+            None,
         )
         .unwrap();
 
@@ -615,6 +618,7 @@ mod tests {
                 tz: None,
             },
             "echo cli-run",
+            None,
         )
         .unwrap();
         let out = run_job_report(&config, &job.id).await.unwrap();
@@ -634,6 +638,7 @@ mod tests {
                 tz: None,
             },
             "echo x",
+            None,
         )
         .unwrap();
         record_run(&config, &job.id, Utc::now(), Utc::now(), "ok", Some("x"), 3).unwrap();

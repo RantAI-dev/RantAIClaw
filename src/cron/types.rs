@@ -133,6 +133,10 @@ pub struct CronJob {
     pub last_run: Option<DateTime<Utc>>,
     pub last_status: Option<String>,
     pub last_output: Option<String>,
+    /// Origin label of whoever created the job (`"cli"`, `"tui"`, `"agent-tool"`,
+    /// the gateway principal, …). `None` for rows written before this column
+    /// existed. Used to scope a scheduled agent job's capability ceiling.
+    pub created_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -173,7 +173,7 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     return Ok(blocked);
                 }
 
-                cron::add_shell_job(&self.config, name, schedule, command)
+                cron::add_shell_job(&self.config, name, schedule, command, Some("agent-tool"))
             }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
@@ -248,6 +248,7 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     model,
                     delivery,
                     delete_after_run,
+                    Some("agent-tool"),
                 )
             }
         };

@@ -122,6 +122,26 @@ fn ensure_cron_enabled(cfg: &crate::config::Config) -> Result<(), ApiError> {
     }
 }
 
+fn err_403(msg: impl std::fmt::Display) -> ApiError {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "forbidden", "detail": msg.to_string() })),
+    )
+}
+
+/// Whether an **agent** cron job may be created over the HTTP surface.
+///
+/// A scheduled agent job later runs the full local toolset; `check_auth` only
+/// proves possession of a pairing token, which does not imply owner identity and
+/// carries no per-request sender. So this fails closed: agent-job creation over
+/// HTTP is allowed only on a single-operator install (`approval_owners` empty,
+/// where the console token IS the operator). With owners configured, the job must
+/// be created from an owner channel or the CLI instead. (Shell jobs are separately
+/// command-gated and unaffected.)
+fn agent_job_creation_allowed(approval_owners: &[String]) -> bool {
+    approval_owners.is_empty()
+}
+
 // ── GET /cron ────────────────────────────────────────────────────────────────
 async fn list_cron(
     State(state): State<AppState>,
@@ -239,6 +259,14 @@ async fn create_cron(
                 .clone()
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| err_400("agent job requires a non-empty 'prompt'"))?;
+            // A scheduled agent job runs the full local toolset; fail closed when
+            // owners are configured (a pairing token does not prove owner identity).
+            if !agent_job_creation_allowed(&cfg.channels_config.approval_owners) {
+                return Err(err_403(
+                    "agent cron jobs cannot be created over HTTP when approval_owners is \
+                     configured; create it from an owner channel or the CLI",
+                ));
+            }
             let target = body
                 .session_target
                 .as_deref()
@@ -263,6 +291,7 @@ async fn create_cron(
                     model,
                     delivery,
                     delete_after,
+                    Some("gateway"),
                 )
             })
             .await
@@ -285,10 +314,12 @@ async fn create_cron(
                 )));
             }
             let (name, schedule) = (body.name.clone(), body.schedule.clone());
-            tokio::task::spawn_blocking(move || cron::add_shell_job(&cfg, name, schedule, &command))
-                .await
-                .map_err(err_500)?
-                .map_err(err_400)?
+            tokio::task::spawn_blocking(move || {
+                cron::add_shell_job(&cfg, name, schedule, &command, Some("gateway"))
+            })
+            .await
+            .map_err(err_500)?
+            .map_err(err_400)?
         }
     };
     Ok(Json(serde_json::to_value(job).map_err(err_500)?))
@@ -464,6 +495,14 @@ mod tests {
         let mut cfg = crate::config::Config::default();
         cfg.cron.enabled = true;
         assert!(ensure_cron_enabled(&cfg).is_ok());
+    }
+
+    #[test]
+    fn agent_job_creation_allowed_only_without_owners() {
+        // Single-operator install: the console token is the operator.
+        assert!(agent_job_creation_allowed(&[]));
+        // Owners configured: agent-job creation over HTTP fails closed.
+        assert!(!agent_job_creation_allowed(&["owner-a".to_string()]));
     }
 
     #[test]
