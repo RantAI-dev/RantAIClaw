@@ -638,23 +638,55 @@ fn forbidden_path_argument(security: &SecurityPolicy, command: &str) -> Option<S
 
         for token in &tokens[idx..] {
             let candidate = strip_wrapping_quotes(token);
-            if candidate.is_empty() || candidate.starts_with('-') || candidate.contains("://") {
+            if candidate.is_empty() || candidate.contains("://") {
                 continue;
             }
 
-            let looks_like_path = candidate.starts_with('/')
-                || candidate.starts_with("./")
-                || candidate.starts_with("../")
-                || candidate.starts_with("~/")
-                || candidate.contains('/');
+            if candidate.starts_with('-') {
+                // A forbidden path can hide in a flag VALUE — `--file=/etc/shadow`
+                // or glued to a short flag as `-o/etc/passwd` — which the old
+                // blanket skip of any `-`-token let straight through. Inspect the
+                // value portion so it faces the same path check as a bare token.
+                if let Some((_, value)) = candidate.split_once('=') {
+                    let value = strip_wrapping_quotes(value);
+                    if path_is_forbidden(security, value) {
+                        return Some(value.to_string());
+                    }
+                } else if let Some(stripped) = candidate.strip_prefix('-') {
+                    // Glued short flag (single leading dash, no `=`): the value is
+                    // the remainder after the flag letter. A long flag (`--x`) has
+                    // no glued value, so skip it.
+                    if !stripped.starts_with('-') {
+                        if let Some(rest) = stripped.get(1..) {
+                            let rest = strip_wrapping_quotes(rest);
+                            if path_is_forbidden(security, rest) {
+                                return Some(rest.to_string());
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
 
-            if looks_like_path && !security.is_path_allowed(candidate) {
+            if path_is_forbidden(security, candidate) {
                 return Some(candidate.to_string());
             }
         }
     }
 
     None
+}
+
+/// Whether `s` looks like a path and is not admitted by the security policy.
+/// Shared by the bare-token and flag-value branches of the forbidden-path guard
+/// so the two cannot drift apart.
+fn path_is_forbidden(security: &SecurityPolicy, s: &str) -> bool {
+    let looks_like_path = s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with("~/")
+        || s.contains('/');
+    looks_like_path && !security.is_path_allowed(s)
 }
 
 /// Apply a wall-clock timeout to a job future, returning a uniform timed-out
@@ -1004,6 +1036,55 @@ mod tests {
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
         assert!(output.contains("/etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_forbidden_path_in_long_flag_value() {
+        // A forbidden path hidden in a `--flag=value` must be caught, not skipped
+        // as an ordinary flag.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat --file=/etc/shadow");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("forbidden path argument"), "{output}");
+        assert!(output.contains("/etc/shadow"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_forbidden_path_in_glued_short_flag() {
+        // `-o/etc/passwd` glues the path to a short flag.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat -o/etc/passwd");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        assert!(output.contains("forbidden path argument"), "{output}");
+        assert!(output.contains("/etc/passwd"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn run_job_command_allows_workspace_path_in_flag_value() {
+        // Negative control: a workspace-relative path in a flag value must NOT be
+        // refused as a forbidden path (guards against over-blocking). The `./`
+        // prefix makes it path-shaped so the value actually reaches is_path_allowed.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["cat".into()];
+        let job = test_job("cat --file=./notes.txt");
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (_success, output) = run_job_command(&config, &security, &job).await;
+        assert!(
+            !output.contains("forbidden path argument"),
+            "a workspace path must not be blocked: {output}"
+        );
     }
 
     #[tokio::test]
