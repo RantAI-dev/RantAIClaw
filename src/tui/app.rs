@@ -3494,8 +3494,10 @@ impl TuiApp {
                     }
                 };
                 let cfg = config.clone();
+                let security =
+                    crate::security::SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir);
                 tokio::spawn(async move {
-                    let _ = crate::cron::scheduler::run_job_manual(&cfg, &job).await;
+                    let _ = crate::cron::scheduler::run_job_manual(&cfg, &security, &job).await;
                 });
                 self.cron_system_msg(&format!(
                     "▶ Started run of cron job {id} — reopen the job for the result."

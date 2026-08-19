@@ -237,7 +237,9 @@ fn print_added(job: &CronJob) {
 /// `Result` would trip `clippy::missing_errors_doc` under the pedantic gate.
 async fn run_job_report(config: &Config, id: &str) -> Result<String> {
     let job = get_job(config, id)?;
-    let (ok, output) = crate::cron::scheduler::run_job_manual(config, &job).await;
+    let security =
+        crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    let (ok, output) = crate::cron::scheduler::run_job_manual(config, &security, &job).await;
     Ok(format!(
         "{} cron job {id} ({})\n{}",
         if ok { "✅" } else { "✗" },
