@@ -15,7 +15,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::Arc;
 
 // ── Types ────────────────────────────────────────────────────────
@@ -322,6 +322,12 @@ pub fn default_backend_for(channel_name: &str) -> Box<dyn ApprovalBackend> {
 
 /// Display the approval prompt and read user input from stdin.
 fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
+    // No interactive approver present (systemd stdin=null, piped input, or a
+    // scheduled/headless run that reached this path by mistake): never block on
+    // a read that cannot be answered — auto-deny, matching AutoDenyBackend.
+    if !io::stdin().is_terminal() {
+        return ApprovalResponse::No;
+    }
     let summary = summarize_args(&request.arguments);
     eprintln!();
     eprintln!("🔧 Agent wants to execute: {}", request.tool_name);
@@ -798,5 +804,35 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");
+    }
+
+    /// The headless surface (`"scheduler"`) selects the auto-deny backend, which
+    /// decides `No` without touching stdin — so a scheduled agent job that hits
+    /// an approval-required tool is denied, never blocked.
+    #[tokio::test]
+    async fn scheduler_surface_auto_denies_without_hanging() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let request = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({ "command": "echo hi" }),
+        };
+        let backend = default_backend_for("scheduler");
+        assert_eq!(backend.decide(&mgr, &request).await, ApprovalResponse::No);
+    }
+
+    /// Defense-in-depth: even the interactive backend refuses to block on a read
+    /// that cannot be answered when stdin is not a terminal (systemd, piped, or a
+    /// headless run routed here by mistake).
+    #[test]
+    fn cli_prompt_denies_when_stdin_not_a_terminal() {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            return; // interactive run: the guard only fires for non-TTY stdin
+        }
+        let request = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({ "command": "echo hi" }),
+        };
+        assert_eq!(prompt_cli_interactive(&request), ApprovalResponse::No);
     }
 }
