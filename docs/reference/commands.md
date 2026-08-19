@@ -145,7 +145,7 @@ Notes:
 
 - `--agent` creates an AGENT job — the positional is the prompt, not a shell command. `--model` overrides the model for an agent job (ignored for shell jobs). Example: `rantaiclaw cron add --agent '0 9 * * *' 'Summarize overnight emails' --model claude-opus-4-8`.
 - `cron run` reuses the same manual-run path as the `cron_run` tool and the web `POST /api/v1/cron/{id}/run`: it records to run history but does not shift the schedule or consume a one-shot.
-- Mutating schedule/cron actions require `cron.enabled = true`.
+- Mutating schedule/cron actions (CLI `cron add/add-at/add-every/once/update/remove/pause/resume/run`, the `cron_*` tools, and the `POST`/`PUT`/`DELETE` `/api/v1/cron*` endpoints) require `cron.enabled = true`; when it is false they are refused. Listing and run history stay readable. If `scheduler.enabled = false`, jobs persist but never fire — `cron list` shows a "scheduler disabled" banner.
 - Shell command payloads for schedule creation (`create` / `add` / `once`) are validated by security command policy before job persistence.
 
 #### HTTP control (`/api/v1/cron*`)
