@@ -1,6 +1,6 @@
 use crate::cron::Schedule;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, LocalResult, NaiveDate, TimeZone, Utc};
 use cron::Schedule as CronExprSchedule;
 use std::str::FromStr;
 
@@ -38,11 +38,64 @@ pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result
     }
 }
 
+/// Scan up to ~400 days of upcoming occurrences for a tz-qualified cron schedule
+/// and return the local dates whose scheduled wall-clock time does not exist
+/// because of a DST spring-forward gap. Coarse schedules (daily/weekly) are fully
+/// covered; a very-high-frequency schedule is bounded by the iteration cap and
+/// may not reach the DST date (a single skipped instance there is immaterial).
+fn dst_skipped_dates(expr: &str, tz_name: &str, from: DateTime<Utc>) -> Result<Vec<NaiveDate>> {
+    const MAX_PROBE_DAYS: i64 = 400;
+    const MAX_PROBE_ITERS: usize = 5_000;
+
+    let normalized = normalize_expression(expr)?;
+    let cron = CronExprSchedule::from_str(&normalized)
+        .with_context(|| format!("Invalid cron expression: {expr}"))?;
+    let tz = chrono_tz::Tz::from_str(tz_name)
+        .with_context(|| format!("Invalid IANA timezone: {tz_name}"))?;
+
+    let horizon = from + ChronoDuration::days(MAX_PROBE_DAYS);
+    let mut skipped: Vec<NaiveDate> = Vec::new();
+
+    // Enumerate in the UTC frame: each occurrence's naive Y-M-D H:M:S equals the
+    // intended local wall-clock fields (02:00 stays 02:00 regardless of frame).
+    for occ in cron.after(&from).take(MAX_PROBE_ITERS) {
+        if occ > horizon {
+            break;
+        }
+        let naive = occ.naive_utc();
+        if let LocalResult::None = tz.from_local_datetime(&naive) {
+            let date = naive.date();
+            if skipped.last() != Some(&date) {
+                skipped.push(date);
+            }
+        }
+    }
+    Ok(skipped)
+}
+
 pub fn validate_schedule(schedule: &Schedule, now: DateTime<Utc>) -> Result<()> {
     match schedule {
-        Schedule::Cron { expr, .. } => {
+        Schedule::Cron { expr, tz } => {
             let _ = normalize_expression(expr)?;
             let _ = next_run_for_schedule(schedule, now)?;
+            if let Some(tz_name) = tz {
+                match dst_skipped_dates(expr, tz_name, now) {
+                    Ok(dates) => {
+                        for date in dates {
+                            tracing::warn!(
+                                target: "cron",
+                                expr = %expr,
+                                tz = %tz_name,
+                                date = %date,
+                                "cron schedule falls on a nonexistent local time (DST spring-forward); it will be skipped that day"
+                            );
+                        }
+                    }
+                    // Detection is best-effort; never fail validation because the
+                    // probe errored (the schedule itself already validated above).
+                    Err(e) => tracing::debug!(target: "cron", error = %e, "DST probe failed"),
+                }
+            }
             Ok(())
         }
         Schedule::At { at } => {
@@ -163,6 +216,45 @@ mod tests {
 
         let next = next_run_for_schedule(&schedule, from).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 2, 16, 17, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn tz_schedule_skips_nonexistent_local_time_on_spring_forward() {
+        // America/New_York springs forward 2026-03-08: 02:00 local does not
+        // exist. A `0 2 * * *` job must therefore skip 03-08 and next fire on
+        // 03-09. This documents the crate's skip behavior (the reason for the
+        // warning added by this plan); it holds before and after the fix.
+        let from = Utc.with_ymd_and_hms(2026, 3, 7, 12, 0, 0).unwrap();
+        let schedule = Schedule::Cron {
+            expr: "0 2 * * *".into(),
+            tz: Some("America/New_York".into()),
+        };
+        let next = next_run_for_schedule(&schedule, from).unwrap();
+        let ny: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        let next_local = next.with_timezone(&ny);
+        assert_eq!(
+            next_local.date_naive(),
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 9).unwrap(),
+            "spring-forward day 2026-03-08 must be skipped; got {next_local}"
+        );
+    }
+
+    #[test]
+    fn dst_skipped_dates_flags_spring_forward_and_ignores_safe_times() {
+        let from = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+
+        let skipped = dst_skipped_dates("0 2 * * *", "America/New_York", from).unwrap();
+        assert!(
+            skipped.contains(&chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap()),
+            "expected 2026-03-08 to be flagged, got {skipped:?}"
+        );
+
+        // Noon always exists → no gap.
+        let safe = dst_skipped_dates("0 12 * * *", "America/New_York", from).unwrap();
+        assert!(
+            !safe.contains(&chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap()),
+            "noon must never be flagged as a DST gap, got {safe:?}"
+        );
     }
 
     // Weekday numbering: crontab uses Sunday=0..Saturday=6 (7 also = Sunday),
