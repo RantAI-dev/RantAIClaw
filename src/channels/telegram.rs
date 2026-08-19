@@ -592,6 +592,20 @@ impl TelegramChannel {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
+    /// Format an error for logging with the bot token scrubbed. reqwest's
+    /// `Display` appends `" for url (…)"`, and every telegram request URL embeds
+    /// `/bot<token>/<method>`, so a raw `{e}` on a telegram request would leak
+    /// the token. Replacing the token literal removes it regardless of how
+    /// reqwest (or an anyhow wrapper) phrased the message. No-op on empty token.
+    fn scrub_token(&self, msg: impl std::fmt::Display) -> String {
+        let s = msg.to_string();
+        if self.bot_token.is_empty() {
+            s
+        } else {
+            s.replace(self.bot_token.as_str(), "<redacted>")
+        }
+    }
+
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
         let resp = self.http_client().get(self.api_url("getMe")).send().await?;
 
@@ -624,7 +638,7 @@ impl TelegramChannel {
                 Some(username)
             }
             Err(e) => {
-                tracing::warn!("Failed to fetch bot username: {e}");
+                tracing::warn!("Failed to fetch bot username: {}", self.scrub_token(&e));
                 None
             }
         }
@@ -2301,7 +2315,7 @@ impl Channel for TelegramChannel {
                     match result {
                         Ok(r) => r,
                         Err(e) => {
-                            tracing::warn!("Telegram poll error: {e}");
+                            tracing::warn!("Telegram poll error: {}", self.scrub_token(&e));
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             continue;
                         }
@@ -2312,7 +2326,7 @@ impl Channel for TelegramChannel {
             let data: serde_json::Value = match resp.json().await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("Telegram parse error: {e}");
+                    tracing::warn!("Telegram parse error: {}", self.scrub_token(&e));
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -2427,7 +2441,7 @@ Ensure only one `rantaiclaw` process is using this bot token."
         {
             Ok(Ok(resp)) => resp.status().is_success(),
             Ok(Err(e)) => {
-                tracing::debug!("Telegram health check failed: {e}");
+                tracing::debug!("Telegram health check failed: {}", self.scrub_token(&e));
                 false
             }
             Err(_) => {
@@ -2481,6 +2495,35 @@ Ensure only one `rantaiclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reqwest error's `Display` appends the request URL, which embeds
+    /// `/bot<token>/<method>`. `scrub_token` must remove the token literal from
+    /// any such error-shaped string before it reaches a log, and be a no-op when
+    /// the token is empty.
+    #[test]
+    fn scrub_token_removes_bot_token_from_error_text() {
+        // Neutral, non-real placeholder token per CLAUDE.md §9.1.
+        let token = "test_token_abc123";
+        let ch = TelegramChannel::new(token.into(), vec![], false);
+        let err_text = format!(
+            "error sending request for url (https://api.telegram.org/bot{token}/getUpdates)"
+        );
+
+        let scrubbed = ch.scrub_token(&err_text);
+        assert!(
+            !scrubbed.contains(token),
+            "token must not survive: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains(&format!("/bot{token}")),
+            "the /bot<token> segment must not survive: {scrubbed}"
+        );
+        assert!(scrubbed.contains("<redacted>"), "{scrubbed}");
+
+        // Empty token: nothing to scrub, message passes through unchanged.
+        let empty = TelegramChannel::new(String::new(), vec![], false);
+        assert_eq!(empty.scrub_token("plain message"), "plain message");
+    }
 
     // ── shared-store pairing (Task 4) ────────────────────────
 
