@@ -51,8 +51,9 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
-/// a small prefix for context.
-fn scrub_credentials(input: &str) -> String {
+/// a small prefix for context. `pub(crate)` so the cron store can reuse the same
+/// scrubber before persisting run history (plan 175) rather than reinventing one.
+pub(crate) fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {
             let full_match = &caps[0];

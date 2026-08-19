@@ -599,6 +599,20 @@ async fn run_job_command(
     .await
 }
 
+/// The first whitespace token of a shell command, reduced to its basename.
+/// Refusal messages are stored in run history and served over the API, so they
+/// identify the rejected *program* for debugging without echoing the full
+/// command line (whose arguments can carry secrets).
+fn program_basename(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+}
+
 async fn run_job_command_with_timeout(
     config: &Config,
     security: &SecurityPolicy,
@@ -623,8 +637,9 @@ async fn run_job_command_with_timeout(
         return (
             false,
             format!(
-                "blocked by security policy: command not allowed: {}",
-                job.command
+                "blocked by security policy: command not allowed (job {}, program `{}`)",
+                job.id,
+                program_basename(&job.command),
             ),
         );
     }
@@ -858,6 +873,17 @@ mod tests {
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("command not allowed"));
+        // The rejected program's basename is identifiable for debugging...
+        assert!(
+            output.contains("curl"),
+            "program name should survive: {output}"
+        );
+        // ...but the argument (a URL here, which could carry a token) is not
+        // echoed into stored, API-served run history.
+        assert!(
+            !output.contains("evil.example"),
+            "command arguments must not be echoed: {output}"
+        );
     }
 
     #[tokio::test]
