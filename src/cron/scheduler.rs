@@ -484,6 +484,11 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+    // Fail-safe for jobs written before the creation-time gate (plan 173 Step 1)
+    // or via a path it does not cover: never announce to an empty target.
+    if target.trim().is_empty() {
+        anyhow::bail!("delivery.to is empty; refusing to announce to an unspecified target");
+    }
 
     // Construction goes through the channels factory, so cron cannot drift from
     // what the runtime and the doctor build — these four were hand-rolled here
@@ -1364,5 +1369,22 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_rejects_empty_target() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+        // Announce on a supported channel but with a whitespace `to`: must error
+        // (fail-safe), never announce to an unspecified target.
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("telegram".into()),
+            to: Some("   ".into()),
+            best_effort: true,
+        };
+        let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
     }
 }
