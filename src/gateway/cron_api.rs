@@ -103,6 +103,25 @@ fn cfg_snapshot(state: &AppState) -> crate::config::Config {
     state.config.lock().clone()
 }
 
+fn err_409(msg: impl std::fmt::Display) -> ApiError {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": "cron_disabled", "detail": msg.to_string() })),
+    )
+}
+
+/// Refuse mutating cron operations when the cron feature switch is off — mirrors
+/// the agent-tool surface (every `cron_*` tool checks `cron.enabled`). Read
+/// endpoints (`list_cron`, `list_cron_runs`) deliberately stay open so an
+/// operator can still inspect dormant jobs.
+fn ensure_cron_enabled(cfg: &crate::config::Config) -> Result<(), ApiError> {
+    if cfg.cron.enabled {
+        Ok(())
+    } else {
+        Err(err_409("cron is disabled by config (cron.enabled=false)"))
+    }
+}
+
 // ── GET /cron ────────────────────────────────────────────────────────────────
 async fn list_cron(
     State(state): State<AppState>,
@@ -110,12 +129,21 @@ async fn list_cron(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let cfg = cfg_snapshot(&state);
+    // Capture the enable flags before `cfg` moves into the blocking task so the
+    // web console can render a "scheduler disabled" banner over dormant jobs.
+    let cron_enabled = cfg.cron.enabled;
+    let scheduler_enabled = cfg.scheduler.enabled;
     let jobs = tokio::task::spawn_blocking(move || cron::list_jobs(&cfg))
         .await
         .map_err(err_500)?
         .map_err(err_500)?;
     let count = jobs.len();
-    Ok(Json(json!({ "jobs": jobs, "count": count })))
+    Ok(Json(json!({
+        "jobs": jobs,
+        "count": count,
+        "cron_enabled": cron_enabled,
+        "scheduler_enabled": scheduler_enabled,
+    })))
 }
 
 // ── GET /cron/{id}/runs ──────────────────────────────────────────────────────
@@ -202,6 +230,7 @@ async fn create_cron(
     check_auth(&state, &headers)?;
     let kind = resolve_job_kind(&body)?;
     let cfg = cfg_snapshot(&state);
+    ensure_cron_enabled(&cfg)?;
 
     let job = match kind {
         JobType::Agent => {
@@ -296,6 +325,7 @@ async fn update_cron(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let cfg = cfg_snapshot(&state);
+    ensure_cron_enabled(&cfg)?;
     // Security-check a newly supplied shell command before persisting.
     if let Some(cmd) = body.command.as_deref().filter(|s| !s.trim().is_empty()) {
         let security = SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir);
@@ -331,6 +361,7 @@ async fn delete_cron(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let cfg = cfg_snapshot(&state);
+    ensure_cron_enabled(&cfg)?;
     let id_for_store = id.clone();
     let result = tokio::task::spawn_blocking(move || cron::remove_job(&cfg, &id_for_store))
         .await
@@ -357,6 +388,7 @@ async fn run_cron(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
     let cfg = cfg_snapshot(&state);
+    ensure_cron_enabled(&cfg)?;
     let cfg_for_get = cfg.clone();
     let id_for_get = id.clone();
     let job = tokio::task::spawn_blocking(move || cron::get_job(&cfg_for_get, &id_for_get))
@@ -417,6 +449,21 @@ mod tests {
             resolve_job_kind(&body(None, Some("echo hi"), None)).unwrap(),
             JobType::Shell
         );
+    }
+
+    #[test]
+    fn ensure_cron_enabled_refuses_when_disabled() {
+        let mut cfg = crate::config::Config::default();
+        cfg.cron.enabled = false;
+        let err = ensure_cron_enabled(&cfg).unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn ensure_cron_enabled_allows_when_enabled() {
+        let mut cfg = crate::config::Config::default();
+        cfg.cron.enabled = true;
+        assert!(ensure_cron_enabled(&cfg).is_ok());
     }
 
     #[test]

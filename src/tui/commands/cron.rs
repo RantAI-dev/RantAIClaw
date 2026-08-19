@@ -80,12 +80,19 @@ fn id_op(parts: &[&str], f: impl FnOnce(&str) -> anyhow::Result<String>, name: &
 }
 
 fn list_text(config: &Config) -> String {
+    let banner = if !config.cron.enabled {
+        "⚠️  Scheduler disabled (cron.enabled=false) — jobs will NOT fire.\n"
+    } else if !config.scheduler.enabled {
+        "⚠️  Scheduler loop disabled (scheduler.enabled=false) — jobs will NOT fire.\n"
+    } else {
+        ""
+    };
     match cron::list_jobs(config) {
         Ok(jobs) if jobs.is_empty() => {
-            "Scheduled tasks:\n  No cron jobs configured.\n\nUse /cron add <5-field-expr> <cmd> to create one.".to_string()
+            format!("{banner}Scheduled tasks:\n  No cron jobs configured.\n\nUse /cron add <5-field-expr> <cmd> to create one.")
         }
         Ok(jobs) => {
-            let mut out = format!("Scheduled tasks ({}):\n", jobs.len());
+            let mut out = format!("{banner}Scheduled tasks ({}):\n", jobs.len());
             for j in jobs {
                 let name = j
                     .name

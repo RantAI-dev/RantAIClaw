@@ -21,8 +21,34 @@ pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedul
 
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
+    // Mutating cron actions require the feature switch, mirroring the `cron_*`
+    // tools. Reads (List, Runs) stay open so an operator can inspect dormant jobs.
+    let mutating = matches!(
+        command,
+        crate::CronCommands::Add { .. }
+            | crate::CronCommands::AddAt { .. }
+            | crate::CronCommands::AddEvery { .. }
+            | crate::CronCommands::Once { .. }
+            | crate::CronCommands::Update { .. }
+            | crate::CronCommands::Remove { .. }
+            | crate::CronCommands::Pause { .. }
+            | crate::CronCommands::Resume { .. }
+            | crate::CronCommands::Run { .. }
+    );
+    if mutating && !config.cron.enabled {
+        bail!("cron is disabled by config (cron.enabled=false)");
+    }
     match command {
         crate::CronCommands::List => {
+            if !config.cron.enabled {
+                println!(
+                    "⚠️  Scheduler disabled (cron.enabled=false) — listed jobs will NOT fire until you re-enable it."
+                );
+            } else if !config.scheduler.enabled {
+                println!(
+                    "⚠️  Scheduler loop disabled (scheduler.enabled=false) — listed jobs will NOT fire until you re-enable it."
+                );
+            }
             let jobs = list_jobs(config)?;
             if jobs.is_empty() {
                 println!("No scheduled tasks yet.");
@@ -539,6 +565,42 @@ mod tests {
         assert_eq!(job.prompt.as_deref(), Some("Summarize overnight emails"));
         assert_eq!(job.model.as_deref(), Some("claude-opus-4-8"));
         assert!(job.command.is_empty());
+    }
+
+    #[test]
+    fn cron_add_refused_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.cron.enabled = false;
+        let err = handle_command(
+            crate::CronCommands::Add {
+                expression: "0 9 * * *".into(),
+                tz: None,
+                command: "echo hi".into(),
+                agent: false,
+                model: None,
+            },
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cron.enabled=false"),
+            "expected a disabled refusal, got: {err}"
+        );
+        assert!(
+            list_jobs(&config).unwrap().is_empty(),
+            "a refused add must persist nothing"
+        );
+    }
+
+    #[test]
+    fn cron_list_allowed_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.cron.enabled = false;
+        // Reads stay open even when cron is disabled, so an operator can inspect
+        // dormant jobs.
+        handle_command(crate::CronCommands::List, &config).unwrap();
     }
 
     #[tokio::test]
