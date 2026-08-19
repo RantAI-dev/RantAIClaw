@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cron weekday field now follows standard crontab numbering.** The `cron`
+  crate numbers weekdays the Quartz way (Sunday=1..Saturday=7); a 5-field
+  crontab expression was passed through without remapping, so every
+  weekday-constrained schedule fired one day early (`0 9 * * 1-5` ran Sun–Thu,
+  not Mon–Fri) and crontab-Sunday (`0`) was rejected outright. The weekday field
+  of 5-field expressions is now translated to the crate's numbering
+  (`0`/`7`=Sunday, `1`=Monday … `6`=Saturday), matching standard crontab and the
+  documented examples. **Behavior change:** existing weekday cron jobs shift by
+  one day (toward the crontab-correct day) on their next reschedule; no stored
+  data is migrated. 6- and 7-field crate-native expressions are unaffected.
+
 ## [0.22.3-alpha] — 2026-08-19
 
 One TUI setup fix and one dependency advisory bump. No config schema change —
