@@ -383,7 +383,7 @@ async fn run_cron(
         }
     }
 
-    let (success, output) = cron::scheduler::run_job_manual(&cfg, &job).await;
+    let (success, output) = cron::scheduler::run_job_manual(&cfg, &security, &job).await;
     Ok(Json(
         json!({ "id": job.id, "success": success, "output": output }),
     ))

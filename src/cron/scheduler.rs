@@ -129,9 +129,12 @@ pub async fn run(config: Config) -> Result<()> {
     }
 }
 
-pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
-    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    execute_job_with_retry(config, &security, job).await
+pub async fn execute_job_now(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
+    execute_job_with_retry(config, security, job).await
 }
 
 /// Force-run a job now: execute + record run history + update
@@ -139,7 +142,11 @@ pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
 /// NOT reschedule, auto-delete one-shots, or run delivery — a manual run is for
 /// testing and must not shift the schedule or consume a one-shot. Callers must
 /// enforce their own security/approval gate before calling.
-pub async fn run_job_manual(config: &Config, job: &CronJob) -> (bool, String) {
+pub async fn run_job_manual(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
     // Claim the shared in-flight registry so a second "run now" (or an overlapping
     // scheduled tick) can't double-execute the same job. The guard releases the
     // claim on drop, including on panic/cancel. An already-running job returns a
@@ -148,7 +155,7 @@ pub async fn run_job_manual(config: &Config, job: &CronJob) -> (bool, String) {
         return (false, format!("cron job '{}' is already running", job.id));
     };
     let started_at = Utc::now();
-    let (success, output) = execute_job_now(config, job).await;
+    let (success, output) = execute_job_now(config, security, job).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let status = if success { "ok" } else { "error" };
@@ -1051,12 +1058,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         // While the job is claimed (simulating an in-flight run), a manual run
         // must refuse and record NO run row.
         {
             let _held = InFlightGuard::claim(&job.id).expect("fresh id must claim");
-            let (success, output) = run_job_manual(&config, &job).await;
+            let (success, output) = run_job_manual(&config, &security, &job).await;
             assert!(!success, "a concurrent manual run must not execute");
             assert!(
                 output.contains("already running"),
@@ -1068,7 +1076,7 @@ mod tests {
             );
         }
         // Claim released → a manual run now executes and records exactly one row.
-        let (success, _) = run_job_manual(&config, &job).await;
+        let (success, _) = run_job_manual(&config, &security, &job).await;
         assert!(success);
         assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
     }
@@ -1215,7 +1223,8 @@ mod tests {
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         let before = cron::get_job(&config, &job.id).unwrap().next_run;
 
-        let (ok, _) = run_job_manual(&config, &job).await;
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let (ok, _) = run_job_manual(&config, &security, &job).await;
         assert!(ok);
 
         let after = cron::get_job(&config, &job.id).unwrap();

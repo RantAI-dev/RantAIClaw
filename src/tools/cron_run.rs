@@ -111,7 +111,8 @@ impl Tool for CronRunTool {
             });
         }
 
-        let (success, output) = cron::scheduler::run_job_manual(&self.config, &job).await;
+        let (success, output) =
+            cron::scheduler::run_job_manual(&self.config, &self.security, &job).await;
         let status = if success { "ok" } else { "error" };
 
         Ok(ToolResult {
@@ -168,6 +169,44 @@ mod tests {
 
         let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_allow_grant_reaches_a_manual_run() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        // Empty boot allowlist + Supervised: only a runtime /allow grant can
+        // permit the command.
+        config.autonomy.allowed_commands = vec![];
+        config.autonomy.level = AutonomyLevel::Supervised;
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
+        let cfg = Arc::new(config);
+
+        // Grant `true` (a real low-risk binary, no path args) at runtime on the
+        // long-lived policy the tool holds. Pre-fix, the manual run built a fresh
+        // policy without this grant and blocked the command; the fix threads this
+        // instance through, so the grant reaches execution.
+        let security = Arc::new(SecurityPolicy::from_config(
+            &cfg.autonomy,
+            &cfg.workspace_dir,
+        ));
+        security.add_runtime_command("true", false).unwrap();
+
+        let job = cron::add_job(&cfg, "*/5 * * * *", "true").unwrap();
+        let tool = CronRunTool::new(cfg.clone(), security);
+
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(
+            result.success,
+            "a runtime /allow grant must reach the manual run: {:?} / {}",
+            result.error, result.output
+        );
     }
 
     #[tokio::test]
