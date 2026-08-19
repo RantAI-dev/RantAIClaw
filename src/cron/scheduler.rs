@@ -327,22 +327,16 @@ async fn run_agent_job(
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
-    mut success: bool,
+    success: bool,
     output: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
 
-    if let Err(e) = deliver_if_configured(config, job, output).await {
-        if job.delivery.best_effort {
-            tracing::warn!("Cron delivery failed (best_effort): {e}");
-        } else {
-            success = false;
-            tracing::warn!("Cron delivery failed: {e}");
-        }
-    }
-
+    // Record the EXECUTION outcome first. `last_status` / the `cron_runs` row
+    // describe whether the JOB ran — delivery is a separate concern and must
+    // never flip this (a chat hiccup is not a job failure).
     let _ = record_run(
         config,
         &job.id,
@@ -352,6 +346,33 @@ async fn persist_job_result(
         Some(output),
         duration_ms,
     );
+
+    // Deliver only a job that actually succeeded and whose output is not a
+    // security refusal. A refused job's output is the rejected command text +
+    // policy internals; announcing it verbatim would leak it into the configured
+    // chat. Delivery is best-effort: its failure is logged, never recorded as a
+    // job error.
+    if success && !is_security_refusal(output) {
+        if let Err(e) = deliver_if_configured(config, job, output).await {
+            if job.delivery.best_effort {
+                tracing::warn!("Cron delivery failed (best_effort): {e}");
+            } else {
+                tracing::warn!("Cron delivery failed: {e}");
+            }
+        }
+    } else if job.delivery.mode.eq_ignore_ascii_case("announce") {
+        // Announce was requested but withheld: never push failed/refused output
+        // into chat. Stated once, without the raw output.
+        tracing::warn!(
+            "Cron job '{}' output withheld from delivery ({})",
+            job.id,
+            if is_security_refusal(output) {
+                "security refusal"
+            } else {
+                "job failed"
+            }
+        );
+    }
 
     if is_one_shot(job) {
         if job.delete_after_run && success {
@@ -417,6 +438,17 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
             job.id
         );
     }
+}
+
+/// The scheduled path's security refusals (autonomy read-only, rate limit,
+/// command not allowed, risk gate, forbidden path, budget) all begin with this
+/// exact prefix (see `run_job_command_with_timeout`). Delivery must never push
+/// such a string into a chat: it carries the rejected command text and policy
+/// internals.
+const SECURITY_REFUSAL_PREFIX: &str = "blocked by security policy:";
+
+fn is_security_refusal(output: &str) -> bool {
+    output.starts_with(SECURITY_REFUSAL_PREFIX)
 }
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
@@ -1056,6 +1088,73 @@ mod tests {
         assert_eq!(runs.len(), 1);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert_eq!(updated.last_status.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_delivery_failure_does_not_mark_job_errored() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        // Announce to a telegram channel NOT configured in the test Config, so
+        // deliver_if_configured returns Err. With best_effort=false this used to
+        // flip the recorded status to "error" for a job that executed fine.
+        let mut job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("telegram".into()),
+            to: Some("123".into()),
+            best_effort: false,
+        };
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success =
+            persist_job_result(&config, &job, true, "job ran fine", started, finished).await;
+        assert!(success, "a delivery failure must not fail the job");
+        assert_eq!(
+            cron::get_job(&config, &job.id)
+                .unwrap()
+                .last_status
+                .as_deref(),
+            Some("ok"),
+            "recorded status must reflect execution, not delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_does_not_deliver_a_security_refusal() {
+        // The marker is this test's teeth. (The full "delivery is not invoked on
+        // a refusal" behaviour isn't isolatable in this unit harness without a
+        // delivery spy; the marker plus the success/refusal gate in
+        // persist_job_result are what suppress it.)
+        assert!(is_security_refusal(
+            "blocked by security policy: command not allowed: example"
+        ));
+        assert!(!is_security_refusal("all good"));
+
+        // Documentation (holds before and after the fix): a refused job records
+        // "error" and returns false.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+        let success = persist_job_result(
+            &config,
+            &job,
+            false,
+            "blocked by security policy: command not allowed: example",
+            started,
+            finished,
+        )
+        .await;
+        assert!(!success);
+        assert_eq!(
+            cron::get_job(&config, &job.id)
+                .unwrap()
+                .last_status
+                .as_deref(),
+            Some("error")
+        );
     }
 
     #[tokio::test]
