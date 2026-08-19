@@ -148,12 +148,6 @@ ask which configured channel to deliver to — do not imply a message will arriv
             }
         };
 
-        let default_delete_after_run = matches!(schedule, Schedule::At { .. });
-        let delete_after_run = args
-            .get("delete_after_run")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(default_delete_after_run);
-
         let result = match job_type {
             JobType::Shell => {
                 let command = match args.get("command").and_then(serde_json::Value::as_str) {
@@ -225,6 +219,21 @@ ask which configured channel to deliver to — do not imply a message will arriv
                     },
                     None => None,
                 };
+
+                // Auto-delete a fired one-shot only when its output was delivered
+                // to the user another way (announce delivery). Without delivery,
+                // the ONLY record of the output is the run-history row — deleting
+                // the job would cascade that row away (cron_runs FK ON DELETE
+                // CASCADE), so keep+disable instead. An explicit `delete_after_run`
+                // in the args still overrides.
+                let delivered = delivery
+                    .as_ref()
+                    .is_some_and(|d| d.mode.eq_ignore_ascii_case("announce"));
+                let default_delete_after_run = matches!(schedule, Schedule::At { .. }) && delivered;
+                let delete_after_run = args
+                    .get("delete_after_run")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(default_delete_after_run);
 
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
@@ -307,6 +316,59 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn agent_oneshot_without_delivery_keeps_run_history() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "at", "at": at },
+                "job_type": "agent",
+                "prompt": "remind me"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let v: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let id = v["id"].as_str().unwrap();
+        let job = crate::cron::get_job(&cfg, id).unwrap();
+        assert!(
+            !job.delete_after_run,
+            "a no-delivery agent one-shot must NOT auto-delete (would cascade away its run history)"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_oneshot_with_announce_delivery_still_auto_deletes() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "at", "at": at },
+                "job_type": "agent",
+                "prompt": "remind me",
+                "delivery": { "mode": "announce", "channel": "telegram", "to": "123" }
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let v: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let id = v["id"].as_str().unwrap();
+        let job = crate::cron::get_job(&cfg, id).unwrap();
+        assert!(
+            job.delete_after_run,
+            "an announce-delivery one-shot should still auto-delete (output already reached the user)"
+        );
     }
 
     #[tokio::test]
