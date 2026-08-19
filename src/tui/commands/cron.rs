@@ -106,12 +106,12 @@ fn list_text(config: &Config) -> String {
                 let _ = write!(
                     out,
                     "  {} [{}] {} · next {} · {}\n    {}\n",
-                    name,
+                    crate::memory::sanitize::sanitize_for_terminal(&name),
                     if j.enabled { "on" } else { "paused" },
-                    j.expression,
+                    crate::memory::sanitize::sanitize_for_terminal(&j.expression),
                     j.next_run.to_rfc3339(),
                     j.last_status.as_deref().unwrap_or("never run"),
-                    what,
+                    crate::memory::sanitize::sanitize_for_terminal(&what),
                 );
             }
             out

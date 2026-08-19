@@ -142,6 +142,20 @@ fn agent_job_creation_allowed(approval_owners: &[String]) -> bool {
     approval_owners.is_empty()
 }
 
+/// Reject a schedule `name` containing control characters. A name has no
+/// legitimate newline/tab need, and it is later rendered into the operator's
+/// terminal/TUI by `cron list` / the TUI — an embedded escape sequence could
+/// rewrite printed lines or spoof an audit. Rejecting at the API boundary keeps
+/// the bad value from ever being stored. (`prompt`/`command` may contain
+/// newlines and are sanitized at render instead.)
+fn reject_control_chars(name: &str) -> Result<(), String> {
+    if name.chars().any(char::is_control) {
+        Err("name must not contain control characters".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 // ── GET /cron ────────────────────────────────────────────────────────────────
 async fn list_cron(
     State(state): State<AppState>,
@@ -251,6 +265,9 @@ async fn create_cron(
     let kind = resolve_job_kind(&body)?;
     let cfg = cfg_snapshot(&state);
     ensure_cron_enabled(&cfg)?;
+    if let Some(name) = &body.name {
+        reject_control_chars(name).map_err(err_400)?;
+    }
 
     let job = match kind {
         JobType::Agent => {
@@ -503,6 +520,16 @@ mod tests {
         assert!(agent_job_creation_allowed(&[]));
         // Owners configured: agent-job creation over HTTP fails closed.
         assert!(!agent_job_creation_allowed(&["owner-a".to_string()]));
+    }
+
+    #[test]
+    fn reject_control_chars_blocks_escapes_allows_clean_name() {
+        // A clean name passes.
+        assert!(reject_control_chars("nightly backup").is_ok());
+        // An embedded ESC (or any C0 control) is refused at the boundary so it
+        // never reaches the operator's terminal via `cron list`.
+        assert!(reject_control_chars("nightly\u{1b}[2Kbackup").is_err());
+        assert!(reject_control_chars("two\nlines").is_err());
     }
 
     #[test]
