@@ -67,7 +67,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 println!(
                     "  {} {short}  {}",
                     crate::cli_style::dot(job.enabled),
-                    job.schedule
+                    crate::memory::sanitize::sanitize_for_terminal(&job.schedule.to_string())
                 );
                 let payload = if job.command.is_empty() {
                     job.prompt.clone().unwrap_or_default()
@@ -75,7 +75,12 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     job.command.clone()
                 };
                 if !payload.is_empty() {
-                    println!("       {}", crate::cli_style::dim(&payload));
+                    println!(
+                        "       {}",
+                        crate::cli_style::dim(&crate::memory::sanitize::sanitize_for_terminal(
+                            &payload
+                        ))
+                    );
                 }
                 println!(
                     "       {}",
@@ -189,7 +194,10 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             println!("\u{2705} Updated cron job {}", job.id);
             println!("  Expr: {}", job.expression);
             println!("  Next: {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            println!(
+                "  Cmd : {}",
+                crate::memory::sanitize::sanitize_for_terminal(&job.command)
+            );
             Ok(())
         }
         crate::CronCommands::Remove { id } => remove_job(config, &id),

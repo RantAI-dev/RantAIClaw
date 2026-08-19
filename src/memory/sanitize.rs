@@ -100,6 +100,19 @@ fn strip_invisible(raw: &str) -> (String, usize) {
     (out, removed)
 }
 
+/// Strip ESC/CSI and C0 control characters for safe terminal/TUI rendering,
+/// preserving `\n` and `\t`. Same keep/drop policy as [`strip_invisible`] — one
+/// control-char policy for the repo. Used at the cron render sites so a field
+/// written over HTTP (or via an injected agent turn) cannot smuggle terminal
+/// escape sequences into a more-trusted surface's output.
+pub(crate) fn sanitize_for_terminal(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| {
+            matches!(c, '\n' | '\t' | '\r') || (!is_invisible_format(c) && !c.is_control())
+        })
+        .collect()
+}
+
 /// Unicode format and zero-width characters that render as nothing.
 fn is_invisible_format(c: char) -> bool {
     matches!(c,
@@ -162,6 +175,18 @@ mod tests {
             sanitize_memory_content(smuggled).is_err(),
             "zero-width padding must not evade the structural check"
         );
+    }
+
+    /// A field written over HTTP (or via an injected agent turn) must not be
+    /// able to smuggle a terminal escape into `cron list` / the TUI. Layout
+    /// whitespace stays; ESC and other C0 controls go.
+    #[test]
+    fn sanitize_for_terminal_strips_escapes_keeps_layout() {
+        // Dropping the ESC byte is what neutralizes the sequence: the terminal
+        // then prints the "[2K" payload literally instead of executing it.
+        let out = sanitize_for_terminal("nightly\u{1b}[2Kbackup\ttag\nrun");
+        assert_eq!(out, "nightly[2Kbackup\ttag\nrun");
+        assert!(!out.contains('\u{1b}'), "escape survived: {out:?}");
     }
 
     /// A stored token is re-injected into every prompt that recalls it and
