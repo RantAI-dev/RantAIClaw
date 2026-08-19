@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.3-alpha] — 2026-08-19
+
+One TUI setup fix and one dependency advisory bump. No config schema change —
+this release carries no migration and rolls back freely to v0.22.2-alpha.
+
+### Fixed
+
+- **TUI: the setup model list shows the full catalog, not the curated list
+  alone.** After picking a provider in `/setup provider`, the model step
+  offered only the ~10 curated entries while the same binary's `/model`
+  picker, the gateway, and channel routing all served the cache-backed
+  catalog (400 openrouter models on a refreshed box). The setup step now
+  reads the same catalog, capped at 120 like the CLI wizard, with curated
+  descriptions merged; a fresh install with no cache still sees the curated
+  list. Also removes a drifted private copy of the per-provider default
+  model table whose openrouter default named a model that no longer exists.
+  (#569)
+
+### Security
+
+- **Dependencies: `h2` 0.4.13 → 0.4.16** for RUSTSEC-2026-0258 (unbounded
+  queueing of empty HTTP/2 DATA frames — denial-of-service class, low
+  severity; transitive via hyper/reqwest). (#570)
+
 ## [0.22.2-alpha] — 2026-08-18
 
 Three TUI/config bugfixes. No config schema change — this release carries no
