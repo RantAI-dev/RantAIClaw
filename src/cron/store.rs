@@ -391,6 +391,34 @@ pub fn record_run(
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
+    // A single-execution row is attempt 1.
+    record_run_attempt(
+        config,
+        job_id,
+        started_at,
+        finished_at,
+        status,
+        output,
+        duration_ms,
+        1,
+    )
+}
+
+/// Like [`record_run`] but stamps the 1-based retry `attempt` index. The
+/// scheduler records each retry of a job as its own history row so operators
+/// see the real `error, error, ok` sequence and each `duration_ms` reflects
+/// that attempt's execution (not the whole retry window including backoff).
+#[allow(clippy::too_many_arguments)]
+pub fn record_run_attempt(
+    config: &Config,
+    job_id: &str,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: Option<&str>,
+    duration_ms: i64,
+    attempt: u32,
+) -> Result<()> {
     // Scrub credential-shaped substrings (api_key=…, password:… etc.) BEFORE
     // truncating and persisting — run history is a world-readable payload sink
     // served back over the API, so a secret in a command's stdout/stderr must
@@ -408,8 +436,8 @@ pub fn record_run(
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
 
         tx.execute(
-            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms, attempt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 job_id,
                 started_at.to_rfc3339(),
@@ -417,6 +445,7 @@ pub fn record_run(
                 status,
                 bounded_output.as_deref(),
                 duration_ms,
+                i64::from(attempt),
             ],
         )
         .context("Failed to insert cron run")?;
@@ -464,7 +493,7 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
     with_connection(config, |conn| {
         let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
         let mut stmt = conn.prepare(
-            "SELECT id, job_id, started_at, finished_at, status, output, duration_ms
+            "SELECT id, job_id, started_at, finished_at, status, output, duration_ms, attempt
              FROM cron_runs
              WHERE job_id = ?1
              ORDER BY started_at DESC, id DESC
@@ -482,6 +511,7 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
                 status: row.get(4)?,
                 output: row.get(5)?,
                 duration_ms: row.get(6)?,
+                attempt: row.get(7)?,
             })
         })?;
 
@@ -571,8 +601,8 @@ fn decode_delivery(delivery_raw: Option<&str>) -> Result<DeliveryConfig> {
     Ok(DeliveryConfig::default())
 }
 
-fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(cron_jobs)")?;
+fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let col_name: String = row.get(1)?;
@@ -586,18 +616,20 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
 
     // Tolerate "duplicate column name" errors to handle the race where
     // another process adds the column between our PRAGMA check and ALTER.
+    // `table` is always a hardcoded literal ("cron_jobs"/"cron_runs"), never
+    // user input, so interpolating it into the DDL is safe.
     match conn.execute(
-        &format!("ALTER TABLE cron_jobs ADD COLUMN {name} {sql_type}"),
+        &format!("ALTER TABLE {table} ADD COLUMN {name} {sql_type}"),
         [],
     ) {
         Ok(_) => Ok(()),
         Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
             if msg.contains("duplicate column name") =>
         {
-            tracing::debug!("Column cron_jobs.{name} already exists (concurrent migration): {err}");
+            tracing::debug!("Column {table}.{name} already exists (concurrent migration): {err}");
             Ok(())
         }
-        Err(e) => Err(e).with_context(|| format!("Failed to add cron_jobs.{name}")),
+        Err(e) => Err(e).with_context(|| format!("Failed to add {table}.{name}")),
     }
 }
 
@@ -671,6 +703,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             status      TEXT NOT NULL,
             output      TEXT,
             duration_ms INTEGER,
+            attempt     INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
@@ -702,16 +735,34 @@ fn migrate_cron_columns_once(conn: &Connection, db_path: &std::path::Path) -> Re
             return Ok(());
         }
     }
-    add_column_if_missing(conn, "schedule", "TEXT")?;
-    add_column_if_missing(conn, "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
-    add_column_if_missing(conn, "prompt", "TEXT")?;
-    add_column_if_missing(conn, "name", "TEXT")?;
-    add_column_if_missing(conn, "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
-    add_column_if_missing(conn, "model", "TEXT")?;
-    add_column_if_missing(conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(conn, "delivery", "TEXT")?;
-    add_column_if_missing(conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "created_by", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "schedule", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "job_type",
+        "TEXT NOT NULL DEFAULT 'shell'",
+    )?;
+    add_column_if_missing(conn, "cron_jobs", "prompt", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "name", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "session_target",
+        "TEXT NOT NULL DEFAULT 'isolated'",
+    )?;
+    add_column_if_missing(conn, "cron_jobs", "model", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "cron_jobs", "delivery", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "delete_after_run",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "cron_jobs", "created_by", "TEXT")?;
+    // Retry attempts are recorded as separate cron_runs rows (plan 185); legacy
+    // DBs get the column with DEFAULT 1 so old rows read as attempt 1.
+    add_column_if_missing(conn, "cron_runs", "attempt", "INTEGER NOT NULL DEFAULT 1")?;
     set.lock()
         .expect("cron migration lock poisoned")
         .insert(db_path.to_path_buf());
