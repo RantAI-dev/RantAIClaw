@@ -18,6 +18,45 @@ const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const AGENT_JOB_TIMEOUT_SECS: u64 = 600;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 
+/// Process-wide set of cron job ids currently executing, shared by BOTH the
+/// scheduled poll loop and every manual force-run entry point. A single registry
+/// lets a manual "run now" see that a scheduled tick (or a second click) is
+/// already running the same job, and refuse to double-execute.
+fn in_flight_registry() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// RAII claim on the in-flight registry. Removing the id on `Drop` releases the
+/// claim even if the job panics or is cancelled — a post-`await` `remove()` would
+/// leak it on any early exit.
+struct InFlightGuard {
+    id: String,
+}
+
+impl InFlightGuard {
+    /// Claim `id`. Returns `None` if it is already claimed (still running).
+    fn claim(id: &str) -> Option<Self> {
+        let mut set = in_flight_registry()
+            .lock()
+            .expect("in-flight lock poisoned");
+        if set.insert(id.to_string()) {
+            Some(Self { id: id.to_string() })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = in_flight_registry().lock() {
+            set.remove(&self.id);
+        }
+    }
+}
+
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
@@ -27,15 +66,28 @@ pub async fn run(config: Config) -> Result<()> {
         &config.workspace_dir,
     ));
 
-    let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+
+    // Due-job batches run on their own tasks so a slow or hung job can never
+    // stall interval.tick(). The JoinSet is owned by `run`: when the daemon
+    // aborts the scheduler task the set drops and all batch tasks abort with it
+    // (a bare tokio::spawn would detach them and leak across shutdown).
+    let mut batches: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     loop {
         interval.tick().await;
-        // Keep scheduler liveness fresh even when there are no due jobs.
+        // Keep scheduler liveness fresh even when there are no due jobs, and even
+        // while a previous batch is still running on its own task.
         crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+
+        // Reap finished batch tasks so the set doesn't grow unbounded.
+        while let Some(res) = batches.try_join_next() {
+            if let Err(e) = res {
+                if e.is_panic() {
+                    tracing::error!("Scheduler batch task panicked: {e}");
+                }
+            }
+        }
 
         // Refresh the config half once per poll tick. The scheduler is a
         // long-lived task built at daemon start, so without this an operator
@@ -62,7 +114,18 @@ pub async fn run(config: Config) -> Result<()> {
             }
         };
 
-        process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT, &in_flight).await;
+        if jobs.is_empty() {
+            continue;
+        }
+
+        // Spawn the batch so a slow/hung job can never stall the poll cadence.
+        // The process-wide in-flight registry still prevents a job from a
+        // still-running earlier batch from being run again.
+        let config = config.clone();
+        let security = Arc::clone(&security);
+        batches.spawn(async move {
+            process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
+        });
     }
 }
 
@@ -77,6 +140,13 @@ pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
 /// testing and must not shift the schedule or consume a one-shot. Callers must
 /// enforce their own security/approval gate before calling.
 pub async fn run_job_manual(config: &Config, job: &CronJob) -> (bool, String) {
+    // Claim the shared in-flight registry so a second "run now" (or an overlapping
+    // scheduled tick) can't double-execute the same job. The guard releases the
+    // claim on drop, including on panic/cancel. An already-running job returns a
+    // clear message and records no run row (it never executed).
+    let Some(_guard) = InFlightGuard::claim(&job.id) else {
+        return (false, format!("cron job '{}' is already running", job.id));
+    };
     let started_at = Utc::now();
     let (success, output) = execute_job_now(config, job).await;
     let finished_at = Utc::now();
@@ -141,7 +211,6 @@ async fn process_due_jobs(
     security: &Arc<SecurityPolicy>,
     jobs: Vec<CronJob>,
     component: &str,
-    in_flight: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
@@ -151,27 +220,19 @@ async fn process_due_jobs(
         let config = config.clone();
         let security = Arc::clone(security);
         let component = component.to_owned();
-        let in_flight = Arc::clone(in_flight);
         async move {
-            // Claim the job; skip if a previous (long-running) invocation is still
-            // going, so a job slower than the poll interval isn't run concurrently.
-            {
-                let mut guard = in_flight.lock().expect("in-flight lock poisoned");
-                if !guard.insert(job.id.clone()) {
-                    tracing::warn!(
-                        "Scheduler job '{}' still running from a previous tick; skipping this cycle",
-                        job.id
-                    );
-                    return (job.id.clone(), true);
-                }
-            }
-            let result =
-                execute_and_persist_job(&config, security.as_ref(), &job, &component).await;
-            in_flight
-                .lock()
-                .expect("in-flight lock poisoned")
-                .remove(&job.id);
-            result
+            // Claim the job on the process-wide registry; skip if a previous
+            // (long-running) invocation — scheduled or manual — is still going,
+            // so a job slower than the poll interval isn't run concurrently. The
+            // guard releases the claim on drop, including on panic/cancel.
+            let Some(_guard) = InFlightGuard::claim(&job.id) else {
+                tracing::warn!(
+                    "Scheduler job '{}' still running from a previous tick; skipping this cycle",
+                    job.id
+                );
+                return (job.id.clone(), true);
+            };
+            execute_and_persist_job(&config, security.as_ref(), &job, &component).await
         }
     }))
     .buffer_unordered(max_concurrent);
@@ -900,8 +961,7 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        let in_flight = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        process_due_jobs(&config, &security, Vec::new(), &component, &in_flight).await;
+        process_due_jobs(&config, &security, Vec::new(), &component).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -922,8 +982,7 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        let in_flight = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        process_due_jobs(&config, &security, vec![job], &component, &in_flight).await;
+        process_due_jobs(&config, &security, vec![job], &component).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -939,20 +998,13 @@ mod tests {
             &config.autonomy,
             &config.workspace_dir,
         ));
-        let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        // Pretend the job is still running from a previous tick.
-        in_flight.lock().unwrap().insert(job.id.clone());
+        // Pretend the job is still running from a previous tick by holding the
+        // process-wide in-flight claim across the poll. The job id is a unique
+        // UUID (cron::add_job), so this global claim cannot bleed into other tests.
+        let _held = InFlightGuard::claim(&job.id).expect("fresh id must claim");
         let component = unique_component("scheduler-inflight");
 
-        process_due_jobs(
-            &config,
-            &security,
-            vec![job.clone()],
-            &component,
-            &in_flight,
-        )
-        .await;
+        process_due_jobs(&config, &security, vec![job.clone()], &component).await;
 
         // It must have been skipped → no run recorded.
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -960,6 +1012,33 @@ mod tests {
             runs.is_empty(),
             "an in-flight job must be skipped, not executed"
         );
+    }
+
+    #[tokio::test]
+    async fn run_job_manual_refuses_a_concurrent_run_of_the_same_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo hi").unwrap();
+
+        // While the job is claimed (simulating an in-flight run), a manual run
+        // must refuse and record NO run row.
+        {
+            let _held = InFlightGuard::claim(&job.id).expect("fresh id must claim");
+            let (success, output) = run_job_manual(&config, &job).await;
+            assert!(!success, "a concurrent manual run must not execute");
+            assert!(
+                output.contains("already running"),
+                "expected an 'already running' message, got: {output}"
+            );
+            assert!(
+                cron::list_runs(&config, &job.id, 10).unwrap().is_empty(),
+                "the refused run must not record a run row"
+            );
+        }
+        // Claim released → a manual run now executes and records exactly one row.
+        let (success, _) = run_job_manual(&config, &job).await;
+        assert!(success);
+        assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
     }
 
     #[tokio::test]
