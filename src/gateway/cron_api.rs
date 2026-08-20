@@ -269,6 +269,10 @@ async fn create_cron(
         reject_control_chars(name).map_err(err_400)?;
     }
 
+    // Advisory (never a gate): a shell job created with a command the fire-time
+    // gate would refuse is still created, but we tell the caller it won't run on
+    // its schedule. Set in the shell arm before `command` moves into the store.
+    let mut warning: Option<String> = None;
     let job = match kind {
         JobType::Agent => {
             let prompt = body
@@ -330,6 +334,12 @@ async fn create_cron(
                     "command blocked by security policy: {command}"
                 )));
             }
+            if let Some(reason) = crate::cron::command_will_be_refused_at_fire(&cfg, &command) {
+                warning = Some(format!(
+                    "created, but will not run on its schedule ({reason}); force-run it with an \
+                     approval, or use an allowlisted low-risk command"
+                ));
+            }
             let delete_after = body
                 .delete_after_run
                 .unwrap_or(matches!(body.schedule, Schedule::At { .. }));
@@ -354,7 +364,11 @@ async fn create_cron(
             .map_err(err_400)?
         }
     };
-    Ok(Json(serde_json::to_value(job).map_err(err_500)?))
+    let mut body = serde_json::to_value(job).map_err(err_500)?;
+    if let (Some(obj), Some(reason)) = (body.as_object_mut(), warning) {
+        obj.insert("warning".to_string(), json!(reason));
+    }
+    Ok(Json(body))
 }
 
 // ── PUT /cron/{id} ───────────────────────────────────────────────────────────

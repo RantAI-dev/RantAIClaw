@@ -19,6 +19,17 @@ pub use store::{
 };
 pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
 
+/// If a shell `command` would be refused by the scheduler's fire-time gate
+/// (allowlist + risk classification, no approval), return the human reason;
+/// `None` means it will run on schedule. **Advisory only** — callers must NOT
+/// block creation on this. A medium/high-risk allowlisted job is still
+/// creatable and can be force-run with an explicit approval; this only lets a
+/// creation surface *warn* that the job won't fire on its own schedule.
+pub(crate) fn command_will_be_refused_at_fire(config: &Config, command: &str) -> Option<String> {
+    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    security.validate_command_execution(command, false).err()
+}
+
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     // Mutating cron actions require the feature switch, mirroring the `cron_*`
@@ -398,6 +409,22 @@ mod tests {
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
+    }
+
+    #[test]
+    fn command_will_be_refused_at_fire_flags_risky_allowlisted_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into(), "curl".into()];
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+
+        // curl is allowlisted but high-risk → the fire-time gate refuses it → Some.
+        assert!(
+            command_will_be_refused_at_fire(&config, "curl https://example.com").is_some(),
+            "a risky allowlisted command must be flagged as won't-run-on-schedule"
+        );
+        // echo is low-risk → runs on schedule → None.
+        assert!(command_will_be_refused_at_fire(&config, "echo hi").is_none());
     }
 
     fn make_job(config: &Config, expr: &str, tz: Option<&str>, cmd: &str) -> CronJob {
