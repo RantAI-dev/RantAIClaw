@@ -115,12 +115,16 @@ pub async fn run(config: Config) -> Result<()> {
             ),
         }
 
+        // One `now` for the whole tick — the poll query and the staleness gate
+        // must agree on the current instant.
+        let now = Utc::now();
+
         // rusqlite is blocking file I/O; run the poll query off the async worker
         // so a lock stall can't park a runtime thread shared with gateway/channel
         // work. Clone `working` in — it is reused below to spawn the batch.
         let jobs = {
             let cfg = working.clone();
-            match tokio::task::spawn_blocking(move || due_jobs(&cfg, Utc::now())).await {
+            match tokio::task::spawn_blocking(move || due_jobs(&cfg, now)).await {
                 Ok(Ok(jobs)) => jobs,
                 Ok(Err(e)) => {
                     crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
@@ -134,6 +138,32 @@ pub async fn run(config: Config) -> Result<()> {
                 }
             }
         };
+
+        // Coalesce catch-up: a due job fires at most once (reschedule re-anchors
+        // forward). But a job whose `next_run` is older than max_catchup_age_secs
+        // is stale — skip it (don't fire "late" on restart), re-anchoring forward
+        // and logging. These are cheap single-row writes and only occur after a
+        // downtime, so they run inline on the poll task.
+        let max_age = working.cron.max_catchup_age_secs;
+        let (jobs, stale): (Vec<CronJob>, Vec<CronJob>) = jobs
+            .into_iter()
+            .partition(|j| !crate::cron::is_run_stale(j.next_run, now, max_age));
+        for job in &stale {
+            tracing::warn!(
+                target: "scheduler",
+                job_id = %job.id,
+                next_run = %job.next_run.to_rfc3339(),
+                "skipping stale cron run (older than max_catchup_age_secs); re-anchoring, not firing"
+            );
+            if let Err(e) = crate::cron::skip_stale_run(&working, job, now) {
+                tracing::warn!(
+                    target: "scheduler",
+                    job_id = %job.id,
+                    error = %e,
+                    "failed to re-anchor stale cron job"
+                );
+            }
+        }
 
         if jobs.is_empty() {
             continue;
