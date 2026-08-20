@@ -2615,10 +2615,22 @@ pub struct CronConfig {
     /// Maximum number of historical cron run records to retain. Default: `50`.
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
+    /// Skip (and log) a scheduled run whose `next_run` is older than this many
+    /// seconds instead of firing it "late" on restart. The job is not lost — a
+    /// recurring schedule re-anchors to its next future occurrence; a one-shot
+    /// `at` job is disabled. Firing that does happen is always coalesced to a
+    /// single run (missed occurrences are never replayed). `0` disables the gate
+    /// (a due job always fires once). Default: `86400` (1 day).
+    #[serde(default = "default_max_catchup_age_secs")]
+    pub max_catchup_age_secs: u64,
 }
 
 fn default_max_run_history() -> u32 {
     50
+}
+
+fn default_max_catchup_age_secs() -> u64 {
+    86_400 // 1 day
 }
 
 impl Default for CronConfig {
@@ -2626,6 +2638,7 @@ impl Default for CronConfig {
         Self {
             enabled: true,
             max_run_history: default_max_run_history(),
+            max_catchup_age_secs: default_max_catchup_age_secs(),
         }
     }
 }
@@ -4851,11 +4864,13 @@ mod tests {
         let c = CronConfig {
             enabled: false,
             max_run_history: 100,
+            max_catchup_age_secs: 3600,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: CronConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.enabled);
         assert_eq!(parsed.max_run_history, 100);
+        assert_eq!(parsed.max_catchup_age_secs, 3600);
     }
 
     #[test]

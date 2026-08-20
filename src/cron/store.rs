@@ -190,6 +190,57 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     })
 }
 
+/// A due run is "stale" when its scheduled instant is older than `max_age_secs`.
+/// `0` disables the gate (never stale) — a due job then always fires once.
+pub fn is_run_stale(next_run: DateTime<Utc>, now: DateTime<Utc>, max_age_secs: u64) -> bool {
+    if max_age_secs == 0 {
+        return false;
+    }
+    let Ok(secs) = i64::try_from(max_age_secs) else {
+        return false;
+    };
+    match now.checked_sub_signed(chrono::Duration::seconds(secs)) {
+        Some(cutoff) => next_run < cutoff,
+        None => false,
+    }
+}
+
+/// Overwrite only the `next_run` column (no run-history / last_* side effects).
+pub fn set_next_run(config: &Config, job_id: &str, next_run: DateTime<Utc>) -> Result<()> {
+    with_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+            params![next_run.to_rfc3339(), job_id],
+        )
+        .context("Failed to set cron next_run")?;
+        Ok(())
+    })
+}
+
+/// Skip a stale due job WITHOUT running it: a recurring schedule re-anchors to
+/// its next future occurrence (and stays enabled — never silently disable a
+/// recurring job on a long outage); a one-shot `At` is disabled (a missed
+/// reminder must not fire late).
+pub fn skip_stale_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
+    match job.schedule {
+        Schedule::At { .. } => {
+            update_job(
+                config,
+                &job.id,
+                CronJobPatch {
+                    enabled: Some(false),
+                    ..CronJobPatch::default()
+                },
+            )?;
+        }
+        _ => {
+            let next_run = next_run_for_schedule(&job.schedule, now)?;
+            set_next_run(config, &job.id, next_run)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
     with_connection(config, |conn| {
         // IMMEDIATE takes the write lock up front so a concurrent
@@ -880,6 +931,54 @@ mod tests {
         assert_eq!(job.delivery.mode, "announce");
         assert_eq!(job.delivery.channel.as_deref(), Some("telegram"));
         assert_eq!(job.delivery.to.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn is_run_stale_respects_cutoff_and_zero_disables() {
+        let now = Utc::now();
+        let old = now - ChronoDuration::seconds(7200); // 2h ago
+        let recent = now - ChronoDuration::seconds(60); // 1m ago
+                                                        // 0 disables the gate → never stale.
+        assert!(!is_run_stale(old, now, 0));
+        // 1h cutoff: 2h-old is stale, 1m-old is not.
+        assert!(is_run_stale(old, now, 3600));
+        assert!(!is_run_stale(recent, now, 3600));
+    }
+
+    #[test]
+    fn skip_stale_run_reanchors_recurring_and_disables_oneshot() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+
+        // Recurring: force next_run into the past, then skip → re-anchored to the
+        // future and still enabled.
+        let cron_job = add_job(&config, "*/5 * * * *", "echo hi").unwrap();
+        set_next_run(&config, &cron_job.id, now - ChronoDuration::hours(3)).unwrap();
+        let stale = get_job(&config, &cron_job.id).unwrap();
+        skip_stale_run(&config, &stale, now).unwrap();
+        let after = get_job(&config, &cron_job.id).unwrap();
+        assert!(after.enabled, "a recurring job must stay enabled");
+        assert!(
+            after.next_run > now,
+            "a recurring job must re-anchor to the future"
+        );
+
+        // One-shot At: disabled (a missed reminder must not fire late).
+        let at = now + ChronoDuration::hours(1);
+        let at_job = add_shell_job(
+            &config,
+            None,
+            Schedule::At { at },
+            "echo once",
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        skip_stale_run(&config, &at_job, now).unwrap();
+        let after_at = get_job(&config, &at_job.id).unwrap();
+        assert!(!after_at.enabled, "a one-shot At job must be disabled");
     }
 
     #[test]

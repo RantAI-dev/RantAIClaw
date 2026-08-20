@@ -33,7 +33,7 @@ use toml::Value;
 
 /// Bump when a `migrate_vN` is added. The `Config` struct's compiled
 /// schema must match this version after [`migrate`] runs.
-pub const CURRENT_VERSION: u32 = 22;
+pub const CURRENT_VERSION: u32 = 23;
 
 /// Field name stored at the top level of `config.toml` carrying the
 /// schema version of the on-disk content. Absent on configs written
@@ -309,8 +309,16 @@ pub fn migrate(raw: &mut Value) -> Result<bool> {
         // (no transformation; additive field whose default is the new behaviour)
     }
 
-    // Future migrations (v21, v22, …) inserted here in order.
-    // if from < 21 { migrate_v21(raw)?; }
+    // v22 → v23: `[cron] max_catchup_age_secs` (u64, default 86400) was added — a
+    // staleness gate that skips-and-re-anchors a missed scheduled run older than
+    // the window instead of firing it late on restart. Additive with a serde
+    // default, nothing to transform — this arm burns a version slot so the
+    // schema_drift fingerprint is accepted with intent.
+    if from < 23 {
+        // (no transformation; additive default-only field)
+    }
+
+    // Future migrations (v24, …) inserted here in order.
 
     set_schema_version(raw, CURRENT_VERSION).context("stamp schema_version after migration")?;
     Ok(true)
@@ -447,6 +455,35 @@ response_cache_max_entries = 9000
             "unrelated keys must be left alone"
         );
         assert_eq!(version_of(&raw), Some(i64::from(CURRENT_VERSION)));
+    }
+
+    /// v22 → v23 is additive-only (`[cron] max_catchup_age_secs`); a config at
+    /// schema_version = 22 migrates to 23 with its content untouched.
+    #[test]
+    fn v23_is_additive_and_preserves_content() {
+        let mut raw = parse(
+            r#"
+schema_version = 22
+
+[cron]
+enabled = true
+max_run_history = 42
+"#,
+        );
+
+        assert!(migrate(&mut raw).expect("migration runs"));
+
+        let cron = raw
+            .get("cron")
+            .and_then(Value::as_table)
+            .expect("cron table survives");
+        assert_eq!(cron.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            cron.get("max_run_history").and_then(Value::as_integer),
+            Some(42),
+            "existing cron keys must be left alone"
+        );
+        assert_eq!(version_of(&raw), Some(23));
     }
 
     #[test]
