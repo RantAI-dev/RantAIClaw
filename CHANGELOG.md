@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0-alpha] — 2026-08-20
+
+Cron scheduler hardening and honesty pass, consolidating the cron deep-scan
+effort. **Config schema v22 → v23** — a new `[cron] max_catchup_age_secs` field
+is added on load. The migration is additive and preserves existing values, but a
+config once opened by this release will not open in v0.22.x, so this is a
+one-way upgrade. Bundles claw-ui **v0.3.20**.
+
+### Added
+
+- **`[cron] max_catchup_age_secs` (default `86400` = 1 day): a staleness gate on
+  catch-up runs.** After downtime the scheduler no longer fires a job "late" — a
+  due job whose `next_run` is older than the window is skipped instead of run: a
+  recurring schedule re-anchors to its next future occurrence and stays enabled,
+  a one-shot `at` job is disabled. `0` disables the gate. Firing that does happen
+  is coalesced to a single run (missed occurrences are never replayed). (#600)
+
+### Changed
+
+- **A cron run blocked by the security policy is now recorded as `refused`, not
+  `error`,** so an operator can tell a command that ran and failed apart from one
+  the policy blocked before it ran. The TUI detail panel and the CLI `cron run`
+  report render `refused` distinctly. (#599, #601)
+- **Creating a shell cron job over HTTP whose command the fire-time gate would
+  refuse now returns an advisory `warning`** ("created, but will not run on its
+  schedule …") instead of silently succeeding; the job is still created
+  unchanged, and the web console surfaces the warning as a toast. (#598, claw-ui
+  #65)
+
 ### Fixed
 
 - **Cron weekday field now follows standard crontab numbering.** The `cron`
@@ -19,6 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented examples. **Behavior change:** existing weekday cron jobs shift by
   one day (toward the crontab-correct day) on their next reschedule; no stored
   data is migrated. 6- and 7-field crate-native expressions are unaffected.
+
+### Security
+
+- **`arrayref` pinned to `=0.3.9` (last known-good).** The crate — pulled
+  transitively via `blake3` and `wa-rs-libsignal` — was compromised on
+  2026-08-20: every legitimate version (0.3.5–0.3.9) was yanked the same day and
+  a trojaned `0.3.10` was published that depends on `proc-macro1`, a
+  proc-macro2 typosquat that pulls an HTTP client (`ureq`) to exfiltrate at
+  compile time. The exact pin (plus a `deny.toml` allow-list for the
+  yanked-but-immutable, safe 0.3.9) prevents any resolution from reaching the
+  malicious version. Do **not** `cargo update -p arrayref` until arrayref
+  publishes a verified-clean release. (#602)
 
 ## [0.22.3-alpha] — 2026-08-19
 
