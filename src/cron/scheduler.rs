@@ -382,7 +382,7 @@ async fn run_agent_job(
 async fn record_attempt(config: &Config, job_id: &str, a: &AttemptOutcome) {
     let cfg = config.clone();
     let jid = job_id.to_string();
-    let status = if a.success { "ok" } else { "error" };
+    let status = run_status(a.success, &a.output);
     let out = a.output.clone();
     let (started, finished, attempt) = (a.started_at, a.finished_at, a.attempt);
     let duration_ms = (finished - started).num_milliseconds();
@@ -569,6 +569,19 @@ const SECURITY_REFUSAL_PREFIX: &str = "blocked by security policy:";
 
 fn is_security_refusal(output: &str) -> bool {
     output.starts_with(SECURITY_REFUSAL_PREFIX)
+}
+
+/// The run-history status for an execution outcome. A policy refusal is recorded
+/// as `"refused"` (not `"error"`) so an operator can tell a command that ran and
+/// failed apart from one the security policy blocked before it ran.
+fn run_status(success: bool, output: &str) -> &'static str {
+    if success {
+        "ok"
+    } else if is_security_refusal(output) {
+        "refused"
+    } else {
+        "error"
+    }
 }
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
@@ -1263,6 +1276,19 @@ mod tests {
             tz: None,
         };
         assert!(!is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn run_status_distinguishes_refusal_from_error() {
+        assert_eq!(run_status(true, "anything"), "ok");
+        assert_eq!(run_status(false, "job failed: boom"), "error");
+        assert_eq!(
+            run_status(
+                false,
+                "blocked by security policy: command not allowed: curl"
+            ),
+            "refused"
+        );
     }
 
     #[tokio::test]

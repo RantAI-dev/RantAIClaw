@@ -3418,7 +3418,7 @@ impl TuiApp {
             .status_with(
                 match job.last_status.as_deref() {
                     Some("ok") => StatusKind::Ok,
-                    Some("error") => StatusKind::Fail,
+                    Some("error" | "refused") => StatusKind::Fail,
                     _ => StatusKind::Info,
                 },
                 "Last status",
