@@ -302,10 +302,12 @@ async fn run_job_report(config: &Config, id: &str) -> Result<String> {
     let security =
         crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
     let (ok, output) = crate::cron::scheduler::run_job_manual(config, &security, &job).await;
+    // Label matches the recorded run-history status: a policy refusal reads
+    // "refused", not "error".
+    let status = crate::cron::scheduler::run_status(ok, &output);
     Ok(format!(
-        "{} cron job {id} ({})\n{}",
+        "{} cron job {id} ({status})\n{}",
         if ok { "✅" } else { "✗" },
-        if ok { "ok" } else { "error" },
         output.trim(),
     ))
 }
@@ -690,6 +692,32 @@ mod tests {
         let out = run_job_report(&config, &job.id).await.unwrap();
         assert!(out.contains("ok") || out.contains("cli-run"), "{out}");
         assert_eq!(list_runs(&config, &job.id, 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cli_run_reports_a_policy_refusal_as_refused() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        // `curl` is not allowlisted, so the fire-time gate refuses it. The report
+        // label (and the recorded run status) must read "refused", not "error".
+        let job = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "curl https://example.com",
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let out = run_job_report(&config, &job.id).await.unwrap();
+        assert!(out.contains("(refused)"), "{out}");
+        assert!(!out.contains("(error)"), "{out}");
     }
 
     #[test]

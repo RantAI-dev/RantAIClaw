@@ -603,8 +603,9 @@ fn is_security_refusal(output: &str) -> bool {
 
 /// The run-history status for an execution outcome. A policy refusal is recorded
 /// as `"refused"` (not `"error"`) so an operator can tell a command that ran and
-/// failed apart from one the security policy blocked before it ran.
-fn run_status(success: bool, output: &str) -> &'static str {
+/// failed apart from one the security policy blocked before it ran. Also used by
+/// the CLI `cron run` report so its label matches the recorded history status.
+pub(crate) fn run_status(success: bool, output: &str) -> &'static str {
     if success {
         "ok"
     } else if is_security_refusal(output) {
