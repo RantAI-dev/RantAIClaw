@@ -5822,6 +5822,7 @@ version = "0.22.3-alpha"
 dependencies = [
  "anyhow",
  "argon2",
+ "arrayref",
  "assert_cmd",
  "async-imap",
  "async-stream",

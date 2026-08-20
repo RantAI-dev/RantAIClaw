@@ -11,6 +11,17 @@ yanked = "deny"
 # Each entry cites (a) the crate, (b) the upstream chain blocking the upgrade,
 # and (c) why the risk is acceptable for our usage.
 ignore = [
+    # SECURITY (2026-08-20 supply-chain incident): arrayref 0.3.9 is YANKED, but
+    # EVERY legitimate version (0.3.5–0.3.9) was yanked the same day to force an
+    # "update" onto a trojaned 0.3.10 — it declares a dependency on `proc-macro1`,
+    # a proc-macro2 typosquat published the same day that pulls an HTTP client
+    # (ureq) + rustls to exfiltrate at compile time. 0.3.9 is the last known-good
+    # release (crates.io versions are immutable — a yank cannot alter its bytes)
+    # and is pinned EXACTLY in Cargo.toml so no build can resolve forward to
+    # 0.3.10. Suppress the yanked check for THIS version only; the pin is the real
+    # mitigation. REMOVE (and unpin Cargo.toml) once arrayref publishes a
+    # verified-clean release. Reached transitively via blake3 + wa-rs-libsignal.
+    "arrayref@0.3.9",
     # bitmaps v3.2.1 via matrix-sdk 0.16 → imbl / imbl-sized-chunks — the
     # crate is declared unmaintained (notice only, no vulnerability). It
     # implements fixed-size bitmap ops with no I/O and no untrusted-input

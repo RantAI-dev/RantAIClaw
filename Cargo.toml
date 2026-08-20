@@ -16,6 +16,18 @@ categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.91"
 
 [dependencies]
+# SECURITY PIN (2026-08-20 supply-chain incident): `arrayref` (a transitive dep
+# via blake3 + wa-rs-libsignal) was compromised — every legitimate version
+# (0.3.5–0.3.9) was yanked the same day and a trojaned 0.3.10 was published that
+# declares a dependency on `proc-macro1`, a typosquat of proc-macro2 that pulls
+# an HTTP client (ureq) + rustls to exfiltrate at compile time. 0.3.9 is the last
+# known-good release (crates.io versions are immutable; a yank cannot alter its
+# bytes). Pin it EXACTLY so `cargo update` cannot resolve forward to the malicious
+# 0.3.10. Do NOT bump this without independently verifying arrayref is clean again.
+# See deny.toml (arrayref@0.3.9 is allow-listed past the yanked check for the same
+# reason). This is an explicit-pin-only dependency; the crate is used transitively.
+arrayref = "=0.3.9"
+
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
