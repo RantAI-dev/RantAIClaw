@@ -480,6 +480,16 @@ async fn run_cron(
     // authenticated operator making the same decision they could make from the
     // CLI. Keep the two asymmetric on purpose — narrowing this to `false` would
     // remove the only way to force-run a gated job from the API.
+    //
+    // KNOWN LIMITATION (plan 193): `?approved=true` is currently INERT for a
+    // risk-gated shell job. This handler passes the approval, but the manual-run
+    // path re-checks `validate_command_execution(&job.command, false)` at fire
+    // time (commit 39233e0), which refuses it again — so the force-run returns
+    // 200 with `success:false` and a "blocked by security policy" output. The
+    // pinned `cron_run_honours_an_operator_supplied_approval` test only asserts
+    // status 200, so it does not catch this. Restoring the parameter (thread an
+    // `operator_approved` bool to the fire-time gate, per recorded decision #356)
+    // vs. removing it is a product call — deferred; see plan 193.
     let security = SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir);
     if !security.can_act() {
         return Err(err_400(
