@@ -154,6 +154,40 @@ impl PtyTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
     }
+
+    /// `pty`/`ssh` run arbitrary commands with no allowlist, so — unlike `shell`
+    /// — the only gate is a human decision. Full autonomy trusts the agent
+    /// (consistent with the shell allowlist bypass); otherwise ask the approval
+    /// backend. Returns `Some(refusal)` if the command must not run (denied, or
+    /// no interactive approver is available), or `None` to proceed.
+    async fn require_command_approval(&self, label: &str, command: &str) -> Option<ToolResult> {
+        if self.security.effective_autonomy() == crate::security::AutonomyLevel::Full {
+            return None;
+        }
+        let Some(approvals) = self.security.pending() else {
+            return Some(fail(format!(
+                "Action blocked: `{label}` runs an arbitrary command and needs approval, but no \
+                 interactive approver is available. Use an interactive session, or \
+                 `rantaiclaw autonomy full` in a trusted environment."
+            )));
+        };
+        let (channel, reply_target) = crate::security::current_turn_scope();
+        match approvals
+            .request_decision_in(
+                uuid::Uuid::new_v4(),
+                label.to_string(),
+                command.to_string(),
+                channel,
+                reply_target,
+            )
+            .await
+        {
+            crate::security::Decision::Deny => {
+                Some(fail(format!("`{label}` denied by the operator")))
+            }
+            _ => None,
+        }
+    }
 }
 
 fn fail(msg: impl Into<String>) -> ToolResult {
@@ -357,6 +391,16 @@ impl Tool for PtyTool {
         if action == "start" && !self.security.record_action() {
             return Ok(fail("Action blocked: rate limit exceeded"));
         }
+        // A `start` launches an arbitrary command with no allowlist — require a
+        // human decision (Full autonomy excepted). `send` drives an
+        // already-approved session, so it is not gated per keystroke.
+        if action == "start" {
+            if let Some(command) = str_field(&args, "command") {
+                if let Some(refusal) = self.require_command_approval("pty start", command).await {
+                    return Ok(refusal);
+                }
+            }
+        }
         // On `start` with no explicit session, mint a unique name so concurrent
         // starts don't collide (and don't kill each other's session). Other
         // actions keep the `nqr` fallback, but callers should pass the name
@@ -381,6 +425,21 @@ impl Tool for PtyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn start_without_an_approver_is_refused() {
+        // Supervised + no approval backend → launching an arbitrary command via
+        // `pty start` must be refused, not run unattended.
+        let t = PtyTool::new(Arc::new(
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::Supervised),
+        ));
+        let res = t
+            .execute(json!({"action": "start", "command": "bash"}))
+            .await
+            .unwrap();
+        assert!(!res.success, "pty start must not run without an approver");
+        assert!(res.error.unwrap_or_default().contains("approver"));
+    }
 
     #[test]
     fn generated_session_names_are_unique_and_prefixed() {
