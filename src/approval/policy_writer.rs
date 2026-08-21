@@ -26,6 +26,28 @@ use serde::Deserialize;
 
 use crate::profile::Profile;
 
+/// Write `contents` to `path` atomically: a temp file in the same directory,
+/// then a rename over `path`. A crash mid-write can therefore never truncate a
+/// policy file the gate reads on the next boot — unlike `fs::write`, which
+/// truncates in place. The temp lands beside the target so the rename stays on
+/// one filesystem (atomic on Unix).
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("policy");
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.tmp-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::write(&tmp, contents)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 // ── Preset bundles (compiled into the binary) ───────────────────
 
 const MANUAL_BUNDLE: &str = include_str!("presets/policy_manual.toml");
@@ -320,7 +342,7 @@ pub fn write_active_preset(policy_dir: &Path, preset: PolicyPreset) -> Result<()
         .with_context(|| format!("create policy dir {}", policy_dir.display()))?;
     let serialized =
         toml::to_string(&toml::Value::Table(table)).context("serialize autonomy.toml")?;
-    fs::write(&path, serialized).with_context(|| format!("write {}", path.display()))?;
+    atomic_write(&path, &serialized).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -544,7 +566,7 @@ fn write_autonomy(
     let body = toml::to_string_pretty(&doc)
         .with_context(|| format!("serialise autonomy section for preset {}", preset.id()))?;
     let out = format!("{AUTONOMY_HEADER}\n{body}");
-    fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
+    atomic_write(&path, &out).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
 }
 
@@ -577,7 +599,7 @@ fn write_patterns(
         }
         body.push_str("]\n");
     }
-    fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
+    atomic_write(path, &body).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
 }
 
@@ -586,6 +608,24 @@ fn write_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_write_replaces_content_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autonomy.toml");
+        std::fs::write(&path, "old = 1\n").unwrap();
+        atomic_write(&path, "level = \"full\"\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "level = \"full\"\n"
+        );
+        // No leftover temp file beside the target.
+        let leaked = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp-"));
+        assert!(!leaked, "atomic_write leaked a temp file");
+    }
 
     #[test]
     fn all_bundles_parse() {
