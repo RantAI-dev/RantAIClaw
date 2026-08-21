@@ -54,10 +54,14 @@ impl ActionTracker {
     /// Record an action and return the current count within the window.
     pub fn record(&self) -> usize {
         let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_hours(1))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > cutoff);
+        // When host uptime is under 1h, `now - 1h` is not representable on the
+        // monotonic clock. In that case keep every recorded action (the window
+        // spans the whole uptime so far) — never fall back to `now`, which would
+        // evict the entire window and silently disable the limit on fresh
+        // boots / CI runners / rebooted VMs.
+        if let Some(cutoff) = Instant::now().checked_sub(std::time::Duration::from_hours(1)) {
+            actions.retain(|t| *t > cutoff);
+        }
         actions.push(Instant::now());
         actions.len()
     }
@@ -65,10 +69,11 @@ impl ActionTracker {
     /// Count of actions in the current window without recording.
     pub fn count(&self) -> usize {
         let mut actions = self.actions.lock();
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_hours(1))
-            .unwrap_or_else(Instant::now);
-        actions.retain(|t| *t > cutoff);
+        // See `record`: on a sub-1h-uptime host the cutoff underflows; keep all
+        // entries rather than clearing the window.
+        if let Some(cutoff) = Instant::now().checked_sub(std::time::Duration::from_hours(1)) {
+            actions.retain(|t| *t > cutoff);
+        }
         actions.len()
     }
 }
@@ -1712,6 +1717,23 @@ mod tests {
         assert_eq!(tracker.record(), 2);
         assert_eq!(tracker.record(), 3);
         assert_eq!(tracker.count(), 3);
+    }
+
+    #[test]
+    fn action_window_does_not_self_clear_within_the_first_hour() {
+        // On a host with <1h uptime, `now - 1h` underflows the monotonic clock.
+        // The window must still retain entries rather than resetting to 1 on
+        // every call — which silently disabled the rate limit on fresh boots,
+        // CI runners, and rebooted VMs. This holds regardless of host uptime.
+        let tracker = ActionTracker::new();
+        for _ in 0..50 {
+            tracker.record();
+        }
+        assert_eq!(
+            tracker.count(),
+            50,
+            "window was cleared — the uptime<1h underflow-clears bug is present"
+        );
     }
 
     #[test]
