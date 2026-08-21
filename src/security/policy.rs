@@ -613,10 +613,11 @@ impl SecurityPolicy {
                 return CommandRiskLevel::High;
             }
 
-            if joined_segment.contains("rm -rf /")
-                || joined_segment.contains("rm -fr /")
-                || joined_segment.contains(":(){:|:&};:")
-            {
+            // NOTE: no fork-bomb (`:(){:|:&};:`) check here — this runs on a
+            // single already-split segment (split on `;`/`|`/`&`), so the full
+            // fork-bomb string can never appear in one segment. It is already
+            // denied because `:` is not on the command allowlist.
+            if joined_segment.contains("rm -rf /") || joined_segment.contains("rm -fr /") {
                 return CommandRiskLevel::High;
             }
 
@@ -2365,12 +2366,23 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_still_respects_forbidden_paths() {
-        let p = SecurityPolicy::default()
-            .with_autonomy(AutonomyLevel::Full)
-            .with_workspace_only(false);
-        assert!(!p.is_path_allowed("/etc/shadow"));
-        assert!(!p.is_path_allowed("/root/.bashrc"));
+    fn forbidden_paths_denied_at_every_autonomy_level() {
+        // `is_path_allowed` is autonomy-independent by design, so the
+        // forbidden-path denial must hold under ReadOnly, Supervised AND Full.
+        // The prior test named `full_autonomy_...` exercised only Full and so
+        // was mutation-vacuous — inverting a (non-existent) autonomy guard would
+        // not have failed it. Asserting across all levels makes the property real.
+        for level in [
+            AutonomyLevel::ReadOnly,
+            AutonomyLevel::Supervised,
+            AutonomyLevel::Full,
+        ] {
+            let p = SecurityPolicy::default()
+                .with_autonomy(level)
+                .with_workspace_only(false);
+            assert!(!p.is_path_allowed("/etc/shadow"), "level {level:?}");
+            assert!(!p.is_path_allowed("/root/.bashrc"), "level {level:?}");
+        }
     }
 
     // ── Edge cases: from_config preserves tracker ────────────
