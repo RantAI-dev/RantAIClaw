@@ -171,15 +171,13 @@ impl PolicyPreset {
 /// Mirrors the web console's `BUILTIN_TOOLS` (claw-ui `src/lib/console.ts`).
 /// The two lists are the shared vocabulary between the surfaces; keep them
 /// in step when a built-in tool is added or renamed.
-const BUILTIN_TOOLS: [&str; 9] = [
+const BUILTIN_TOOLS: [&str; 7] = [
     "shell",
     "file_read",
     "file_write",
-    "web_search",
+    "web_search_tool",
     "memory_store",
     "memory_recall",
-    "send_message",
-    "cron_schedule",
     "browser",
 ];
 
@@ -209,15 +207,15 @@ const BUILTIN_TOOLS: [&str; 9] = [
 pub fn apply_preset_to_config(config: &mut crate::config::Config, preset: PolicyPreset) {
     config.autonomy.level = preset.autonomy_level();
     match preset {
-        // Keep whatever the config already forces to always-ask (the default
-        // is the high-blast-radius `ssh`/`pty` pair) and add every built-in on
-        // top, so the strictest supervised preset never *loosens* a gate.
+        // Force EVERY tool to prompt with a `*` wildcard, so the strictest
+        // supervised preset can never drift from the registry (the old list of
+        // named built-ins missed ~40 real tools, and named 3 that don't exist).
+        // Also clear `auto_approve` so no stale entry skips the prompt under the
+        // "Safest" preset. `forces_prompt` treats `*` as "any tool prompts", and
+        // `preset_for_autonomy` reads a non-empty `always_ask` back as Manual.
         PolicyPreset::Manual => {
-            for tool in BUILTIN_TOOLS {
-                if !config.autonomy.always_ask.iter().any(|t| t == tool) {
-                    config.autonomy.always_ask.push(tool.to_string());
-                }
-            }
+            config.autonomy.always_ask = vec!["*".to_string()];
+            config.autonomy.auto_approve.clear();
         }
         // Smart means "nothing is forced to prompt"; an empty list is also
         // what marks it as Smart rather than Manual on the way back out.
@@ -765,6 +763,34 @@ mod tests {
         assert_eq!(config.autonomy.level, AutonomyLevel::Full);
         apply_preset_to_config(&mut config, PolicyPreset::Smart);
         assert_eq!(config.autonomy.level, AutonomyLevel::Supervised);
+    }
+
+    #[test]
+    fn manual_preset_uses_the_prompt_everything_wildcard() {
+        let mut config = crate::config::Config::default();
+        config.autonomy.auto_approve = vec!["http_request".to_string()];
+        apply_preset_to_config(&mut config, PolicyPreset::Manual);
+        assert_eq!(
+            config.autonomy.always_ask,
+            vec!["*".to_string()],
+            "Manual must set the wildcard, not an enumerated list"
+        );
+        assert!(
+            config.autonomy.auto_approve.is_empty(),
+            "Manual must clear auto_approve"
+        );
+        // The wildcard must still read back as Manual (non-empty always_ask).
+        assert_eq!(preset_for_autonomy(&config.autonomy), PolicyPreset::Manual);
+    }
+
+    #[test]
+    fn builtin_tools_have_no_phantom_names() {
+        // The three phantom names (matched no registered tool) are gone; the
+        // web-search tool is under its real name.
+        assert!(BUILTIN_TOOLS.contains(&"web_search_tool"));
+        assert!(!BUILTIN_TOOLS.contains(&"web_search"));
+        assert!(!BUILTIN_TOOLS.contains(&"send_message"));
+        assert!(!BUILTIN_TOOLS.contains(&"cron_schedule"));
     }
 
     #[test]

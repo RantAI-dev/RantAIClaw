@@ -109,9 +109,15 @@ impl ApprovalManager {
     /// so a cached copy made switching between them a no-op on any surface
     /// that builds its manager once — which the channels path does.
     fn forces_prompt(&self, tool_name: &str) -> bool {
+        // `"*"` is the wildcard the Manual preset writes: it forces EVERY tool to
+        // prompt, so the list can never drift from the registry.
         match &self.policy {
-            Some(p) => p.fields().always_ask.iter().any(|t| t == tool_name),
-            None => self.always_ask.contains(tool_name),
+            Some(p) => p
+                .fields()
+                .always_ask
+                .iter()
+                .any(|t| t == "*" || t == tool_name),
+            None => self.always_ask.contains(tool_name) || self.always_ask.contains("*"),
         }
     }
 
@@ -458,6 +464,25 @@ mod tests {
             "switching Smart -> Manual must start prompting even though the \
              autonomy level did not change"
         );
+    }
+
+    #[test]
+    fn manual_wildcard_forces_prompt_for_any_tool() {
+        // The Manual preset sets always_ask=["*"]; every tool must prompt,
+        // including a non-builtin sitting in auto_approve (the wildcard wins).
+        let manual = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec!["*".to_string()],
+            auto_approve: vec!["http_request".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&manual);
+        for tool in ["http_request", "ssh", "delegate", "git_operations", "shell"] {
+            assert!(
+                mgr.needs_approval(tool),
+                "Manual wildcard must prompt for {tool}"
+            );
+        }
     }
 
     /// The mirror: dropping a tool from `auto_approve` must start prompting.

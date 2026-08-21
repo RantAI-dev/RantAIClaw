@@ -78,6 +78,10 @@ impl GuestGate {
         "cron_add",
         "cron_update",
         "cron_run",
+        // Deleting a scheduled job is a mutation a guest must not perform (job
+        // tampering / denial of the owner's schedule) — read-only cron_list /
+        // cron_runs stay allowed.
+        "cron_remove",
     ];
 
     /// Whether a guest may invoke `tool` at all. Owner-only tools are always
@@ -290,14 +294,16 @@ mod tests {
                 "cron_add".to_string(),
                 "cron_update".to_string(),
                 "cron_run".to_string(),
+                "cron_remove".to_string(),
                 "cron_list".to_string(),
                 "cron_runs".to_string(),
             ],
             &[],
         );
-        // The three mutation/trigger tools stay owner-only even when allowlisted:
-        // each persists or fires an agent job whose scheduled run has no guest gate.
-        for tool in ["cron_add", "cron_update", "cron_run"] {
+        // The mutation/trigger tools stay owner-only even when allowlisted:
+        // each persists, fires, or deletes an agent job the guest ceiling can't
+        // constrain.
+        for tool in ["cron_add", "cron_update", "cron_run", "cron_remove"] {
             assert!(!g.tool_permitted(tool), "{tool} must stay owner-only");
             let reason = g.deny_reason(tool, &json!({})).unwrap();
             assert!(reason.contains("owner-only"), "{tool}: {reason}");
