@@ -715,6 +715,7 @@ mod tests {
         assert_eq!(PolicyPreset::Strict.next(), PolicyPreset::Off);
     }
 
+    #[test]
     fn next_cycles_in_canonical_order() {
         assert_eq!(PolicyPreset::Manual.next(), PolicyPreset::Smart);
         assert_eq!(PolicyPreset::Smart.next(), PolicyPreset::Strict);
