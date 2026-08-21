@@ -3345,9 +3345,14 @@ impl TuiApp {
                     }
                 };
                 if let Err(e) = self.apply_preset_to_config_and_reload(target) {
+                    // The live gate did NOT change — do not flip the status-bar
+                    // preset or print a success line (that would assert a level
+                    // not in force). Mirror the Shift+Tab handler, which returns
+                    // early on the same failure.
                     let msg = format!("⚠ Preset written, but live reload failed: {e}");
                     let _ = self.context.append_system_message(&msg);
                     self.scrollback_queue.push(("system".into(), msg));
+                    return;
                 }
                 self.context.autonomy_preset = Some(target);
                 let msg = format!(

@@ -1898,7 +1898,16 @@ async fn main() -> Result<()> {
             let model = config.default_model.as_deref().unwrap_or("(default)");
             cli_style::field("Provider", W, &format!("{provider} · {model}"));
             cli_style::field("Observ.", W, &config.observability.backend.to_string());
-            cli_style::field("Autonomy", W, &format!("{:?}", config.autonomy.level));
+            // Show the preset, not just the level: Manual and Smart are both
+            // `Supervised` and differ only in `always_ask`, so the level alone
+            // can't say whether a shell command will prompt.
+            let autonomy_preset =
+                crate::approval::policy_writer::preset_for_autonomy(&config.autonomy);
+            cli_style::field(
+                "Autonomy",
+                W,
+                &format!("{} ({:?})", autonomy_preset.id(), config.autonomy.level),
+            );
             cli_style::field("Runtime", W, &config.runtime.kind.to_string());
             cli_style::field(
                 "Heartbeat",
