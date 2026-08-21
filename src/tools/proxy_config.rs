@@ -118,21 +118,25 @@ impl ProxyConfigTool {
     }
 
     fn env_snapshot() -> Value {
+        // Proxy URLs frequently embed basic-auth creds (http://user:pass@host);
+        // strip the userinfo before it reaches the model-/channel-visible output.
+        let red = |k: &str| std::env::var(k).ok().map(|v| redact_proxy_userinfo(&v));
         json!({
-            "HTTP_PROXY": std::env::var("HTTP_PROXY").ok(),
-            "HTTPS_PROXY": std::env::var("HTTPS_PROXY").ok(),
-            "ALL_PROXY": std::env::var("ALL_PROXY").ok(),
+            "HTTP_PROXY": red("HTTP_PROXY"),
+            "HTTPS_PROXY": red("HTTPS_PROXY"),
+            "ALL_PROXY": red("ALL_PROXY"),
             "NO_PROXY": std::env::var("NO_PROXY").ok(),
         })
     }
 
     fn proxy_json(proxy: &ProxyConfig) -> Value {
+        let red = |u: &Option<String>| u.as_deref().map(redact_proxy_userinfo);
         json!({
             "enabled": proxy.enabled,
             "scope": proxy.scope,
-            "http_proxy": proxy.http_proxy,
-            "https_proxy": proxy.https_proxy,
-            "all_proxy": proxy.all_proxy,
+            "http_proxy": red(&proxy.http_proxy),
+            "https_proxy": red(&proxy.https_proxy),
+            "all_proxy": red(&proxy.all_proxy),
             "no_proxy": proxy.normalized_no_proxy(),
             "services": proxy.normalized_services(),
         })
@@ -335,6 +339,20 @@ impl ProxyConfigTool {
     }
 }
 
+/// Strip `user:pass@` userinfo from a proxy URL so credentials never reach the
+/// model-/channel-visible tool output. Non-URL or userinfo-free values pass
+/// through unchanged. Only the DISPLAYED copy is redacted; config/env writes
+/// keep the real value.
+fn redact_proxy_userinfo(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('@') {
+            Some((_userinfo, host)) => format!("{scheme}://***@{host}"),
+            None => url.to_string(),
+        },
+        None => url.to_string(),
+    }
+}
+
 #[async_trait]
 impl Tool for ProxyConfigTool {
     fn name(&self) -> &str {
@@ -440,6 +458,21 @@ mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use tempfile::TempDir;
+
+    #[test]
+    fn proxy_url_userinfo_is_redacted() {
+        // credentials stripped, host/scheme/port preserved
+        assert_eq!(
+            redact_proxy_userinfo("http://u:p@proxy.internal:8080"),
+            "http://***@proxy.internal:8080"
+        );
+        // userinfo-free and non-URL values pass through unchanged
+        assert_eq!(
+            redact_proxy_userinfo("http://proxy.internal:8080"),
+            "http://proxy.internal:8080"
+        );
+        assert_eq!(redact_proxy_userinfo("not-a-url"), "not-a-url");
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(
