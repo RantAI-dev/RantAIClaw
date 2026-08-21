@@ -7925,7 +7925,12 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
 /// `None != None` as "cannot prove it is unchanged", which errs toward
 /// restarting.
 pub(crate) fn channels_fingerprint(c: &crate::config::Config) -> Option<String> {
-    serde_json::to_string(&c.channels_config).ok()
+    // Include the autonomy policy alongside the channel config so an autonomy
+    // change (e.g. `/autonomy strict`, `/allow …`) also restarts running channel
+    // listeners with the new policy. A channels-only fingerprint left listeners
+    // on the old, looser autonomy until an independent restart — a tightening the
+    // operator saw on-screen but that wasn't enforced fleet-wide.
+    serde_json::to_string(&(&c.channels_config, &c.autonomy)).ok()
 }
 
 /// Whether the channel configuration differs between two fingerprints.
@@ -8640,6 +8645,20 @@ mod tests {
             crate::channels::configured_channel_count(&cfg_with_telegram("123:OLD")),
             crate::channels::configured_channel_count(&cfg_with_telegram("123:NEW")),
             "precondition: the counts are equal, which is why counting missed it"
+        );
+    }
+
+    #[test]
+    fn autonomy_tightening_changes_the_restart_fingerprint() {
+        // A tightening (e.g. /autonomy strict) must restart running listeners so
+        // they enforce the new policy — the fingerprint now covers autonomy.
+        let mut cfg = crate::config::Config::default();
+        let before = channels_fingerprint(&cfg);
+        cfg.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        let after = channels_fingerprint(&cfg);
+        assert!(
+            channels_differ(before.as_ref(), after.as_ref()),
+            "an autonomy change must change the restart fingerprint"
         );
     }
 
