@@ -652,18 +652,29 @@ impl SecurityPolicy {
                             | "fetch"
                             | "ls-remote"
                             | "pull"
+                            // Subcommands that run an arbitrary program: bisect
+                            // run <prog>, submodule foreach '<cmd>', filter-branch.
+                            | "bisect"
+                            | "submodule"
+                            | "filter-branch"
                     )
                 }),
                 "npm" | "pnpm" | "yarn" => args.iter().any(|verb| {
                     matches!(
                         verb.as_str(),
                         "install" | "add" | "remove" | "uninstall" | "update" | "publish"
+                        // run/test/exec/ci/dlx execute arbitrary package.json
+                        // scripts or fetched packages.
+                            | "run" | "test" | "exec" | "ci" | "dlx"
                     )
                 }),
                 "cargo" => args.iter().any(|verb| {
                     matches!(
                         verb.as_str(),
                         "add" | "remove" | "install" | "clean" | "publish"
+                        // run/build/test/bench execute a build.rs hook or
+                        // project/test code.
+                            | "run" | "build" | "test" | "bench"
                     )
                 }),
                 "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
@@ -1670,6 +1681,46 @@ mod tests {
         assert_eq!(p.command_risk_level("git status"), CommandRiskLevel::Low);
         assert_eq!(
             p.command_risk_level("git --no-pager log"),
+            CommandRiskLevel::Low
+        );
+    }
+
+    #[test]
+    fn code_executing_subcommands_are_medium() {
+        // These execute a build.rs hook, a package.json script, or an arbitrary
+        // program — strictly more dangerous than a state change, so a Supervised
+        // session must hit the approval gate rather than run them silently.
+        let p = default_policy();
+        for cmd in [
+            "cargo build",
+            "cargo run --release",
+            "cargo test",
+            "cargo bench",
+            "npm run deploy",
+            "npm test",
+            "npm exec foo",
+            "git bisect run ./x.sh",
+            "git submodule foreach 'sh -c x'",
+        ] {
+            assert_eq!(
+                p.command_risk_level(cmd),
+                CommandRiskLevel::Medium,
+                "{cmd} should be Medium"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_git_and_cargo_stay_low() {
+        let p = default_policy();
+        assert_eq!(p.command_risk_level("git status"), CommandRiskLevel::Low);
+        assert_eq!(
+            p.command_risk_level("git log --oneline"),
+            CommandRiskLevel::Low
+        );
+        // A bare `cargo` with no subcommand, or metadata, stays Low.
+        assert_eq!(
+            p.command_risk_level("cargo --version"),
             CommandRiskLevel::Low
         );
     }
