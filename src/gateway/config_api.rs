@@ -403,6 +403,10 @@ async fn set_autonomy(
     }
     let resp = serde_json::to_value(&cfg.autonomy).map_err(err_500)?;
     persist_and_swap(&state, cfg).await?;
+    // A tightening must revoke prior "Always" grants — otherwise a blanket grant
+    // made under a looser preset is re-seeded into the next turn's manager and
+    // keeps skipping the prompt.
+    crate::gateway::web_approval::clear_all_session_grants();
     Ok(Json(resp))
 }
 

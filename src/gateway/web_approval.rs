@@ -159,6 +159,13 @@ pub fn record_session_grants<S: std::hash::BuildHasher>(
         .extend(tools.iter().cloned());
 }
 
+/// Drop every session's remembered "Always" grants. Called when the autonomy
+/// policy changes so a tightening actually re-prompts instead of re-seeding a
+/// stale blanket grant made under a looser preset.
+pub fn clear_all_session_grants() {
+    SESSION_GRANTS.lock().clear();
+}
+
 /// Exempt the `shell` tool from the Layer-A tool-gate on the web console. The
 /// shell tool has its own command-level gate (Layer-B), which the console now
 /// resolves via the modal, so gating `shell` at Layer-A too would mean two

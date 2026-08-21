@@ -212,6 +212,13 @@ impl ApprovalManager {
         self.session_allowlist.lock().extend(tools);
     }
 
+    /// Drop all prior "Always" session grants. Call this when the live policy is
+    /// tightened/reloaded so a blanket grant made under a looser preset does not
+    /// survive the change (a tightening must actually re-prompt).
+    pub fn clear_session_allowlist(&self) {
+        self.session_allowlist.lock().clear();
+    }
+
     /// Prompt the user on the CLI and return their decision.
     ///
     /// For non-CLI channels, returns `Yes` automatically (interactive
@@ -700,6 +707,24 @@ mod tests {
 
         // Now file_write should be in session allowlist.
         assert!(!mgr.needs_approval("file_write"));
+    }
+
+    #[test]
+    fn clearing_the_session_allowlist_revokes_a_prior_always_grant() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        mgr.record_decision(
+            "file_write",
+            &serde_json::json!({"path": "x"}),
+            ApprovalResponse::Always,
+            "cli",
+        );
+        assert!(!mgr.needs_approval("file_write"), "granted this session");
+        // A live tightening/reload must revoke the blanket grant.
+        mgr.clear_session_allowlist();
+        assert!(
+            mgr.needs_approval("file_write"),
+            "clearing the session allowlist must re-prompt"
+        );
     }
 
     #[test]
