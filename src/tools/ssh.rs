@@ -25,6 +25,62 @@ impl SshTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
     }
+
+    /// `ssh exec` runs an arbitrary remote command with no allowlist, so — like
+    /// `pty` — the only gate is a human decision. Full autonomy trusts the
+    /// agent; otherwise ask the approval backend. Returns `Some(refusal)` if the
+    /// command must not run, or `None` to proceed.
+    async fn require_command_approval(&self, label: &str, command: &str) -> Option<ToolResult> {
+        if self.security.effective_autonomy() == crate::security::AutonomyLevel::Full {
+            return None;
+        }
+        let Some(approvals) = self.security.pending() else {
+            return Some(fail(format!(
+                "Action blocked: `{label}` runs an arbitrary command and needs approval, but no \
+                 interactive approver is available. Use an interactive session, or \
+                 `rantaiclaw autonomy full` in a trusted environment."
+            )));
+        };
+        let (channel, reply_target) = crate::security::current_turn_scope();
+        match approvals
+            .request_decision_in(
+                uuid::Uuid::new_v4(),
+                label.to_string(),
+                command.to_string(),
+                channel,
+                reply_target,
+            )
+            .await
+        {
+            crate::security::Decision::Deny => {
+                Some(fail(format!("`{label}` denied by the operator")))
+            }
+            _ => None,
+        }
+    }
+
+    /// Confine a local file-transfer path to the workspace + forbidden-path
+    /// policy, exactly as the file tools do — so `ssh push local_path=~/.ssh/id_rsa`
+    /// can't exfiltrate a host file and `pull` can't overwrite one outside the
+    /// workspace. Returns `Some(refusal)` if the path is out of bounds.
+    fn require_local_path_allowed(&self, local: &str) -> Option<ToolResult> {
+        if !self.security.is_path_allowed(local) {
+            return Some(fail(format!(
+                "Action blocked: local path `{local}` is outside the workspace or is a forbidden path"
+            )));
+        }
+        // Post-canonicalization containment (symlink escape). `pull` may target a
+        // not-yet-existing file (canonicalize fails) — then the lexical check
+        // above is the guard.
+        if let Ok(canon) = std::path::Path::new(local).canonicalize() {
+            if !self.security.is_resolved_path_allowed(&canon) {
+                return Some(fail(format!(
+                    "Action blocked: local path `{local}` resolves outside the workspace"
+                )));
+            }
+        }
+        None
+    }
 }
 
 fn fail(msg: impl Into<String>) -> ToolResult {
@@ -234,6 +290,22 @@ impl Tool for SshTool {
         let Some(action) = str_field(&args, "action") else {
             return Ok(fail("missing `action`"));
         };
+        // `exec` runs an arbitrary remote command — require a human decision.
+        if action == "exec" {
+            if let Some(command) = str_field(&args, "command") {
+                if let Some(refusal) = self.require_command_approval("ssh exec", command).await {
+                    return Ok(refusal);
+                }
+            }
+        }
+        // `push`/`pull` read/write a local path — confine it to the workspace.
+        if matches!(action, "push" | "pull") {
+            if let Some(local) = str_field(&args, "local_path") {
+                if let Some(refusal) = self.require_local_path_allowed(local) {
+                    return Ok(refusal);
+                }
+            }
+        }
         let result = match action {
             "connect" => Self::do_connect(&args).await,
             "exec" => Self::do_exec(&args).await,
@@ -253,6 +325,40 @@ mod tests {
 
     fn tool(level: AutonomyLevel) -> SshTool {
         SshTool::new(Arc::new(SecurityPolicy::default().with_autonomy(level)))
+    }
+
+    #[tokio::test]
+    async fn exec_without_an_approver_is_refused() {
+        // Supervised + no approval backend attached → an arbitrary remote
+        // command must be refused, not run unattended.
+        let t = tool(AutonomyLevel::Supervised);
+        let res = t
+            .execute(json!({"action": "exec", "session": "nope", "command": "id"}))
+            .await
+            .unwrap();
+        assert!(!res.success, "ssh exec must not run without an approver");
+        assert!(res.error.unwrap_or_default().contains("approver"));
+    }
+
+    #[tokio::test]
+    async fn push_of_a_forbidden_local_path_is_refused() {
+        // A host file outside the workspace must not be exfiltrated via push.
+        let t = tool(AutonomyLevel::Supervised);
+        let res = t
+            .execute(json!({
+                "action": "push",
+                "session": "nope",
+                "local_path": "/etc/hosts",
+                "remote_path": "/tmp/x"
+            }))
+            .await
+            .unwrap();
+        assert!(!res.success, "ssh push of a forbidden path must be refused");
+        assert!(res
+            .error
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("path"));
     }
 
     #[test]
