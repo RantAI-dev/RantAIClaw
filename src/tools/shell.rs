@@ -352,12 +352,14 @@ impl Tool for ShellTool {
                             )
                             .await;
                         match decision {
+                            // Once/Session/Persist fall through to re-validate on
+                            // the next loop iteration (an explicit `continue` here
+                            // is redundant — the loop re-iterates anyway).
                             Decision::Once | Decision::Session => {
                                 if let Err(e) = self.security.add_runtime_command(&basename, false)
                                 {
                                     tracing::warn!(target: "shell", error = %e, "add_runtime_command failed");
                                 }
-                                continue;
                             }
                             Decision::Persist => {
                                 if let Err(e) = self.security.add_runtime_command(&basename, true) {
@@ -368,7 +370,6 @@ impl Tool for ShellTool {
                                     );
                                     let _ = self.security.add_runtime_command(&basename, false);
                                 }
-                                continue;
                             }
                             Decision::Deny => {
                                 return Ok(ToolResult {
@@ -406,9 +407,10 @@ impl Tool for ShellTool {
                             )
                             .await;
                         match decision {
+                            // Approved for this run — fall through to re-validate
+                            // with `human_approved = true` on the next iteration.
                             Decision::Once | Decision::Session | Decision::Persist => {
                                 human_approved = true;
-                                continue;
                             }
                             Decision::Deny => {
                                 return Ok(ToolResult {
