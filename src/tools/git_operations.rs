@@ -369,6 +369,16 @@ impl GitOperationsTool {
             anyhow::bail!("Branch name contains invalid characters");
         }
 
+        // Reject a leading-dash spec so it can never be parsed as an option
+        // rather than a ref — e.g. `-f` would run `git checkout -f`, discarding
+        // uncommitted changes. (A `--` separator can't be used here: for
+        // checkout, `git checkout -- <arg>` forces <arg> to be a *pathspec*,
+        // which would break branch switching. Rejecting the leading dash is the
+        // correct guard for a ref argument.)
+        if branch_name.starts_with('-') {
+            anyhow::bail!("Branch name may not start with '-'");
+        }
+
         let output = self.run_git_command(&["checkout", branch_name]).await;
 
         match output {
@@ -753,6 +763,32 @@ mod tests {
         assert!(
             !error_msg.contains("read-only") && !error_msg.contains("autonomy"),
             "Error should be about git, not about autonomy restrictions: {error_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_rejects_leading_dash_branch() {
+        let tmp = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        // Full autonomy so the write op reaches git_checkout without an approval
+        // gate; the point is the leading-dash guard, not the approval flow.
+        let security = Arc::new(SecurityPolicy::default().with_autonomy(AutonomyLevel::Full));
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        // `-f` must be refused, never run as `git checkout -f` (which would
+        // discard the working tree with no pathspec). `git_checkout` bails, so
+        // execute() returns Err — same shape as its other branch-spec rejections.
+        let err = tool
+            .execute(json!({"operation": "checkout", "branch": "-f"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("start with '-'"),
+            "expected a leading-dash rejection, got: {err}"
         );
     }
 
