@@ -1685,7 +1685,10 @@ mod tests {
             CommandRiskLevel::Low
         );
         // A bare `cargo` with no subcommand, or metadata, stays Low.
-        assert_eq!(p.command_risk_level("cargo --version"), CommandRiskLevel::Low);
+        assert_eq!(
+            p.command_risk_level("cargo --version"),
+            CommandRiskLevel::Low
+        );
     }
 
     #[test]
