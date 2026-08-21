@@ -6,11 +6,13 @@
 //! [`PairingGuard`] implements device pairing for channel authentication, and
 //! [`SecretStore`] handles encrypted credential storage.
 //!
-//! OS-level isolation is provided through the [`Sandbox`] trait defined in
-//! [`traits`], with pluggable backends including Docker, Firejail, Bubblewrap,
-//! and Landlock. The [`create_sandbox`] function selects the best available
-//! backend at runtime. An [`AuditLogger`] records security-relevant events for
-//! forensic review.
+//! The [`Sandbox`] trait defined in [`traits`] abstracts OS-level isolation
+//! backends (Docker, Firejail, Bubblewrap, Landlock), and [`AuditLogger`]
+//! defines a security-event log. **Neither is currently wired into the runtime**
+//! (as of 2026-08): `create_sandbox` and `AuditLogger` have no production
+//! callers, so `[security.sandbox]`/`[security.audit]` config has no effect
+//! today. In-process command confinement is available via `[runtime].kind`.
+//! Wiring these is tracked in `plans/215`/`plans/218`.
 //!
 //! # Extension
 //!

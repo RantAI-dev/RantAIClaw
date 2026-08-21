@@ -3,18 +3,24 @@
 //! This module defines the [`Sandbox`] trait, which abstracts OS-level process
 //! isolation backends. Implementations wrap shell commands with platform-specific
 //! sandboxing (e.g., seccomp, AppArmor, namespaces) to limit the blast radius
-//! of tool execution. The agent runtime selects and applies a sandbox backend
-//! before executing any shell command.
+//! of tool execution.
+//!
+//! **NOT CURRENTLY WIRED.** As of 2026-08, this layer is defined but not applied
+//! to command execution: `create_sandbox` has no production caller and the shell
+//! tool spawns commands unwrapped, so `[security.sandbox] backend = …` has no
+//! effect today. In-process confinement is instead available via
+//! `[runtime].kind = "docker"`. Wiring a backend here is a tracked follow-up
+//! (`plans/215-sandbox-layer-wire-or-delete-spike.md`).
 
 use async_trait::async_trait;
 use std::process::Command;
 
 /// Sandbox backend for OS-level process isolation.
 ///
-/// Implement this trait to add a new sandboxing strategy. The runtime queries
-/// [`is_available`](Sandbox::is_available) at startup to select the best
-/// backend for the current platform, then calls
-/// [`wrap_command`](Sandbox::wrap_command) before every shell execution.
+/// Implement this trait to add a new sandboxing strategy. The intended contract
+/// is that the runtime queries [`is_available`](Sandbox::is_available) to select
+/// a backend and calls [`wrap_command`](Sandbox::wrap_command) before a shell
+/// execution — but note that wiring is NOT in place today (see the module docs).
 ///
 /// Implementations must be `Send + Sync` because the sandbox may be shared
 /// across concurrent tool executions on the Tokio runtime.
