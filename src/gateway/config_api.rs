@@ -367,7 +367,17 @@ async fn set_autonomy(
         cfg.autonomy.always_ask = v;
     }
     if let Some(v) = body.allowed_commands {
-        cfg.autonomy.allowed_commands = v;
+        // Validate each entry into a single basename (the shell gate matches by
+        // basename), rejecting multi-token/glob values that would silently never
+        // match. The high-risk warning is advisory and dropped here.
+        let mut cleaned = Vec::with_capacity(v.len());
+        for entry in &v {
+            match crate::approval::permissions::validate_allow_basename(entry) {
+                Ok((base, _)) => cleaned.push(base),
+                Err(msg) => return Err(err_400(msg)),
+            }
+        }
+        cfg.autonomy.allowed_commands = cleaned;
     }
     if let Some(v) = body.forbidden_paths {
         cfg.autonomy.forbidden_paths = v;
