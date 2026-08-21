@@ -68,6 +68,10 @@ impl GuestGate {
         "delegate",
         "ssh",
         "pty",
+        // Persists proxy config and can rewrite the whole process's egress
+        // (HTTP(S)_PROXY) — same config-mutating/traffic-redirecting class as
+        // the tools above, so a guest must never reach it.
+        "proxy_config",
         "author_skill",
         "skills_install",
         "skills_install_deps",
@@ -238,6 +242,7 @@ mod tests {
                 "delegate".to_string(),
                 "ssh".to_string(),
                 "pty".to_string(),
+                "proxy_config".to_string(),
             ],
             &[],
         );
@@ -247,6 +252,7 @@ mod tests {
             "delegate",
             "ssh",
             "pty",
+            "proxy_config",
         ] {
             assert!(!g.tool_permitted(tool), "{tool} must stay owner-only");
             let reason = g.deny_reason(tool, &json!({})).unwrap();
