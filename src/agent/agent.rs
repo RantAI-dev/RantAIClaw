@@ -340,6 +340,12 @@ fn empty_usage(model: &str) -> TokenUsage {
 /// prompting. Returns `Err` only on TOML parse failure; missing file
 /// → `Ok(empty)` so a fresh profile (no policy provisioned yet) gets
 /// the generic safety section instead of a hard error.
+///
+/// NOTE: these globs are ADVISORY — shown to the model, not enforced. The
+/// runtime shell gate matches `config.autonomy.allowed_commands` by BASENAME
+/// (`SecurityPolicy::is_command_allowed`), so `git status` here is enforced as
+/// "any `git`". Editing this file changes what the model is told, not what the
+/// gate allows; mutating subcommands are instead gated by `command_risk_level`.
 fn read_command_allowlist(policy_dir: &std::path::Path) -> Result<Vec<String>> {
     let path = policy_dir.join("command_allowlist.toml");
     let raw = match std::fs::read_to_string(&path) {

@@ -983,7 +983,14 @@ impl SecurityPolicy {
     // forbidden-prefix match. Each layer addresses a distinct escape
     // technique; together they enforce workspace confinement.
 
-    /// Check if a file path is allowed (no path traversal, within workspace)
+    /// Check if a file path is allowed (no path traversal, within workspace).
+    ///
+    /// SCOPE: this gate is consulted by the FILE tools (file_read/file_write/
+    /// pdf_read/image_info), NOT the shell tool. An allowlisted `cat`/`grep` in
+    /// the shell can still read any path — `forbidden_paths` does not confine
+    /// shell reads. Use a lower autonomy level or `[runtime].kind` for shell
+    /// confinement (OS sandboxing via `[security.sandbox]` is a roadmap item,
+    /// not yet wired).
     pub fn is_path_allowed(&self, path: &str) -> bool {
         // Directories that are ALWAYS denied to file tools, independent of the
         // operator's `forbidden_paths` config. The config list can only ADD to
