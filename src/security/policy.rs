@@ -973,6 +973,25 @@ impl SecurityPolicy {
 
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
+        // Directories that are ALWAYS denied to file tools, independent of the
+        // operator's `forbidden_paths` config. The config list can only ADD to
+        // this floor — it can never remove an entry — so an emptied or relaxed
+        // `forbidden_paths` (including one set via `PUT /api/v1/config/autonomy`)
+        // cannot expose credentials or system files.
+        const FORBIDDEN_PATH_FLOOR: &[&str] = &[
+            "/etc",
+            "/root",
+            "/boot",
+            "/sys",
+            "/proc",
+            "~/.ssh",
+            "~/.aws",
+            "~/.gnupg",
+            "~/.config/gh",
+            "~/.kube",
+            "~/.netrc",
+        ];
+
         // Block null bytes (can truncate paths in C-backed syscalls)
         if path.contains('\0') {
             return false;
@@ -1008,20 +1027,35 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block forbidden paths using path-component-aware matching
+        // Block forbidden paths (hardcoded floor ∪ operator config) using
+        // path-component-aware matching. On a case-insensitive filesystem
+        // (macOS/Windows), fold case so `/ETC/passwd` still matches `/etc`.
         let expanded_path = Path::new(&expanded);
-        for forbidden in &self.fields().forbidden_paths {
-            let forbidden_expanded = if let Some(stripped) = forbidden.strip_prefix("~/") {
+        let case_insensitive = cfg!(any(target_os = "macos", target_os = "windows"));
+        let expand_forbidden = |forbidden: &str| -> String {
+            if let Some(stripped) = forbidden.strip_prefix("~/") {
                 if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
-                    home.join(stripped).to_string_lossy().to_string()
-                } else {
-                    forbidden.clone()
+                    return home.join(stripped).to_string_lossy().to_string();
                 }
+            }
+            forbidden.to_string()
+        };
+        let is_under_forbidden = |forbidden: &str| -> bool {
+            let fe = expand_forbidden(forbidden);
+            if case_insensitive {
+                let el = expanded.to_lowercase();
+                let fl = fe.to_lowercase();
+                Path::new(&el).starts_with(Path::new(&fl))
             } else {
-                forbidden.clone()
-            };
-            let forbidden_path = Path::new(&forbidden_expanded);
-            if expanded_path.starts_with(forbidden_path) {
+                expanded_path.starts_with(Path::new(&fe))
+            }
+        };
+        for forbidden in FORBIDDEN_PATH_FLOOR
+            .iter()
+            .copied()
+            .chain(self.fields().forbidden_paths.iter().map(String::as_str))
+        {
+            if is_under_forbidden(forbidden) {
                 return false;
             }
         }
@@ -2257,6 +2291,26 @@ mod tests {
             .with_allowed_commands(vec!["git".into()]);
         assert!(p.is_command_allowed("git status"));
         assert!(!p.is_command_allowed("docker ps"));
+    }
+
+    #[test]
+    fn empty_forbidden_paths_still_denies_the_floor() {
+        // The operator's forbidden_paths can be emptied (e.g. via
+        // `PUT /api/v1/config/autonomy`), but the hardcoded floor must still
+        // deny system/credential directories.
+        let p = SecurityPolicy::default()
+            .with_forbidden_paths(vec![])
+            .with_workspace_only(false);
+        assert!(!p.is_path_allowed("/etc/passwd"), "floor /etc must hold");
+        assert!(!p.is_path_allowed("/root/.bashrc"), "floor /root must hold");
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(
+                !p.is_path_allowed(&format!("{home}/.ssh/id_rsa")),
+                "floor ~/.ssh must hold"
+            );
+        }
+        // A normal in-workspace path is still allowed.
+        assert!(p.is_path_allowed("./src/main.rs"));
     }
 
     #[test]
