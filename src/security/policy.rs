@@ -351,6 +351,77 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
     segments
 }
 
+/// Split one already-separator-free command segment into the argv the shell
+/// (`sh -c`) would actually see: whitespace-separated, with unescaped `'…'` /
+/// `"…"` quotes removed so `'-exec'` becomes `-exec`. This models only the
+/// quote removal the argument-safety checks need — not variable/`$()`/glob
+/// expansion. Without it, `is_args_safe`/`command_risk_level` compared their
+/// blocklists against quote-bearing tokens (`'-exec'` != `-exec`) while the
+/// shell stripped the quotes, letting a dangerous arg slip past the gate.
+fn shell_argv(segment: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quote = QuoteState::None;
+    let mut chars = segment.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if c == '\'' {
+                    quote = QuoteState::None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            QuoteState::Double => {
+                if c == '"' {
+                    quote = QuoteState::None;
+                } else if c == '\\' {
+                    match chars.peek() {
+                        Some(&n) if n == '"' || n == '\\' || n == '$' || n == '`' => {
+                            cur.push(n);
+                            chars.next();
+                        }
+                        _ => cur.push('\\'),
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+            QuoteState::None => match c {
+                '\'' => {
+                    quote = QuoteState::Single;
+                    in_word = true;
+                }
+                '"' => {
+                    quote = QuoteState::Double;
+                    in_word = true;
+                }
+                '\\' => {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                        in_word = true;
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if in_word {
+                        out.push(std::mem::take(&mut cur));
+                        in_word = false;
+                    }
+                }
+                _ => {
+                    cur.push(c);
+                    in_word = true;
+                }
+            },
+        }
+    }
+    if in_word || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
 ///
 /// We treat any standalone `&` as unsafe in policy validation because it can
@@ -462,7 +533,9 @@ fn is_dangerous_git_long_opt(arg: &str) -> bool {
         return false;
     };
     let name = rest.split('=').next().unwrap_or(rest);
-    if name.len() < 4 {
+    // git accepts unambiguous 3-char abbreviations: `--exe` -> `--exec`,
+    // `--upl` -> `--upload-pack`. Floor at 3 so those don't slip the blocklist.
+    if name.len() < 3 {
         return false;
     }
     ["upload-pack", "receive-pack"]
@@ -494,7 +567,15 @@ impl SecurityPolicy {
                 .unwrap_or("")
                 .to_ascii_lowercase();
 
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            // De-quote the arguments the shell will actually see so a quoted
+            // state-changing verb (e.g. `git "push"`) is still detected. A quoted
+            // *base* can't reach here allowlisted (it fails the basename match in
+            // `is_command_allowed`), so keeping the base split_whitespace is safe.
+            let args: Vec<String> = shell_argv(cmd_part)
+                .into_iter()
+                .skip(1)
+                .map(|w| w.to_ascii_lowercase())
+                .collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
 
             // High-risk commands
@@ -806,8 +887,16 @@ impl SecurityPolicy {
                 return false;
             }
 
-            // Validate arguments for the command
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            // Validate arguments for the command, de-quoted to what `sh -c` will
+            // actually see — otherwise a quoted dangerous flag (`find . '-exec'`,
+            // `git ls-remote --upload-pac"k"=…`) slips past the blocklist while
+            // the shell strips the quotes. The base was already matched by
+            // basename above; skip it here.
+            let args: Vec<String> = shell_argv(cmd_part)
+                .into_iter()
+                .skip(1)
+                .map(|w| w.to_ascii_lowercase())
+                .collect();
             if !self.is_args_safe(base_cmd, &args) {
                 return false;
             }
@@ -1983,6 +2072,47 @@ mod tests {
         // No false positive: a plain clone with no dangerous flags must pass.
         let p = default_policy();
         assert!(p.is_command_allowed("git clone https://example.com/repo.git"));
+    }
+
+    #[test]
+    fn quoted_find_exec_is_still_blocked() {
+        // A quote inside the flag (`'-exec'`) used to satisfy is_args_safe's
+        // exact-string check while `sh -c` stripped the quote and ran -exec.
+        // The base `find` is unquoted (allowlisted); the args are now de-quoted.
+        let p = default_policy();
+        assert!(
+            !p.is_command_allowed("find . '-exec' rm -rf {} +"),
+            "quoted -exec must still be blocked"
+        );
+    }
+
+    #[test]
+    fn quoted_git_upload_pack_is_still_blocked() {
+        // `--upload-pac\"k\"=…` de-quotes to `--upload-pack=…`, which the shell
+        // would launch as the transport program (silent RCE).
+        let p = default_policy();
+        assert!(
+            !p.is_command_allowed(r#"git ls-remote --upload-pac"k"=/tmp/evil.sh ."#),
+            "quote-split --upload-pack must still be blocked"
+        );
+    }
+
+    #[test]
+    fn git_short_abbrev_exec_is_blocked() {
+        // 3-char unambiguous abbreviation of --exec.
+        let p = default_policy();
+        assert!(
+            !p.is_command_allowed("git push --exe=/tmp/evil"),
+            "abbreviated --exe= must be blocked"
+        );
+    }
+
+    #[test]
+    fn legitimate_quoted_find_still_allowed() {
+        // No regression: quotes around a benign glob arg are stripped, the glob
+        // char is preserved, and the command still passes.
+        let p = default_policy();
+        assert!(p.is_command_allowed("find . -name '*.txt'"));
     }
 
     #[test]
