@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0-alpha] — 2026-08-21
+
+Tools & Autonomy security hardening, consolidating a dedicated deep-scan of the
+policy engine, the approval flow, the privileged tools, and the OS sandbox layer.
+**No config schema change** (still v23): the release adds no migration and rolls
+back cleanly. claw-ui pin unchanged at **v0.3.20**. Every change tightens or
+honestly labels an existing surface; none widens an exposure boundary.
+
+### Security
+
+- **Command gate: quote-insertion no longer defeats the argument checks.** Shell
+  arguments are de-quoted before the allowlist safety checks, so a value like
+  `find . '-exec'` can no longer smuggle a dangerous flag past `is_args_safe` and
+  reach `sh -c` as an executable token. Also floors git short-form abbreviations.
+  (#607)
+- **Rate limiter no longer self-disables on freshly-booted hosts.** The
+  action-window computation underflowed when host uptime was under one hour,
+  silently clearing the limit; the window is now preserved. (#604)
+- **`forbidden_paths` has a non-removable floor.** System-critical paths
+  (`/etc`, `/root`, `~/.ssh`, `~/.aws`, …) are always enforced even if config
+  strips the list, and matching is case-folded. The config API no longer accepts
+  a `forbidden_paths` override at all. (#610, #620)
+- **`pty` and `ssh` no longer execute arbitrary commands ungated.** `pty start`
+  and `ssh exec` now route through human approval (deny when no approver backend
+  is present), and ssh file transfers are confined to allowed local paths. (#612)
+- **Code-executing `git`/`cargo`/`npm` subcommands are classified Medium risk**
+  so they prompt under the default policy instead of passing as low-risk. (#609)
+- **`proxy_config` is owner-only and its credentials are redacted** in tool
+  output. (#606)
+- **Authority tools are gated under ReadOnly and refuse a wildcard owner.**
+  `manage_permissions` and `issue_pairing_code` now hold a `SecurityPolicy`,
+  refuse to grant to `*`, and are blocked at ReadOnly autonomy. (#608)
+- **The shell approval flag can no longer self-clear the risk gate.** A
+  model-set `approved` field is gone from the tool schema; an allowlisted but
+  risk-gated command routes to a human, and a hard-blocked command is refused,
+  not model-approvable. (#611)
+- **The "Manual / Safest" preset forces every tool to prompt.** A `["*"]`
+  wildcard in `always_ask` closes the fail-open where ~40 registered tools were
+  auto-approved because the shared catalog only named nine (three of them
+  phantom). `cron_remove` is now owner-only. (#613)
+- **Session "Always" grants are revoked when autonomy is tightened,** so a grant
+  made under a looser policy does not survive a lock-down. (#614)
+- **Allow-command entries are validated to a single basename** (CLI and config
+  API), rejecting multi-token or glob values that would silently never match, and
+  warning on dangerous basenames. (#615)
+- **Policy files are written atomically** (temp + rename) so a crash mid-write
+  cannot truncate the autonomy/permissions state. (#619)
+
+### Changed
+
+- **An autonomy change now restarts channel listeners** and is part of the
+  restart fingerprint, so a tightened policy reaches already-running channels.
+  (#621)
+
+### Fixed
+
+- **CLI `status` and the `/autonomy` picker no longer misreport the preset.**
+  `status` shows the enforced preset next to the level (so `Manual` and `Smart`,
+  both `Supervised`, are distinguishable), and the TUI picker no longer claims
+  success when a policy reload fails. (#616)
+
+### Documentation
+
+- **Sandbox/audit docs no longer claim a control that isn't wired.** `traits.rs`
+  and module docs previously asserted a sandbox backend and audit logger were
+  applied before every shell execution; the docs now state the real scope, and
+  `is_path_allowed` / `read_command_allowlist` carry accurate scope comments.
+  The `[security.sandbox]` layer, cost cap, and audit/resource limits remain
+  configured-but-inert pending a wire-vs-delete decision. (#617, #620)
+
+### Internal
+
+- Policy test cleanup: the dead autonomy-cycle test now runs, the vacuous
+  forbidden-path test is retargeted to a real assertion, and a dead fork-bomb
+  string check is removed. (#618)
+
 ## [0.23.0-alpha] — 2026-08-20
 
 Cron scheduler hardening and honesty pass, consolidating the cron deep-scan
