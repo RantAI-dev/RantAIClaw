@@ -29,6 +29,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::approval::permissions::{self, Op, Target};
 use crate::config::Config;
+use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -42,11 +43,15 @@ pub struct ManagePermissionsTool {
     /// loaded. The actual edit reloads from disk to avoid clobbering concurrent
     /// changes.
     config: Arc<Config>,
+    /// Gates the tool under ReadOnly/Strict: authority mutation must not run
+    /// when the agent is read-only (the approval gate fails open for ReadOnly,
+    /// delegating the block to each tool).
+    security: Arc<SecurityPolicy>,
 }
 
 impl ManagePermissionsTool {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
+        Self { config, security }
     }
 }
 
@@ -103,6 +108,15 @@ impl Tool for ManagePermissionsTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Authority mutation must not run under ReadOnly/Strict. The approval
+        // gate returns false ("blocks everything — handled elsewhere") for
+        // ReadOnly and delegates the block to the tool, so gate it here.
+        if !self.security.can_act() {
+            return Ok(err(
+                "Action blocked: autonomy is read-only — permissions cannot be changed.",
+            ));
+        }
+
         let action = args
             .get("action")
             .and_then(serde_json::Value::as_str)
@@ -179,6 +193,19 @@ impl Tool for ManagePermissionsTool {
             ));
         }
 
+        // Refuse a wildcard owner outright — `*` makes every sender a full-
+        // toolset owner, which is never a safe interactive action from a tool
+        // call (a single prompt-injected owner turn could open the bot to
+        // anyone). The local CLI retains a warned `permissions add owner '*'`
+        // for operators who truly intend it.
+        if target == Target::Owner && op == Op::Add && value == "*" {
+            return Ok(err(
+                "Refused: owner '*' would make every sender a full-toolset owner. \
+                 Add a specific owner id instead; use the `rantaiclaw permissions` CLI \
+                 if you truly intend a wildcard.",
+            ));
+        }
+
         // Serialize this tool's load→apply→save so two concurrent owner calls
         // can't read-modify-write over each other (last-writer-wins data loss).
         let _save_guard = SAVE_LOCK.lock().await;
@@ -199,16 +226,8 @@ impl Tool for ManagePermissionsTool {
         }
 
         let mut output = outcome.message;
-        if target == Target::Owner && op == Op::Add && value == "*" {
-            // Surface to the operator log too, not just the chat reply.
-            tracing::warn!(
-                target: "permissions",
-                "approval_owners set to wildcard '*' via chat — ANY sender is now an owner"
-            );
-            output.push_str(
-                "\n⚠️ `*` makes ANY sender an owner with the full toolset — this is insecure.",
-            );
-        }
+        // Wildcard owner is refused before save (see above), so no post-save
+        // wildcard warning is reachable here.
         output.push_str("\n(Saved. A running channel/daemon may need a reload/restart to apply.)");
 
         Ok(ToolResult {
@@ -229,12 +248,47 @@ mod tests {
     use tempfile::TempDir;
 
     fn tool_in(tmp: &TempDir) -> ManagePermissionsTool {
+        tool_in_with(tmp, SecurityPolicy::default())
+    }
+
+    fn tool_in_with(tmp: &TempDir, security: SecurityPolicy) -> ManagePermissionsTool {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        ManagePermissionsTool::new(Arc::new(config))
+        ManagePermissionsTool::new(Arc::new(config), Arc::new(security))
+    }
+
+    #[tokio::test]
+    async fn wildcard_owner_is_refused() {
+        let _g = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("RANTAICLAW_CONFIG_DIR", tmp.path());
+        let tool = tool_in(&tmp);
+        let res = tool
+            .execute(json!({"action": "add", "target": "owner", "value": "*"}))
+            .await
+            .unwrap();
+        assert!(!res.success, "wildcard owner must be refused");
+        assert!(res.error.unwrap_or_default().contains("Refused"));
+    }
+
+    #[tokio::test]
+    async fn readonly_blocks_permission_change() {
+        // can_act() fails first, before any config load, so no disk isolation
+        // is needed here.
+        let tmp = TempDir::new().unwrap();
+        let tool = tool_in_with(
+            &tmp,
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly),
+        );
+        let res = tool
+            .execute(json!({"action": "add", "target": "owner", "value": "rantaiclaw_user"}))
+            .await
+            .unwrap();
+        assert!(!res.success, "ReadOnly must block permission changes");
+        assert!(res.error.unwrap_or_default().contains("read-only"));
     }
 
     #[tokio::test]

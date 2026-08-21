@@ -276,12 +276,19 @@ pub fn all_tools_with_runtime(
         // Owner-only: manage channel owners + the non-owner capability ceiling
         // from chat. The per-turn GuestGate hard-denies it for non-owners
         // (see GuestGate::OWNER_ONLY_TOOLS), so only owner/operator turns reach it.
-        Arc::new(crate::tools::manage_permissions::ManagePermissionsTool::new(config.clone())),
+        Arc::new(
+            crate::tools::manage_permissions::ManagePermissionsTool::new(
+                config.clone(),
+                security.clone(),
+            ),
+        ),
         // Owner-only: mint an on-demand pairing code from chat so a new user or
         // device can self-onboard (/claim or /bind) without a daemon restart.
-        // Hard-denied for non-owners via GuestGate::OWNER_ONLY_TOOLS; resolves
-        // the active profile root itself, so it needs no constructor args.
-        Arc::new(crate::tools::issue_pairing_code::IssuePairingCodeTool::new()),
+        // Hard-denied for non-owners via GuestGate::OWNER_ONLY_TOOLS; the
+        // SecurityPolicy gates it under ReadOnly.
+        Arc::new(crate::tools::issue_pairing_code::IssuePairingCodeTool::new(
+            security.clone(),
+        )),
         Arc::new(GitOperationsTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),

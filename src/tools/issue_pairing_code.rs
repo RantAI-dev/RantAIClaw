@@ -27,10 +27,11 @@
 //! next `/bind`/`/claim` message with no restart.
 
 use super::traits::{Tool, ToolResult};
-use crate::security::pairing_store;
+use crate::security::{pairing_store, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Tool name. Kept in one place because both the registry and the
@@ -40,17 +41,15 @@ pub const TOOL_NAME: &str = "issue_pairing_code";
 /// Default validity window, in minutes, when the caller omits `ttl_minutes`.
 const DEFAULT_TTL_MINUTES: i64 = 15;
 
-pub struct IssuePairingCodeTool;
-
-impl IssuePairingCodeTool {
-    pub fn new() -> Self {
-        Self
-    }
+pub struct IssuePairingCodeTool {
+    /// Gates the tool under ReadOnly/Strict: minting an owner-capable pairing
+    /// code is an authority grant and must not run when the agent is read-only.
+    security: Arc<SecurityPolicy>,
 }
 
-impl Default for IssuePairingCodeTool {
-    fn default() -> Self {
-        Self::new()
+impl IssuePairingCodeTool {
+    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+        Self { security }
     }
 }
 
@@ -114,6 +113,15 @@ impl Tool for IssuePairingCodeTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Minting an owner-capable code is an authority grant; it must not run
+        // under ReadOnly/Strict. The approval gate fails open for ReadOnly, so
+        // gate it here.
+        if !self.security.can_act() {
+            return Ok(err(
+                "Action blocked: autonomy is read-only — pairing codes cannot be minted.",
+            ));
+        }
+
         let channel = args
             .get("channel")
             .and_then(serde_json::Value::as_str)
@@ -205,13 +213,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readonly_blocks_minting() {
+        // can_act() fails first, before any pairing work — no HOME/env setup.
+        let tool = IssuePairingCodeTool::new(Arc::new(
+            SecurityPolicy::default().with_autonomy(crate::security::AutonomyLevel::ReadOnly),
+        ));
+        let res = tool
+            .execute(json!({"channel": "telegram", "ttl_minutes": 5}))
+            .await
+            .unwrap();
+        assert!(!res.success, "ReadOnly must block minting a pairing code");
+        assert!(res.error.unwrap_or_default().contains("read-only"));
+    }
+
+    #[tokio::test]
     async fn mint_returns_code_in_output() {
         let _g = crate::test_env::ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
-        let tool = IssuePairingCodeTool::new();
+        let tool = IssuePairingCodeTool::new(Arc::new(SecurityPolicy::default()));
         let res = tool
             .execute(json!({"channel": "telegram", "ttl_minutes": 5}))
             .await
@@ -238,7 +260,7 @@ mod tests {
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
-        let tool = IssuePairingCodeTool::new();
+        let tool = IssuePairingCodeTool::new(Arc::new(SecurityPolicy::default()));
         let res = tool
             .execute(json!({"channel": "whatsapp", "owner": false}))
             .await
@@ -262,7 +284,7 @@ mod tests {
         let prev_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
 
-        let tool = IssuePairingCodeTool::new();
+        let tool = IssuePairingCodeTool::new(Arc::new(SecurityPolicy::default()));
         let res = tool.execute(json!({"ttl_minutes": 10})).await.unwrap();
         assert!(!res.success);
         assert!(res.error.unwrap_or_default().contains("missing `channel`"));
