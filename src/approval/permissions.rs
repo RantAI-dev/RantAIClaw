@@ -119,6 +119,24 @@ pub fn apply(config: &mut Config, target: Target, op: Op, value: &str) -> Change
         };
     }
 
+    // `allow-command` feeds the basename-matched shell allowlist, so validate the
+    // shape here: the reader matches by basename with `==`, so a multi-token
+    // (`"git status"`) or path-qualified value would be stored but never match —
+    // a silently dead entry. Strip any path and reject shell metacharacters.
+    let (value, warn) = if matches!((target, op), (Target::AllowCommand, Op::Add)) {
+        match validate_allow_basename(&value) {
+            Ok(pair) => pair,
+            Err(msg) => {
+                return ChangeOutcome {
+                    changed: false,
+                    message: msg,
+                }
+            }
+        }
+    } else {
+        (value, None)
+    };
+
     let list = match target {
         Target::Owner => &mut config.channels_config.approval_owners,
         Target::GuestTool => &mut config.channels_config.guest_allowed_tools,
@@ -135,9 +153,13 @@ pub fn apply(config: &mut Config, target: Target, op: Op, value: &str) -> Change
                 }
             } else {
                 list.push(value.clone());
+                let mut message = format!("Added {} `{}`.", target.label(), value);
+                if let Some(w) = warn {
+                    message.push_str(&w);
+                }
                 ChangeOutcome {
                     changed: true,
-                    message: format!("Added {} `{}`.", target.label(), value),
+                    message,
                 }
             }
         }
@@ -157,6 +179,41 @@ pub fn apply(config: &mut Config, target: Target, op: Op, value: &str) -> Change
             }
         }
     }
+}
+
+/// Validate an `allow-command` value into a single command basename. Returns the
+/// basename plus an optional high-risk warning, or an error message when the
+/// value can't be a basename (multi-token / path-qualified with args / shell
+/// metacharacters). The shell gate matches `allowed_commands` by basename with
+/// `==`, so anything else is a silently dead entry.
+pub(crate) fn validate_allow_basename(value: &str) -> Result<(String, Option<String>), String> {
+    let base = value.rsplit('/').next().unwrap_or(value).trim();
+    if base.is_empty() {
+        return Err("Refused: empty allow-command basename.".to_string());
+    }
+    if base.chars().any(char::is_whitespace)
+        || base.contains([
+            '*', '?', '[', ']', '{', '}', '(', ')', '$', '`', ';', '|', '&', '<', '>', '\\',
+        ])
+    {
+        return Err(format!(
+            "Refused: allow-command must be a single command basename (e.g. `docker`, \
+             not `{value}`). It is matched by basename, so a multi-token or glob value \
+             would never take effect."
+        ));
+    }
+    const DANGEROUS: &[&str] = &[
+        "rm", "dd", "mkfs", "sudo", "su", "chmod", "chown", "mount", "umount", "shutdown",
+        "reboot", "halt", "poweroff", "curl", "wget", "nc", "ncat", "netcat", "bash", "sh", "zsh",
+        "python", "python3", "perl", "ruby", "node",
+    ];
+    let warn = DANGEROUS.contains(&base).then(|| {
+        format!(
+            "\n⚠ `{base}` is a high-risk command — allowlisting it lets the agent run it \
+             without the risk prompt when autonomy is off or full."
+        )
+    });
+    Ok((base.to_string(), warn))
 }
 
 /// Whether an owner entry is a Telegram-style numeric id.
@@ -442,5 +499,37 @@ mod tests {
         assert!(s.contains("web_search"));
         assert!(s.contains("ls *"));
         assert!(s.contains("file_read")); // safe set surfaced
+    }
+
+    #[test]
+    fn allow_command_rejects_multi_token() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::AllowCommand, Op::Add, "git status");
+        assert!(!out.changed, "a multi-token allow-command must be refused");
+        assert!(!c
+            .autonomy
+            .allowed_commands
+            .iter()
+            .any(|e| e == "git status"));
+    }
+
+    #[test]
+    fn allow_command_strips_path_to_basename() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::AllowCommand, Op::Add, "/usr/bin/docker");
+        assert!(out.changed);
+        assert!(c.autonomy.allowed_commands.iter().any(|e| e == "docker"));
+    }
+
+    #[test]
+    fn allow_command_warns_on_dangerous_basename() {
+        let mut c = cfg();
+        let out = apply(&mut c, Target::AllowCommand, Op::Add, "rm");
+        assert!(out.changed, "still added");
+        assert!(
+            out.message.contains("high-risk") || out.message.contains('⚠'),
+            "expected a high-risk warning, got: {}",
+            out.message
+        );
     }
 }
