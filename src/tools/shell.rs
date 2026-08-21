@@ -268,11 +268,6 @@ impl Tool for ShellTool {
                 "command": {
                     "type": "string",
                     "description": "The shell command to execute"
-                },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
-                    "default": false
                 }
             },
             "required": ["command"]
@@ -284,10 +279,12 @@ impl Tool for ShellTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // `approved` is intentionally NOT read from the tool args. The model
+        // controls its own args, so a model-supplied `approved=true` would let
+        // it wave its own risk gate. Approval for a medium/high-risk allowlisted
+        // command comes ONLY from the human backend in the cascade below (which
+        // denies by default off an interactive terminal).
+        let mut human_approved = false;
 
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
@@ -309,7 +306,10 @@ impl Tool for ShellTool {
         const MAX_CASCADING_APPROVALS: usize = 6;
         let mut iters = 0;
         loop {
-            match self.security.validate_command_execution(command, approved) {
+            match self
+                .security
+                .validate_command_execution(command, human_approved)
+            {
                 Ok(_) => break,
                 Err(reason) => {
                     iters += 1;
@@ -322,16 +322,11 @@ impl Tool for ShellTool {
                             )),
                         });
                     }
-                    let (Some(approvals), Some(basename)) = (
-                        self.security.pending(),
-                        self.security.first_unallowed_basename(command),
-                    ) else {
-                        // Hard block (high-risk, redirect, subshell
-                        // expansion, etc.) — no basename to approve;
-                        // return the error and let the LLM/UI decide
-                        // what to do. The TUI's per-turn block counter
-                        // surfaces a "switch to /autonomy off" toast
-                        // when these pile up.
+                    let Some(approvals) = self.security.pending() else {
+                        // No interactive approval channel wired (or a true hard
+                        // block) — nothing to prompt; return the error and let the
+                        // LLM/UI decide. The TUI's per-turn block counter surfaces
+                        // a "switch to /autonomy off" toast when these pile up.
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
@@ -343,45 +338,94 @@ impl Tool for ShellTool {
                     // as before — an unscoped request is still answerable only
                     // by naming the command.
                     let (channel, reply_target) = crate::security::current_turn_scope();
-                    let decision = approvals
-                        .request_decision_in(
-                            uuid::Uuid::new_v4(),
-                            basename.clone(),
-                            command.to_string(),
-                            channel,
-                            reply_target,
-                        )
-                        .await;
-                    match decision {
-                        Decision::Once | Decision::Session => {
-                            if let Err(e) = self.security.add_runtime_command(&basename, false) {
-                                tracing::warn!(target: "shell", error = %e, "add_runtime_command failed");
+
+                    if let Some(basename) = self.security.first_unallowed_basename(command) {
+                        // Case 1: an unallowed basename in the chain — approve it,
+                        // add to the runtime allowlist, and re-validate.
+                        let decision = approvals
+                            .request_decision_in(
+                                uuid::Uuid::new_v4(),
+                                basename.clone(),
+                                command.to_string(),
+                                channel,
+                                reply_target,
+                            )
+                            .await;
+                        match decision {
+                            Decision::Once | Decision::Session => {
+                                if let Err(e) = self.security.add_runtime_command(&basename, false)
+                                {
+                                    tracing::warn!(target: "shell", error = %e, "add_runtime_command failed");
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                        Decision::Persist => {
-                            if let Err(e) = self.security.add_runtime_command(&basename, true) {
-                                tracing::warn!(
-                                    target: "shell",
-                                    error = %e,
-                                    "add_runtime_command(persist) failed; falling back to session-only"
-                                );
-                                let _ = self.security.add_runtime_command(&basename, false);
+                            Decision::Persist => {
+                                if let Err(e) = self.security.add_runtime_command(&basename, true) {
+                                    tracing::warn!(
+                                        target: "shell",
+                                        error = %e,
+                                        "add_runtime_command(persist) failed; falling back to session-only"
+                                    );
+                                    let _ = self.security.add_runtime_command(&basename, false);
+                                }
+                                continue;
                             }
-                            continue;
+                            Decision::Deny => {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(reason),
+                                });
+                            }
                         }
-                        Decision::Deny => {
-                            // Explicit user deny → fail the call with the gate's
-                            // rejection. The allowlist-rejection message embeds
-                            // the full command string and is identical across
-                            // cascade iterations, so there is no per-blocker
-                            // "last error" to preserve.
-                            return Ok(ToolResult {
-                                success: false,
-                                output: String::new(),
-                                error: Some(reason),
-                            });
+                    } else if self
+                        .security
+                        .validate_command_execution(command, true)
+                        .is_ok()
+                    {
+                        // Case 2: the ONLY thing blocking this command is the
+                        // risk-approval requirement — approving it would let it
+                        // run (checked by re-validating with approved=true). The
+                        // model can no longer self-approve (see `human_approved`
+                        // above), so ask the human. Any non-Deny decision approves
+                        // THIS run only; the risk gate re-evaluates on every call.
+                        // (A block_high_risk / subshell / redirect block fails this
+                        // check and correctly falls through to the hard block below.)
+                        let label = command
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("command")
+                            .to_string();
+                        let decision = approvals
+                            .request_decision_in(
+                                uuid::Uuid::new_v4(),
+                                label,
+                                command.to_string(),
+                                channel,
+                                reply_target,
+                            )
+                            .await;
+                        match decision {
+                            Decision::Once | Decision::Session | Decision::Persist => {
+                                human_approved = true;
+                                continue;
+                            }
+                            Decision::Deny => {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(reason),
+                                });
+                            }
                         }
+                    } else {
+                        // Case 3: a true hard block (subshell / redirect / high-risk
+                        // blocked by policy) with no basename to approve.
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("{reason}{BLOCKED_COMMAND_REMEDIATION}")),
+                        });
                     }
                 }
             }
@@ -651,7 +695,9 @@ mod tests {
             .as_array()
             .expect("schema required field should be an array")
             .contains(&json!("command")));
-        assert!(schema["properties"]["approved"].is_object());
+        // `approved` was removed: the model must not be able to set it (a
+        // model-supplied approval would wave its own risk gate).
+        assert!(schema["properties"]["approved"].is_null());
     }
 
     #[tokio::test]
@@ -917,7 +963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_requires_approval_for_medium_risk_command() {
+    async fn shell_medium_risk_needs_human_approval_not_a_model_flag() {
         let security = Arc::new(
             SecurityPolicy::default()
                 .with_autonomy(AutonomyLevel::Supervised)
@@ -925,29 +971,84 @@ mod tests {
                 .with_workspace_dir(std::env::temp_dir()),
         );
 
+        // A model-supplied `approved: true` must NOT run a medium-risk command:
+        // the flag is ignored, and with no human backend the command is refused.
         let tool = ShellTool::new(security.clone(), test_runtime());
         let denied = tool
-            .execute(json!({"command": "touch rantaiclaw_shell_approval_test"}))
+            .execute(json!({
+                "command": "touch rantaiclaw_shell_approval_test",
+                "approved": true
+            }))
             .await
-            .expect("unapproved command should return a result");
-        assert!(!denied.success);
+            .expect("command should return a result");
+        assert!(
+            !denied.success,
+            "a model-supplied approved=true must not wave the risk gate"
+        );
         assert!(denied
             .error
             .as_deref()
             .unwrap_or("")
             .contains("explicit approval"));
 
+        // With a human backend that approves, the same command runs.
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let resolver = approvals.clone();
+        let mut rx = approvals.subscribe();
+        tokio::spawn(async move {
+            if let Ok(req) = rx.recv().await {
+                resolver.resolve(req.id, crate::security::Decision::Once);
+            }
+        });
         let allowed = tool
-            .execute(json!({
-                "command": "touch rantaiclaw_shell_approval_test",
-                "approved": true
-            }))
+            .execute(json!({"command": "touch rantaiclaw_shell_approval_test"}))
             .await
-            .expect("approved command execution should succeed");
-        assert!(allowed.success);
+            .expect("human-approved command should run");
+        assert!(
+            allowed.success,
+            "human approval must let the medium-risk command run: {:?}",
+            allowed.error
+        );
 
         let _ = tokio::fs::remove_file(std::env::temp_dir().join("rantaiclaw_shell_approval_test"))
             .await;
+    }
+
+    #[tokio::test]
+    async fn shell_high_risk_block_is_not_approvable() {
+        let security = Arc::new(
+            SecurityPolicy::default()
+                .with_autonomy(AutonomyLevel::Supervised)
+                .with_allowed_commands(vec!["curl".into()])
+                .with_block_high_risk_commands(true)
+                .with_workspace_dir(std::env::temp_dir()),
+        );
+        // A backend that would approve anything if asked. A block_high_risk
+        // command must still be hard-blocked (never routed to approval), so it
+        // must NOT run — proving Case 2 doesn't wrongly prompt a hard block.
+        let approvals = Arc::new(PendingApprovals::new(Some(std::time::Duration::from_secs(
+            5,
+        ))));
+        security.set_pending(approvals.clone());
+        let resolver = approvals.clone();
+        let mut rx = approvals.subscribe();
+        tokio::spawn(async move {
+            if let Ok(req) = rx.recv().await {
+                resolver.resolve(req.id, crate::security::Decision::Once);
+            }
+        });
+        let tool = ShellTool::new(security.clone(), test_runtime());
+        let res = tool
+            .execute(json!({"command": "curl http://127.0.0.1:9/nope"}))
+            .await
+            .expect("command should return a result");
+        assert!(
+            !res.success,
+            "a block_high_risk command must be hard-blocked, not approvable"
+        );
     }
 
     // ── §5.2 Shell timeout enforcement tests ─────────────────
