@@ -549,6 +549,38 @@ impl SessionStore {
         Ok(messages)
     }
 
+    /// The most recent `max_messages` messages for a session, returned
+    /// oldest-first so replay order is natural. Bounds the prompt a long
+    /// conversation rebuilds on every turn — without this, turn N re-sends
+    /// turns 1..N-1 in full. `get_messages` (unbounded) is kept for the
+    /// transcript view, which wants everything.
+    pub fn get_recent_messages(
+        &self,
+        session_id: &str,
+        max_messages: usize,
+    ) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, role, content, tool_calls, timestamp \
+             FROM messages WHERE session_id = ?1 ORDER BY timestamp DESC, id DESC LIMIT ?2",
+        )?;
+        let lim = i64::try_from(max_messages).unwrap_or(i64::MAX);
+        let mut messages = stmt
+            .query_map(params![session_id, lim], |row| {
+                Ok(Message {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    tool_calls: row.get(4)?,
+                    timestamp: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Query took newest-first for the LIMIT; flip back to chronological.
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// List recent sessions ordered by `started_at` descending.
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionMeta>> {
         self.list_sessions_paged(limit, 0)
@@ -1010,6 +1042,30 @@ mod tests {
         assert!(store.session_exists(&id).unwrap());
         store.delete_session(&id).unwrap();
         assert!(!store.session_exists(&id).unwrap());
+    }
+
+    #[test]
+    fn get_recent_messages_returns_the_newest_n_in_order() {
+        let mut store = SessionStore::in_memory().unwrap();
+        // 25 turns via record_api_turn => 50 messages under one session.
+        let mut id = None;
+        for i in 0..25 {
+            let sid = store
+                .record_api_turn("m", id.as_deref(), &format!("q{i}"), &format!("a{i}"))
+                .unwrap();
+            id = Some(sid);
+        }
+        let sid = id.unwrap();
+        let recent = store.get_recent_messages(&sid, 10).unwrap();
+        assert_eq!(recent.len(), 10, "capped at the requested count");
+        // Oldest-first within the window: the last two turns' 4 messages are the
+        // newest; the window's final message is the last assistant reply.
+        assert_eq!(recent.last().unwrap().content, "a24");
+        // Ascending by id within the window.
+        let ids: Vec<i64> = recent.iter().map(|m| m.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "returned oldest-first");
     }
 
     #[test]
