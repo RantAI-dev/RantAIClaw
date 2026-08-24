@@ -831,16 +831,19 @@ pub fn build_gateway_router(config: Config) -> Result<(AppState, Router)> {
                 api_rate_limit,
             )),
         )
-        // The 64 KiB body cap and 120 s timeout apply to webhook + api_v1
-        // routes (small JSON bodies, fast handlers). They are deliberately NOT
-        // applied to the KB router below, which sets its own larger upload
-        // limit (KB_UPLOAD_MAX_BYTES) and longer ingest timeout. Applying these
-        // outer caps to the whole app would override the KB limits and reject
-        // large uploads (413) or cut off long embeds (408).
+        // The 64 KiB body cap and the response-deadline timeout apply to
+        // webhook + api_v1 routes (small JSON bodies, fast handlers). They are
+        // deliberately NOT applied to the KB router below, which sets its own
+        // larger upload limit (KB_UPLOAD_MAX_BYTES) and longer ingest timeout.
+        // Applying these outer caps to the whole app would override the KB
+        // limits and reject large uploads (413) or cut off long embeds (408).
+        // The timeout honors [gateway] request_timeout_secs (floored at 5 s);
+        // it bounds the response *future*, so it cuts the sync
+        // `POST /api/v1/agent/chat` but not a live SSE body.
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(config.gateway.request_timeout_secs.max(5)),
         ));
 
     // KB HTTP surface (Phase 11) — only mounted when the `kb` feature is on.
