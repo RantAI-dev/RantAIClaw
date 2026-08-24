@@ -37,13 +37,50 @@ pub fn render(
         strip_avoid_block(template)
     };
 
+    // A single left-to-right pass resolves each `{{key}}` exactly once, so a
+    // value that itself contains a `{{placeholder}}` token is not re-expanded by
+    // a later replacement (which sequential `.replace` calls would have done).
+    // An empty name falls back to "you" so a legacy persona with no name does
+    // not render a double-space gap ("assistant for  (timezone: …)").
+    let name = if name.trim().is_empty() { "you" } else { name };
     let avoid_value = avoid.unwrap_or("");
-    stripped
-        .replace("{{name}}", name)
-        .replace("{{timezone}}", timezone)
-        .replace("{{role}}", role)
-        .replace("{{tone}}", tone)
-        .replace("{{avoid}}", avoid_value)
+    substitute_placeholders(&stripped, |key| match key {
+        "name" => Some(name),
+        "timezone" => Some(timezone),
+        "role" => Some(role),
+        "tone" => Some(tone),
+        "avoid" => Some(avoid_value),
+        _ => None,
+    })
+}
+
+/// Walk `template`, replacing each `{{key}}` once with `lookup(key)`. An
+/// unknown key (no match from `lookup`) is emitted verbatim, so a value that
+/// happens to contain `{{…}}` is never re-expanded.
+fn substitute_placeholders<'a>(template: &str, lookup: impl Fn(&str) -> Option<&'a str>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        if let Some(close) = after.find("}}") {
+            let key = after[..close].trim();
+            match lookup(key) {
+                Some(value) => out.push_str(value),
+                None => {
+                    // Not a known placeholder — emit the literal `{{…}}`.
+                    out.push_str(&rest[open..open + 2 + close + 2]);
+                }
+            }
+            rest = &after[close + 2..];
+        } else {
+            // No closing `}}` — emit the rest verbatim.
+            out.push_str(&rest[open..]);
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Remove `{{#if avoid}}...{{/if}}` (and its trailing blank line, if any) from
