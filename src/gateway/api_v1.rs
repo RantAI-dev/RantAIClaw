@@ -49,6 +49,7 @@ pub fn router() -> Router<AppState> {
             get(sessions_get).delete(sessions_delete),
         )
         .route("/api/v1/sessions/{id}/title", put(sessions_set_title))
+        .route("/api/v1/sessions/{id}/fork", post(sessions_fork))
         .route("/api/v1/insights", get(insights))
         .route("/api/v1/skills", get(skills_list).post(skills_create))
         .route("/api/v1/skills/install", post(skills_install))
@@ -1158,6 +1159,45 @@ async fn sessions_set_title(
     Ok(Json(
         serde_json::json!({ "id": session_id, "title": title }),
     ))
+}
+
+#[derive(Deserialize)]
+struct ForkBody {
+    /// Optional note recorded as the child's first system message. When absent,
+    /// a default naming the parent is used.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// POST /api/v1/sessions/{id}/fork — branch a new session from an existing one.
+/// The parent is left open (unlike compaction's split); the child carries a
+/// `parent_session_id` and a single system message naming the origin.
+async fn sessions_fork(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ForkBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let store = open_session_store().map_err(err_500)?;
+    let session_id = resolve_session_id(&store, &id)?;
+    let parent_title = store
+        .get_session(&session_id)
+        .map_err(err_500)?
+        .and_then(|s| s.title);
+    let note = body
+        .note
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| match parent_title {
+            Some(t) => format!("Forked from session \"{t}\"."),
+            None => format!("Forked from session {session_id}."),
+        });
+    let child = store.fork_session(&session_id, &note).map_err(err_500)?;
+    Ok(Json(serde_json::json!({
+        "id": child.id,
+        "title": child.title,
+        "parent_session_id": child.parent_session_id,
+    })))
 }
 
 async fn sessions_delete(
@@ -2815,6 +2855,19 @@ mod tests {
         assert_eq!(resp.0["name"], "Atlas");
         assert_eq!(resp.0["timezone"], "Asia/Jakarta");
         assert_eq!(resp.0["preset"], "concise_pro");
+    }
+
+    #[tokio::test]
+    async fn sessions_fork_requires_auth_when_pairing_enabled() {
+        let err = sessions_fork(
+            State(paired_state("tok")),
+            HeaderMap::new(),
+            Path("some-id".to_string()),
+            Json(ForkBody { note: None }),
+        )
+        .await
+        .expect_err("missing bearer must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
