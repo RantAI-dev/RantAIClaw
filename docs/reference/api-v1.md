@@ -793,19 +793,35 @@ is created first.
     "role": "...",
     "tone": "...",
     "avoid": "",
+    "timezone": "Asia/Jakarta",
     "always_on_kbs": ["..."]
   }
   ```
-  - `preset`, when supplied, must be one of: `default`, `concise_pro`,
-    `friendly_companion`, `research_analyst`, `executive_assistant` — any
-    other value is a `400`.
+  - `preset`, when supplied, must be one of the ids returned by
+    `GET /api/v1/personality/presets` — any other value is a `400`.
   - `avoid`: an empty string **clears** the "things to avoid" block; a
     non-empty string sets it; the field being absent leaves it unchanged
     (three distinct behaviors for one field — not "empty means unset").
-- **Response** `200`: the persisted persona in the same shape as the
-  "persona configured" branch of `GET /api/v1/personality` above (minus
-  `profile`/`timezone`).
-- **Status codes**: `200`, `400` (unknown `preset`), `401`.
+  - `name`/`timezone`/`tone` are capped at 80/64/80 characters, `role`/`avoid`
+    at 400; a value over its cap or containing control characters is a `400`.
+- **Response** `200`: the persisted persona (`preset`, `name`, `role`, `tone`,
+  `avoid`, `timezone`, `always_on_kbs`).
+- **Scope of effect**: a change takes effect immediately on the **web chat**
+  and on the next **channel** message (Telegram/Discord/…). A **TUI** session
+  that is already open picks it up on its next new conversation (`/new`) or a
+  config reload, not mid-conversation.
+- **Status codes**: `200`, `400` (unknown `preset` or invalid field), `401`.
+
+### GET /api/v1/personality/presets
+
+- **Auth**: bearer-gated.
+- **Request**: none.
+- **Response** `200`:
+  ```json
+  { "presets": [ { "id": "default", "label": "Default", "description": "..." } ] }
+  ```
+  The list is served from the enum, so a console never hardcodes it.
+- **Status codes**: `200`, `401`.
 
 ---
 
