@@ -289,7 +289,10 @@ resolves normally, `2+` matches return `400` ("ambiguous").
   ```json
   { "query": "required, non-empty", "limit": 20 }
   ```
-  `limit` optional, default `20`, capped at `200`.
+  `limit` optional, default `20`, capped at `200`. The query is matched
+  literally — each whitespace token is treated as a quoted phrase, so FTS5
+  operator characters (`"`, `*`, `(`, `NEAR`, `OR`) are searched as text rather
+  than parsed as query syntax (which previously produced a `500`).
 - **Response** `200`:
   ```json
   {
@@ -371,8 +374,9 @@ resolves normally, `2+` matches return `400` ("ambiguous").
     "latest_session_started_at": 1700000000
   }
   ```
-  Computed by scanning up to the 10,000 most recent sessions on every call —
-  no caching. `avg_messages_per_session` is `0.0` when there are no sessions.
+  Computed with aggregate SQL queries (`COUNT`/`SUM`), so the totals stay
+  correct for any number of sessions. `avg_messages_per_session` is `0.0` when
+  there are no sessions.
 - **Status codes**: `200`, `401`.
 
 ---

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::migrations::run_migrations;
@@ -109,6 +109,28 @@ fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// Turn free text into an FTS5 query that matches it literally: each whitespace
+/// token becomes a quoted phrase (inner `"` doubled), joined by implicit AND.
+/// `"`, `*`, `(`, `NEAR` and other FTS operators in user input therefore never
+/// reach the parser as syntax. Returns an empty string for whitespace-only
+/// input (the caller treats that as "no results").
+fn fts_literal_query(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Cumulative session/message statistics, computed in SQL by [`SessionStore::stats`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStats {
+    pub total_sessions: usize,
+    pub total_messages: i64,
+    pub latest_session_id: Option<String>,
+    pub latest_session_started_at: Option<i64>,
 }
 
 /// Persistent store for TUI sessions and messages backed by SQLite.
@@ -541,6 +563,37 @@ impl SessionStore {
         Ok(usize::try_from(total).unwrap_or(0))
     }
 
+    /// Whether a session row exists. Used by the API to refuse to re-create a
+    /// session that was deleted while a turn was in flight.
+    pub fn session_exists(&self, id: &str) -> Result<bool> {
+        Ok(self.get_session(id)?.is_some())
+    }
+
+    /// Cumulative session/message stats computed in SQL, so the count stays
+    /// correct past any page size (the old path loaded 10,000 rows and counted
+    /// them in Rust, freezing at 10,000).
+    pub fn stats(&self) -> Result<SessionStats> {
+        let (total_sessions, total_messages): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(message_count), 0) FROM sessions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let latest = self
+            .conn
+            .query_row(
+                "SELECT id, started_at FROM sessions ORDER BY started_at DESC, id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(SessionStats {
+            total_sessions: usize::try_from(total_sessions).unwrap_or(0),
+            total_messages,
+            latest_session_id: latest.as_ref().map(|l| l.0.clone()),
+            latest_session_started_at: latest.map(|l| l.1),
+        })
+    }
+
     /// One page of sessions, newest first, skipping `offset` rows.
     ///
     /// Without an offset the API could only ever show the newest 500 sessions;
@@ -548,7 +601,7 @@ impl SessionStore {
     pub fn list_sessions_paged(&self, limit: usize, offset: usize) -> Result<Vec<SessionMeta>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, model, started_at, message_count \
-             FROM sessions ORDER BY started_at DESC LIMIT ?1 OFFSET ?2",
+             FROM sessions ORDER BY started_at DESC, id DESC LIMIT ?1 OFFSET ?2",
         )?;
 
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -570,6 +623,15 @@ impl SessionStore {
 
     /// Full-text search across message content using FTS5, ranked by BM25.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        // Match the user's text literally: each whitespace token becomes a
+        // quoted phrase (inner `"` doubled), joined by implicit AND. A stray
+        // `"`, a leading `*`, an unbalanced paren, or an operator word like
+        // `OR`/`NEAR` in user input therefore never reaches the FTS5 parser as
+        // syntax — which used to surface as a 500 with the raw SQLite message.
+        let match_query = fts_literal_query(query);
+        if match_query.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare(
             "SELECT m.session_id, s.title, m.id, m.role, m.content, m.timestamp, \
              bm25(messages_fts) as rank \
@@ -582,7 +644,7 @@ impl SessionStore {
         )?;
 
         let results = stmt
-            .query_map(params![query, limit as i64], |row| {
+            .query_map(params![match_query, limit as i64], |row| {
                 Ok(SearchResult {
                     session_id: row.get(0)?,
                     session_title: row.get(1)?,
@@ -879,6 +941,90 @@ mod tests {
         let store = SessionStore::in_memory().unwrap();
         insert_with_id(&store, "only-one", 1);
         assert!(store.list_sessions_paged(10, 99).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_paged_breaks_started_at_ties_by_id() {
+        // started_at is second-granular, so ties are routine. Without the
+        // secondary `id` key SQLite's order between two OFFSET queries is
+        // unspecified — pages could overlap or skip. Five of these rows share
+        // one timestamp.
+        let store = SessionStore::in_memory().unwrap();
+        for i in 0..25 {
+            let ts = if i < 5 { 100 } else { i64::from(i) + 100 };
+            insert_with_id(&store, &format!("s-{i:03}"), ts);
+        }
+        let page1 = store.list_sessions_paged(10, 0).unwrap();
+        let page2 = store.list_sessions_paged(10, 10).unwrap();
+        let page3 = store.list_sessions_paged(10, 20).unwrap();
+        let seen: std::collections::HashSet<_> = page1
+            .iter()
+            .chain(page2.iter())
+            .chain(page3.iter())
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(
+            seen.len(),
+            25,
+            "tied rows must not overlap or skip across pages"
+        );
+    }
+
+    #[test]
+    fn search_with_quote_or_star_does_not_error() {
+        // FTS5 operator characters in user input must be matched literally, not
+        // parsed as query syntax (which used to 500).
+        let mut store = SessionStore::in_memory().unwrap();
+        store
+            .record_api_turn("m", None, "hello world", "an answer")
+            .unwrap();
+        assert!(store.search("\"", 10).is_ok(), "bare quote must not error");
+        assert!(store.search("*", 10).is_ok(), "leading star must not error");
+        assert!(
+            store.search("(", 10).is_ok(),
+            "unbalanced paren must not error"
+        );
+        assert_eq!(store.search("hello", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_is_literal_not_boolean() {
+        // `OR` is a literal token now, not an FTS operator.
+        let mut store = SessionStore::in_memory().unwrap();
+        store
+            .record_api_turn("m", None, "alpha beta", "reply")
+            .unwrap();
+        assert_eq!(
+            store.search("alpha OR gamma", 10).unwrap().len(),
+            0,
+            "no message contains all three literal tokens"
+        );
+    }
+
+    #[test]
+    fn session_exists_reports_deleted_rows_as_absent() {
+        let mut store = SessionStore::in_memory().unwrap();
+        let id = store
+            .record_api_turn("m", None, "question", "answer")
+            .unwrap();
+        assert!(store.session_exists(&id).unwrap());
+        store.delete_session(&id).unwrap();
+        assert!(!store.session_exists(&id).unwrap());
+    }
+
+    #[test]
+    fn stats_counts_all_rows_not_a_page() {
+        let mut store = SessionStore::in_memory().unwrap();
+        // Three sessions, each with 2 messages via record_api_turn.
+        for i in 0..3 {
+            store
+                .record_api_turn("m", None, &format!("q{i}"), &format!("a{i}"))
+                .unwrap();
+        }
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.total_sessions, 3);
+        assert_eq!(stats.total_messages, 6);
+        assert!(stats.latest_session_id.is_some());
     }
 
     #[test]

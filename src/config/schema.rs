@@ -970,9 +970,11 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
 
-    /// Request timeout in seconds (default: 300).
-    /// Controls how long the gateway waits for the agentic loop to complete.
-    /// Increase for workloads with long-running tool calls (package installs, etc.)
+    /// Response deadline in seconds for `/api/v1/*`, `/api/v1/config`, and
+    /// `/api/v1/cron` requests (default: 300, floored at 5). It bounds the
+    /// response *future*, so it cuts the synchronous `POST /api/v1/agent/chat`
+    /// but NOT a live streaming (SSE) chat body. Increase for workloads with
+    /// long-running sync tool calls; prefer the streaming path for those.
     #[serde(default = "default_gateway_request_timeout_secs")]
     pub request_timeout_secs: u64,
 

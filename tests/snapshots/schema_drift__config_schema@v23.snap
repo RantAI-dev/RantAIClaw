@@ -1680,7 +1680,7 @@ expression: pretty
           "minimum": 0
         },
         "request_timeout_secs": {
-          "description": "Request timeout in seconds (default: 300).\nControls how long the gateway waits for the agentic loop to complete.\nIncrease for workloads with long-running tool calls (package installs, etc.)",
+          "description": "Response deadline in seconds for `/api/v1/*`, `/api/v1/config`, and\n`/api/v1/cron` requests (default: 300, floored at 5). It bounds the\nresponse *future*, so it cuts the synchronous `POST /api/v1/agent/chat`\nbut NOT a live streaming (SSE) chat body. Increase for workloads with\nlong-running sync tool calls; prefer the streaming path for those.",
           "type": "integer",
           "format": "uint64",
           "default": 300,

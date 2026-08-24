@@ -34,7 +34,7 @@ pub fn list(limit: usize) -> Result<()> {
     }
     crate::cli_style::section(&format!("sessions ({})", sessions.len()));
     for s in &sessions {
-        let short = &s.id[..s.id.len().min(8)];
+        let short = s.id.chars().take(8).collect::<String>();
         let title = s.title.as_deref().unwrap_or("(untitled)");
         println!("  {short}  {title}");
         println!(
@@ -90,7 +90,7 @@ pub fn search(query: &str, limit: usize) -> Result<()> {
     println!("{} match(es) for '{query}':", results.len());
     println!();
     for r in &results {
-        let short = &r.session_id[..r.session_id.len().min(8)];
+        let short = r.session_id.chars().take(8).collect::<String>();
         let preview: String = r.content.chars().take(80).collect();
         let suffix = if r.content.chars().count() > 80 {
             "…"
@@ -132,27 +132,26 @@ fn resolve_id(store: &SessionStore, id_prefix: &str) -> Result<String> {
 /// Cumulative session/message stats — the headless equivalent of TUI `/insights`.
 pub fn insights() -> Result<()> {
     let store = open_store()?;
-    let sessions = store.list_sessions(10_000)?;
-    let total_sessions = sessions.len();
-    let total_messages: i64 = sessions.iter().map(|s| s.message_count).sum();
-    let avg = if total_sessions > 0 {
-        total_messages as f64 / total_sessions as f64
+    // Aggregate in SQL so totals stay correct past any page size.
+    let stats = store.stats()?;
+    let avg = if stats.total_sessions > 0 {
+        stats.total_messages as f64 / stats.total_sessions as f64
     } else {
         0.0
     };
     const W: usize = 11;
     crate::cli_style::section("insights");
-    crate::cli_style::field("Sessions", W, &total_sessions.to_string());
-    crate::cli_style::field("Messages", W, &total_messages.to_string());
+    crate::cli_style::field("Sessions", W, &stats.total_sessions.to_string());
+    crate::cli_style::field("Messages", W, &stats.total_messages.to_string());
     crate::cli_style::field("Avg/session", W, &format!("{avg:.1}"));
-    if let Some(latest) = sessions.first() {
+    if let (Some(id), Some(started)) = (&stats.latest_session_id, stats.latest_session_started_at) {
         crate::cli_style::field(
             "Latest",
             W,
             &format!(
                 "{}  ·  {}",
-                &latest.id[..latest.id.len().min(8)],
-                fmt_ts(latest.started_at)
+                id.chars().take(8).collect::<String>(),
+                fmt_ts(started)
             ),
         );
     }

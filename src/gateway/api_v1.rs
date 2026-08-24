@@ -167,14 +167,49 @@ struct SkillCandidate {
 }
 
 fn err_500(e: anyhow::Error) -> (StatusCode, Json<ErrorBody>) {
+    // Log the full chain server-side, but never return raw filesystem paths or
+    // secret-looking tokens to the browser. The sessions handlers reach this
+    // with errors like "failed to open session db at /home/<user>/…"; the chat
+    // handlers already scrub separately, and scrubbing twice is idempotent.
+    let full = format!("{e:#}");
+    tracing::error!(error = %full, "api_v1 internal error");
+    let detail = crate::providers::sanitize_api_error(&redact_profile_paths(&full));
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorBody {
             error: "internal_error".into(),
             matches: None,
-            detail: Some(format!("{e:#}")),
+            detail: Some(detail),
         }),
     )
+}
+
+/// Whether a completed turn should be persisted. A turn is dropped only when
+/// the session it names existed when the turn started but has since been
+/// deleted — persisting then would silently re-create (resurrect) the row the
+/// operator just removed. A brand-new session (`existed_at_start == false`) is
+/// always persisted (that is how the first turn creates the session).
+fn should_persist(existed_at_start: bool, exists_now: bool) -> bool {
+    !existed_at_start || exists_now
+}
+
+/// Replace the active profile root and the home directory with placeholders so
+/// an error about a file never tells a browser where the operator's files are.
+fn redact_profile_paths(s: &str) -> String {
+    let mut out = s.to_string();
+    if let Ok(p) = crate::profile::ProfileManager::active() {
+        let root = p.root.display().to_string();
+        if !root.is_empty() {
+            out = out.replace(&root, "<profile>");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy().to_string();
+        if !home.is_empty() {
+            out = out.replace(&home, "~");
+        }
+    }
+    out
 }
 
 fn err_404(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
@@ -488,7 +523,7 @@ async fn agent_chat_sync(
         return Err(err_400("message must not be empty"));
     }
 
-    let config = chat_config_from_body(&state, &body);
+    let config = chat_config_from_body(&state, &body)?;
 
     let provider = config
         .default_provider
@@ -517,6 +552,9 @@ async fn agent_chat_sync(
     // Continue an existing conversation: re-feed prior turns so the model
     // remembers the exchange instead of starting cold on every message.
     let prior = load_session_history(body.session_id.as_deref());
+    // A session with prior turns already existed when this turn started; used
+    // below to avoid resurrecting a session deleted mid-turn.
+    let session_existed_at_start = !prior.is_empty();
     if !prior.is_empty() {
         agent.restore_history(&prior).map_err(err_500)?;
     }
@@ -540,16 +578,29 @@ async fn agent_chat_sync(
         // adjacent `record_api_turn` failure was reported.
         match open_session_store() {
             Ok(mut store) => {
-                match store.record_api_turn(
-                    &model,
-                    body.session_id.as_deref(),
-                    &body.message,
-                    &text,
-                ) {
-                    Ok(id) => session_id = id,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "api agent chat session persistence failed");
+                let exists_now = body
+                    .session_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|sid| store.session_exists(sid).unwrap_or(true))
+                    .unwrap_or(false);
+                if should_persist(session_existed_at_start, exists_now) {
+                    match store.record_api_turn(
+                        &model,
+                        body.session_id.as_deref(),
+                        &body.message,
+                        &text,
+                    ) {
+                        Ok(id) => session_id = id,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "api agent chat session persistence failed");
+                        }
                     }
+                } else {
+                    tracing::warn!(
+                        session_id = ?body.session_id,
+                        "session deleted mid-turn; not persisting"
+                    );
                 }
             }
             Err(err) => {
@@ -580,7 +631,7 @@ async fn agent_chat_stream(
         return Err(err_400("message must not be empty"));
     }
 
-    let config = chat_config_from_body(&state, &body);
+    let config = chat_config_from_body(&state, &body)?;
     let model = config
         .default_model
         .clone()
@@ -590,6 +641,19 @@ async fn agent_chat_stream(
     let req_session_id = body.session_id.clone();
     let scope_session_id = req_session_id.clone();
     let history_session_id = body.session_id.clone();
+    // Snapshot, at turn start, whether the named session already exists — so the
+    // persist step below can tell a brand-new session (create it) from one that
+    // was deleted mid-turn (do not resurrect it).
+    let session_existed_at_start = req_session_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|sid| {
+            open_session_store()
+                .ok()
+                .and_then(|s| s.session_exists(sid).ok())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<crate::agent::AgentEvent>(64);
     let cancel = CancellationToken::new();
     let cancel_for_agent = cancel.clone();
@@ -727,8 +791,14 @@ async fn agent_chat_stream(
         }
     });
 
+    // Construct the cancel guard BEFORE the stream generator so it is owned by
+    // the generator's captured environment from construction. A client that
+    // disconnects between the response header and the first body poll then
+    // still drops the guard (which cancels the turn) — building it as the first
+    // statement inside `stream!` left an unpolled stream unable to fire it.
+    let cancel_guard = CancelOnDrop(cancel_for_stream);
     let stream = async_stream::stream! {
-        let _cancel_on_drop = CancelOnDrop(cancel_for_stream);
+        let _cancel_on_drop = cancel_guard;
         let mut buffered_text = String::new();
         // Set when the agent emits an Error — a failed turn must not be persisted
         // (it would store a user message with an empty/partial assistant reply).
@@ -774,17 +844,29 @@ async fn agent_chat_stream(
                         // the `done` event with nothing logged to explain it.
                         match open_session_store() {
                             Ok(mut store) => {
-                                match store.record_api_turn(
-                                    &model,
-                                    req_session_id.as_deref(),
-                                    &user_message,
-                                    &persisted_text,
-                                ) {
-                                    Ok(id) => session_id = id,
-                                    Err(err) => tracing::warn!(
-                                        error = %err,
-                                        "api agent chat stream session persistence failed"
-                                    ),
+                                let exists_now = req_session_id
+                                    .as_deref()
+                                    .filter(|s| !s.is_empty())
+                                    .map(|sid| store.session_exists(sid).unwrap_or(true))
+                                    .unwrap_or(false);
+                                if should_persist(session_existed_at_start, exists_now) {
+                                    match store.record_api_turn(
+                                        &model,
+                                        req_session_id.as_deref(),
+                                        &user_message,
+                                        &persisted_text,
+                                    ) {
+                                        Ok(id) => session_id = id,
+                                        Err(err) => tracing::warn!(
+                                            error = %err,
+                                            "api agent chat stream session persistence failed"
+                                        ),
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        session_id = ?req_session_id,
+                                        "session deleted mid-turn; not persisting"
+                                    );
                                 }
                             }
                             Err(err) => tracing::warn!(
@@ -862,7 +944,10 @@ async fn agent_chat_stream(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-fn chat_config_from_body(state: &AppState, body: &ChatRequestBody) -> crate::config::Config {
+fn chat_config_from_body(
+    state: &AppState,
+    body: &ChatRequestBody,
+) -> Result<crate::config::Config, (StatusCode, Json<ErrorBody>)> {
     let mut config = state.config.lock().clone();
     if let Some(p) = body.provider.clone() {
         config.default_provider = Some(p);
@@ -871,9 +956,14 @@ fn chat_config_from_body(state: &AppState, body: &ChatRequestBody) -> crate::con
         config.default_model = Some(m);
     }
     if let Some(t) = body.temperature {
+        if !t.is_finite() || !(0.0..=2.0).contains(&t) {
+            return Err(err_400(
+                "temperature must be a finite number between 0.0 and 2.0",
+            ));
+        }
         config.default_temperature = t;
     }
-    config
+    Ok(config)
 }
 
 struct CancelOnDrop(CancellationToken);
@@ -1045,20 +1135,20 @@ async fn insights(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let store = open_session_store().map_err(err_500)?;
-    let sessions = store.list_sessions(10_000).map_err(err_500)?;
-    let total_sessions = sessions.len();
-    let total_messages: i64 = sessions.iter().map(|s| s.message_count).sum();
-    let avg = if total_sessions > 0 {
-        total_messages as f64 / total_sessions as f64
+    // Aggregate in SQL: the old path loaded 10,000 rows and counted them in
+    // Rust, so totals silently froze past 10,000 sessions.
+    let stats = store.stats().map_err(err_500)?;
+    let avg = if stats.total_sessions > 0 {
+        stats.total_messages as f64 / stats.total_sessions as f64
     } else {
         0.0
     };
     Ok(Json(serde_json::json!({
-        "total_sessions": total_sessions,
-        "total_messages": total_messages,
+        "total_sessions": stats.total_sessions,
+        "total_messages": stats.total_messages,
         "avg_messages_per_session": avg,
-        "latest_session_id": sessions.first().map(|s| s.id.clone()),
-        "latest_session_started_at": sessions.first().map(|s| s.started_at),
+        "latest_session_id": stats.latest_session_id,
+        "latest_session_started_at": stats.latest_session_started_at,
     })))
 }
 
@@ -2255,6 +2345,89 @@ mod tests {
         assert_eq!(messages[0].content, "Summarize the runtime contract");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "Runtime contract summary.");
+    }
+
+    #[test]
+    fn should_persist_only_drops_a_session_deleted_mid_turn() {
+        // Brand-new session (did not exist at start): always persist.
+        assert!(should_persist(false, false));
+        assert!(should_persist(false, true));
+        // Existed at start and still exists: persist.
+        assert!(should_persist(true, true));
+        // Existed at start but is gone now: deleted mid-turn — do NOT resurrect.
+        assert!(!should_persist(true, false));
+    }
+
+    #[test]
+    fn chat_config_rejects_non_finite_temperature() {
+        let state = test_state();
+        let body = ChatRequestBody {
+            message: "hi".into(),
+            model: None,
+            provider: None,
+            temperature: Some(f64::NAN),
+            session_id: None,
+        };
+        let err = chat_config_from_body(&state, &body).expect_err("NaN must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let body = ChatRequestBody {
+            temperature: Some(9.0),
+            ..ChatRequestBody {
+                message: "hi".into(),
+                model: None,
+                provider: None,
+                temperature: None,
+                session_id: None,
+            }
+        };
+        let err = chat_config_from_body(&state, &body).expect_err("out-of-range must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn chat_config_accepts_in_range_temperature() {
+        let state = test_state();
+        let body = ChatRequestBody {
+            message: "hi".into(),
+            model: None,
+            provider: None,
+            temperature: Some(0.3),
+            session_id: None,
+        };
+        let config = chat_config_from_body(&state, &body).expect("in-range temperature is ok");
+        assert!((config.default_temperature - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn sessions_search_returns_200_on_a_bare_quote() {
+        // A stray FTS operator character used to reach the parser as syntax and
+        // surface as a 500; it must now be a literal-match 200.
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+        let profile = crate::profile::ProfileManager::active().expect("active profile");
+        let db = profile.sessions_db_path();
+        assert!(db.starts_with(tmp.path()), "test must own its sessions.db");
+        {
+            let mut store = crate::sessions::SessionStore::open(&db).expect("open store");
+            store
+                .record_api_turn("m", None, "hello world", "an answer")
+                .unwrap();
+        }
+
+        let state = test_state();
+        let resp = sessions_search(
+            State(state),
+            HeaderMap::new(),
+            Json(SearchBody {
+                query: "\"".into(),
+                limit: Some(5),
+            }),
+        )
+        .await
+        .expect("bare quote must not 500");
+        assert_eq!(resp.0["count"], 0);
     }
 
     #[test]
