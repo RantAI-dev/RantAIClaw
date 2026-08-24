@@ -192,9 +192,14 @@ tokens, session ids, or paths.
     "model": "optional string override",
     "provider": "optional string override",
     "temperature": 0.7,
-    "session_id": "optional — continue this session; absent/empty starts a new one"
+    "session_id": "optional — continue this session; absent/empty starts a new one",
+    "context": "optional — retrieved reference material for this turn only"
   }
   ```
+  `temperature` must be finite and in `0.0`–`2.0` (else `400`). `context`, when
+  present, is placed in the prompt as clearly-framed reference material for
+  **this turn only** — it is not persisted with the user message and never
+  enters replayed history, so retrieved documents do not compound across turns.
 - **Choosing the session id**: `session_id` may name a session that does not
   exist yet. If it is UUID-shaped (`8-4-4-4-12` hex), the turn is persisted
   under exactly that id; anything else is ignored and the server mints one. This
@@ -206,9 +211,10 @@ tokens, session ids, or paths.
   handler. It streams via Server-Sent Events when either the request has
   `Accept: text/event-stream`, or the query string has
   `?stream=1|true|yes|on`; otherwise it returns one synchronous JSON body.
-  Event types, SSE framing, and the `ApprovalRequest`/`ToolCallStart`/
-  `CompactionStart` event payloads are documented in
-  [api-v1-streaming.md](api-v1-streaming.md) rather than duplicated here.
+  The full event table (including `approval_request`, `memory_recalled`,
+  `reload_complete`, and both `compaction_*` events) and the SSE framing are
+  documented in [api-v1-streaming.md](api-v1-streaming.md) rather than
+  duplicated here.
 - **Sync response** `200`:
   ```json
   {
