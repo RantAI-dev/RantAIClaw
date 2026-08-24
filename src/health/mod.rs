@@ -39,6 +39,17 @@ impl HealthSnapshot {
     pub fn is_ready(&self) -> bool {
         self.unhealthy_components().is_empty()
     }
+
+    /// A public-safe view for the unauthenticated `/health` and `/readyz`
+    /// endpoints: the readiness verdict plus the *names* of unhealthy
+    /// components only. No pid, no uptime, and no raw `last_error` strings —
+    /// those ride on the bearer-gated `/api/v1/status.runtime`.
+    pub fn public_status_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ready": self.unhealthy_components().is_empty(),
+            "unhealthy_components": self.unhealthy_components(),
+        })
+    }
 }
 
 struct HealthRegistry {
@@ -88,7 +99,10 @@ pub fn mark_component_ok(component: &str) {
 
 #[allow(clippy::needless_pass_by_value)]
 pub fn mark_component_error(component: &str, error: impl ToString) {
-    let err = error.to_string();
+    // Scrub secret-looking tokens before storing: even the bearer-gated
+    // `/api/v1/status.runtime` view should never keep a credentialed URL a
+    // component's error `Display` happened to embed.
+    let err = crate::providers::sanitize_api_error(&error.to_string());
     upsert_component(component, move |entry| {
         entry.status = "error".into();
         entry.last_error = Some(err);
@@ -127,6 +141,25 @@ mod tests {
 
     fn unique_component(prefix: &str) -> String {
         format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn public_status_json_omits_pid_and_component_details() {
+        // The unauthenticated /health and /readyz views must not carry the pid,
+        // uptime, or raw component error strings.
+        let snap = snapshot();
+        let public = snap.public_status_json();
+        assert!(public.get("ready").is_some());
+        assert!(public.get("unhealthy_components").is_some());
+        assert!(
+            public.get("pid").is_none(),
+            "public view must not expose pid"
+        );
+        assert!(
+            public.get("components").is_none(),
+            "public view must not expose per-component details"
+        );
+        assert!(public.get("uptime_seconds").is_none());
     }
 
     #[test]

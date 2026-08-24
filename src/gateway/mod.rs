@@ -953,10 +953,11 @@ pub async fn run_gateway(
 /// GET /health — liveness. Always 200 if the gateway is serving (that is the
 /// signal). Public, no secrets leaked. Use `/readyz` for readiness.
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
+    // Unauthenticated liveness — the pid, uptime, and raw component error
+    // strings that used to ride here are now behind `/api/v1/status.runtime`.
     let body = serde_json::json!({
         "status": "ok",
         "paired": state.pairing.is_paired(),
-        "runtime": crate::health::snapshot_json(),
     });
     Json(body)
 }
@@ -966,19 +967,18 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 /// so an orchestrator can pull a crash-looping instance out of rotation.
 /// Public, no secrets leaked.
 async fn handle_readyz() -> impl IntoResponse {
+    // Unauthenticated readiness — verdict + unhealthy component NAMES only.
+    // The full runtime snapshot (pid, uptime, raw error strings) is behind
+    // `/api/v1/status.runtime`.
     let snap = crate::health::snapshot();
-    let unhealthy = snap.unhealthy_components();
-    let ready = unhealthy.is_empty();
+    let ready = snap.unhealthy_components().is_empty();
     let code = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    let body = serde_json::json!({
-        "status": if ready { "ready" } else { "unready" },
-        "unhealthy_components": unhealthy,
-        "runtime": serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({})),
-    });
+    let mut body = snap.public_status_json();
+    body["status"] = serde_json::json!(if ready { "ready" } else { "unready" });
     (code, Json(body))
 }
 
