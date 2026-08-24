@@ -190,12 +190,10 @@ impl PromptSection for PersonaSection {
         "persona"
     }
 
-    /// Inject the active profile's persona — `persona.toml` rendered to
-    /// SYSTEM.md by the persona writer. Pre-fix the persona system was
-    /// effectively decorative because no agent code path read it; only the
-    /// TUI's `/personality` picker showed the values back to the user.
-    /// Now `personality set <preset>` actually reshapes the agent's voice
-    /// for both `agent -m` and `/api/v1/agent/chat`.
+    /// Inject the active profile's persona, rendered on the fly from
+    /// `persona.toml` (there is no separate SYSTEM.md file). `personality set`
+    /// reshapes the agent's voice for `agent -m`, `/api/v1/agent/chat`, and —
+    /// via a per-message splice — running channel listeners.
     ///
     /// Resolution: read the active profile's persona.toml via the same
     /// reader the CLI uses. Fall through to an empty section when no
@@ -216,7 +214,11 @@ impl PromptSection for IdentitySection {
         let mut has_aieos = false;
         if let Some(config) = ctx.identity_config {
             if identity::is_aieos_configured(config) {
-                if let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.workspace_dir) {
+                let loaded = identity::load_aieos_identity(config, ctx.workspace_dir);
+                if let Err(ref e) = loaded {
+                    tracing::warn!(error = %e, "aieos identity failed to load; falling back to workspace files");
+                }
+                if let Ok(Some(aieos)) = loaded {
                     let rendered = identity::aieos_to_system_prompt(&aieos);
                     if !rendered.is_empty() {
                         prompt.push_str(&rendered);
@@ -359,21 +361,24 @@ pub fn render_safety_section(
     SafetySection.build(&ctx).unwrap_or_default()
 }
 
-/// Swap the safety section of an already-built prompt for `replacement`.
-///
-/// Returns `prompt` unchanged when it carries no safety section, so a caller
-/// cannot silently lose the rest of the prompt if section composition changes.
+/// Heading of the persona section, as emitted by [`render_persona_section`].
+pub const PERSONA_SECTION_HEADING: &str = "## Persona";
+
+/// Swap the section opened by `heading` in an already-built prompt for
+/// `replacement`. Returns `prompt` unchanged when it carries no such section,
+/// so a caller cannot silently lose the rest of the prompt if section
+/// composition changes.
 #[must_use]
-pub fn replace_safety_section(prompt: &str, replacement: &str) -> String {
-    let Some(start) = prompt.find(SAFETY_SECTION_HEADING) else {
+fn replace_section(prompt: &str, heading: &str, replacement: &str) -> String {
+    let Some(start) = prompt.find(heading) else {
         return prompt.to_string();
     };
     // Sections are joined with a blank line and each opens with `## `, so the
     // next such marker is the end of this one.
-    let rest = &prompt[start + SAFETY_SECTION_HEADING.len()..];
-    let end = rest.find("\n## ").map_or(prompt.len(), |i| {
-        start + SAFETY_SECTION_HEADING.len() + i + 1
-    });
+    let rest = &prompt[start + heading.len()..];
+    let end = rest
+        .find("\n## ")
+        .map_or(prompt.len(), |i| start + heading.len() + i + 1);
 
     let mut out = String::with_capacity(prompt.len());
     out.push_str(&prompt[..start]);
@@ -383,6 +388,21 @@ pub fn replace_safety_section(prompt: &str, replacement: &str) -> String {
         out.push_str(&prompt[end..]);
     }
     out
+}
+
+/// Swap the safety section of an already-built prompt for `replacement`.
+#[must_use]
+pub fn replace_safety_section(prompt: &str, replacement: &str) -> String {
+    replace_section(prompt, SAFETY_SECTION_HEADING, replacement)
+}
+
+/// Swap the persona section of an already-built prompt for `replacement` (or
+/// remove it when `replacement` is empty). Lets a channel re-render the persona
+/// per message so a `PUT /api/v1/personality` reaches an already-running
+/// listener without a restart.
+#[must_use]
+pub fn replace_persona_section(prompt: &str, replacement: &str) -> String {
+    replace_section(prompt, PERSONA_SECTION_HEADING, replacement)
 }
 
 impl PromptSection for SafetySection {
