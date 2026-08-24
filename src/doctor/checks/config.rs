@@ -186,7 +186,13 @@ impl DoctorCheck for PathsCheck {
             .with_category(self.category())
             .with_hint("run: rantaiclaw onboard --interactive");
         }
-        match writable_probe(ws) {
+        // The probe creates, writes, and deletes a file — blocking FS work that
+        // must not run on the async runtime.
+        let ws_owned = ws.to_path_buf();
+        let probe = tokio::task::spawn_blocking(move || writable_probe(&ws_owned))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(format!("probe task panicked: {e}"))));
+        match probe {
             Ok(()) => CheckResult::ok(
                 self.name(),
                 format!("workspace at {} is writable", ws.display()),

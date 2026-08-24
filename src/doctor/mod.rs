@@ -135,7 +135,27 @@ async fn run_one(check: &dyn DoctorCheck, ctx: &DoctorContext) -> CheckResult {
     result
 }
 
+/// Result of a doctor run: the checks that executed, plus the names of any that
+/// were skipped (the `live` checks in brief mode). The `skipped` list lets a
+/// caller (the console) tell the operator that provider/channel/MCP were not
+/// probed, instead of silently showing all-green.
+pub struct DoctorRun {
+    pub results: Vec<CheckResult>,
+    pub skipped: Vec<String>,
+}
+
+/// Run the check registry, returning results only (back-compat wrapper).
 pub async fn run_all(ctx: DoctorContext, brief: bool) -> Vec<CheckResult> {
+    run_all_detailed(ctx, brief).await.results
+}
+
+/// Run the check registry concurrently and report which checks were skipped.
+///
+/// Non-skipped checks run in parallel (`join_all`), so total latency is the
+/// slowest single check rather than the sum. In brief mode the `live` checks
+/// (`provider.ping`, `channels.auth`, `mcp.startup`) are skipped and their
+/// names returned in `skipped`.
+pub async fn run_all_detailed(ctx: DoctorContext, brief: bool) -> DoctorRun {
     let registry: Vec<Box<dyn DoctorCheck>> = vec![
         Box::new(checks::config::ConfigSchemaCheck),
         Box::new(checks::config::ProviderKeyCheck),
@@ -148,14 +168,19 @@ pub async fn run_all(ctx: DoctorContext, brief: bool) -> Vec<CheckResult> {
         Box::new(checks::daemon::DaemonRegistrationCheck),
         Box::new(checks::system_deps::SystemDepsCheck),
     ];
-    let mut results = Vec::with_capacity(registry.len());
-    for check in &registry {
+    let ctx = std::sync::Arc::new(ctx);
+    let mut skipped = Vec::new();
+    let mut futs = Vec::new();
+    for check in registry {
         if brief && check.category() == "live" {
+            skipped.push(check.name().to_string());
             continue;
         }
-        results.push(run_one(check.as_ref(), &ctx).await);
+        let ctx = std::sync::Arc::clone(&ctx);
+        futs.push(async move { run_one(check.as_ref(), &ctx).await });
     }
-    results
+    let results = futures::future::join_all(futs).await;
+    DoctorRun { results, skipped }
 }
 
 #[cfg(test)]

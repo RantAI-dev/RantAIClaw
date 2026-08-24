@@ -16,7 +16,14 @@ impl DoctorCheck for DaemonRegistrationCheck {
     }
     async fn run(&self, _ctx: &DoctorContext) -> CheckResult {
         let cat = self.category();
-        match detect_registration() {
+        // `detect_registration` shells out to systemctl/launchctl and scans the
+        // PATH — blocking work that must not run on the async runtime (it would
+        // stall the worker other SSE chat streams share). Move it to a blocking
+        // pool.
+        let state = tokio::task::spawn_blocking(detect_registration)
+            .await
+            .unwrap_or(DaemonState::Unsupported);
+        match state {
             DaemonState::Registered { backend } => {
                 CheckResult::ok(self.name(), format!("daemon registered via {backend}"))
                     .with_category(cat)

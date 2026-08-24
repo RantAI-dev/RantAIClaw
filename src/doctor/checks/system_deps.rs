@@ -18,7 +18,11 @@ impl DoctorCheck for SystemDepsCheck {
         "system"
     }
     async fn run(&self, _ctx: &DoctorContext) -> CheckResult {
-        let report = probe_binaries(REQUIRED, RECOMMENDED);
+        // PATH scans are blocking filesystem work; keep them off the async
+        // runtime so a doctor poll cannot stall an SSE chat worker.
+        let report = tokio::task::spawn_blocking(|| probe_binaries(REQUIRED, RECOMMENDED))
+            .await
+            .unwrap_or_default();
 
         if !report.required_missing.is_empty() {
             return CheckResult::fail(
