@@ -915,6 +915,18 @@ pub async fn run_gateway(
 
     let (state, app) = build_gateway_router(config.clone())?;
 
+    // Best-effort one-shot: derive titles for legacy sessions that never went
+    // through the auto-titling path. Idempotent — a no-op once every session
+    // has a title. The TUI does this too, but a gateway-only deployment never
+    // opens the TUI, so it must run here as well.
+    if let Ok(profile) = crate::profile::ProfileManager::active() {
+        if let Ok(store) = crate::sessions::SessionStore::open(&profile.sessions_db_path()) {
+            if let Err(e) = store.backfill_titles() {
+                tracing::warn!(error = %e, "session title backfill failed at startup");
+            }
+        }
+    }
+
     // ── Tunnel ────────────────────────────────────────────────
     let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
     let mut tunnel_url: Option<String> = None;
@@ -936,6 +948,18 @@ pub async fn run_gateway(
     println!("🦀 RantaiClaw Gateway listening on http://{display_addr}");
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
+    }
+    // Warn when the gateway is reachable beyond localhost but the web console
+    // has no login configured — anyone who can reach the port can drive the
+    // agent. Advisory only; the operator opted into the exposure.
+    let exposed = is_public_bind(host) || tunnel_url.is_some();
+    let login_off = config.gateway.login.password_hash.is_none();
+    if exposed && login_off {
+        println!(
+            "  ⚠️  Reachable beyond localhost with no web-console login configured — \
+             anyone who can reach {display_addr} can drive the agent."
+        );
+        println!("      Set [gateway.login] or bind to 127.0.0.1.");
     }
     println!("  POST /pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST /webhook   — {{\"message\": \"your prompt\"}}");

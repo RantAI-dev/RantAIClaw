@@ -753,6 +753,48 @@ impl SessionStore {
             source,
         })
     }
+
+    /// Fork a session **without ending the parent**: create a new session with
+    /// `parent_session_id` set and a single system message naming the origin.
+    /// Unlike [`Self::split_session`] (written for compaction, which ends the
+    /// parent), this is a user-initiated "branch from here" — the parent stays
+    /// open and continuable. Returns the new child session.
+    pub fn fork_session(&self, parent_id: &str, note: &str) -> Result<Session> {
+        let parent = self
+            .get_session(parent_id)?
+            .ok_or_else(|| anyhow::anyhow!("no session with id {parent_id}"))?;
+        let new_id = Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().timestamp();
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO sessions (id, parent_session_id, model, started_at, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![new_id, parent_id, parent.model, started_at, parent.source],
+        )?;
+        tx.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![new_id, "system", note, Option::<String>::None, started_at],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?1",
+            params![new_id],
+        )?;
+        tx.commit()?;
+
+        Ok(Session {
+            id: new_id,
+            title: None,
+            parent_session_id: Some(parent_id.to_string()),
+            model: parent.model,
+            started_at,
+            ended_at: None,
+            message_count: 1,
+            token_count: 0,
+            source: parent.source,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1066,6 +1108,35 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         assert_eq!(ids, sorted, "returned oldest-first");
+    }
+
+    #[test]
+    fn fork_creates_a_child_and_leaves_the_parent_untouched() {
+        let store = SessionStore::in_memory().unwrap();
+        let parent = store.new_session("m", "api").unwrap();
+
+        let child = store.fork_session(&parent.id, "Forked here").unwrap();
+        assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.message_count, 1);
+        assert_ne!(child.id, parent.id);
+
+        // The parent must be untouched — unlike split_session, fork does not end
+        // it or write to it.
+        let after = store.get_session(&parent.id).unwrap().unwrap();
+        assert!(after.ended_at.is_none(), "fork must not end the parent");
+        assert_eq!(after.message_count, 0, "fork must not write to the parent");
+
+        // The child carries the origin note as its first system message.
+        let msgs = store.get_messages(&child.id).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[0].content, "Forked here");
+    }
+
+    #[test]
+    fn fork_unknown_parent_is_an_error() {
+        let store = SessionStore::in_memory().unwrap();
+        assert!(store.fork_session("no-such-id", "x").is_err());
     }
 
     #[test]

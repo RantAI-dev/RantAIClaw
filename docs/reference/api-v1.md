@@ -369,6 +369,26 @@ resolves normally, `2+` matches return `400` ("ambiguous").
   ```
 - **Status codes**: `200`, `404`, `400` (ambiguous), `401`.
 
+### POST /api/v1/sessions/{id}/fork
+
+Branch a new session from an existing one. Unlike compaction's internal split,
+the **parent is left open and continuable** — the fork is a "branch from here".
+The child carries a `parent_session_id` and a single system message naming the
+origin.
+
+- **Auth**: bearer-gated.
+- **Path param**: `id` (prefix match, see note above).
+- **Request body** (optional):
+  ```json
+  { "note": "recorded as the child's first system message" }
+  ```
+  When absent, a default note naming the parent is used.
+- **Response** `200`:
+  ```json
+  { "id": "<child id>", "title": null, "parent_session_id": "<parent id>" }
+  ```
+- **Status codes**: `200`, `404` (no such session), `401`.
+
 ---
 
 ## Insights
