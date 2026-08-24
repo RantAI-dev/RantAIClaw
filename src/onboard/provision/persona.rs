@@ -199,7 +199,10 @@ impl TuiProvisioner for PersonaProvisioner {
 
         let persona_record = PersonaToml {
             preset,
-            name: String::new(),
+            // A non-empty default name so the template does not render a blank
+            // gap; the operator can set the real name via the console or the
+            // personality API.
+            name: "RantaiClaw".to_string(),
             timezone: "UTC".to_string(),
             role,
             tone,
@@ -208,15 +211,11 @@ impl TuiProvisioner for PersonaProvisioner {
         };
 
         persona::write_persona_toml(profile, &persona_record)?;
-        persona::render_system_md(profile, &persona_record)?;
 
         send(
             &events,
             ProvisionEvent::Done {
-                summary: format!(
-                    "Persona saved as `{}` preset. SYSTEM.md generated.",
-                    preset.slug()
-                ),
+                summary: format!("Persona saved as `{}` preset.", preset.slug()),
             },
         )
         .await?;
