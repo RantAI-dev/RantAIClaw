@@ -393,8 +393,9 @@ async fn doctor(
         config: lib_config,
         offline: true, // brief mode — no live network probes
     };
-    let results = crate::doctor::run_all(ctx, true).await;
-    let summary: Vec<_> = results
+    let run = crate::doctor::run_all_detailed(ctx, true).await;
+    let summary: Vec<_> = run
+        .results
         .iter()
         .map(|r| {
             serde_json::json!({
@@ -407,7 +408,12 @@ async fn doctor(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "results": summary })))
+    // `skipped` names the live checks (provider.ping, channels.auth,
+    // mcp.startup) that brief mode does not run, so the console can say so
+    // instead of implying an all-green gateway.
+    Ok(Json(
+        serde_json::json!({ "results": summary, "skipped": run.skipped }),
+    ))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

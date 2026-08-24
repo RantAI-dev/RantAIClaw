@@ -161,14 +161,21 @@ tokens, session ids, or paths.
         "hint": null,
         "duration_ms": 12
       }
-    ]
+    ],
+    "skipped": ["provider.ping", "channels.auth", "mcp.startup"]
   }
   ```
   `severity` is one of `"Ok"`, `"Warn"`, `"Fail"`, `"Info"` (Rust `Debug`
   formatting of `doctor::Severity`, PascalCase — not the lowercase
-  `as_str()` form the CLI uses elsewhere). This endpoint always runs in
-  **offline/brief mode** (`offline: true`) — no live network probes, so it
-  is safe to poll from a console without side effects.
+  `as_str()` form the CLI uses elsewhere). This endpoint runs in
+  **offline/brief mode**: it runs the seven non-live checks (config,
+  provider-key presence, api-url, paths, allowlist, daemon registration,
+  system deps) and makes no network calls. It is **not** fully side-effect-free
+  — it spawns `systemctl`/`launchctl` to detect the daemon and writes a
+  short-lived probe file in the workspace to verify writability (both moved off
+  the async runtime). The three live checks (`provider.ping`, `channels.auth`,
+  `mcp.startup`) are not run in brief mode; their names are returned in
+  `skipped` so a client can say so rather than imply an all-green gateway.
 - **Status codes**: `200`, `401`.
 
 ---

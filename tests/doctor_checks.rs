@@ -15,7 +15,7 @@ use rantaiclaw::config::Config;
 use rantaiclaw::doctor::checks::policy::{diagnose_allowlist, AllowlistDiagnosis};
 use rantaiclaw::doctor::checks::provider::ProviderPingCheck;
 use rantaiclaw::doctor::report::{render, render_brief, render_json, render_text, DoctorFormat};
-use rantaiclaw::doctor::{CheckResult, DoctorCheck, DoctorContext, Severity};
+use rantaiclaw::doctor::{run_all_detailed, CheckResult, DoctorCheck, DoctorContext, Severity};
 use rantaiclaw::profile::Profile;
 use tempfile::TempDir;
 
@@ -153,4 +153,30 @@ fn render_dispatches_to_json() {
     let s = render(&fixture_results(), DoctorFormat::Json);
     let v: serde_json::Value = serde_json::from_str(&s).unwrap();
     assert_eq!(v["summary"]["total"], 4);
+}
+
+#[tokio::test]
+async fn run_all_detailed_reports_skipped_live_checks() {
+    // Brief mode must skip the three live checks and name them, rather than
+    // silently omitting them (which made the console imply an all-green gateway).
+    let (ctx, _tmp) = ctx_with_provider("openai", Some("sk-test"), true);
+    let run = run_all_detailed(ctx, true).await;
+
+    let mut skipped = run.skipped.clone();
+    skipped.sort();
+    assert_eq!(
+        skipped,
+        vec![
+            "channels.auth".to_string(),
+            "mcp.startup".to_string(),
+            "provider.ping".to_string(),
+        ]
+    );
+    // None of the skipped checks appear in the results.
+    for name in ["provider.ping", "channels.auth", "mcp.startup"] {
+        assert!(
+            run.results.iter().all(|r| r.name != name),
+            "skipped check {name} must not be in results"
+        );
+    }
 }
