@@ -217,7 +217,12 @@ async fn api_rate_limit(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| *addr);
-    let key = client_key_from_request(peer, req.headers(), state.trust_forwarded_headers);
+    // Prefer the authenticated principal (the bearer token) over the peer IP:
+    // behind the BFF the console is designed for, every browser presents the
+    // proxy's IP, so an IP key gives all console users one shared 600/min
+    // bucket where one tab can 429 everyone. Fall back to the IP key for
+    // unauthenticated routes / requests with no bearer.
+    let key = api_rate_limit_key(req.headers(), peer, state.trust_forwarded_headers);
     if state.rate_limiter.allow_api(&key) {
         return next.run(req).await;
     }
@@ -362,6 +367,34 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .get("X-Real-IP")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_client_ip)
+}
+
+/// Rate-limit bucket key for the `/api/v1` tier: the authenticated principal
+/// (a stable hash of the bearer token) when one is present, else the peer-IP
+/// key. Keys on the token so console users behind one proxy IP get independent
+/// buckets instead of sharing one.
+fn api_rate_limit_key(
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+    trust_forwarded_headers: bool,
+) -> String {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if let Some(token) = bearer {
+        // Hash so the raw token is never a map key; 16 hex chars is ample to
+        // separate principals without collision risk at console scale.
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+        return format!("tok:{}", &digest[..16]);
+    }
+    client_key_from_request(peer_addr, headers, trust_forwarded_headers)
 }
 
 fn client_key_from_request(
@@ -2935,6 +2968,33 @@ mod tests {
         assert!(limiter.allow_api("127.0.0.1"));
         assert!(limiter.allow_api("127.0.0.1"));
         assert!(!limiter.allow_api("127.0.0.1"));
+    }
+
+    #[test]
+    fn api_rate_limit_key_prefers_the_bearer_token_over_the_peer_ip() {
+        use axum::http::HeaderValue;
+        let peer: Option<SocketAddr> = Some("10.0.0.1:5000".parse().unwrap());
+
+        // Two different tokens from the SAME peer IP get different buckets.
+        let mut a = HeaderMap::new();
+        a.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer token-aaa"),
+        );
+        let mut b = HeaderMap::new();
+        b.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer token-bbb"),
+        );
+        let ka = api_rate_limit_key(&a, peer, false);
+        let kb = api_rate_limit_key(&b, peer, false);
+        assert!(ka.starts_with("tok:"), "token key expected, got {ka}");
+        assert_ne!(ka, kb, "distinct tokens must not share a bucket");
+
+        // No bearer → falls back to the peer-IP key.
+        let none = HeaderMap::new();
+        let kip = api_rate_limit_key(&none, peer, false);
+        assert_eq!(kip, "10.0.0.1");
     }
 
     #[test]
