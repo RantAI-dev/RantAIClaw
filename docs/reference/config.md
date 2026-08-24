@@ -323,6 +323,7 @@ Notes:
 | `pair_rate_limit_per_minute` | `10` | max `/pair` + `/login` attempts per minute per client |
 | `webhook_rate_limit_per_minute` | `60` | max `/webhook` requests per minute per client |
 | `api_rate_limit_per_minute` | `600` | max `/api/v1/*` requests per minute per client |
+| `request_timeout_secs` | `300` | response deadline for `/api/v1/*` (floored at 5 s); cuts the sync `POST /api/v1/agent/chat` but not a live SSE stream |
 | `paired_tokens` | `[]` | SHA-256 hashes of issued bearer tokens; managed by `POST /pair` |
 
 **Revoking a token.** Delete its hash from `paired_tokens` and save — the
