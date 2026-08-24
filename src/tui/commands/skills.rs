@@ -4,16 +4,6 @@ use super::{normalise_skill_name, CommandHandler, CommandResult};
 use crate::tui::context::TuiContext;
 use crate::tui::widgets::{ListPicker, ListPickerItem, ListPickerKind};
 
-/// Built-in personality presets surfaced in the `/personality` picker.
-/// Each tuple is `(key, summary shown as the muted secondary line)`.
-const PERSONALITY_PRESETS: &[(&str, &str)] = &[
-    ("default", "Balanced general-purpose assistant"),
-    ("concise", "Terse responses, minimal preamble"),
-    ("verbose", "Detailed explanations and rationale"),
-    ("executive-assistant", "Calendar, email, scheduling focus"),
-    ("friendly-companion", "Warm, conversational tone"),
-];
-
 /// Template for `/skill new`. Matches the shape the console's Form view
 /// expects (`## Instructions` with `- ` items), so a skill written here stays
 /// form-editable there.
@@ -482,51 +472,55 @@ impl CommandHandler for PersonalityCommand {
     }
 
     fn execute(&self, args: &str, _ctx: &mut TuiContext) -> Result<CommandResult> {
-        let name = args.trim();
-        if !name.is_empty() {
+        let arg = args.trim();
+        if !arg.is_empty() {
+            // `/personality <preset>` writes the persona; unknown slugs report so.
+            let Some(preset) = crate::persona::PresetId::from_slug(arg) else {
+                return Ok(CommandResult::Message(format!("Unknown preset '{arg}'.")));
+            };
+            let profile = crate::profile::ProfileManager::active()?;
+            crate::persona::apply_update(
+                &profile,
+                crate::persona::PersonaUpdate {
+                    preset: Some(preset),
+                    ..Default::default()
+                },
+            )?;
             return Ok(CommandResult::Message(format!(
-                "Personality set to: {}\n(Full integration with system prompt pending)",
-                name
+                "Personality preset set to {}.\nTakes effect on your next new conversation (/new) or reload.",
+                preset.slug()
             )));
         }
 
-        // v0.6.8: read the active persona from `<profile>/persona/persona.toml`
-        // so the picker (a) opens with the cursor on the current preset and
-        // (b) annotates that row with `· current` so the user can tell at a
-        // glance what's loaded — pre-v0.6.8 the picker hardcoded `Some("default")`
-        // as preselect even when the actual persona was something else.
-        //
-        // Note: `PresetId::slug()` uses snake_case (`concise_pro`,
-        // `friendly_companion`) while the picker keys here use kebab-case
-        // (`friendly-companion`). Match by lowercasing + normalizing `_`
-        // to `-`. The picker also has `concise` and `verbose` keys with
-        // no exact PresetId mapping; those rows just won't get the
-        // `· current` marker, which is acceptable.
+        // Read the active persona from `<profile>/persona/persona.toml` so the
+        // picker opens on the current preset and annotates that row `· current`.
+        // The rows are built from `PresetId::ALL` so the picker never drifts
+        // from the enum (it used to hardcode a kebab-case list with two bogus
+        // keys and two presets missing).
         let active_preset_slug = {
             let profile = crate::profile::ProfileManager::active().ok();
             profile.and_then(|p| {
                 crate::persona::read_persona_toml(&p)
                     .ok()
                     .flatten()
-                    .map(|t| t.preset.slug().replace('_', "-").to_string())
+                    .map(|t| t.preset.slug().to_string())
             })
         };
 
-        let items: Vec<ListPickerItem> = PERSONALITY_PRESETS
+        let items: Vec<ListPickerItem> = crate::persona::PresetId::ALL
             .iter()
-            .map(|(key, summary)| {
-                let is_current = active_preset_slug
-                    .as_deref()
-                    .map(|p| p == *key)
-                    .unwrap_or(false);
+            .map(|preset| {
+                let slug = preset.slug();
+                let is_current = active_preset_slug.as_deref() == Some(slug);
+                let summary = preset.description();
                 let secondary = if is_current {
                     format!("{summary}  · current")
                 } else {
-                    (*summary).to_string()
+                    summary.to_string()
                 };
                 ListPickerItem {
-                    key: (*key).to_string(),
-                    primary: (*key).to_string(),
+                    key: slug.to_string(),
+                    primary: slug.to_string(),
                     secondary,
                 }
             })
