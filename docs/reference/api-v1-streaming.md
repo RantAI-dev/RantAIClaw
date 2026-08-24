@@ -31,19 +31,24 @@ Event types:
 | Type | Fields | Meaning |
 |---|---|---|
 | `chunk` | `text` | Assistant text delta. Multiple chunks may arrive per turn. |
-| `usage` | `model`, `prompt`, `completion`, `total`, `cost_usd` | Token/cost summary when available. |
+| `usage` | `model`, `prompt`, `completion`, `total`, `cost_usd` | Token/cost summary. Emitted only when token counts are known — absence means the provider did not report usage. |
+| `memory_recalled` | `keys` | Keys of stored memories injected into this turn's prompt. Emitted before the first chunk. |
 | `tool_call_start` | `id`, `name`, `args` | Agent started a tool call. |
 | `tool_call_end` | `id`, `ok`, `output_preview` | Agent finished a tool call. |
+| `approval_request` | `id`, `tool`, `args` | Agent paused awaiting an in-browser approval. Resolve via `POST /api/v1/approvals/{id}`; the stream resumes after. |
 | `error` | `message` | Non-recoverable turn error. |
-| `done` | `text`, `cancelled` | Terminal event. The stream closes after this event. |
+| `reload_complete` | — | Informational: a config reload completed (benign for a per-request gateway agent). |
+| `compaction_start` | `original_count`, `keep_last` | Context compaction began. |
+| `compaction_complete` | `summary`, `original_count`, `keep_last`, `kept_count` | Context compaction finished. |
+| `done` | `text`, `cancelled`, `session_id` | Terminal event; `session_id` is the session this turn was persisted to (pass it back to continue). The stream closes after this event. |
 
 Completed non-cancelled streams are persisted to `sessions.db` with
 `source = "api"`, matching the sync path. If the client disconnects before
 `done`, the in-flight agent turn is cancelled and no API session is recorded.
 
-Clients that omit `Accept: text/event-stream` and `?stream=1` keep the original
-sync JSON response shape:
+Clients that omit `Accept: text/event-stream` and `?stream=1` keep the sync
+JSON response shape:
 
 ```json
-{"text":"...","model":"...","provider":"...","duration_ms":1234}
+{"text":"...","model":"...","provider":"...","duration_ms":1234,"session_id":"..."}
 ```
