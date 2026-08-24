@@ -66,6 +66,21 @@ pub struct PendingRequest {
     pub created_at: u64,
 }
 
+/// A resolution event, broadcast to `subscribe_resolved` listeners when a pending
+/// request is answered or auto-denied. Lets a surface (the web console) close a
+/// modal it raised instead of leaving dead approve/deny buttons on screen.
+#[derive(Debug, Clone)]
+pub struct ResolvedInfo {
+    pub id: Uuid,
+    pub decision: Decision,
+    /// The `reply_target` the request carried, so a listener can tell whether the
+    /// resolution belongs to the turn it is serving.
+    pub reply_target: String,
+    /// True when the resolution was the deadline auto-deny rather than a user
+    /// decision.
+    pub timed_out: bool,
+}
+
 tokio::task_local! {
     /// The chat the current turn came from: `(channel, reply_target)`.
     ///
@@ -148,6 +163,8 @@ struct Inner {
     /// New-request notifications. Listeners that miss a beat just see
     /// the snapshot next time they wake up.
     notify_tx: broadcast::Sender<PendingRequest>,
+    /// Resolution notifications: a pending request was answered or auto-denied.
+    resolved_tx: broadcast::Sender<ResolvedInfo>,
     /// Optional auto-deny timeout. `None` waits forever — matches CC's
     /// pause semantics for the TUI surface. Tests + channels that
     /// genuinely want a deadline pass `Some(Duration::…)` via
@@ -179,11 +196,13 @@ impl PendingApprovals {
     /// indefinitely for an explicit decision.
     pub fn new(timeout: Option<Duration>) -> Self {
         let (notify_tx, _) = broadcast::channel(32);
+        let (resolved_tx, _) = broadcast::channel(64);
         Self {
             inner: Arc::new(Inner {
                 waiting: Mutex::new(HashMap::new()),
                 snapshot: Mutex::new(HashMap::new()),
                 notify_tx,
+                resolved_tx,
                 timeout,
             }),
         }
@@ -193,6 +212,12 @@ impl PendingApprovals {
     /// `broadcast::Receiver` — each subscriber gets its own copy.
     pub fn subscribe(&self) -> broadcast::Receiver<PendingRequest> {
         self.inner.notify_tx.subscribe()
+    }
+
+    /// Subscribe to resolution notifications (answered or auto-denied). Each
+    /// subscriber gets its own `broadcast::Receiver`.
+    pub fn subscribe_resolved(&self) -> broadcast::Receiver<ResolvedInfo> {
+        self.inner.resolved_tx.subscribe()
     }
 
     /// Snapshot of currently-pending requests.
@@ -245,6 +270,9 @@ impl PendingApprovals {
             reply_target.into(),
         );
         let id = request.id;
+        // Kept for the resolution broadcast on the auto-deny path (the snapshot
+        // entry is gone by the time the deadline fires and cleanup runs).
+        let reply_target_for_resolve = request.reply_target.clone();
 
         let (tx, rx) = oneshot::channel();
         {
@@ -264,8 +292,19 @@ impl PendingApprovals {
         match self.inner.timeout {
             Some(d) => match tokio::time::timeout(d, rx).await {
                 Ok(Ok(decision)) => decision,
-                // Timed out or sender dropped — deny is the safe default.
-                _ => Decision::Deny,
+                // Sender dropped (registry shut down) — deny, no broadcast.
+                Ok(Err(_)) => Decision::Deny,
+                // Deadline elapsed — auto-deny AND tell resolved-subscribers so a
+                // web modal can close instead of leaving dead buttons.
+                Err(_elapsed) => {
+                    let _ = self.inner.resolved_tx.send(ResolvedInfo {
+                        id,
+                        decision: Decision::Deny,
+                        reply_target: reply_target_for_resolve.clone(),
+                        timed_out: true,
+                    });
+                    Decision::Deny
+                }
             },
             None => match rx.await {
                 Ok(decision) => decision,
@@ -281,7 +320,28 @@ impl PendingApprovals {
     pub fn resolve(&self, id: Uuid, decision: Decision) -> bool {
         let tx = self.inner.waiting.lock().remove(&id);
         match tx {
-            Some(tx) => tx.send(decision).is_ok(),
+            Some(tx) => {
+                let ok = tx.send(decision).is_ok();
+                if ok {
+                    // The snapshot entry is still present (cleanup runs after the
+                    // awaiting future returns), so read the reply_target for the
+                    // resolution broadcast.
+                    let reply_target = self
+                        .inner
+                        .snapshot
+                        .lock()
+                        .get(&id)
+                        .map(|r| r.reply_target.clone())
+                        .unwrap_or_default();
+                    let _ = self.inner.resolved_tx.send(ResolvedInfo {
+                        id,
+                        decision,
+                        reply_target,
+                        timed_out: false,
+                    });
+                }
+                ok
+            }
             None => false,
         }
     }
@@ -572,5 +632,53 @@ mod tests {
     async fn resolve_unknown_id_returns_false() {
         let registry = PendingApprovals::new(Some(Duration::from_secs(10)));
         assert!(!registry.resolve(Uuid::new_v4(), Decision::Once));
+    }
+
+    #[tokio::test]
+    async fn resolve_broadcasts_to_resolved_subscribers() {
+        // A resolution must notify `subscribe_resolved` listeners (the web
+        // forwarder) so a modal can close, carrying the request's reply_target.
+        let registry = PendingApprovals::new(Some(Duration::from_secs(10)));
+        let mut resolved = registry.subscribe_resolved();
+        let id = Uuid::new_v4();
+        let r = registry.clone();
+        let task = tokio::spawn(async move {
+            r.request_decision_in(id, "git", "git status", "console", "turn-1")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(registry.resolve(id, Decision::Once));
+
+        let info = tokio::time::timeout(Duration::from_millis(100), resolved.recv())
+            .await
+            .expect("resolution within deadline")
+            .expect("recv ok");
+        assert_eq!(info.id, id);
+        assert_eq!(info.decision, Decision::Once);
+        assert_eq!(info.reply_target, "turn-1");
+        assert!(!info.timed_out);
+        assert_eq!(task.await.unwrap(), Decision::Once);
+    }
+
+    #[tokio::test]
+    async fn timeout_broadcasts_deny_as_timed_out() {
+        // The deadline auto-deny must also broadcast, flagged timed_out, so the
+        // browser closes the modal instead of leaving dead buttons.
+        let registry = PendingApprovals::new(Some(Duration::from_millis(50)));
+        let mut resolved = registry.subscribe_resolved();
+        let id = Uuid::new_v4();
+        let decision = registry
+            .request_decision_in(id, "git", "git status", "console", "turn-2")
+            .await;
+        assert_eq!(decision, Decision::Deny);
+
+        let info = tokio::time::timeout(Duration::from_millis(100), resolved.recv())
+            .await
+            .expect("resolution within deadline")
+            .expect("recv ok");
+        assert_eq!(info.id, id);
+        assert_eq!(info.decision, Decision::Deny);
+        assert_eq!(info.reply_target, "turn-2");
+        assert!(info.timed_out);
     }
 }

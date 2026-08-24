@@ -2840,9 +2840,9 @@ impl TuiApp {
                 ));
             }
             // The TUI gates tools through its own inline `PendingApprovals`
-            // overlay, never the web-modal backend, so it never receives this
-            // event. Covered for exhaustiveness only.
-            AgentEvent::ApprovalRequest { .. } => {}
+            // overlay, never the web-modal backend, so it never receives these
+            // events. Covered for exhaustiveness only.
+            AgentEvent::ApprovalRequest { .. } | AgentEvent::ApprovalResolved { .. } => {}
         }
     }
 
