@@ -19,6 +19,7 @@
 - [7 — Gateway, Daemon, and Operations](pillars/7-gateway-daemon.md)
 - [8 — Install, Packaging, and Release](pillars/8-install-release.md)
 - [9 — Documentation and Adoption](pillars/9-docs-adoption.md)
+- [10 — Web Console](pillars/10-web-console.md)
 
 ## 2) Getting started
 
