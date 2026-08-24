@@ -6,6 +6,7 @@
 pub mod guest;
 pub mod permissions;
 pub mod policy_writer;
+pub mod session_grants;
 
 pub use guest::GuestGate;
 

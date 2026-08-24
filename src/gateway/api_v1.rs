@@ -681,7 +681,8 @@ async fn agent_chat_stream(
     let agent_message = compose_turn_input(&body.message, body.context.as_deref());
     let req_session_id = body.session_id.clone();
     let scope_session_id = req_session_id.clone();
-    let history_session_id = body.session_id.clone();
+    // Empty string is not a real session id — don't seed/harvest grants under `""`.
+    let history_session_id = body.session_id.clone().filter(|s| !s.is_empty());
     // Snapshot, at turn start, whether the named session already exists — so the
     // persist step below can tell a brand-new session (create it) from one that
     // was deleted mid-turn (do not resurrect it).
@@ -708,6 +709,12 @@ async fn agent_chat_stream(
     let gate_tools = !config.channels_config.autonomous_tools;
     // Share the gateway observer so streamed-chat metrics reach `/metrics`.
     let observer = state.observer.clone();
+
+    // One scope per SSE turn. The turn runs inside `TURN_SCOPE = ("console",
+    // turn_scope)`, so the shell tool and the Layer-A modal register their
+    // approval requests against it — the forwarder then only sees and the
+    // browser only resolves this turn's own requests.
+    let turn_scope = uuid::Uuid::new_v4().to_string();
 
     tokio::spawn(async move {
         match crate::agent::Agent::from_config_with_observer(&config, observer).await {
@@ -763,26 +770,56 @@ async fn agent_chat_stream(
                         sec.set_pending(web_approvals.clone());
                     }
                     let mut shell_rx = web_approvals.subscribe();
+                    let mut resolved_rx = web_approvals.subscribe_resolved();
                     let fwd_tx = events_tx.clone();
+                    let turn_scope_for_fwd = turn_scope.clone();
                     shell_approval_forwarder = Some(tokio::spawn(async move {
+                        use tokio::sync::broadcast::error::RecvError;
                         loop {
-                            match shell_rx.recv().await {
-                                Ok(req) if req.channel.is_empty() => {
-                                    let _ = fwd_tx
-                                        .send(crate::agent::AgentEvent::ApprovalRequest {
-                                            id: req.basename.clone(),
-                                            tool: "shell".to_string(),
-                                            args: serde_json::json!({
-                                                "command": req.full_command,
-                                            }),
-                                        })
-                                        .await;
-                                }
-                                // Layer-A (non-shell) requests emit their own
-                                // modal; a lagged receiver just skips ahead.
-                                Ok(_)
-                                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            tokio::select! {
+                                r = shell_rx.recv() => match r {
+                                    // Only this turn's own shell (Layer-B) requests;
+                                    // forward the UUID (not the basename) so two turns
+                                    // waiting on the same command stay distinguishable.
+                                    Ok(req) if forward_to_this_stream(&req, &turn_scope_for_fwd) => {
+                                        let _ = fwd_tx
+                                            .send(crate::agent::AgentEvent::ApprovalRequest {
+                                                id: req.id.to_string(),
+                                                tool: "shell".to_string(),
+                                                args: serde_json::json!({
+                                                    "command": req.full_command,
+                                                    "basename": req.basename,
+                                                }),
+                                            })
+                                            .await;
+                                    }
+                                    // Another turn's request, or a lagged receiver — skip.
+                                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                                    Err(RecvError::Closed) => break,
+                                },
+                                r = resolved_rx.recv() => match r {
+                                    // A request for this turn was answered or expired —
+                                    // tell the browser so it closes the modal (covers both
+                                    // the Layer-A tool modal and the Layer-B shell modal).
+                                    Ok(info)
+                                        if !turn_scope_for_fwd.is_empty()
+                                            && info.reply_target == turn_scope_for_fwd =>
+                                    {
+                                        let approved = !matches!(
+                                            info.decision,
+                                            crate::security::Decision::Deny
+                                        );
+                                        let _ = fwd_tx
+                                            .send(crate::agent::AgentEvent::ApprovalResolved {
+                                                id: info.id.to_string(),
+                                                approved,
+                                                timed_out: info.timed_out,
+                                            })
+                                            .await;
+                                    }
+                                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                                    Err(RecvError::Closed) => break,
+                                },
                             }
                         }
                     }));
@@ -792,11 +829,18 @@ async fn agent_chat_stream(
                 if !prior.is_empty() {
                     let _ = agent.restore_history(&prior);
                 }
-                let _ = agent
-                    .turn_streaming(
-                        &agent_message,
-                        Some(events_tx.clone()),
-                        Some(cancel_for_agent),
+                // Carry this turn's scope into tool execution so the shell tool
+                // and the Layer-A modal register their approvals against it. The
+                // agent loop does not spawn between here and `Tool::execute`, so
+                // the task-local survives (same pattern as channel dispatch).
+                let _ = crate::security::TURN_SCOPE
+                    .scope(
+                        ("console".to_string(), turn_scope.clone()),
+                        agent.turn_streaming(
+                            &agent_message,
+                            Some(events_tx.clone()),
+                            Some(cancel_for_agent),
+                        ),
                     )
                     .await;
                 // Turn is done — stop forwarding shell approvals (the shared
@@ -953,6 +997,14 @@ async fn agent_chat_stream(
                     "tool": tool,
                     "args": args,
                 }),
+                // A pending approval was answered or expired — the client closes
+                // the modal instead of leaving dead approve/deny buttons.
+                crate::agent::AgentEvent::ApprovalResolved { id, approved, timed_out } => serde_json::json!({
+                    "type": "approval_resolved",
+                    "id": id,
+                    "approved": approved,
+                    "timed_out": timed_out,
+                }),
                 // Gateway endpoint operates on a per-turn agent built
                 // for the request — reload events are a TUI-only
                 // concern. Surface as a benign info line so the SSE
@@ -1022,6 +1074,15 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
     }
+}
+
+/// Whether a shell (Layer-B) approval request belongs to this SSE turn. Each turn
+/// runs inside `TURN_SCOPE = ("console", <turn_scope>)`, so the shell tool
+/// registers its request with that channel and reply_target; a request from a
+/// different turn (or an unscoped one, with an empty reply_target) is not ours.
+/// Extracted so the scoping can be unit-tested without a live stream.
+fn forward_to_this_stream(req: &crate::security::PendingRequest, turn_scope: &str) -> bool {
+    !turn_scope.is_empty() && req.channel == "console" && req.reply_target == turn_scope
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1209,6 +1270,9 @@ async fn sessions_delete(
     let mut store = open_session_store().map_err(err_500)?;
     let session_id = resolve_session_id(&store, &id)?;
     let deleted = store.delete_session(&session_id).map_err(err_500)?;
+    // A deleted session's "Always" grants must not outlive it (a reused id would
+    // otherwise inherit stale approvals).
+    crate::approval::session_grants::clear_session_grants(&session_id);
     Ok(Json(
         serde_json::json!({ "deleted": deleted, "id": session_id }),
     ))
@@ -2873,11 +2937,13 @@ mod tests {
     #[tokio::test]
     async fn resolve_approval_endpoint_resolves_pending_request() {
         let state = test_state();
-        // A WebModalApprovalBackend would register this while a turn is paused.
+        // A WebModalApprovalBackend registers this under a UUID while a turn is
+        // paused; the browser resolves that same UUID.
         let producer = state.web_approvals.clone();
+        let id = uuid::Uuid::new_v4();
         let task = tokio::spawn(async move {
             producer
-                .request_decision("modal-1", "tool: web_search", "console")
+                .request_decision_in(id, id.to_string(), "tool: web_search", "console", "turn-x")
                 .await
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2885,7 +2951,7 @@ mod tests {
         let resp = resolve_approval(
             State(state),
             HeaderMap::new(),
-            Path("modal-1".to_string()),
+            Path(id.to_string()),
             Json(ApprovalDecisionBody {
                 approve: true,
                 always: false,
@@ -2896,6 +2962,65 @@ mod tests {
         assert_eq!(resp.0["resolved"], true);
         assert_eq!(resp.0["approved"], true);
         assert_eq!(task.await.unwrap(), crate::security::Decision::Once);
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_requires_auth_when_pairing_enabled() {
+        // The resolve endpoint is the approver — it must honor bearer auth.
+        let err = resolve_approval(
+            State(paired_state("tok")),
+            HeaderMap::new(),
+            Path(uuid::Uuid::new_v4().to_string()),
+            Json(ApprovalDecisionBody {
+                approve: true,
+                always: false,
+            }),
+        )
+        .await
+        .expect_err("missing bearer must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn agent_chat_requires_auth_when_pairing_enabled() {
+        // `ChatResponseBody` isn't Debug, so match rather than `expect_err`.
+        let res = agent_chat_sync(
+            State(paired_state("tok")),
+            HeaderMap::new(),
+            Json(ChatRequestBody {
+                message: "hi".into(),
+                model: None,
+                provider: None,
+                temperature: None,
+                session_id: None,
+                context: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(res, Err((StatusCode::UNAUTHORIZED, _))),
+            "missing bearer must be rejected"
+        );
+    }
+
+    #[test]
+    fn forwarder_only_matches_its_own_turn_scope() {
+        // The forwarder must forward only requests scoped to its own turn, so
+        // one browser never sees another turn's shell command.
+        let mk = |reply_target: &str, channel: &str| crate::security::PendingRequest {
+            id: uuid::Uuid::new_v4(),
+            basename: "git".into(),
+            full_command: "git status".into(),
+            channel: channel.into(),
+            reply_target: reply_target.into(),
+            created_at: 0,
+        };
+        assert!(forward_to_this_stream(&mk("t1", "console"), "t1"));
+        assert!(!forward_to_this_stream(&mk("t2", "console"), "t1"));
+        // An unscoped request (empty reply_target, e.g. a direct CLI run) is never ours.
+        assert!(!forward_to_this_stream(&mk("", ""), "t1"));
+        // Right target but wrong channel is not ours either.
+        assert!(!forward_to_this_stream(&mk("t1", "telegram"), "t1"));
     }
 
     #[tokio::test]

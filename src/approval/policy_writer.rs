@@ -269,6 +269,11 @@ pub fn apply_preset_to_config(config: &mut crate::config::Config, preset: Policy
         basenames.dedup();
         config.autonomy.allowed_commands = basenames;
     }
+    // Applying a preset is the CLI/TUI tightening chokepoint. Drop any web-console
+    // "Always" grants so a blanket grant made under a looser preset isn't
+    // re-seeded into the next turn (the gateway's own autonomy route clears them
+    // separately). Safe-by-default: clearing only forces a re-prompt.
+    crate::approval::session_grants::clear_all_session_grants();
 }
 
 /// Bring `config.autonomy` into line with the preset marker already on disk.

@@ -44,6 +44,18 @@ pub enum AgentEvent {
         args: serde_json::Value,
     },
 
+    /// A pending in-browser approval was answered (or expired). Lets the console
+    /// close the modal instead of leaving dead approve/deny buttons on screen.
+    /// Emitted by the SSE forwarder for the turn that raised the request.
+    ApprovalResolved {
+        /// The id from the matching `ApprovalRequest`.
+        id: String,
+        /// True when approved (once or always); false when denied.
+        approved: bool,
+        /// True when the resolution was the deadline auto-deny, not a user action.
+        timed_out: bool,
+    },
+
     /// Stored memory was recalled and prepended to this turn's user message.
     /// Emitted once, before the first `Chunk`, and only when something was
     /// actually injected — an empty recall emits nothing.

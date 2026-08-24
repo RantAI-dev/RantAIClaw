@@ -10,17 +10,16 @@
 //!
 //! This is the web twin of the channel `ChatRelayApprovalBackend`: same async
 //! [`crate::security::PendingApprovals`] await machinery, different transport
-//! (SSE event out + HTTP POST in instead of a chat message round-trip). The id
-//! lives in the registry's `basename` slot so resolution by id is unambiguous.
+//! (SSE event out + HTTP POST in instead of a chat message round-trip). Each
+//! request registers under a fresh UUID (the id the browser is handed) and is
+//! scoped to the turn that raised it, so resolution by id is unambiguous and one
+//! stream can neither see nor answer another's requests.
 //!
 //! Authority: the resolve endpoint is gated by the console's `check_auth`
 //! (the API token is the approver). Absent a resolution, the request times out
 //! to deny — secure by default.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
-
-use parking_lot::Mutex;
+use std::sync::Arc;
 
 use crate::agent::{AgentEvent, AgentEventSender};
 use crate::approval::{
@@ -60,13 +59,13 @@ impl WebModalApprovalBackend {
 #[async_trait::async_trait]
 impl ApprovalBackend for WebModalApprovalBackend {
     async fn decide(&self, _mgr: &ApprovalManager, request: &ApprovalRequest) -> ApprovalResponse {
-        let id = Uuid::new_v4().to_string();
+        let id = Uuid::new_v4();
         // Tell the browser to show the modal. If the SSE receiver is gone the
         // client can't answer → fail closed (deny), never run the tool.
         if self
             .events
             .send(AgentEvent::ApprovalRequest {
-                id: id.clone(),
+                id: id.to_string(),
                 tool: request.tool_name.clone(),
                 args: request.arguments.clone(),
             })
@@ -76,12 +75,21 @@ impl ApprovalBackend for WebModalApprovalBackend {
             return ApprovalResponse::No;
         }
 
+        // Register under the same UUID the browser holds, scoped to this turn so
+        // only its own SSE stream sees and can resolve it. Inside the turn task
+        // `current_turn_scope()` yields `("console", <turn_scope>)`.
+        let (channel, reply_target) = crate::security::current_turn_scope();
         // Block this tool call until the client resolves `id` (via `resolve`)
-        // or the registry deadline auto-denies. The id sits in the `basename`
-        // slot so `resolve_by_basename(id, …)` is unambiguous.
+        // or the registry deadline auto-denies.
         match self
             .relay
-            .request_decision(id, summarize_args(&request.arguments), "console")
+            .request_decision_in(
+                id,
+                id.to_string(),
+                summarize_args(&request.arguments),
+                channel,
+                reply_target,
+            )
             .await
         {
             Decision::Once => ApprovalResponse::Yes,
@@ -114,57 +122,21 @@ pub fn resolve(relay: &PendingApprovals, id: &str, approve: bool, always: bool) 
     } else {
         Decision::Once
     };
-    relay.resolve_by_basename(id, decision).is_some()
-}
-
-/// Per-session "Always"-granted tool names for the web console. Each SSE turn
-/// rebuilds a fresh `ApprovalManager`, so without this an "Always" grant would
-/// reset every message; keying grants by the conversation's session id lets the
-/// grant persist across the conversation (parity with the TUI's session-scoped
-/// allowlist). Process-scoped and bounded — the gateway is one process, and a
-/// convenience grant is safe to drop under memory pressure (it just re-prompts).
-static SESSION_GRANTS: LazyLock<Mutex<HashMap<String, HashSet<String>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Cap on distinct sessions holding grants, so a long-lived gateway can't grow
-/// the map without bound. A new session past the cap simply won't persist grants
-/// (it re-prompts each turn — safe degradation).
-const MAX_GRANT_SESSIONS: usize = 1000;
-
-/// Tools this session has granted "Always" — used to seed a new turn's manager.
-pub fn session_granted_tools(session_id: &str) -> Vec<String> {
-    SESSION_GRANTS
-        .lock()
-        .get(session_id)
-        .map(|s| s.iter().cloned().collect())
-        .unwrap_or_default()
-}
-
-/// Merge a turn's "Always" grants into the session's persistent set. No-op when
-/// empty, and bounded: a brand-new session past `MAX_GRANT_SESSIONS` is skipped
-/// rather than evicting an existing one.
-pub fn record_session_grants<S: std::hash::BuildHasher>(
-    session_id: &str,
-    tools: &HashSet<String, S>,
-) {
-    if tools.is_empty() {
-        return;
+    // Web approvals are always addressed by their UUID (the id the browser was
+    // handed in the `approval_request` event), never by basename — two turns
+    // waiting on the same command must not be resolvable by a shared basename.
+    match Uuid::parse_str(id) {
+        Ok(uuid) => relay.resolve(uuid, decision),
+        Err(_) => false,
     }
-    let mut map = SESSION_GRANTS.lock();
-    if !map.contains_key(session_id) && map.len() >= MAX_GRANT_SESSIONS {
-        return;
-    }
-    map.entry(session_id.to_string())
-        .or_default()
-        .extend(tools.iter().cloned());
 }
 
-/// Drop every session's remembered "Always" grants. Called when the autonomy
-/// policy changes so a tightening actually re-prompts instead of re-seeding a
-/// stale blanket grant made under a looser preset.
-pub fn clear_all_session_grants() {
-    SESSION_GRANTS.lock().clear();
-}
+/// Per-session "Always" grants live in `crate::approval::session_grants` (moved
+/// there so the autonomy tightening path can revoke them without `approval`
+/// depending on `gateway`). Re-exported so existing gateway callers are unchanged.
+pub use crate::approval::session_grants::{
+    clear_all_session_grants, record_session_grants, session_granted_tools,
+};
 
 /// Exempt the `shell` tool from the Layer-A tool-gate on the web console. The
 /// shell tool has its own command-level gate (Layer-B), which the console now
@@ -291,19 +263,28 @@ mod tests {
         assert!(!resolve(&relay, "no-such-id", true, false));
     }
 
-    #[test]
-    fn session_grants_accumulate_and_empty_is_noop() {
-        // Unique session id so this never collides with the process-global store.
-        let sid = "sess-grants-roundtrip-3f9c";
-        assert!(session_granted_tools(sid).is_empty());
-        record_session_grants(sid, &HashSet::from(["http_request".to_string()]));
-        record_session_grants(sid, &HashSet::new()); // empty is a no-op
-        record_session_grants(sid, &HashSet::from(["browser".to_string()])); // accumulates
-        let got: HashSet<String> = session_granted_tools(sid).into_iter().collect();
-        assert_eq!(
-            got,
-            HashSet::from(["http_request".to_string(), "browser".to_string()])
+    #[tokio::test]
+    async fn resolve_by_basename_is_rejected_on_the_web_path() {
+        // A shell approval with basename "git" must NOT be resolvable by posting
+        // "git": the web path is UUID-only, so two turns waiting on the same
+        // command can't cross-resolve. Only the UUID resolves it.
+        let relay = Arc::new(PendingApprovals::new(Some(Duration::from_secs(10))));
+        let id = Uuid::new_v4();
+        let r = relay.clone();
+        let task = tokio::spawn(async move {
+            r.request_decision_in(id, "git", "git status", "console", "turn-x")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !resolve(&relay, "git", true, false),
+            "basename must not resolve on the web path"
         );
+        assert!(
+            resolve(&relay, &id.to_string(), true, false),
+            "the UUID resolves it"
+        );
+        assert_eq!(task.await.unwrap(), Decision::Once);
     }
 
     #[test]
