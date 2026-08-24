@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::profile::ProfileManager;
 
-use super::{read_persona_toml, write_persona_toml, PersonaToml, PresetId};
+use super::{read_persona_toml, PresetId};
 
 pub fn show() -> Result<()> {
     let profile = ProfileManager::active()?;
@@ -41,19 +41,13 @@ pub fn list() -> Result<()> {
 
 pub fn set(preset: PresetId) -> Result<()> {
     let profile = ProfileManager::active()?;
-    let existing = read_persona_toml(&profile)?;
-    let timezone = existing
-        .as_ref()
-        .map(|e| e.timezone.clone())
-        .unwrap_or_else(|| "UTC".to_string());
-    let name = existing
-        .as_ref()
-        .map(|e| e.name.clone())
-        .unwrap_or_else(|| "RantaiClawAgent".to_string());
-    let mut next = existing.unwrap_or_else(|| PersonaToml::default_for(&name, &timezone));
-    next.preset = preset;
-    write_persona_toml(&profile, &next)?;
-    super::render_system_md(&profile, &next)?;
+    super::apply_update(
+        &profile,
+        super::PersonaUpdate {
+            preset: Some(preset),
+            ..Default::default()
+        },
+    )?;
     println!(
         "Persona preset set to {} for profile '{}'.",
         preset.slug(),

@@ -15,7 +15,7 @@ use anyhow::Result;
 
 use crate::config::Config;
 use crate::onboard::section::{SetupContext, SetupSection};
-use crate::persona::{self, render_system_md, write_persona_toml, PersonaToml, PresetId};
+use crate::persona::{self, write_persona_toml, PersonaToml, PresetId};
 use crate::profile::Profile;
 
 pub struct PersonaSection;
@@ -51,7 +51,6 @@ impl SetupSection for PersonaSection {
         };
 
         write_persona_toml(ctx.profile, &persona_record)?;
-        render_system_md(ctx.profile, &persona_record)?;
         Ok(())
     }
 
@@ -65,11 +64,11 @@ impl SetupSection for PersonaSection {
 /// config crate and may have moved; we only need string-ish accessors so
 /// keep this loose and recover via defaults.
 fn derive_defaults(_config: &Config) -> (String, String) {
-    // Wave 3 will replace this with proper project-context lookups from
-    // `Config::project_context.{name, timezone}`. For now we use the
-    // sensible fallbacks the spec lists — the project-context section will
-    // re-render `SYSTEM.md` once those fields exist anyway.
-    (String::new(), "UTC".to_string())
+    // `Config` has no project-context name/timezone yet, so use coherent
+    // fallbacks: a non-empty name keeps the default template from rendering a
+    // blank gap ("assistant for  (timezone: UTC)"). The operator can set the
+    // real name/timezone via the console or `PUT /api/v1/personality`.
+    ("RantaiClaw".to_string(), "UTC".to_string())
 }
 
 #[cfg(test)]

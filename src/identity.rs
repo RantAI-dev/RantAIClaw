@@ -174,6 +174,18 @@ pub fn load_aieos_identity(
             workspace_dir.join(path)
         };
 
+        // Cap the read: the identity file is injected into every system prompt,
+        // so an accidentally-huge or grown JSON must not blow up prompt size.
+        const IDENTITY_MAX_BYTES: u64 = 256 * 1024;
+        if let Ok(meta) = std::fs::metadata(&full_path) {
+            if meta.len() > IDENTITY_MAX_BYTES {
+                anyhow::bail!(
+                    "AIEOS file {} is {} bytes, over the {IDENTITY_MAX_BYTES}-byte cap",
+                    full_path.display(),
+                    meta.len()
+                );
+            }
+        }
         let content = std::fs::read_to_string(&full_path)
             .with_context(|| format!("Failed to read AIEOS file: {}", full_path.display()))?;
 

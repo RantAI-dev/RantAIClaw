@@ -13,8 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rantaiclaw::persona::{
-    self, read_persona_toml, render_system_md, template_for, write_persona_toml, PersonaToml,
-    PresetId,
+    self, read_persona_toml, template_for, write_persona_toml, PersonaToml, PresetId,
 };
 use rantaiclaw::profile::ProfileManager;
 use tempfile::TempDir;
@@ -219,16 +218,11 @@ fn write_persona_toml_round_trips() {
 }
 
 #[test]
-fn render_system_md_writes_expected_body() {
-    let tmp = TempDir::new().unwrap();
-    std::env::set_var("HOME", tmp.path());
-    std::env::remove_var("RANTAICLAW_PROFILE");
-    let profile = ProfileManager::ensure("rt-render").unwrap();
-
+fn render_produces_a_substituted_body_with_no_leftover_placeholders() {
+    // The persona renders straight to the `## Persona` prompt section (no
+    // on-disk SYSTEM.md file any more), so assert the rendered body directly.
     let persona = PersonaToml::default_for("Shiro", "Asia/Jakarta");
-    render_system_md(&profile, &persona).unwrap();
-
-    let body = std::fs::read_to_string(profile.persona_dir().join("SYSTEM.md")).unwrap();
+    let body = persona.render();
     assert!(body.contains("Shiro"));
     assert!(body.contains("Asia/Jakarta"));
     assert!(!body.contains("{{name}}"));
@@ -238,3 +232,35 @@ fn render_system_md_writes_expected_body() {
 // `is_already_configured` is tested in the section's `#[cfg(test)]` block
 // since the `onboard` module is `pub(crate)` and not reachable from this
 // integration test.
+
+#[test]
+fn renders_without_a_blank_name_gap() {
+    // A legacy persona with an empty name must not render "assistant for  (…".
+    let persona = PersonaToml::default_for("", "UTC");
+    let body = persona.render();
+    assert!(
+        !body.contains("for  ("),
+        "empty name must not leave a double-space gap"
+    );
+    assert!(!body.contains("{{"), "no leftover placeholders");
+}
+
+#[test]
+fn placeholder_in_a_field_value_is_not_re_expanded() {
+    // A value that itself contains a `{{role}}` token must survive verbatim —
+    // sequential replaces used to expand it with the later role substitution.
+    let persona = PersonaToml {
+        preset: PresetId::Default,
+        name: "{{role}}".to_string(),
+        timezone: "UTC".to_string(),
+        role: "analyst".to_string(),
+        tone: "neutral".to_string(),
+        avoid: None,
+        always_on_kbs: Vec::new(),
+    };
+    let body = persona.render();
+    assert!(
+        body.contains("{{role}}"),
+        "the literal name token must not be re-expanded: {body}"
+    );
+}

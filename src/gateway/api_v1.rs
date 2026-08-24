@@ -71,6 +71,7 @@ pub fn router() -> Router<AppState> {
             "/api/v1/personality",
             get(personality_get).put(personality_set),
         )
+        .route("/api/v1/personality/presets", get(personality_presets))
         .route("/api/v1/channels", get(channels_list))
         .route("/api/v1/providers", get(providers_list))
         .route("/api/v1/providers/{id}/models", get(provider_models))
@@ -2036,8 +2037,50 @@ struct PersonalityBody {
     /// string clears it. Absent leaves it unchanged.
     #[serde(default)]
     avoid: Option<String>,
+    /// IANA timezone name, e.g. `Asia/Jakarta`. Overwrites when supplied.
+    #[serde(default)]
+    timezone: Option<String>,
     #[serde(default)]
     always_on_kbs: Option<Vec<String>>,
+}
+
+/// Reject a persona free-text field that is too long or carries control
+/// characters (it renders first in the system prompt, above tools and safety).
+fn validate_persona_field(
+    label: &str,
+    value: &str,
+    max: usize,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if value.chars().count() > max {
+        return Err(err_400(format!("{label} exceeds {max} characters")));
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(err_400(format!("{label} contains control characters")));
+    }
+    Ok(())
+}
+
+/// GET /api/v1/personality/presets — the persona presets a client may choose,
+/// served from the enum so a console never hardcodes (and drifts from) the list.
+async fn personality_presets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    check_auth(&state, &headers)?;
+    let presets: Vec<_> = crate::persona::PresetId::ALL
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.slug(),
+                "label": p.label(),
+                "description": p.description(),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "presets": presets })))
 }
 
 async fn personality_set(
@@ -2047,58 +2090,51 @@ async fn personality_set(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     check_auth(&state, &headers)?;
     let profile = crate::profile::ProfileManager::active().map_err(err_500)?;
-    let existing = crate::persona::read_persona_toml(&profile).map_err(err_500)?;
-    let timezone = existing
-        .as_ref()
-        .map(|e| e.timezone.clone())
-        .unwrap_or_else(|| "UTC".to_string());
-    let name = existing
-        .as_ref()
-        .map(|e| e.name.clone())
-        .unwrap_or_else(|| "RantaiClawAgent".to_string());
-    let mut next =
-        existing.unwrap_or_else(|| crate::persona::PersonaToml::default_for(&name, &timezone));
-    // Update the preset only when supplied; otherwise keep the current one.
-    if let Some(ref preset) = body.preset {
-        next.preset = match preset.as_str() {
-            "default" => crate::persona::PresetId::Default,
-            "concise_pro" => crate::persona::PresetId::ConcisePro,
-            "friendly_companion" => crate::persona::PresetId::FriendlyCompanion,
-            "research_analyst" => crate::persona::PresetId::ResearchAnalyst,
-            "executive_assistant" => crate::persona::PresetId::ExecutiveAssistant,
-            other => return Err(err_400(format!("unknown preset `{other}`"))),
-        };
+
+    // Validate every supplied free-text field before persisting.
+    if let Some(ref name) = body.name {
+        validate_persona_field("name", name, 80)?;
     }
-    // Each field overwrites only when supplied, so a partial PUT preserves the
-    // rest of the persona.
-    if let Some(name) = body.name {
-        next.name = name;
+    if let Some(ref tz) = body.timezone {
+        validate_persona_field("timezone", tz, 64)?;
     }
-    if let Some(role) = body.role {
-        next.role = role;
+    if let Some(ref tone) = body.tone {
+        validate_persona_field("tone", tone, 80)?;
     }
-    if let Some(tone) = body.tone {
-        next.tone = tone;
+    if let Some(ref role) = body.role {
+        validate_persona_field("role", role, 400)?;
     }
-    if let Some(avoid) = body.avoid {
-        // Empty string clears the avoid block (renderer treats blank as none).
-        next.avoid = if avoid.trim().is_empty() {
-            None
-        } else {
-            Some(avoid)
-        };
+    if let Some(ref avoid) = body.avoid {
+        validate_persona_field("avoid", avoid, 400)?;
     }
-    if let Some(kbs) = body.always_on_kbs {
-        next.always_on_kbs = kbs;
-    }
-    crate::persona::write_persona_toml(&profile, &next).map_err(err_500)?;
-    crate::persona::render_system_md(&profile, &next).map_err(err_500)?;
+
+    let preset = match body.preset {
+        Some(ref p) => Some(
+            crate::persona::PresetId::from_slug(p)
+                .ok_or_else(|| err_400(format!("unknown preset `{p}`")))?,
+        ),
+        None => None,
+    };
+
+    let update = crate::persona::PersonaUpdate {
+        preset,
+        name: body.name,
+        timezone: body.timezone,
+        role: body.role,
+        tone: body.tone,
+        // Some(text) sets/keeps per apply_update's blank-clears rule; None leaves.
+        avoid: body.avoid.map(Some),
+        always_on_kbs: body.always_on_kbs,
+    };
+    let next = crate::persona::apply_update(&profile, update).map_err(err_500)?;
+
     Ok(Json(serde_json::json!({
         "preset": next.preset.slug(),
         "name": next.name,
         "role": next.role,
         "tone": next.tone,
         "avoid": next.avoid,
+        "timezone": next.timezone,
         "always_on_kbs": next.always_on_kbs,
     })))
 }
@@ -2699,6 +2735,86 @@ mod tests {
             !user.content.contains("SECRET_DOC_TEXT"),
             "retrieved context must not be persisted"
         );
+    }
+
+    #[tokio::test]
+    async fn personality_presets_lists_all_five() {
+        let resp = personality_presets(State(test_state()), HeaderMap::new())
+            .await
+            .expect("presets ok");
+        let presets = resp.0["presets"].as_array().expect("presets array");
+        assert_eq!(presets.len(), crate::persona::PresetId::ALL.len());
+        assert!(presets.iter().any(|p| p["id"] == "default"));
+        assert!(presets
+            .iter()
+            .all(|p| p["description"].as_str().is_some_and(|d| !d.is_empty())));
+    }
+
+    #[tokio::test]
+    async fn personality_set_rejects_unknown_preset_and_overlong_name() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let unknown = personality_set(
+            State(test_state()),
+            HeaderMap::new(),
+            Json(PersonalityBody {
+                preset: Some("nonexistent".to_string()),
+                name: None,
+                role: None,
+                tone: None,
+                avoid: None,
+                timezone: None,
+                always_on_kbs: None,
+            }),
+        )
+        .await
+        .expect_err("unknown preset must 400");
+        assert_eq!(unknown.0, StatusCode::BAD_REQUEST);
+
+        let long = personality_set(
+            State(test_state()),
+            HeaderMap::new(),
+            Json(PersonalityBody {
+                preset: None,
+                name: Some("x".repeat(81)),
+                role: None,
+                tone: None,
+                avoid: None,
+                timezone: None,
+                always_on_kbs: None,
+            }),
+        )
+        .await
+        .expect_err("overlong name must 400");
+        assert_eq!(long.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn personality_set_can_set_name_and_timezone() {
+        let _env = crate::test_env::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _restore = HomeGuard::set(tmp.path());
+
+        let resp = personality_set(
+            State(test_state()),
+            HeaderMap::new(),
+            Json(PersonalityBody {
+                preset: Some("concise_pro".to_string()),
+                name: Some("Atlas".to_string()),
+                role: None,
+                tone: None,
+                avoid: None,
+                timezone: Some("Asia/Jakarta".to_string()),
+                always_on_kbs: None,
+            }),
+        )
+        .await
+        .expect("set ok");
+        assert_eq!(resp.0["name"], "Atlas");
+        assert_eq!(resp.0["timezone"], "Asia/Jakarta");
+        assert_eq!(resp.0["preset"], "concise_pro");
     }
 
     #[tokio::test]

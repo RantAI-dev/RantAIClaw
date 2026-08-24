@@ -3234,9 +3234,24 @@ impl TuiApp {
                 }
             }
             ListPickerKind::Personality => {
-                let msg = format!(
-                    "Personality set to: {key}\n(Full integration with system prompt pending)"
-                );
+                let msg = match crate::persona::PresetId::from_slug(&key) {
+                    Some(preset) => match crate::profile::ProfileManager::active().and_then(|p| {
+                        crate::persona::apply_update(
+                            &p,
+                            crate::persona::PersonaUpdate {
+                                preset: Some(preset),
+                                ..Default::default()
+                            },
+                        )
+                    }) {
+                        Ok(_) => format!(
+                            "Personality preset set to {}.\nTakes effect on your next new conversation (/new) or reload.",
+                            preset.slug()
+                        ),
+                        Err(e) => format!("Failed to set personality: {e}"),
+                    },
+                    None => format!("Unknown preset '{key}'."),
+                };
                 let _ = self.context.append_system_message(&msg);
                 self.scrollback_queue.push(("system".to_string(), msg));
             }

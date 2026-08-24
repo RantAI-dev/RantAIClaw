@@ -440,6 +440,14 @@ pub(crate) async fn process_channel_message(
             &[],
         ),
     );
+    // Re-render the persona section too, from `persona.toml` fresh, so a
+    // `PUT /api/v1/personality` reaches an already-running channel listener
+    // without a restart — the same per-message in-memory splice the safety
+    // section uses (`ctx.system_prompt` is built once at channel start).
+    let base_prompt = crate::agent::prompt::replace_persona_section(
+        &base_prompt,
+        &crate::agent::prompt::render_persona_section(),
+    );
     let system_prompt = prompt::build_channel_system_prompt(
         &base_prompt,
         &msg.channel,
