@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0-alpha] — 2026-08-26
+
+Console chat surface hardening and features, consolidating a deep-scan of the web
+console's Chat, Status, and Persona surfaces across the gateway and claw-ui.
+**No config schema change** (still v23): the release adds no migration and rolls
+back cleanly. claw-ui pin bumped to **v0.3.21**. The only exposure-boundary touch
+is an advisory startup warning for an exposed-but-unauthenticated bind; nothing
+widens a default.
+
+### Security
+
+- **Web-console tool approvals are scoped to the SSE turn that raised them.**
+  Approvals were process-global and keyed by shell command basename, so one
+  browser could see and resolve another turn's command, and two turns waiting on
+  the same basename stalled until the auto-deny. Each turn now runs under a
+  per-turn scope; requests carry a UUID (resolution is UUID-only, never
+  basename), and a new `approval_resolved` SSE event tells the browser when a
+  request is answered or expires so the modal can't be left with dead buttons.
+  Per-session "Always" grants are keyed safely, revoked wherever autonomy is
+  tightened, and cleared on session delete. (#640)
+- **API rate limiting keys on the authenticated principal behind a proxy** — a
+  bearer-token prefix rather than the peer IP, so every browser behind the BFF no
+  longer shares one bucket. (#638)
+- **Advisory warning when the gateway is reachable beyond localhost with no
+  console login configured.** Print-only; it does not change the default bind. (#639)
+
+### Added
+
+- **Branch a conversation.** `POST /api/v1/sessions/{id}/fork` creates a child
+  session (carrying `parent_session_id` and an origin system message) and leaves
+  the parent open; surfaced as a Fork action on each console session row. (#639, claw-ui #71)
+- **Transcript export** from the console (Markdown/JSON), formatted client-side
+  from the stored transcript. (claw-ui #71)
+- **Session usage tile** on the Status panel (sessions, messages, average, latest)
+  from the existing insights endpoint. (claw-ui #71)
+- **Persona editor** in the console: settable name, role, tone, avoid, and
+  timezone, with presets served from `GET /api/v1/personality/presets`; edits sync
+  the console header live. (#626, claw-ui #69)
+- **Web-console pillar doc** and the gateway/console API-contract ADR. (#639)
+
+### Fixed
+
+- **Sessions & chat handlers hardened**: full-text search no longer 500s on a
+  quote in the query, error responses no longer leak profile filesystem paths,
+  temperature is clamped, session paging has a stable tiebreak, a deleted session
+  is not resurrected mid-turn, a cancelled turn is not persisted, and the
+  previously-dead `gateway.request_timeout_secs` is now wired to the timeout
+  layer. Insights totals are aggregated in SQL (correct past 10k sessions). (#623)
+- **Chat turn contract**: retrieved reference material is threaded as a structured
+  field (kept out of the persisted transcript and replayed history), replay is
+  capped, and a zero-token usage event is no longer emitted as real data. (#625)
+- **Persona end-to-end**: preset resolution, validation, live channel reach, and
+  removal of the dead SYSTEM.md write; the TUI persona command writes through to
+  config. (#626)
+- **Doctor and health honesty**: `/health` and `/readyz` are slimmed (no pid or
+  last-error leak), doctor checks run without blocking the async runtime and
+  report which checks were skipped. (#624)
+
+### Changed
+
+- Startup backfills session titles on a gateway-only deployment (previously only
+  the TUI did). (#639)
+
+[0.25.0-alpha]: https://github.com/RantAI-dev/RantAIClaw/releases/tag/v0.25.0-alpha
+
 ## [0.24.0-alpha] — 2026-08-21
 
 Tools & Autonomy security hardening, consolidating a dedicated deep-scan of the
