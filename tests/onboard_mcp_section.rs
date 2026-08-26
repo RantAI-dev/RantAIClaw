@@ -124,7 +124,12 @@ async fn validate_mcp_startup_succeeds_for_well_behaved_server() {
         install_command: &[
             "sh",
             "-c",
-            r#"printf '{"jsonrpc":"2.0","id":0,"result":{}}\n'; exit 0"#,
+            // Read the initialize request off stdin before exiting: a real MCP
+            // server reads before it responds, so it never closes stdin out from
+            // under the validator's write. Exiting right after `printf` raced the
+            // validator's `write_all` — on a fast runner the shell was gone before
+            // the write landed, giving a spurious "write initialize request" EPIPE.
+            r#"printf '{"jsonrpc":"2.0","id":0,"result":{}}\n'; read _ 2>/dev/null; exit 0"#,
         ],
         auth: AuthMethod::None,
         env_vars: &[],
