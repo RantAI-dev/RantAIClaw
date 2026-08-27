@@ -54,9 +54,10 @@ fn config_schema_does_not_drift_unannounced() {
 /// machine-independent.
 #[test]
 fn config_defaults_do_not_drift_unannounced() {
-    // Route through `to_value` first so map-typed fields (e.g. `cost.prices`, a
-    // HashMap) serialise with sorted keys — `to_string_pretty` on the struct
-    // directly emits HashMap entries in a random per-run order, which flakes.
+    // Route through `to_value` first so any map-typed field (a `HashMap`, e.g.
+    // `provider_api_keys`) serialises with sorted keys — `to_string_pretty` on
+    // the struct directly emits HashMap entries in a random per-run order, which
+    // flakes as soon as such a map is non-empty by default.
     let value = serde_json::to_value(Config::default()).expect("defaults serialise");
     let defaults = serde_json::to_string_pretty(&value).expect("value serialises");
 
@@ -140,7 +141,7 @@ fn every_schema_snapshot_has_a_migration_arm() {
 fn current_version_is_pinned() {
     assert_eq!(
         config_migrations::CURRENT_VERSION,
-        24,
+        25,
         "CURRENT_VERSION changed — bump this pin AND add the migrate_vN arm + snapshot"
     );
 }
