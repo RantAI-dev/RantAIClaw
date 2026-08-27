@@ -232,16 +232,22 @@ async fn probe_telegram(client: &reqwest::Client, token: &str) -> Result<String,
     if token.trim().is_empty() {
         return Err("token is empty".into());
     }
+    // Telegram carries the bot token in the URL path, so a reqwest error's
+    // `Display` would leak it into the rendered doctor output. `without_url()`
+    // strips the URL from the error before it is formatted.
     let url = format!("https://api.telegram.org/bot{token}/getMe");
     let resp = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("network: {e}"))?;
+        .map_err(|e| format!("network: {}", e.without_url()))?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
-    let body: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("decode: {}", e.without_url()))?;
     Ok(body
         .get("result")
         .and_then(|r| r.get("username"))
