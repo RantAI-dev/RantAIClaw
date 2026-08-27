@@ -4605,17 +4605,19 @@ impl Config {
         let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
         let backup_path = parent_dir.join(format!("{file_name}.bak"));
 
-        let mut temp_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to create temporary config file: {}",
-                    temp_path.display()
-                )
-            })?;
+        let mut open_opts = OpenOptions::new();
+        open_opts.create_new(true).write(true);
+        // 0600 AT OPEN so the config (bot tokens / API keys / paired tokens) is
+        // never briefly world-readable under the process umask between create and
+        // the belt-and-braces chmod below.
+        #[cfg(unix)]
+        open_opts.mode(0o600);
+        let mut temp_file = open_opts.open(&temp_path).await.with_context(|| {
+            format!(
+                "Failed to create temporary config file: {}",
+                temp_path.display()
+            )
+        })?;
         temp_file
             .write_all(toml_str.as_bytes())
             .await

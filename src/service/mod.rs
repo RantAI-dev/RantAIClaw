@@ -806,8 +806,12 @@ fn chown_to_rantaiclaw(_path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn chown_recursive_to_rantaiclaw(path: &Path) -> Result<()> {
+    // `-h` (no-dereference) so a symlink planted in the config dir by a
+    // compromised daemon account is not followed — chowning the link's TARGET to
+    // the service user is a local privilege-escalation primitive (BusyBox `chown`
+    // on Alpine dereferences symlinks without it).
     let output = Command::new("chown")
-        .args(["-R", "rantaiclaw:rantaiclaw", &path.to_string_lossy()])
+        .args(["-R", "-h", "rantaiclaw:rantaiclaw", &path.to_string_lossy()])
         .output()
         .context("Failed to run recursive chown")?;
 
@@ -1122,6 +1126,19 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
             fs::set_permissions(&secret_key_path, fs::Permissions::from_mode(0o600)).with_context(
                 || format!("Failed to set permissions on {}", secret_key_path.display()),
             )?;
+        }
+        // The OAuth token store (`PROFILES_FILENAME` in auth::profiles) holds
+        // access/refresh tokens — restrict it like config.toml/.secret_key so it
+        // is not left world-readable under /etc/rantaiclaw (0755).
+        let auth_profiles_path = config_dir.join("auth-profiles.json");
+        if auth_profiles_path.exists() {
+            fs::set_permissions(&auth_profiles_path, fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!(
+                        "Failed to set permissions on {}",
+                        auth_profiles_path.display()
+                    )
+                })?;
         }
     }
 
