@@ -83,9 +83,18 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
 }
 
 fn err_500(msg: impl std::fmt::Display) -> ApiError {
+    // Log the specific cause server-side, but NEVER relay it to the browser. The
+    // detail carried by these errors has included the absolute `config.toml`
+    // path and the gateway's host:port — disclosing host filesystem layout and
+    // internal addressing to any console session. Return a stable, non-specific
+    // message; the `error` code lets the console map it to a friendly string.
+    tracing::error!("config API internal error: {msg}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": "internal_error", "detail": msg.to_string() })),
+        Json(json!({
+            "error": "internal_error",
+            "detail": "internal error — check the gateway logs",
+        })),
     )
 }
 
@@ -1291,6 +1300,34 @@ async fn set_knowledge(
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn err_500_does_not_leak_path() {
+        // A load/save failure carries an absolute config path and, in some
+        // cases, the gateway host:port. The response `detail` must not echo it —
+        // the specific cause belongs in the server log, not the browser.
+        let (status, Json(body)) =
+            err_500("failed to load /home/rantaiclaw/.rantaiclaw/config.toml at 127.0.0.1:9494");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = body
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !detail.contains("config.toml"),
+            "detail leaked a path: {detail}"
+        );
+        assert!(!detail.contains("/home"), "detail leaked a path: {detail}");
+        assert!(
+            !detail.contains("9494"),
+            "detail leaked an address: {detail}"
+        );
+        // The stable error code is still present for the console to map.
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("internal_error")
+        );
+    }
 
     #[test]
     fn redact_config_secrets_clears_knowledge_keys() {
