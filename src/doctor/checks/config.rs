@@ -46,6 +46,31 @@ impl DoctorCheck for ConfigSchemaCheck {
             }
         }
 
+        // Per-route providers: nothing else validated `model_routes[].provider`,
+        // so a typo'd provider was accepted everywhere and failed only at
+        // routing time. A duplicate hint silently shadows, since the router keys
+        // on the hint.
+        let mut seen_hints = std::collections::HashSet::new();
+        for route in &cfg.model_routes {
+            if let Some(reason) = provider_validation_error(&route.provider) {
+                problems.push(format!(
+                    "model_route \"{}\" provider \"{}\" invalid: {reason}",
+                    route.hint, route.provider
+                ));
+            }
+            if !seen_hints.insert(route.hint.as_str()) {
+                problems.push(format!("duplicate model_route hint \"{}\"", route.hint));
+            }
+        }
+        for route in &cfg.embedding_routes {
+            if let Some(reason) = provider_validation_error(&route.provider) {
+                problems.push(format!(
+                    "embedding_route \"{}\" provider \"{}\" invalid: {reason}",
+                    route.hint, route.provider
+                ));
+            }
+        }
+
         if problems.is_empty() {
             CheckResult::ok(self.name(), "config schema is valid").with_category(self.category())
         } else {
@@ -402,6 +427,39 @@ mod tests {
         let result = ConfigSchemaCheck.run(&ctx).await;
         assert_eq!(result.severity, Severity::Fail);
         assert!(result.hint.is_some());
+    }
+
+    #[tokio::test]
+    async fn typo_provider_in_route_is_flagged() {
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("openrouter".into());
+        cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
+            hint: "code".into(),
+            provider: "totally-fake".into(),
+            model: "x".into(),
+            api_key: None,
+        }];
+        let (ctx, _tmp) = ctx_with_config(cfg);
+        let result = ConfigSchemaCheck.run(&ctx).await;
+        assert_eq!(result.severity, Severity::Fail, "{}", result.message);
+        assert!(result.message.contains("model_route"), "{}", result.message);
+    }
+
+    #[tokio::test]
+    async fn duplicate_model_route_hint_is_flagged() {
+        let route = |p: &str| crate::config::schema::ModelRouteConfig {
+            hint: "code".into(),
+            provider: p.into(),
+            model: "x".into(),
+            api_key: None,
+        };
+        let mut cfg = Config::default();
+        cfg.default_provider = Some("openrouter".into());
+        cfg.model_routes = vec![route("openrouter"), route("anthropic")];
+        let (ctx, _tmp) = ctx_with_config(cfg);
+        let result = ConfigSchemaCheck.run(&ctx).await;
+        assert_eq!(result.severity, Severity::Fail, "{}", result.message);
+        assert!(result.message.contains("duplicate"), "{}", result.message);
     }
 
     #[tokio::test]

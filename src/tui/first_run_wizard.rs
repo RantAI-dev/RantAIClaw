@@ -83,25 +83,6 @@ const RAIL: &[(&str, &str)] = &[
     ("08", "Complete"),
 ];
 
-const CHANNEL_PROVISIONER_NAMES: &[&str] = &[
-    "telegram",
-    "discord",
-    "slack",
-    "whatsapp-web",
-    "whatsapp-cloud",
-    "signal",
-    "matrix",
-    "mattermost",
-    "imessage",
-    "lark",
-    "dingtalk",
-    "nextcloud-talk",
-    "qq",
-    "email",
-    "irc",
-    "linq",
-];
-
 impl FirstRunWizard {
     pub fn new(profile: Profile) -> Self {
         let queue: Vec<String> = REQUIRED_PROVISIONERS
@@ -1166,7 +1147,12 @@ fn render_horizontal_rule(frame: &mut Frame, area: Rect, dim: Color) {
 }
 
 fn is_channel_name(name: &str) -> bool {
-    CHANNEL_PROVISIONER_NAMES.contains(&name)
+    // Derive from the provisioner registry — the same source `channel_options`
+    // uses — so the two never drift. A hardcoded array meant the next channel
+    // added without editing it here looped the user back to the picker with no
+    // way forward.
+    use crate::onboard::provision::{provisioner_for, ProvisionerCategory};
+    provisioner_for(name).is_some_and(|p| p.category() == ProvisionerCategory::Channel)
 }
 
 fn is_integration_name(name: &str) -> bool {
@@ -1226,6 +1212,23 @@ mod tests {
     fn integration_options_includes_knowledge_with_kb() {
         assert!(integration_options().iter().any(|(k, _)| k == "knowledge"));
         assert!(is_integration_name("knowledge"));
+    }
+
+    #[test]
+    fn channel_name_matches_registry() {
+        use crate::onboard::provision::available;
+        let channel_names: std::collections::HashSet<String> =
+            channel_options().into_iter().map(|(n, _)| n).collect();
+        // `is_channel_name` and `channel_options` must agree over the whole
+        // registry — a hardcoded array used to drift on the next channel added.
+        for (name, _) in available() {
+            assert_eq!(
+                is_channel_name(name),
+                channel_names.contains(name),
+                "is_channel_name disagreed with channel_options for {name}"
+            );
+        }
+        assert!(!is_channel_name("not-a-real-provisioner"));
     }
 
     #[test]

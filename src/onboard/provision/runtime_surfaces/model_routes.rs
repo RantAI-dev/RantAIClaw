@@ -122,7 +122,25 @@ impl TuiProvisioner for ModelRoutesProvisioner {
             .await?;
 
             let provider = recv_text(&mut responses).await?;
-            if provider.trim().is_empty() {
+            let provider = provider.trim().to_string();
+            if provider.is_empty() {
+                continue;
+            }
+            // Reject an unknown provider here rather than accepting a typo that
+            // is valid nowhere and fails only at routing time. `create_provider`
+            // is the same oracle the doctor `config.schema` check uses.
+            if crate::providers::create_provider(&provider, None).is_err() {
+                send(
+                    &events,
+                    ProvisionEvent::Message {
+                        severity: Severity::Warn,
+                        text: format!(
+                            "Unknown provider \"{provider}\" — route skipped. \
+                             Use a registered provider (e.g. openrouter, anthropic, openai)."
+                        ),
+                    },
+                )
+                .await?;
                 continue;
             }
 
